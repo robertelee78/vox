@@ -79,7 +79,7 @@ Never wait on, fail on, or blame an anchor that wasn't needed. Nothing may wait 
 refuse because of an absent anchor when the peer is directly reachable (a link address, a port
 mapping, the same LAN): not create, serve, invite, join or connect. Never call an anchor
 unreachable when it was reached. When an anchor is missing, say truthfully what that costs.
-(ADR-012, "The anchor principle, restated (2026-10-01)")
+(ADR-012, N-1–N-8)
 
 ## Releases
 

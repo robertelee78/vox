@@ -32,7 +32,8 @@
 //! 1. *Live flood:* the stranger publishes 4100 geneses and a live member record for each, from
 //!    `[::1]`. The anchor still serves the victim's room in use; a room the victim creates
 //!    afterwards is served; a real `vox room join` of it succeeds.
-//! 2. *Away:* the anchor runs with its clock 8 days ahead (`VOX_TEST_CLOCK_SKEW_MS`), so it holds the
+//! 2. *Away:* the anchor runs with its clock 8 days ahead (`VOX_TEST_CLOCK_STEP_MS`, which moves the seconds clock; since v0.3.0
+//!    `VOX_TEST_CLOCK_SKEW_MS` moves only the milliseconds), so it holds the
 //!    victim's genesis and no live record; after the same live flood it still serves the room.
 //! 3. *Re-send:* the stranger fetches the room in use's member and bundle records and puts them back
 //!    unchanged from `[::1]`, then floods 4100 rooms credited to both its networks (each genesis put
@@ -68,7 +69,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hostile::{create_room, daemon, fingerprint, free_port, profile_dir, stranger, vox_in, Rt};
-use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::{RootSigner, SoftwareRootSigner};
 use vox_core::nat::multiaddr::EndpointList;
@@ -101,7 +102,6 @@ const BUDGET: Duration = if cfg!(debug_assertions) {
 fn policy() -> ChannelPolicy {
     ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        deniability_mode: DeniabilityMode::Attributable,
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     }
@@ -543,7 +543,7 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
 #[test]
 #[ignore = "real vox processes with production Argon2id and a flood; run in release"]
 fn a_room_whose_members_are_away_is_not_crowded_out() {
-    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
+    test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
     watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (anchor_dir, victim_dir) = (
@@ -558,7 +558,7 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
         "anchor",
         &anchor_dir,
         port,
-        &[("VOX_TEST_CLOCK_SKEW_MS", &skew)],
+        &[("VOX_TEST_CLOCK_STEP_MS", &skew)],
     );
     let anchor6: SocketAddr = format!("[::1]:{port}")
         .parse()

@@ -1,233 +1,70 @@
 # ADR-009: Deniability Mode (per-channel)
 
-**Status**: implemented (M7 core + the `dgka-setup` codec, `crates/vox-core/src/deniable/`) — **still not enabled for shipping**: the formal analysis is outstanding, and so is the re-key hardening of gap (3) (see Implementation notes)
-**Date**: 2026-06-20
-**Updated**: 2026-09-21 — shipping blocker (2) closed: `deniable::wire::DgkaMessage` frames all four rounds as `0x000B` entries and the whole M7 suite now runs through it, so deniable mode can travel on a log for the first time. Closing it surfaced that the re-key path had never executed anywhere; it does now, which makes gap (3)'s weakness reproducible rather than theoretical. The formal analysis remains the blocker to enabling the mode. 2026-09-19 — status reconciled; Implementation notes (M7) added recording formula drift (code normative) and the shipping blockers.
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: Withdrawn (PRD-001 R43). The code is removed. Only the requirements below bind: they say
+what remains on the wire so existing rooms keep their names. As R43 requires, the withdrawn design is
+kept in the non-normative design record at the end.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: deniability, mpenc, deniable-gka, content-authorship, post-quantum
 
 ## Context
 
-Deniability is a per-channel option, scoped to **content-authorship only** (governance/membership stay
-attributable, ADR-007/ADR-008). Earlier drafts named a *family* ("DAKE + MDVS") rather than a buildable
-protocol and left the deniable/governance collision unresolved. This ADR specifies ONE concrete,
-implementation-grade construction and how it composes with the log (ADR-008) and per-sender consent
-(ADR-007). It is grounded in the mpENC/mpOTR lineage (Van Gundy's *Deniable Key Exchange for Group
-Messaging*; mpENC "Multi-Party Encrypted Messaging Protocol", arXiv 1606.04598) and the deniable group
-key agreement of Bohli–Steinwandt. *(Verified 3-0 against these primary sources.)*
+Deniability would have been a per-channel option: after an epoch closed, nothing would prove to an
+outsider who wrote a message. Vox does not offer it (PRD-001 R43); every room is attributable.
 
-## Decision
+## Requirements
 
-### Deniability scope = "weak" (content) deniability — the group analogue of OTR
-
-We adopt exactly mpENC's **weak deniability**: *message contents are deniable, but session
-participation is not*. This matches ADR-001/ADR-007 (membership is attributable) and is the group
-analogue of how OTR achieves deniability — equivalent security. Full participation-deniability would
-require ring signatures "not yet in widespread usage" and is explicitly **out of scope** (it would also
-contradict the attributable governance plane). Deniability is defined against a judge and is **offline
-content repudiation**: no transferable proof of *who authored a message* survives, even given long-term
-secrets.
-
-### Per-entry-type signing (canonical; mirrors ADR-008)
-
-Confirmed by mpENC, which warns that signing content with static keys "destroys any chance … at
-retaining deniability … we can never regain it in a higher layer":
-- **Governance/structural entries are static-composite-signed (Ed25519+ML-DSA identity key) in ALL
-  modes:** genesis, admin delegations, consent grants, consent revocations, policy/passphrase-rotation
-  updates, **and the DGKA/DSKE setup entries** (§Concrete protocol; participation is attributable).
-  (Attributable; preserves ADR-007 single-writer consent integrity.)
-- **Message-content payloads** in a deniable channel are authenticated **only** by the per-author
-  ephemeral key below — never the static key.
-
-### Concrete protocol — Deniable GKA + DSKE (per-epoch), buildable rounds
-
-At each epoch (the passphrase/epoch boundary, ADR-006) the consenting member set runs a **4-round**
-deniable group key agreement + deniable signature-key exchange (DSKE), augmenting Bohli–Steinwandt
-deniable GKA. All four rounds' broadcasts are **governance/control-class log entries** (ADR-008,
-struct-type `dgka-setup`): they are **root-composite-signed**, so peers accept them under ADR-008's
-per-entry-type rule and *participation* in the epoch is attributable — which is exactly mpENC **weak
-deniability** (participation is never deniable; only message *content* is). The static signature is on
-the log envelope only; the key-agreement material *inside* carries no static signature, preserving
-content deniability. Let each member `i` hold an ephemeral DH share `x_i` and generate a **per-epoch
-ephemeral composite (Ed25519+ML-DSA-65) signing keypair** `(esk_i, epk_i)`:
-
-1. **Commit.** `i` broadcasts `commit_i = SHA-256("vox/dgka-commit/v1" ‖ epk_i ‖ g^{x_i} ‖ n_i)` with a
-   fresh 128-bit nonce `n_i`. (Commitments prevent adaptive key-choice.)
-2. **Reveal.** `i` broadcasts `(epk_i, g^{x_i}, n_i)`; everyone checks each `commit_i`. The group key is
-   `K = HKDF-SHA-256(ikm = BD-combine([g^{x_1}, …, g^{x_m}] sorted by author composite-pubkey),
-   info="vox/dgka/v1" ‖ channelID ‖ epoch)` — the Burmester–Desmedt/Bohli–Steinwandt combiner over the
-   ephemeral DH shares in **ascending-composite-pubkey order** (pinned so every member derives the *same*
-   `K`; the BD term order follows the standard published construction over that ordering). `K` is used
-   **only for epoch key-confirmation/binding (step 4), not as the content key**. It is a **deniable**
-   agreement: only ephemeral DH shares enter it, **no static signature on the key**. *(Note: `K` itself is
-   classical-DH; this is harmless because message **content** confidentiality is owned by the per-sender
-   Sender Keys (ADR-006), which are ML-KEM-768/PQXDH-distributed — see §Post-quantum instantiation. A
-   hybrid `K` is unnecessary since `K` only confirms the agreement.)*
-3. **DSKE bind.** Each `i` signs the transcript `T = SHA-256(epk_* ‖ g^{x_*} ‖ channelID ‖ epoch)`
-   — both lists in ascending author composite-pubkey order — with `esk_i` and broadcasts the signature,
-   proving knowledge of `esk_i` and binding `epk_i` to this session's transcript. This gives members
-   real **post-quantum origin authentication to each other** for the epoch's content.
-   **Honest deniability scope (important):** the `dgka-setup` envelope is root-signed (it must be an
-   accepted log entry, ADR-008), so it *is* transferable proof that identity `i` **participated** and
-   registered `epk_i` this epoch — consistent with mpENC **weak deniability** (participation is never
-   deniable). Consequently **live content authored under `esk_i` is attributable to `i` during the
-   epoch**; content-authorship repudiation is **retrospective**, taking effect at epoch end when `esk_i`
-   is published (step below), after which anyone could have forged it. This matches this ADR's scope —
-   *offline content repudiation against a later judge*, not live unlinkability. (The optional UDMVS
-   upgrade in §Post-quantum would add *live* non-transferability; not required for the threat model.)
-4. **Confirm.** Each `i` broadcasts `MAC_K(T)`; the session opens when all confirmations verify.
-
-Message content in the epoch is then signed with the author's `esk_i`. **At epoch end** — and only after
-the epoch has closed (a passphrase-rotation/epoch-increment is on the log; publishing earlier would void
-live authentication) — **each member publishes its ephemeral *private* key `esk_i`** as an
-`esk-publication` log entry (ADR-008 tag `0x0010`, root-signed envelope, body `{ epoch, esk_i }`). Anyone
-can then retroactively forge that epoch's content signatures → content authorship becomes repudiable (the
-deniability property), while *live* recipients got genuine PQ origin authentication during the epoch.
-
-### Per-sender consent is preserved (critical)
-
-The construction keeps **one ephemeral signing key per member** (public part shared), **not** a shared
-group signing secret. So the consent primitive survives unchanged in deniable mode: to consent, `A`
-releases `A`'s per-epoch ephemeral verifier (and the per-sender content key, ADR-006) to `N`; to
-withhold/revoke, `A` does not. `N` gains or loses **only `A`'s** content — exactly the per-sender,
-monotonic visibility of ADR-007. (A shared-group-secret design, e.g. a pure DGKE, would break this and
-is rejected for that reason.)
-
-### Mid-epoch membership change
-
-A member who joins (and is newly consented to, ADR-007) between passphrase-epochs does **not** reuse
-the prior epoch's (now-published, forgeable) keys. The **incremental DSKE re-key** is triggered by the
-consent-grant log entry naming the newcomer: each member that consented generates a fresh `(esk', epk')`,
-re-runs steps 3–4 (DSKE bind + confirm) against an updated transcript `T'` that includes the newcomer's
-`epk_new` (members in `T'` ordered by ascending composite-pubkey, the same sort rule as `T`), and
-distributes the result to the newcomer. The group key `K` (a confidentiality key, not an
-authenticator) may be retained for the epoch, or re-derived if the join changes the DH set. Cost: one
-incremental bind+confirm round per such join (bounded; the FS window for the new verifiers is one re-key
-interval). This is the concrete answer to "consent is continuous but the DGKA is per-epoch."
-
-### Fork / equivocation in deniable channels
-
-Because content authenticators are forgeable by any member, automated "freeze the equivocator" is
-**disabled** for deniable content (it would be a framing/DoS primitive — ADR-008). Vox uses mpENC's
-policy: a deniable-content fork raises a **non-attributable alarm** (causal-DAG inconsistency +
-TCP-style timeout warnings) surfaced for manual, out-of-band resolution, optionally hardened with
-GOTR-style deferred pairwise consistency checks. Governance forks remain attributable and auto-handled
-(they are static-signed, ADR-008).
-
-### Attributable mode (default)
-
-Content is signed with the root-cross-signed composite key — **non-repudiable to insiders and
-outsiders** (honest: it is *not* deniable). Used when intra-group accountability is wanted.
-
-### Post-quantum instantiation — deniable mode is PQ today
-
-Deniable mode is **fully post-quantum now**, with no dependency on any unshipped primitive:
-- **Live origin authentication is PQ.** The per-epoch ephemeral signing key is the **composite
-  Ed25519+ML-DSA-65** key (ADR-002/ADR-003), so content signatures verify under a PQ signature during
-  the epoch.
-- **Confidentiality is PQ.** Message *content* confidentiality is owned by the per-sender Sender Keys
-  (ADR-006), which are distributed over PQXDH (ML-KEM-768) — PQ independent of the DGKA. The DGKA's own
-  key `K` (used for epoch key-confirmation/binding, **not** as the content key) is a **classical
-  Burmester–Desmedt** agreement over the ephemeral DH shares (§Concrete protocol, step 2). This is
-  harmless: `K` never protects content (content confidentiality is the PQ Sender Keys above), it only
-  confirms the agreement, so a classical `K` introduces no harvest-now-decrypt-later exposure. (A hybrid
-  `K` mixing the members' pairwise PQXDH secrets was considered and rejected: those pairwise secrets are
-  not a common group input, so the combiner would not be computable by all members — step 2 is the
-  authoritative, computable construction.)
-- **Deniability is mechanism-based, not primitive-based.** Repudiation comes from **publishing the
-  ephemeral private key at epoch end** (anyone can then forge that epoch's content) — this needs no
-  special signature type, so there is no "classical-only until a PQ scheme ships" gap. Participation is
-  attributable by design (ADR-001/ADR-007), consistent with weak/content deniability.
-
-**Optional future strengthening (not required, via crypto-agility).** A post-quantum *designated-verifier*
-signature — **UDMVS** (lattice SIS/LWE universal designated-multi-verifier, ROM, ISPEC 2024) or a PQ
-**MDVRS** — would give **live non-transferability** so members need not wait for epoch-end key
-publication to obtain repudiation. It is an enhancement layered in through ADR-003 versioning without
-changing this mode's semantics; deniable mode ships complete without it. (Rejected as unfit for the
-group setting: **LaSDVS** single-verifier-only; **PSDVRS** discrete-log, not PQ.)
+1. **R43.** The code MUST NOT contain deniable mode: no deniable group key agreement, no deniable
+   authenticator, and no non-attributable fork alarm. *Status:* built.
+2. A genesis policy MUST keep the deniability slot in its wire layout, because a room's channelID is
+   the hash of the genesis bytes and dropping the slot would rename every existing room. The slot MUST
+   be written as `0`. A genesis carrying any other value MUST be refused, so a deniable room can be
+   neither created nor joined (`governance/genesis.rs`, `attributable_slot`). *Status:* built.
+3. A log entry's `auth_type` `2` (the removed deniable authenticator) MUST be refused like any unknown
+   type. *Status:* built (`log/entry.rs`, `decode_authenticator`).
+4. The ADR-008 struct tags `0x000B` (formerly `dgka-setup`) and `0x0010` (formerly `esk-publication`)
+   MUST stay reserved: a build MUST NOT write them, and they MUST NOT be reused. A frame carrying either
+   MUST be refused as an unknown struct tag (`UnknownStructTag`, sync wire error `0x03`).
+   *Status:* built (`wire.rs` marks both reserved).
 
 ## Consequences
 
-### Positive
-- One concrete, citable, buildable protocol (Van Gundy GKA+DSKE) — no families, no deferral.
-- Per-sender consent is provably preserved (per-author ephemeral keys), so the headline feature works
-  in deniable channels.
-- Clean split: governance attributable + auto-fork-handled; content deniable + alarm-only — the C1/C2
-  knot is resolved end-to-end with ADR-008.
+- No room is deniable. A message's authenticator is the author's composite signature (ADR-008), so
+  authorship and forks are attributable, to insiders and outsiders alike.
+- Every existing room keeps its channelID.
 
-### Negative
-- In-epoch message **unlinkability** is sacrificed (a member's content in one epoch shares an ephemeral
-  key) — acceptable, since intra-group linkage is already attributable; only outsider non-attribution
-  matters.
-- A multi-round deniable GKA + incremental re-key on each mid-epoch join is real protocol complexity and must be
-  formally analyzed before shipping (Van Gundy/mpENC give the template, not a drop-in library).
-- Deniable mode is PQ today (composite ephemeral keys + epoch-end publication); the *optional*
-  live-non-transferability upgrade (PQ designated-verifier, UDMVS/MDVRS) is a young primitive, so until
-  one is vetted, repudiation is obtained by key publication rather than a designated-verifier signature.
+## Related ADRs
 
-### Neutral
-- Per-channel choice (admin-set, ADR-007), attributable default.
+ADR-002, ADR-003, ADR-006, ADR-007, ADR-008 (the log and its struct tags), ADR-014.
 
-## Implementation notes (M7)
+## Design record (non-normative)
 
-These record the concrete decisions made building this ADR (`crates/vox-core/src/deniable/`), so the spec and code stay in lockstep. **The code is the normative source for the formulas below**; an independent implementation must match these bytes, not the prose above:
+The withdrawn design, kept as R43 requires. Nothing in this section binds the code.
 
-- **Commitment** `= SHA-256("vox/dgka-commit/v1" ‖ author_pubkey ‖ epk ‖ z ‖ n16)` — the author's
-  static public key is included (the Decision's formula omits it; including it is the stronger binding).
-- **Transcript** `T = SHA-256("vox/dgka-transcript/v1" ‖ cid ‖ epoch_le64 ‖ epk_1..m ‖ z_1..m)` with
-  members sorted by ascending `author_pubkey` bytes (not fingerprint); the DSKE binding signature is
-  over `T_bind = SHA-256(T ‖ X_1..m)` (the round-2 values are bound too), and the confirmation is
-  `HMAC-SHA-256(K_confirm, T_bind)` with `K_confirm = HKDF(K, "vox/dgka-confirm/v1" ‖ cid ‖ epoch_le)`
-  — a derived sub-key, not `K` itself. `K = HKDF(compressed BD point, info = "vox/dgka/v1" ‖ cid ‖
-  epoch_le)`.
-- **The reveal is static-signed.** Each member's `(epk_i, z_i)` is signed by its identity root under
-  `vox/dgka-setup/v1 ‖ CBOR[cid, epoch, author_id, epk, z]`. This contradicts the Decision's "the
-  key-agreement material inside carries no static signature" sentence but is security-consistent
-  with its own "participation is attributable anyway" paragraph: without it a `(victim_id,
-  attacker_epk)` substitution is possible. The signature binds identity to the ephemeral key; content
-  authorship remains deniable because content is signed only by the per-epoch ephemeral key.
-- **Two-party case.** Burmester–Desmedt with `n = 2` degenerates to plain ECDH on the two shares; the
-  code takes that path explicitly.
-- **Verifier.** `EpochVerifier` implements the ADR-008 `DeniableVerifier` seam and keys on the exact
-  `(channel_id, epoch, author_id)` triple — it never scans other epochs. Epoch-end `esk` publication
-  (tag `0x0010`) is refused unless `publishing_epoch < current_epoch`, on build and on receive.
-- **Known gaps / shipping blockers (recorded 2026-09-19; (2) closed 2026-09-21).** (1) **The formal
-  analysis of the DGKA+DSKE construction the Decision requires before shipping is not on file** —
-  deniable mode must not be enabled in a shipped build until it is (the module docs say the same).
-  (2) **PARTLY closed 2026-09-21; reopened the same day by review — see below.** `deniable::wire::DgkaMessage` is the `dgka-setup` (`0x000B`) codec: one
-  struct tag, four rounds told apart by a leading discriminant, each a fixed-arity canonical CBOR body
-  (`COMMIT` 3, `REVEAL` 7, `CONFIRM` 5, `REKEY` 7). The round-3 `X_i` broadcast travels in `CONFIRM`
-  alongside the DSKE bind and the confirmation MAC. The codec decides nothing — it does not check a
-  commitment against a reveal, verify a signature, or order rounds; that stays with `DgkaMember`,
-  which holds the state a decision needs. The reveal's static signature covers the `dgka-setup`
-  *signing input*, not the frame, so re-framing cannot change what was signed and a reveal lifted into
-  another channel or epoch does not verify. **Every** DGKA round in the M7 suite is now carried through
-  this codec rather than handed over in-process, so a field it drops or reorders fails those tests —
-  mutation-checked on both a `REVEAL` field and a `REKEY` field swap.
+- **Scope:** weak (content) deniability, after mpENC: message contents deniable, participation not.
+  Repudiation was retrospective: offline, against a later judge, not live unlinkability.
+- **Signing:** governance and structural entries, including the setup rounds, were static
+  composite-signed in every mode. Content in a deniable channel was signed only with a per-epoch,
+  per-member ephemeral composite (Ed25519+ML-DSA-65) key `esk_i`.
+- **Setup:** a 4-round deniable group key agreement plus signature-key exchange, after Van Gundy and
+  Bohli–Steinwandt, carried as `dgka-setup` (`0x000B`) entries:
+  1. commit: `SHA-256("vox/dgka-commit/v1" ‖ author_pubkey ‖ epk ‖ z ‖ n16)`;
+  2. reveal: `(epk_i, z_i)`, statically signed over `vox/dgka-setup/v1 ‖ CBOR[cid, epoch, author_id, epk, z]`;
+  3. bind: each member signed `T_bind = SHA-256(T ‖ X_1..m)` with `esk_i`;
+  4. confirm: `HMAC-SHA-256(K_confirm, T_bind)`.
 
-  **Reopened the same day.** An independent review (`gpt-6-astra` via `codex exec`, 2026-09-21) showed
-  the codec still cannot drive a real exchange, and it is right: `finalize` requires the **full** `X_*`
-  map before it can produce any `Confirm`, and the only wire carrier of `X_i` **is** `Confirm`. Over a
-  log nobody can produce a confirm until everybody already has — a deadlock. The M7 tests do not hit it
-  because they gather `own_round2()` in-process, which is precisely the shortcut the codec existed to
-  remove. So the claim "deniable mode can travel on a log" was **false**; what shipped is four
-  well-formed message encodings, not a runnable protocol. A standalone round-3 `X_i` broadcast is
-  required, and until it exists blocker (2) stays open. (3) Re-key regenerates all shares and always
-  re-derives `K'`, skips the commitment round (its shares are not protected against adaptive
-  choice), carries no static reveal signature on the wire, and uses the unverified context
-  constructor — identity binding on re-key rests on the caller sourcing descriptors from root-signed
-  entries. **Found 2026-09-21 while closing (2): `begin_rekey` and `ReKeyParticipant` had no caller
-  and no test anywhere in the workspace — the re-key path had never executed.** It now runs in
-  `rekey_round_trips_through_the_dgka_setup_codec_and_every_member_agrees`: three members re-key,
-  agree on `K'`, and verify one another's `ReKey` after a wire round trip. That exercises the path; it
-  does **not** harden it, and this gap stays open until the commitment round and the static reveal
-  signature are there. (4) Epoch-closed gating relies on a caller-supplied `current_epoch`, not log state. (5) The
-  optional GOTR-style deferred consistency checks are not present. Test-vector obligation: no pinned
-  K / T / T_bind / commit / MAC vectors exist yet.
-
-## Links
-**Depends on**: ADR-002, ADR-003, ADR-006, ADR-007, ADR-008.
-- Depended on by: ADR-014.
+  `K` was a classical Burmester–Desmedt key over ristretto255 shares in ascending author-pubkey order,
+  through HKDF with `info = "vox/dgka/v1" ‖ cid ‖ epoch_le`. It only confirmed the agreement. Content
+  confidentiality stayed with the PQ sender keys (ADR-006).
+- **Repudiation:** at epoch end, after the epoch had closed, each member published `esk_i` as an
+  `esk-publication` (`0x0010`) entry, after which anyone could forge that epoch's content.
+- **Consent:** one ephemeral key per member, not a shared group secret, so ADR-007's per-sender consent
+  held unchanged.
+- **Mid-epoch join:** the consent grant naming the newcomer triggered a fresh `(esk', epk')` and a
+  re-run of bind and confirm.
+- **Forks:** automatic freezing was disabled for deniable content, because it would have been a
+  framing primitive. A content fork raised a non-attributable alarm. Governance forks stayed
+  attributable.
 
 ## Engineering Mantra
 

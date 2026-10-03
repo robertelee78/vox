@@ -42,6 +42,9 @@ pub struct ChannelSummary {
     pub open: bool,
     /// Number of accepted log entries (0 while closed).
     pub entries: u64,
+    /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
+    /// or it ended. `None` while it is going on, and while it is closed.
+    pub over: Option<String>,
 }
 
 /// A rendered, render-gated message.
@@ -59,7 +62,21 @@ pub struct MessageRow {
     pub created_millis: u64,
     /// The text.
     pub text: String,
+    /// When this node rendered it, as a number that only grows; local, and not the
+    /// room's order ([`crate::node::channel::Rendered::arrival`]).
+    pub arrival: u64,
+    /// It took its place above a row this node had already shown: it arrived late
+    /// (ADR-023 decision 1).
+    pub late: bool,
+    /// **Not received yet** (V030-10): this node holds the message's signed envelope and is still
+    /// asking for its body, which has not expired here. `text` is empty and `arrival` is `0`, so a
+    /// read from a cursor never yields it; the message replaces it when the body arrives.
+    pub owed: bool,
 }
+
+/// What a person is shown in place of a message whose body is owed ([`MessageRow::owed`],
+/// V030-10).
+pub const NOT_RECEIVED_YET: &str = "(not received yet)";
 
 /// Rows the view carries, oldest first, in shared chunks (V210-120): a room's timeline, and the
 /// positions of its structured posts.
@@ -426,17 +443,47 @@ pub struct ChannelDetail {
     /// IPC read page takes one — used to copy every room's whole timeline (V210-71); and a new
     /// message adds its row without rebuilding the rest (V210-120).
     pub timeline: Timeline,
+    /// Every entry this node holds for the channel, readable or not, in the room's one
+    /// order (PRD-001 R13), each with the clock that placed it (ms). `timeline` is this
+    /// sequence restricted to rendered rows.
+    pub order: Vec<(Digest32, u64)>,
     /// Where its structured posts sit in `timeline`, by `type` (V210-120).
     pub structured: StructuredIndex,
     /// The services this node offers in this channel: `(service_tag, local address)`
     /// in tag order (ADR-013 Bind config — host configuration, not authorization).
     pub services: Vec<(String, std::net::SocketAddr)>,
+    /// The services shared in this channel by every member, as its log says (V030-25).
+    pub shares: Vec<crate::node::channel::Share>,
+    /// Whether this node has completed the room's first sync since joining it (V210-164): until
+    /// then its log may not yet hold what the room's members have written, shares included.
+    pub synced: bool,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
+    /// The room's genesis creator, its root admin (ADR-007).
+    pub creator: Digest32,
     /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
     /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
     pub consented: Vec<Digest32>,
+    /// The room's admins, its creator first (V030-08): who may end it.
+    pub admins: Vec<Digest32>,
+    /// The other members that consent to this identity reading them here, in fingerprint order:
+    /// the inbound half of `consented`, off the log the same way (V030-17).
+    pub consenting: Vec<Digest32>,
+    /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
+    /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
+    /// so a reader never has to take the room's lock, which a sync session holds while it runs.
+    pub retention: u64,
+    /// How many generations of this node's own sender key it still holds here (PRD-001 R14).
+    pub key_generations: usize,
+    /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
+    /// receiving side).
+    pub received_key_generations: usize,
+    /// Authors this node froze here for signing two entries at one position (ADR-008).
+    pub frozen: Vec<Digest32>,
+    /// Entries this node refused here as at or below their author's checkpoint since it opened
+    /// the room (ADR-023 decision 3).
+    pub refused_below_checkpoint: u64,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -516,17 +563,10 @@ pub struct AnchoredChannel {
     pub members: usize,
     /// Joiners with a live pre-join announcement.
     pub pending: usize,
-    /// Entries in the ciphertext copy of the log this node keeps for the channel
-    /// (`None` when it keeps none — a client's board, or an anchor not yet caught up).
-    pub entries: Option<u64>,
     /// The address each member's live record on this board names, as the board would hand it to
     /// any member asking where that member is (V210-51, #230): what `vox node` prints so an
     /// operator — and a proof — can see which of a member's processes the board points at.
     pub holding: Vec<(Digest32, Vec<String>)>,
-    /// The members this node's copy of the room holds back for equivocating (V210-66): each
-    /// `(author, seq)` where it saw two different messages signed by that author. Empty where it
-    /// keeps no copy.
-    pub equivocations: Vec<(Digest32, u64)>,
 }
 
 /// A command from a client to the node.
@@ -585,11 +625,35 @@ pub enum NodeCommand {
         /// The channelID.
         channel_id: Digest32,
     },
-    /// Leave an open room (V210-164): say so in the room, and once another member has it,
-    /// remove the room from this node.
-    LeaveChannel {
+    /// Leave a room (V210-164): say so in the room, and once another member has that, delete
+    /// the room from this node (the decider, 2026-10-03: "leave deletes it"). Answered then, or
+    /// with [`Fault::LeaveNotHeard`] when no member took it within 30 s; the room goes once one
+    /// does.
+    LeaveRoom {
         /// The channelID.
         channel_id: Digest32,
+    },
+    /// Make a member an admin of a room, or take it back (V030-08). Only its creator may.
+    SetAdmin {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The member.
+        member: Digest32,
+        /// `true` to add, `false` to remove.
+        admin: bool,
+    },
+    /// End a room for everyone (V030-08). Only its creator may.
+    EndRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Choose a room's idle end (V030-08): it ends after `idle_secs` with nothing said in it.
+    /// Only its creator may; `vox room create --idle-end` is where it does.
+    ChooseIdleEnd {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The idle end, in seconds (more than 0).
+        idle_secs: u64,
     },
     /// Author a text message in an open channel.
     SendText {
@@ -628,6 +692,26 @@ pub enum NodeCommand {
         /// What this node will call it. Local; nothing is registered.
         petname: String,
     },
+    /// Rename an identity already trusted, keeping its history grant (PRD-001 R12). Fails
+    /// with [`Fault::NotConsented`] for an identity that is not trusted.
+    Rename {
+        /// The trusted identity.
+        fingerprint: Digest32,
+        /// Its new petname.
+        petname: String,
+    },
+    /// [`NodeCommand::Trust`], choosing what each consent releases of **this node's own**
+    /// messages (PRD-001 R12): [`HistoryGrant::Now`](crate::node::trust::HistoryGrant),
+    /// the default, or `Full` — every generation of this node's sender key still held,
+    /// at its origin, so the newcomer reads what was written before the approval too.
+    TrustWith {
+        /// The identity to trust.
+        fingerprint: Digest32,
+        /// What this node will call it. Local; nothing is registered.
+        petname: String,
+        /// What its consents release.
+        history: crate::node::trust::HistoryGrant,
+    },
     /// Stop trusting an identity node-wide, and **change the lock** (ADR-020 §3).
     ///
     /// Removes the ring entry, then rotates this identity's sender key and re-keys
@@ -646,11 +730,11 @@ pub enum NodeCommand {
     /// Create a **service room** and offer one local TCP service in it, in one act
     /// (ADR-017 decisions 3 and 4) — what `vox serve <port>` does.
     ///
-    /// The room's genesis confers `dial:<port>` on every member, so joining it *is* the
-    /// authorization and the host never waits to grant anyone anything; the service is
-    /// declared in the same step, because a room created for a service that does not
-    /// exist yet is a room that lies. Nothing is exposed implicitly: the port named here
-    /// is the only thing reachable, and only by members.
+    /// The room's genesis confers nothing (PRD-001 R44): who may reach the service is the
+    /// host's own dial gate, its trust keyring and the room's current authors. The service is
+    /// declared in the same step, because a room created for a service that does not exist
+    /// yet is a room that lies. Nothing is exposed implicitly: the port named here is the
+    /// only thing reachable, and only by members the host trusts.
     ///
     /// Fails without creating anything if the room cannot be created *or* the service
     /// cannot be offered — a half-made service room would hand out an address for
@@ -661,9 +745,14 @@ pub enum NodeCommand {
         /// The room passphrase — machine-generated by the caller
         /// ([`crate::node::passphrase::generate`]), never chosen.
         passphrase: Secret,
-        /// The service's port, which is also its tag (ADR-017: the port names the
-        /// service).
+        /// The service's name, as its sharer gives it (V030-25): the `<service>` of
+        /// `<service>.<node>.<room>.vox`, and the tag the host's gate looks it up by.
+        name: String,
+        /// The service's port: where it listens on this machine unless `at` says otherwise.
         port: u16,
+        /// Whether the service is UDP: served as `udp/<name>` rather than `<name>`
+        /// (ADR-022 decision 6). Its address is the same either way.
+        udp: bool,
         /// The local endpoint to carry connections to. Defaults to
         /// `127.0.0.1:<port>` — the same port, which is the case worth optimising.
         at: Option<std::net::SocketAddr>,
@@ -722,6 +811,15 @@ pub enum NodeCommand {
     StopForward {
         /// The local address the forward is listening on.
         local: std::net::SocketAddr,
+    },
+    /// Set a room's retention (PRD-001 R7, ADR-023 decision 2): `ttl` seconds, `0` for
+    /// forever, as an ADR-007 policy-update. Only the room's admin may; it applies to what is
+    /// already stored.
+    SetRetention {
+        /// The channel.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
     },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
@@ -874,15 +972,43 @@ pub enum Fault {
     /// A leave was written, but no other member of the room took it within the wait: the room
     /// is held until one does (V210-164).
     LeaveNotHeard,
-    /// A leave was overtaken: this node wrote in the room after it, so it is in the room again
-    /// (V210-164).
+    /// A leave was overtaken: this node wrote in the room after it, or joined it again, so it is
+    /// in the room again (V210-164).
     LeaveUndone,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
+    /// The change is the room admin's to make — a holder of the `policy` capability — and
+    /// this identity is not one (PRD-001 R7: setting a room's retention).
+    NotAdmin,
+    /// A member who is not the room's creator or an admin asked to keep the room's messages
+    /// **longer** than the room does (V030-32). A member may set a shorter retention, which
+    /// governs only their own node; never a longer one.
+    AboveRoomRetention,
+    /// The room is over: its creator ended it, or its idle end ran out (V030-08). It takes no
+    /// new message.
+    RoomEnded,
+    /// Only the room's creator may do that — end the room (or an admin it delegated), or choose
+    /// its idle end (V030-08).
+    NotCreator,
+    /// Only the room's creator adds or removes an admin (#319); an admin may not.
+    NotRoomCreator,
+    /// The member named is not an admin of the room, so there is no admin to take back (V030-08).
+    NotAnAdmin,
+    /// A join reached a room that has ended (V030-08): a member said so before checking anything,
+    /// or a board that took the room off at its end did (V030-14).
+    JoinedRoomEnded,
+    /// The member a join reached has left the room (V030-08), so it answers no join for it.
+    ResponderLeft,
+    /// The room's stored log was written by vox before v0.3.0, whose message format changed;
+    /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
+    RoomFromBeforeV030,
     /// A service removal named a tag this room does not offer. Not [`Fault::UnknownChannel`],
     /// which said "no such room in this profile" about a room that was right there (V210-83).
     NotOffered,
+    /// A share named a service this node already shares in the room under that name (V030-25):
+    /// names are unique per node per room, because the name is the address.
+    NameTaken,
     /// A forward was to be stopped at a local address where no forward is listening. Not
     /// [`Fault::UnknownChannel`] either: no room was named at all (V210-83).
     NoSuchForward,
@@ -898,8 +1024,6 @@ impl Fault {
     /// What this fault means to a person, and what to do about it, in the house style: one
     /// short line saying what happened, then indented lines saying what to do.
     ///
-    // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
-    const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
     // `Fault::PassphraseNeeded`'s explanation names the window in words.
@@ -930,8 +1054,16 @@ impl Fault {
                 "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
             }
             Fault::TooLong => "that is longer than this field allows",
+            // The cap in force, read once (#85): a test build's lowered cap is never called 1,024.
             Fault::KeyringFull => {
-                "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
+                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                TEXT.get_or_init(|| {
+                    format!(
+                        "your trust keyring is full ({} identities)\n       remove one with \
+                         `vox trust remove <fingerprint>`, then add again",
+                        crate::node::trust::trust_cap_words()
+                    )
+                })
             }
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
@@ -1008,14 +1140,44 @@ impl Fault {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
             }
             Fault::NotAServiceRoom => {
-                "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+                "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service by its address, `vox forward <service>.<node>.<room>.vox`"
+            }
+            Fault::AboveRoomRetention => {
+                "a member may keep this room's messages for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"
+            }
+            Fault::NotAdmin => {
+                "only the room's admin may change that, and this identity is not its admin\n       the room's creator and the admins it named are; `vox room admin list` shows who"
+            }
+            Fault::RoomEnded => {
+                "this room has ended — its creator or an admin ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       this node deletes it once it has passed the end on"
+            }
+            Fault::NotCreator => {
+                "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
+            }
+            Fault::JoinedRoomEnded => {
+                "that room has ended — a member or its board said so — so it takes nobody in\n       your passphrase was never checked; the room is over, not your access to it"
+            }
+            Fault::ResponderLeft => {
+                "the member that answered has left that room, so it lets nobody in\n       your passphrase was never checked; ask a member still in the room for an address"
+            }
+            Fault::NotRoomCreator => {
+                "only the room's creator adds or removes an admin, and this identity did not create the room"
+            }
+            Fault::NotAnAdmin => {
+                "that member is not an admin of the room\n       `vox room admin list` shows who is"
+            }
+            Fault::RoomFromBeforeV030 => {
+                "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
             }
             Fault::NotOffered => {
                 "that service is not offered in this room\n       check its name: it is the tag that was given to `vox service add`"
             }
+            Fault::NameTaken => {
+                "you already share a service under that name in this room\n       choose another name, or `vox service remove` the one you share first"
+            }
             Fault::NoSuchForward => "no forward is listening at that local address",
             Fault::TunnelLimit => {
-                "16 tunnels are already open to this member\n       to free one: close the program using it, or restart the `vox up` or `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member\n       `vox status` lists every tunnel, and when each last moved"
+                "16 tunnels are already open to this member\n       to free one: `vox tunnel close` it (`vox status` lists every tunnel, its number, and when it last moved), close the program using it, or restart the `vox up` or `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member"
             }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
@@ -1099,7 +1261,17 @@ fault_names!(
     LeaveUndone,
     NotAServiceRoom,
     NotOffered,
+    NameTaken,
     NoSuchForward,
+    NotAdmin,
+    AboveRoomRetention,
+    RoomFromBeforeV030,
+    RoomEnded,
+    NotCreator,
+    NotAnAdmin,
+    NotRoomCreator,
+    JoinedRoomEnded,
+    ResponderLeft,
     TunnelLimit,
     Internal,
 );
@@ -1116,6 +1288,16 @@ pub enum Outcome {
     /// refused (`connecting to the forward: Connection refused`), while the other forward was
     /// never stopped at all.
     Bound(std::net::SocketAddr),
+    /// A member who is not the room's creator or an admin set their **own** node's retention
+    /// for a room, at or below the room's (V030-32): `own` seconds here, while the room keeps
+    /// `room` (`0` = forever). It changes nothing on any other node. `own == room` means the
+    /// member's own line was cleared: their node follows the room's retention again.
+    OwnRetention {
+        /// This node's retention for the room now, seconds.
+        own: u64,
+        /// The room's retention, seconds (`0` = forever).
+        room: u64,
+    },
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -1145,7 +1327,10 @@ impl Outcome {
     /// Whether the command succeeded.
     #[must_use]
     pub fn is_done(self) -> bool {
-        matches!(self, Outcome::Done | Outcome::Bound(_))
+        matches!(
+            self,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. }
+        )
     }
 }
 
@@ -1154,6 +1339,10 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Done => f.write_str("done"),
             Outcome::Bound(local) => write!(f, "bound at {local}"),
+            Outcome::OwnRetention { own, room } => write!(
+                f,
+                "this node keeps the room's messages for {own} s; the room keeps them for {room} s"
+            ),
             Outcome::Failed(fault) => f.write_str(fault.explain()),
         }
     }
@@ -1189,6 +1378,23 @@ pub enum NodeEvent {
     /// A channel was closed.
     ChannelClosed {
         /// The channel.
+        channel_id: Digest32,
+    },
+    /// A room this node holds ended, and the end has been passed on (V030-08): `handed` of
+    /// `members` members were synced with after it; the rest learn it from them, or from an
+    /// anchor. The room is deleted from this node next ([`NodeEvent::RoomRemoved`]).
+    RoomEnded {
+        /// The room.
+        channel_id: Digest32,
+        /// Members synced with after the end.
+        handed: usize,
+        /// Members it had to pass it to.
+        members: usize,
+    },
+    /// Everything this node held of a room was deleted: it left the room (V210-164), or the
+    /// room ended (the decider, 2026-10-03).
+    RoomRemoved {
+        /// The room.
         channel_id: Digest32,
     },
     /// A peer completed an ADR-005 join against this node, which verified its
@@ -1298,6 +1504,17 @@ pub enum NodeEvent {
         /// Which record it was, and which board (`our address (board …)`).
         what: String,
     },
+    /// This node's own `retention` file asks to keep a room's messages for longer than the room
+    /// does (V030-32). A node may keep less than its room, never more, so the room's value is the
+    /// one in force: said once, so its operator knows the file line has no effect.
+    RetentionAboveRoom {
+        /// The room.
+        channel_id: Digest32,
+        /// What the node's file asks for, seconds.
+        node: u64,
+        /// What the room keeps, seconds.
+        room: u64,
+    },
     /// What happened to a connection to `peer`, said so a failure that recurs names itself (#229,
     /// after #232's CI reds): a newcomer that lost the one-connection-per-peer tie-break, a
     /// retired connection closed, an anchor connection lost or redialled, a reach that waited for
@@ -1382,6 +1599,13 @@ pub enum NodeEvent {
     /// `reach_host_with_patience` had deliberately kept — died in a dropped `Result`.
     ProxyRefused {
         /// What went wrong, as this node saw it.
+        reason: String,
+    },
+    /// A tunnel this node carried was **closed on purpose** (V030-11): by a person here or at
+    /// the other end (`vox tunnel close`, the TUI), or as stuck. Not [`NodeEvent::ProxyRefused`]:
+    /// "refused or cut" read a deliberate close as a fault.
+    TunnelClosed {
+        /// Which session, by which end, and why.
         reason: String,
     },
     /// A dial this node started in the background failed, with what it reported.

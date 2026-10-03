@@ -79,6 +79,12 @@ pub async fn load_names(client: &mut IpcClient) {
     }
 }
 
+/// This node, as [`load_names`] read it, or `None` before it has.
+#[must_use]
+pub fn me() -> Option<&'static Digest32> {
+    ME.get()
+}
+
 /// The names [`load_names`] read, or none.
 #[must_use]
 pub fn names() -> &'static [(Digest32, String)] {

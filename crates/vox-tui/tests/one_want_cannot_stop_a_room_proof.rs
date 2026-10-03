@@ -138,10 +138,28 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     )
 }
 
+/// How a timed verb ended, for a red to quote.
+#[derive(Debug)]
+enum Ended {
+    /// It exited, successfully or not, with this status.
+    Exited(std::process::ExitStatus),
+    /// It was still running at the cap and was killed.
+    Killed,
+}
+
+impl std::fmt::Display for Ended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ended::Exited(st) => write!(f, "it exited with {st}"),
+            Ended::Killed => write!(f, "it had not returned when it was killed at the cap"),
+        }
+    }
+}
+
 /// Run a one-shot `vox` verb, killing it (by PID) if it has not finished in `cap`. Returns
-/// whether it succeeded, how long it ran, and what it printed. A verb still running at `cap`
-/// is reported as a failure with its elapsed time, never waited on for ever.
-fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, String) {
+/// whether it succeeded, how long it ran, how it ended, and what it printed. A verb still
+/// running at `cap` is reported as a failure with its elapsed time, never waited on for ever.
+fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Ended, String) {
     let out_file = data.join(format!("timed-{}.out", std::process::id()));
     let t0 = Instant::now();
     let mut child = Command::new(VOX)
@@ -162,21 +180,23 @@ fn vox_timed(data: &Path, argv: &[&str], cap: Duration) -> (bool, Duration, Stri
         ))
         .spawn()
         .expect("APPARATUS: spawn vox");
-    let ok = loop {
+    let ended = loop {
         if let Some(status) = child.try_wait().expect("APPARATUS: wait for vox") {
-            break status.success();
+            break Ended::Exited(status);
         }
         if t0.elapsed() >= cap {
             let _ = child.kill();
             let _ = child.wait();
-            break false;
+            break Ended::Killed;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
     let took = t0.elapsed();
+    let ok = matches!(&ended, Ended::Exited(st) if st.success());
     (
         ok,
         took,
+        ended,
         std::fs::read_to_string(&out_file).unwrap_or_default(),
     )
 }
@@ -277,10 +297,12 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         &args(&["node", "--listen", "127.0.0.1:0"]),
     );
     let spec = anchor
-        .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
+        .expect_line("PRODUCT (staging): the anchor's spec", |l| {
+            l.contains("@/ip4/127.0.0.1/udp/")
+        })
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .expect("PRODUCT: the anchor's spec line holds no dialable spec")
+        .expect("PRODUCT (staging): the anchor's spec line holds no spec")
         .to_owned();
     let victim_id = fingerprint(&victim_dir);
     let _ = fingerprint(&mallory_dir);
@@ -293,7 +315,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         &["room", "create", "--passphrase-file", "-", "--name", "team"],
         ROOM_PASS,
     );
-    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}\n{err}");
     let (_, list, _) = vox_once(&victim_dir, &args(&["room", "list"]));
     let prefix = list
         .split_whitespace()
@@ -303,7 +325,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     // The product's baseline: each staging post must answer inside the bound, with no attack.
     let mut quiet = Duration::ZERO;
     for i in 1..=HELD {
-        let (ok, took, said) = vox_timed(
+        let (ok, took, ended, said) = vox_timed(
             &victim_dir,
             &["room", "post", &prefix, &format!("held {i}")],
             PATIENCE * 6,
@@ -313,7 +335,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
             &format!("staging post {i}, with no attack at all,"),
             ok,
             took,
-            &said,
+            &format!("`vox room post`: {ended}, printing {said:?}"),
         );
         quiet = quiet.max(took);
     }
@@ -450,8 +472,9 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
 
     // ---- 2. the room still works --------------------------------------------------------
     let text = "posted while the WANT was being served";
-    let (ok, took, said) = vox_timed(&victim_dir, &["room", "post", &room, text], PATIENCE * 6);
-    println!("[proof] post during the attack: ok={ok} in {took:?} (quiet {quiet:?})");
+    let (ok, took, ended, said) =
+        vox_timed(&victim_dir, &["room", "post", &room, text], PATIENCE * 6);
+    println!("[proof] post during the attack: ok={ok} in {took:?}; {ended} (quiet {quiet:?})");
     within_patience(
         "PRODUCT",
         &format!(
@@ -460,11 +483,11 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         ),
         ok,
         took,
-        &said,
+        &format!("`vox room post`: {ended}, printing {said:?}"),
     );
-    let (ok, t, read) = vox_timed(&victim_dir, &["room", "read", &room], PATIENCE * 6);
+    let (ok, t, ended, read) = vox_timed(&victim_dir, &["room", "read", &room], PATIENCE * 6);
     println!(
-        "[proof] read: ok={ok} in {t:?}, shows the post: {}",
+        "[proof] read: ok={ok} in {t:?}; {ended}; shows the post: {}",
         read.contains(text)
     );
     within_patience(
@@ -472,7 +495,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         "the victim's `vox room read` during the attack",
         ok,
         t,
-        &read,
+        &format!("`vox room read`: {ended}, printing {read:?}"),
     );
     assert!(
         read.contains(text),

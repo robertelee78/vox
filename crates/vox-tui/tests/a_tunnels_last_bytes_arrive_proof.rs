@@ -231,7 +231,7 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         &host_dir,
         &args(&[
             "serve",
-            &backend.to_string(),
+            &format!("{backend}={backend}"),
             "--anchor",
             &anchor.v4_spec,
             "--listen",
@@ -288,12 +288,8 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         &guest_dir,
         &args(&[
             "forward",
-            &room,
-            host_fp.trim(),
-            &backend.to_string(),
+            &format!("{backend}.{}.{room}.vox", host_fp.trim()),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &pass_file,
             "--anchor",
             &anchor.v6_spec,
             "--listen",

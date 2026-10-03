@@ -55,10 +55,16 @@ pub struct MessageView {
     pub author: Digest32,
     /// The author's local nickname.
     pub author_nick: String,
+    /// Who an addressed message is to, as this node names each (PRD-001 R15): `to you, bob`,
+    /// or empty for a message to the whole room.
+    pub addressed: String,
     /// Wall-clock send time (epoch-seconds) as recorded in the entry.
     pub timestamp: u64,
     /// The rendered body if decryptable to you, else `None` (shown as a marker).
     pub body: Option<String>,
+    /// It arrived after rows below it had already been shown: a member who was offline,
+    /// or a sync that caught up (ADR-023 decision 1). Shown in its true place, marked.
+    pub late: bool,
 }
 
 impl MessageView {
@@ -114,6 +120,9 @@ pub struct ChannelView {
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
+    /// The services shared in the room (V030-25), each as `<address> by <who>`: its address in
+    /// this operator's own aliases (fingerprints where it has none), and who shared it.
+    pub shared: Vec<String>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }
@@ -154,6 +163,10 @@ pub struct ViewModel {
     /// material (ADR-015's rule for the status channel), and never free-form text
     /// derived from a message.
     pub notice: Option<String>,
+    /// Every live tunnel, as `vox status` lists them (V030-11).
+    pub tunnels: Vec<vox_core::transport::quic::LiveTunnel>,
+    /// The tunnels that ended for a reason a person should see, with that reason (V030-11).
+    pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
 }
 
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline
@@ -206,6 +219,8 @@ pub enum UiError {
     KeyringFull,
     /// Persisting to the store failed; reopen the channel.
     Storage,
+    /// The tunnel to close is no longer open (V030-11).
+    NoSuchTunnel,
     /// The other side refused: the channel passphrase is wrong, or it is not
     /// accepting joins for that channel. Deliberately coarse — the responder does not
     /// say which, so neither does this (ADR-005).
@@ -224,6 +239,17 @@ pub enum UiError {
     BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
+    /// The room has ended: it takes no new message (V030-08).
+    RoomEnded,
+    /// No other member could be told of the leave within 30 s; the node leaves once one can
+    /// (V210-164).
+    LeaveNotHeard,
+    /// Something was written in the room after the leave, so this node is in it again (V210-164).
+    LeaveUndone,
+    /// Only the room's creator, or an admin it delegated, may do that (V030-08).
+    NotCreator,
+    /// The room was joined a moment ago and is still being read (V030-08).
+    StillJoining,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -278,10 +304,20 @@ impl UiError {
             UiError::Locked => "locked — :unlock",
             UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
-            UiError::KeyringFull => "your trust keyring is full (1,024) — remove one first",
+            // The cap in force (#85), as `Fault::KeyringFull` names it.
+            UiError::KeyringFull => {
+                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                TEXT.get_or_init(|| {
+                    format!(
+                        "your trust keyring is full ({}) — remove one first",
+                        vox_core::node::trust::trust_cap_words()
+                    )
+                })
+            }
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
+            UiError::NoSuchTunnel => "that tunnel is no longer open",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
             UiError::AddressInUse => {
@@ -292,6 +328,15 @@ impl UiError {
             }
             UiError::BindFailed => "the --listen address could not be listened on",
             UiError::AlreadyMember => "you already hold that room — it is in your list",
+            UiError::RoomEnded => {
+                "this room has ended — it takes no new message, and this node deletes it soon"
+            }
+            UiError::LeaveNotHeard => {
+                "no other member could be told within 30s — the room goes once one can be"
+            }
+            UiError::LeaveUndone => "something was written here after :leave — you are in the room again",
+            UiError::NotCreator => "only the room's creator, or an admin it delegated, may end it",
+            UiError::StillJoining => "joined a moment ago and still reading the room — try again",
             UiError::Internal => "internal error",
         }
     }
@@ -364,6 +409,22 @@ pub enum Command {
     CloseChannel {
         /// The channelID.
         channel_id: Digest32,
+    },
+    /// Leave a room (V210-164): the other members are told, then the room is deleted here.
+    LeaveRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// End a room for everyone (V030-08); its creator only.
+    EndRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Close one live tunnel, by its number (V030-11). Nobody is untrusted and no service
+    /// removed; its far end is told it was closed.
+    CloseTunnel {
+        /// The tunnel's number ([`vox_core::transport::quic::LiveTunnel::id`]).
+        id: u64,
     },
     /// The UI's active channel changed (`None` = back at the channel list); the
     /// core projects `ViewModel::active` and unread counts from it.

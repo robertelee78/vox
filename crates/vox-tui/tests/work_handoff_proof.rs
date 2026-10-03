@@ -24,14 +24,15 @@
 //! 4. a decline frees the item — it does **not** return to the sender — and a fresh
 //!    claim by a third session then succeeds;
 //! 5. a handoff of a claim that had **no TTL** still lapses at its own deadline;
-//! 6. **the same rows logged in different orders fold to the same board.** Each node logs
-//!    its own post when it is made and a peer's when it arrives, so two claims of one item
-//!    made while the nodes cannot reach each other sit in opposite local orders: bob's
-//!    daemon is stopped (SIGSTOP) while alice claims, alice's and the anchor's (it holds
-//!    the room's entries too) while bob claims, then all resume. The earlier claim must
-//!    hold on both nodes. Precondition (else APPARATUS, CANNOT MEASURE): `room read
-//!    --json` shows the two claims in different orders on the two nodes — without that,
-//!    a fold in local order and the canonical fold give the same board.
+//! 6. **two claims made while the nodes cannot reach each other fold to the same board.**
+//!    bob's daemon is down while alice claims; then alice's and the anchor's (it holds the
+//!    room's entries too) are stopped (SIGSTOP) while bob's restarts and bob claims; then all
+//!    resume. Each claim is posted and told it is not agreed yet, since the other member
+//!    cannot be reached (V210-168). Since v0.3.0 every node reads a room in its one order
+//!    (PRD-001 R13), so `room read --json` must show the two claims in the same order on both
+//!    nodes, and the earlier claim must hold on both. (This case used to require the two
+//!    nodes to show *different* local orders; with one room order nothing shows a local
+//!    order any more.)
 //!
 //! Cases 1–5 depend on no causal order between two authors: every step waits until the
 //! node that acts next has *seen* what it acts on. That is also why they cannot catch a
@@ -46,7 +47,7 @@
 //! no anchor, alice creates, bob and carol join, all six `Trust` edges applied; after
 //! 60 s, `bob never received the sender key of ["carol"]`. In a room of three, the two
 //! who joined cannot read each other — a user meets that the moment a third person
-//! arrives. It is recorded as **open defect F12 in ADR-021**, in `vox-core` key
+//! arrives. The rules that close it are ADR-004 O2–O4 and ADR-007 G-15a, in `vox-core` key
 //! distribution, not accepted as a gap; `node_m19_untrust_lock_gate` stays green only
 //! because it never has one joiner read another. Every property this proof asserts is
 //! a property of the fold across *nodes* and *sessions*, and two nodes with several
@@ -153,9 +154,10 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         .build()
         .expect("APPARATUS: could not build the test's tokio runtime");
     let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
-    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let mut room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
-    let r = room.id.as_str();
+    let room_id = room.id.clone();
+    let r = room_id.as_str();
     let (a_fp, b_fp) = (alice.b32(), bob.b32());
     let b_prefix = &b_fp[..16];
 
@@ -387,25 +389,35 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
     }
 
     // ---- (6) the same claims, logged in opposite orders, fold to one board ----
+    // Bob's daemon is **down**, not frozen, while alice claims: since a claim asks every member
+    // to agree (V210-168), alice sends it to bob at once, and a frozen bob found it waiting in
+    // his socket when he resumed and logged it before his own, so both orders were the same.
     let alice_d = alice
         .daemon_pid()
         .expect("APPARATUS: the harness has no pid for alice's daemon");
-    let bob_d = bob
-        .daemon_pid()
-        .expect("APPARATUS: the harness has no pid for bob's daemon");
     let anchor_d = room.anchor_pid();
-    signal(bob_d, "-STOP", "bob's daemon");
+    room.stop(1);
+    let alice = &room.workers[0];
     let first = alice.vox(Some("a1"), &["room", "claim", r, "h-order"]);
     // The anchor holds the room's entries too, and would serve bob alice's claim.
     signal(alice_d, "-STOP", "alice's daemon");
     signal(anchor_d, "-STOP", "the anchor");
-    signal(bob_d, "-CONT", "bob's daemon");
+    room.restart(1);
+    let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let second = bob.vox(Some("b1"), &["room", "claim", r, "h-order"]);
     signal(alice_d, "-CONT", "alice's daemon");
     signal(anchor_d, "-CONT", "the anchor");
+    // Bob is stopped, so alice's claim cannot be agreed: it is posted, and she is told it is not
+    // sure to be hers rather than "you hold" (V210-168: a member who cannot be reached is said,
+    // never answered as success). Posted is what this case needs: the fold below orders it.
     assert!(
-        first.ok && first.stdout.contains("you hold h-order"),
-        "PRODUCT: alice/a1 claimed h-order first, with nobody else claiming it: {first:?}"
+        first.code == Some(5)
+            && first.stderr.contains("h-order is not agreed yet")
+            // Named as alice names bob (V210-162).
+            && first.stderr.contains("member bob-the-builder could not be reached")
+            && first.stderr.contains("Your claim is posted"),
+        "PRODUCT: alice/a1's claim of h-order, made while bob's daemon was stopped, must be posted \
+         and answered \"not agreed yet\" (exit 5) naming the member it could not reach: {first:?}"
     );
     let orders: Vec<Vec<(String, String, u64)>> = [alice, bob]
         .iter()
@@ -422,18 +434,17 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         .collect();
     let hashes = |v: &[(String, String, u64)]| v.iter().map(|c| c.0.clone()).collect::<Vec<_>>();
     eprintln!(
-        "[proof] (6) local order of the h-order claims: alice {:?}, bob {:?}; bob's claim said: {}{}",
+        "[proof] (6) the h-order claims as each node reads them: alice {:?}, bob {:?}; bob's claim said: {}{}",
         hashes(&orders[0]),
         hashes(&orders[1]),
         second.stdout.trim(),
         second.stderr.trim()
     );
-    assert!(
-        hashes(&orders[0]) != hashes(&orders[1]),
-        "APPARATUS: CANNOT MEASURE (6): both nodes logged the two claims of h-order in the \
-         same order {:?} (bob had alice's claim before he made his), so this case cannot tell \
-         a canonical fold from one in local order",
-        orders[0]
+    assert_eq!(
+        hashes(&orders[0]),
+        hashes(&orders[1]),
+        "PRODUCT (6): alice and bob read the two claims of h-order in different orders; a room \
+         has one order on every node (PRD-001 R13)"
     );
     let by = |author: &str| orders[0].iter().find(|c| c.1 == author).map(|c| c.2);
     assert!(
@@ -461,7 +472,7 @@ fn a_handoff_moves_ownership_by_fingerprint_and_every_node_agrees() {
         held[0]
     );
     eprintln!(
-        "[proof] (6) identical h-order on two nodes from opposite local orders: {}",
+        "[proof] (6) identical h-order on two nodes from claims made apart: {}",
         held[0]
     );
 

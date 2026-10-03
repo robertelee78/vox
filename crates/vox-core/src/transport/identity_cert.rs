@@ -14,9 +14,9 @@
 //! `libp2p-tls` mechanism, with Vox's own OID arc and canonical-CBOR value.
 //!
 //! ## Extension layout (ADR-011, concrete)
-//! - **OID** [`VOX_IDENTITY_EXT_OID`] — a **provisional** arc under the documented
-//!   PEN placeholder until Vox's IANA Private Enterprise Number is assigned (the
-//!   interop matrix pins the exact OID; Vox does NOT squat libp2p's PEN 53594).
+//! - **OID** [`VOX_IDENTITY_EXT_OID_DOTTED`] — `2.25.<UUID>.1.1`, under a UUID arc
+//!   (ITU-T X.667) Vox generated once, which anyone may use without registering
+//!   (V030-33). Vox does NOT squat libp2p's PEN 53594, nor any other PEN.
 //! - `critical = false`.
 //! - value = canonical-CBOR (ADR-008 framing, tag [`StructTag::TlsIdentityExtension`]
 //!   = `0x0009`, domain `vox/tls-identity-extension/v1`) of the 2-field struct
@@ -50,17 +50,40 @@ use crate::hash::{Digest32, COMPOSITE_PUB_LEN, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::wire::{self, StructTag};
 
-/// The provisional Vox identity-extension OID arc.
+/// The UUID Vox's identity-extension arc is made from: generated once, on 2026-10-03,
+/// with `uuidgen` (a random, version-4 UUID). Never regenerate it: it **is** the arc.
+pub const VOX_OID_UUID: &str = "14b7e534-e0b1-494d-8cb6-b81f37787c27";
+
+/// The Vox identity-extension OID, dotted: `2.25.<VOX_OID_UUID as an integer>.1.1`.
 ///
-/// `1.3.6.1.4.1.<PEN>.1.1`, where `<PEN>` is a **provisional placeholder**
-/// (`1234567`) standing in for Vox's IANA Private Enterprise Number, which is
-/// pending registration (ADR-011). Until the real PEN is assigned, this exact arc
-/// is pinned by the interop-test matrix as a release gate, so every supported peer
-/// agrees on it. Vox deliberately does **not** reuse libp2p's PEN `53594`.
+/// **An arc Vox may use without registering anything** (V030-33). ITU-T X.667 / RFC 9562
+/// give every UUID the OID `2.25.<the UUID as a 128-bit integer>`, owned by whoever made the
+/// UUID. The old arc, `1.3.6.1.4.1.1234567.1.1`, was a placeholder for an IANA Private
+/// Enterprise Number Vox never registered — so it named another organisation's arc. No
+/// compatibility is owed: a node of an older build is refused, as rooms made before v0.3.0 are.
 ///
-/// `.1.1` under the PEN names the v1 Vox-TLS-identity extension specifically; the
-/// trailing `.1` leaves room for future extension families under the same PEN.
-pub const VOX_IDENTITY_EXT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 1_234_567, 1, 1];
+/// `.1.1` under the UUID names the v1 Vox-TLS-identity extension; the trailing `.1` leaves room
+/// for future extension families under the same arc.
+pub const VOX_IDENTITY_EXT_OID_DOTTED: &str = "2.25.27539399102012846121714982791979498535.1.1";
+
+/// [`VOX_IDENTITY_EXT_OID_DOTTED`] as DER content bytes (the OBJECT IDENTIFIER's value,
+/// without its tag and length): what a certificate carries. Derived from [`VOX_OID_UUID`]
+/// itself, so the arc and the UUID cannot disagree.
+///
+/// The UUID arc is a 128-bit integer, and the certificate builder (`rcgen`) takes arcs as
+/// `u64`, so the extension is built under [`PLACEHOLDER_OID`] — whose encoding is exactly as
+/// long — and these bytes are put in its place before the certificate is signed (see
+/// [`build_leaf_certificate`]).
+#[must_use]
+pub fn vox_identity_ext_oid() -> Vec<u8> {
+    let uuid = u128::from_str_radix(&VOX_OID_UUID.replace('-', ""), 16).unwrap_or_default();
+    oid_content(&[2, 25, uuid, 1, 1])
+}
+
+/// The arcs the extension is built under before [`vox_identity_ext_oid`] takes their place: a
+/// DER encoding of the same length (21 bytes), so no length in the certificate moves. It never
+/// leaves [`build_leaf_certificate`]: a certificate still carrying it is refused there.
+const PLACEHOLDER_OID: &[u128] = &[2, 25, 15_445_094_922_067_116_033, 562_949_953_421_313, 1, 1];
 
 /// The PoP signing-string prefix (ADR-011). Concatenated with the certificate's
 /// raw subject-public-key bytes to form the bytes the composite identity key
@@ -109,7 +132,7 @@ impl VoxLeafCertificate {
 }
 
 /// Build a fresh self-signed leaf certificate that carries `signer`'s composite
-/// identity in the [`VOX_IDENTITY_EXT_OID`] extension, with a composite
+/// identity in the [`vox_identity_ext_oid`] extension, with a composite
 /// proof-of-possession over [`POP_PREFIX`] ‖ `cert_public_key`.
 ///
 /// The flow (ADR-011) is necessarily two-pass because the PoP signs the
@@ -137,14 +160,18 @@ pub fn build_leaf_certificate<S: RootSigner>(signer: &S) -> Result<VoxLeafCertif
     let ext_value = encode_extension(&signer.public_key(), &pop_sig);
     let mut params =
         CertificateParams::new(Vec::<String>::new()).map_err(|_| Error::SigningFailed)?;
-    let mut ext = CustomExtension::from_oid_content(VOX_IDENTITY_EXT_OID, ext_value);
+    let placeholder: Vec<u64> = PLACEHOLDER_OID
+        .iter()
+        .map(|a| u64::try_from(*a).map_err(|_| Error::SigningFailed))
+        .collect::<Result<_>>()?;
+    let mut ext = CustomExtension::from_oid_content(&placeholder, ext_value);
     ext.set_criticality(false);
     params.custom_extensions.push(ext);
 
     let cert = params
         .self_signed(&key_pair)
         .map_err(|_| Error::SigningFailed)?;
-    let cert_der = cert.der().clone();
+    let cert_der = CertificateDer::from(with_vox_oid(cert.der(), &key_pair)?);
     let key_der =
         PrivateKeyDer::try_from(key_pair.serialize_der()).map_err(|_| Error::SigningFailed)?;
 
@@ -153,6 +180,86 @@ pub fn build_leaf_certificate<S: RootSigner>(signer: &S) -> Result<VoxLeafCertif
         key_der,
         identity_fingerprint: signer.fingerprint(),
     })
+}
+
+/// `cert` with [`PLACEHOLDER_OID`]'s encoding replaced by [`vox_identity_ext_oid`], and signed
+/// again by `key_pair` over the changed to-be-signed part.
+///
+/// Same-length bytes in, so every DER length stays as it was; the Ed25519 signature is a fixed
+/// 64 bytes at the very end of the certificate. Anything else — the placeholder not found
+/// exactly once, a signature of another length — is refused rather than guessed around.
+fn with_vox_oid(cert: &[u8], key_pair: &KeyPair) -> Result<Vec<u8>> {
+    use rcgen::SigningKey as _;
+    let placeholder = oid_content(PLACEHOLDER_OID);
+    let vox = vox_identity_ext_oid();
+    if placeholder.len() != vox.len() {
+        return Err(Error::SigningFailed);
+    }
+    let mut out = cert.to_vec();
+    let at: Vec<usize> = out
+        .windows(placeholder.len() + 2)
+        .enumerate()
+        .filter(|(_, w)| {
+            w[0] == 0x06 && usize::from(w[1]) == placeholder.len() && w[2..] == placeholder[..]
+        })
+        .map(|(i, _)| i + 2)
+        .collect();
+    let [at] = at[..] else {
+        return Err(Error::SigningFailed);
+    };
+    out[at..at + vox.len()].copy_from_slice(&vox);
+    // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }: the
+    // to-be-signed part is the first element of the outer SEQUENCE.
+    let (outer_hdr, _) = der_header(&out, 0)?;
+    let (tbs_hdr, tbs_len) = der_header(&out, outer_hdr)?;
+    let tbs = out[outer_hdr..outer_hdr + tbs_hdr + tbs_len].to_vec();
+    let sig = key_pair.sign(&tbs).map_err(|_| Error::SigningFailed)?;
+    let n = out.len();
+    if sig.len() != 64 || n < 64 {
+        return Err(Error::SigningFailed);
+    }
+    out[n - 64..].copy_from_slice(&sig);
+    Ok(out)
+}
+
+/// The DER encoding of `arcs`' OBJECT IDENTIFIER value (no tag, no length).
+fn oid_content(arcs: &[u128]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut push = |mut n: u128| {
+        let mut b = vec![(n & 0x7f) as u8];
+        n >>= 7;
+        while n > 0 {
+            b.push(0x80 | (n & 0x7f) as u8);
+            n >>= 7;
+        }
+        out.extend(b.iter().rev());
+    };
+    if let [a, b, rest @ ..] = arcs {
+        push(a * 40 + b);
+        for r in rest {
+            push(*r);
+        }
+    }
+    out
+}
+
+/// The DER element at `at`: (its header's length, its content's length).
+fn der_header(der: &[u8], at: usize) -> Result<(usize, usize)> {
+    let bad = || Error::SigningFailed;
+    let first = *der.get(at + 1).ok_or_else(bad)?;
+    if first < 0x80 {
+        return Ok((2, usize::from(first)));
+    }
+    let k = usize::from(first & 0x7f);
+    if k == 0 || k > 4 {
+        return Err(bad());
+    }
+    let len = der
+        .get(at + 2..at + 2 + k)
+        .ok_or_else(bad)?
+        .iter()
+        .fold(0usize, |n, b| (n << 8) | usize::from(*b));
+    Ok((2 + k, len))
 }
 
 /// The exact bytes the composite identity key signs for the PoP:
@@ -226,7 +333,7 @@ fn parse_extension(value: &[u8]) -> Result<ParsedExtension> {
 /// (ADR-011 §"Identity authentication").
 ///
 /// Steps, all of which must pass:
-/// 1. parse the leaf DER and locate the [`VOX_IDENTITY_EXT_OID`] extension
+/// 1. parse the leaf DER and locate the [`vox_identity_ext_oid`] extension
 ///    (exactly one — a duplicate is malformed);
 /// 2. decode the canonical-CBOR `{ composite_pubkey, pop_sig }` (strict);
 /// 3. read the leaf's **raw subject-public-key BIT STRING content**
@@ -254,7 +361,7 @@ pub fn verify_peer_certificate(cert_der: &[u8]) -> Result<CompositePublicKey> {
     let cert_public_key = cert.public_key().subject_public_key.data.as_ref();
 
     // Locate the identity extension by OID (exactly one).
-    let oid = oid_from_arcs(VOX_IDENTITY_EXT_OID)?;
+    let oid = Oid::new(std::borrow::Cow::Owned(vox_identity_ext_oid()));
     let ext = cert
         .get_extension_unique(&oid)
         .map_err(|_| Error::SignatureInvalid)? // duplicate extension ⇒ reject
@@ -269,9 +376,4 @@ pub fn verify_peer_certificate(cert_der: &[u8]) -> Result<CompositePublicKey> {
         .pubkey
         .verify(&pop_signing_input(cert_public_key), &parsed.pop_sig)?;
     Ok(parsed.pubkey)
-}
-
-/// Build an `x509_parser` OID from a `&[u64]` arc slice.
-fn oid_from_arcs(arcs: &[u64]) -> Result<Oid<'static>> {
-    Oid::from(arcs).map_err(|_| Error::MalformedBundle("invalid identity extension OID"))
 }

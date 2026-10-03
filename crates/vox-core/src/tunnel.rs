@@ -9,10 +9,6 @@
 //! Modules:
 //! - [`addr`] — identity-derived overlay addressing for the TUN model (self-
 //!   certifying Vox-CGA /128; an address grants no reachability).
-//! - [`service`] — signed [`service::ServiceAdvertisement`]s and discovery-gating by
-//!   sealing each ad only to the members holding the matching `dial:` capability.
-//! - [`sshca`] — "ssh over Vox": OpenSSH certificate issuance bound to the verified
-//!   Vox identity (no host-key TOFU).
 //! - [`session`] — the per-stream tunnel data path over one QUIC stream, with reach
 //!   enforced at stream setup (the ssh-style port-forward primary model).
 //! - [`socks`] — a SOCKS5 front-end that maps `CONNECT` requests onto tunnel
@@ -29,7 +25,6 @@
 //! path too — the interface is convenience, never a policy bypass.
 
 pub mod addr;
-pub mod service;
 pub mod session;
 pub mod socks;
-pub mod sshca;
+pub mod udp;

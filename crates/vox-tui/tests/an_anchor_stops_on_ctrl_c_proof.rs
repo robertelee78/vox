@@ -353,17 +353,16 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
         })
     };
     let terminal = open();
-    let mut a = vec![verb.to_owned(), w.room.clone()];
+    // `vox up <room>`; `vox forward <service>.<host fp>.<room>.vox <local>`, its only form.
+    let mut a = vec![verb.to_owned()];
     if verb == "forward" {
-        a.extend([
-            w.host_fp.clone(),
-            w.service_port.to_string(),
-            "127.0.0.1:0".into(),
-        ]);
+        a.extend([w.service_host(), "127.0.0.1:0".into()]);
+    } else {
+        a.push(w.room.clone());
     }
     a.extend([
         "--anchor".into(),
-        w.anchor_spec.clone(),
+        w.host_anchor.clone(),
         "--listen".into(),
         "127.0.0.1:0".into(),
     ]);
@@ -507,7 +506,7 @@ fn daemon(w: &World, dir: &Path, pass_file: &Path) -> VoxProc {
                 .to_str()
                 .expect("APPARATUS: a temp path is not UTF-8"),
             "--anchor",
-            &w.anchor_spec,
+            &w.host_anchor,
             "--listen",
             "127.0.0.1:0",
         ]),
@@ -631,9 +630,9 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
             &w.host_dir,
             &args(&[
                 "serve",
-                &w.service_port.to_string(),
+                &format!("{0}={0}", w.service_port),
                 "--anchor",
-                &w.anchor_spec,
+                &w.host_anchor,
                 "--listen",
                 "127.0.0.1:0",
             ]),

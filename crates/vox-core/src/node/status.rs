@@ -1,34 +1,700 @@
-//! ADR-025 S0b — **simple sync counters**, per `(room, peer)`, behind `vox status --json`.
+//! PRD-001 R35 and R38 — **what this node is doing, and whether it is well**: the report
+//! behind `vox status`, its JSON form, and the Prometheus text `vox daemon --metrics`
+//! serves.
 //!
-//! The decider's decision 3 (2026-09-26): the proofs assert what a person sees — above all how
-//! long a post takes to become readable — and use a handful of counters only for what a person
-//! cannot see directly: that nothing was refused, skipped or left stale. There is deliberately no
-//! session journal.
+//! Every fact here is **read** from state the node already keeps — the published view,
+//! the connection manager, the sync schedules, the app layer and each connection's
+//! datagram router — plus three small ledgers this module keeps for the purpose
+//! ([`StatusBook`]): when each room last completed a sync, when each peer was last seen
+//! connected, and which tunnels are being served right now. Nothing here decides
+//! anything, and nothing the node does waits on it.
 //!
-//! The counters live in a [`SyncBook`] shared between the actor (the only writer) and every
-//! [`crate::node::actor::NodeHandle`] (readers), behind a plain mutex held for a few map updates
-//! at a time, so `vox status` answers even while the actor is busy.
+//! ## What "unhealthy" means
 //!
-//! ## The request
+//! A line in [`StatusReport::unhealthy`] is something an operator should look at:
 //!
-//! `vox status --json` asks the running node over its control socket with the request
-//! `[2301]`, and the node answers `[2302, json]`. The tags are the ones PRD-001 R35's fuller
-//! `vox status` uses on the v0.3.0 line, so that report can fold this one in: the JSON is an
-//! object whose `"sync"` key holds the per-`(room, peer)` rows, and other sections can be added
-//! beside it without changing this one. `"tunnels"` lists every live tunnel (V210-81).
+//! - a room with other members that has not completed a sync in [`STALE_SYNC_SECS`];
+//! - a **trusted** member of an open room this node was connected to and no longer is;
+//! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_SECS`], while
+//!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
+//!   (ADR-012), so an anchor this node does not need alarms no one: the line is raised only while
+//!   an open room has a trusted member this node does not hold a direct connection to (one it
+//!   reaches over a relay, or not at all). Every member reached directly, or no member at all,
+//!   and a lost anchor costs nothing now. The line says what it costs and what it does not.
+//!
+//! An untrusted member that is offline is not flagged: nothing this node does depends on
+//! reaching it. A trusted one is who this node reads, and is read by.
+//!
+//! ## What is not knowable yet
+//!
+//! Whether a room has an **always-on member** is ADR-023's question and nothing records
+//! it yet, so the report says so and shows when each member was last seen instead.
+//! "Direct" covers both a dialled and a hole-punched path: which rung won is not kept
+//! once the connection is filed.
+//!
+//! ## ADR-025 S0b's sync counters
+//!
+//! Beside the report, `vox status --json` carries v0.2.10's **simple sync counters** (the
+//! decider's decision 3, 2026-09-26): a `"sync"` row per `(room, peer)` — sessions opened,
+//! admitted, refused busy, completed, partial, failed, stale, skipped at the cap, queued, and the
+//! backoff a port is in — and a `"reach"` row per peer, counting reachability ladders and outbound
+//! circuits (V210-53). They are what a person cannot see directly: that nothing was refused,
+//! skipped or left stale. They live in a [`SyncBook`] the actor writes and every handle reads.
+//!
+//! `"tunnels"` lists every live tunnel (V210-81): the member, the service, which way it was
+//! opened, and when it was opened and last moved a byte.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, IpcHandshake, Result};
 use crate::hash::Digest32;
+use crate::node::actor::NodeHandle;
+use crate::node::app::AppStats;
 use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
 use crate::node::link::b32_encode;
+use crate::transport::router::DatagramStats;
+
+/// A room with other members and no completed sync for this long is flagged.
+pub const STALE_SYNC_SECS: u64 = 10 * 60;
+
+/// An anchor this node keeps and has not reached for this long is flagged (PRD-001 R37). Long
+/// enough that an anchor restarting, which members are back from within seconds (V210-86), never
+/// interrupts anyone.
+pub const ANCHOR_UNREACHABLE_SECS: u64 = 60;
+
+/// The ledgers this module keeps beside the node's own state.
+#[derive(Debug, Default)]
+pub struct StatusBook {
+    /// Room → when a sync this node ran there last completed.
+    pub room_synced: BTreeMap<Digest32, u64>,
+    /// Peer → when a sync session with it last completed, in any room.
+    pub member_synced: BTreeMap<Digest32, u64>,
+    /// Peer → when this node last saw a live connection to it.
+    pub last_seen: BTreeMap<Digest32, u64>,
+    /// When the node started, seconds since the epoch: a room that has not synced *yet*
+    /// is not stale until it has had [`STALE_SYNC_SECS`] to do so.
+    pub started: u64,
+}
+
+/// One member of a room, as this node sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberStatus {
+    /// Its identity.
+    pub id: Digest32,
+    /// Whether it is this node.
+    pub me: bool,
+    /// Whether this node's keyring trusts it.
+    pub trusted: bool,
+    /// Whether this node has a live connection to it now.
+    pub connected: bool,
+    /// When this node last saw it connected (now, if it is).
+    pub last_seen: Option<u64>,
+    /// When a sync session with it last ran.
+    pub last_sync: Option<u64>,
+}
+
+/// One open room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomStatus {
+    /// The room.
+    pub id: Digest32,
+    /// Its local name.
+    pub name: String,
+    /// Its epoch.
+    pub epoch: u64,
+    /// When a sync this node ran there last completed.
+    pub last_sync: Option<u64>,
+    /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
+    /// and the node's own (ADR-023 decision 2).
+    ///
+    /// This and the three below come from the room as the node last published it, so they are
+    /// answered while a sync session holds the room. Read from the room itself they were `null`
+    /// for as long as a session ran: a person reading `vox status` saw no retention, "(busy)" for
+    /// the keys held and no frozen member, with no reason (#58, #59).
+    pub retention: u64,
+    /// How many generations of this node's own sender key it still holds here (PRD-001
+    /// R14: one, unless a full-history grant is still owed).
+    pub key_generations: usize,
+    /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
+    /// receiving side: a generation read to the end is deleted).
+    pub received_key_generations: usize,
+    /// Authors this node froze here for signing two entries at one position (ADR-008).
+    pub frozen: Vec<Digest32>,
+    /// Entries this node refused here as at or below their author's checkpoint since it opened
+    /// the room (ADR-023 decision 3).
+    pub refused_below_checkpoint: u64,
+    /// Its members.
+    pub members: Vec<MemberStatus>,
+}
+
+/// One connected peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerStatus {
+    /// Its identity.
+    pub id: Digest32,
+    /// `direct` (dialled or hole-punched) or `relayed`.
+    pub path: &'static str,
+    /// The relay carrying it, when relayed and known.
+    pub relay: Option<Digest32>,
+    /// QUIC's smoothed round-trip time, milliseconds.
+    pub rtt_ms: u64,
+    /// This connection's datagram counters.
+    pub datagrams: DatagramStats,
+    /// The TLS key-exchange group its handshake negotiated, as rustls observed it (V030-33).
+    pub tls_group: u16,
+}
+
+/// A local port forwarded to a member's service (the dial side): a door, which carries a tunnel
+/// only while something is connected through it. The tunnels themselves are in the one list of
+/// live tunnels ([`crate::transport::quic::live_tunnels`], V210-81).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardStatus {
+    /// The room.
+    pub channel_id: Digest32,
+    /// The member hosting it.
+    pub host: Digest32,
+    /// The service.
+    pub service_tag: String,
+    /// Where it listens locally.
+    pub local: SocketAddr,
+}
+
+/// Everything `vox status` shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StatusReport {
+    /// When this was taken, seconds since the epoch.
+    pub now: u64,
+    /// When the node started, seconds since the epoch.
+    pub started: u64,
+    /// This node.
+    pub identity: Option<Digest32>,
+    /// Whether it is on the network.
+    pub networked: bool,
+    /// Where it listens.
+    pub listening: Vec<String>,
+    /// Its open rooms.
+    pub rooms: Vec<RoomStatus>,
+    /// Its live connections.
+    pub peers: Vec<PeerStatus>,
+    /// How many circuits it carries for others.
+    pub relaying: usize,
+    /// Ports it forwards to others' services.
+    pub forwards: Vec<ForwardStatus>,
+    /// Datagram counters, summed over every connection.
+    pub datagrams: DatagramStats,
+    /// The app layer's counters.
+    pub app: AppStats,
+    /// Every live UDP flow, hosted or dialled, with its own counters (ADR-022 6.9, V030-34).
+    pub udp_flows: Vec<crate::tunnel::udp::FlowInfo>,
+    /// The anchors this node keeps, and whether it reaches them.
+    pub anchors: Vec<AnchorStatus>,
+    /// What needs looking at.
+    pub unhealthy: Vec<Unhealthy>,
+}
+
+/// One anchor this node keeps: configured, or named by an open room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchorStatus {
+    /// Its identity.
+    pub id: Digest32,
+    /// Since when this node has not reached it (unix seconds); `None` while it is reached.
+    pub unreached_since: Option<u64>,
+}
+
+/// One condition that needs looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unhealthy {
+    /// A stable name for the condition — `peer-unreachable:<room>:<peer>`, `room-stale:<room>`
+    /// or `anchor-unreachable:<anchor>` — the same for as long as the condition holds, so a notifier
+    /// can tell it starting from it continuing (PRD-001 R37).
+    pub key: String,
+    /// What a person reads. May change while the condition holds ("last seen 12s ago").
+    pub message: String,
+}
+
+fn short(d: &Digest32) -> String {
+    b32_encode(d).chars().take(12).collect()
+}
+
+impl StatusReport {
+    /// Work out the unhealthy lines from the rest of the report.
+    pub fn diagnose(&mut self) {
+        let mut out = Vec::new();
+        for room in &self.rooms {
+            let others = room.members.iter().filter(|m| !m.me).count();
+            if others == 0 || !self.networked {
+                continue;
+            }
+            // Measured from the last completed sync, or from the node's start when there
+            // has been none: a daemon that has just started is not unhealthy for not
+            // having synced in its first seconds, and would otherwise alarm on every start.
+            let since = room.last_sync.unwrap_or(self.started);
+            let stale = self.now.saturating_sub(since) > STALE_SYNC_SECS;
+            if stale {
+                out.push(Unhealthy {
+                    key: format!("room-stale:{}", b32_encode(&room.id)),
+                    message: format!(
+                        "room {} ({}): no completed sync in {} minutes",
+                        short(&room.id),
+                        room.name,
+                        STALE_SYNC_SECS / 60
+                    ),
+                });
+            }
+            for m in &room.members {
+                if m.me || !m.trusted || m.connected {
+                    continue;
+                }
+                if let Some(seen) = m.last_seen {
+                    out.push(Unhealthy {
+                        key: format!(
+                            "peer-unreachable:{}:{}",
+                            b32_encode(&room.id),
+                            b32_encode(&m.id)
+                        ),
+                        message: format!(
+                            "room {} ({}): trusted member {} unreachable, last seen {}s ago",
+                            short(&room.id),
+                            room.name,
+                            short(&m.id),
+                            self.now.saturating_sub(seen)
+                        ),
+                    });
+                }
+            }
+        }
+        // Whether this node needs an anchor now (ADR-012: an anchor only bridges): some open room
+        // has a trusted member it holds no direct connection to.
+        let direct = |id: &Digest32| self.peers.iter().any(|p| p.id == *id && p.path == "direct");
+        let needs_a_bridge = self.rooms.iter().any(|room| {
+            room.members
+                .iter()
+                .any(|m| !m.me && m.trusted && !direct(&m.id))
+        });
+        if self.networked && needs_a_bridge {
+            for a in &self.anchors {
+                let Some(since) = a.unreached_since else {
+                    continue;
+                };
+                let for_secs = self.now.saturating_sub(since);
+                if for_secs > ANCHOR_UNREACHABLE_SECS {
+                    out.push(Unhealthy {
+                        key: format!("anchor-unreachable:{}", b32_encode(&a.id)),
+                        message: format!(
+                            "anchor {} unreachable for {for_secs}s: a host that can find this \
+                             node only through it cannot reach it until it is back; peers this \
+                             node reaches directly are unaffected",
+                            short(&a.id)
+                        ),
+                    });
+                }
+            }
+        }
+        self.unhealthy = out;
+    }
+
+    /// The report as JSON (what `vox status --json` prints). Hand-written, because the
+    /// shape is small and fixed and the crate carries no serializer.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut j = String::from("{");
+        let _ = write!(j, "\"now\":{},", self.now);
+        let _ = write!(
+            j,
+            "\"identity\":{},",
+            self.identity.map_or("null".into(), |d| q(&b32_encode(&d)))
+        );
+        let _ = write!(j, "\"networked\":{},", self.networked);
+        let _ = write!(
+            j,
+            "\"listening\":[{}],",
+            list(self.listening.iter().map(|s| q(s)))
+        );
+        let _ = write!(
+            j,
+            "\"always_on_member\":{},",
+            q("unknown: not recorded until ADR-023; see each member's last_seen")
+        );
+        let rooms = self.rooms.iter().map(|r| {
+            let members = r.members.iter().map(|m| {
+                format!(
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen\":{},\"last_sync\":{}}}",
+                    q(&b32_encode(&m.id)),
+                    m.me,
+                    m.trusted,
+                    m.connected,
+                    opt(m.last_seen),
+                    opt(m.last_sync)
+                )
+            });
+            let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
+            format!(
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"members\":[{}]}}",
+                q(&b32_encode(&r.id)),
+                q(&r.name),
+                r.epoch,
+                opt(r.last_sync),
+                r.retention,
+                r.key_generations,
+                r.received_key_generations,
+                frozen,
+                r.refused_below_checkpoint,
+                list(members)
+            )
+        });
+        let _ = write!(j, "\"rooms\":[{}],", list(rooms));
+        let peers = self.peers.iter().map(|p| {
+            format!(
+                "{{\"id\":{},\"path\":{},\"relay\":{},\"rtt_ms\":{},\"tls_group\":{},\"datagrams\":{}}}",
+                q(&b32_encode(&p.id)),
+                q(p.path),
+                p.relay.map_or("null".into(), |d| q(&b32_encode(&d))),
+                p.rtt_ms,
+                q(&format!("{:?}", rustls::NamedGroup::from(p.tls_group))),
+                dgram_json(&p.datagrams)
+            )
+        });
+        let _ = write!(j, "\"peers\":[{}],", list(peers));
+        let _ = write!(j, "\"relaying\":{},", self.relaying);
+        let forwards = self.forwards.iter().map(|t| {
+            format!(
+                "{{\"host\":{},\"room\":{},\"service\":{},\"local\":{}}}",
+                q(&b32_encode(&t.host)),
+                q(&b32_encode(&t.channel_id)),
+                q(&t.service_tag),
+                q(&t.local.to_string())
+            )
+        });
+        let _ = write!(j, "\"forwards\":[{}],", list(forwards));
+        let _ = write!(j, "\"datagrams\":{},", dgram_json(&self.datagrams));
+        let a = &self.app;
+        let _ = write!(
+            j,
+            "\"app\":{{\"inbound\":{},\"accepted\":{},\"opened\":{},\"refused_untrusted\":{},\"refused_busy\":{},\"refused_no_listener\":{},\"refused_unaccepted\":{},\"refused_locally\":{},\"withdrawn\":{}}},",
+            a.inbound,
+            a.accepted,
+            a.opened,
+            a.refused_untrusted,
+            a.refused_busy,
+            a.refused_no_listener,
+            a.refused_unaccepted,
+            a.refused_locally,
+            a.withdrawn
+        );
+        // **Each UDP flow apart** (ADR-022 6.9, V030-34): the summed datagram counters above
+        // cannot say which flow lost what, and a flow's own counts are what a person checks
+        // against the packets their program sent.
+        let flows = self.udp_flows.iter().map(|f| {
+            format!(
+                "{{\"peer\":{},\"service\":{},\"to\":{},\"from\":{},\"dropped\":{},\"idle_ms\":{}}}",
+                q(&b32_encode(&f.peer)),
+                q(&f.label),
+                f.to_peer,
+                f.from_peer,
+                f.dropped,
+                u64::try_from(f.idle.as_millis()).unwrap_or(u64::MAX)
+            )
+        });
+        let _ = write!(j, "\"udp_flows\":[{}],", list(flows));
+        let _ = write!(
+            j,
+            "\"anchors\":[{}],",
+            list(self.anchors.iter().map(|a| format!(
+                "{{\"id\":{},\"reached\":{},\"unreached_since\":{}}}",
+                q(&b32_encode(&a.id)),
+                a.unreached_since.is_none(),
+                opt(a.unreached_since)
+            )))
+        );
+        let _ = write!(
+            j,
+            "\"unhealthy\":[{}]",
+            list(self.unhealthy.iter().map(|u| format!(
+                "{{\"key\":{},\"message\":{}}}",
+                q(&u.key),
+                q(&u.message)
+            )))
+        );
+        j.push('}');
+        j
+    }
+
+    /// The report as Prometheus text exposition (what `vox daemon --metrics` serves).
+    #[must_use]
+    pub fn to_prometheus(&self) -> String {
+        let mut m = String::new();
+        let mut gauge = |name: &str, help: &str, rows: Vec<(String, u64)>| {
+            let _ = writeln!(m, "# HELP {name} {help}");
+            let _ = writeln!(m, "# TYPE {name} gauge");
+            for (labels, v) in rows {
+                let _ = writeln!(m, "{name}{labels} {v}");
+            }
+        };
+        gauge(
+            "vox_up",
+            "1 while the node answers.",
+            vec![(String::new(), 1)],
+        );
+        gauge(
+            "vox_networked",
+            "1 when the node is on the network.",
+            vec![(String::new(), u64::from(self.networked))],
+        );
+        gauge(
+            "vox_peers_connected",
+            "Live connections.",
+            vec![(String::new(), self.peers.len() as u64)],
+        );
+        gauge(
+            "vox_peer_relayed",
+            "1 when the path to this peer runs through a relay, 0 when direct.",
+            self.peers
+                .iter()
+                .map(|p| {
+                    (
+                        format!(
+                            "{{peer=\"{}\",relay=\"{}\"}}",
+                            b32_encode(&p.id),
+                            p.relay.map(|r| b32_encode(&r)).unwrap_or_default()
+                        ),
+                        u64::from(p.path == "relayed"),
+                    )
+                })
+                .collect(),
+        );
+        gauge(
+            "vox_peer_rtt_milliseconds",
+            "QUIC smoothed round-trip time per peer.",
+            self.peers
+                .iter()
+                .map(|p| (format!("{{peer=\"{}\"}}", b32_encode(&p.id)), p.rtt_ms))
+                .collect(),
+        );
+        gauge(
+            "vox_room_members",
+            "Members per open room.",
+            self.rooms
+                .iter()
+                .map(|r| {
+                    (
+                        format!("{{room=\"{}\"}}", b32_encode(&r.id)),
+                        r.members.len() as u64,
+                    )
+                })
+                .collect(),
+        );
+        gauge(
+            "vox_room_last_sync_seconds",
+            "When a sync this node ran in the room last completed (0: never).",
+            self.rooms
+                .iter()
+                .map(|r| {
+                    (
+                        format!("{{room=\"{}\"}}", b32_encode(&r.id)),
+                        r.last_sync.unwrap_or(0),
+                    )
+                })
+                .collect(),
+        );
+        gauge(
+            "vox_relaying_circuits",
+            "Circuits carried for other peers.",
+            vec![(String::new(), self.relaying as u64)],
+        );
+        let live = crate::transport::quic::live_tunnels();
+        gauge(
+            "vox_tunnels_served",
+            "Tunnels being served now.",
+            vec![(
+                String::new(),
+                live.iter().filter(|t| !t.outbound).count() as u64,
+            )],
+        );
+        gauge(
+            "vox_tunnels_dialed",
+            "Tunnels this node opened to members' services, now.",
+            vec![(
+                String::new(),
+                live.iter().filter(|t| t.outbound).count() as u64,
+            )],
+        );
+        gauge(
+            "vox_forwards",
+            "Local forwards to members' services.",
+            vec![(String::new(), self.forwards.len() as u64)],
+        );
+        gauge(
+            "vox_udp_flows",
+            "Live UDP flows, hosted or dialled.",
+            vec![(String::new(), self.udp_flows.len() as u64)],
+        );
+        // Per flow (ADR-022 6.9, V030-34). Counters of a live flow: a flow that ends leaves the
+        // listing, as a tunnel does.
+        let flow_labels = |f: &crate::tunnel::udp::FlowInfo| {
+            format!(
+                "{{peer=\"{}\",service=\"{}\"}}",
+                b32_encode(&f.peer),
+                f.label
+            )
+        };
+        for (name, help, read) in [
+            (
+                "vox_udp_flow_to_peer",
+                "Packets this UDP flow put on its tunnel toward the peer.",
+                (|f: &crate::tunnel::udp::FlowInfo| f.to_peer) as fn(&_) -> u64,
+            ),
+            (
+                "vox_udp_flow_from_peer",
+                "Packets this UDP flow delivered from the peer to the local UDP side.",
+                |f| f.from_peer,
+            ),
+            (
+                "vox_udp_flow_dropped",
+                "Packets this UDP flow dropped because the local socket or its queue was full.",
+                |f| f.dropped,
+            ),
+        ] {
+            gauge(
+                name,
+                help,
+                self.udp_flows
+                    .iter()
+                    .map(|f| (flow_labels(f), read(f)))
+                    .collect(),
+            );
+        }
+        gauge(
+            "vox_unhealthy",
+            "Lines `vox status` flags as needing attention.",
+            vec![(String::new(), self.unhealthy.len() as u64)],
+        );
+        let d = &self.datagrams;
+        let mut counter = |name: &str, help: &str, v: u64| {
+            let _ = writeln!(m, "# HELP {name} {help}");
+            let _ = writeln!(m, "# TYPE {name} counter");
+            let _ = writeln!(m, "{name} {v}");
+        };
+        counter(
+            "vox_datagrams_sent_total",
+            "Datagrams handed to QUIC.",
+            d.sent,
+        );
+        counter(
+            "vox_datagrams_delivered_total",
+            "Datagrams delivered to a flow.",
+            d.delivered,
+        );
+        counter(
+            "vox_datagrams_fragmented_total",
+            "Packets sent as fragments.",
+            d.fragmented,
+        );
+        counter(
+            "vox_datagrams_dropped_total",
+            "Datagrams dropped: unknown flow, full inbox, malformed, reassembly, or unsendable.",
+            d.unknown_flow
+                + d.inbox_full
+                + d.malformed
+                + d.unknown_context
+                + d.reassembly_expired
+                + d.reassembly_evicted
+                + d.reassembly_rejected
+                + d.send_dropped,
+        );
+        let a = &self.app;
+        counter(
+            "vox_app_streams_inbound_total",
+            "App streams that arrived.",
+            a.inbound,
+        );
+        counter(
+            "vox_app_streams_accepted_total",
+            "App streams accepted.",
+            a.accepted,
+        );
+        counter(
+            "vox_app_streams_opened_total",
+            "App streams opened.",
+            a.opened,
+        );
+        counter(
+            "vox_app_streams_refused_total",
+            "App streams refused, for any reason.",
+            a.refused_untrusted
+                + a.refused_busy
+                + a.refused_no_listener
+                + a.refused_unaccepted
+                + a.refused_locally,
+        );
+        m
+    }
+}
+
+fn q(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn opt(v: Option<u64>) -> String {
+    v.map_or("null".into(), |v| v.to_string())
+}
+
+fn list(items: impl Iterator<Item = String>) -> String {
+    items.collect::<Vec<_>>().join(",")
+}
+
+fn dgram_json(d: &DatagramStats) -> String {
+    format!(
+        "{{\"sent\":{},\"delivered\":{},\"fragmented\":{},\"unknown_flow\":{},\"inbox_full\":{},\"malformed\":{},\"send_dropped\":{}}}",
+        d.sent,
+        d.delivered,
+        d.fragmented,
+        d.unknown_flow,
+        d.inbox_full,
+        d.malformed + d.unknown_context,
+        d.send_dropped
+    )
+}
+
+/// Add `b` into `a`, field by field.
+pub fn add_stats(a: &mut DatagramStats, b: &DatagramStats) {
+    a.delivered += b.delivered;
+    a.unknown_flow += b.unknown_flow;
+    a.inbox_full += b.inbox_full;
+    a.malformed += b.malformed;
+    a.unknown_context += b.unknown_context;
+    a.reassembly_expired += b.reassembly_expired;
+    a.reassembly_evicted += b.reassembly_evicted;
+    a.reassembly_rejected += b.reassembly_rejected;
+    a.sent += b.sent;
+    a.fragmented += b.fragmented;
+    a.send_dropped += b.send_dropped;
+}
+
+// ---- ADR-025 S0b: sync and reach counters ----------------------------------
 
 /// The kinds of backoff a port can be in (ADR-025 D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,10 +1075,15 @@ impl SyncBook {
         *b.ladders.entry(peer).or_default() += 1;
     }
 
-    /// The counters as `vox status --json` prints them, with the rooms' equivocations
-    /// (`(room, author, position)`, V210-63).
+    /// The counters as `vox status --json` carries them: its `"sync"`, `"reach"`,
+    /// `"equivocations"`, `"publish"`, `"prekeys"` and `"set_aside"` members, without the enclosing braces, for [`serve`] to add beside
+    /// [`StatusReport::to_json`]'s. `equivocations` is each `(room, author, position)` the node
+    /// holds back (V210-63).
     #[must_use]
-    pub fn to_json(book: &SharedSyncBook, equivocations: &[(Digest32, Digest32, u64)]) -> String {
+    pub fn sections_json(
+        book: &SharedSyncBook,
+        equivocations: &[(Digest32, Digest32, u64)],
+    ) -> String {
         // Read before the book is held: the manager takes a lock of its own.
         let held: BTreeMap<Digest32, (String, crate::node::net::PathClass)> = {
             let manager = book
@@ -431,7 +1102,7 @@ impl SyncBook {
                 .unwrap_or_default()
         };
         let b = book.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut s = String::from("{\"sync\":[");
+        let mut s = String::from("\"sync\":[");
         for (i, ((room, peer), c)) in b.ports.iter().enumerate() {
             if i > 0 {
                 s.push(',');
@@ -452,7 +1123,7 @@ impl SyncBook {
                 c.failed,
                 c.last_failure
                     .as_deref()
-                    .map_or_else(|| "null".to_owned(), json_string),
+                    .map_or_else(|| "null".to_owned(), q),
                 c.stale,
                 c.refused,
                 c.skipped_at_cap,
@@ -477,17 +1148,21 @@ impl SyncBook {
         s.push_str("],\"reach\":[");
         // Ladders from this book; circuits counted where every outbound circuit is asked for
         // (`circuitstream::connect_through`). Every peer either names, in one row.
+        // Dial-backs (V030-22) counted where each is asked for, in the ladder.
         let circuits = crate::node::circuitstream::outbound_circuits();
+        let dial_backs = crate::node::coordstream::dial_backs();
         let peers: std::collections::BTreeSet<&Digest32> = b
             .ladders
             .keys()
             .chain(circuits.keys())
+            .chain(dial_backs.keys())
             .chain(held.keys())
             .collect();
         for (i, peer) in peers.into_iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
+            let (asked, answered) = dial_backs.get(peer).copied().unwrap_or((0, 0));
             // The connection held for the peer, by the tag both ends' notes use, and its path.
             let (connection, path) = held.get(peer).map_or_else(
                 || ("null".to_owned(), "null".to_owned()),
@@ -497,13 +1172,13 @@ impl SyncBook {
                         crate::node::net::PathClass::Relayed => "relayed",
                         crate::node::net::PathClass::Severed => "severed",
                     };
-                    (json_string(tag), json_string(path))
+                    (q(tag), q(path))
                 },
             );
             let _ = write!(
                 s,
-                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{},\"connection\":{connection},\
-                 \"path\":{path}}}",
+                "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{},\"dial_backs\":{asked},\
+                 \"dial_backs_answered\":{answered},\"connection\":{connection},\"path\":{path}}}",
                 b32_encode(peer),
                 b.ladders.get(peer).copied().unwrap_or(0),
                 circuits.get(peer).copied().unwrap_or(0)
@@ -565,7 +1240,7 @@ impl SyncBook {
             if i > 0 {
                 s.push(',');
             }
-            let list: Vec<String> = entries.iter().map(|e| json_string(e)).collect();
+            let list: Vec<String> = entries.iter().map(|e| q(e)).collect();
             let _ = write!(
                 s,
                 "{{\"room\":\"{}\",\"entries\":[{}]}}",
@@ -582,46 +1257,137 @@ impl SyncBook {
             }
             let _ = write!(
                 s,
-                "{{\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\"opened\":{},\
-                 \"last_moved\":{}}}",
+                "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
+                 \"opened\":{},\"last_moved\":{}}}",
+                t.id,
                 b32_encode(&t.peer),
-                json_string(&t.service),
+                q(&t.service),
                 if t.outbound { "out" } else { "in" },
                 t.opened,
                 t.last_moved
             );
         }
-        s.push_str("]}");
+        // **Tunnels that ended for a reason a person should see** (V030-11): closed here, closed
+        // at the other end, or closed as stuck, with why; and how long a stuck tunnel is given.
+        s.push_str("],\"closed_tunnels\":[");
+        for (i, t) in crate::transport::quic::closed_tunnels().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            let _ = write!(
+                s,
+                "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
+                 \"opened\":{},\"closed\":{},\"why\":{}}}",
+                t.id,
+                b32_encode(&t.peer),
+                q(&t.service),
+                if t.outbound { "out" } else { "in" },
+                t.opened,
+                t.closed,
+                q(&t.why)
+            );
+        }
+        let _ = write!(
+            s,
+            "],\"tunnel_stuck_after\":{}",
+            crate::tunnel::session::stuck_after().as_secs()
+        );
         s
     }
 }
 
-/// `text` as a JSON string literal.
-fn json_string(text: &str) -> String {
-    let mut s = String::with_capacity(text.len() + 2);
-    s.push('"');
-    for c in text.chars() {
-        match c {
-            '"' => s.push_str("\\\""),
-            '\\' => s.push_str("\\\\"),
-            '\n' => s.push_str("\\n"),
-            '\r' => s.push_str("\\r"),
-            '\t' => s.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(s, "\\u{:04x}", c as u32);
-            }
-            c => s.push(c),
-        }
-    }
-    s.push('"');
-    s
-}
-
 // ---- IPC -------------------------------------------------------------------
-// Additive to the control protocol, away from the sequential tags, as PRD-001 R35's are.
+// Additive to protocol 6, away from the sequential tags as the other late ones are.
 
 const T_STATUS: u64 = 2301;
 const T_STATUS_REPORT: u64 = 2302;
+const T_TUNNEL_CLOSE: u64 = 2303;
+const T_TUNNEL_CLOSED: u64 = 2304;
+
+/// What `vox tunnel close` says it closed (V030-11): each tunnel as `vox status` lists it.
+#[must_use]
+pub fn closed_said(closed: &[crate::transport::quic::LiveTunnel]) -> String {
+    closed
+        .iter()
+        .map(|t| {
+            format!(
+                "tunnel {} {} {} for {}",
+                t.id,
+                if t.outbound { "to" } else { "from" },
+                b32_encode(&t.peer).chars().take(12).collect::<String>(),
+                t.service
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `body` is a tunnel-close request (V030-11), and if so what it names.
+#[must_use]
+pub fn close_request(body: &[u8]) -> Option<crate::transport::quic::TunnelSelector> {
+    let mut d = Decoder::new(body);
+    if !matches!((d.array(), d.uint()), (Ok(4), Ok(T_TUNNEL_CLOSE))) {
+        return None;
+    }
+    let mut field = || d.text().ok().filter(|t| !t.is_empty()).map(str::to_owned);
+    let (id, member, service) = (field(), field(), field());
+    Some(crate::transport::quic::TunnelSelector {
+        id: id.and_then(|i| i.parse().ok()),
+        member,
+        service,
+    })
+}
+
+/// Close what `which` names, here in the node, and answer with what was closed.
+///
+/// # Errors
+/// If the reply cannot be written.
+pub async fn serve_close(
+    stream: &mut UnixStream,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<()> {
+    // Nothing closed and a reason: the selector named more than one member.
+    let (n, said) =
+        match crate::transport::quic::close_tunnels(which, "closed by a person on this side") {
+            Ok(closed) => (closed.len() as u64, closed_said(&closed)),
+            Err(refused) => (0, refused),
+        };
+    let mut e = Encoder::new();
+    e.array(3).uint(T_TUNNEL_CLOSED).uint(n).text(&said);
+    write_frame(stream, &e.finish()).await
+}
+
+/// Ask the node listening on `path` to close the tunnels `which` names: how many it closed,
+/// and each as `vox status` lists it — or none, and why not, when `which` named more than one
+/// member.
+///
+/// # Errors
+/// If the node cannot be reached, does not answer in time, or answers something else.
+pub async fn request_close(
+    path: &Path,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<(u64, String)> {
+    let mut e = Encoder::new();
+    e.array(4)
+        .uint(T_TUNNEL_CLOSE)
+        .text(&which.id.map(|i| i.to_string()).unwrap_or_default())
+        .text(which.member.as_deref().unwrap_or_default())
+        .text(which.service.as_deref().unwrap_or_default());
+    let body = tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, exchange(path, e.finish()))
+        .await
+        .map_err(|_| crate::node::ipc::silent())??;
+    let mut d = Decoder::new(&body);
+    if let (Ok(3), Ok(T_TUNNEL_CLOSED)) = (d.array(), d.uint()) {
+        let n = d
+            .uint()
+            .map_err(|_| Error::MalformedIpc("ipc tunnel-close reply"))?;
+        let said = d
+            .text()
+            .map_err(|_| Error::MalformedIpc("ipc tunnel-close reply"))?;
+        return Ok((n, said.to_owned()));
+    }
+    Err(Error::MalformedIpc("ipc tunnel-close reply"))
+}
 
 /// Whether `body` is a status request.
 #[must_use]
@@ -634,19 +1400,39 @@ pub fn is_request(body: &[u8]) -> bool {
 ///
 /// # Errors
 /// If the reply cannot be written.
-pub async fn serve(
-    stream: &mut UnixStream,
-    book: &SharedSyncBook,
-    equivocations: &[(Digest32, Digest32, u64)],
-) -> Result<()> {
-    let mut e = Encoder::new();
-    e.array(2)
-        .uint(T_STATUS_REPORT)
-        .text(&SyncBook::to_json(book, equivocations));
-    write_frame(stream, &e.finish()).await
+pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
+    let body = match handle.status().await {
+        Ok(report) => {
+            // ADR-025 S0b's counters join the report as its `sync` and `reach` members, and the
+            // rooms' equivocations as `equivocations` (V210-63).
+            let equivocations: Vec<(Digest32, Digest32, u64)> = handle
+                .view()
+                .open_channels
+                .iter()
+                .flat_map(|d| {
+                    d.equivocations
+                        .iter()
+                        .map(move |(author, seq)| (d.channel_id, *author, *seq))
+                })
+                .collect();
+            let mut json = report.to_json();
+            json.pop();
+            json.push(',');
+            json.push_str(&SyncBook::sections_json(handle.sync_book(), &equivocations));
+            json.push('}');
+            let mut e = Encoder::new();
+            e.array(2).uint(T_STATUS_REPORT).text(&json);
+            e.finish()
+        }
+        Err(e) => Frame::Error {
+            reason: e.to_string(),
+        }
+        .to_bytes(),
+    };
+    write_frame(stream, &body).await
 }
 
-/// Ask the node listening on `path` for its status, as JSON.
+/// Ask the node at `path` for its status, as JSON.
 ///
 /// **Bounded by [`ANSWER_WITHIN`](crate::node::ipc::ANSWER_WITHIN)** (V210-83): a suspended node's
 /// socket still accepts, and `vox status` against one waited for ever.
@@ -660,6 +1446,27 @@ pub async fn request(path: &Path) -> Result<String> {
 }
 
 async fn ask(path: &Path) -> Result<String> {
+    let mut e = Encoder::new();
+    e.array(1).uint(T_STATUS);
+    let body = exchange(path, e.finish()).await?;
+    let mut d = Decoder::new(&body);
+    if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
+        return d
+            .text()
+            .map(str::to_owned)
+            .map_err(|_| Error::MalformedIpc("ipc status reply"));
+    }
+    match Frame::from_bytes(&body)? {
+        Frame::Error { reason } => Err(Error::Path {
+            op: "vox status",
+            detail: reason,
+        }),
+        _ => Err(Error::MalformedIpc("ipc status reply")),
+    }
+}
+
+/// Greet the node listening on `path`, send it `request`, and return its one reply.
+async fn exchange(path: &Path, request: Vec<u8>) -> Result<Vec<u8>> {
     let mut stream = crate::node::ipc::connect_own(path).await?;
     // A connection that ends is named as such, never as a malformed message (V210-101); and none
     // of this is an identity bundle, which `MalformedBundle` said.
@@ -676,26 +1483,105 @@ async fn ask(path: &Path) -> Result<String> {
         }
         _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
     }
-    let mut e = Encoder::new();
-    e.array(1).uint(T_STATUS);
-    if let Err(e) = write_frame(&mut stream, &e.finish()).await {
+    if let Err(e) = write_frame(&mut stream, &request).await {
         return Err(crate::node::ipc::named(path, e).await);
     }
     let Some(body) = read_frame(&mut stream).await? else {
         return Err(crate::node::ipc::hung_up(path).await);
     };
-    let mut d = Decoder::new(&body);
-    if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
-        return d
-            .text()
-            .map(str::to_owned)
-            .map_err(|_| Error::MalformedIpc("ipc status reply"));
+    Ok(body)
+}
+
+// ---- metrics endpoint ------------------------------------------------------
+
+/// Bind the metrics endpoint, **loopback only**: the counters name every peer and room
+/// this node talks to, which is exactly what a relay operator must not learn, so they
+/// are not offered to the network. The same rule `vox forward` enforces.
+///
+/// # Errors
+/// If `addr` is not a loopback address, or cannot be bound.
+pub async fn bind_metrics(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    if !addr.ip().is_loopback() {
+        return Err(Error::AppRefused(format!(
+            "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or ::1); \
+             it names every peer and room this node talks to"
+        )));
     }
-    match Frame::from_bytes(&body)? {
-        Frame::Error { reason } => Err(Error::Path {
-            op: "vox status",
-            detail: reason,
-        }),
-        _ => Err(Error::MalformedIpc("ipc status reply")),
+    tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| Error::Path {
+            op: "bind metrics endpoint",
+            detail: format!("{addr}: {e}"),
+        })
+}
+
+/// The most of a request's head [`read_request_head`] reads: far more than a scraper's request
+/// line and headers, so a client cannot hold the reader on a head without end.
+const REQUEST_HEAD_MAX: usize = 16 * 1024;
+
+/// Read `sock` until the end of an HTTP request's head (`\r\n\r\n`), the peer's end of stream,
+/// [`REQUEST_HEAD_MAX`] bytes, or `within`, whichever comes first (V210-126).
+async fn read_request_head(sock: &mut tokio::net::TcpStream, within: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 2048];
+    while head.len() < REQUEST_HEAD_MAX {
+        match tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => {
+                // Only the last three bytes of what came before can begin the terminator.
+                let from = head.len().saturating_sub(3);
+                head.extend_from_slice(&chunk[..n]);
+                if head[from..].windows(4).any(|w| w == b"\r\n\r\n") {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
+/// How long [`drain_after_answer`] goes on discarding what a client still sends.
+const DRAIN_AFTER_ANSWER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// After the answer and its FIN: read and discard what the client still sends, until it closes
+/// its end or `within` passes (V030-23). Closing with unread input makes the OS reset the
+/// connection, and on macOS that reset can overtake the answer, so a client whose head was cut
+/// off at [`REQUEST_HEAD_MAX`] or never ended lost a response it had already been sent.
+async fn drain_after_answer(sock: &mut tokio::net::TcpStream, within: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    let mut chunk = [0u8; 2048];
+    while let Ok(Ok(n)) = tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+        if n == 0 {
+            return;
+        }
+    }
+}
+
+/// Serve Prometheus text on every connection to `listener`, until it is dropped.
+pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle) {
+    while let Ok((mut sock, _)) = listener.accept().await {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            // The request itself is not interpreted: every path answers the metrics. But it is
+            // **read to its end** first, the blank line after its headers, within the same 2 s
+            // (V210-126): one read took only the first segment of a request that arrived in
+            // pieces, and closing with the rest unread made the OS reset the connection, so the
+            // scraper lost the answer (`Connection reset by peer`).
+            read_request_head(&mut sock, std::time::Duration::from_secs(2)).await;
+            let body = match handle.status().await {
+                Ok(r) => r.to_prometheus(),
+                Err(_) => "vox_up 0\n".to_owned(),
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            // Half-closed, so the answer is followed by a FIN, then drained, so whatever of the
+            // request was never read cannot turn the close into a reset (V030-23).
+            let _ = sock.shutdown().await;
+            drain_after_answer(&mut sock, DRAIN_AFTER_ANSWER).await;
+        });
     }
 }

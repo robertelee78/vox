@@ -17,7 +17,7 @@
 //! samples refused in two runs). So each sample is a pair of processes of the guest's identity:
 //! **A**, a plain `vox forward` whose address the anchor is seen to hold, then killed; and **B**, a
 //! `vox forward` started at once with its millisecond clock [`SKEW_MS`] behind
-//! (`VOX_TEST_CLOCK_SKEW_MS`, test-only, inert when unset — the clock that floors a record's
+//! (`VOX_TEST_CLOCK_STEP_MS`, test-only, inert when unset — the clock that floors a record's
 //! `seq`). B publishes as long after A as it takes to start (kill, unlock, bind): about a second in
 //! a release build, and as much as 15 s in a debug build, whose production Argon2id unlock alone
 //! was measured at 6–14 s (V210-99). So B's clock is behind by [`SKEW_MS`] **plus** what A, started
@@ -95,20 +95,19 @@ fn free_udp_port() -> u16 {
 /// A `vox forward` of the guest's identity on UDP `port`, with its millisecond clock skewed if asked.
 fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
     let listen = format!("127.0.0.1:{port}");
+    let address = format!("{}.{}.{}.vox", w.service, w.host_fp, w.room);
     let env: Vec<(&str, &str)> = skew
-        .map(|s| vec![("VOX_TEST_CLOCK_SKEW_MS", s)])
+        // A whole clock step, both clocks (V210-64): `VOX_TEST_CLOCK_SKEW_MS` moves the
+        // millisecond clock only, and would prove half the cure.
+        .map(|s| vec![("VOX_TEST_CLOCK_STEP_MS", s)])
         .unwrap_or_default();
     VoxProc::spawn_env(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service,
+            &address,
             "127.0.0.1:0",
-            "--passphrase-file",
-            &w.passphrase_file(),
             "--anchor",
             &w.anchor.v4_spec,
             "--listen",
@@ -121,7 +120,7 @@ fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
 fn a_fresh_process_is_taken_by_its_board() {
-    test_knobs::require(&["VOX_TEST_CLOCK_SKEW_MS"]);
+    test_knobs::require(&["VOX_TEST_CLOCK_STEP_MS"]);
     watchdog::arm();
     // A fixed skew, in place of SKEW_MS beyond B's start, for a manual experiment.
     let fixed_skew: Option<i64> = std::env::var("VOX_PROOF_230_SKEW_MS")

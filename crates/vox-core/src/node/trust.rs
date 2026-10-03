@@ -76,12 +76,61 @@ pub const TRUST_META_KEY: &str = "trust";
 /// Only slot; the keyring is a single blob.
 pub const TRUST_SEGMENT_ID: u64 = 0;
 
-/// Encoding version of the keyring body.
-const KEYRING_VERSION: u64 = 1;
+/// Encoding version of the keyring body. Version 2 adds each identity's history grant;
+/// a version-1 body (no grants) still reads, as "from now on" for everyone.
+const KEYRING_VERSION: u64 = 2;
+
+/// What a consent releases of **this node's own** messages to a trusted identity
+/// (PRD-001 R12, ADR-023 decision 5): chosen by the approver, per grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryGrant {
+    /// From approval onward: the sender key at its current position. The default.
+    #[default]
+    Now,
+    /// Everything this node still holds a key for: iteration 0 of each retained
+    /// generation, so the newcomer reads this node's messages from before approval too.
+    Full,
+}
 
 /// Most identities one node will ever trust. A bound, not a target: it keeps a
 /// corrupt or hostile blob from forcing an unbounded allocation on load.
 pub const MAX_TRUSTED: usize = 1024;
+
+/// **For proofs only.** When set to a number below [`MAX_TRUSTED`], [`Keyring::trust_with`] refuses
+/// past that many identities instead, through the same refusal: R36's proof shows a full keyring's
+/// message without 1,100 production-Argon2id `trust add`s first (#85). Nothing a person runs sets
+/// it; unset, nothing changes. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_KEYRING_CAP_ENV: &str = "VOX_TEST_KEYRING_CAP";
+
+/// How many identities [`Keyring::trust_with`] takes: [`MAX_TRUSTED`], or the test-only
+/// `VOX_TEST_KEYRING_CAP` when it names fewer.
+#[must_use]
+pub fn trust_cap() -> usize {
+    #[cfg(feature = "test-knobs")]
+    if let Some(cap) = std::env::var(TEST_KEYRING_CAP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return cap.min(MAX_TRUSTED);
+    }
+    MAX_TRUSTED
+}
+
+/// [`trust_cap`] as a person reads it, with thousands grouped: `1,024`. A refusal that names the
+/// cap names the one in force, so a test build's lowered cap is never reported as 1,024 (#85).
+#[must_use]
+pub fn trust_cap_words() -> String {
+    let digits = trust_cap().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// Longest petname. Long enough for `codex@some-long-hostname`, short enough that
 /// a name cannot be used to smuggle a payload into a operator's terminal.
@@ -101,6 +150,8 @@ pub fn legacy_trust_sek(signer: &dyn RootSigner) -> Result<Sek> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Keyring {
     entries: BTreeMap<Digest32, String>,
+    /// The identities granted full history; everyone else gets [`HistoryGrant::Now`].
+    full_history: BTreeSet<Digest32>,
 }
 
 impl Keyring {
@@ -118,6 +169,17 @@ impl Keyring {
     /// control characters — it is displayed in a terminal and used to address
     /// members by name.
     pub fn trust(&mut self, fingerprint: Digest32, petname: &str) -> Result<()> {
+        self.trust_with(fingerprint, petname, HistoryGrant::Now)
+    }
+
+    /// [`Keyring::trust`], choosing what the consent releases of this node's own
+    /// history (PRD-001 R12). Re-trusting replaces the choice.
+    pub fn trust_with(
+        &mut self,
+        fingerprint: Digest32,
+        petname: &str,
+        history: HistoryGrant,
+    ) -> Result<()> {
         let name = petname.trim();
         if name.is_empty() || name.len() > MAX_PETNAME {
             return Err(Error::SizeLimitExceeded("petname length"));
@@ -125,11 +187,25 @@ impl Keyring {
         if name.chars().any(char::is_control) {
             return Err(Error::MalformedGovernance("petname control character"));
         }
-        if !self.entries.contains_key(&fingerprint) && self.entries.len() >= MAX_TRUSTED {
+        if !self.entries.contains_key(&fingerprint) && self.entries.len() >= trust_cap() {
             return Err(Error::SizeLimitExceeded("trusted identities"));
         }
         self.entries.insert(fingerprint, name.to_owned());
+        match history {
+            HistoryGrant::Full => self.full_history.insert(fingerprint),
+            HistoryGrant::Now => self.full_history.remove(&fingerprint),
+        };
         Ok(())
+    }
+
+    /// What a consent to `fingerprint` releases of this node's history.
+    #[must_use]
+    pub fn history(&self, fingerprint: &Digest32) -> HistoryGrant {
+        if self.full_history.contains(fingerprint) {
+            HistoryGrant::Full
+        } else {
+            HistoryGrant::Now
+        }
     }
 
     /// Stop trusting `fingerprint`. Returns whether it was trusted.
@@ -146,6 +222,7 @@ impl Keyring {
     /// has. It stops them reading what comes *next*. ADR-007's enforcement honesty
     /// applies and nothing here can say otherwise.
     pub fn untrust(&mut self, fingerprint: &Digest32) -> bool {
+        self.full_history.remove(fingerprint);
         self.entries.remove(fingerprint).is_some()
     }
 
@@ -184,13 +261,16 @@ impl Keyring {
         self.entries.is_empty()
     }
 
-    /// Canonical CBOR body: `[version, [[fingerprint, petname], ..]]`.
+    /// Canonical CBOR body: `[version, [[fingerprint, petname, full_history], ..]]`.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(2).uint(KEYRING_VERSION).array(self.entries.len());
         for (fp, name) in &self.entries {
-            e.array(2).bytes(fp).text(name);
+            e.array(3)
+                .bytes(fp)
+                .text(name)
+                .uint(u64::from(self.full_history.contains(fp)));
         }
         e.finish()
     }
@@ -205,9 +285,10 @@ impl Keyring {
         let version = d
             .uint()
             .map_err(|_| Error::MalformedAtRest("keyring version"))?;
-        if version != KEYRING_VERSION {
+        if version != KEYRING_VERSION && version != 1 {
             return Err(Error::MalformedAtRest("keyring version"));
         }
+        let row_arity = if version == 1 { 2 } else { 3 };
         let n = d
             .array()
             .map_err(|_| Error::MalformedAtRest("keyring len"))?;
@@ -215,11 +296,12 @@ impl Keyring {
             return Err(Error::SizeLimitExceeded("trusted identities"));
         }
         let mut entries = BTreeMap::new();
+        let mut full_history = BTreeSet::new();
         for _ in 0..n {
             let pair = d
                 .array()
                 .map_err(|_| Error::MalformedAtRest("keyring row"))?;
-            if pair != 2 {
+            if pair != row_arity {
                 return Err(Error::MalformedAtRest("keyring row arity"));
             }
             let fp = Digest32::try_from(
@@ -234,11 +316,26 @@ impl Keyring {
             if name.is_empty() || name.len() > MAX_PETNAME {
                 return Err(Error::MalformedAtRest("keyring petname length"));
             }
+            if row_arity == 3 {
+                match d
+                    .uint()
+                    .map_err(|_| Error::MalformedAtRest("keyring history"))?
+                {
+                    0 => {}
+                    1 => {
+                        full_history.insert(fp);
+                    }
+                    _ => return Err(Error::MalformedAtRest("keyring history")),
+                }
+            }
             entries.insert(fp, name);
         }
         d.finish()
             .map_err(|_| Error::MalformedAtRest("keyring trailing"))?;
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            full_history,
+        })
     }
 
     /// Seal and write the keyring. Requires an unlocked identity.

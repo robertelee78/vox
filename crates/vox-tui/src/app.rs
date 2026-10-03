@@ -560,7 +560,7 @@ pub fn run_node(
         .bind(vox_core::node::actor::Bind::Addr(listen))
         .anchors(anchors)
         .headless(signer)
-        .anchor_logs(true)
+        .anchor_boards(true)
         .on_profile_wait(crate::tunnel_cli::say_waiting);
     let cfg = match serve_only {
         Some(creators) => {
@@ -592,7 +592,6 @@ pub fn run_node(
         // What the board actually holds per room, reported when it changes. See below.
         let mut last_board: Vec<String> = Vec::new();
         let mut last_holding: Vec<String> = Vec::new();
-        let mut last_held: Vec<String> = Vec::new();
         let mut stalls = node.subscribe();
         let mut ticks = tokio::time::interval(std::time::Duration::from_millis(500));
         // **One Ctrl-C listener for the whole loop, not one per turn.** A listener sees only
@@ -675,11 +674,10 @@ pub fn run_node(
                         .iter()
                         .map(|a| {
                             format!(
-                                "{} {}m/{}p{}",
+                                "{} {}m/{}p",
                                 crate::tunnel_cli::short_id_of(&a.channel_id),
                                 a.members,
                                 a.pending,
-                                a.entries.map_or(String::new(), |e| format!("/{e}e"))
                             )
                         })
                         .collect();
@@ -710,29 +708,6 @@ pub fn run_node(
                         println!("vox node: board — {line}");
                     }
                     last_holding = holding;
-                    // **Who this anchor's copy holds back for equivocating** (V210-66): said on
-                    // change, and again after a restart, since the freeze is kept.
-                    let held: Vec<String> = view
-                        .anchoring
-                        .iter()
-                        .flat_map(|a| {
-                            a.equivocations.iter().map(|(author, seq)| {
-                                format!(
-                                    "{} holds {} back: {}",
-                                    crate::tunnel_cli::short_id_of(&a.channel_id),
-                                    crate::ident::member_name(&view.trusted, author),
-                                    crate::ident::equivocation_notice(
-                                        &crate::ident::member_name(&view.trusted, author),
-                                        *seq
-                                    )
-                                )
-                            })
-                        })
-                        .collect();
-                    for line in held.iter().filter(|l| !last_held.contains(*l)) {
-                        println!("vox node: board — {line}");
-                    }
-                    last_held = held;
                     // Drained without blocking: this arm also has an anchors file to
                     // write, and a status line nobody reads is better than a tick nobody
                     // reaches.
@@ -817,22 +792,6 @@ pub fn run_node(
                                 vox_core::node::api::NodeEvent::NodeNote { note } => {
                                     eprintln!("vox node: {note}");
                                 }
-                                vox_core::node::api::NodeEvent::Synced {
-                                    channel_id,
-                                    applied,
-                                    ..
-                                } => {
-                                    // Not a failure — but on an anchor it is the whole job, and
-                                    // seeing it arrive is how "the anchor has it but nobody else
-                                    // does" becomes distinguishable from "nobody sent it".
-                                    if applied > 0 {
-                                        eprintln!(
-                                            "vox node: took {applied} entr{} for room {}",
-                                            if applied == 1 { "y" } else { "ies" },
-                                            crate::tunnel_cli::short_id_of(&channel_id)
-                                        );
-                                    }
-                                }
                                 _ => {}
                             },
                             vox_core::node::actor::EventStreamItem::Lagged(n) => {
@@ -901,14 +860,20 @@ fn may_wake(text: &str) -> bool {
     vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.urgent && !e.to.is_empty())
 }
 
+/// Whether `text` is an envelope that answers an earlier one: it may be a reply some session is
+/// owed a notice for (V030-20).
+fn may_answer(text: &str) -> bool {
+    vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.re.is_some())
+}
+
 /// The interrupt decision for one entry that just landed in `channel_id`: when it addresses
-/// this node and is marked urgent (ADR-020 §6), and has hops left (§9), wake every session
-/// registered on this node but the one that posted it. Everything else waits for the
-/// session's next turn.
+/// this node and is marked urgent (ADR-020 §6), and has hops left (§9), every session registered
+/// on this node but the one that posted it, and but one already in its reply chain (V210-121), is
+/// owed a notice. [`tend`] sends it. Everything else waits for the session's next turn.
 ///
-/// `view` is the node's view as the entry is judged: the room's log, for the hop budget
-/// of a reply chain, and the keyring, for the name the wake gives the author.
-async fn judge(
+/// `view` is the node's view as the entry is judged: the room's log, for the hop budget and the
+/// reply chain.
+fn judge(
     paths: &vox_core::node::paths::Paths,
     view: &vox_core::node::api::NodeView,
     channel_id: &vox_core::hash::Digest32,
@@ -937,23 +902,14 @@ async fn judge(
         );
         return;
     }
-    let room_name = view
-        .channels
-        .iter()
-        .find(|c| c.channel_id == *channel_id)
-        .and_then(|c| c.local_name.clone())
-        .unwrap_or_default();
-    let me = view.identity.as_ref().map(|i| i.fingerprint);
     // **A message wakes the agents of the nodes it addresses** (V210-161): `to` names nodes by
     // fingerprint, and every session of this node hears every room it holds.
-    let Some(me) = me else {
+    let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
         return;
     };
     if !envelope.may_interrupt(&vox_core::node::link::b32_encode(&me)) {
         return;
     }
-    let author = crate::ident::author_for(&view.trusted, Some(&me), &row.author);
-    let to = crate::agent_hook::addressed(&row.text, Some(&me), &view.trusted);
     for session in crate::wake::registered(paths) {
         if row.author == me && envelope.from == session.session {
             continue;
@@ -970,58 +926,241 @@ async fn judge(
             );
             continue;
         }
-        // **Attributed and framed as the drain is** (V210-79): the wake arrives as the
-        // harness's own user message, so the bare body read as the operator speaking.
-        let text = crate::agent_hook::render_wake(
-            &room[..12.min(room.len())],
-            &room_name,
-            &row.entry_hash,
-            &author,
-            &to,
-            &envelope.body,
-        );
-        // Recorded **before** the wake is sent, so the session's answer with no `--re` replies to
-        // this (V210-121) however soon it comes: recorded after, an answer could beat the record.
-        // A wake that then fails still put the message before the session's next turn.
+        // Recorded **before** the notice is sent, so the session's answer with no `--re` replies
+        // to this (V210-121) however soon it comes: recorded after, an answer could beat the
+        // record. A notice that then fails still put the message before the session's next turn.
         crate::wake::note_woke(paths, &session.session, &room, &row.entry_hash);
-        let entry = vox_core::node::link::b32_encode(&row.entry_hash);
-        let paths = paths.clone();
-        // **One wedged session must not stall every other wake.** Each is its own task,
-        // bounded by a deadline: a session endpoint that accepts and never reads would
-        // otherwise hold this loop — and so every later interrupt — indefinitely.
-        tokio::spawn(async move {
-            let woke = crate::wake::wake(&session, &entry, &text);
-            match tokio::time::timeout(WAKE_DEADLINE, woke).await {
-                Ok(Ok(())) => {}
-                // A session that has ended is forgotten, so its name's later messages are
-                // not tried against it for ever.
-                Ok(Err(crate::wake::WakeError::Gone(e))) => {
-                    let forgot = crate::wake::forget(&paths, &session);
+        // **Codex is never woken** (V210-169): nothing is owed it in notices; it reads at its next
+        // turn, and a poster on this node is told so ([`crate::wake::uninterruptible`]).
+        if !crate::wake::wakeable(&session.harness) {
+            continue;
+        }
+        let mut n = crate::wake::notices(paths, &session.session);
+        if !n.urgent_due {
+            n.urgent_due = true;
+            if let Err(e) = crate::wake::save_notices(paths, &session.session, &n) {
+                eprintln!(
+                    "vox daemon: could not record that session {} is owed a notice: {e}",
+                    session.session
+                );
+            }
+        }
+    }
+}
+
+/// Send each session the notice it is owed now, if any (ADR-020 §6; V030-15, V030-20).
+///
+/// A session hears every room its node holds (V210-163), so it is owed one notice across all of
+/// them. It is looked at when it is owed an urgent notice, while a reply to it is unread, and
+/// when an answer to anything landed in one of its rooms (`answered`). What it is owed is
+/// **counted here, just before sending**, from each room and the session's cursor there, so a
+/// message its drain already read is never announced. [`crate::wake::tend`] has the rules; the
+/// notice carries counts and senders, never a message.
+fn tend(
+    paths: &vox_core::node::paths::Paths,
+    view: &vox_core::node::api::NodeView,
+    answered: &std::collections::HashSet<vox_core::hash::Digest32>,
+    t: &mut Tending,
+) {
+    let (settings, problems) = crate::wake::Settings::load(paths);
+    let now = crate::wake::now_millis();
+    // **A setting that cannot be read is said, not silently replaced**: when it changes, and
+    // again every ten minutes while it stands.
+    if problems != t.problems || now.saturating_sub(t.problems_said) >= 600_000 {
+        for problem in &problems {
+            eprintln!("vox daemon: {problem}; its default is used until it is fixed");
+        }
+        t.problems_said = if problems.is_empty() { 0 } else { now };
+        t.problems = problems;
+    }
+    let said_held = &mut t.said_held;
+    let me = view.identity.as_ref().map(|i| i.fingerprint);
+    let starting = std::mem::take(&mut t.starting);
+    let any_answered = view
+        .open_channels
+        .iter()
+        .any(|d| answered.contains(&d.channel_id));
+    for session in crate::wake::registered(paths) {
+        if !crate::wake::wakeable(&session.harness) {
+            continue;
+        }
+        let mut n = crate::wake::notices(paths, &session.session);
+        // Looked at only when something may be owed: every room is read to count it.
+        if !(starting || n.active(&settings) || any_answered) {
+            continue;
+        }
+        // Each room's unread, and the session's read position across all of them: the notice
+        // is outstanding until any of its cursors moves.
+        let mut rooms = Vec::new();
+        let mut cursors = Vec::new();
+        for d in &view.open_channels {
+            let room = vox_core::node::link::b32_encode(&d.channel_id);
+            let cursor = crate::agent_hook::load_cursor(paths, &room, &session.session);
+            let ahead = crate::agent_hook::delivered_ahead(paths, &room, &session.session);
+            cursors.push(format!(
+                "{room}={}",
+                cursor
+                    .as_ref()
+                    .map(vox_core::node::link::b32_encode)
+                    .unwrap_or_default()
+            ));
+            let (urgent, replies) = crate::wake::unread(&d.timeline, me, &session, cursor, &ahead);
+            if !urgent.is_empty() || !replies.is_empty() {
+                rooms.push((d, urgent, replies));
+            }
+        }
+        let urgent: usize = rooms.iter().map(|(_, u, _)| u.len()).sum();
+        let newest_reply = rooms
+            .iter()
+            .flat_map(|(_, _, r)| r.iter())
+            .max_by_key(|r| r.arrival)
+            .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
+        let before = n.clone();
+        // **At start every session is counted from its cursors.** This guards one window only: a
+        // daemon killed after a row reached its store and before the wake loop looked at it (the
+        // next sweep, at most 2 s). Such a row is history to the restarted loop, so nothing new
+        // marks it. Rows that land while the daemon is down arrive by sync after it starts and are
+        // judged as new without this. The window cannot be staged through the shipped binary
+        // (`vox room post` needs a running node), so this is unproven by mutant: a review-only guard.
+        if starting && urgent > 0 {
+            n.urgent_due = true;
+        }
+        let outcome = crate::wake::tend(
+            &mut n,
+            Some(cursors.join(" ")),
+            urgent,
+            newest_reply,
+            session.idle(now, settings.busy_idle),
+            now,
+            &settings,
+        );
+        if n != before {
+            if let Err(e) = crate::wake::save_notices(paths, &session.session, &n) {
+                eprintln!(
+                    "vox daemon: could not record the notices owed to session {}: {e}",
+                    session.session
+                );
+            }
+        }
+        match outcome {
+            crate::wake::Tended::Quiet => {}
+            crate::wake::Tended::AlreadyRead => eprintln!(
+                "vox daemon: not waking session {}: it already read the urgent message(s) owed \
+                 a notice",
+                session.session
+            ),
+            crate::wake::Tended::Held => {
+                if said_held.insert(session.session.clone()) {
                     eprintln!(
-                        "vox daemon: session {} is gone ({e}){}",
+                        "vox daemon: not waking session {} again yet: the notice sent to it is \
+                         outstanding until it reads or {}s pass",
                         session.session,
-                        if forgot {
-                            "; forgot its registration"
-                        } else {
-                            ""
-                        }
+                        settings.wake_hold.as_secs()
                     );
                 }
-                // Reported, never fatal: an agent that cannot be interrupted still reads the
-                // message on its next turn, which is the whole point of queueing always.
-                Ok(Err(e)) => eprintln!(
-                    "vox daemon: could not interrupt session {}: {e}",
+            }
+            crate::wake::Tended::Send => {
+                said_held.remove(&session.session);
+                // The reader's own name for each sender, and "you" for another session of this
+                // node (V210-162): its own fingerprint read as "not in keyring".
+                let me = view.identity.as_ref().map(|i| i.fingerprint);
+                let name = |r: &&vox_core::node::api::MessageRow| {
+                    crate::ident::author_for(&view.trusted, me.as_ref(), &r.author)
+                };
+                let owed: Vec<crate::agent_hook::Owed> = rooms
+                    .iter()
+                    .map(|(d, urgent, replies)| {
+                        let label = vox_core::node::link::b32_encode(&d.channel_id);
+                        let room_name = view
+                            .channels
+                            .iter()
+                            .find(|c| c.channel_id == d.channel_id)
+                            .and_then(|c| c.local_name.clone())
+                            .unwrap_or_default();
+                        crate::agent_hook::Owed {
+                            room_label: label[..12.min(label.len())].to_owned(),
+                            room_name,
+                            urgent: urgent.iter().map(name).collect(),
+                            replies: replies.iter().map(name).collect(),
+                        }
+                    })
+                    .collect();
+                let text = crate::agent_hook::render_wake(&owed);
+                let hold = u64::try_from(settings.wake_hold.as_millis()).unwrap_or(u64::MAX);
+                deliver(paths.clone(), session, text, (before, n, hold));
+            }
+        }
+    }
+}
+
+/// What the wake loop remembers between looks (see [`tend`]).
+#[derive(Default)]
+struct Tending {
+    /// The first look since the daemon started: every session is counted from its cursor.
+    starting: bool,
+    /// The sessions already told, on stderr, that their notice is held.
+    said_held: std::collections::HashSet<String>,
+    /// The settings problems last said, and when.
+    problems: Vec<String>,
+    problems_said: u64,
+}
+
+/// Wake `session` with `text`, on a task of its own.
+///
+/// **One wedged session must not stall every other wake.** Each is its own task, bounded by a
+/// deadline: a session endpoint that accepts and never reads would otherwise hold the wake
+/// loop — and so every later interrupt — indefinitely.
+///
+/// **A notice that does not arrive stays owed** (`undo`: the record before and after it was sent,
+/// and the hold): it is tried again once the hold passes or the session's cursor moves.
+fn deliver(
+    paths: vox_core::node::paths::Paths,
+    session: crate::wake::Session,
+    text: String,
+    undo: (crate::wake::Notices, crate::wake::Notices, u64),
+) {
+    tokio::spawn(async move {
+        let failed = |paths: &vox_core::node::paths::Paths| {
+            crate::wake::undelivered(paths, &session.session, &undo.0, &undo.1, undo.2);
+        };
+        let woke = crate::wake::wake(&session, &text);
+        match tokio::time::timeout(WAKE_DEADLINE, woke).await {
+            Ok(Ok(())) => eprintln!("vox daemon: woke session {}", session.session),
+            // A session that has ended is forgotten, so its name's later messages are
+            // not tried against it for ever.
+            Ok(Err(crate::wake::WakeError::Gone(e))) => {
+                let forgot = crate::wake::forget(&paths, &session);
+                eprintln!(
+                    "vox daemon: session {} is gone ({e}){}",
+                    session.session,
+                    if forgot {
+                        "; forgot its registration"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            // Reported, never fatal: an agent that cannot be interrupted still reads the
+            // message on its next turn, which is the whole point of queueing always.
+            Ok(Err(e)) => {
+                failed(&paths);
+                eprintln!(
+                    "vox daemon: could not interrupt session {}: {e}; it stays owed, and is \
+                     tried again",
                     session.session
-                ),
-                Err(_) => eprintln!(
-                    "vox daemon: interrupting session {} took longer than {}s; gave up — it \
-                     reads the message on its next turn",
+                );
+            }
+            Err(_) => {
+                failed(&paths);
+                eprintln!(
+                    "vox daemon: interrupting session {} took longer than {}s; gave up for now — \
+                     it stays owed, and is tried again",
                     session.session,
                     WAKE_DEADLINE.as_secs()
-                ),
+                );
             }
-        });
-    }
+        }
+    });
 }
 
 impl AppError {
@@ -1053,12 +1192,12 @@ enum Asked<T> {
     Stopped(StopSignal),
 }
 
-/// `VOX_IDENTITY_PASSPHRASE`, when set and not empty: how an agent's harness gives a daemon its
-/// identity passphrase (V210-159, decider 2026-10-02, option A).
+/// `VOX_IDENTITY_PASSPHRASE`, when set: how an agent's harness gives a daemon its identity
+/// passphrase (V210-159, decider 2026-10-02, option A). Set to nothing, it gives none on purpose
+/// (V030-36).
 fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
     std::env::var("VOX_IDENTITY_PASSPHRASE")
         .ok()
-        .filter(|p| !p.is_empty())
         .map(zeroize::Zeroizing::new)
 }
 
@@ -1074,15 +1213,26 @@ fn daemon_passphrases(
     let raw = if let Some(path) = &passphrase_file {
         crate::tunnel_cli::passphrase_file_text(path)?
     } else if let Some(identity) = daemon_env_passphrase() {
-        return Ok(Asked::Got((identity, Vec::new())));
+        // Said whichever way the passphrase came: an empty one set in the environment goes on
+        // without one, and the person is told so here as on every other path (V030-36).
+        return Ok(Asked::Got((encouraged(identity), Vec::new())));
     } else if io::IsTerminal::is_terminal(&io::stdin()) {
         return Ok(match ask_without_echo(rt, stop, "identity passphrase") {
-            Asked::Got(identity) => Asked::Got((nonempty_identity(identity?)?, Vec::new())),
+            Asked::Got(identity) => match identity? {
+                Some(identity) => Asked::Got((encouraged(identity), Vec::new())),
+                None => {
+                    return Err(AppError::Usage(format!(
+                        "{NO_IDENTITY_PASSPHRASE} The terminal's input ended before one was \
+                         typed."
+                    )))
+                }
+            },
             Asked::Stopped(signal) => Asked::Stopped(signal),
         });
     } else {
         match read_piped_stdin(rt, stop) {
-            Asked::Got(raw) => raw?,
+            // Nothing at all on stdin is no passphrase given; an empty line is an empty one.
+            Asked::Got(raw) => given_on_stdin(raw?)?,
             Asked::Stopped(signal) => return Ok(Asked::Stopped(signal)),
         }
     };
@@ -1116,21 +1266,35 @@ fn daemon_passphrases(
         .map(|l| l.trim_end_matches('\r').to_owned())
         .filter(|l| !l.is_empty())
         .collect();
-    Ok(Asked::Got((nonempty_identity(identity)?, rooms)))
+    Ok(Asked::Got((encouraged(identity), rooms)))
 }
 
-/// `identity`, or the reason an empty one cannot unlock anything.
-fn nonempty_identity(
-    identity: zeroize::Zeroizing<String>,
-) -> Result<zeroize::Zeroizing<String>, AppError> {
-    if identity.is_empty() {
-        return Err(AppError::Usage(
-            "no identity passphrase. Type it at the terminal, pipe it in (`echo … | vox \
-             daemon`), set VOX_IDENTITY_PASSPHRASE, or pass --passphrase-file."
-                .into(),
-        ));
+/// `identity`, after one line encouraging a passphrase when it is empty.
+///
+/// **An empty identity passphrase is accepted** (V030-36, decider 2026-10-02: "passphrase is a
+/// good idea, but is technically optional"). It was refused here, so an identity made with none
+/// could never be served by a daemon.
+fn encouraged(identity: zeroize::Zeroizing<String>) -> zeroize::Zeroizing<String> {
+    crate::tunnel_cli::encouraged(identity.as_str(), "identity");
+    identity
+}
+
+/// What to say when nothing at all was given for the identity passphrase.
+const NO_IDENTITY_PASSPHRASE: &str =
+    "no identity passphrase. Type it at the terminal (Enter alone \
+     gives none), pipe it in (`echo … | vox daemon`; an empty line gives none), set \
+     VOX_IDENTITY_PASSPHRASE, or pass --passphrase-file.";
+
+/// Stdin that is not a terminal, read to its end: refused when it held nothing at all. A harness
+/// that closes stdin without writing has given nothing, and an identity whose passphrase that is
+/// not would only fail later as a wrong one; an empty line is how to give none.
+fn given_on_stdin(raw: zeroize::Zeroizing<String>) -> Result<zeroize::Zeroizing<String>, AppError> {
+    if raw.is_empty() {
+        return Err(AppError::Usage(format!(
+            "{NO_IDENTITY_PASSPHRASE} Stdin ended with nothing on it."
+        )));
     }
-    Ok(identity)
+    Ok(raw)
 }
 
 /// How long `vox daemon` reads a stdin that is not a terminal before it says what it is waiting
@@ -1183,13 +1347,13 @@ fn read_piped_stdin(
 /// loaded machine.
 const HANGUP_GRACE: Duration = Duration::from_secs(1);
 
-/// One line typed at the terminal, without echo, racing `stop`. A stop leaves the terminal as it
-/// was: echo comes back whichever ends the wait.
+/// One line typed at the terminal, without echo, racing `stop`; `None` when its input ended with
+/// none. A stop leaves the terminal as it was: echo comes back whichever ends the wait.
 fn ask_without_echo(
     rt: &tokio::runtime::Runtime,
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
     prompt: &str,
-) -> Asked<Result<zeroize::Zeroizing<String>, AppError>> {
+) -> Asked<Result<Option<zeroize::Zeroizing<String>>, AppError>> {
     let _ = write!(io::stderr(), "{prompt}: ");
     let _ = io::stderr().flush();
     let quiet = no_echo::EchoOff::new();
@@ -1200,8 +1364,10 @@ fn ask_without_echo(
             signal = &mut *stop => return Asked::Stopped(signal),
         };
         let read = match read {
-            Ok(Ok(Some(line))) => return Asked::Got(Ok(line)),
-            Ok(Ok(None)) => Ok(zeroize::Zeroizing::new(String::new())),
+            Ok(Ok(Some(line))) => return Asked::Got(Ok(Some(line))),
+            // End of input, not an empty line: nothing was typed, which is not an empty
+            // passphrase (V030-36).
+            Ok(Ok(None)) => Ok(None),
             Ok(Err(e)) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
             Err(e) => Err(AppError::Usage(format!("reading the terminal: {e}"))),
         };
@@ -1485,7 +1651,18 @@ pub fn run_daemon(
     anchors: vox_core::nat::bootstrap::BootstrapSet,
     anchor_specs: Vec<String>,
     passphrase_file: Option<std::path::PathBuf>,
+    metrics: Option<std::net::SocketAddr>,
 ) -> Result<(), AppError> {
+    // Refused before anything is read or unlocked: a metrics endpoint the network can
+    // reach names every peer and room this node talks to (PRD-001 R38).
+    if let Some(addr) = metrics {
+        if !addr.ip().is_loopback() {
+            return Err(AppError::Usage(format!(
+                "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or \
+                 ::1); it names every peer and room this node talks to"
+            )));
+        }
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -1596,7 +1773,8 @@ pub fn run_daemon(
                 "passphrase for a closed room ({shut} closed; Enter to start without them)"
             );
             let line = match ask_without_echo(&rt, &mut stop, &prompt) {
-                Asked::Got(line) => line?,
+                // End of input starts it without them, as Enter does.
+                Asked::Got(line) => line?.unwrap_or_default(),
                 Asked::Stopped(signal) => {
                     return stopped_while_starting(rt, Some(&node), signal);
                 }
@@ -1677,10 +1855,26 @@ pub fn run_daemon(
         });
     }
 
+    if let Some(addr) = metrics {
+        let listener = rt
+            .block_on(vox_core::node::status::bind_metrics(addr))
+            .map_err(|e| AppError::Usage(e.to_string()))?;
+        let bound = listener.local_addr().map_err(AppError::Io)?;
+        rt.spawn(vox_core::node::status::serve_metrics(
+            listener,
+            node.clone(),
+        ));
+        println!("vox daemon: metrics http://{bound}/metrics");
+    }
+
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
     let _ipc = rt
         .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
         .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
+
+    // Tell the operator when `vox status` would flag something, and when it clears
+    // (PRD-001 R37). Off with `notify = off` in the profile's config file.
+    rt.spawn(crate::notify::watch(node.clone(), paths.clone()));
 
     let fp = node
         .view()
@@ -1702,7 +1896,7 @@ pub fn run_daemon(
     // **The interrupt path (ADR-020 §6).** The daemon is the only thing that sees
     // every entry as it lands and also knows which local sessions exist, so it is
     // where "addressed and urgent" turns into a wake. The rule is deliberately
-    // narrow: a message interrupts only if it names this agent *and* is marked
+    // narrow: a message interrupts only if it names this node *and* is marked
     // urgent. Everything else waits for the next turn, because an interrupt that
     // fires on everything is a queue with worse manners.
     //
@@ -1747,6 +1941,16 @@ pub fn run_daemon(
                 })
                 .collect();
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            // The rooms where an answer to anything landed since the last look: a session there
+            // may now be owed a reply's notice (V030-20).
+            let mut answered: std::collections::HashSet<vox_core::hash::Digest32> =
+                std::collections::HashSet::new();
+            let mut tending = Tending {
+                starting: true,
+                ..Tending::default()
+            };
+            // Counted at once, not at the first tick.
+            tend(&paths, &node.view(), &answered, &mut tending);
             loop {
                 let sweep = tokio::select! {
                     item = events.next() => match item {
@@ -1764,10 +1968,27 @@ pub fn run_daemon(
                                 vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
                                     // The view — every open room's timeline — is copied only
                                     // for a message that could interrupt someone.
-                                    if seen.insert(row.entry_hash) && may_wake(&row.text) {
-                                        judge(&paths, &node.view(), &channel_id, &row).await;
+                                    if seen.insert(row.entry_hash) {
+                                        // A ping is the daemon's to answer, never a model's
+                                        // (V030-16).
+                                        if crate::ping::is_ping(&row.text) {
+                                            crate::ping::answer(
+                                                &node,
+                                                &paths,
+                                                &node.view(),
+                                                channel_id,
+                                                &row,
+                                            );
+                                        }
+                                        if may_wake(&row.text) {
+                                            judge(&paths, &node.view(), &channel_id, &row);
+                                        }
+                                        if may_answer(&row.text) {
+                                            answered.insert(channel_id);
+                                        }
                                     }
-                                    false
+                                    // Looked at at once, rather than at the next tick.
+                                    true
                                 }
                                 vox_core::node::api::NodeEvent::Synced { .. }
                                 | vox_core::node::api::NodeEvent::SenderKeyReceived { .. } => true,
@@ -1782,6 +2003,7 @@ pub fn run_daemon(
                     // Every unseen row is marked seen; only one that could interrupt
                     // someone is copied out to be judged.
                     let mut fresh = Vec::new();
+                    let mut pings = Vec::new();
                     for d in &view.open_channels {
                         let from = match swept.get(&d.channel_id) {
                             Some(&(n, last))
@@ -1793,8 +2015,17 @@ pub fn run_daemon(
                             _ => 0,
                         };
                         for r in d.timeline.iter_from(from) {
-                            if seen.insert(r.entry_hash) && may_wake(&r.text) {
+                            if !seen.insert(r.entry_hash) {
+                                continue;
+                            }
+                            if may_wake(&r.text) {
                                 fresh.push((d.channel_id, r.clone()));
+                            }
+                            if crate::ping::is_ping(&r.text) {
+                                pings.push((d.channel_id, r.clone()));
+                            }
+                            if may_answer(&r.text) {
+                                answered.insert(d.channel_id);
                             }
                         }
                         swept.insert(
@@ -1803,8 +2034,13 @@ pub fn run_daemon(
                         );
                     }
                     for (cid, row) in fresh {
-                        judge(&paths, &view, &cid, &row).await;
+                        judge(&paths, &view, &cid, &row);
                     }
+                    for (cid, row) in pings {
+                        crate::ping::answer(&node, &paths, &view, cid, &row);
+                    }
+                    tend(&paths, &view, &answered, &mut tending);
+                    answered.clear();
                 }
             }
         });

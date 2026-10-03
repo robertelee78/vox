@@ -84,7 +84,7 @@ use hostile::{
     answer_circuits, ask_circuit, connect, create_room, daemon, fingerprint, free_port,
     member_signer, profile_dir, put, stranger, vox_in, CircuitAnswer, Rt,
 };
-use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::governance::membership::issue_consent_grant;
 use vox_core::group::{SenderChain, Skdm};
 use vox_core::hash::{sha256, Digest32};
@@ -313,6 +313,9 @@ fn feed_entry(author: &dyn RootSigner, room: Digest32, prev: &[Entry], payload: 
         payload_hash: sha256(&payload),
         payload_len: payload.len() as u64,
         end_of_feed: false,
+        // v0.3.0's ordering fields (ADR-023): no claimed time and nothing seen, as a fresh feed.
+        claimed_ms: 0,
+        seen: Vec::new(),
     };
     Entry::build_signed(author, skeleton, payload).expect("APPARATUS (harness error): a feed entry")
 }
@@ -442,7 +445,6 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let s2 = stranger(0x52);
     let policy = ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        deniability_mode: DeniabilityMode::Attributable,
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };

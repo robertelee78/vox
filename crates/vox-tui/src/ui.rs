@@ -23,6 +23,11 @@ use crate::viewmodel::{MemberView, MessageView, Reachability, SyncStatus, Trust,
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
 pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 
+/// Prefixed to a message that arrived after the rows below it were already shown — a member
+/// who was offline, or a sync that caught up (ADR-023 decision 1). It sits in its true place in
+/// history; without the marker it would go unseen above what the reader already read.
+pub const LATE_MARKER: &str = "[late] ";
+
 /// Where a member stands with you, in words: whether you trust it, and whether it reads you here.
 /// Nothing for yourself.
 #[must_use]
@@ -69,6 +74,7 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     match ui.screen {
         Screen::ChannelList => render_channel_list(frame, chunks[0], vm, ui),
         Screen::Channel => render_channel(frame, chunks[0], vm, ui),
+        Screen::Tunnels => render_tunnels(frame, chunks[0], vm, ui),
     }
     render_status_bar(frame, chunks[1], vm);
     render_hint_bar(frame, chunks[2], ui, vm);
@@ -128,6 +134,68 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
     frame.render_widget(list, area);
 }
 
+/// The live tunnels, one per line with its number, member, service and how long it has been
+/// still, then those that ended for a reason, with that reason (V030-11).
+fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
+    let now = vox_core::transport::quic::unix_now();
+    let ago = |t: u64| {
+        let s = now.saturating_sub(t);
+        if s < 120 {
+            format!("{s}s")
+        } else if s < 7200 {
+            format!("{}m", s / 60)
+        } else {
+            format!("{}h", s / 3600)
+        }
+    };
+    let short = |p: &vox_core::hash::Digest32| -> String {
+        vox_core::node::link::b32_encode(p)
+            .chars()
+            .take(12)
+            .collect()
+    };
+    let mut items: Vec<ListItem> = vm
+        .tunnels
+        .iter()
+        .map(|t| {
+            let marker = if ui.selected_tunnel == Some(t.id) {
+                "▶ "
+            } else {
+                "  "
+            };
+            let way = if t.outbound { "to" } else { "from" };
+            ListItem::new(format!(
+                "{marker}tunnel {} {way} {} for {}: open {}, last moved {} ago",
+                t.id,
+                short(&t.peer),
+                t.service,
+                ago(t.opened),
+                ago(t.last_moved)
+            ))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new("  no tunnel is open"));
+    }
+    for t in vm.closed_tunnels.iter().rev() {
+        let way = if t.outbound { "to" } else { "from" };
+        items.push(ListItem::new(format!(
+            "  tunnel {} {way} {} for {} was {} {} ago",
+            t.id,
+            short(&t.peer),
+            t.service,
+            t.why,
+            ago(t.closed)
+        )));
+    }
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Tunnels (x: close the selected one · Esc: back)"),
+    );
+    frame.render_widget(list, area);
+}
+
 fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiState) {
     let Some(channel) = vm.active.as_ref() else {
         let p = Paragraph::new("No channel open").block(Block::default().borders(Borders::ALL));
@@ -154,13 +222,36 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         focused(ui, Focus::Timeline),
     );
     render_composer(frame, body[1], &ui.composer, focused(ui, Focus::Composer));
+    // Members above, and under them what is shared in the room (V030-25), when anything is.
+    let side = if channel.shared.is_empty() {
+        vec![cols[1]]
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(
+                    u16::try_from(channel.shared.len().saturating_add(2)).unwrap_or(u16::MAX),
+                ),
+            ])
+            .split(cols[1])
+            .to_vec()
+    };
     render_members(
         frame,
-        cols[1],
+        side[0],
         &channel.members,
         ui.selected_member,
         focused(ui, Focus::Members),
     );
+    if let Some(area) = side.get(1) {
+        let items: Vec<ListItem> = channel
+            .shared
+            .iter()
+            .map(|s| ListItem::new(Line::from(s.clone())))
+            .collect();
+        frame.render_widget(List::new(items).block(pane_block("Shared", false)), *area);
+    }
 }
 
 fn focused(ui: &UiState, pane: Focus) -> bool {
@@ -192,13 +283,24 @@ fn render_timeline(
                 .body
                 .clone()
                 .unwrap_or_else(|| UNDECRYPTABLE_MARKER.to_owned());
-            Line::from(vec![
-                Span::styled(
-                    format!("{}: ", m.author_nick),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(body),
-            ])
+            let mut spans = Vec::with_capacity(3);
+            if m.late {
+                // In its true place, above rows already read: say so, or it goes unseen.
+                spans.push(Span::styled(
+                    LATE_MARKER,
+                    Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ));
+            }
+            spans.push(Span::styled(
+                if m.addressed.is_empty() {
+                    format!("{}: ", m.author_nick)
+                } else {
+                    format!("{} {}: ", m.author_nick, m.addressed)
+                },
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(body));
+            Line::from(spans)
         })
         .chain(notices.rev());
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
@@ -337,11 +439,12 @@ fn render_hint_bar(frame: &mut Frame, area: Rect, ui: &UiState, vm: &ViewModel) 
     }
     let hint = match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · :new <name> · :join · :unlock · :lock · Ctrl-C quit"
         }
         Screen::Channel => {
             " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · : command · Esc back"
         }
+        Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
     };
     frame.render_widget(Paragraph::new(hint), area);
 }

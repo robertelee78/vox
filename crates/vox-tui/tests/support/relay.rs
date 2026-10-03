@@ -194,6 +194,29 @@ impl Anchor {
             })
     }
 
+    /// Where the anchor's output stands now, after draining it: pass it to
+    /// [`Self::circuits_since`] to read only the reports printed after this moment.
+    pub fn mark(&mut self) -> usize {
+        let _ = self.proc.transcript();
+        self.proc.seen.len()
+    }
+
+    /// The most circuits the anchor reported carrying in what it printed after `mark`, after
+    /// draining for `settle`. With no report since, the count it last reported (a report is
+    /// printed on change only); with none at all, `CANNOT MEASURE`.
+    pub fn circuits_since(&mut self, mark: usize, settle: Duration) -> usize {
+        let last = self.circuits(settle);
+        self.proc.seen[mark.min(self.proc.seen.len())..]
+            .iter()
+            .filter_map(|l| {
+                let rest = l.strip_prefix("vox node: ")?;
+                let (_, after) = rest.split_once(" peer(s) connected, ")?;
+                after.split_whitespace().next()?.parse::<usize>().ok()
+            })
+            .max()
+            .map_or(last, |m| m.max(last))
+    }
+
     /// The circuit count in the latest status report this anchor printed, if it printed one.
     fn last_report(&self) -> Option<usize> {
         self.proc.seen.iter().rev().find_map(|l| {
@@ -364,7 +387,7 @@ impl RelayWorld {
             &host_dir,
             &args(&[
                 "serve",
-                &service,
+                &format!("{service}={service}"),
                 "--anchor",
                 &v4_spec,
                 "--listen",
@@ -421,8 +444,8 @@ impl RelayWorld {
         (ok, t0.elapsed(), out, err)
     }
 
-    /// Start the guest's `vox forward` to the host's service, on `[::1]`; returns the local
-    /// address it bound.
+    /// Start the guest's `vox forward <service>.<host fp>.<room>.vox` to the host's service, on
+    /// `[::1]`; returns the local address it bound.
     pub fn forward(&mut self) -> SocketAddr {
         self.forward_with_anchors(&[])
     }
@@ -441,15 +464,11 @@ impl RelayWorld {
 
     fn spawn_forward(&mut self, spec: &str, extra: &[&str]) -> SocketAddr {
         let listen = self.guest_net().0;
-        let passphrase_file = self.passphrase_file();
+        let address = format!("{}.{}.{}.vox", self.service, self.host_fp, self.room);
         let mut list = vec![
             "forward",
-            &self.room,
-            &self.host_fp,
-            &self.service,
+            &address,
             "127.0.0.1:0",
-            "--passphrase-file",
-            &passphrase_file,
             "--anchor",
             spec,
             "--listen",
@@ -468,13 +487,54 @@ impl RelayWorld {
         at
     }
 
+    /// Start the guest's `vox up` for the room, on `[::1]`; returns the proxy's address and **when
+    /// the test read its `vox up on` line** — the moment a person sees it is up and asks it for
+    /// something, after both production-Argon2id unlocks. Kept where a forward is, so
+    /// [`Self::expect_still_relayed`] reads it.
+    pub fn up(&mut self) -> (SocketAddr, Instant) {
+        let (listen, spec) = self.guest_net();
+        let (listen, spec) = (listen.to_owned(), spec.to_owned());
+        let passphrase_file = self.passphrase_file();
+        let mut up = VoxProc::spawn(
+            "up",
+            &self.guest_dir,
+            &args(&[
+                "up",
+                &self.room,
+                "--passphrase-file",
+                &passphrase_file,
+                "--bind",
+                "127.0.0.1:0",
+                "--anchor",
+                &spec,
+                "--listen",
+                &listen,
+            ]),
+        );
+        let line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
+        let ready = Instant::now();
+        let bound = line
+            .split_whitespace()
+            .nth(3)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| panic!("PRODUCT: no proxy address in `vox up`'s line {line:?}"));
+        self.fwd = Some(up);
+        (bound, ready)
+    }
+
+    /// The host's service's address, as a SOCKS5 client asks `vox up` for it:
+    /// `<service>.<node>.<room>.vox`, the only form that resolves (V030-25).
+    pub fn hostname(&self) -> String {
+        format!("{}.{}.{}.vox", self.service, self.host_fp, self.room)
+    }
+
     /// **The path is a relay, said by the guest.** The forward's upgrade tries a direct dial and
     /// a punch and reports that neither landed. Without this line nothing here is staging a
     /// relayed path, and the caller must not report anything.
     pub fn expect_still_relayed(&mut self) {
         self.fwd
             .as_mut()
-            .expect("APPARATUS: the proof asked for `still relayed` before it started a forward")
+            .expect("APPARATUS: the proof asked for `still relayed` before it started a forward or a proxy")
             .expect_staging_within(
                 Duration::from_secs(60),
                 "`still relayed` for the host",

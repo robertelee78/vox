@@ -28,7 +28,7 @@
 //! useless to the peer and no hole punch can work: the only path is the anchor's relay. With the
 //! shipped binary as a person runs it — `vox node`, `vox serve` on the host, `vox id`,
 //! `vox trust add`, `vox connect` and `vox up` on the guest — the guest must join the host's room
-//! and reach its service over SOCKS5 (`<room>.vox`), [`SYM_REQUESTS`] times, every byte through the
+//! and reach its service over SOCKS5 (`<service>.<node>.<room>.vox`), [`SYM_REQUESTS`] times, every byte through the
 //! anchor and none peer to peer.
 //! - A process that never used its NAT, or a single payload byte peer to peer, is
 //!   `APPARATUS`: the emulator would not be what is being measured.
@@ -71,7 +71,7 @@ mod test_knobs;
 mod family_split;
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -716,10 +716,9 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
             )
         });
     }
-    let anchor_port = UdpSocket::bind("[::]:0")
-        .and_then(|s| s.local_addr())
-        .unwrap_or_else(|e| panic!("APPARATUS (harness error): no free UDP port: {e}"))
-        .port();
+    // Free on IPv4 too: a `[::]:0` pick can be a port another program holds on IPv4, and the
+    // anchor then refuses it (as it must), which was this harness's red, not the product's.
+    let anchor_port = world::free_dual_stack_port();
     let nats = TwoNats::start(Kind::Symmetric, anchor_port);
     let advertise = format!("{},{}", nats.anchor_for_host, nats.anchor_for_guest);
     let mut anchor = VoxProc::spawn_env(
@@ -744,8 +743,9 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
 
     let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
     assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
-    let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
+    let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
     assert!(ok, "PRODUCT (staging): vox id (host): {err}");
+    let host_fp = host_fp.trim().to_owned();
     let (ok, out, err) = vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
@@ -757,7 +757,7 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
         &host_dir,
         &args(&[
             "serve",
-            &service_port.to_string(),
+            &format!("{service_port}={service_port}"),
             "--anchor",
             &host_spec,
             "--listen",
@@ -834,7 +834,7 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
         .and_then(|a| a.parse().ok())
         .unwrap_or_else(|| panic!("PRODUCT: vox up printed no bound address: {line:?}"));
     let payload: Vec<u8> = (0..SYM_PAYLOAD).map(|i| (i % 251) as u8).collect();
-    let hostname = format!("{room}.vox");
+    let hostname = format!("{service_port}.{host_fp}.{room}.vox");
     let outcomes: Vec<Outcome> = (0..SYM_REQUESTS)
         .map(|_| sym_request(proxy, &hostname, service_port, &payload))
         .collect();

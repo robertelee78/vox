@@ -491,7 +491,7 @@ pub fn frontiers_of(dag: &Dag) -> Vec<FeedFrontier> {
 ///   different valid hashes would otherwise never exchange the conflicting entry
 ///   and no fork proof would form (ADR-008 §"Fork / equivocation handling"). The
 ///   pulled conflicting entry is fed into DAG fork handling, which freezes the
-///   author on an attributable proof and raises an alarm on a deniable one.
+///   author on the proof.
 #[must_use]
 pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
     let mut wants = Vec::new();
@@ -615,8 +615,8 @@ pub fn wire_error_for(err: &Error) -> WireError {
         Error::UnsupportedVersion { .. } => WireError::ProtocolVersionUnsupported,
         Error::UnknownAlgoId(_) | Error::UnexpectedAlgo { .. } => WireError::UnknownAlgoId,
         Error::SuiteBelowFloor { .. } => WireError::SuiteBelowFloor,
-        // Signature/authenticator failures, malformed structures, the deniable
-        // boundary, and oversize/CBOR malformation are all "this authenticator/
+        // Signature/authenticator failures, malformed structures, and oversize/CBOR
+        // malformation are all "this authenticator/
         // structure is not acceptable" → AuthenticatorInvalid. (Size limits are a
         // structural rejection; there is no dedicated size code in the M0 table.)
         _ => WireError::AuthenticatorInvalid,
@@ -631,10 +631,11 @@ pub fn wire_error_for_rejected(rej: &Rejected) -> WireError {
         Rejected::Verification(e) => wire_error_for(e),
         Rejected::Feed(_) => WireError::AuthenticatorInvalid,
         Rejected::Fork(_) => WireError::AuthenticatorInvalid,
-        Rejected::GovernanceNotAttributable => WireError::AuthenticatorInvalid,
         // A duplicate is not a hard fail; callers handle it before mapping. If it
         // ever reaches here, treat as a benign authenticator-class rejection.
         Rejected::Duplicate => WireError::AuthenticatorInvalid,
+        // Likewise handled before mapping (`apply_entry`): refused, and the session goes on.
+        Rejected::PreCheckpoint => WireError::AuthenticatorInvalid,
     }
 }
 
@@ -648,10 +649,13 @@ pub enum ApplyOutcome {
     Duplicate,
     /// The entry conflicted with a stored one at the same `(author, seq)`: a fork.
     /// This is a *local security event*, NOT a wire-protocol violation — it is
-    /// recorded/surfaced (an attributable fork freezes the author; a deniable one
-    /// raises an alarm) and sync **continues**. The stream is not closed for a
-    /// fork (ADR-008 §"Fork / equivocation handling").
+    /// recorded/surfaced (the fork freezes the author) and sync **continues**. The stream is
+    /// not closed for a fork (ADR-008 §"Fork / equivocation handling").
     Fork,
+    /// The entry was for a position at or below its author's checkpoint that this node does
+    /// not hold as it (ADR-023 decision 3): refused, not stored, not a fork. Nothing a peer
+    /// can say there is ever shown, so the session **continues**.
+    PreCheckpoint,
 }
 
 /// Apply a received `ENTRY` wire frame to the local [`Dag`] under the full
@@ -687,6 +691,7 @@ pub fn apply_entry<R: AuthorResolver>(
         // A fork is recorded by `accept` (freeze / proof) and surfaced; it does
         // not close the stream.
         Err(Rejected::Fork(_)) => Ok(ApplyOutcome::Fork),
+        Err(Rejected::PreCheckpoint) => Ok(ApplyOutcome::PreCheckpoint),
         Err(other) => Err(wire_error_for_rejected(&other)),
     }
 }
@@ -821,8 +826,12 @@ where
     T: Transport,
     R: AuthorResolver,
 {
-    match frontier_session_peer_inner(t, dag, resolver, admission) {
-        Ok(applied) => Ok(applied),
+    let outcome = frontier_session_peer_inner(t, dag, resolver, admission);
+    // Whatever arrived without a signature and was never chained to a signed entry is not
+    // authentic; it is taken back on every path out of the session (ADR-023 decision 3).
+    let discarded = dag.discard_unverified();
+    match outcome {
+        Ok(applied) => Ok(applied.saturating_sub(discarded)),
         Err(code) => {
             t.close(code);
             Err(code)
@@ -944,12 +953,10 @@ pub enum EntryClass {
     /// (ADR-025): the entry is refused, the rest of the batch is applied, and the port asks again
     /// once it has learned the room's members.
     Unadmitted,
-    /// Arrived without its payload (V210-74). The signature covers the skeleton only, so a peer
-    /// serving the entry can strip it; held, it would fill its position with nothing to log or
-    /// read. Never taken, and still owed: an honest peer serves it whole.
-    Withheld,
-    /// Past a position this side does not hold yet, in an author's feed (V210-74): after a
-    /// withheld entry in the same batch, say. Not taken, and still owed.
+    /// The body of an entry held without one (V030-10): put back, to be stored and shown.
+    BodyArrived,
+    /// Past a position this side does not hold yet, in an author's feed (V210-74). Not taken, and
+    /// still owed.
     Unlinked,
     /// A signed entry that cannot be classified (V210-74), or anything after it in its author's
     /// feed. Refused before anything is stored, and the author's feed is closed here from that
@@ -962,7 +969,7 @@ impl EntryClass {
     /// it is still owed once its author is admitted.
     #[must_use]
     pub fn fills(self) -> bool {
-        !matches!(self, Self::Unadmitted | Self::Withheld | Self::Unlinked)
+        !matches!(self, Self::Unadmitted | Self::Unlinked)
     }
 }
 
@@ -1020,7 +1027,7 @@ pub struct RoomSession {
     pub unadmitted: usize,
     /// Entries refused because their author is frozen.
     pub frozen: usize,
-    /// Entries refused as unheld (V210-74): withheld, unlinked, or unclassifiable.
+    /// Entries refused as unheld (V210-74): unlinked or unclassifiable.
     pub refused: usize,
     /// Forks recorded.
     pub forks: usize,
@@ -1235,10 +1242,10 @@ where
                 EntryClass::Unadmitted => out.unadmitted += 1,
                 EntryClass::Frozen => out.frozen += 1,
                 EntryClass::ForkHandled => out.forks += 1,
-                EntryClass::Withheld | EntryClass::Unlinked | EntryClass::Refused => {
+                EntryClass::Unlinked | EntryClass::Refused => {
                     out.refused += 1;
                 }
-                EntryClass::Stored | EntryClass::Duplicate => {}
+                EntryClass::Stored | EntryClass::Duplicate | EntryClass::BodyArrived => {}
             }
             if class.fills() {
                 coverage.fill(author, seq);
@@ -1323,6 +1330,9 @@ where
 ///   epoch 7 past the entry's own, so it classifies as governance and does not bind;
 /// - `old-row-ids` (V210-74): a room it reopens resumes its row ids from the log rows alone, as
 ///   before V210-73, so its own store gets the collision that lost received messages.
+/// - `refuse-sessions` (PRD-001 R36, #85): it refuses every sync session a peer opens to it, with
+///   the coded reason `EpochMismatch`, so the peer's session ends as the peer's refusal and the
+///   correct node's log is what a proof reads.
 ///
 /// Any other value, or none, sends correctly. The first session announces the build and the mode
 /// on stderr, [`MARKER`](mutant::MARKER), which the proofs require before they measure anything.
@@ -1343,6 +1353,9 @@ pub mod mutant {
         AuthorUnclassifiable,
         OldRowIds,
         AuthorMisbound,
+        WithdrawUnentitled,
+        AdminUnentitled,
+        RefuseSessions,
     }
 
     fn mode() -> Mode {
@@ -1357,6 +1370,9 @@ pub mod mutant {
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
                 "old-row-ids" => Mode::OldRowIds,
                 "author-misbound" => Mode::AuthorMisbound,
+                "withdraw-unentitled" => Mode::WithdrawUnentitled,
+                "admin-unentitled" => Mode::AdminUnentitled,
+                "refuse-sessions" => Mode::RefuseSessions,
                 _ => Mode::Correct,
             };
             eprintln!(
@@ -1364,6 +1380,20 @@ pub mod mutant {
             );
             mode
         })
+    }
+
+    /// Whether this build takes a room off boards even where its node may not end it (V030-14): the
+    /// faulty peer a board must not obey — an admin whose admin was taken back.
+    #[must_use]
+    pub fn withdraws_unentitled() -> bool {
+        mode() == Mode::WithdrawUnentitled
+    }
+
+    /// Whether this build names admins though its identity is not the room's creator (#319): the
+    /// admin with a modified client whose certificate no node may honour.
+    #[must_use]
+    pub fn admins_unentitled() -> bool {
+        mode() == Mode::AdminUnentitled
     }
 
     /// The `HAVE` to send, and the entries to serve unasked.
@@ -1400,6 +1430,13 @@ pub mod mutant {
         Ok((shown, hidden))
     }
 
+    /// `refuse-sessions` (#85): the coded reason this build refuses every inbound sync session
+    /// with.
+    #[must_use]
+    pub fn refuses() -> Option<WireError> {
+        (mode() == Mode::RefuseSessions).then_some(WireError::EpochMismatch)
+    }
+
     /// `serve-slowly` (V210-71): the gap before each served frame, with the serve budget ignored,
     /// so the peer's drain runs past its own budget.
     #[must_use]
@@ -1414,7 +1451,10 @@ pub mod mutant {
             | Mode::ServeSlowly
             | Mode::AuthorUnclassifiable
             | Mode::OldRowIds
-            | Mode::AuthorMisbound => asked,
+            | Mode::AuthorMisbound
+            | Mode::WithdrawUnentitled
+            | Mode::AdminUnentitled
+            | Mode::RefuseSessions => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
             Mode::StripPayload => asked
@@ -1477,8 +1517,20 @@ pub fn apply_entry_classified<R: AuthorResolver>(
     if dag.refused_from(&author).is_some_and(|from| seq >= from) {
         return Ok(EntryClass::Refused);
     }
-    if entry.payload.is_none() {
-        return Ok(EntryClass::Withheld);
+    // **An envelope is always taken; its body, if it did not come, is owed** (V030-10, the
+    // decider, 2026-10-01: "when we have an envelope that indicates that I should expect a body,
+    // if I have not received it yet, I know to keep asking for it"). v0.2.10 set a payload-less
+    // entry aside (V210-74), which in v0.3.0 also refused every honest pruned skeleton and stopped
+    // its author's feed for a late joiner. Taken, it links the feed; whether its body is expired
+    // or still owed is the receiver's own computation, and an owed body is asked for again.
+    // A body for a skeleton held without one is put back, if its author could sign it here.
+    if entry.payload.is_some() && dag.contains(&entry.entry_hash()) {
+        if resolver.unclassifiable(&entry).is_some() {
+            return Ok(EntryClass::Refused);
+        }
+        if dag.fill_body(&entry) {
+            return Ok(EntryClass::BodyArrived);
+        }
     }
     let head = dag.feed(&author).map_or(0, |f| f.max_seq());
     if seq > head.saturating_add(1) {

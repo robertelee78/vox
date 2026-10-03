@@ -5,7 +5,7 @@
 //! and sends its hello and sender key over it. If both do it before either has the other's
 //! hello, each holds a session the other did not accept. Before `56f9763`, each kept its own,
 //! ignored the other's hello, and could not open the key sealed under it: neither ever read the
-//! other (ADR-021 F12). The fix has both ends keep the session the lower fingerprint opened.
+//! other (ADR-004 O2). The fix has both ends keep the session the lower fingerprint opened.
 //!
 //! That race used to be caught by chance: about one run in three. Here it is forced. bob and
 //! carol reach each other only through the anchor's relay (bob on `127.0.0.1`, carol on `[::1]`,

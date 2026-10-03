@@ -2,11 +2,10 @@
 //! between two online nodes whose only path is a relay circuit is delivered, and within R40's
 //! **1 s**.
 //!
-//! Until now the relayed half of R40 was proved only on the NAT simulator
-//! (`vox-core/tests/perf_r40_relayed_chat_gate.rs`), because nothing in the binary forces a relay.
-//! `support/relay.rs` forces one with the product's own `--listen`: a real `vox node` anchor on
-//! `[::]`, alice's `vox daemon` on `127.0.0.1`, bob's on `[::1]`. Neither daemon can send a
-//! datagram to the other, so the anchor's circuit is the only path.
+//! The binary has no switch that forces a relay, so `support/relay.rs` forces one with the
+//! product's own `--listen`: a real `vox node` anchor on `[::]`, alice's `vox daemon` on
+//! `127.0.0.1`, bob's on `[::1]`. Neither daemon can send a datagram to the other, so the
+//! anchor's circuit is the only path.
 //!
 //! **Relayed is asserted, before and after the samples**, from the anchor's own count of circuits
 //! carried, so a direct path cannot pass this silently. **The split is checked first**, as a
@@ -52,7 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use relay::{Anchor, Split};
-use vox_core::node::ipc::{Frame, IpcClient, Request};
+use vox_core::node::ipc::{Frame, IpcClient};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
@@ -299,17 +298,13 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms
             .iter()
-            .map(|(id, _, _)| *id)
+            .map(|(id, _, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(&room))
             .expect("PRODUCT: the room on bob's node"),
         other => panic!("PRODUCT: rooms: {other:?}"),
     };
     let readable = |reader: &mut IpcClient, text: &str| -> bool {
-        match rt.block_on(reader.request(&Request::Read {
-            channel_id,
-            since: None,
-            limit: 0,
-        })) {
+        match rt.block_on(reader.read_rows(channel_id, None)) {
             Ok(Frame::Rows { rows }) => rows.iter().any(|r| r.text == text),
             _ => false,
         }

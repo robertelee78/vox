@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
+use crate::transport::quic::TunnelWatch;
 
 /// Maximum length of a service tag carried in a tunnel request (matches the
 /// capability-token bound; rejects an oversized field before allocation).
@@ -272,7 +273,48 @@ pub async fn accept<F>(
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
 {
-    accept_reporting(send, recv, client_id, resolve, |_, _| Ok(None)).await
+    accept_reporting(send, recv, client_id, resolve, |_, _| Ok(None), None).await
+}
+
+/// What a host needs to serve a UDP service (ADR-022 decision 6): the connection the
+/// stream arrived on, to bind the flow to, and the node's flow table, to bound it.
+/// Without it a `udp/<port>` request is refused like any other service the host cannot
+/// carry.
+pub struct UdpHost<'a> {
+    /// The connection the tunnel stream arrived on.
+    pub conn: &'a crate::transport::quic::VoxConnection,
+    /// Every UDP flow this node holds.
+    pub flows: Arc<crate::tunnel::udp::UdpFlows>,
+}
+
+/// Serve a UDP request that has passed the gate: a socket connected to the service, the
+/// `Accepted` status, then the stream bound as the flow and pumped until it ends.
+async fn accept_udp(
+    mut send: SendStream,
+    recv: RecvStream,
+    udp: UdpHost<'_>,
+    client_id: &Digest32,
+    target: SocketAddr,
+    label: &str,
+    cut: impl core::future::Future<Output = ()>,
+) -> Result<()> {
+    use crate::tunnel::udp;
+    // Admitted before anything is bound: a full table refuses exactly as an unknown
+    // service does, so it tells the dialer nothing it could not already guess.
+    let (Some(guard), Ok(sock)) = (
+        udp.flows.admit(*client_id, label),
+        udp::connect_service(target).await,
+    ) else {
+        write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+        let _ = send.finish();
+        return Err(Error::TunnelDenied("udp flow refused"));
+    };
+    write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
+    let flow = udp.conn.bind_flow(send, recv)?;
+    // Whatever ends the pump, dropping the flow ends the stream, which ends the flow at
+    // the dialer too — untrust and service removal included (R22).
+    udp::host_pump(flow, sock, guard, cut).await;
+    Ok(())
 }
 
 /// [`accept`], reporting each authorized request to `served` before the local connect.
@@ -292,17 +334,20 @@ where
 /// any refusal but one: the member already has all the tunnels it may with this host
 /// ([`Error::TunnelLimit`]), which it is told as `TunnelStatus::Full`, since it reveals nothing
 /// to a member the host already lets in. It may hand back where the splice is to mark the time it
-/// last moved a byte (`vox status`).
+/// last moved a byte (`vox status`) and how it is asked to close ([`TunnelWatch`]).
+///
+/// `udp` lets it serve `udp/<port>` services (ADR-022 decision 6); `None` refuses them.
 pub async fn accept_reporting<F, S>(
     mut send: SendStream,
     mut recv: RecvStream,
     client_id: &Digest32,
     resolve: F,
     served: S,
+    udp: Option<UdpHost<'_>>,
 ) -> Result<()>
 where
     F: FnOnce(&Digest32, &str) -> Option<HostService>,
-    S: FnOnce(&Digest32, &str) -> Result<Option<Arc<AtomicU64>>>,
+    S: FnOnce(&Digest32, &str) -> Result<Option<TunnelWatch>>,
 {
     let req = TunnelRequest::from_bytes(&read_frame(&mut recv).await?)?;
 
@@ -353,8 +398,8 @@ where
     };
     // Authorized, and not before: the host learns who reached what, and learns nothing
     // about a refusal it did not grant.
-    let moved = match served(&req.channel_id, &req.service_tag) {
-        Ok(moved) => moved,
+    let watch = match served(&req.channel_id, &req.service_tag) {
+        Ok(watch) => watch,
         Err(e) => {
             let status = if matches!(e, Error::TunnelLimit(_)) {
                 TunnelStatus::Full
@@ -366,6 +411,16 @@ where
             return Err(e);
         }
     };
+
+    if crate::tunnel::udp::is_udp(&req.service_tag) {
+        let cut = withdrawn(reachers, offered, *client_id, req.service_tag.clone());
+        let Some(udp) = udp else {
+            write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
+            let _ = send.finish();
+            return Err(Error::TunnelDenied("udp not served here"));
+        };
+        return accept_udp(send, recv, udp, client_id, target, &req.service_tag, cut).await;
+    }
 
     let tcp = match TcpStream::connect(target).await {
         Ok(t) => t,
@@ -379,7 +434,7 @@ where
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
     let cut = withdrawn(reachers, offered, *client_id, req.service_tag);
-    splice_until(send, recv, tcp, cut, moved).await
+    splice_until(send, recv, tcp, cut, watch).await
 }
 
 /// The QUIC application error code a host resets a tunnel stream with when it withdraws
@@ -445,15 +500,16 @@ pub async fn splice(send: SendStream, recv: RecvStream, tcp: TcpStream) -> Resul
     splice_until(send, recv, tcp, std::future::pending(), None).await
 }
 
-/// [`splice`], marking in `moved` the time (Unix seconds) it last moved a byte either way, so
-/// `vox status` can show a tunnel that has gone still.
-pub async fn splice_moving(
+/// [`splice`] for a tunnel on the live list: marking in `watch` when it last moved a byte, so
+/// `vox status` can show one that has gone still, and ending when it is asked to close or is
+/// stuck (V030-11).
+pub async fn splice_watched(
     send: SendStream,
     recv: RecvStream,
     tcp: TcpStream,
-    moved: Arc<AtomicU64>,
+    watch: TunnelWatch,
 ) -> Result<()> {
-    splice_until(send, recv, tcp, std::future::pending(), Some(moved)).await
+    splice_until(send, recv, tcp, std::future::pending(), Some(watch)).await
 }
 
 /// How long a tunnel that has sent its last byte waits for the peer to acknowledge it.
@@ -502,25 +558,81 @@ enum Leg {
     Abort,
     /// The host reset the stream with [`REACH_WITHDRAWN_CODE`].
     Withdrawn,
+    /// A person at the other end closed the tunnel ([`TUNNEL_CLOSED_CODE`]).
+    ClosedThere,
+    /// The other end closed the tunnel as stuck ([`TUNNEL_STUCK_CODE`]).
+    StuckClosedThere,
+    /// Bytes waited [`stuck_after`] to go to the other end, and it took none.
+    /// …for this long, measured from when the write began.
+    StuckThere(std::time::Duration),
+    /// Bytes waited [`stuck_after`] to go to this side's application, and it read none.
+    /// …for this long, measured from when the write began.
+    StuckHere(std::time::Duration),
+}
+
+/// The QUIC application error code a tunnel is reset with when it is **closed on purpose** —
+/// by a person (`vox tunnel close`, the TUI) or as stuck (V030-11) — so the far end can say it
+/// was closed rather than that it failed.
+pub const TUNNEL_CLOSED_CODE: u32 = 0x1713;
+
+/// [`TUNNEL_CLOSED_CODE`]'s sibling for a tunnel closed **as stuck**, so the far end can say why
+/// it was closed, not only that it was.
+pub const TUNNEL_STUCK_CODE: u32 = 0x1714;
+
+/// How long bytes may wait to be taken, by the far end or by this side's application, before
+/// the tunnel counts as stuck and is closed (V030-11). 10 minutes unless the profile's
+/// `tunnel-stuck-after` file says otherwise ([`set_stuck_after`]).
+///
+/// Only a write that waits counts: an idle tunnel, with nothing to send either way, is never
+/// closed, so an idle `ssh` session lasts as long as its owner wants it.
+pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// [`STUCK_AFTER`], or what the node was configured with.
+static STUCK_AFTER_SECS: AtomicU64 = AtomicU64::new(STUCK_AFTER.as_secs());
+
+/// Use `after` as this process's [`stuck_after`].
+pub fn set_stuck_after(after: std::time::Duration) {
+    STUCK_AFTER_SECS.store(after.as_secs().max(1), Ordering::Relaxed);
+}
+
+/// How long a tunnel's bytes may wait before it is closed as stuck ([`STUCK_AFTER`]).
+#[must_use]
+pub fn stuck_after() -> std::time::Duration {
+    std::time::Duration::from_secs(STUCK_AFTER_SECS.load(Ordering::Relaxed))
+}
+
+/// `after` in the words `vox status` uses: whole minutes when it is some, else whole seconds,
+/// rounded down, so a wait is never said longer than it was.
+fn spoken(after: std::time::Duration) -> String {
+    let s = after.as_secs();
+    if s >= 60 && s.is_multiple_of(60) {
+        format!("{} min", s / 60)
+    } else {
+        format!("{s} s")
+    }
 }
 
 /// [`splice`], ending early — and abortively, with [`REACH_WITHDRAWN_CODE`] — when `cut`
-/// resolves, and marking `moved` as [`splice_moving`] does.
+/// resolves; and, given its [`TunnelWatch`], marking when it last moved a byte and ending with
+/// [`TUNNEL_CLOSED_CODE`] when it is asked to close or is stuck.
 async fn splice_until(
     mut send: SendStream,
     mut recv: RecvStream,
     mut tcp: TcpStream,
     cut: impl core::future::Future<Output = ()>,
-    moved: Option<Arc<AtomicU64>>,
+    watch: Option<TunnelWatch>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     const CHUNK: usize = 16 * 1024;
-    let mark = |moved: &Option<Arc<AtomicU64>>| {
-        if let Some(m) = moved {
-            m.store(crate::transport::quic::unix_now(), Ordering::Relaxed);
+    let stuck = stuck_after();
+    let mark = |watch: &Option<TunnelWatch>| {
+        if let Some(w) = watch {
+            w.mark_moved();
         }
     };
-    let moved_in = moved.clone();
+    let closed_code = quinn::VarInt::from_u32(TUNNEL_CLOSED_CODE);
+    let stuck_code = quinn::VarInt::from_u32(TUNNEL_STUCK_CODE);
+    let (watch_out, watch_in) = (watch.clone(), watch.clone());
     let outcome = {
         let (mut tcp_r, mut tcp_w) = tcp.split();
         let (send, recv) = (&mut send, &mut recv);
@@ -541,10 +653,20 @@ async fn splice_until(
                         return Leg::Clean;
                     }
                     Ok(n) => {
-                        if send.write_all(&buf[..n]).await.is_err() {
-                            return Leg::Abort;
+                        // A write the far end takes nothing of, for `stuck`, is a stuck tunnel.
+                        let began = tokio::time::Instant::now();
+                        match tokio::time::timeout(stuck, send.write_all(&buf[..n])).await {
+                            Err(_) => return Leg::StuckThere(began.elapsed()),
+                            Ok(Err(quinn::WriteError::Stopped(code))) if code == closed_code => {
+                                return Leg::ClosedThere
+                            }
+                            Ok(Err(quinn::WriteError::Stopped(code))) if code == stuck_code => {
+                                return Leg::StuckClosedThere
+                            }
+                            Ok(Err(_)) => return Leg::Abort,
+                            Ok(Ok(())) => {}
                         }
-                        mark(&moved);
+                        mark(&watch_out);
                     }
                     Err(_) => return Leg::Abort,
                 }
@@ -560,49 +682,103 @@ async fn splice_until(
                         return Leg::Clean;
                     }
                     Ok(Some(n)) => {
-                        if tcp_w.write_all(&buf[..n]).await.is_err() {
-                            return Leg::Abort;
+                        let began = tokio::time::Instant::now();
+                        match tokio::time::timeout(stuck, tcp_w.write_all(&buf[..n])).await {
+                            Err(_) => return Leg::StuckHere(began.elapsed()),
+                            Ok(Err(_)) => return Leg::Abort,
+                            Ok(Ok(())) => {}
                         }
-                        mark(&moved_in);
+                        mark(&watch_in);
                     }
                     Err(quinn::ReadError::Reset(code))
                         if code == quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE) =>
                     {
                         return Leg::Withdrawn
                     }
+                    Err(quinn::ReadError::Reset(code)) if code == closed_code => {
+                        return Leg::ClosedThere
+                    }
+                    Err(quinn::ReadError::Reset(code)) if code == stuck_code => {
+                        return Leg::StuckClosedThere
+                    }
                     Err(_) => return Leg::Abort,
                 }
             }
         };
-        tokio::pin!(outbound, inbound, cut);
+        let asked = async {
+            match &watch {
+                Some(w) => w.close_asked().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(outbound, inbound, cut, asked);
         let (mut out_done, mut in_done) = (false, false);
         loop {
             tokio::select! {
                 leg = &mut outbound, if !out_done => match leg {
                     Leg::Clean => out_done = true,
-                    other => break Some(other),
+                    other => break Some(Ok(other)),
                 },
                 leg = &mut inbound, if !in_done => match leg {
                     Leg::Clean => in_done = true,
-                    other => break Some(other),
+                    other => break Some(Ok(other)),
                 },
                 () = &mut cut => break None,
+                why = &mut asked => break Some(Err(why)),
             }
             if out_done && in_done {
-                break Some(Leg::Clean);
+                break Some(Ok(Leg::Clean));
             }
         }
     };
-    match outcome {
-        Some(Leg::Clean) => Ok(()),
-        Some(Leg::Abort) => {
-            let code = quinn::VarInt::from_u32(TUNNEL_ABORT_CODE);
-            let _ = send.reset(code);
-            let _ = recv.stop(code);
-            abort_after_drain(tcp).await;
-            Err(Error::MalformedTunnel("tunnel splice aborted"))
+    // A tunnel closed on purpose — here, there, or as stuck — is reset with the closing code,
+    // and its reason is kept where a person looks (`vox status`, the TUI).
+    let close = |why: String| {
+        if let Some(w) = &watch {
+            w.ended(&why);
         }
-        Some(Leg::Withdrawn) => {
+        why
+    };
+    // The wait said is the one measured, not the setting: a close that came early must not read
+    // as a close on time (c4 verdict).
+    // Each with the code that tells the far end why: a person, or stuck.
+    let closing = match outcome {
+        Some(Err(ref why)) => Some((close(why.clone()), closed_code)),
+        Some(Ok(Leg::StuckThere(waited))) => Some((
+            close(format!(
+                "closed as stuck: the other end took nothing for {} with data waiting \
+                 for it",
+                spoken(waited)
+            )),
+            stuck_code,
+        )),
+        Some(Ok(Leg::StuckHere(waited))) => Some((
+            close(format!(
+                "closed as stuck: the application on this side read nothing for {} \
+                 with data waiting for it",
+                spoken(waited)
+            )),
+            stuck_code,
+        )),
+        Some(Ok(Leg::ClosedThere)) => Some((
+            close("closed by a person at the other end".to_owned()),
+            closed_code,
+        )),
+        Some(Ok(Leg::StuckClosedThere)) => Some((
+            close("closed as stuck at the other end".to_owned()),
+            stuck_code,
+        )),
+        _ => None,
+    };
+    if let Some((why, code)) = closing {
+        let _ = send.reset(code);
+        let _ = recv.stop(code);
+        abort_after_drain(tcp).await;
+        return Err(Error::TunnelClosed(why));
+    }
+    match outcome {
+        Some(Ok(Leg::Clean)) => Ok(()),
+        Some(Ok(Leg::Withdrawn)) => {
             let _ = recv.stop(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
             let _ = send.reset(quinn::VarInt::from_u32(REACH_WITHDRAWN_CODE));
             abort_after_drain(tcp).await;
@@ -618,6 +794,13 @@ async fn splice_until(
             let _ = recv.stop(code);
             abort_after_drain(tcp).await;
             Err(Error::TunnelRevoked("withdrawn mid-session"))
+        }
+        _ => {
+            let code = quinn::VarInt::from_u32(TUNNEL_ABORT_CODE);
+            let _ = send.reset(code);
+            let _ = recv.stop(code);
+            abort_after_drain(tcp).await;
+            Err(Error::MalformedTunnel("tunnel splice aborted"))
         }
     }
 }

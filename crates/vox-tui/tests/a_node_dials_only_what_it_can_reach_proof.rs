@@ -234,8 +234,9 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
 
     let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
     assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
-    let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
+    let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
     assert!(ok, "PRODUCT (staging): vox id (host): {err}");
+    let host_fp = host_fp.trim().to_owned();
     let (ok, out, err) = vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
@@ -280,7 +281,7 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
         &host_dir,
         &args(&[
             "serve",
-            &service_port.to_string(),
+            &format!("{service_port}={service_port}"),
             "--anchor",
             &anchor.v6_spec,
             "--listen",
@@ -348,7 +349,7 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
         .expect("PRODUCT: an address in the up line")
         .parse()
         .expect("PRODUCT: a socket address");
-    let hostname = format!("{room}.vox");
+    let hostname = format!("{service_port}.{host_fp}.{room}.vox");
     let (code, mut s) = socks5_connect(proxy, &hostname, service_port);
     assert_eq!(
         code,

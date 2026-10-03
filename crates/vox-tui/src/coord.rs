@@ -349,6 +349,36 @@ pub async fn reply_chain(
     Ok(chain)
 }
 
+/// The rows of a room with these entry hashes, those the node holds, fetched [`MAX_FIND`] at a
+/// time (V210-120): what a bounded read looks up by hash instead of reading the room.
+///
+/// [`MAX_FIND`]: vox_core::node::ipc::MAX_FIND
+///
+/// # Errors
+/// If the node cannot answer.
+pub async fn find(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    entries: &[Digest32],
+) -> Result<Vec<MessageRow>, AppError> {
+    let mut found: Vec<MessageRow> = Vec::new();
+    for chunk in entries.chunks(vox_core::node::ipc::MAX_FIND) {
+        match ask(
+            client,
+            &Request::Find {
+                channel_id,
+                entries: chunk.to_vec(),
+            },
+        )
+        .await?
+        {
+            Frame::Rows { rows } => found.extend(rows),
+            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        }
+    }
+    Ok(found)
+}
+
 /// What [`crate::wake::open_wakes`] needs of a room for `session` (V210-120): the entries recorded
 /// as having woken it, fetched by hash, and every row after the oldest of them, where a reply to
 /// any of them can be. Not the room's whole history.
@@ -408,6 +438,11 @@ pub fn index_of(posted: &[Posted]) -> OpIndex {
 /// Up to `limit` rows after `since` (all of them when `limit` is 0), paged from the node and no
 /// further than asked (V210-120). `Ok(None)` when the node does not hold the cursor.
 ///
+/// A read from a cursor is a feed by arrival, so its next page follows the last row as a cursor;
+/// a read of the whole room is in the room's order (ADR-023 decision 1), so its next page follows
+/// the last row as a page mark. Paging the room by cursor showed a late arrival twice: once in the
+/// room's order, and again in the feed after the page boundary.
+///
 /// # Errors
 /// If the node cannot answer.
 pub async fn read_upto(
@@ -417,7 +452,7 @@ pub async fn read_upto(
     limit: usize,
 ) -> Result<Option<Vec<MessageRow>>, AppError> {
     let mut rows: Vec<MessageRow> = Vec::new();
-    let mut cursor = since;
+    let (mut cursor, mut mark) = (since, None);
     loop {
         let want = if limit == 0 {
             0
@@ -428,6 +463,7 @@ pub async fn read_upto(
             .request(&Request::Read {
                 channel_id,
                 since: cursor,
+                after: mark,
                 limit: want,
             })
             .await
@@ -437,10 +473,15 @@ pub async fn read_upto(
                 let Some(last) = page.last() else {
                     return Ok(Some(rows));
                 };
-                if cursor == Some(last.entry_hash) {
+                let marker = if since.is_some() {
+                    &mut cursor
+                } else {
+                    &mut mark
+                };
+                if *marker == Some(last.entry_hash) {
                     return Err(AppError::Usage("ipc rows page did not advance".into()));
                 }
-                cursor = Some(last.entry_hash);
+                *marker = Some(last.entry_hash);
                 rows.extend(page);
                 if limit > 0 && rows.len() >= limit {
                     rows.truncate(limit);
@@ -719,6 +760,7 @@ fn conflict(op: &str, group: &[Digest32]) -> AppError {
 /// # Errors
 /// [`EXIT_VERSION`] naming every incompatible worker, or a node error.
 pub async fn participate(
+    paths: &vox_core::node::paths::Paths,
     client: &mut IpcClient,
     channel_id: Digest32,
     room: &str,
@@ -726,9 +768,18 @@ pub async fn participate(
 ) -> Result<Snapshot, AppError> {
     let mut snap = snapshot(client, channel_id).await?;
     if !snap.announced(session) {
+        // **How it can be reached rides the hello** (V030-17): a sender on another node cannot
+        // see this node's session registrations, so it learns from the room whether an urgent
+        // message can interrupt this session.
+        let mut data = serde_json::Map::new();
+        data.insert(
+            crate::wake::WAKE_KEY.into(),
+            crate::wake::reachability(paths, session).into(),
+        );
         let hello = Draft {
             kind: HELLO.into(),
             body: format!("session {session} runs vox {VERSION}"),
+            data,
             ..Draft::default()
         };
         let op = new_op()?;

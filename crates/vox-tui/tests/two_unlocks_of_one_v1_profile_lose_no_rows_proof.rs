@@ -188,12 +188,16 @@ fn daemon(exe: &Path, name: &str, data: &Path, spec: &str, pass_file: &Path) -> 
 
 /// Create a room on `host`'s daemon, have `guest` join it, and return the room's id.
 fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
-    ok(
-        exe,
-        host,
-        &["room", "create", "--passphrase-file", "-", "--name", name],
-        Some("room pass"),
-    );
+    // The room passphrase goes on stdin. This build reads it there only when told
+    // (`--passphrase-file -`, v0.2.10); the previous release has no such flag and reads stdin
+    // unasked, so it is given the argv it accepts.
+    let from_stdin: &[&str] = if exe == Path::new(VOX) {
+        &["--passphrase-file", "-"]
+    } else {
+        &[]
+    };
+    let create = [&["room", "create"][..], from_stdin, &["--name", name]].concat();
+    ok(exe, host, &create, Some("room pass"));
     let list = ok(exe, host, &["room", "list"], None);
     let room = list
         .lines()
@@ -202,20 +206,13 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
         .unwrap_or_else(|| panic!("PRODUCT (staging): room not listed: {list}"))
         .to_owned();
     let link = ok(exe, host, &["room", "invite", &room], None);
-    ok(
-        exe,
-        guest,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            name,
-        ],
-        Some("room pass"),
-    );
+    let join = [
+        &["room", "join"][..],
+        from_stdin,
+        &[link.trim(), "--name", name],
+    ]
+    .concat();
+    ok(exe, guest, &join, Some("room pass"));
     room
 }
 

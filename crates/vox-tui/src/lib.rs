@@ -19,12 +19,18 @@
 
 pub mod agent_hook;
 pub mod app;
+pub mod app_cli;
 pub mod cli;
 pub mod codex_trust;
 pub mod coord;
+pub mod doctor;
 pub mod ident;
+pub mod lan_cli;
 pub mod live;
+pub mod notify;
+pub mod ping;
 pub mod room_cli;
+pub mod share_cli;
 pub mod shell;
 pub mod state;
 pub mod status_cli;

@@ -1,140 +1,113 @@
 # ADR-003: Post-Quantum and Crypto-Agility Policy
 
-**Status**: implemented (M0/M2/M3/M6; registry in `crates/vox-core/src/suite.rs`)
-**Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes added; the channel minimum suite now lives in the signed genesis policy and every PQXDH/join handshake is floor-gated (previously `check_floor` had no callers).
-**Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: post-quantum, ml-kem, ml-dsa, crypto-agility, hybrid
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status:** accepted and built. The registry is `crates/vox-core/src/suite.rs`; the floor is in the
+signed genesis policy (`ChannelPolicy::min_suite`) and enforced in `pairwise::pqxdh` and the ADR-005
+join. PQ post-compromise security (§Scope) is not built.
+**Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context
 
-The threat model (ADR-001) defends content confidentiality against an on-path network adversary,
-which includes "harvest now, decrypt later": ciphertext recorded today could be decrypted by a future
-quantum computer. Post-quantum content confidentiality is the one defended property that is
-*time-sensitive* in this way, so PQ readiness is required from the start, not retrofitted. (This does
-not extend to metadata or traffic analysis, which ADR-001 lists as non-goals.) This policy constrains every cryptographic
-ADR (004, 005, 006, 007, 008, 009). FIPS 203 (ML-KEM), 204 (ML-DSA), and 205 (SLH-DSA) are
-finalized, and mature Rust implementations exist (RustCrypto `ml-kem`, libsignal's PQXDH, liboqs/
-oqs-rs, composite KEM/signature crates).
+ADR-001 defends content confidentiality against an on-path adversary, including harvest now, decrypt
+later. That is the one defended property that is time-sensitive, so post-quantum readiness is needed
+from the start. FIPS 203 (ML-KEM), 204 (ML-DSA) and 205 (SLH-DSA) are final, and mature Rust
+implementations exist. This policy constrains ADR-004 through ADR-009. Metadata and traffic analysis
+stay non-goals (ADR-001).
 
-## Decision
+## Requirements
 
-**Hybrid everywhere — never pure-PQ.** Every primitive combines a classical and a PQ algorithm
-so the construction is secure if *either* assumption holds. This defeats harvest-now-decrypt-later
-while retaining decades of classical assurance.
+### Hybrid everywhere
 
-- **Key agreement:** X25519 + ML-KEM (PQXDH-style; ADR-004). Normative parameter ML-KEM-768
-  (libsignal ships Kyber-768; Signal's spec example is -1024).
-- **Signatures:** Ed25519 + ML-DSA (composite). SLH-DSA only where statelessness/conservatism
-  justifies its size. Affects log/cert sizes (ADR-007, ADR-008).
-- **Symmetric:** AES-256-GCM / ChaCha20-Poly1305 (already PQ-resistant at 256-bit).
+- **H1.** Every primitive MUST combine a classical and a post-quantum algorithm, so the construction
+  holds if either assumption holds. Vox MUST NOT use a pure-PQ construction.
+- **H2.** Key agreement MUST be X25519 + ML-KEM-768 (PQXDH-style, ADR-004).
+- **H3.** Signatures MUST be composite Ed25519 + ML-DSA-65. SLH-DSA MAY be used only where its
+  statelessness justifies its size.
+- **H4.** Symmetric encryption MUST be AES-256-GCM or ChaCha20-Poly1305.
 
-**Two normative PQXDH defensive requirements** (from the USENIX'24 formal verification of PQXDH,
-Bhargavan et al.; Cryspen):
-1. **No public-key type confusion** — curve keys and KEM keys must have *pairwise-disjoint*
-   encoding ranges plus algorithm-identifying prefix bytes, so a curve key can never be
-   substituted for a KEM key.
-2. **KEM shared-secret binding** — bind the KEM public key (and ciphertext) into the AEAD
-   associated data; IND-CCA alone is insufficient (re-encapsulation attack).
+### PQXDH defensive requirements (Bhargavan et al., USENIX Security 2024)
 
-**Crypto-agility (with an explicit downgrade-rejection rule).** All handshakes, certificates, and log
-entries carry explicit, versioned algorithm identifiers and negotiable ciphersuites, so primitives
-can be upgraded (e.g. PQ-PCS ratchet, new KEMs) without breaking the wire format. Negotiation is
-**floor-gated, not best-effort**: each party advertises only suites at or above the channel's minimum
-policy, **rejects** (aborts, no fallback) any proposal below it, binds the negotiated suite into the
-transcript, and re-checks it after the handshake — so a network attacker cannot force a weaker suite.
-There is no "downgrade to classical" path: hybrid PQ is the floor.
+- **Requirement 1 (no public-key type confusion).** Curve keys and KEM keys MUST have pairwise-disjoint
+  encoding ranges and algorithm-identifying prefixes, so a curve key can never be read as a KEM key.
+  The registry class byte (§Registry) is that prefix.
+- **Requirement 2 (KEM shared-secret binding).** The KEM public key and ciphertext MUST be bound into
+  the AEAD associated data (ADR-004 §Decision); IND-CCA alone MUST NOT be relied on.
 
-### Algorithm & ciphersuite registry (normative — the single source for every `algo_ids`)
+### Crypto-agility and downgrade rejection
 
-Every algorithm-identified field across the series (`algo_ids` in ADR-004/006/008 headers, suite IDs
-in ADR-005/011 handshakes, ADR-007 certs) draws from **this one registry**. An algorithm ID is a
-`u16` big-endian: the **high byte is the class** (this *is* the pairwise-disjoint encoding range +
-self-describing algorithm-prefix that ADR-002/§requirement-1 mandate) and the low byte is the member.
+- **G1.** Every handshake, certificate and log entry MUST carry explicit, versioned algorithm
+  identifiers from §Registry, so primitives can be upgraded without breaking the wire format.
+- **G2.** Negotiation MUST be floor-gated: a party MUST advertise only suites at or above the channel's
+  minimum, MUST abort (no fallback) on a proposal below it with `Error::SuiteBelowFloor`, MUST bind the
+  negotiated suite into the transcript, and MUST re-check it after the handshake.
+- **G3.** There MUST NOT be a downgrade-to-classical path: hybrid PQ is the floor.
 
-| Class (hi) | Members (lo → algorithm) |
-|---|---|
-| `0x01` curve/KEX | `01` X25519 |
-| `0x02` KEM | `01` ML-KEM-768 |
-| `0x03` signature | `01` Ed25519 · `02` ML-DSA-65 · `03` SLH-DSA-SHA2-128s · `04` **composite** Ed25519+ML-DSA-65 |
-| `0x04` AEAD | `01` AES-256-GCM · `02` ChaCha20-Poly1305 |
-| `0x05` hash | `01` SHA-256 · `02` BLAKE3-256 |
-| `0x06` KDF | `01` HKDF-SHA-256 · `02` Argon2id |
-| `0x07` PAKE | `01` CPace-Ristretto255-SHA-512 |
-| `0x08` TLS group | `01` X25519MLKEM768 (`0x11EC` on the TLS wire) |
+### §Registry (normative: the one source of every `algo_ids`)
 
-A **ciphersuite** is a named, versioned tuple over these classes — itself a registry entry:
+- **K1.** An algorithm ID MUST be a big-endian `u16` whose high byte is the class and low byte the
+  member:
 
-| Suite | Composition |
-|---|---|
-| `vox-suite-1` (`0x0001`, rank 1) | X25519 · ML-KEM-768 · composite-Ed25519+ML-DSA-65 · AES-256-GCM · SHA-256 · HKDF-SHA-256 · CPace-Ristretto255-SHA-512 |
+  | Class (hi) | Members (lo → algorithm) |
+  |---|---|
+  | `0x01` curve/KEX | `01` X25519 |
+  | `0x02` KEM | `01` ML-KEM-768 |
+  | `0x03` signature | `01` Ed25519 · `02` ML-DSA-65 · `03` SLH-DSA-SHA2-128s · `04` composite Ed25519+ML-DSA-65 |
+  | `0x04` AEAD | `01` AES-256-GCM · `02` ChaCha20-Poly1305 |
+  | `0x05` hash | `01` SHA-256 · `02` BLAKE3-256 |
+  | `0x06` KDF | `01` HKDF-SHA-256 · `02` Argon2id |
+  | `0x07` PAKE | `01` CPace-Ristretto255-SHA-512 |
+  | `0x08` TLS group | `01` X25519MLKEM768 (`0x11EC` on the TLS wire) |
 
-**Hash is SHA-256 series-wide** (all `prev_hash`/`payload_hash`/CID/fingerprint uses) unless a future
-suite names otherwise. **Floor relation:** each suite carries an explicit total **strength rank** (the
-column above, *not* the numeric ID). A channel policy names a **minimum suite**; a peer advertises only
-suites whose every component rank ≥ the minimum's and **rejects** (aborts) any proposal below it. New
-suites are appended with an assigned rank, so the floor advances deliberately and never silently
-downgrades. The canonical byte serialization shared by every signed structure is specified once in
-**ADR-008** and referenced everywhere, so the same bytes are signed and verified across all ADRs.
+- **K2.** A ciphersuite MUST be a named, versioned registry entry with an explicit strength rank:
 
-**Scope of "post-quantum from the start" (precise, to avoid the false-deferral reading).** It means
-PQ **confidentiality** (hybrid PQXDH) and PQ **authentication** (composite Ed25519+ML-DSA) are present
-day one, everywhere. PQ **post-compromise security** in the ratchet (ADR-004) is a **distinct named
-capability with its own ADR**, not a deferred increment of confidentiality — it is separated because it
-is a different security property with a different cost profile (~2.3 KB per PQ ratchet message vs ~32 B,
-mitigated by chunking), exactly as voice/video, metadata/traffic-analysis resistance, and additional
-platforms are separate capabilities rather than "v1/v2" of one. Each is built complete when built; none
-is a stub or a half-promise inside another capability.
+  | Suite | Composition |
+  |---|---|
+  | `vox-suite-1` (`0x0001`, rank 1) | X25519 · ML-KEM-768 · composite Ed25519+ML-DSA-65 · AES-256-GCM · SHA-256 · HKDF-SHA-256 · CPace-Ristretto255-SHA-512 |
 
-## Implementation notes
+- **K3.** The hash MUST be SHA-256 series-wide (`prev_hash`, `payload_hash`, CID, fingerprint) unless a
+  future suite names otherwise.
+- **K4.** Every signed structure MUST use the one canonical serialization of ADR-008.
+- **K5.** A shipped build MUST register only production suites: a suite ranked below `vox-suite-1` MUST NOT
+  exist in it, so no production peer can propose, accept or set a floor at one.
 
-These record the concrete decisions made building this ADR, so the spec and code stay in lockstep:
+### §Floor relation
 
-- **Where the floor lives.** The channel's minimum suite is a field of the signed genesis policy
-  (`ChannelPolicy::min_suite`, ADR-007 tag `0x000D`; must name a registered suite) and can only be
-  **raised** by a `policy`-holder via a policy-update carrying `min_suite`: the evaluator ignores an
-  update naming a suite ranked below the floor in force (its other fields still apply), so the floor
-  advances deliberately and never silently downgrades. New channels default to `vox-suite-1`
-  (`SuiteFloor::DAY_ONE`).
-- **Where the floor is enforced.** `suite::SuiteFloor` is a distinct type from a proposed suite id (the
-  two `u16`s cannot be swapped at a call site) and is threaded through the handshakes that carry a
-  suite: `pairwise::pqxdh::{initiate, accept}` (and therefore `Session::{initiate, accept}`) refuse
-  to propose or accept a suite ranked below it, and the ADR-005 join binds its `JoinContext` to the
-  floor — `JoinContext::new`, `join_initiate` and `join_accept` all check before any PoW/CPace work.
-  A proposal below the floor is `Error::SuiteBelowFloor`: an abort, no fallback negotiation.
-  *(2026-09-19 review: `check_floor` existed but had no callers; any registered suite was accepted.)*
-- **The floor relation is on the suite rank.** The registry's rank column is assigned when a suite is
-  appended, so the total rank *is* the deliberate strength order; the "every component rank" phrasing
-  above has no separate per-component rank registry to compare against and is satisfied by the
-  suite rank. If a future suite is stronger in one class and weaker in another, that is decided at
-  registration time by the rank it is given, not by a per-component comparison at handshake time.
-- **The TLS group is outside the suite.** The `vox-suite-1` tuple does not include the TLS group
-  class; the transport (ADR-011) pins the provider to exactly X25519MLKEM768 both sides, which is a
-  compile-time floor rather than a policy value.
-- **Test-only weaker suite.** With a single production suite the relation cannot be exercised, so the
-  unit build registers a `cfg(test)`-only rank-0 suite (`vox-suite-test-weak`, id `0x7FFF`, identical
-  components). It does not exist in a non-test build: no production peer can propose, accept, or set
-  a floor at it.
+- **F1.** A suite's strength MUST be its registry rank, not its numeric ID. A suite meets a floor iff
+  its rank is at or above the floor suite's rank. There is no per-component rank: a suite stronger in
+  one class and weaker in another MUST be ranked when it is registered.
+- **F2.** New suites MUST be appended with an assigned rank, so the floor advances only deliberately.
+- **F3.** A channel's minimum suite MUST be the `min_suite` field of its signed genesis policy
+  (ADR-007, tag `0x000D`) and MUST name a registered suite. New channels MUST default to
+  `vox-suite-1` (`SuiteFloor::DAY_ONE`).
+- **F4.** The floor is fixed at creation. A policy update carries retention only (ADR-007 G-6), and an
+  update carrying `min_suite` MUST be refused.
+- **F5.** The floor MUST be enforced in every handshake that carries a suite:
+  `pairwise::pqxdh::{initiate, accept}` (and so `Session::{initiate, accept}`), and the ADR-005 join
+  (`JoinContext::new`, `join_initiate`, `join_accept`), before any PoW or CPace work. `SuiteFloor`
+  MUST be a distinct type from a proposed suite ID.
+- **F6.** The TLS group is outside the suite: the transport (ADR-011) MUST pin X25519MLKEM768 on both
+  sides as a build-time floor.
+
+### §Scope
+
+- **S1.** PQ confidentiality (hybrid PQXDH) and PQ authentication (composite signatures) MUST be
+  present everywhere from the first release.
+- **S2.** PQ post-compromise security in the ratchet (ADR-004) is a separate capability with its own
+  ADR, built complete when built. It MUST NOT be described as a deferred part of confidentiality.
 
 ## Consequences
 
-### Positive
-- Confidentiality survives a future quantum adversary from day one (harvest-now-decrypt-later defeated).
-- Hybrid means a flaw in any single PQ primitive does not break security.
-- Versioned suites allow upgrading primitives without a flag-day.
+- Confidentiality is designed to survive a future quantum adversary, provided the lattice half holds.
+- ML-DSA signatures (about 2.4–4.6 KB against Ed25519's 64 B) inflate the log and certificate chains;
+  ADR-008 signs payload hashes for this reason.
+- ML-KEM has no static-static DH and larger messages, which complicates Sender-Key distribution
+  (ADR-006).
 
-### Negative
-- Larger keys/signatures: ML-DSA signatures ~2.4–4.6 KB vs Ed25519's 64 B — materially inflates
-  the hash-linked log and certificate chains (drives the "sign the payload-hash" design in ADR-008).
-- ML-KEM has no static-static DH and bigger messages, complicating Sender-Key distribution (ADR-006).
-- More code, larger handshake/storage footprint, more test surface.
+## Related ADRs
 
-### Neutral
-- Aligns with the industry direction (Signal PQXDH, Apple PQ3, IETF MLS PQ ciphersuites).
-
-## Links
-**Depends on**: ADR-001, ADR-002.
-- Depended on by: ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009.
+Depends on ADR-001 and ADR-002. Depended on by ADR-004, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009,
+ADR-011.
 
 ## Engineering Mantra
 

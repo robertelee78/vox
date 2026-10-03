@@ -55,6 +55,11 @@ use crate::suite::algo;
 pub struct CompositePublicKey {
     ed: EdVerifyingKey,
     ml_dsa: DsaVerifyingKey<MlDsa65>,
+    /// [`Self::fingerprint`], worked out once (V030-09). It re-encoded the 1,952-byte ML-DSA key
+    /// and hashed it on every call, and a node asks for every room's creator and every member's
+    /// fingerprint each time it rebuilds its view and its peer policy — after every command and
+    /// event — so each room created cost a little more than the one before it.
+    fp: std::sync::OnceLock<Digest32>,
 }
 
 impl CompositePublicKey {
@@ -106,7 +111,11 @@ impl CompositePublicKey {
         let ml_enc: ml_dsa::EncodedVerifyingKey<MlDsa65> = ml_arr.into();
         let ml_dsa = DsaVerifyingKey::<MlDsa65>::decode(&ml_enc);
 
-        Ok(Self { ed, ml_dsa })
+        Ok(Self {
+            ed,
+            ml_dsa,
+            fp: std::sync::OnceLock::new(),
+        })
     }
 
     /// The human-verifiable identity fingerprint (ADR-002):
@@ -115,7 +124,9 @@ impl CompositePublicKey {
     /// verify.
     #[must_use]
     pub fn fingerprint(&self) -> Digest32 {
-        identity_fingerprint(&self.ed25519_bytes(), &self.ml_dsa_bytes())
+        *self
+            .fp
+            .get_or_init(|| identity_fingerprint(&self.ed25519_bytes(), &self.ml_dsa_bytes()))
     }
 
     /// Verify a composite signature over `msg`. Returns `Ok(())` **only if both**
@@ -252,6 +263,7 @@ impl CompositeSecret {
         CompositePublicKey {
             ed: self.ed.verifying_key(),
             ml_dsa: self.ml_dsa_key().verifying_key(),
+            fp: std::sync::OnceLock::new(),
         }
     }
 
@@ -396,7 +408,7 @@ impl SoftwareRootSigner {
     ///
     /// Returns secret material in a [`Zeroizing`] buffer (non-`Copy`, wiped on
     /// drop) so no bare `[u8; 32]` seed copy lingers at a call site. Used by the
-    /// backup bundle builder (M1) and the epoch-end ESK publication (M7).
+    /// backup bundle builder (M1).
     #[must_use]
     pub(crate) fn ed25519_seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.secret.ed.to_bytes())

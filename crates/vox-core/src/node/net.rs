@@ -161,12 +161,15 @@ impl PeerPolicy {
 
     /// Whether a peer of `class` may open a `kind` stream.
     ///
+    /// - **Anyone**: `goodbye`, which speaks only of the connection it arrives on.
     /// - **Member**: everything. It is in the channel; the log, consent and
     ///   render gates (ADR-007/008) govern what it can actually *read*.
     /// - **Anchor**: `rendezvous` (the board), `sync` (it replicates ciphertext it
-    ///   can never read) and `coord` (it relays hole-punch signalling). Never
-    ///   `join` or `pairwise`: it has no channel authority.
-    /// - **PendingJoiner**: `join`, `rendezvous` and `pairwise`. ADR-016's Decision
+    ///   can never read), `coord` (it relays hole-punch signalling) and `circuit` (it
+    ///   relays a connection's packets). Never `join` or `pairwise`: it has no channel
+    ///   authority.
+    /// - **PendingJoiner**: `join`, `rendezvous`, `pairwise`, `coord` and `circuit`
+    ///   (a newcomer must be able to punch or relay its way in, ADR-012). ADR-016's Decision
     ///   says "for the join stream only", which is one stream too few: the moment a
     ///   join completes, the newcomer must deliver its **own** sender key (ADR-007
     ///   step 2), and it cannot wait to be reclassified — the responder only admits
@@ -174,8 +177,10 @@ impl PeerPolicy {
     ///   cannot speak first on the new session anyway. Allowing `pairwise` costs
     ///   nothing: a sealed message from a peer we hold no session with cannot be
     ///   opened and is dropped. Never `sync` (no log authority) and never `tunnel`.
-    /// - **Unknown**: `rendezvous` only, gated further by the service's own policy
-    ///   (ADR-012: reads open, member-only writes refused there).
+    /// - **JoinResponder**: `pairwise` (its sender key), `rendezvous` and `coord`.
+    /// - **Unknown**: `rendezvous`, gated further by the service's own policy (ADR-012:
+    ///   reads open, member-only writes refused there), and `coord`, where its only verb is
+    ///   `WHOAMI`.
     #[must_use]
     pub fn allows(class: PeerClass, kind: StreamKind) -> bool {
         // **Any peer may say it is stopping** (V210-93): it speaks only of the connection it
@@ -1004,7 +1009,7 @@ impl ConnectionManager {
     ///
     /// So the question is asked instead of waited for. One datagram goes out on each held
     /// connection — one byte, deliberately unframed, which the far end's
-    /// [`VoxConnection::recv_datagram`] discards before any application sees it — and a
+    /// datagram reader discards before any application sees it — and a
     /// datagram frame is ack-eliciting, so a live peer ACKs it within its ACK delay (25ms)
     /// whether or not anything reads datagrams. Anything at all arriving on a held connection
     /// within [`probe_patience`] of its probe is an answer. Nothing is a connection whose far
@@ -1495,9 +1500,7 @@ pub fn refuse_disallowed(
 /// Reset both halves of a stream with the coded rejection — the same code an
 /// unauthenticated peer gets, so probing stream kinds reveals nothing.
 pub fn refuse_stream(send: &mut SendStream, recv: &mut RecvStream) {
-    let code = close_code(WireError::AuthenticatorInvalid);
-    let _ = send.reset(code);
-    let _ = recv.stop(code);
+    crate::transport::streams::refuse(send, recv);
 }
 
 /// Reset both halves of a stream with a **specific** coded reason, for a peer that is owed one

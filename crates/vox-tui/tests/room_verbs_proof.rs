@@ -217,7 +217,10 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     assert!(ok, "PRODUCT: room post failed: {err}");
 
     // ---- post from stdin: how an agent sends JSON without quoting trouble ----
-    let envelope = r#"{"v":1,"type":"assign","to":["codex@host2"],"body":"port the codec"}"#;
+    // `to` names nodes, each by its whole fingerprint as `vox room roster` prints it (V210-161):
+    // here this node's own.
+    let envelope = format!(r#"{{"v":1,"type":"assign","to":["{me}"],"body":"port the codec"}}"#);
+    let envelope = envelope.as_str();
     let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(envelope));
     assert!(ok, "PRODUCT: room post from stdin failed: {err}");
 

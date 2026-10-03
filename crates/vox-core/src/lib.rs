@@ -68,10 +68,9 @@
 //!   decrypt-what-you-can); anti-entropy sync over an abstract transport in both
 //!   frontier and Negentropy-v1 range-reconciliation modes (keyed by the full
 //!   32-byte entry hash); attributable fork/equivocation proofs with author
-//!   freeze (and the deniable-alarm seam for ADR-009/M7); and the personal
-//!   multi-device self-channel (tag `0x000C`, `K_self` / `rendezvous_self` KDFs)
-//!   that carries received SKDMs across an identity's own
-//!   devices. The real QUIC transport (M9), the deniable authenticator (M7),
+//!   freeze; and the personal multi-device self-channel (tag `0x000C`, `K_self` /
+//!   `rendezvous_self` KDFs) that carries received SKDMs across an identity's own
+//!   devices. The real QUIC transport (M9),
 //!   payload-TTL policy (M8), and admitted-set population (M3/M6) are documented
 //!   seams, not stubs.
 //!
@@ -81,12 +80,11 @@
 //!   (ADR-007), Vox's headline differentiator. The self-certifying genesis record
 //!   (tag `0x000D`, `channelID = SHA-256(canonical genesis)`, consistent with M3's
 //!   derivation); the closed capability vocabulary + SPKI/SDSI/UCAN attenuation
-//!   lattice (`admin` ⊇ `delegate`/`invite`/`policy`/`passphrase-rotate` + the
-//!   ADR-013 tunnel caps `bind:`/`dial:`/`#role`); the composite-signed,
-//!   `(channelID, epoch)`-bound governance entry bodies that ride the M5 log
-//!   (admin-delegation cert `0x0003` and revocation `0x000E`, consent grant
-//!   `0x0004` and revocation `0x0005`, policy-update + passphrase-rotation
-//!   `0x0006`); the
+//!   lattice (`admin` ⊇ `policy`; governance is only "the creator or an admin sets the room's
+//!   retention", V030-32; the tunnel tokens `bind:`/`dial:` are gone too, PRD-001 R44); the
+//!   composite-signed, `(channelID, epoch)`-bound governance entry bodies that ride the M5
+//!   log (admin-delegation cert `0x0003` and revocation `0x000E`, consent grant `0x0004`
+//!   and revocation `0x0005`, policy-update `0x0006`, retention only); the
 //!   **deterministic evaluator** — a total function of log state with
 //!   chain-to-genesis, monotonic attenuation, expiry, revocation-wins, and the
 //!   ascending-entry-hash tie-break — gated by a mandatory golden-vector suite;
@@ -96,28 +94,8 @@
 //!   passphrase re-key on rotation (M3/M5), and TTL erasure (M8) are documented
 //!   seams, not stubs.
 //!
-//! Built on M1 + M4 + M5 + M6, milestone **M7** adds:
-//!
-//! - [`deniable`] — per-channel **deniability mode** (ADR-009), filling the
-//!   [`log::entry::DeniableVerifier`] seam M5 defined. Content authorship becomes
-//!   repudiable while governance/membership stay attributable (mpENC **weak**
-//!   deniability). The pieces: the per-epoch ephemeral composite (Ed25519+ML-DSA)
-//!   signing key `(esk_i, epk_i)` that signs content (never the static key); the
-//!   **4-round Deniable GKA + DSKE** (commit → reveal → DSKE-bind → confirm) whose
-//!   broadcasts ride the log as root-signed `dgka-setup` governance entries (tag
-//!   `0x000B`); the classical **Burmester–Desmedt** combiner over Ristretto255
-//!   ephemeral shares for the confirmation-only epoch key `K`; the
-//!   [`deniable::EpochVerifier`] that verifies deniable content against the
-//!   per-epoch `epk` *released* by per-sender consent (ADR-007); the incremental
-//!   DSKE re-key for a mid-epoch join; and the epoch-end **ESK publication** (tag
-//!   `0x0010`) that, by publishing `esk_i` after the epoch closes, makes that
-//!   epoch's content forgeable-by-anyone — the deniability mechanism. Confidentiality
-//!   (PQ Sender Keys, M4) and live origin auth (PQ composite ephemeral key) are PQ;
-//!   `K` is classical (confirmation-only) by design. The optional *live*
-//!   non-transferability upgrade (PQ designated-verifier, UDMVS/MDVRS) is out of
-//!   scope; the attributable-content path is M4/M6. **Ship prerequisite:** ADR-009
-//!   requires a formal analysis of the DGKA+DSKE construction before deniable mode
-//!   is enabled in a release (see [`deniable`]).
+//! Milestone **M7** built ADR-009 deniable rooms; they were removed (PRD-001 R43) and
+//! the design is kept in ADR-009.
 //!
 //! Built on M0 + M1 + M5, milestone **M8** adds:
 //!
@@ -153,8 +131,8 @@
 //!   leaf carries the Vox composite identity (ADR-002) in a custom X.509 extension
 //!   plus a composite proof-of-possession over `"vox-tls-handshake:" ‖
 //!   cert_public_key`, which the verifier recovers and matches against the expected
-//!   peer (mismatch → wire error `0x05`). 0-RTT is disabled; datagrams carry a
-//!   64-bit sequence + a DTLS-style sliding anti-replay window (default 1024); the
+//!   peer (mismatch → wire error `0x05`). 0-RTT is disabled; datagrams travel on
+//!   stream-bound flows routed by one reader per connection (ADR-022); the
 //!   negotiated suite/group is recorded in a session-establishment entry (tag
 //!   `0x0011`) for end-to-end downgrade auditability. M5's [`log::sync::Transport`]
 //!   gets a real quinn-backed implementation so anti-entropy sync runs over QUIC.
@@ -179,13 +157,13 @@
 
 pub mod atrest;
 pub mod cbor;
-pub mod deniable;
 pub mod error;
 pub mod governance;
 pub mod group;
 pub mod hash;
 pub mod identity;
 pub mod join;
+pub mod lan;
 pub mod log;
 pub mod nat;
 pub mod node;

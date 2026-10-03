@@ -326,7 +326,7 @@ async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> Option<PortMapping> {
 
 /// Ask each candidate gateway to forward `port`, stopping at the first that grants a
 /// mapping. Each candidate runs the PCP-then-NAT-PMP ladder of
-/// [`map_port`](crate::nat::portmap::map_port); if none grants one, **UPnP-IGD** is
+/// [`crate::nat::portmap::map_port`]; if none grants one, **UPnP-IGD** is
 /// tried last (ADR-012 rung 2's full order) — it finds the router by SSDP rather
 /// than by address, which is why it is not one of the raced candidates.
 async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> Option<PortMapping> {

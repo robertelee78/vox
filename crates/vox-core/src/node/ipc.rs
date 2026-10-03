@@ -11,8 +11,8 @@
 //! ## What this is not
 //!
 //! It is deliberately **not** a mirror of [`NodeCommand`](super::api::NodeCommand). That enum carries
-//! [`Secret`](super::api::Secret) — passphrases — and reaches `CreateIdentity`,
-//! `Revoke` and `PassphraseRotate`. An agent session runs model-authored code and
+//! [`Secret`](super::api::Secret) — passphrases — and reaches `CreateIdentity` and
+//! `Revoke`. An agent session runs model-authored code and
 //! has no business issuing any of those, so the socket speaks its own narrow
 //! vocabulary and this milestone carries **events only**. Requests that let a
 //! client *act* arrive with the agent-comms protocol (ADR-020 §4), scoped to what
@@ -59,7 +59,17 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// The protocol this build speaks. Bumped when a frame's shape changes in a way
 /// an older client would misread; a client that sees a version it does not know
 /// MUST disconnect rather than guess.
-pub const PROTOCOL_VERSION: u64 = 5;
+///
+/// 6: the app API (`node::appipc`, ADR-022 M22.5). 7: a row carries where it arrived
+/// and whether it arrived late, and `Order` asks for the room's whole order (ADR-023
+/// decision 1). Both 6s were bumped on separate branches; the merged build is 7.
+///
+/// v0.2.10's changes are carried at 7 without a bump, as v0.2.10 carried them at 5: `Rooms` is
+/// paged (an unpaged request is still read as the first page), and its new events
+/// (`SyncFailed`, `RoomNotRemembered`) are additive tags.
+///
+/// 8: a row says whether its body is **not received yet** (V030-10, [`MessageRow::owed`]).
+pub const PROTOCOL_VERSION: u64 = 8;
 
 /// Largest frame accepted in either direction.
 ///
@@ -170,6 +180,8 @@ const T_REACH_WITHDRAWN: u64 = 1711;
 const T_PROXY_REFUSED: u64 = 1712;
 /// Additive, and deliberately away from the sequential range (see above).
 const T_STILL_RELAYED: u64 = 1713;
+/// `NodeEvent::TunnelClosed` (V030-11). Additive, numbered for the item.
+const T_TUNNEL_CLOSED: u64 = 3011;
 /// Additive, and deliberately away from the sequential range (see above).
 const T_JOIN_FAILED: u64 = 1714;
 /// Additive, and deliberately away from the sequential range (see above).
@@ -208,18 +220,26 @@ const T_SYNC_FAILED: u64 = 1720;
 /// [`NodeEvent::RoomNotRemembered`] (#208). Additive, and far from the other additive tags so a
 /// concurrently-developed branch that takes 1721 does not collide with it.
 const T_ROOM_NOT_REMEMBERED: u64 = 2081;
+/// `NodeEvent::RetentionAboveRoom` (V030-32): a node file value above the room's, ignored.
+const T_RETENTION_ABOVE_ROOM: u64 = 3803;
 const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_MEMBERS: u64 = 6;
+/// [`Frame::Consents`] (V030-17).
+const T_CONSENTS: u64 = 3271;
 const T_ROOMS: u64 = 7;
 
 const T_BOUND: u64 = 8;
+/// `Frame::OwnRetention` (V030-32).
+const T_OWN_RETENTION: u64 = 3802;
 const T_LINK: u64 = 9;
 /// Protocol 5. 8 and 9 were taken (`T_BOUND`, `T_LINK`), which a first attempt at this
 /// collided with — the decoder then read a trusted list as a bound address and said
 /// "malformed identity bundle", three layers from the cause.
 const T_TRUSTED: u64 = 26;
+/// Protocol 6: the room's whole order, as `(entry hash, clock)` pairs.
+const T_ORDER_ROWS: u64 = 27;
 /// The services a [`Request::Services`] asked for (V030-24).
 const T_SERVICES: u64 = 28;
 // Client → node.
@@ -227,6 +247,8 @@ const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
 const T_READ: u64 = 3;
 const T_ROSTER: u64 = 4;
+/// [`Request::Consents`] (V030-17).
+const T_CONSENTS_REQ: u64 = 3270;
 const T_ROOMS_REQ: u64 = 5;
 // Protocol 3 — the service verbs an agent needs for file exchange (ADR-020 §11).
 // They exist on this socket, rather than as one-shot verbs that open the profile,
@@ -261,6 +283,15 @@ const T_INVITE: u64 = 13;
 const T_TRUST: u64 = 14;
 const T_UNTRUST: u64 = 15;
 const T_TRUST_LIST: u64 = 16;
+// Setting a room's retention deletes what is already stored (ADR-023 decision 2), so it is an
+// operator decision like the keyring and carries the identity passphrase the same way.
+const T_RETENTION: u64 = 23;
+// Protocol 6 — every entry the node holds for a room, in the room's one order
+// (PRD-001 R13), readable or not. What "the same order on every node" is checked
+// against, because a node's timeline shows only the rows it holds keys for.
+const T_ORDER: u64 = 24;
+// Renaming a trusted identity keeps its history grant (PRD-001 R12, R20's `vox name`).
+const T_RENAME: u64 = 25;
 // **Liveness** (V210-83). Answered by the actor and changes nothing, so a client waiting on a long
 // request can tell a node at work from a suspended or stuck one. Not a protocol bump: a node that
 // does not know it answers with an error, and any answer is proof of life.
@@ -285,6 +316,16 @@ const T_SERVICES_REQ: u64 = 18;
 const T_AGREE: u64 = 123;
 /// [`Frame::Agreement`] (V210-168).
 const T_AGREEMENT: u64 = 1201;
+// A room's lifecycle (V030-08): end, admins and the creator's idle end; a leave is `T_LEAVE`.
+// Not gated on the identity passphrase: tearing down a room the work is done in is an agent's
+// call to make. 31 was `vox room forget`, removed (the decider, 2026-10-03): reserved.
+const T_END: u64 = 32;
+const T_IDLE_END: u64 = 33;
+const T_SET_ADMIN: u64 = 34;
+const T_ADMINS: u64 = 35;
+/// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
+const T_ROOM_ENDED: u64 = 2440;
+const T_ROOM_REMOVED: u64 = 2441;
 
 /// What a client sends.
 ///
@@ -312,11 +353,28 @@ pub enum Request {
         channel_id: Digest32,
         /// Return only entries **after** this one. Absent reads from the start.
         since: Option<Digest32>,
+        /// Continue a read that has no cursor after this row, in the room's order: the page
+        /// mark of a read that came in pages. It is not `since`, which is a feed by arrival
+        /// (see the server): paging the room by `since` would skip every late arrival that
+        /// landed above the page boundary. Only with no `since`.
+        after: Option<Digest32>,
         /// Cap on rows returned; 0 means no cap.
         limit: u64,
     },
+    /// Every entry the node holds for a room, in the room's one order (ADR-023
+    /// decision 1): the sequence the timeline is a subsequence of.
+    Order {
+        /// The room.
+        channel_id: Digest32,
+    },
     /// The members of a room.
     Roster {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Who this identity consents to reading it in a room, and who consents to it: both
+    /// directions of trust, off the room's log (V030-17).
+    Consents {
         /// The room.
         channel_id: Digest32,
     },
@@ -326,9 +384,9 @@ pub enum Request {
         /// The last room of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
-    /// Offer a local TCP endpoint as a room-bound service (ADR-013), for as long as this
-    /// connection stays open: it is withdrawn when the connection closes, however the client
-    /// ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
+    /// Offer a local TCP endpoint as a room-bound service (ADR-013). Unless `persist`, only for
+    /// as long as this connection stays open: it is withdrawn when the connection closes, however
+    /// the client ends, and never persisted (V210-72). A [`Request::Forward`] likewise.
     AddService {
         /// The room.
         channel_id: Digest32,
@@ -336,6 +394,9 @@ pub enum Request {
         service_tag: String,
         /// The local endpoint to carry connections to.
         local: String,
+        /// Kept: offered until removed, across this node's restarts, as `vox service add` offers
+        /// it without a daemon (V030-06). Not withdrawn when the connection closes.
+        persist: bool,
     },
     /// The services this node offers in a room, answered with [`Frame::Services`] (V030-24).
     Services {
@@ -397,8 +458,8 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
-    /// Leave a room (V210-164): the node says so in the room, and removes it once another
-    /// member has that. Answers [`Frame::Ok`] once it is removed.
+    /// Leave a room (V210-164): the node says so in the room, and deletes it once another
+    /// member has that. Answers [`Frame::Ok`] once it is deleted.
     Leave {
         /// The room.
         channel_id: Digest32,
@@ -413,11 +474,62 @@ pub enum Request {
         petname: String,
         /// The identity passphrase, or empty for none: within the window none is needed.
         identity_passphrase: String,
+        /// Whether its consents release this node's full history (PRD-001 R12). On the
+        /// wire only when `true`, so an older client's request still decodes.
+        full_history: bool,
+    },
+    /// Set a room's retention (ADR-023 decision 2). Requires the identity passphrase:
+    /// shortening it deletes stored history, which is not an agent's call.
+    SetRetention {
+        /// The room.
+        channel_id: Digest32,
+        /// Seconds a message body is kept; `0` keeps it forever.
+        ttl: u64,
+        /// The identity passphrase, proving this is the operator and not an agent.
+        identity_passphrase: String,
+    },
+    /// End a room for everyone (V030-08); its creator only.
+    End {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Make a member an admin of a room, or take it back (V030-08); its creator only.
+    SetAdmin {
+        /// The room.
+        channel_id: Digest32,
+        /// The member.
+        member: Digest32,
+        /// `true` to add, `false` to remove.
+        admin: bool,
+    },
+    /// A room's admins, its creator first (V030-08): answered as [`Frame::Members`].
+    Admins {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Choose a room's idle end (V030-08); its creator only.
+    IdleEnd {
+        /// The room.
+        channel_id: Digest32,
+        /// Seconds with nothing said before it ends.
+        idle_secs: u64,
     },
     /// Remove an identity from the trust keyring. Needs the passphrase as [`Request::Trust`] does.
     Untrust {
         /// Who to stop trusting.
         target: Digest32,
+        /// The identity passphrase, or empty for none.
+        identity_passphrase: String,
+    },
+    /// Rename an identity already in the trust keyring, keeping what its consents release
+    /// (the history grant, PRD-001 R12). Needs the passphrase as [`Request::Trust`] does: a
+    /// keyring change (V210-159). A rename through `Trust` would reset a full-history grant to
+    /// from-now-on as a side effect.
+    Rename {
+        /// Who to rename, as a full fingerprint.
+        target: Digest32,
+        /// The new petname.
+        petname: String,
         /// The identity passphrase, or empty for none.
         identity_passphrase: String,
     },
@@ -546,18 +658,26 @@ impl Request {
             Request::Read {
                 channel_id,
                 since,
+                after,
                 limit,
             } => {
-                e.array(4)
+                e.array(5)
                     .uint(T_READ)
                     .bytes(channel_id)
                     // An absent cursor is the empty byte string, so the arity is
                     // fixed — ADR-008's canonical encoding has no optionals.
                     .bytes(since.as_ref().map_or(&[][..], |d| &d[..]))
+                    .bytes(after.as_ref().map_or(&[][..], |d| &d[..]))
                     .uint(*limit);
             }
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
+            }
+            Request::Consents { channel_id } => {
+                e.array(2).uint(T_CONSENTS_REQ).bytes(channel_id);
+            }
+            Request::Order { channel_id } => {
+                e.array(2).uint(T_ORDER).bytes(channel_id);
             }
             Request::Services { channel_id } => {
                 e.array(2).uint(T_SERVICES_REQ).bytes(channel_id);
@@ -571,12 +691,14 @@ impl Request {
                 channel_id,
                 service_tag,
                 local,
+                persist,
             } => {
-                e.array(4)
+                e.array(5)
                     .uint(T_ADD_SERVICE)
                     .bytes(channel_id)
                     .text(service_tag)
-                    .text(local);
+                    .text(local)
+                    .uint(u64::from(*persist));
             }
             Request::RemoveService {
                 channel_id,
@@ -626,15 +748,67 @@ impl Request {
             Request::Leave { channel_id } => {
                 e.array(2).uint(T_LEAVE).bytes(channel_id);
             }
+            Request::SetAdmin {
+                channel_id,
+                member,
+                admin,
+            } => {
+                e.array(4)
+                    .uint(T_SET_ADMIN)
+                    .bytes(channel_id)
+                    .bytes(member)
+                    .uint(u64::from(*admin));
+            }
+            Request::Admins { channel_id } => {
+                e.array(2).uint(T_ADMINS).bytes(channel_id);
+            }
+            Request::End { channel_id } => {
+                e.array(2).uint(T_END).bytes(channel_id);
+            }
+            Request::IdleEnd {
+                channel_id,
+                idle_secs,
+            } => {
+                e.array(3)
+                    .uint(T_IDLE_END)
+                    .bytes(channel_id)
+                    .uint(*idle_secs);
+            }
             Request::Trust {
+                target,
+                petname,
+                identity_passphrase,
+                full_history,
+            } => {
+                e.array(if *full_history { 5 } else { 4 })
+                    .uint(T_TRUST)
+                    .bytes(target)
+                    .text(petname)
+                    .text(identity_passphrase);
+                if *full_history {
+                    e.uint(1);
+                }
+            }
+            Request::Rename {
                 target,
                 petname,
                 identity_passphrase,
             } => {
                 e.array(4)
-                    .uint(T_TRUST)
+                    .uint(T_RENAME)
                     .bytes(target)
                     .text(petname)
+                    .text(identity_passphrase);
+            }
+            Request::SetRetention {
+                channel_id,
+                ttl,
+                identity_passphrase,
+            } => {
+                e.array(4)
+                    .uint(T_RETENTION)
+                    .bytes(channel_id)
+                    .uint(*ttl)
                     .text(identity_passphrase);
             }
             Request::Untrust {
@@ -687,23 +861,26 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Post { channel_id, text })
             }
-            (T_READ, 4) => {
+            (T_READ, 5) => {
                 let channel_id = digest(&mut d)?;
-                let cursor = d.bytes().map_err(|_| Error::MalformedIpc("ipc cursor"))?;
-                let since = if cursor.is_empty() {
-                    None
-                } else {
-                    Some(
-                        Digest32::try_from(cursor)
-                            .map_err(|_| Error::MalformedIpc("ipc cursor length"))?,
-                    )
+                let mut hash = |what: &'static str| -> Result<Option<Digest32>> {
+                    let b = d.bytes().map_err(|_| Error::MalformedIpc(what))?;
+                    if b.is_empty() {
+                        return Ok(None);
+                    }
+                    Digest32::try_from(b)
+                        .map(Some)
+                        .map_err(|_| Error::MalformedIpc(what))
                 };
+                let since = hash("ipc cursor")?;
+                let after = hash("ipc page mark")?;
                 let limit = d.uint().map_err(|_| Error::MalformedIpc("ipc limit"))?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Read {
                     channel_id,
                     since,
+                    after,
                     limit,
                 })
             }
@@ -712,6 +889,18 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
+            }
+            (T_CONSENTS_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Consents { channel_id })
+            }
+            (T_ORDER, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Order { channel_id })
             }
             (T_SERVICES_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -805,15 +994,44 @@ impl Request {
                     entries,
                 })
             }
-            (T_TRUST, 4) => {
+            (T_TRUST, n @ (4 | 5)) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
                 let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                let full_history = n == 5
+                    && d.uint()
+                        .map_err(|_| Error::MalformedBundle("ipc history"))?
+                        == 1;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Trust {
                     target,
                     petname,
+                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                    full_history,
+                })
+            }
+            (T_RENAME, 4) => {
+                let target = digest(&mut d)?;
+                let petname = text(&mut d, "ipc petname")?;
+                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::Rename {
+                    target,
+                    petname,
+                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                })
+            }
+            (T_RETENTION, 4) => {
+                let channel_id = digest(&mut d)?;
+                let ttl = d.uint().map_err(|_| Error::MalformedBundle("ipc ttl"))?;
+                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::SetRetention {
+                    channel_id,
+                    ttl,
                     identity_passphrase: std::mem::take(&mut *identity_passphrase),
                 })
             }
@@ -847,16 +1065,18 @@ impl Request {
                     after,
                 })
             }
-            (T_ADD_SERVICE, 4) => {
+            (T_ADD_SERVICE, 5) => {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
                 let local = text(&mut d, "ipc local address")?;
+                let persist = flag(&mut d, "ipc service persist")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::AddService {
                     channel_id,
                     service_tag,
                     local,
+                    persist,
                 })
             }
             (T_REMOVE_SERVICE, 3) => {
@@ -917,11 +1137,43 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
             }
-            (T_LEAVE, 2) => {
+            (T_LEAVE | T_END, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Leave { channel_id })
+                Ok(if tag == T_LEAVE {
+                    Request::Leave { channel_id }
+                } else {
+                    Request::End { channel_id }
+                })
+            }
+            (T_SET_ADMIN, 4) => {
+                let channel_id = digest(&mut d)?;
+                let member = digest(&mut d)?;
+                let admin = d.uint().map_err(|_| Error::MalformedIpc("ipc admin"))? != 0;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SetAdmin {
+                    channel_id,
+                    member,
+                    admin,
+                })
+            }
+            (T_ADMINS, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Admins { channel_id })
+            }
+            (T_IDLE_END, 3) => {
+                let channel_id = digest(&mut d)?;
+                let idle_secs = d.uint().map_err(|_| Error::MalformedIpc("ipc idle end"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::IdleEnd {
+                    channel_id,
+                    idle_secs,
+                })
             }
             _ => Err(Error::UnknownIpcRequest),
         }
@@ -983,10 +1235,32 @@ pub enum Frame {
         /// The rendered entries.
         rows: Vec<MessageRow>,
     },
+    /// The order a [`Request::Order`] asked for.
+    Order {
+        /// `(entry hash, clock in ms)`, first to last.
+        entries: Vec<(Digest32, u64)>,
+    },
     /// The members a [`Request::Roster`] asked for.
     Members {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
+    },
+    /// The answer to a [`Request::SetRetention`] from a member who is not the room's creator or
+    /// an admin (V030-32): it set **its own node's** retention for the room, `own` seconds, while
+    /// the room keeps `room` (`0` = forever). Its own frame, so the CLI says plainly that nothing
+    /// changed for anyone else.
+    OwnRetention {
+        /// This node's retention for the room now, seconds.
+        own: u64,
+        /// The room's retention, seconds.
+        room: u64,
+    },
+    /// What a [`Request::Consents`] asked for, each in fingerprint order.
+    Consents {
+        /// The members this identity consents to reading it.
+        outbound: Vec<Digest32>,
+        /// The members that consent to this identity reading them.
+        inbound: Vec<Digest32>,
     },
     /// The address a [`Request::Forward`] actually bound.
     ///
@@ -1011,8 +1285,9 @@ pub enum Frame {
     },
     /// The rooms a [`Request::Rooms`] asked for.
     Rooms {
-        /// `(channel_id, local name, open)` per room.
-        rooms: Vec<(Digest32, String, bool)>,
+        /// `(channel_id, local name, open, over)` per room; `over` says, in plain words, that
+        /// this identity left the room or it ended (V030-08), and is empty while it goes on.
+        rooms: Vec<(Digest32, String, bool, String)>,
     },
     /// The services a [`Request::Services`] asked for: the room's local name, and
     /// `(service tag, local address)` per service, as the node offers them.
@@ -1021,6 +1296,9 @@ pub enum Frame {
         room: String,
         /// `(service tag, local address)`, in the node's order.
         services: Vec<(String, String)>,
+        /// What every member shares in the room (V030-25): `(address, sharer, udp)`, each as
+        /// this node writes it.
+        shared: Vec<(String, String, bool)>,
     },
 }
 
@@ -1061,11 +1339,20 @@ impl Frame {
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
                 for r in rows {
-                    e.array(4)
+                    e.array(7)
                         .bytes(&r.entry_hash)
                         .bytes(&r.author)
                         .uint(r.created_millis)
-                        .text(&r.text);
+                        .text(&r.text)
+                        .uint(r.arrival)
+                        .uint(u64::from(r.late))
+                        .uint(u64::from(r.owed));
+                }
+            }
+            Frame::Order { entries } => {
+                e.array(2).uint(T_ORDER_ROWS).array(entries.len());
+                for (h, clock) in entries {
+                    e.array(2).bytes(h).uint(*clock);
                 }
             }
             Frame::Members { members } => {
@@ -1074,8 +1361,21 @@ impl Frame {
                     e.bytes(m);
                 }
             }
+            Frame::Consents { outbound, inbound } => {
+                e.array(3).uint(T_CONSENTS).array(outbound.len());
+                for m in outbound {
+                    e.bytes(m);
+                }
+                e.array(inbound.len());
+                for m in inbound {
+                    e.bytes(m);
+                }
+            }
             Frame::Bound { local } => {
                 e.array(2).uint(T_BOUND).text(local);
+            }
+            Frame::OwnRetention { own, room } => {
+                e.array(3).uint(T_OWN_RETENTION).uint(*own).uint(*room);
             }
             Frame::Link { url, note } if note.is_empty() => {
                 e.array(2).uint(T_LINK).text(url);
@@ -1085,8 +1385,17 @@ impl Frame {
             }
             Frame::Rooms { rooms } => {
                 e.array(2).uint(T_ROOMS).array(rooms.len());
-                for (id, name, open) in rooms {
-                    e.array(3).bytes(id).text(name).uint(u64::from(*open));
+                for (id, name, open, over) in rooms {
+                    // `over` only when there is one: additive, so an older client still decodes.
+                    if over.is_empty() {
+                        e.array(3).bytes(id).text(name).uint(u64::from(*open));
+                    } else {
+                        e.array(4)
+                            .bytes(id)
+                            .text(name)
+                            .uint(u64::from(*open))
+                            .text(over);
+                    }
                 }
             }
             Frame::Trusted { entries } => {
@@ -1095,10 +1404,18 @@ impl Frame {
                     e.array(2).bytes(id).text(petname);
                 }
             }
-            Frame::Services { room, services } => {
-                e.array(3).uint(T_SERVICES).text(room).array(services.len());
+            Frame::Services {
+                room,
+                services,
+                shared,
+            } => {
+                e.array(4).uint(T_SERVICES).text(room).array(services.len());
                 for (tag, local) in services {
                     e.array(2).text(tag).text(local);
+                }
+                e.array(shared.len());
+                for (address, who, udp) in shared {
+                    e.array(3).text(address).text(who).uint(u64::from(*udp));
                 }
             }
         }
@@ -1138,6 +1455,15 @@ fn text(d: &mut Decoder<'_>, what: &'static str) -> Result<String> {
     Ok(d.text().map_err(|_| Error::MalformedIpc(what))?.to_owned())
 }
 
+/// A 0/1 flag; any other value is malformed rather than read as true.
+fn flag(d: &mut Decoder<'_>, what: &'static str) -> Result<bool> {
+    match d.uint().map_err(|_| Error::MalformedBundle(what))? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(Error::MalformedBundle(what)),
+    }
+}
+
 /// A passphrase field, decoded into a buffer that is wiped when dropped (V210-94): a request that
 /// fails to decode after it is returns an error, and a plain `String` would free a copy unwiped.
 /// Moved out with [`std::mem::take`] once the whole request has decoded.
@@ -1155,13 +1481,15 @@ fn addr(d: &mut Decoder<'_>) -> Result<std::net::SocketAddr> {
 fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
     match ev {
         NodeEvent::NewEntry { channel_id, row } => {
-            e.array(6)
+            e.array(8)
                 .uint(T_NEW_ENTRY)
                 .bytes(channel_id)
                 .bytes(&row.entry_hash)
                 .bytes(&row.author)
                 .uint(row.created_millis)
-                .text(&row.text);
+                .text(&row.text)
+                .uint(row.arrival)
+                .uint(u64::from(row.late));
         }
         NodeEvent::Unlocked => {
             e.array(1).uint(T_UNLOCKED);
@@ -1245,6 +1573,31 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::NodeNote { note } => {
             e.array(2).uint(T_NODE_NOTE).text(note);
         }
+        NodeEvent::RetentionAboveRoom {
+            channel_id,
+            node,
+            room,
+        } => {
+            e.array(4)
+                .uint(T_RETENTION_ABOVE_ROOM)
+                .bytes(channel_id)
+                .uint(*node)
+                .uint(*room);
+        }
+        NodeEvent::RoomEnded {
+            channel_id,
+            handed,
+            members,
+        } => {
+            e.array(4)
+                .uint(T_ROOM_ENDED)
+                .bytes(channel_id)
+                .uint(*handed as u64)
+                .uint(*members as u64);
+        }
+        NodeEvent::RoomRemoved { channel_id } => {
+            e.array(2).uint(T_ROOM_REMOVED).bytes(channel_id);
+        }
         NodeEvent::HandshakesQueued {
             waited,
             most_waiting,
@@ -1300,6 +1653,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         }
         NodeEvent::StillRelayed { peer, reason } => {
             e.array(3).uint(T_STILL_RELAYED).bytes(peer).text(reason);
+        }
+        NodeEvent::TunnelClosed { reason } => {
+            e.array(2).uint(T_TUNNEL_CLOSED).text(reason);
         }
         NodeEvent::ProxyRefused { reason } => {
             e.array(2).uint(T_PROXY_REFUSED).text(reason);
@@ -1424,7 +1780,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rows = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc row"))?;
-                if arity != 4 {
+                if arity != 7 {
                     return Err(Error::MalformedIpc("ipc row arity"));
                 }
                 rows.push(MessageRow {
@@ -1435,9 +1791,32 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                         .text()
                         .map_err(|_| Error::MalformedIpc("ipc text"))?
                         .to_owned(),
+                    arrival: d
+                        .uint()
+                        .map_err(|_| Error::MalformedBundle("ipc arrival"))?,
+                    late: flag(d, "ipc late")?,
+                    owed: flag(d, "ipc owed")?,
                 });
             }
             return Ok(Frame::Rows { rows });
+        }
+        (T_ORDER_ROWS, 2) => {
+            let n = d.array().map_err(|_| Error::MalformedBundle("ipc order"))?;
+            let mut entries = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                if d.array()
+                    .map_err(|_| Error::MalformedBundle("ipc order entry"))?
+                    != 2
+                {
+                    return Err(Error::MalformedBundle("ipc order entry arity"));
+                }
+                let h = digest(d)?;
+                let clock = d
+                    .uint()
+                    .map_err(|_| Error::MalformedBundle("ipc order clock"))?;
+                entries.push((h, clock));
+            }
+            return Ok(Frame::Order { entries });
         }
         (T_MEMBERS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc members"))?;
@@ -1446,6 +1825,29 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 members.push(digest(d)?);
             }
             return Ok(Frame::Members { members });
+        }
+        (T_OWN_RETENTION, 3) => {
+            return Ok(Frame::OwnRetention {
+                own: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc own retention"))?,
+                room: d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room retention"))?,
+            });
+        }
+        (T_CONSENTS, 3) => {
+            let mut set = |what: &'static str| -> Result<Vec<Digest32>> {
+                let n = d.array().map_err(|_| Error::MalformedIpc(what))?;
+                let mut out = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    out.push(digest(d)?);
+                }
+                Ok(out)
+            };
+            let outbound = set("ipc consents outbound")?;
+            let inbound = set("ipc consents inbound")?;
+            return Ok(Frame::Consents { outbound, inbound });
         }
         (T_BOUND, 2) => {
             return Ok(Frame::Bound {
@@ -1469,7 +1871,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let mut rooms = Vec::with_capacity(n.min(1024));
             for _ in 0..n {
                 let arity = d.array().map_err(|_| Error::MalformedIpc("ipc room"))?;
-                if arity != 3 {
+                if !(3..=4).contains(&arity) {
                     return Err(Error::MalformedIpc("ipc room arity"));
                 }
                 let id = digest(d)?;
@@ -1478,11 +1880,18 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc room name"))?
                     .to_owned();
                 let open = d.uint().map_err(|_| Error::MalformedIpc("ipc room open"))? != 0;
-                rooms.push((id, name, open));
+                let over = if arity == 4 {
+                    d.text()
+                        .map_err(|_| Error::MalformedIpc("ipc room over"))?
+                        .to_owned()
+                } else {
+                    String::new()
+                };
+                rooms.push((id, name, open, over));
             }
             return Ok(Frame::Rooms { rooms });
         }
-        (T_SERVICES, 3) => {
+        (T_SERVICES, 4) => {
             let room = text(d, "ipc services room")?;
             let count = d
                 .array()
@@ -1497,7 +1906,30 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 }
                 services.push((text(d, "ipc service tag")?, text(d, "ipc service address")?));
             }
-            return Ok(Frame::Services { room, services });
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc shared array"))?;
+            let mut shared = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc shared row"))?
+                    != 3
+                {
+                    return Err(Error::MalformedIpc("ipc shared row arity"));
+                }
+                let address = text(d, "ipc shared address")?;
+                let who = text(d, "ipc shared sharer")?;
+                let udp = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc shared udp"))?
+                    != 0;
+                shared.push((address, who, udp));
+            }
+            return Ok(Frame::Services {
+                room,
+                services,
+                shared,
+            });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -1520,7 +1952,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Trusted { entries });
         }
-        (T_NEW_ENTRY, 6) => {
+        (T_NEW_ENTRY, 8) => {
             let channel_id = digest(d)?;
             let entry_hash = digest(d)?;
             let author = digest(d)?;
@@ -1529,6 +1961,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc text"))?
                 .to_owned();
+            let arrival = d
+                .uint()
+                .map_err(|_| Error::MalformedBundle("ipc arrival"))?;
+            let late = flag(d, "ipc late")?;
             NodeEvent::NewEntry {
                 channel_id,
                 row: MessageRow {
@@ -1536,6 +1972,9 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     author,
                     created_millis,
                     text,
+                    arrival,
+                    late,
+                    owed: false,
                 },
             }
         }
@@ -1597,6 +2036,22 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .map_err(|_| Error::MalformedIpc("ipc room not remembered why"))?
                 .to_owned(),
         },
+        (T_ROOM_ENDED, 4) => NodeEvent::RoomEnded {
+            channel_id: digest(d)?,
+            handed: usize::try_from(
+                d.uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room quiet"))?,
+            )
+            .unwrap_or(usize::MAX),
+            members: usize::try_from(
+                d.uint()
+                    .map_err(|_| Error::MalformedIpc("ipc room quiet"))?,
+            )
+            .unwrap_or(usize::MAX),
+        },
+        (T_ROOM_REMOVED, 2) => NodeEvent::RoomRemoved {
+            channel_id: digest(d)?,
+        },
         (T_HANDSHAKES_QUEUED, 6) => {
             let mut count = |what| {
                 d.uint()
@@ -1627,6 +2082,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc address withheld"))?
                 .to_owned(),
+        },
+        (T_RETENTION_ABOVE_ROOM, 4) => NodeEvent::RetentionAboveRoom {
+            channel_id: digest(d)?,
+            node: d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc retention node"))?,
+            room: d
+                .uint()
+                .map_err(|_| Error::MalformedIpc("ipc retention room"))?,
         },
         (T_CONNECTION_NOTE, 3) => NodeEvent::ConnectionNote {
             peer: digest(d)?,
@@ -1693,6 +2157,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             reason: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc proxy refusal reason"))?
+                .to_owned(),
+        },
+        (T_TUNNEL_CLOSED, 2) => NodeEvent::TunnelClosed {
+            reason: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc tunnel close reason"))?
                 .to_owned(),
         },
         (T_PEER_UNREACHABLE, 3) => NodeEvent::PeerUnreachable {
@@ -2022,6 +2492,8 @@ impl Held {
     /// cloned for this: some carry passphrases).
     fn intent(request: &Request) -> Intent {
         match request {
+            // A kept offer outlives the connection that made it, as `vox service add` means it to.
+            Request::AddService { persist: true, .. } => Intent::Nothing,
             Request::AddService {
                 channel_id,
                 service_tag,
@@ -2112,20 +2584,40 @@ async fn serve_requests(
         // a join is the end of the join — it was still there when the lock reported done.
         // Measured through the shipped binary both times: one copy of a join's room passphrase.
         let body = zeroize::Zeroizing::new(body);
-        // ADR-025 S0b: `vox status --json`. Answered, and the connection serves on.
+        // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
+        if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
+            if crate::node::nameipc::serve(&mut stream, handle, req).await? {
+                continue;
+            }
+            return Ok(());
+        }
+        // PRD-001 R35: `vox status`. Answered, and the connection serves on.
         if crate::node::status::is_request(&body) {
-            let equivocations: Vec<(Digest32, Digest32, u64)> = handle
-                .view()
-                .open_channels
-                .iter()
-                .flat_map(|d| {
-                    d.equivocations
-                        .iter()
-                        .map(move |(author, seq)| (d.channel_id, *author, *seq))
-                })
-                .collect();
-            crate::node::status::serve(&mut stream, handle.sync_book(), &equivocations).await?;
+            crate::node::status::serve(&mut stream, handle).await?;
             continue;
+        }
+        // V030-11: `vox tunnel close`. The live tunnels are this process's, so it is answered
+        // here, and the connection serves on.
+        if let Some(which) = crate::node::status::close_request(&body) {
+            crate::node::status::serve_close(&mut stream, &which).await?;
+            continue;
+        }
+        // Protocol 6: an app request turns the connection into an app connection for
+        // the rest of its life (ADR-022 decision 7, `node::appipc`).
+        if let Some(app) = crate::node::appipc::AppRequest::parse(&body) {
+            return match app {
+                Ok(app) => crate::node::appipc::serve(stream, handle.clone(), app).await,
+                Err(e) => {
+                    write_frame(
+                        &mut stream,
+                        &Frame::Error {
+                            reason: e.to_string(),
+                        }
+                        .to_bytes(),
+                    )
+                    .await
+                }
+            };
         }
         let request = Request::from_bytes(&body);
         drop(body);
@@ -2160,6 +2652,16 @@ async fn serve_requests(
     }
 }
 
+/// Apply `command` and answer `Ok`, or the outcome as an error.
+async fn plain(handle: &NodeHandle, command: crate::node::api::NodeCommand) -> Frame {
+    match handle.apply(command).await {
+        crate::node::api::Outcome::Done => Frame::Ok,
+        other => Frame::Error {
+            reason: other.to_string(),
+        },
+    }
+}
+
 /// Prove the caller holds the identity passphrase, or say why not. A right one is an entry of it,
 /// so the node's keyring window starts again (V210-159).
 async fn verify_operator(
@@ -2189,10 +2691,16 @@ async fn verify_operator(
     }
 }
 
-/// [`verify_operator`] for a passphrase that was given; nothing to check for one that was not
-/// (the empty string), and the node's keyring window decides.
+/// [`verify_operator`] for a passphrase that was given; for none (the empty string), the node's
+/// keyring window decides.
+///
+/// **The empty string is also a passphrase** (V030-36): an identity may have none. So an empty
+/// one is checked too, and a match counts as the passphrase entered, opening the window; a
+/// mismatch is "none given", not a wrong passphrase. Without that, an identity with no
+/// passphrase could never change its keyring once the window had passed.
 async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
     if passphrase.is_empty() {
+        let _ = verify_operator(handle, passphrase).await;
         return Ok(());
     }
     verify_operator(handle, passphrase).await
@@ -2262,16 +2770,41 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             target,
             petname,
             identity_passphrase,
+            full_history,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
             Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Trust {
+                .apply(crate::node::api::NodeCommand::TrustWith {
                     fingerprint: target,
                     petname,
+                    history: if full_history {
+                        crate::node::trust::HistoryGrant::Full
+                    } else {
+                        crate::node::trust::HistoryGrant::Now
+                    },
                 })
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            },
+        },
+        Request::SetRetention {
+            channel_id,
+            ttl,
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::SetRetention { channel_id, ttl })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                crate::node::api::Outcome::OwnRetention { own, room } => {
+                    Frame::OwnRetention { own, room }
+                }
                 other => Frame::Error {
                     reason: other.to_string(),
                 },
@@ -2285,6 +2818,25 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             Ok(()) => match handle
                 .apply(crate::node::api::NodeCommand::Untrust {
                     fingerprint: target,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            },
+        },
+        Request::Rename {
+            target,
+            petname,
+            identity_passphrase,
+        } => match verify_given(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::Rename {
+                    fingerprint: target,
+                    petname,
                 })
                 .await
             {
@@ -2332,6 +2884,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Read {
             channel_id,
             since,
+            after,
             limit,
         } => {
             let view = handle.view();
@@ -2344,27 +2897,57 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: "room not open".into(),
                 };
             };
-            // The cursor is an entry hash the client already has; everything
-            // after it is what it has not seen. A cursor this node does not hold
-            // is an error rather than "from the start", which would silently
+            // The cursor is an entry hash the client already has; everything that
+            // **arrived** after it is what it has not seen. A cursor this node does not
+            // hold is an error rather than "from the start", which would silently
             // re-deliver the whole room.
-            let start = match since {
-                None => 0,
-                // From the end: a tail's cursor is the last row it read, at or near the end, so
-                // finding it costs what came after it rather than the room's history (V210-113).
-                Some(cursor) => match detail
-                    .timeline
-                    .iter()
-                    .rev()
-                    .position(|r| r.entry_hash == cursor)
-                {
-                    Some(k) => detail.timeline.len() - k,
-                    None => {
+            //
+            // Arrival, not position: the timeline is in the room's order (ADR-023
+            // decision 1), where a late arrival lands *above* rows already shown, and
+            // "everything below the cursor" would skip it for good. So a read from a
+            // cursor is a feed: what this node rendered after the cursor, in the order it
+            // rendered them, which makes the last line always the right next cursor. A
+            // read with no cursor is the room, in the room's order, and `after` is where
+            // its next page starts in that order.
+            let candidates: Vec<&MessageRow> = match (since, after) {
+                (Some(_), Some(_)) => {
+                    return Frame::Error {
+                        reason: "a read takes a cursor or a page mark, not both".into(),
+                    }
+                }
+                (Some(cursor), None) => {
+                    // A message not received yet has no arrival to read on from (V030-10): as a
+                    // cursor its `0` would re-deliver the whole room.
+                    // Searched from the end: a tail's cursor is the last row it read, at or near
+                    // the end (V210-113).
+                    let Some(mark) = detail
+                        .timeline
+                        .iter()
+                        .rev()
+                        .find(|r| r.entry_hash == cursor && !r.owed)
+                        .map(|r| r.arrival)
+                    else {
                         return Frame::Error {
                             reason: "cursor not in this room's timeline".into(),
-                        }
-                    }
-                },
+                        };
+                    };
+                    let mut newer: Vec<&MessageRow> = detail
+                        .timeline
+                        .iter()
+                        .filter(|r| r.arrival > mark)
+                        .collect();
+                    newer.sort_by_key(|r| r.arrival);
+                    newer
+                }
+                (None, None) => detail.timeline.iter().collect(),
+                (None, Some(mark)) => {
+                    let Some(i) = detail.timeline.iter().position(|r| r.entry_hash == mark) else {
+                        return Frame::Error {
+                            reason: "page mark not in this room's timeline".into(),
+                        };
+                    };
+                    detail.timeline.iter_from(i + 1).collect()
+                }
             };
             // **One reply is bounded by bytes, never the whole room.** A reply was every row
             // after `since`, in one frame, and the client refuses a frame over `MAX_FRAME`:
@@ -2375,7 +2958,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             let limit = usize::try_from(limit).unwrap_or(usize::MAX);
             let mut rows: Vec<MessageRow> = Vec::new();
             let mut bytes = 0usize;
-            for r in detail.timeline.iter_from(start) {
+            for r in candidates {
                 if limit > 0 && rows.len() >= limit {
                     break;
                 }
@@ -2388,10 +2971,21 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
             Frame::Rows { rows }
         }
-        // **Not paged, and bounded by the product's scale.** A room is at most 500 members
-        // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
-        // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
-        // ever rises past a few thousand (V210-16).
+        Request::Order { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Order {
+                    entries: detail.order.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
         // V210-120: only the rows asked for, found through the room's index of structured posts,
         // so a client after a room's coordination posts no longer reads every row of the room.
         Request::Structured {
@@ -2410,29 +3004,32 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: "room not open".into(),
                 };
             };
-            let at = detail.structured.positions(&types, &ops);
-            let start = match since {
-                None => 0,
-                Some(cursor) => match at.iter().rposition(|i| {
-                    detail
-                        .timeline
-                        .get(*i as usize)
-                        .is_some_and(|r| r.entry_hash == cursor)
-                }) {
-                    Some(k) => k + 1,
-                    None => {
-                        return Frame::Error {
-                            reason: "cursor not among this room's structured posts".into(),
-                        }
-                    }
-                },
-            };
+            // Arrival order, as a read from a cursor is (ADR-023 decision 1): a late post lands
+            // above rows already shown, so "the posts below the cursor" would skip it for good. On
+            // a room where nothing arrived late this is the timeline's own order.
+            let mut matched: Vec<&MessageRow> = detail
+                .structured
+                .positions(&types, &ops)
+                .into_iter()
+                .filter_map(|i| detail.timeline.get(i as usize))
+                .collect();
+            matched.sort_by_key(|r| r.arrival);
+            if let Some(cursor) = since {
+                let Some(mark) = matched
+                    .iter()
+                    .rev()
+                    .find(|r| r.entry_hash == cursor && !r.owed)
+                    .map(|r| r.arrival)
+                else {
+                    return Frame::Error {
+                        reason: "cursor not among this room's structured posts".into(),
+                    };
+                };
+                matched.retain(|r| r.arrival > mark);
+            }
             let mut rows: Vec<MessageRow> = Vec::new();
             let mut bytes = 0usize;
-            for i in &at[start.min(at.len())..] {
-                let Some(r) = detail.timeline.get(*i as usize) else {
-                    continue;
-                };
+            for r in matched {
                 let cost = r.text.len() + ROW_OVERHEAD;
                 if !rows.is_empty() && bytes + cost > rows_budget() {
                     break;
@@ -2453,8 +3050,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: "room not open".into(),
                 };
             };
+            // Counted by arrival, as a read from the cursor delivers (ADR-023 decision 1), and
+            // `last` is the row that arrived last, the cursor such a read ends on. A message not
+            // received yet (V030-10) has no arrival and is neither.
             let len = detail.timeline.len();
-            let last = detail.timeline.last().map(|r| r.entry_hash);
+            let last = detail
+                .timeline
+                .iter()
+                .filter(|r| !r.owed)
+                .max_by_key(|r| r.arrival)
+                .map(|r| r.entry_hash);
             match since {
                 None => Frame::Count {
                     n: len as u64,
@@ -2465,9 +3070,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     .timeline
                     .iter()
                     .rev()
-                    .position(|r| r.entry_hash == cursor)
+                    .find(|r| r.entry_hash == cursor && !r.owed)
+                    .map(|r| r.arrival)
                 {
-                    Some(k) => Frame::Count { n: k as u64, last },
+                    Some(mark) => Frame::Count {
+                        n: detail.timeline.iter().filter(|r| r.arrival > mark).count() as u64,
+                        last,
+                    },
                     None => Frame::Error {
                         reason: "cursor not in this room's timeline".into(),
                     },
@@ -2513,6 +3122,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     .iter()
                     .map(|(tag, local)| (tag.clone(), local.to_string()))
                     .collect(),
+                shared: handle.shared_in(channel_id).await.unwrap_or_default(),
             },
             None => Frame::Error {
                 reason: "room not open".into(),
@@ -2544,6 +3154,10 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
+        // **Not paged, and bounded by the product's scale.** A room is at most 500 members
+        // (PRD-001's family scale); a member is a 32-byte key, so a roster is ~17 KiB of a
+        // 256 KiB frame. A frame would hold ~7,700; paging this is owed only if that scale
+        // ever rises past a few thousand (V210-16).
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view
@@ -2559,10 +3173,28 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             }
         }
+        // Bounded like the roster: two sets of at most a room's members.
+        Request::Consents { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Consents {
+                    outbound: detail.consented.clone(),
+                    inbound: detail.consenting.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
         Request::AddService {
             channel_id,
             service_tag,
             local,
+            persist,
         } => {
             let Ok(local) = local.parse() else {
                 return Frame::Error {
@@ -2575,8 +3207,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     service_tag,
                     local,
                     // Offered over this socket, it lasts as long as the client's connection
-                    // (`Held`), and so never outlives this node's run either.
-                    persist: false,
+                    // (`Held`), and so never outlives this node's run either — unless the client
+                    // asked for it kept, as `vox service add` does (V030-06).
+                    persist,
                 })
                 .await
             {
@@ -2723,15 +3356,63 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        Request::Leave { channel_id } => match handle
-            .apply(crate::node::api::NodeCommand::LeaveChannel { channel_id })
+        Request::Leave { channel_id } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::LeaveRoom { channel_id },
+            )
             .await
-        {
-            crate::node::api::Outcome::Done => Frame::Ok,
-            other => Frame::Error {
-                reason: other.to_string(),
-            },
-        },
+        }
+        Request::End { channel_id } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::EndRoom { channel_id },
+            )
+            .await
+        }
+        Request::SetAdmin {
+            channel_id,
+            member,
+            admin,
+        } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::SetAdmin {
+                    channel_id,
+                    member,
+                    admin,
+                },
+            )
+            .await
+        }
+        Request::Admins { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Members {
+                    members: detail.admins.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        Request::IdleEnd {
+            channel_id,
+            idle_secs,
+        } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::ChooseIdleEnd {
+                    channel_id,
+                    idle_secs,
+                },
+            )
+            .await
+        }
         Request::Invite { channel_id } => {
             // Subscribe before asking: the link arrives as an event, and one emitted
             // between the command and the wait would be lost.
@@ -2816,11 +3497,14 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         c.channel_id,
                         c.local_name.clone().unwrap_or_default(),
                         c.open,
+                        c.over.clone().unwrap_or_default(),
                     )
                 })
                 .collect();
             Frame::Rooms {
-                rooms: page(rooms, after, |(id, name, _)| (*id, name.len())),
+                rooms: page(rooms, after, |(id, name, _, over)| {
+                    (*id, name.len() + over.len())
+                }),
             }
         }
     }
@@ -3007,13 +3691,18 @@ impl IpcClient {
         channel_id: Digest32,
         since: Option<Digest32>,
     ) -> Result<Frame> {
+        // A read from a cursor is a feed by arrival, so its next page follows the last row
+        // as a cursor. A read of the whole room is in the room's order, so its next page
+        // follows the last row as a page mark: as a cursor it would become that feed, and
+        // lose every late arrival above the page boundary.
         let mut all = Vec::new();
-        let mut cursor = since;
+        let (mut cursor, mut mark) = (since, None);
         loop {
             match self
                 .request(&Request::Read {
                     channel_id,
                     since: cursor,
+                    after: mark,
                     limit: 0,
                 })
                 .await?
@@ -3023,11 +3712,16 @@ impl IpcClient {
                         return Ok(Frame::Rows { rows: all });
                     };
                     // A page that ends where the last one did would be asked for again
-                    // forever; a node that ignored the cursor is an error, not a hang.
-                    if cursor == Some(last.entry_hash) {
+                    // forever; a node that ignored the cursor or the mark is an error, not a hang.
+                    let marker = if since.is_some() {
+                        &mut cursor
+                    } else {
+                        &mut mark
+                    };
+                    if *marker == Some(last.entry_hash) {
                         return Err(Error::MalformedIpc("ipc rows page did not advance"));
                     }
-                    cursor = Some(last.entry_hash);
+                    *marker = Some(last.entry_hash);
                     all.extend(rows);
                 }
                 other => return Ok(other),

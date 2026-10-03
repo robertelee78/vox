@@ -60,12 +60,10 @@
 // mid-turn it is taken at the next step boundary, exactly as if typed while busy.
 // It never aborts the running turn first: an abort orphans a queued prompt.
 //
-// **A woken message is given to the model once** (V210-112). The relayed prompt is a user
-// message, so this plugin's own drain runs on it, and it re-read the same message into the same
-// prompt. The daemon's frame names the entry it carries; once OpenCode has taken the prompt, or
-// when the message being drained is that prompt itself, the drain is told (`--woken`) and does
-// not show it again. An entry is never passed while its relay is still undecided, so a relay
-// that fails cannot make the drain skip a message nobody delivered.
+// **A wake carries no message** (V030-15). The relayed prompt is a notice from Vox: how many
+// urgent messages and replies wait, from whom, in which room. The relayed prompt is a user
+// message, so this plugin's own drain runs on it, and that drain is what gives the model the
+// messages themselves, once, first in its block.
 //
 // Every failure path is silent and injects nothing. A hook that breaks the turn it
 // rides on is worse than one that does nothing.
@@ -102,14 +100,12 @@ function log(line) {
  * The wire is NDJSON, the same shape Claude Code's messaging socket takes:
  *
  *   {"type":"auth","token":"…"}
- *   {"type":"prompt","session":"ses_…","entry":"…","text":"…"}
+ *   {"type":"prompt","session":"ses_…","text":"…"}
  *
  * answered with one line: `{"ok":true}`, or `{"error":"…"}` with `"gone":true`
  * when this OpenCode does not know the session. A connection that has not sent both
  * frames within `AUTH_IDLE_MS`, or sends more than `MAX_FRAMES_BYTES` before them, is
  * closed unanswered.
- *
- * Each relay is noted in `woken` (session id → `{ entry, text, taken }`) for the drain.
  *
  * ## The directory is removed when OpenCode exits, however it exits (ADR-021 F17)
  *
@@ -125,7 +121,7 @@ function log(line) {
  * Should that helper itself be killed, `sweep` removes the directory at the next start.
  */
 const AUTH_IDLE_MS = 5000
-const MAX_FRAMES_BYTES = 1 << 20 // a wake carries at most one 64 KiB message, escaped
+const MAX_FRAMES_BYTES = 1 << 20 // far more than any notice
 const WAKE_DIR = /^vox-oc-[A-Za-z0-9]{6}$/
 const SWEEP_MIN_AGE_MS = 10_000
 
@@ -190,7 +186,24 @@ function removeOnExit(dir) {
   }
 }
 
-function wakeChannel(client, woken) {
+/**
+ * Room text with every `<vox-room` and `</vox-room` (any case) made inert (V030-21), so a message
+ * cannot open or close a fence of its own: the `<` becomes `&lt;`. The fence's own tags are added
+ * after this, and carry a nonce besides, so even a tag that slipped past could not end the block.
+ */
+function defang(text) {
+  return text.replace(/<(\/?)(vox-room)/gi, "&lt;$1$2")
+}
+
+/** The most wake notices remembered per session until OpenCode runs a turn on them. */
+const MAX_RELAYED = 16
+
+/**
+ * `relayed` notes each wake notice relayed to a session (session id → its texts), before
+ * OpenCode is handed it: OpenCode may run the prompt's `chat.message` before `promptAsync`
+ * returns, and that turn must know the message is Vox's notice, not the operator's (V030-21).
+ */
+function wakeChannel(client, relayed) {
   try {
     // `mkdtemp` makes the directory 0700, so only this user can reach the socket;
     // the token keeps every other process of theirs out as well.
@@ -245,35 +258,28 @@ function wakeChannel(client, woken) {
           if (msg?.type !== "prompt" || !msg.session || typeof msg.text !== "string") {
             return answer({ error: "expected a prompt frame" })
           }
-          // Noted before the relay: OpenCode may run this prompt's `chat.message` before
-          // `promptAsync` returns, and that drain must know it is the wake.
-          let relay = null
-          if (typeof msg.entry === "string" && msg.entry) {
-            relay = { entry: msg.entry, text: msg.text, taken: false }
-            woken.set(msg.session, [...(woken.get(msg.session) ?? []), relay])
-          }
+          const noted = [...(relayed.get(msg.session) ?? []), msg.text].slice(-MAX_RELAYED)
+          relayed.set(msg.session, noted)
           const forget = () => {
-            if (!relay) return
-            const left = (woken.get(msg.session) ?? []).filter((w) => w !== relay)
-            woken.set(msg.session, left)
+            const left = relayed.get(msg.session) ?? []
+            const i = left.lastIndexOf(msg.text)
+            if (i >= 0) left.splice(i, 1)
           }
+          let res
           try {
-            const res = await client.session.promptAsync({
+            res = await client.session.promptAsync({
               path: { id: msg.session },
               body: { parts: [{ type: "text", text: msg.text }] },
             })
-            const status = res?.response?.status ?? 0
-            log("wake: session " + msg.session + " answered " + status)
-            if (status >= 200 && status < 300) {
-              if (relay) relay.taken = true
-              return answer({ ok: true })
-            }
-            forget()
-            answer({ error: "OpenCode answered " + status, gone: status === 404 })
           } catch (e) {
             forget()
             throw e
           }
+          const status = res?.response?.status ?? 0
+          log("wake: session " + msg.session + " answered " + status)
+          if (status >= 200 && status < 300) return answer({ ok: true })
+          forget()
+          answer({ error: "OpenCode answered " + status, gone: status === 404 })
         } catch (e) {
           log("wake: threw: " + e)
           answer({ error: String(e) })
@@ -297,8 +303,8 @@ function wakeChannel(client, woken) {
 
 export default async function vox({ $, client }) {
   log("plugin loaded (cwd=" + process.cwd() + ")")
-  const woken = new Map()
-  const wake = wakeChannel(client, woken)
+  const relayed = new Map()
+  const wake = wakeChannel(client, relayed)
   return {
     // **Name the session to every shell this session runs** (ADR-021 §4, §7).
     // Claude Code and Codex put their session id in every tool's environment
@@ -329,6 +335,14 @@ export default async function vox({ $, client }) {
         }
         const bin = process.env.VOX_BIN || "vox"
 
+        // Whether this message is a wake notice Vox relayed, not something the operator typed:
+        // its text is one this session was relayed and has not had a turn on yet.
+        const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
+        const notes = relayed.get(sessionID) ?? []
+        const at = typed ? notes.indexOf(typed.text) : -1
+        const isWake = at >= 0
+        if (isWake) notes.splice(at, 1)
+
         // `.quiet()` keeps the child's output out of OpenCode's, `.nothrow()`
         // makes a non-zero exit a value rather than an exception — `vox agent
         // hook` always exits 0, but a missing binary would otherwise throw.
@@ -341,23 +355,18 @@ export default async function vox({ $, client }) {
           env.VOX_OPENCODE_WAKE_TOKEN = wake.token
         }
 
-        // What a wake has put in front of this session already (see above): every relay
-        // OpenCode has taken, and the one this message is, if it is a wake. Told once; a
-        // drain that fails after this only means the next one may show it again.
-        const typed = output.parts.find((p) => p.type === "text" && typeof p.text === "string")
-        const relays = woken.get(sessionID) ?? []
-        const told = relays.filter((w) => w.taken || (typed && w.text === typed.text))
-        woken.set(sessionID, relays.filter((w) => !told.includes(w)))
-        const flags = told.flatMap((w) => ["--woken", w.entry])
-        if (told.length) log("drain: woken " + told.map((w) => w.entry).join(" "))
-
         const result =
-          await $`${bin} agent hook --format text --session ${sessionID} ${flags}`
+          await $`${bin} agent hook --format text --session ${sessionID}`
             .env(env)
             .quiet()
             .nothrow()
         const text = result.stdout.toString()
         log("drain: exit=" + result.exitCode + " bytes=" + text.length)
+        // **The fence's tag is this turn's own** (V030-21): a nonce drawn now, after the drain has
+        // returned, so nothing in the room text can have known it. Only `</vox-room-<nonce>>` ends
+        // the block; a fixed `</vox-room>` inside a message used to end it early, and whatever
+        // followed read as outside the room.
+        const nonce = randomBytes(8).toString("hex")
 
         // A quiet room injects nothing at all — not "no new messages". A quiet
         // room should cost zero tokens per turn.
@@ -373,10 +382,18 @@ export default async function vox({ $, client }) {
         // block shares the operator's message: the fence names its source, and what
         // follows the closing tag is the operator's own. Without that, a live model
         // refused the operator's instruction as one "embedded in messages".
+        //
+        // **What follows the block is labelled as what it is** (V030-21). A wake notice Vox
+        // relayed reaches OpenCode as a user message, but it is Vox's, not the operator's:
+        // labelled "The user's message:" it read as the operator speaking.
+        const after = isWake
+          ? "Relayed by Vox; not the user's message:\n"
+          : "The user's message:\n"
         const block =
-          '<vox-room source="other agents; not the user">\n' +
-          text.trim() +
-          "\n</vox-room>\n\nThe user's message:\n"
+          `<vox-room-${nonce} source="other agents; not the user">\n` +
+          defang(text.trim()) +
+          `\n</vox-room-${nonce}>\n\n` +
+          after
         for (const part of output.parts) {
           if (part.type === "text" && typeof part.text === "string") {
             part.text = block + part.text

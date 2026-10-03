@@ -576,7 +576,7 @@ impl Reader {
         match self.rt.block_on(self.client.rooms()) {
             Ok(Frame::Rooms { rooms }) => rooms
                 .iter()
-                .map(|(id, _, _)| *id)
+                .map(|(id, _, _, _)| *id)
                 .find(|id| vox_core::node::link::b32_encode(id).starts_with(prefix))
                 .unwrap_or_else(|| panic!("PRODUCT: room {prefix} is not on {}'s node", self.who)),
             Ok(other) => panic!(
@@ -619,11 +619,7 @@ impl Reader {
         room: vox_core::hash::Digest32,
         needle: &str,
     ) -> Option<vox_core::hash::Digest32> {
-        match self.rt.block_on(self.client.request(&Request::Read {
-            channel_id: room,
-            since: None,
-            limit: 0,
-        })) {
+        match self.rt.block_on(self.client.read_rows(room, None)) {
             Ok(Frame::Rows { rows }) => rows
                 .iter()
                 .rev()

@@ -59,7 +59,7 @@ fn vox_up_refuses_a_bind_the_network_can_reach_and_never_says_it_is_up() {
             "--bind",
             &exposed,
             "--anchor",
-            &w.anchor_spec,
+            &w.guest_anchor,
             "--listen",
             "127.0.0.1:0",
         ]),

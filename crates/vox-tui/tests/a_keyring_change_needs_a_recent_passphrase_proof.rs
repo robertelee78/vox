@@ -136,6 +136,7 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Fram
                 target,
                 petname: petname.to_owned(),
                 identity_passphrase: passphrase.to_owned(),
+                full_history: false,
             }),
         )
         .await

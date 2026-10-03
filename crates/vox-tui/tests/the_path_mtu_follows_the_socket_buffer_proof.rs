@@ -169,7 +169,7 @@ fn run_arm(granted: usize, short: bool, staged: Option<&std::path::Path>) {
         .expect("APPARATUS: the world has no host process");
     // Moved out (the temp dir stays with `w`) so it is killed last, after everything that
     // reaches through it.
-    let anchor = w._anchor;
+    let anchor = w.anchor;
     for proc in [forward, host, anchor] {
         let name = proc.name.clone();
         let pid = proc.child.id();

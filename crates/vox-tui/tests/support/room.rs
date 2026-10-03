@@ -139,6 +139,8 @@ pub struct Worker {
     /// The identity passphrase file the daemon was unlocked with.
     pub pass: std::path::PathBuf,
     daemon: Option<Proc>,
+    /// The anchor its daemon was started with, so it can be started again the same way.
+    anchor: String,
 }
 
 impl Worker {
@@ -257,6 +259,29 @@ impl Worker {
     pub fn b32(&self) -> String {
         vox_core::node::link::b32_encode(&self.fp)
     }
+
+    /// Stop this worker's daemon, by its own handle, so another `vox` can hold the profile.
+    #[allow(dead_code)] // not every proof that includes this support module stops one
+    pub fn stop_daemon(&mut self) {
+        drop(self.daemon.take());
+    }
+
+    /// Stop this worker's daemon, by its own handle, and start it again as it was started.
+    #[allow(dead_code)] // not every proof that includes this support module restarts one
+    pub fn restart_daemon(&mut self, err: &std::path::Path) {
+        drop(self.daemon.take());
+        let anchor = self.anchor.clone();
+        start_daemon(self, &anchor, err);
+    }
+
+    /// Stop this worker's daemon and start it again from `exe` with `env`, as it was started
+    /// otherwise: a member that is to run a faulty build (the mutant sender).
+    #[allow(dead_code)] // only proofs that run a faulty member call it
+    pub fn restart_daemon_as(&mut self, exe: &str, env: &[(&str, &str)], err: &std::path::Path) {
+        drop(self.daemon.take());
+        let anchor = self.anchor.clone();
+        start_daemon_as(self, exe, env, &anchor, err);
+    }
 }
 
 /// A room shared by every worker, and the processes that serve it. Dropping it kills
@@ -271,6 +296,13 @@ pub struct Room {
 }
 
 impl Room {
+    /// Stop worker `i`'s daemon as a crash does: killed (SIGKILL) and reaped by its own PID. It
+    /// stays down until [`Room::restart`].
+    #[allow(dead_code)] // not every proof that includes this support module stops a daemon
+    pub fn stop(&mut self, i: usize) {
+        self.workers[i].daemon = None;
+    }
+
     /// Restart worker `i`'s daemon as an operator does after a crash: killed (SIGKILL) and
     /// reaped by its own PID, then `vox daemon` again with the identity passphrase alone, which
     /// reopens every room it held (#208). Returns once this room reads on that node again.
@@ -421,6 +453,7 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
         fp: [0; 32],
         pass,
         daemon: None,
+        anchor: String::new(),
     };
     // `vox id` creates the identity on first use and prints its fingerprint.
     let o = w.vox(None, &["id", "--identity-passphrase-file", utf8(&w.pass)]);
@@ -433,7 +466,20 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
 }
 
 fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
-    let child = Command::new(VOX)
+    start_daemon_as(w, VOX, &[], anchor, err);
+}
+
+/// [`start_daemon`] from `exe` with `env` beside it: a proof that runs one member as a faulty
+/// build (the mutant sender) names it here.
+fn start_daemon_as(
+    w: &mut Worker,
+    exe: &str,
+    env: &[(&str, &str)],
+    anchor: &str,
+    err: &std::path::Path,
+) {
+    let child = Command::new(exe)
+        .envs(env.iter().copied())
         .args([
             "daemon",
             "--listen",
@@ -449,8 +495,9 @@ fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
         .stdout(Stdio::null())
         .stderr(log_file(err))
         .spawn()
-        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} daemon: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {exe} daemon: {e}"));
     w.daemon = Some(Proc(child));
+    w.anchor = anchor.to_owned();
     let started = Instant::now();
     let deadline = started + DAEMON_START_PATIENCE;
     let mut looks = Looks::new();

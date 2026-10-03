@@ -33,7 +33,8 @@
 //! tunnels each take less than [`ONE_WINDOW_TAKEN`]; and Alice's daemon grows by less than
 //! [`GREW_PAST_CAP`] (from `ps`) between the cap and past it. The refusal names the service the
 //! 16 go to and how to free one ([`FREE_ONE_SAID`]), and at the cap `vox status` (both `--json`
-//! and the lines a person reads) lists the 16 on each side: out on Bob's, in on Alice's.
+//! and the lines a person reads) lists the 16 on each side: out on Bob's, in on Alice's; and
+//! Alice's names the offer once per tunnel, in one listing, never twice.
 //!
 //! ## Preconditions (else CANNOT MEASURE)
 //! The control posts all arrived within [`BOUND`]. In the download arm, both collectors received
@@ -104,7 +105,8 @@ const REFUSED_WITHIN: Duration = Duration::from_secs(30);
 /// What the person is told past the cap.
 const LIMIT_SAID: &str = "16 tunnels are already open to this member";
 /// How the refusal tells them to free one (decider, 2026-10-01).
-const FREE_ONE_SAID: [&str; 4] = [
+const FREE_ONE_SAID: [&str; 5] = [
+    "`vox tunnel close`",
     "close the program using it",
     "`vox forward`",
     "`vox service remove`",
@@ -520,7 +522,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     let at_cap = stalled(|| loads(&written).into_iter().chain(loads(&more)).collect());
     let rss_at_cap = rss(alice_pid);
     // What each side's `vox status` lists now: Bob's 16 tunnels to the offer, Alice's 16 from him.
-    let listed = |m: &Member, way: &str| -> (usize, String) {
+    let listed = |m: &Member, way: &str| -> (usize, String, String) {
         // Not `Member::status`: here the listing is the claim, so a failed one is the product's.
         let (ok, out, err) = m.vox(&["status", "--json"], None);
         assert!(ok, "PRODUCT: {}: vox status --json failed: {err}", m.name);
@@ -545,13 +547,25 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
             .unwrap_or(0);
         let (ok, human, err) = m.vox(&["status"], None);
         assert!(ok, "PRODUCT: {}: vox status failed: {err}", m.name);
-        (rows, human)
+        (rows, human, out)
     };
-    let (bob_rows, bob_human) = listed(&bob, "out");
-    let (alice_rows, alice_human) = listed(&alice, "in");
+    let (bob_rows, bob_human, _) = listed(&bob, "out");
+    let (alice_rows, alice_human, alice_json) = listed(&alice, "in");
+    // **Each tunnel is listed once** (V210-81, #314): Alice serves the offer and forwards nothing,
+    // so every mention of its tag in her status is one of the tunnels, in one listing.
+    let alice_said = alice_human
+        .lines()
+        .filter(|l| l.contains(tag.as_str()))
+        .count();
+    let alice_named = alice_json.matches(&format!("\"{tag}\"")).count();
     let human_lines = |text: &str, way: &str| {
         text.lines()
-            .filter(|l| l.starts_with(&format!("tunnel {way} ")) && l.contains(tag.as_str()))
+            .filter(|l| {
+                l.starts_with("tunnel ")
+                    && l.contains(&format!(" {way} "))
+                    && l.contains(": open ")
+                    && l.contains(tag.as_str())
+            })
             .count()
     };
     let (bob_lines, alice_lines) = (
@@ -608,6 +622,16 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     }
     send.signal("-CONT");
 
+    eprintln!(
+        "[proof] cap arm: Alice's status names {tag} on {alice_said} line(s) and {alice_named} \
+         time(s) in --json"
+    );
+    assert!(
+        alice_said == cap && alice_named == cap,
+        "PRODUCT: with {cap} tunnels open to Alice's offer, her `vox status` names {tag} on \
+         {alice_said} line(s) and {alice_named} time(s) in --json: a tunnel is listed more than \
+         once\nAlice's vox status:\n{alice_human}"
+    );
     assert!(
         [bob_rows, bob_lines, alice_rows, alice_lines]
             .iter()

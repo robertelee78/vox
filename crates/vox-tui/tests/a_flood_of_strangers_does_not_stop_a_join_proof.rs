@@ -4,8 +4,8 @@
 //! Two stores on a board were bounded by refusing whatever came next, and anyone could fill
 //! them:
 //! - **Pre-join slots.** A pre-join record needs nothing but a key — a joiner has no membership,
-//!   passphrase or proof of work yet — and a room's name is public (it is the `.vox` name and it
-//!   is in every invite link). A full bucket of 256 refused every later pre-join, so strangers
+//!   passphrase or proof of work yet — and a room's id is public (it is in every `.vox` address and
+//!   in every invite link). A full bucket of 256 refused every later pre-join, so strangers
 //!   who put 256 of them on a room's boards refused every real joiner for the two hours the
 //!   records live.
 //! - **Geneses.** A board took a genesis from any peer, up to 4096, and never let one go. A
@@ -220,7 +220,6 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let policy = ChannelPolicy {
                 history_mode: vox_core::governance::genesis::HistoryMode::ForwardOnly,
-                deniability_mode: vox_core::governance::genesis::DeniabilityMode::Attributable,
                 ttl: 0,
                 min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
             };

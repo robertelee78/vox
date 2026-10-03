@@ -5,8 +5,8 @@
 //! is dropped, so a direct dial alone never lands, and only a coordinated simultaneous open (ADR-012
 //! rung 3, coordinated by the anchor) gets through. The guest has joined the host's room and is
 //! trusted; nothing runs on its side. It starts `vox up` and asks for the host's service over SOCKS5
-//! (what `ssh user@<room>.vox` does). The wait until the request is answered by any path, and the
-//! wait until the pair is **on the punched path**, must both be under 2 s.
+//! (what `ssh user@<service>.<node>.<room>.vox` does). The wait until the request is answered by
+//! any path, and the wait until the pair is **on the punched path**, must both be under 2 s.
 //!
 //! **The staging — real processes only, NATs in userspace.** A `vox node` anchor on `[::]`, a
 //! `vox serve` host on `127.0.0.1`, the guest on `[::1]`, set up with `vox id`, `vox trust add` and
@@ -97,6 +97,7 @@ struct NatWorld {
     guest_dir: std::path::PathBuf,
     guest_spec: String,
     room: String,
+    host_fp: String,
     passphrase: String,
     service_port: u16,
 }
@@ -136,7 +137,8 @@ impl NatWorld {
 
         let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
         assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
-        let (ok, _host_fp, err) = vox_once(&host_dir, &args(&["id"]));
+        let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
+        let host_fp = host_fp.trim().to_owned();
         assert!(ok, "PRODUCT (staging): vox id (host): {err}");
         let (ok, out, err) = vox_once(
             &host_dir,
@@ -149,7 +151,7 @@ impl NatWorld {
             &host_dir,
             &args(&[
                 "serve",
-                &service_port.to_string(),
+                &format!("{service_port}={service_port}"),
                 "--anchor",
                 &host_spec,
                 "--listen",
@@ -199,6 +201,7 @@ impl NatWorld {
             guest_dir,
             guest_spec,
             room,
+            host_fp,
             passphrase,
             service_port,
         }
@@ -232,8 +235,9 @@ impl NatWorld {
         (up, bound, ready)
     }
 
+    /// The host's service by its address, `<service>.<node>.<room>.vox` (V030-25).
     fn hostname(&self) -> String {
-        format!("{}.vox", self.room)
+        format!("{}.{}.{}.vox", self.service_port, self.host_fp, self.room)
     }
 }
 

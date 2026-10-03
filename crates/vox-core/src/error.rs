@@ -134,15 +134,6 @@ pub enum Error {
     #[error("join proof-of-work invalid")]
     JoinPowInvalid,
 
-    /// A log entry carried the ADR-009 *deniable* content authenticator, whose
-    /// verification is provided by milestone M7 (ADR-009) — not implemented in M5.
-    /// This is an honest capability boundary, not a stub: M5 builds the wire seam
-    /// (the entry round-trips and is classified non-attributable) and the
-    /// composite path fully, and refuses to *claim* a deniable verification it
-    /// does not perform (ADR-008 §"build coupling with ADR-009").
-    #[error("deniable authenticator verification is provided by M7 (ADR-009)")]
-    DeniableVerificationUnavailable,
-
     /// A framed structure exceeded a hard size limit before any allocation
     /// proportional to attacker-declared counts/lengths was performed (ADR-008
     /// anti-abuse: a declared length is never trusted ahead of the bytes behind it).
@@ -160,8 +151,8 @@ pub enum Error {
     /// A governance struct (genesis record, admin-delegation cert, consent
     /// grant/revocation, admin-delegation revocation, policy update) was
     /// structurally malformed on parse — bad arity, an out-of-domain enum, a
-    /// wrong-length digest/key, or a field forbidden by its schema (e.g. a
-    /// policy-update carrying `deniability_mode`). Carries a static reason
+    /// wrong-length digest/key, a field forbidden by its schema, or a genesis
+    /// asking for a removed deniable room. Carries a static reason
     /// (ADR-007).
     #[error("malformed governance struct: {0}")]
     MalformedGovernance(&'static str),
@@ -183,6 +174,13 @@ pub enum Error {
     /// wrong (the at-rest analogue of [`Error::JoinProofFailed`]).
     #[error("at-rest unlock failed (wrong factor or tampered ciphertext)")]
     AtRestUnlockFailed,
+
+    /// A log entry in the shape vox wrote **before v0.3.0**: its skeleton has no `seen` and no
+    /// causal time (ADR-023 decision 1). v0.3.0 does not read them; the decider chose that
+    /// such a room is made again (2026-09-29, #226). Its own variant so a person is told that,
+    /// not "an internal error".
+    #[error("a log entry written by vox before v0.3.0, whose message format changed")]
+    LogFormatBeforeV030,
 
     /// A SEK-backed operation (segment seal/open, re-wrap) was attempted after the
     /// app was **locked** (ADR-010 §"App-lock and memory hygiene"): the SEK was
@@ -300,11 +298,10 @@ pub enum Error {
         reason: String,
     },
 
-    /// A tunnel operation was refused by authorization (ADR-013): the requesting
-    /// member holds no valid `dial:<service>` capability (or the host no
-    /// `bind:<service>`), or the service is dark/unknown. Default-deny: the absence
-    /// of a grant is a denial, and a denial is indistinguishable from "no such
-    /// service" so an unauthorized member cannot even confirm a service exists.
+    /// A tunnel operation was refused (ADR-013, ADR-017 decision 3): the host does not
+    /// trust the requesting member, it is no current author of the room, or the service is
+    /// dark/unknown. Default-deny, and a denial is indistinguishable from "no such service",
+    /// so an unauthorized member cannot even confirm a service exists.
     #[error("tunnel denied: {0}")]
     TunnelDenied(&'static str),
 
@@ -325,6 +322,17 @@ pub enum Error {
     /// the person is told: how many are open, to which services, and how to free one.
     #[error("{0}")]
     TunnelLimit(String),
+
+    /// A node shares at most one service under a name in a room (V030-25): the name is the
+    /// `<service>` part of `<service>.<node>.<room>.vox`, so two under one name would make the
+    /// address mean two things. Carries the name and where the existing one lives.
+    #[error("{0:?} is already the name of a service you share in this room, at {1}")]
+    ServiceNameTaken(String, std::net::SocketAddr),
+
+    /// A running tunnel was closed on purpose (V030-11): by a person (`vox tunnel close`, the
+    /// TUI), at its other end, or as stuck. Carries why, in the words `vox status` shows.
+    #[error("the tunnel was {0}")]
+    TunnelClosed(String),
 
     /// A room this node joined has not yet synced with another member, so it writes nothing to
     /// it (V210-164): its identity may already have entries there that it does not hold yet.
@@ -424,6 +432,15 @@ pub enum Error {
     #[error("a member is busy answering other joins")]
     JoinResponderBusy,
 
+    /// The member that answered said the room has ended (V030-08): it takes nobody in. The
+    /// passphrase was never checked.
+    #[error("the room has ended")]
+    JoinRoomEnded,
+
+    /// The member that answered has left the room (V030-08), so it answers no join for it.
+    #[error("the member that answered has left the room")]
+    JoinResponderLeft,
+
     /// This node ended a join it was answering, to give its slot to a joiner from a lighter source
     /// (V210-92): every slot was held and this join's source was the heaviest. Its joiner is told
     /// the member is busy, as at the cap.
@@ -469,6 +486,12 @@ pub enum Error {
         /// The underlying OS message.
         detail: String,
     },
+
+    /// A node refused an app-API request over its control socket (ADR-022 decision 7),
+    /// carrying the node's own reason — `no-listener`, not in the keyring, and so on —
+    /// because the program asking has no other way to learn it.
+    #[error("{0}")]
+    AppRefused(String),
 
     /// Attaching to a node's control socket failed before any request: the connect, or
     /// the node's greeting. Said in a person's words, because each one needs a different

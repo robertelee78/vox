@@ -40,10 +40,13 @@ pub enum StreamKind {
     /// as up until its probing says otherwise, and reports a clean stop as silence. A stream is
     /// delivered like any data, so this is said while the connection still runs.
     Goodbye = 8,
+    /// A stream (and optionally a datagram flow) between two programs on two member
+    /// nodes, through the app API (ADR-022 decision 7). 9, not the 8 ADR-022 first gave it:
+    /// v0.2.10 took 8 for [`StreamKind::Goodbye`].
+    App = 9,
     /// **Does a member hold a claim this node just posted?** (V210-168): the claimant's node asks
     /// every member it can reach, and its client says "you hold it" only when every one folds to
-    /// that claim. See `node::agreestream`. Members only. Not 9, which another branch's stream
-    /// takes.
+    /// that claim. See `node::agreestream`. Members only. Not 9, which [`StreamKind::App`] takes.
     Agree = 10,
 }
 
@@ -64,6 +67,7 @@ impl StreamKind {
             6 => Some(Self::Coord),
             7 => Some(Self::Circuit),
             8 => Some(Self::Goodbye),
+            9 => Some(Self::App),
             10 => Some(Self::Agree),
             _ => None,
         }
@@ -107,6 +111,14 @@ pub async fn open_typed(
 
 /// Accept the next bi-stream on `conn` and read its kind frame. A stream the peer
 /// closes before typing it, or types with an unknown kind, is an error.
+///
+/// A stream of a kind this node does not know is **refused with the same reset as a
+/// kind the peer may not open** ([`refuse`]). They used to differ — an unknown kind
+/// was dropped, which finishes the stream and stops reading with code 0, where a
+/// forbidden one is reset with the coded rejection — so a peer could tell "this node
+/// has no such kind" from "you may not open it". The app API relies on the two being
+/// identical: an untrusted peer's `App` stream gets this same reset, so it cannot
+/// learn whether the node even runs an app (ADR-022 decision 7).
 pub async fn accept_typed(conn: &VoxConnection) -> Result<(StreamKind, SendStream, RecvStream)> {
     accept_typed_on(conn.quinn()).await
 }
@@ -129,12 +141,26 @@ pub async fn accept_typed_on(
 /// run this on a task of its own: a peer that opens a stream and withholds its kind would
 /// otherwise hold every stream it opens after it.
 pub async fn read_kind(
-    send: SendStream,
+    mut send: SendStream,
     mut recv: RecvStream,
 ) -> Result<(StreamKind, SendStream, RecvStream)> {
     let frame = read_frame(&mut recv, MAX_KIND_FRAME)
         .await?
         .ok_or(Error::MalformedBundle("stream closed before kind"))?;
-    let kind = StreamKind::parse(&frame)?;
-    Ok((kind, send, recv))
+    match StreamKind::parse(&frame) {
+        Ok(kind) => Ok((kind, send, recv)),
+        Err(e) => {
+            refuse(&mut send, &mut recv);
+            Err(e)
+        }
+    }
+}
+
+/// Reset both halves of a stream with the coded rejection — the same code an
+/// unauthenticated peer's connection is closed with, so probing stream kinds, or
+/// whether an app is listening, reveals nothing.
+pub fn refuse(send: &mut SendStream, recv: &mut RecvStream) {
+    let code = crate::transport::quic::close_code(crate::wire::WireError::AuthenticatorInvalid);
+    let _ = send.reset(code);
+    let _ = recv.stop(code);
 }

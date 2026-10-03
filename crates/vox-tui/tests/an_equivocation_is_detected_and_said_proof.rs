@@ -30,15 +30,15 @@
 //!   posts reaches carol;
 //! - **kept**: with **every other node stopped** — so nobody could show either fork again
 //!   (V210-66) — carol's daemon is restarted, and `vox status --json` still lists both;
-//! - **kept by the anchor**: the anchor, which said it holds eve and frank back, is restarted
-//!   alone and says both again (V210-66).
+//!   (An anchor that is not a member keeps no copy of the room, so it has nothing to hold anyone
+//!   back in: ADR-023 decision 6, PRD-001 R34. The case that restarted it and read its notice
+//!   is gone with that copy.)
 //! - **in the TUI**: carol's real `vox tui`, in a pty, says both — each on its own line, by the
 //!   names carol gave them (V210-66).
 //!
 //! Mutations: the old `wants_for` (from past our head, no comparison of a shorter peer's head) —
 //! eve's fork is never listed; the `room read` notice removed; `keep_forks` doing nothing — the
-//! restarted carol lists neither; the anchor's `keep_forks` doing nothing — the restarted anchor
-//! says neither; the TUI drawing only the first — frank is never said.
+//! restarted carol lists neither; the TUI drawing only the first — frank is never said.
 
 #![cfg(unix)]
 
@@ -461,15 +461,18 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         );
     }
 
-    // `vox room read` says it, by the short id its rows use.
+    // `vox room read` says it, naming the member as its rows do: by the reader's own name for it,
+    // or by 26 characters of its fingerprint when the reader has none (V210-162).
     let short = |f: &str| f.chars().take(26).collect::<String>();
     for (who, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
         let (_, r, _) = vox_once(d, &args(&["room", "read", &room]));
         for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
             let said = r.lines().any(|l| {
-                l.starts_with("! ")
-                    && l.contains(&short(f))
-                    && l.contains("signed two different messages at the same place")
+                let Some(rest) = l.strip_prefix("! ") else {
+                    return false;
+                };
+                (rest.starts_with(&format!("{name} ")) || rest.starts_with(&short(f)))
+                    && rest.contains("signed two different messages at the same place")
             });
             assert!(
                 said,
@@ -500,18 +503,6 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     // ---- kept: every other node stops, so nobody could show either fork again (V210-66) ---------
     // With a live peer holding the other side, a restarted node could meet the fork again and list
     // it without having kept it (verifier-252). Here nobody is left to show it.
-    let anchor_holds = |said: &str, f: &str| {
-        said.lines()
-            .any(|l| l.contains(" board — ") && l.contains(&format!("holds {} back", short(f))))
-    };
-    let before = anchor.transcript();
-    for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
-        assert!(
-            anchor_holds(&before, f),
-            "PRODUCT (staging): the anchor never said it holds {name} back, so its restart proves \
-             nothing:\n{before}"
-        );
-    }
     stop(bob);
     stop(alice);
     stop(anchor);
@@ -530,25 +521,6 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         "PRODUCT: carol forgot an equivocation across a restart: she lists {after:?}"
     );
     stop(carol);
-
-    // ---- kept by the anchor too: it restarts alone, and says both again (V210-66) --------------
-    let mut anchor = VoxProc::spawn("anchor", &anchor_dir, &args(&["node", "--listen", &listen]));
-    let deadline = Instant::now() + REACH;
-    let mut said = String::new();
-    while Instant::now() < deadline {
-        said = anchor.transcript();
-        if anchor_holds(&said, &eve_fp) && anchor_holds(&said, &frank_fp) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    for (name, f) in [("eve", &eve_fp), ("frank", &frank_fp)] {
-        assert!(
-            anchor_holds(&said, f),
-            "PRODUCT: the anchor forgot it holds {name} back across a restart:\n{said}"
-        );
-    }
-    stop(anchor);
 
     // ---- the TUI says both, each on its own line, by carol's names for them (V210-66) ----------
     // Carol's real `vox tui`, on her stopped profile, in a pty (`tests/pty/tui_equivocation.py`).

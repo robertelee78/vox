@@ -40,9 +40,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
-use crate::node::resolver::VoxResolver;
+use crate::node::resolver::{ServiceRoom, VoxResolver};
 use crate::transport::quic::VoxConnection;
-use crate::tunnel::socks::{self, Reply, Target};
+use crate::tunnel::socks::{self, Command, Reply, Target};
 
 /// The loopback port `vox up` listens on by default. 1080 is the registered SOCKS port
 /// and needs no privilege.
@@ -75,20 +75,37 @@ pub trait HostDialer: Send + Sync {
     ) -> impl core::future::Future<Output = Result<Arc<VoxConnection>>> + Send;
 }
 
+/// How the proxy turns a `.vox` name into a room and a member.
+///
+/// Asked per connection, like [`HostDialer`], so a room joined or a node renamed after the
+/// proxy came up is resolvable at once. A fixed [`VoxResolver`] answers from its snapshot;
+/// the node answers from its current rooms and keyring.
+pub trait Names: Send + Sync {
+    /// The room and member `name` leads to, or a sentence saying why it leads nowhere.
+    fn lookup(
+        &self,
+        name: &str,
+    ) -> impl core::future::Future<Output = std::result::Result<ServiceRoom, String>> + Send;
+}
+
+impl Names for VoxResolver {
+    async fn lookup(&self, name: &str) -> std::result::Result<ServiceRoom, String> {
+        VoxResolver::lookup(self, name)
+    }
+}
+
 /// Serve SOCKS5 on `bind` until the task is dropped.
 ///
 /// Loopback only, and enforced: this proxy carries traffic into rooms this machine is a
 /// member of, so exposing it to the network would hand that membership to anyone who can
 /// reach the port.
-pub async fn serve<D>(
-    listener: TcpListener,
-    resolver: Arc<VoxResolver>,
-    dialer: Arc<D>,
-) -> Result<()>
+pub async fn serve<D, N>(listener: TcpListener, resolver: Arc<N>, dialer: Arc<D>) -> Result<()>
 where
     D: HostDialer + 'static,
+    N: Names + 'static,
 {
-    serve_reporting(listener, resolver, dialer, |_, _| {}, |_| {}).await
+    let flows = Arc::new(crate::tunnel::udp::UdpFlows::default());
+    serve_reporting(listener, resolver, dialer, flows, |_, _| {}, |_| {}).await
 }
 
 /// [`serve`], reporting each carried tunnel that was **cut by a withdrawal of reach**
@@ -104,17 +121,22 @@ where
 /// the proxy's to disclose (ADR-013). But the operator's own node is not the peer: the ladder's
 /// verdict was already kept specifically so it could be said, and returning it into a dropped
 /// `Result` meant `ssh` failed with nothing to act on. An ordinary disconnect stays silent.
-pub async fn serve_reporting<D, R, F>(
+///
+/// `flows` is the node's UDP flow table: `UDP ASSOCIATE` flows count against it like any
+/// other (ADR-022 decision 6).
+pub async fn serve_reporting<D, N, R, F>(
     listener: TcpListener,
-    resolver: Arc<VoxResolver>,
+    resolver: Arc<N>,
     dialer: Arc<D>,
+    flows: Arc<crate::tunnel::udp::UdpFlows>,
     withdrawn: R,
     refused: F,
 ) -> Result<()>
 where
     D: HostDialer + 'static,
+    N: Names + 'static,
     R: Fn(&Digest32, u16) + Send + Sync + 'static,
-    F: Fn(&str) + Send + Sync + 'static,
+    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
 {
     let withdrawn = Arc::new(withdrawn);
     let refused = Arc::new(refused);
@@ -149,16 +171,10 @@ where
         let dialer = Arc::clone(&dialer);
         let withdrawn = Arc::clone(&withdrawn);
         let refused = Arc::clone(&refused);
+        let flows = Arc::clone(&flows);
         tokio::spawn(async move {
             // One connection's failure is its own; the proxy keeps serving.
-            let _ = handle(
-                stream,
-                &resolver,
-                dialer.as_ref(),
-                withdrawn.as_ref(),
-                refused.as_ref(),
-            )
-            .await;
+            let _ = handle(stream, resolver, dialer, flows, withdrawn.as_ref(), refused).await;
         });
     }
 }
@@ -225,6 +241,27 @@ async fn reach_host_with_patience<D: HostDialer>(
         }
         tokio::time::sleep(HOST_POLL).await;
     }
+}
+
+/// [`open_tunnel`] for a `udp/<port>` service: the accepted stream bound as a datagram
+/// flow on the connection it was opened on (ADR-022 decision 6). The flow ends when the
+/// host ends the stream, and dropping it ends the stream. The tunnel's credit comes back with
+/// it ([`open_tunnel`]), for the caller to hold for as long as the flow runs: a UDP flow counts
+/// among the member's tunnels as a TCP one does (V210-81).
+///
+/// # Errors
+/// As [`open_tunnel`], and if the connection closes before the flow is bound.
+pub async fn open_flow<D: HostDialer>(
+    dialer: &D,
+    host: &Digest32,
+    channel_id: &Digest32,
+    label: &str,
+) -> Result<(
+    crate::transport::router::DatagramFlow,
+    crate::transport::quic::TunnelCredit,
+)> {
+    let (send, recv, conn, credit) = open_tunnel(dialer, host, channel_id, label).await?;
+    Ok((conn.bind_flow(send, recv)?, credit))
 }
 
 /// Reach `host` and open a tunnel to `service_tag` in `channel_id`, returning the stream
@@ -320,33 +357,52 @@ const UNSPECIFIED: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
 
 /// Negotiate, resolve, and carry one SOCKS5 connection.
-async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
+async fn handle<D, N, R, F>(
     mut stream: TcpStream,
-    resolver: &VoxResolver,
-    dialer: &D,
+    resolver: Arc<N>,
+    dialer: Arc<D>,
+    flows: Arc<crate::tunnel::udp::UdpFlows>,
     withdrawn: &R,
-    refused: &F,
-) -> Result<()> {
+    refused: Arc<F>,
+) -> Result<()>
+where
+    D: HostDialer + 'static,
+    N: Names + 'static,
+    R: Fn(&Digest32, u16),
+    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
+{
+    use crate::node::tunnel::TunnelNote::{Closed, Refused};
     socks::negotiate(&mut stream).await?;
-    let target = socks::read_connect(&mut stream).await?;
+    let (command, target) =
+        socks::read_request(&mut stream, &[Command::Connect, Command::UdpAssociate]).await?;
+    if command == Command::UdpAssociate {
+        return associate(stream, resolver, dialer, flows, refused).await;
+    }
+    let (resolver, dialer, refused) = (resolver.as_ref(), dialer.as_ref(), refused.as_ref());
     let (name, port) = match target {
         Target::Domain(name, port) => (name, port),
         Target::Ip(_) => {
             // Not a Vox name. Refusing is the point: a proxy on loopback that forwarded
             // arbitrary addresses would be an open relay for anything on this machine.
-            refused("a CONNECT to a bare address: vox up carries .vox names only");
+            refused(Refused(
+                "a CONNECT to a bare address: vox up carries .vox names only".to_owned(),
+            ));
             socks::write_reply(&mut stream, Reply::AddressNotSupported, UNSPECIFIED).await?;
             return Err(Error::MalformedTunnel(
                 "vox up carries .vox names only; configure socks5h so the name reaches it",
             ));
         }
     };
-    let Some(room) = resolver.resolve(&name).copied() else {
-        // A room this machine has not joined, or not a `.vox` name at all. One uniform
-        // refusal for both: which of the two it was is not the proxy's to disclose.
-        refused(&format!("no room on this machine answers to {name}"));
-        socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
-        return Err(Error::MalformedTunnel("no such .vox name on this machine"));
+    let room = match resolver.lookup(&name).await {
+        Ok(room) => room,
+        Err(why) => {
+            // Said to this machine's operator only, and only about this machine's own
+            // names: which part of the name matched nothing, or matched too much. The
+            // SOCKS client gets the one code.
+            refused(Refused(why.to_string()));
+            socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
+            return Err(Error::MalformedTunnel("no such .vox name on this machine"));
+        }
     };
     // **Reply only once the host has answered** (PRD-001 R23). This used to say
     // "succeeded" before dialling, on the belief that the host waits for the client's
@@ -357,9 +413,10 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
     // then hung up, and neither the tool nor the person could tell a refusal from a
     // network fault.
     //
-    // **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
-    // and the **host** decides whether the dial is allowed — this side claims nothing.
-    let tag = port.to_string();
+    // **The name's `<service>` is the service asked for** (V030-25): the port the tool dialled
+    // selects nothing, and the **host** decides whether the dial is allowed — this side claims
+    // nothing.
+    let tag = room.service.clone();
     // `_carried` and `_credit` are held for the whole splice (see [`open_tunnel`]): the path, and
     // the tunnel's receive window of its own on it.
     let (send, recv, _carried, credit) =
@@ -368,7 +425,7 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
             Err(why) => {
                 // The SOCKS reply is a code, and a coarse one; the sentence goes to this node's
                 // own operator. Neither says anything the host did not.
-                refused(&refusal(&why, &format!("{name}:{port}")));
+                refused(Refused(refusal(&why, &format!("{name}:{port}"))));
                 let reply = match why {
                     Error::TunnelDenied(_) => Reply::NotAllowed,
                     _ => Reply::GeneralFailure,
@@ -378,12 +435,17 @@ async fn handle<D: HostDialer, R: Fn(&Digest32, u16), F: Fn(&str)>(
             }
         };
     socks::write_reply(&mut stream, Reply::Succeeded, UNSPECIFIED).await?;
-    match crate::tunnel::session::splice_moving(send, recv, stream, credit.moved()).await {
+    match crate::tunnel::session::splice_watched(send, recv, stream, credit.watch()).await {
         // The session was established and then cut by a decision. Report it; every other
         // ending is silent (M17.11).
         Err(Error::TunnelRevoked(why)) => {
             withdrawn(&room.channel_id, port);
             Err(Error::TunnelRevoked(why))
+        }
+        // Closed on purpose, here or at the host, or as stuck (V030-11): said as a close.
+        Err(e @ Error::TunnelClosed(_)) => {
+            refused(Closed(format!("a session to {name}:{port}: {e}")));
+            Err(e)
         }
         other => other,
     }
@@ -399,4 +461,144 @@ pub fn ssh_config_hint(bind: SocketAddr) -> String {
         "Host *.vox\n    ProxyCommand nc -X 5 -x {} %h %p\n    # or, without nc:\n    #   ProxyCommand socat - SOCKS5:{}:%h:%p\n",
         bind, bind
     )
+}
+
+/// A SOCKS5 `UDP ASSOCIATE` (RFC 1928 §7, ADR-022 decision 6): a loopback relay socket
+/// carrying the client's datagrams to `.vox` UDP services, for as long as `control` — the
+/// TCP connection that asked — stays open.
+///
+/// - **`.vox` destinations only**, as for CONNECT: a relay that forwarded to arbitrary
+///   addresses would be an open UDP relay for anything on this machine.
+/// - **One flow per destination** `(name, port)`, opened on the first datagram to it and
+///   counted against `flows`.
+/// - **`FRAG ≠ 0` is dropped.** RFC 1928 lets a relay that does not reassemble do so, and
+///   Vox fragments inside the flow anyway (ADR-022 decision 4).
+/// - **Only the client's own address is heard**: the IP the control connection came from,
+///   and the port its first datagram came from. Anything else on loopback is ignored.
+/// - **The association dies with `control`**: when it closes, every flow is dropped, which
+///   ends each flow's stream at the host.
+async fn associate<D, N, F>(
+    mut control: TcpStream,
+    resolver: Arc<N>,
+    dialer: Arc<D>,
+    flows: Arc<crate::tunnel::udp::UdpFlows>,
+    refused: Arc<F>,
+) -> Result<()>
+where
+    D: HostDialer + 'static,
+    N: Names + 'static,
+    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
+{
+    use crate::node::tunnel::TunnelNote::Refused;
+    use crate::tunnel::udp;
+    use std::collections::HashMap;
+    use tokio::io::AsyncReadExt as _;
+
+    let client_ip = control
+        .peer_addr()
+        .map_err(|_| Error::MalformedTunnel("socks: control peer"))?
+        .ip();
+    let relay = match tokio::net::UdpSocket::bind(SocketAddr::new(client_ip, 0)).await {
+        Ok(r) => Arc::new(r),
+        Err(_) => {
+            socks::write_reply(&mut control, Reply::GeneralFailure, UNSPECIFIED).await?;
+            return Err(Error::MalformedTunnel("socks: cannot bind a UDP relay"));
+        }
+    };
+    let relay_addr = relay
+        .local_addr()
+        .map_err(|_| Error::MalformedTunnel("socks: relay address"))?;
+    socks::write_reply(&mut control, Reply::Succeeded, relay_addr).await?;
+
+    // Dropping this aborts every flow task, which drops every flow, which ends every
+    // stream: the whole association is torn down by one drop.
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut dests: HashMap<(String, u16), tokio::sync::mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut client: Option<SocketAddr> = None;
+    let mut buf = vec![0u8; udp::MAX_UDP];
+    let mut control_buf = [0u8; 64];
+    loop {
+        tokio::select! {
+            // Anything but more bytes — EOF or an error — is the client going away. Bytes
+            // on the control connection mean nothing after the request, and are ignored.
+            read = control.read(&mut control_buf) => {
+                if !matches!(read, Ok(n) if n > 0) {
+                    return Ok(());
+                }
+            }
+            got = relay.recv_from(&mut buf) => {
+                let Ok((n, from)) = got else { continue };
+                if from.ip() != client_ip || client.is_some_and(|c| c != from) {
+                    continue;
+                }
+                client = Some(from);
+                let Some(datagram) = socks::parse_udp(&buf[..n]) else { continue };
+                if datagram.frag != 0 {
+                    continue;
+                }
+                let Target::Domain(name, port) = datagram.target else {
+                    refused(Refused(
+                        "a UDP datagram to a bare address: vox up carries .vox names only"
+                            .to_owned(),
+                    ));
+                    continue;
+                };
+                let key = (name.to_ascii_lowercase(), port);
+                // A destination whose flow ended is opened afresh.
+                if dests.get(&key).is_some_and(tokio::sync::mpsc::Sender::is_closed) {
+                    dests.remove(&key);
+                }
+                if !dests.contains_key(&key) {
+                    let room = match resolver.lookup(&name).await {
+                        Ok(room) => room,
+                        Err(why) => {
+                            refused(Refused(why.to_string()));
+                            continue;
+                        }
+                    };
+                    // **A datagram has no refusal to carry**, so one to a name the room's log
+                    // shows is no UDP share is refused here, at once, and said to this node's
+                    // operator (PRD-001 R23), rather than dialled and dropped (V030-25).
+                    let stated_udp = crate::tunnel::udp::is_udp(&room.service);
+                    let why = match room.share {
+                        crate::node::resolver::ShareState::Absent => Some("shares no service"),
+                        crate::node::resolver::ShareState::Stated if !stated_udp => {
+                            Some("shares it over TCP, not UDP")
+                        }
+                        _ => None,
+                    };
+                    if let Some(why) = why {
+                        refused(Refused(format!("{name}:{port}/udp: its sharer {why} by that name")));
+                        continue;
+                    }
+                    let label = format!(
+                        "udp/{}",
+                        crate::node::channel::service_name(&room.service)
+                    );
+                    let Some(guard) = flows.admit(room.host, &label) else { continue };
+                    let (tx, rx) = tokio::sync::mpsc::channel(udp::CLIENT_QUEUE);
+                    let (dialer, relay, refused) =
+                        (Arc::clone(&dialer), Arc::clone(&relay), Arc::clone(&refused));
+                    let source = Target::Domain(name.clone(), port);
+                    tasks.spawn(async move {
+                        match open_flow(dialer.as_ref(), &room.host, &room.channel_id, &label).await {
+                            Ok((flow, _credit)) => {
+                                let to_client = |p: &[u8]| {
+                                    socks::encode_udp(&source, p)
+                                        .is_some_and(|d| relay.try_send_to(&d, from).is_ok())
+                                };
+                                udp::client_pump(flow, rx, to_client, guard).await;
+                            }
+                            Err(e) => refused(Refused(refusal(&e, &format!("{name}:{port}/udp")))),
+                        }
+                    });
+                    dests.insert(key.clone(), tx);
+                }
+                if let Some(tx) = dests.get(&key) {
+                    // Never waits: a full queue drops this datagram.
+                    let _ = tx.try_send(datagram.data.to_vec());
+                }
+            }
+        }
+    }
 }

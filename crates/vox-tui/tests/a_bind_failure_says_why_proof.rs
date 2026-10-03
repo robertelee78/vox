@@ -93,7 +93,7 @@ fn argv(verb: &str, listen: &str) -> Vec<String> {
     match verb {
         "daemon" => args(&["daemon", "--listen", listen]),
         "node" => args(&["node", "--listen", listen]),
-        "serve" => args(&["serve", "22", "--listen", listen]),
+        "serve" => args(&["serve", "22=22", "--listen", listen]),
         other => panic!("APPARATUS: no arguments for vox {other}"),
     }
 }

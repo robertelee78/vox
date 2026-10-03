@@ -57,57 +57,66 @@ pub fn system_millis_clock() -> MillisClock {
     })
 }
 
-/// [`system_clock`], shifted by `VOX_TEST_CLOCK_SKEW_MS` in whole seconds (rounded down).
+/// [`system_clock`], shifted by [`TEST_CLOCK_STEP_ENV`] in whole seconds (rounded down).
 /// **Test-only: for proofs; nothing in a real deployment sets it**, and without the `test-knobs`
 /// feature (V210-105) it is the system clock.
 ///
-/// **Both clocks move** (V210-64): a real clock step moves the seconds a record is stamped with as
-/// well as the milliseconds that floor its `seq`, and a board refuses a record that is behind on
-/// either. Moving only the milliseconds proved half the cure.
+/// **A clock step moves both clocks** (V210-64): the seconds a record is stamped with as well as
+/// the milliseconds that floor its `seq`, and a board refuses a record that is behind on either.
+/// Moving only the milliseconds proved half the cure. It has its own knob, apart from
+/// [`TEST_CLOCK_SKEW_ENV`], because the v0.3.0 proofs that skew a message's claimed time by an
+/// hour or by ten years must not move the seconds clock: that would make the node unreachable,
+/// which is a different test.
 #[must_use]
 pub fn clock_with_test_skew() -> Clock {
-    let skew = test_skew_ms();
+    let step = env_ms(TEST_CLOCK_STEP_ENV);
     let system = system_clock();
-    if skew == 0 {
+    if step == 0 {
         return system;
     }
-    let secs = skew.div_euclid(1000);
+    let secs = step.div_euclid(1000);
     Arc::new(move || system().saturating_add_signed(secs))
 }
 
-/// The signed skew [`TEST_CLOCK_SKEW_ENV`] names, in milliseconds; zero when unset or unparsable.
+/// The signed milliseconds `var` names; zero when unset or unparsable.
 #[cfg(feature = "test-knobs")]
-fn test_skew_ms() -> i64 {
-    std::env::var(TEST_CLOCK_SKEW_ENV)
+fn env_ms(var: &str) -> i64 {
+    std::env::var(var)
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0)
 }
 
-/// No skew: the knob is not compiled in (V210-105).
+/// No skew and no step: the knobs are not compiled in (V210-105).
 #[cfg(not(feature = "test-knobs"))]
-const fn test_skew_ms() -> i64 {
+const fn env_ms(_var: &str) -> i64 {
     0
 }
 
-/// The environment variable [`millis_clock_with_test_skew`] reads. **Test-only.**
-#[cfg(feature = "test-knobs")]
+/// The environment variable that moves only the millisecond clock ([`millis_clock_with_test_skew`]).
+/// **Test-only.**
 pub const TEST_CLOCK_SKEW_ENV: &str = "VOX_TEST_CLOCK_SKEW_MS";
 
+/// The environment variable for a whole **clock step**: both clocks move ([`clock_with_test_skew`],
+/// [`millis_clock_with_test_skew`]). **Test-only.**
+pub const TEST_CLOCK_STEP_ENV: &str = "VOX_TEST_CLOCK_STEP_MS";
+
 /// [`system_millis_clock`], shifted by a signed number of milliseconds read once from
-/// `VOX_TEST_CLOCK_SKEW_MS`. **Test-only: for proofs; nothing in a real deployment sets it**, and
-/// without the `test-knobs` feature (V210-105) it is the system clock.
+/// [`TEST_CLOCK_SKEW_ENV`] and [`TEST_CLOCK_STEP_ENV`] together. **Test-only: for proofs; nothing
+/// in a real deployment sets them**, and without the `test-knobs` feature (V210-105) it is the
+/// system clock.
 ///
 /// It lets a proof drive the shipped binary with a node whose millisecond clock is wrong, which
 /// a proof that pinned the clock inside the process could not: that would not be the binary a
-/// person runs. The node's seconds [`Clock`] moves with it ([`clock_with_test_skew`], V210-64), as
-/// both do in a real clock step. Ported from the v0.3.0 line (c065a37) for #230's proof, which starts a node a moment
-/// behind so its first record is refused as stale, deterministically.
+/// person runs. ADR-023 proof 2 posts a reply from a node an hour behind and asserts the reply is
+/// still ordered after what it answered (the skew alone: the seconds clock stays); #230's proof
+/// starts a node a moment behind on both clocks (a step, V210-64) so its first board record is
+/// refused as stale, deterministically.
 ///
 /// Unset, empty or unparsable is no skew: an operator who never heard of it gets the system clock.
 #[must_use]
 pub fn millis_clock_with_test_skew() -> MillisClock {
-    let skew = test_skew_ms();
+    let skew = env_ms(TEST_CLOCK_SKEW_ENV).saturating_add(env_ms(TEST_CLOCK_STEP_ENV));
     let system = system_millis_clock();
     if skew == 0 {
         return system;

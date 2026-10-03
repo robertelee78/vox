@@ -1,209 +1,144 @@
 # ADR-005: Channel Addressing and Authenticated Join
 
-**Status**: implemented (M3, `crates/vox-core/src/join/`)
-**Date**: 2026-06-19
-**Updated**: 2026-09-19 — KDF error paths (`K_pop`, rendezvous) now surface as errors instead of an all-zero key; `K_pop` returned zeroizing. C++ solver carve-out rejected (Rust only); difficulty defaults, cap and load-adaptation policy added; solver rewritten with a bucket-sorted flat layout — (200,9) measured 1.1 s / 245 MB (was 7.5 s / 1.65 GB), target met. 2026-09-20 — the join exchange now has a transport (`node::joinstream`, ADR-016 M14.4); the state machine's borrowed signer is `Send + Sync` so it can be driven across `await`s; answering a join requires the channel passphrase live, so a node retains it while the channel is open (M14.7c).
-**Deciders**: Robert E. Lee <robert@agidreams.us>
-**Tags**: channel, addressing, pake, cpace, rendezvous, join
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status:** accepted. Built in `crates/vox-core/src/join/` (M3), `node::joinstream` (ADR-016 M14.4)
+and `node::link`, except:
+- J-24: the ≈ 1–2 s mobile solve target is not measured, because no mobile client exists (ADR-014 is
+  macOS).
+
+**Date:** 2026-06-19
+**Deciders:** Robert E. Lee <robert@agidreams.us>
 
 ## Context
 
-A channel is addressed magnet-link style by a channel ID + passphrase shared out-of-band
-(ADR-001). Two distinct jobs are bundled in that string and must be separated: *rendezvous*
-(finding the swarm) and *authentication* (proving you may join). The passphrase is low-entropy
-and human-chosen, so it must resist offline dictionary attack. Discovery rides the P2P swarm/DHT
-(ADR-012). Joining must yield a real authenticated pairwise channel (ADR-004), and — critically —
-joining must grant *no* readable content by itself (per-sender consent, ADR-007).
+A room (a channel) is joined with a link and a passphrase shared out of band (ADR-001). That pair does
+two jobs, which this ADR keeps apart: *rendezvous* (finding the room's members) and *authentication*
+(proving the joiner may join). The passphrase is low-entropy and human-chosen, so it must resist
+offline dictionary attack. A join yields an authenticated pairwise session (ADR-004) and nothing
+readable: who reads whom is decided by trust (ADR-007).
 
-## Decision
+## Requirements
 
-**Authenticated join = CPace + identity proof-of-possession.** CPace (the CFRG-recommended
-*balanced* PAKE) is symmetric (no server, no fixed roles), gives implicit mutual authentication, and
-limits an attacker to one online guess per interaction — provably resisting offline dictionary
-attack on the low-entropy passphrase (UC proof, eprint 2021/114). **CPace alone only proves "this
-party holds the passphrase," not *which identity* it is.** Vox therefore composes two factors:
-1. **CPace, instantiated as Ristretto255 + SHA-512** (the CFRG primary instantiation: group =
-   Ristretto255, hash = SHA-512, generator via the CPace `calculate_generator`/`map_to_group`
-   procedure — registry `0x07/0x01`, ADR-003). Ristretto255 removes cofactor/point-validation
-   foot-guns and reuses the X25519 stack (`curve25519-dalek`). It establishes a session keyed by the
-   passphrase, with `CI = "vox/cpace/v1" ‖ channelID ‖ epoch`, `sid` = the fresh per-run nonce, and
-   `AD = suite_id` bound into CPace's inputs.
-2. **Identity proof-of-possession.** Inside that CPace-protected session, each party signs the CPace
-   `sid` (and transcript hash) with its **composite Ed25519+ML-DSA identity key** (ADR-002) and sends
-   its identity public keys; the peer verifies the signature and matches the derived identity
-   fingerprint against the expected one (verified out-of-band per ADR-014). Merely *naming* an
-   identity string in CPace inputs is not sufficient — possession of the identity private key must be
-   proven, and it is, here.
+### §Joining a room
 
-Pairwise CPace-on-meet between members; no bespoke group PAKE (GPAKE is immature/unstandardized).
+- **J-1.** Joining MUST work this way, with no other step: the two people swap fingerprints; one
+  creates the room; `vox room invite` prints the room's link; the link and the passphrase are sent
+  separately; the other runs `vox room join` with them; each then runs `vox trust add` for the other
+  (ADR-007).
+- **J-2.** A room passphrase is OPTIONAL. The core MUST NOT refuse an empty room passphrase. An identity
+  passphrase is OPTIONAL by the same rule: the core MUST NOT refuse an empty identity passphrase
+  (V030-36).
+- **J-3.** A join naming a room this node already holds MUST update the room's stored address to the
+  new link's addresses, not refuse (V210-167): the members the link names are dialled there, and those
+  that answer, with the anchors it names, are kept as the room's address. An address at which no member
+  answers MUST change nothing. A link that names no other member of the room MUST be refused as a bad
+  link.
+- **J-4.** A room made by a Vox release before v0.3.0 MUST be refused, saying to make the room again
+  (`Fault::RoomFromBeforeV030`). There is no compatibility path.
+- **J-5.** Addressing a service is ADR-017's: only `service.node.room.vox` connects; `room.vox` and
+  `node.room.vox` MUST resolve to nothing. No `<room>.vox` name resolves to the room's creator.
 
-**Separate rendezvous from authentication.**
-- **channelID is high-entropy and self-certifying.** The `channelID` is `SHA-256(canonical genesis
-  record)` (ADR-007 genesis, which carries a 128-bit random nonce) — 256-bit, high-entropy, and bound
-  to exactly one genesis (a cold-joiner fetches genesis from the rendezvous and accepts it only if its
-  hash equals the `channelID`, so there is one true genesis per channel).
-- **channelID → rendezvous address.** `rendezvous_key = HKDF-SHA-256(channelID, info = "vox/rendezvous/v1" ‖ epoch)`,
-  truncated to the DHT key width. A plain (fast) KDF is sufficient and correct **because the channelID
-  is already high-entropy** — a memory-hard KDF would add cost without benefit (knowing the channelID,
-  an observer computes the key once regardless; swarm-presence unlinkability is the later
-  metadata-privacy phase, ADR-001). The passphrase is **never** an input to rendezvous. ADR-012 uses
-  this exact derivation.
-- **Same construction, other seeds.** The rendezvous KDF generalizes: any high-entropy seed `S` yields
-  `rendezvous = HKDF-SHA-256(S, info=<label>)`. The personal self-channel (ADR-008) uses this with
-  `S = self_seed` — the **private** per-identity self-channel secret (ADR-002), *not* the public
-  identity key — so a user's own shared-root devices meet at a rendezvous no third party can locate.
-- **passphrase → CPace secret only.**
+### §"Separate rendezvous from authentication"
 
-**Post-join.** A successful CPace run bootstraps a PQXDH/Double-Ratchet pairwise session (ADR-004).
-Joining yields **no readable content**: membership is emergent (join + per-sender consent, ADR-007)
-and a joined node sees only ciphertext until individual members consent to it. There is no admin
-admission step and no membership certificate.
+- **J-6.** The invite link (`vox://…`, ADR-016) MUST carry only what finds the room: the channelID, the
+  inviting host and any anchors (each a fingerprint with its addresses, at most `MAX_LINK_ANCHORS` = 4,
+  ADR-012), and optionally a pin of the responder's fingerprint. The passphrase MUST NOT be in the link;
+  `InviteLink` has no field for a secret.
+- **J-7.** The passphrase MUST be an input to CPace only. It MUST NOT be an input to rendezvous.
 
-**Anti-abuse (layered, not just rate-limiting).** PAKE does not stop *online* guessing (one per run),
-and naive rate-limiting is Sybil-bypassable in a decentralized setting. Vox therefore relies on three
-concrete, non-bypassable layers rather than rate-limiting alone:
-1. **The real gate is consent.** A successful join grants *nothing readable* — no sender keys — until
-   members individually consent (ADR-007). There is no admin admission step; the passphrase gates the
-   swarm and per-sender consent gates reading. Online passphrase-guessing therefore buys an attacker
-   only the ability to sit in the swarm receiving ciphertext; it never yields readable content.
-2. **Channel/epoch-bound proof-of-work join tokens (concrete).** Each join attempt carries a PoW token
-   bound to `(channelID, epoch, responder-nonce)` so tokens cannot be precomputed or replayed across
-   channels/epochs. **Concrete function:** an *asymmetric memory-hard* PoW — **Equihash `(n=200, k=9)`**
-   (Zcash parameters) — chosen precisely because it is **memory-hard to *solve* (denies GPU/ASIC
-   advantage) yet cheap to *verify*** (a few hashes + XOR checks, sub-millisecond), so verification is
-   never itself the DoS (a plain Argon2id PoW does **not** have this property — verifying it costs the
-   same memory-hard work as solving it, which is why Equihash is used here). **Default target solve
-   ≈ 1–2 s on a mobile CPU**; the responder advertises a difficulty (Equihash effective-difficulty
-   filter on the solution hash) it adapts upward under load and downward when idle, carried in the
-   signed responder-nonce so the prover cannot lie about it. Accessibility note: difficulty caps keep
-   low-end devices usable. An **identity-bound (invite) channel defaults to a *low but non-zero* PoW
-   (≈200–500 ms)** — not zero — so a leaked channelID cannot cheaply flood the swarm; literal zero is
-   reserved for explicitly LAN/closed deployments. Per-sender consent remains the real read-gate
-   regardless.
-3. **Identity-bound log acceptance.** Joining the swarm grants no authority to be
-   *rendered*: the causal log accepts entries only from identities that completed the authenticated
-   join and carry valid per-author composite signatures (ADR-008). *(The per-author entry/byte quotas
-   this item used to name were removed 2026-09-24, PRD-001 R3: an admitted member is trusted and is not
-   rate-limited.)* No amount of passphrase guessing yields readable content or unbounded write authority —
-   there is no admin-signed membership certificate to forge (ADR-007), because there is no membership
-   certificate at all.
+#### §"channelID is high-entropy and self-certifying"
 
-Rate-limiting by peers remains a cheap first filter but is explicitly **not** the security boundary.
-**Bandwidth abuse beyond join** (a joined member spamming the log or rendezvous, or forcing
-render-gating amplification) is **not** bounded by a log quota — there is none since 2026-09-24
-(PRD-001 R3) — but by membership itself: such a member is revoked and the channel rotated (ADR-007).
-Rendezvous-record caps (ADR-012) still bound the board, and join PoW bounds none of it.
+- **J-8.** The `channelID` MUST be `SHA-256(canonical genesis record)` (ADR-007 §"Trust anchor"; the
+  genesis carries a 128-bit random nonce). A joiner MUST accept a genesis fetched from a board only if
+  its hash equals the `channelID` it joined with, so each channel has one genesis.
 
-### Implementation notes (normative)
+#### §"channelID → rendezvous address"
 
-- **PoW verification is pure-Rust and cheap.** Equihash solution validity is checked with the
-  `equihash` (librustzcash) crate's pure-Rust verifier plus the difficulty-filter hash; verification
-  is sub-millisecond and is always the path a responder runs. The signed responder-nonce carries the
-  difficulty so the prover cannot understate it, and a token is bound to `(channelID, epoch,
-  responder_nonce)` so it cannot be precomputed or replayed across channels/epochs.
-- **PoW solving — pure Rust only; the C++ carve-out is rejected.** The solve path is Vox's own
-  pure-Rust generalized-Wagner solver (`join::pow::wagner`), the *only* prover at every parameter set;
-  the librustzcash crate is used solely as the verifier. The optional C++ `tromp` solver this note once
-  carved out as "pending deciders' confirmation" was **rejected by the decider on 2026-09-19** ("Vox is
-  Rust only", ADR-001 principle 10): the `equihash-solver` feature and its CI job were removed. A
-  performance gap is an algorithm/implementation problem to be solved in Rust, never grounds for a
-  non-Rust exception.
-- **Measured cost (2026-09-19, `examples/spike_pow.rs`, release build, Apple-silicon laptop core).**
-  The bucket-sorted pure-Rust Wagner solver at the real `(200,9)`: **≈ 1.1 s per nonce, 245 MB peak
-  RSS, ≈ 2.5 solutions per nonce** — inside the ≈ 1–2 s target on a desktop-class core. The previous
-  parent-pointer layout measured 7.5 s / 1.65 GB / 2.0 on the same machine the same day; the 6.6×
-  speed-up and 6.7× memory reduction came entirely from the layout (below), confirming the gap was
-  never the language. Reduced CI parameters `(48,5)`: sub-millisecond; `(96,5)`: ≈ 0.1 s.
-  (`(144,5)` was also measured with the old layout — 115 s and 10 GB — and is not a candidate.)
-  The **mobile** figure the target names is measured when a mobile client exists (ADR-014 is macOS;
-  iOS is a separate capability); on current phone cores a 1.1 s laptop solve is expected to land
-  in the 2–4 s range, which the difficulty policy below can absorb by keeping invite channels at
-  1 bit.
-- **Difficulty is calibrated in base-solve multiples, not seconds.** A `(200,9)` solve yields ≈ 2
-  solutions per nonce and a `d`-bit filter passes each with probability `2^-d`, so a join costs
-  `max(1, 2^d / 2)` base solves (`Difficulty::expected_solves`). Defaults (`join::pow::Difficulty`):
-  `DEFAULT_INVITE` = 1 bit (≈ 1 solve; the smallest *non-zero* filter, so a leaked channelID still
-  costs a full memory-hard solve per attempt), `DEFAULT_OPEN` = 2 bits (≈ 2 solves), and the
-  accessibility cap `MAX` = 8 bits (≈ 128 solves) — a joiner **refuses** a challenge above the cap
-  before grinding (`join_initiate`), which also bounds the work an attacker-signed challenge can
-  extract. `ZERO` remains explicit LAN/closed mode. With the measured ≈ 1.1 s base solve the bit
-  values map onto wall-clock cost as invite ≈ 1 s and open ≈ 2 s on a desktop-class core.
-- **Load adaptation is a pure function.** `Difficulty::adapted_for_load(pending_joins)` adds one bit
-  per doubling of the pending-join queue at or above a small threshold (4) and saturates at `MAX`;
-  it is monotone in load and falls back as the queue drains, so a responder node calls it with its
-  live queue depth each time it mints a signed challenge. The node runtime that supplies the queue
-  depth is the integration milestone (no such runtime exists yet); the policy itself is complete.
-- **Solver layout (`join::pow::wagner`, 2026-09-19).** The same Wagner algorithm, re-derived with a
-  bucket-sorted flat-memory layout rather than ported from any C code: (i) each round's entries live in
-  a flat buffer of `2^12` fixed-capacity buckets keyed by the top 12 bits of the round's 20-bit digit,
-  each slot a compact byte record `[rest byte ‖ remaining digits]`; (ii) in-bucket collisions are found
-  in one pass with a 256-entry chained table on the rest byte (no sorting, no per-entry allocation);
-  (iii) two hash layers alternate between rounds, and one `u32` array per round records each slot's
-  parent pair `(bucket, slot_a, slot_b)`; (iv) the final round collides on the last two digits at once;
-  (v) the `2^k` leaves are expanded — and canonically ordered, distinctness-checked and minimal-encoded
-  — only for the final hits. A full bucket drops further entries (bounded, rare), so peak memory is a
-  function of the parameters alone. Acceptance gates, all met: every emitted solution accepted by the
-  librustzcash verifier for the same `(seed, nonce)` (reduced-parameter tests at `(48,5)` and `(96,5)`,
-  and the real-parameter round-trip `real_200_9_solve_then_verify`, which CI now runs in release as
-  the production-parameter gate); ≤ 2 s per nonce and ≤ 256 MB peak RSS at `(200,9)` on this
-  machine (`spike_pow`). Parameter sets whose parent references exceed 32 bits (e.g. `(144,5)`)
-  transparently use 64-bit references.
+- **J-9.** The rendezvous key MUST be `HKDF-SHA-256(channelID, info = "vox/rendezvous/v1" ‖ epoch_be)`,
+  truncated to the key width. A memory-hard KDF MUST NOT be used here: the channelID is already
+  high-entropy. ADR-012 uses this exact derivation.
+- **J-10.** Any other high-entropy seed MAY use the same construction under its own label. The personal
+  self-channel (ADR-008) MUST use the private `self_seed` (ADR-002), never the public identity key,
+  under `"vox/self-rzv/v1"`, so no third party can locate it.
 
-- **The join over the wire (`node::joinstream`, ADR-016 M14.4).** This ADR's Decision defines the
-  cryptography and leaves "the *exchange* of shares / PoP / PoW ... the transport's job"; that transport
-  now exists as seven ordered frames on a bi-stream typed `join` (CHALLENGE → SOLVE → SHARE → PROOF →
-  PROOF → INIT → ACCEPTED/REJECTED), driving `join_initiate` / `join_accept` / `complete_cpace` /
-  `verify_peer_sealed` / `bootstrap` **unchanged**. Three properties are worth pinning here:
-  (1) **The transport identity *is* the expected PoP identity.** The responder verifies the joiner's PoP
-  against `VoxConnection::peer_id` and the joiner requires the challenge's composite key to hash to the
-  peer it dialled, so the ADR-005 proof and the ADR-011 handshake cannot disagree and a third party
-  cannot relay someone else's join. (2) **The joiner proves first**, so the party seeking entry commits
-  before the member reveals its proof; the consequence is that a wrong passphrase is detected by the
-  *responder*, which answers with one opaque `Refused` — `PowInvalid` and `Malformed` stay
-  distinguishable because they are structural, but nothing distinguishes a wrong passphrase from an
-  identity mismatch or a policy refusal. (3) The responder's challenge difficulty is
-  `base.adapted_for_load(pending_joins)`, so the load-adaptation policy above is applied where the load
-  is actually known. A full join runs over loopback QUIC in a test, at reduced and at **production
-  (200,9)** parameters (1.95 s in release, including the solve).
-- **Answering a join needs the passphrase live, which is why a node retains it (M14.7c).** CPace derives
-  its generator from the passphrase *per run*, against a fresh `sid`, so there is nothing a responder can
-  precompute and keep instead: to prove it knows the passphrase it must have the passphrase at handshake
-  time. The at-rest SEK is a one-way derivative and cannot stand in. So a node can only answer an inbound
-  join for a channel whose passphrase it holds, and the node therefore keeps it (zeroizing, in memory
-  only, wiped on close/app-lock) for exactly the lifetime of the open channel — the alternative is that
-  nobody can ever join a channel unless its members first enter a special mode. This is a bounded
-  decision, not a relaxation: the channel passphrase is the *group* factor (ADR-010 Implementation notes),
-  every member already holds it, it is scoped to one channel and epoch, and it sits beside the SEK it
-  derives, which an attacker able to read that memory would find strictly more valuable.
-- **Proof-of-possession confidentiality.** The identity PoP exchanged inside the CPace-protected
-  session is AEAD-sealed (AES-256-GCM) under a key derived from the CPace ISK,
-  `K_pop = HKDF-SHA-256(ISK, info="vox/cpace-pop/v1")`, so the identity public keys and signature are
-  not exposed on the wire before the pairwise session exists.
-- **PoW precedes CPace.** A responder verifies the join PoW token *before* performing any CPace work,
-  so unauthenticated peers cannot force PAKE computation.
-- **No zero-key fallback.** `derive_pop_key` and the rendezvous derivation return `Result` and
-  propagate the (unreachable for a 32-byte OKM) HKDF-Expand error as `MalformedJoin`; they never
-  substitute an all-zero key. `K_pop` is returned in a `Zeroizing` buffer. *(2026-09-19 review: both
-  previously zero-filled on the error path — a key no honest peer derives is still a key.)*
+### §Authenticated join: CPace and identity proof-of-possession
+
+- **J-11.** The join MUST run CPace instantiated as Ristretto255 + SHA-512 (CFRG primary
+  instantiation, generator by `calculate_generator`/`map_to_group`, ADR-003 registry `0x07/0x01`), with
+  `CI = "vox/cpace/v1" ‖ channelID ‖ epoch`, `sid` a fresh nonce per run, and `AD = suite_id`.
+- **J-12.** Inside the CPace session each party MUST prove possession of its identity: it signs the
+  CPace `sid` and transcript hash with its composite Ed25519+ML-DSA identity key (ADR-002) and sends its
+  identity public keys; the peer MUST verify the signature and match the derived fingerprint to the one
+  expected. Naming an identity in the CPace inputs MUST NOT be accepted as proof.
+- **J-13.** The proof of possession MUST be AEAD-sealed (AES-256-GCM) under
+  `K_pop = HKDF-SHA-256(ISK, info = "vox/cpace-pop/v1")`, returned in a zeroizing buffer, so identity keys
+  and signature are not on the wire in the clear.
+- **J-14.** `derive_pop_key` and the rendezvous derivation MUST return an error (`MalformedJoin`) on an
+  HKDF failure. They MUST NOT substitute an all-zero key.
+- **J-15.** Members MUST run pairwise CPace when they meet. A group PAKE MUST NOT be used.
+- **J-16.** The transport identity MUST be the expected proof-of-possession identity: the responder
+  verifies the joiner's proof against `VoxConnection::peer_id`, and the joiner MUST require the
+  challenge's composite key to hash to the peer it dialled, so a third party cannot relay another's join.
+- **J-17.** The joiner MUST prove first. A wrong passphrase is detected by the responder, which MUST
+  answer with one opaque `Refused`: a wrong passphrase MUST NOT be distinguishable from an identity
+  mismatch or a policy refusal. `PowInvalid` and `Malformed` MAY stay distinguishable (they are
+  structural).
+- **J-18.** The exchange MUST be ordered frames on a bi-stream typed `join` (ADR-016 M14.4):
+  CHALLENGE → SOLVE → SHARE → PROOF → PROOF → INIT, then ACCEPTED, REJECTED, or FULL for a room at its
+  member cap (ADR-007 G-22).
+- **J-19. (M14.7c)** A node MUST hold a room's passphrase live while the room is open, because a CPace
+  responder needs it at handshake time and nothing derived from it can stand in. It MUST be held in a
+  zeroizing buffer and wiped from memory on lock and on close (under ADR-026, on detach and on close). A daemon's set of open rooms keeps it
+  sealed at rest so the rooms reopen after a restart (#208; ADR-010). *Decided, not built (ADR-026):*
+  the set is per node, and a node's rooms reopen when it attaches. A room passphrase given to a join
+  travels to the daemon over the control socket in a zeroizing buffer (ADR-026 C-6).
+
+### §Post-join
+
+- **J-20.** A successful join MUST bootstrap a PQXDH / Double Ratchet pairwise session (ADR-004) and
+  MUST yield no readable content: the joiner reads a member only once that member's node trusts it
+  (ADR-007). There MUST be no admin admission step and no membership certificate.
+
+### §Anti-abuse
+
+- **J-21.** The read gate MUST be trust (ADR-007): a correct passphrase guess buys only ciphertext.
+- **J-22.** Each join attempt MUST carry a proof-of-work token: Equihash `(n = 200, k = 9)`, bound to
+  `(channelID, epoch, responder_nonce)` so it cannot be precomputed or replayed, with the difficulty
+  carried in the signed responder nonce so the prover cannot understate it.
+  - Verification MUST use the `equihash` (librustzcash) verifier plus the difficulty-filter hash.
+  - Solving MUST use Vox's own pure-Rust solver (`join::pow::wagner`), the only prover. A non-Rust
+    solver MUST NOT be used (the C++ carve-out was rejected, 2026-09-19, ADR-001 principle 10).
+  - The solver's peak memory MUST be a function of the parameters alone (a full bucket drops further
+    entries), and every solution it emits MUST pass the verifier for the same `(seed, nonce)`.
+- **J-23.** A responder MUST verify the PoW token before doing any CPace work.
+- **J-24.** Difficulty MUST be counted in base solves: a `d`-bit filter costs `max(1, 2^d / 2)` solves
+  (`Difficulty::expected_solves`). The responder's base MUST be `DEFAULT_INVITE` = 1 bit (low but non-zero,
+  so a leaked channelID still costs a full solve per attempt); `DEFAULT_OPEN` = 2 bits; `ZERO` MAY be used
+  only for an explicit LAN or closed deployment. A joiner MUST refuse a challenge above `MAX` = 8 bits
+  before grinding. The target base solve SHOULD be ≈ 1–2 s on a mobile CPU.
+- **J-25.** The responder MUST adapt difficulty to its live count of joins in flight with
+  `Difficulty::adapted_for_load`: one bit per doubling of the queue at or above `ADAPT_THRESHOLD` = 4,
+  saturating at `MAX`, falling back as the queue drains.
+- **J-26.** The log MUST accept entries only from identities that completed the authenticated join and
+  carry valid per-author composite signatures (ADR-008). There MUST be no per-author entry or byte quota
+  (PRD-001 R3, 2026-09-24): an admitted member is not rate-limited.
+- **J-27.** Peers MAY rate-limit as a first filter; that MUST NOT be treated as the security boundary.
+  A joined member's abuse is bounded by membership (its peers remove their trust, ADR-007), and the board
+  by ADR-012's rendezvous-record caps.
 
 ## Consequences
 
-### Positive
-- The passphrase becomes a real cryptographic gate, not mere obscurity.
+- The passphrase is a cryptographic gate, not obscurity, and offline guessing is not possible.
 - Serverless: no prekey server; peers authenticate as equals.
-- Separating rendezvous-ID from auth-passphrase closes the offline-guessing leak on the DHT.
+- A leaked passphrase lets an attacker join, but yields only ciphertext unless members trust it.
+- Moving the link and the passphrase by two channels is a burden the user owns.
+- Group PAKE and affiliation hiding are left to a later metadata-privacy phase.
 
-### Negative
-- A leaked passphrase lets an attacker complete the join (but still yields only ciphertext until
-  members consent — ADR-007); passphrase rotation is the mitigation (ADR-007 epoch).
-- Out-of-band exchange of channelID + passphrase is a usability burden the user owns.
+## Related ADRs
 
-### Neutral
-- Group PAKE / affiliation-hiding (partitioned GPAKE) is deferred to the metadata-privacy phase.
-
-## Links
-**Depends on**: ADR-002, ADR-003, ADR-004.
-- Depended on by: ADR-007, ADR-012.
+Depends on ADR-002, ADR-003, ADR-004. Depended on by ADR-007, ADR-012. Cited: ADR-001, ADR-008,
+ADR-010, ADR-014, ADR-016, ADR-017.
 
 ## Engineering Mantra
 

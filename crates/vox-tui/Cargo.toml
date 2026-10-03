@@ -68,11 +68,17 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
-# `vox daemon` asks for its passphrase with echo off and the terminal otherwise as it was
-# (V210-153): `termios`.
-rustix = { workspace = true, features = ["termios"] }
+# The LAN helper passes its utun descriptor over a socket: `net`. `vox daemon` asks for its
+# passphrase with echo off and the terminal otherwise as it was (V210-153): `termios`.
+rustix = { workspace = true, features = ["net", "termios"] }
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
+
+# The family LAN's helper (`vox lan helper`, ADR-013 §"The family LAN"): the macOS `utun`
+# control socket (`SysControlAddr`, `UtunIfname`), `getpeereid` and `chown`, all through
+# nix's safe wrappers so `#![forbid(unsafe_code)]` holds.
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]
@@ -84,6 +90,10 @@ aes-gcm.workspace = true
 # The R41 link emulator sizes its own UDP sockets' buffers (std cannot): a link does not drop
 # packets at a 786 KB socket, and the emulator must not either.
 socket2.workspace = true
+# Driving the TUI on a real terminal (the unread-badge proof): a pty, and a screen grid to
+# replay its output into. The workspace manifest says why each version.
+portable-pty.workspace = true
+vt100.workspace = true
 # V210-49's proof plays the attacker who deletes one row of a stopped node's store: no vox command
 # can, so the test opens the file itself (never while a vox process holds it).
 redb.workspace = true
@@ -93,6 +103,8 @@ quinn.workspace = true
 # R41's comparison flow (ADR-024) presents a certificate of its own.
 rcgen.workspace = true
 rustls.workspace = true
+# V030-33's proof offers the node only the post-quantum hybrid group, as a client of its own.
+rustls-post-quantum.workspace = true
 # V210-85's proof stops `vox connect` at its passphrase prompts, which it shows only on a terminal:
 # the test opens a pty of its own and reads the terminal's modes back after the stop.
 rustix = { workspace = true, features = ["pty", "termios"] }

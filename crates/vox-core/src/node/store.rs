@@ -47,6 +47,11 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
+/// The codes of the anchor's ciphertext copy of a room it was not a member of — its log pages (6)
+/// and its metadata (7) — **retired** with that copy (ADR-023 decision 6, PRD-001 R34, R45). Never
+/// reused, and deleted wherever they are found ([`Store::delete_retired_anchor_pages`]).
+const RETIRED_ANCHOR_CODES: [u8; 2] = [6, 7];
+
 /// Stable on-disk code for a [`SegmentKind`] (part of the key; never reordered).
 const fn kind_code(kind: SegmentKind) -> u8 {
     match kind {
@@ -55,8 +60,6 @@ const fn kind_code(kind: SegmentKind) -> u8 {
         SegmentKind::Index => 3,
         SegmentKind::KeyMaterial => 4,
         SegmentKind::PrekeyRing => 5,
-        SegmentKind::AnchorLog => 6,
-        SegmentKind::AnchorMeta => 7,
         // The keyring is not stored as a segment (it is a sealed blob in `meta`,
         // because it belongs to no channel), but a kind must map to a stable code
         // or this match stops being exhaustive.
@@ -467,6 +470,42 @@ impl Store {
         Ok(existed)
     }
 
+    /// Delete **everything this store holds of one channel** (a room left or ended, V030-08): every
+    /// sealed segment of every kind and its SEK wrap, in one durable transaction. Returns how
+    /// many rows went. The freed pages still hold the old bytes until the space is reused; a
+    /// caller that must leave none follows with [`Store::rewrite_fresh`].
+    pub fn purge_channel(&self, channel: &Digest32) -> Result<usize> {
+        let txn = self.begin_write()?;
+        let mut gone = 0usize;
+        {
+            let mut t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+            let lo: SegmentKey = (*channel, 0, 0);
+            let hi: SegmentKey = (*channel, u8::MAX, u64::MAX);
+            let keys: Vec<SegmentKey> = t
+                .range(lo..=hi)
+                .map_err(storage("range segments"))?
+                .map(|item| item.map(|(k, _)| k.value()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(storage("iterate segments"))?;
+            for k in keys {
+                if t.remove(k).map_err(storage("delete segment"))?.is_some() {
+                    gone += 1;
+                }
+            }
+            let mut w = txn
+                .open_table(SEK_WRAPS)
+                .map_err(storage("open sek_wraps"))?;
+            if w.remove(*channel)
+                .map_err(storage("delete sek wrap"))?
+                .is_some()
+            {
+                gone += 1;
+            }
+        }
+        txn.commit().map_err(storage("commit"))?;
+        Ok(gone)
+    }
+
     /// Persist a channel's double-locked SEK wrap (its own durable transaction).
     pub fn put_sek_wrap(&self, channel: &Digest32, wrap: &SekWrap) -> Result<()> {
         let mut b = self.batch()?;
@@ -500,20 +539,31 @@ impl Store {
         Ok(out)
     }
 
-    /// Every channel this store holds an **anchor** copy of (an `AnchorMeta` segment),
-    /// in unspecified order — how a restarted anchor finds the rooms it was serving.
-    pub fn anchored_channels(&self) -> Result<Vec<Digest32>> {
-        let txn = self.begin_read()?;
-        let t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
-        let mut out: Vec<Digest32> = Vec::new();
-        for item in t.iter().map_err(storage("iterate segments"))? {
-            let (k, _) = item.map_err(storage("iterate segments"))?;
-            let (channel, kind, _) = k.value();
-            if kind == kind_code(SegmentKind::AnchorMeta) && !out.contains(&channel) {
-                out.push(channel);
+    /// Delete every page of the anchor's old ciphertext copy of a room (the retired segment
+    /// codes, 6 and 7): an anchor stores nothing for a room it is not a member
+    /// of (ADR-023 decision 6), and pages an earlier build stored are deleted when it next opens
+    /// the store — where a member's vault shares the anchor's data directory; otherwise the
+    /// anchor deletes the whole file. Returns how many were deleted.
+    pub fn delete_retired_anchor_pages(&self) -> Result<usize> {
+        let txn = self.begin_write()?;
+        let mut deleted = 0;
+        {
+            let mut t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
+            let keys: Vec<SegmentKey> = t
+                .iter()
+                .map_err(storage("iterate segments"))?
+                .filter_map(std::result::Result::ok)
+                .map(|(k, _)| k.value())
+                .filter(|(_, kind, _)| RETIRED_ANCHOR_CODES.contains(kind))
+                .collect();
+            for key in keys {
+                if t.remove(key).map_err(storage("delete segment"))?.is_some() {
+                    deleted += 1;
+                }
             }
         }
-        Ok(out)
+        txn.commit().map_err(storage("commit"))?;
+        Ok(deleted)
     }
 
     /// Write a public metadata entry (its own durable transaction). Meta holds
@@ -637,50 +687,6 @@ impl Batch<'_> {
         let key: SegmentKey = (*channel, kind_code(kind), id);
         let existed = t.remove(key).map_err(storage("delete segment"))?.is_some();
         Ok(existed)
-    }
-
-    /// Queue the removal of everything this node holds **as a member** of `channel`: its SEK
-    /// wrap and every segment sealed under that SEK (V210-164). An anchor's copy of the room
-    /// (`AnchorLog`, `AnchorMeta`) is a separate role and stays. Returns how many rows went.
-    pub fn delete_room(&mut self, channel: &Digest32) -> Result<usize> {
-        let mut removed = 0usize;
-        {
-            let mut t = self
-                .txn
-                .open_table(SEGMENTS)
-                .map_err(storage("open segments"))?;
-            for kind in [
-                SegmentKind::LogDb,
-                SegmentKind::PlaintextCache,
-                SegmentKind::Index,
-                SegmentKind::KeyMaterial,
-            ] {
-                let lo: SegmentKey = (*channel, kind_code(kind), 0);
-                let hi: SegmentKey = (*channel, kind_code(kind), u64::MAX);
-                let keys: Vec<SegmentKey> = t
-                    .range(lo..=hi)
-                    .map_err(storage("range segments"))?
-                    .map(|item| item.map(|(k, _)| k.value()))
-                    .collect::<std::result::Result<_, _>>()
-                    .map_err(storage("iterate segments"))?;
-                for key in keys {
-                    t.remove(key).map_err(storage("delete segment"))?;
-                    removed += 1;
-                }
-            }
-        }
-        let mut wraps = self
-            .txn
-            .open_table(SEK_WRAPS)
-            .map_err(storage("open sek_wraps"))?;
-        if wraps
-            .remove(*channel)
-            .map_err(storage("delete sek wrap"))?
-            .is_some()
-        {
-            removed += 1;
-        }
-        Ok(removed)
     }
 
     /// Queue a public metadata write (see [`Store::put_meta`]).

@@ -1,16 +1,15 @@
 //! ADR-021 M21.1 — **workers must run the same Vox version, enforced**, through the
-//! shipped `vox` binary and a **published older release** in one room.
+//! shipped `vox` binary with the stamps other versions write.
 //!
 //! Mixed-version coordination is not supported: the operator upgrades every worker
 //! together. What must therefore be proved is not compatibility but **refusal** — a
 //! worker that would coordinate with another version stops, before it posts anything
 //! that participates, and says exactly who and what:
 //!
-//! 1. **missing** — the real published `vox` v0.2.6, attached to a current node, posts
-//!    a claim with no version stamp, because it predates ADR-021. A current worker that
-//!    has **never posted in the room** then has its first `claim` refused with exit 3,
-//!    naming that worker, "no version", and the required version — and the claim is
-//!    never posted;
+//! 1. **missing** — a claim with no version stamp, as every release before ADR-021 wrote
+//!    it. A current worker that has **never posted in the room** then has its first
+//!    `claim` refused with exit 3, naming that worker, "no version", and the required
+//!    version — and the claim is never posted;
 //! 2. **unknown** and **different** — a stamp that is not a version (`banana`) and one
 //!    that is another version (this build's patch + 1, `another_version`) are each
 //!    refused and named;
@@ -21,13 +20,20 @@
 //!    first participating verb announces the current version, and coordination
 //!    resumes for everyone.
 //!
-//! The unknown and different stamps are written onto the control socket as exactly the
-//! bytes a foreign binary would write — a `hello` carrying that version — because this
-//! build cannot be made to *be* another version.
+//! Every foreign stamp is written onto the control socket as exactly the envelope another
+//! version writes, because this build cannot be made to *be* another version. The
+//! missing stamp used to come from the real published v0.2.6, and it cannot any more,
+//! either way it could be run:
+//! - **its CLI against a current node** fails the handshake: the node speaks IPC protocol 7,
+//!   and v0.2.6 speaks 5;
+//! - **its own member node** can never deliver anything: since ADR-023 M23.2 the log entry
+//!   has 12 fields where v0.2.6 writes 10, so every entry it writes is refused at decode
+//!   (no compatibility, by design). Its claim would never reach alice, and the gate would
+//!   measure the log format, not the version refusal.
 //!
 //! Every red names its side: `PRODUCT:` quotes what `vox` said, `CANNOT MEASURE:` is a
-//! staging step that did not happen (the published binary's claim, a precondition), and
-//! `APPARATUS:` is the proof's own fault (the download, its SHA-256, the runtime).
+//! staging step that did not happen (a precondition), and `APPARATUS:` is the proof's own
+//! fault (the runtime, its temporary directory).
 
 #![cfg(unix)]
 
@@ -39,79 +45,6 @@ mod watchdog;
 use support::{post_raw, until, Out, Worker};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const PUBLISHED: &str = "0.2.6";
-const REPO: &str = "robertelee78/vox";
-
-fn allow_unproven(name: &str) -> bool {
-    std::env::var("VOX_PROOF_ALLOW_UNPROVEN")
-        .unwrap_or_default()
-        .split(',')
-        .any(|s| s.trim().eq_ignore_ascii_case(name))
-}
-
-fn triple() -> &'static str {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => "aarch64-apple-darwin",
-        ("macos", "x86_64") => "x86_64-apple-darwin",
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-        other => panic!("APPARATUS, CANNOT MEASURE: no published vox for {other:?}"),
-    }
-}
-
-/// The published release binary, fetched once and verified against its published
-/// SHA-256 on every run, cached copy included. `None` when it cannot be fetched.
-fn published_vox() -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("vox-published-v{PUBLISHED}"));
-    let bin = dir.join("vox");
-    let sum = dir.join("vox.sha256");
-    if !(bin.is_file() && sum.is_file()) {
-        std::fs::create_dir_all(&dir).ok()?;
-        let base = format!(
-            "https://github.com/{REPO}/releases/download/v{PUBLISHED}/vox-{}",
-            triple()
-        );
-        let fetch = |url: &str, out: &std::path::Path| {
-            std::process::Command::new("curl")
-                .args(["-fsSL", "-o"])
-                .arg(out)
-                .arg(url)
-                .status()
-                .is_ok_and(|s| s.success())
-        };
-        let part = dir.join("vox.part");
-        if !fetch(&base, &part) || !fetch(&format!("{base}.sha256"), &sum) {
-            return None;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).ok()?;
-        }
-        std::fs::rename(&part, &bin).ok()?;
-    }
-    let want = std::fs::read_to_string(&sum)
-        .ok()?
-        .split_whitespace()
-        .next()?
-        .to_owned();
-    let got = {
-        use sha2::{Digest as _, Sha256};
-        let bytes = std::fs::read(&bin).ok()?;
-        Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
-    assert_eq!(
-        got,
-        want,
-        "APPARATUS: {} does not match the published v{PUBLISHED} SHA-256 (a bad download \
-         or a changed cache); delete {} to fetch it again",
-        bin.display(),
-        dir.display()
-    );
-    Some(bin)
-}
 
 /// A version that is valid and is **not** this build's: its patch number plus one. Hard-coded,
 /// it stopped being different the day the tree was at that version: on 0.2.9 a hello stamped
@@ -149,7 +82,13 @@ fn refused_naming(o: &Out, who: &Worker, what: &str) {
         Some(3),
         "PRODUCT: a version refusal must exit 3: {o:?}"
     );
-    for needle in [&who.b32()[..12], what, &format!("required {VERSION}")] {
+    // The reader (alice, always) names the worker by her own name for it, the one `vox trust
+    // add --name` gave (V210-162), not by a fingerprint prefix.
+    for needle in [
+        &format!("worker {} session", who.name),
+        what,
+        &format!("required {VERSION}"),
+    ] {
         assert!(
             o.stderr.contains(needle),
             "PRODUCT: the refusal must name {needle:?}: {}",
@@ -168,37 +107,9 @@ fn claims_by(w: &Worker, reader: &Worker, r: &str) -> usize {
 }
 
 #[test]
-#[ignore = "two networked nodes, production Argon2id, and a published release; CI runs it in release"]
+#[ignore = "two networked nodes and production Argon2id; CI runs it in release"]
 fn a_worker_on_another_version_is_refused_by_name() {
     watchdog::arm();
-    let Some(old) = published_vox() else {
-        assert!(
-            allow_unproven("published-release"),
-            "APPARATUS, CANNOT MEASURE: the published v{PUBLISHED} binary could not be fetched, so the \
-             missing-stamp case cannot be measured. Set \
-             VOX_PROOF_ALLOW_UNPROVEN=published-release to accept that gap deliberately."
-        );
-        eprintln!(
-            "CANNOT MEASURE (accepted by VOX_PROOF_ALLOW_UNPROVEN): the published \
-             v{PUBLISHED} binary could not be fetched; nothing was proved"
-        );
-        return;
-    };
-    let old = old.to_string_lossy().into_owned();
-    let v = std::process::Command::new(&old)
-        .arg("--version")
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run {old} --version: {e}"));
-    eprintln!(
-        "[receipt] {old} --version -> {}",
-        String::from_utf8_lossy(&v.stdout).trim()
-    );
-    assert!(
-        String::from_utf8_lossy(&v.stdout).contains(PUBLISHED),
-        "APPARATUS: {old} --version said {:?}, not v{PUBLISHED}",
-        String::from_utf8_lossy(&v.stdout)
-    );
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -209,21 +120,18 @@ fn a_worker_on_another_version_is_refused_by_name() {
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let r = room.id.as_str();
 
-    // ---- (1) missing: the published v0.2.6 claims, and a fresh current worker is refused ----
-    let o = bob.vox_bin(&old, None, &["room", "claim", r, "old-work"], None);
-    eprintln!(
-        "[receipt] published v{PUBLISHED} claim -> exit {:?}",
-        o.code
-    );
-    assert!(
-        o.ok,
-        "APPARATUS, CANNOT MEASURE: the published v{PUBLISHED} binary's claim failed, so the missing-stamp \
-         case was never staged: {o:?}"
-    );
-    until(
+    // ---- (1) missing: a pre-ADR-021 claim, and a fresh current worker is refused ----
+    // Exactly what a release before ADR-021 wrote for `vox room claim`: no `data.vox`.
+    let old_claim = serde_json::json!({
+        "v": 1, "type": "claim", "from": "b-old", "body": "claiming old-work",
+        "data": { "resource": "old-work" }
+    })
+    .to_string();
+    rt.block_on(post_raw(bob, room.cid, &old_claim));
+    let seen = until(
         alice,
         None,
-        "the old worker's claim to reach alice",
+        "the unstamped claim to reach alice",
         &["room", "read", r, "--json"],
         |o: &Out| {
             o.ok && o
@@ -231,6 +139,25 @@ fn a_worker_on_another_version_is_refused_by_name() {
                 .iter()
                 .any(|x| x["envelope"]["type"] == "claim" && x["envelope"]["data"]["vox"].is_null())
         },
+    );
+    let unstamped = seen
+        .ndjson()
+        .iter()
+        .filter(|x| {
+            x["author"] == bob.b32()
+                && x["envelope"]["type"] == "claim"
+                && x["envelope"]["data"]["vox"].is_null()
+        })
+        .count();
+    eprintln!("[receipt] unstamped claims from bob that reached alice: {unstamped}");
+    assert_eq!(
+        unstamped, 1,
+        "PRODUCT: exactly bob's unstamped claim must reach alice, and `vox room read --json` \
+         shows {unstamped}"
+    );
+    eprintln!(
+        "[receipt] alice's own claims before her first: {}",
+        claims_by(alice, alice, r)
     );
     assert_eq!(
         claims_by(alice, alice, r),
@@ -290,7 +217,10 @@ fn a_worker_on_another_version_is_refused_by_name() {
         ],
     );
     assert!(
-        hook.stdout.contains("work coordination refused") && hook.stdout.contains(&bob.b32()[..12]),
+        hook.stdout.contains("work coordination refused")
+            && hook
+                .stdout
+                .contains(&format!("worker {} session", bob.name)),
         "PRODUCT: the drain hook must say it plainly: {hook:?}"
     );
 
@@ -303,7 +233,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
         o.ok,
         "PRODUCT: plain conversation was refused while coordination is: {o:?}"
     );
-    // **And structured conversation**: a reply addressed to a session, urgent, is still
+    // **And structured conversation**: a reply addressed to a member, urgent, is still
     // conversation — only `--work` takes part in coordination. A refusal that reached
     // every structured post stayed green while this checked only the plain form.
     let re = alice
@@ -321,7 +251,7 @@ fn a_worker_on_another_version_is_refused_by_name() {
             "--type",
             "say",
             "--to",
-            "b1",
+            "bob",
             "--urgent",
             "--re",
             &re,

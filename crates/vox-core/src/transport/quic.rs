@@ -8,13 +8,13 @@
 //! [`VoxConnection::accept_stream`]): QUIC gives per-stream flow control with no
 //! cross-stream head-of-line blocking, so bulk log replication on one stream never
 //! stalls an interactive flow on another (ADR-011 §"Two contracts on one
-//! connection"). Low-latency, loss-tolerant flows use RFC 9221 datagrams
-//! ([`VoxConnection::send_datagram`] / [`VoxConnection::recv_datagram`]); the
-//! connection itself applies the [`crate::transport::datagram`] 64-bit sequence
-//! framing and the DTLS-style anti-replay window (ADR-011 §"Datagram
-//! anti-replay"), so a replayed, duplicate, out-of-window or unframed datagram is
-//! dropped before it can reach the application — that is a property of the
-//! connection, never caller discipline (2026-09-19 review).
+//! connection"). Low-latency, loss-tolerant flows use RFC 9221 datagrams on
+//! **flows** ([`VoxConnection::bind_flow`]): each flow is bound to a stream and lives
+//! exactly as long as it, and the connection's one
+//! [`DatagramRouter`] — started with the
+//! connection, the only reader of its datagrams — hands each datagram to its flow and
+//! drops and counts the rest (ADR-022). Replay is QUIC's own concern (RFC 9000 §12.3);
+//! Vox adds no sequence number of its own.
 //!
 //! ## Authentication + the recorded session
 //! Connecting and accepting both authenticate the peer via the
@@ -44,10 +44,12 @@ use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
-use crate::transport::datagram::{parse_datagram, DatagramSender, ReplayWindow, SEQ_PREFIX_LEN};
 use crate::transport::identity_cert::build_leaf_certificate;
 use crate::transport::mux::{CircuitPort, MuxSocket};
-use crate::transport::provider::{client_config, server_config, X25519MLKEM768_CODE_POINT};
+use crate::transport::provider::{client_config, server_config};
+use crate::transport::router::{
+    DatagramFlow, DatagramRouter, DatagramStats, FlowMode, MAX_PACKET_HEADER,
+};
 use crate::transport::session::SessionEstablishment;
 use crate::transport::verifier::{VerifiedPeer, VoxClientCertVerifier, VoxServerCertVerifier};
 use crate::wire::WireError;
@@ -285,10 +287,21 @@ fn endpoint_config(mtu_ceiling: u16) -> quinn::EndpointConfig {
     cfg
 }
 
+/// How many bidirectional streams a peer may have open to this node at once.
+///
+/// Set explicitly rather than left at quinn's default of 100 (ADR-022 decision 7). App
+/// streams are opened by other programs, so a peer can hold many of them open while they
+/// wait, and every one of them occupies a slot a `sync` or `join` stream would otherwise
+/// take: at 100, a hundred stalled app streams were enough to stop a room's messages. The
+/// per-peer app limit (`node::app::MAX_APP_STREAMS_PER_PEER`) is what keeps app streams
+/// few; this is the headroom that keeps the node's own streams opening while they are.
+pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 1024;
+
 /// The transport parameters every Vox connection runs with, in both directions.
 fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
+    cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_BIDI_STREAMS));
     // `From<VarInt>` rather than `try_from(Duration)`: the millisecond value is a compile-
     // time constant inside the varint range, so there is no error case to handle.
     cfg.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
@@ -379,7 +392,30 @@ fn bind_udp(addr: SocketAddr) -> Result<std::net::UdpSocket> {
             .port();
         let missed = match hears_ipv4(&socket, port) {
             Ok(()) => return Ok(socket),
-            Err(missed) => missed,
+            Err(Missed::Routable(missed)) => {
+                // **Said as it was observed** (V030-33's finding): only the datagram to this
+                // machine's own routable address went missing. A program holding the port on
+                // `0.0.0.0` takes the loopback datagram too, and that one arrived; what stops only
+                // the routable one is, almost always, a firewall that filters this binary's incoming
+                // traffic (macOS's application firewall leaves loopback alone), or rarely a program
+                // bound to that one address. Both are named; another port would meet the same
+                // firewall, so none is tried.
+                return Err(Error::LocalBind {
+                    addr,
+                    cause: crate::error::BindCause::Other,
+                    reason: format!(
+                        "IPv4 traffic to this machine's own address on port {port} never reached \
+                         this node, though traffic to 127.0.0.1 did ({missed}). Either this \
+                         machine's firewall blocks incoming traffic to this vox (on macOS: System \
+                         Settings › Network › Firewall › Options, allow {}), or another program \
+                         holds port {port} on that address",
+                        std::env::current_exe()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "vox".to_owned())
+                    ),
+                });
+            }
+            Err(Missed::Loopback(missed)) => missed,
         };
         if addr.port() != 0 {
             return Err(Error::LocalBind {
@@ -427,25 +463,48 @@ fn routable_ipv4() -> Option<std::net::Ipv4Addr> {
 /// Whether a datagram sent over IPv4 to each address a node advertises — `127.0.0.1` and the
 /// routable IPv4 address — on `port` reaches `socket` (see [`bind_udp`]). Everything the test sent
 /// that arrived is drained, so none of it reaches QUIC.
-fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<(), String> {
+fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<(), Missed> {
     let started = std::time::Instant::now();
     let mut targets = vec![std::net::Ipv4Addr::LOCALHOST];
     targets.extend(routable_ipv4());
     let Ok(probe) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
         return Ok(()); // no test is possible; never refuse a bind for that
     };
+    // **A control for each address: an IPv4 socket of this test's own.** A machine can drop what
+    // it sends to its own routable address (a VPN that blocks the local network does): measured
+    // 2026-10-03, every datagram to the LAN address was lost, to an IPv4-only socket as much as
+    // to a dual-stack one, and the node refused every port it was given as "held by another
+    // program". So an address whose control datagram does not arrive tests nothing, and is left
+    // out of the verdict rather than read as a collision.
+    let Ok(control) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
+        return Ok(());
+    };
+    let Ok(control_port) = control.local_addr().map(|a| a.port()) else {
+        return Ok(());
+    };
+    let nonce = |what: &[u8]| -> Option<Vec<u8>> {
+        let mut n = [0u8; 16];
+        getrandom::fill(&mut n).ok()?;
+        let mut text = what.to_vec();
+        text.extend_from_slice(&n);
+        Some(text)
+    };
     let mut owed: Vec<(std::net::Ipv4Addr, Vec<u8>)> = Vec::new();
+    let mut controls: Vec<(std::net::Ipv4Addr, Vec<u8>)> = Vec::new();
     for target in targets {
-        let mut nonce = [0u8; 16];
-        if getrandom::fill(&mut nonce).is_err() {
+        let (Some(text), Some(check)) = (
+            nonce(b"vox dual-stack self-test "),
+            nonce(b"vox dual-stack control "),
+        ) else {
             return Ok(());
-        }
-        let mut text = b"vox dual-stack self-test ".to_vec();
-        text.extend_from_slice(&nonce);
-        if probe.send_to(&text, (target, port)).is_err() {
+        };
+        if probe.send_to(&text, (target, port)).is_err()
+            || probe.send_to(&check, (target, control_port)).is_err()
+        {
             return Ok(());
         }
         owed.push((target, text));
+        controls.push((target, check));
     }
     let deadline = std::time::Instant::now() + DUAL_STACK_SELF_TEST;
     let mut buf = [0u8; 64];
@@ -473,14 +532,39 @@ fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<()
     if owed.is_empty() {
         return Ok(());
     }
-    Err(format!(
+    // The controls of the addresses still owed: each had the whole wait to arrive.
+    if control.set_nonblocking(true).is_ok() {
+        while let Ok((n, _)) = control.recv_from(&mut buf) {
+            controls.retain(|(_, t)| buf[..n] != t[..]);
+        }
+    }
+    owed.retain(|(at, _)| !controls.iter().any(|(c, _)| c == at));
+    if owed.is_empty() {
+        return Ok(());
+    }
+    let said = format!(
         "port {port}: nothing sent to {} arrived within {} ms",
         owed.iter()
             .map(|(at, _)| at.to_string())
             .collect::<Vec<_>>()
             .join(" or "),
         started.elapsed().as_millis()
-    ))
+    );
+    if owed.iter().any(|(at, _)| at.is_loopback()) {
+        Err(Missed::Loopback(said))
+    } else {
+        Err(Missed::Routable(said))
+    }
+}
+
+/// Which of [`hears_ipv4`]'s datagrams went missing, and what to say of it.
+enum Missed {
+    /// The one to `127.0.0.1`: another program holds the port on IPv4 (loopback is never
+    /// firewalled).
+    Loopback(String),
+    /// Only the one to this machine's routable address: a firewall filtering this binary, or a
+    /// program bound to that address alone.
+    Routable(String),
 }
 
 impl VoxEndpoint {
@@ -573,19 +657,39 @@ impl VoxEndpoint {
         self.mux.attach(peer, None, carrier)
     }
 
-    /// Attach an **inbound** circuit from `peer`, as [`Self::attach_circuit`] does, recording
-    /// where its far end comes from (V210-92). The connection the circuit makes carries it as
-    /// [`VoxConnection::circuit_origin`].
+    /// Attach an **inbound** circuit from `peer`, carried by `relay`, as
+    /// [`Self::attach_circuit_via`] does, recording where its far end comes from (V210-92). The
+    /// connection the circuit makes carries it as [`VoxConnection::circuit_origin`].
     ///
     /// # Errors
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
     pub fn attach_inbound_circuit(
         &self,
         peer: &Digest32,
+        relay: &Digest32,
         origin: crate::transport::mux::CircuitOrigin,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach(peer, Some(origin), carrier)
+        self.mux.attach_via(peer, relay, Some(origin), carrier)
+    }
+
+    /// [`VoxEndpoint::attach_circuit`], recording `relay` as the peer carrying it.
+    ///
+    /// # Errors
+    /// As [`VoxEndpoint::attach_circuit`].
+    pub fn attach_circuit_via(
+        &self,
+        peer: &Digest32,
+        relay: &Digest32,
+        carrier: Option<crate::transport::mux::CircuitCarrier>,
+    ) -> Result<CircuitPort> {
+        self.mux.attach_via(peer, relay, None, carrier)
+    }
+
+    /// The relay carrying `peer`'s live circuit, if one is recorded.
+    #[must_use]
+    pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
+        self.mux.circuit_relay_of(peer)
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
@@ -936,11 +1040,10 @@ fn finish_connection(
     // running, which must not happen — treat as an auth failure.
     let peer_id = verified.fingerprint().ok_or(Error::SignatureInvalid)?;
 
-    // Confirm the negotiated named group is the hybrid PQ group. quinn exposes the
-    // negotiated group via the rustls handshake data attached to the connection.
-    confirm_vox_alpn(&connection)?;
-
-    let session = SessionEstablishment::new(peer_id, now_secs);
+    // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
+    // actually negotiated; a session under any group but the post-quantum hybrid is refused.
+    let group = confirm_handshake(&connection)?;
+    let session = SessionEstablishment::observed(peer_id, group, now_secs)?;
     // The peer's leaf certificate is generated per endpoint — per process — and bound to the
     // identity by a signature (`identity_cert`), so its digest says which *process* of the
     // identity this connection is to (V210-57).
@@ -954,15 +1057,13 @@ fn finish_connection(
         .ok_or(Error::SignatureInvalid)?;
     Ok(VoxConnection {
         serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
-        connection,
         peer_id,
         peer_process,
         session,
         via_circuit,
         circuit_origin: None,
-        datagram_tx: Mutex::new(DatagramSender::new()),
-        datagram_rx: Mutex::new(ReplayWindow::default()),
-        datagrams_dropped: AtomicU64::new(0),
+        router: DatagramRouter::start(connection.clone()),
+        connection,
         closed_here: std::sync::OnceLock::new(),
         peer_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         carrier: None,
@@ -970,38 +1071,21 @@ fn finish_connection(
     })
 }
 
-/// Lock a piece of per-connection datagram state. The critical sections are a
-/// single counter/bitmap update with no `.await` inside, so the state is always
-/// consistent between operations; a poisoned lock (another thread panicked while
-/// holding it — impossible in this `deny(clippy::panic)` crate outside tests) is
-/// therefore safe to recover rather than propagate.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Confirm this handshake ran under the Vox TLS configuration, by its ALPN.
+/// Confirm this handshake ran under the Vox TLS configuration, by its ALPN, and return the
+/// key-exchange group it **negotiated**, read from rustls through quinn's handshake data
+/// (V030-33).
 ///
-/// **It does not observe the negotiated key-exchange group, and it is named for what
-/// it checks because it used to be named for what it does not.** It was
-/// `confirm_hybrid_group`, documented as confirming X25519MLKEM768 and as surfacing
-/// "a clear error if a future config regression ever widened the offered groups" —
-/// which it would not have done. Widening `kx_groups` leaves this function passing,
-/// since the ALPN is unchanged. The defence in depth the old name promised was not
-/// there, and a reader auditing the connection path had every reason to believe it
-/// was.
-///
-/// What actually guarantees the group is upstream of here and is sound: the provider
-/// offers exactly one `kx_group`, so there is no downgrade target to negotiate to;
-/// `provider::assert_pq_only` enforces that at every config
-/// boundary; and TLS 1.3 binds the negotiated parameters into the Finished MAC, so a
-/// mismatch breaks the handshake rather than passing quietly. The group cannot be
-/// checked *here* because quinn 0.11 gates rustls's
-/// `negotiated_key_exchange_group` behind a test-only cfg, so the value rustls holds
-/// is not reachable from the connection.
-///
-/// The ALPN check is still worth keeping: it confirms a Vox-configured handshake
-/// completed, and a non-Vox config would not carry this protocol.
-fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
+/// It used to check only the ALPN while the session record wrote the group from a constant, so
+/// the downgrade-auditability record restated the configuration rather than observing the
+/// handshake. Now the record carries what rustls negotiated, and
+/// [`SessionEstablishment::observed`] refuses a session under any group but X25519MLKEM768 —
+/// defence in depth beneath the provider, which offers no other group
+/// (`provider::assert_pq_only`), and TLS 1.3, which binds the group into the Finished MAC.
+fn confirm_handshake(connection: &Connection) -> Result<u16> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
@@ -1009,19 +1093,18 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
         return Err(Error::SignatureInvalid);
     };
     match &hd.protocol {
-        Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => Ok(()),
+        Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => {
+            Ok(u16::from(hd.negotiated_key_exchange_group))
+        }
         _ => Err(Error::SignatureInvalid),
     }
 }
 
 /// An authenticated QUIC connection to one Vox peer.
 ///
-/// Owns the per-connection datagram anti-replay state (ADR-011): an outbound
-/// [`DatagramSender`] sequence counter and an inbound [`ReplayWindow`] of
-/// [`crate::transport::datagram::DEFAULT_WINDOW`] packets. Both are private, so
-/// every datagram sent through [`VoxConnection::send_datagram`] is sequenced and
-/// every datagram returned by [`VoxConnection::recv_datagram`] has passed the
-/// window.
+/// Owns the connection's [`DatagramRouter`], started with it: every datagram the peer
+/// sends is read there and handed to the flow it names, so there is no way to read a
+/// datagram that bypasses the flow table (ADR-022).
 pub struct VoxConnection {
     /// This connection's name in this process, never given to another (see [`Self::serial`]).
     serial: u64,
@@ -1035,14 +1118,7 @@ pub struct VoxConnection {
     via_circuit: bool,
     /// Where an inbound circuit's far end comes from (see [`Self::circuit_origin`]).
     circuit_origin: Option<crate::transport::mux::CircuitOrigin>,
-    /// Outbound datagram sequence numbers (monotonic, saturating).
-    datagram_tx: Mutex<DatagramSender>,
-    /// Inbound sliding anti-replay window.
-    datagram_rx: Mutex<ReplayWindow>,
-    /// Inbound datagrams dropped as replay / out-of-window / unframed. Exposed
-    /// for observability ([`VoxConnection::datagrams_dropped`]); a rising count
-    /// on a live connection is a replay signal worth surfacing.
-    datagrams_dropped: AtomicU64,
+    router: Arc<DatagramRouter>,
     /// The code this end closed the connection with, if it did (see [`Self::closed_here`]).
     closed_here: std::sync::OnceLock<WireError>,
     /// Whether the peer said it is stopping (see [`Self::peer_stopped`]). Shared, so a
@@ -1056,6 +1132,15 @@ pub struct VoxConnection {
     tunnels: Arc<Mutex<u32>>,
 }
 
+impl Drop for VoxConnection {
+    fn drop(&mut self) {
+        // The router's reader holds a connection handle; without this it would keep
+        // an otherwise-unused connection open for ever. Flows still bound keep it
+        // reading until they end.
+        self.router.release_owner();
+    }
+}
+
 /// A tunnel's share of its connection's receive window, held for as long as the tunnel runs
 /// (see [`CONNECTION_WINDOW`]). Dropping it gives the share back, and takes the tunnel off
 /// [`live_tunnels`].
@@ -1064,32 +1149,203 @@ pub struct TunnelCredit {
     tunnels: Arc<Mutex<u32>>,
     connection: Connection,
     id: u64,
-    moved: Arc<AtomicU64>,
+    watch: TunnelWatch,
 }
 
 impl TunnelCredit {
-    /// Where the tunnel's splice marks the time it last moved a byte, in Unix seconds (see
-    /// [`LiveTunnel::last_moved`]).
+    /// What the tunnel's splice marks and listens to: when it last moved a byte, and whether it
+    /// has been asked to close (see [`TunnelWatch`]).
     #[must_use]
-    pub fn moved(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.moved)
+    pub fn watch(&self) -> TunnelWatch {
+        self.watch.clone()
     }
 }
 
 impl Drop for TunnelCredit {
     fn drop(&mut self) {
         // One lock at a time, as `carry_tunnel` takes them.
-        lock(&LIVE).remove(&self.id);
-        let mut n = lock(&self.tunnels);
-        *n = n.saturating_sub(1);
-        set_tunnel_window(&self.connection, *n);
+        {
+            let mut n = lock(&self.tunnels);
+            *n = n.saturating_sub(1);
+            set_tunnel_window(&self.connection, *n);
+        }
+        let Some(live) = lock(&LIVE).remove(&self.id) else {
+            return;
+        };
+        // A tunnel that ended for a reason someone should see — closed by a person, closed as
+        // stuck, closed at its other end — is kept on the closed list with that reason.
+        if let Some(why) = lock(&self.watch.why).clone() {
+            let mut closed = lock(&CLOSED);
+            if closed.len() == CLOSED_KEPT {
+                closed.pop_front();
+            }
+            closed.push_back(ClosedTunnel {
+                id: self.id,
+                peer: live.peer,
+                service: live.service,
+                outbound: live.outbound,
+                opened: live.opened,
+                closed: unix_now(),
+                why,
+            });
+        }
     }
+}
+
+/// A running tunnel's side of its entry in the live list (V030-11): where its splice marks the
+/// time it last moved a byte, and how it is asked to close and says why it ended.
+#[derive(Clone, Debug)]
+pub struct TunnelWatch {
+    moved: Arc<AtomicU64>,
+    close: Arc<tokio::sync::Notify>,
+    why: Arc<Mutex<Option<String>>>,
+}
+
+impl TunnelWatch {
+    fn new(now: u64) -> Self {
+        Self {
+            moved: Arc::new(AtomicU64::new(now)),
+            close: Arc::new(tokio::sync::Notify::new()),
+            why: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Mark that the tunnel moved a byte just now.
+    pub fn mark_moved(&self) {
+        self.moved.store(unix_now(), Ordering::Relaxed);
+    }
+
+    /// Resolves once the tunnel is asked to close ([`close_tunnels`]), with the reason.
+    pub async fn close_asked(&self) -> String {
+        self.close.notified().await;
+        lock(&self.why).clone().unwrap_or_default()
+    }
+
+    /// Record why the tunnel ended, for [`closed_tunnels`]; the first reason stands.
+    pub fn ended(&self, why: &str) {
+        let mut w = lock(&self.why);
+        if w.is_none() {
+            *w = Some(why.to_owned());
+        }
+    }
+
+    fn ask_to_close(&self, why: &str) {
+        self.ended(why);
+        // `notify_one` keeps a permit, so a splice that has not started listening yet still
+        // hears it.
+        self.close.notify_one();
+    }
+}
+
+/// A tunnel that ended for a reason a person should see, as `vox status` and the TUI list it
+/// (V030-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedTunnel {
+    /// Its number while it ran ([`LiveTunnel::id`]).
+    pub id: u64,
+    /// The member at the other end.
+    pub peer: Digest32,
+    /// The service it reached.
+    pub service: String,
+    /// Whether this node opened it.
+    pub outbound: bool,
+    /// When it was opened, in Unix seconds.
+    pub opened: u64,
+    /// When it ended, in Unix seconds.
+    pub closed: u64,
+    /// Why: closed by a person here, closed at the other end, or closed as stuck.
+    pub why: String,
+}
+
+/// How many ended tunnels [`closed_tunnels`] keeps, newest last.
+const CLOSED_KEPT: usize = 32;
+
+/// The tunnels that ended for a reason, newest last ([`ClosedTunnel`]).
+static CLOSED: Mutex<std::collections::VecDeque<ClosedTunnel>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// The tunnels that ended for a reason a person should see, oldest first.
+#[must_use]
+pub fn closed_tunnels() -> Vec<ClosedTunnel> {
+    lock(&CLOSED).iter().cloned().collect()
+}
+
+/// Which live tunnels to close (V030-11): one by its number, or a member's — all of them, or
+/// those to one service.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunnelSelector {
+    /// One tunnel, by [`LiveTunnel::id`].
+    pub id: Option<u64>,
+    /// The member's id as `vox status` prints it, or a prefix of it (case does not matter).
+    pub member: Option<String>,
+    /// Only the tunnels to this service.
+    pub service: Option<String>,
+}
+
+impl TunnelSelector {
+    /// Whether it names anything: a selector naming nothing closes nothing, never everything.
+    #[must_use]
+    pub fn names_something(&self) -> bool {
+        self.id.is_some() || self.member.is_some()
+    }
+
+    fn matches(&self, id: u64, t: &Live) -> bool {
+        if !self.names_something() {
+            return false;
+        }
+        let member = self.member.as_ref().is_none_or(|m| {
+            crate::node::link::b32_encode(&t.peer).starts_with(&m.to_ascii_lowercase())
+        });
+        self.id.is_none_or(|i| i == id)
+            && member
+            && self.service.as_ref().is_none_or(|s| *s == t.service)
+    }
+}
+
+/// Close every live tunnel `which` names, saying `why` to whoever looks (`vox status`, the
+/// TUI) and, by a reset with [`TUNNEL_CLOSED_CODE`](crate::tunnel::session::TUNNEL_CLOSED_CODE),
+/// to the far end. Neither untrusts anyone nor removes a service. The tunnels it asked to close,
+/// as they were.
+///
+/// # Errors
+/// What to tell the person, closing nothing, when `which` names a member by a prefix that more
+/// than one member's tunnels match: "a person closes one member's tunnels" (V030-11), and a
+/// short or mistyped prefix must not close several members' at once.
+pub fn close_tunnels(
+    which: &TunnelSelector,
+    why: &str,
+) -> std::result::Result<Vec<LiveTunnel>, String> {
+    let live = lock(&LIVE);
+    if let Some(prefix) = &which.member {
+        let members: std::collections::BTreeSet<String> = live
+            .iter()
+            .filter(|(id, t)| which.matches(**id, t))
+            .map(|(_, t)| crate::node::link::b32_encode(&t.peer))
+            .collect();
+        if members.len() > 1 {
+            return Err(format!(
+                "{prefix:?} matches more than one member with a live tunnel, so nothing was \
+                 closed — give more of the id:\n       {}",
+                members.into_iter().collect::<Vec<_>>().join("\n       ")
+            ));
+        }
+    }
+    Ok(live
+        .iter()
+        .filter(|(id, t)| which.matches(**id, t))
+        .map(|(id, t)| {
+            t.watch.ask_to_close(why);
+            t.listed(*id)
+        })
+        .collect())
 }
 
 /// One live tunnel, as `vox status` lists it (V210-81): so a person can see which tunnels hold a
 /// member's connection, and which of them is stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveTunnel {
+    /// Its number in this node, for closing it ([`TunnelSelector::id`]).
+    pub id: u64,
     /// The member at the other end.
     pub peer: Digest32,
     /// The service it reaches: a port, or a `vox room send` offer's tag.
@@ -1108,7 +1364,20 @@ struct Live {
     service: String,
     outbound: bool,
     opened: u64,
-    moved: Arc<AtomicU64>,
+    watch: TunnelWatch,
+}
+
+impl Live {
+    fn listed(&self, id: u64) -> LiveTunnel {
+        LiveTunnel {
+            id,
+            peer: self.peer,
+            service: self.service.clone(),
+            outbound: self.outbound,
+            opened: self.opened,
+            last_moved: self.watch.moved.load(Ordering::Relaxed).max(self.opened),
+        }
+    }
 }
 
 /// Every tunnel this process carries now, by a number of its own. A process runs one node, so
@@ -1130,16 +1399,7 @@ pub fn unix_now() -> u64 {
 /// Every tunnel this node carries now, oldest first.
 #[must_use]
 pub fn live_tunnels() -> Vec<LiveTunnel> {
-    lock(&LIVE)
-        .values()
-        .map(|t| LiveTunnel {
-            peer: t.peer,
-            service: t.service.clone(),
-            outbound: t.outbound,
-            opened: t.opened,
-            last_moved: t.moved.load(Ordering::Relaxed).max(t.opened),
-        })
-        .collect()
+    lock(&LIVE).iter().map(|(id, t)| t.listed(*id)).collect()
 }
 
 /// What a person is told when a tunnel is refused at the cap: how many are open to this member,
@@ -1161,9 +1421,10 @@ fn limit_said(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> 
         .collect();
     format!(
         "{TUNNELS_PER_PEER} tunnels are already open to this member (to {})\n       \
-         to free one: close the program using it, or restart the `vox up` or `vox forward` \
+         to free one: `vox tunnel close` it (`vox status` lists every tunnel, its number, and when \
+         it last moved), close the program using it, or restart the `vox up` or `vox forward` \
          carrying it; on the host, `vox service remove` the service, or `vox trust remove` the \
-         member\n       `vox status` lists every tunnel, and when each last moved",
+         member",
         services.join(", ")
     )
 }
@@ -1198,7 +1459,7 @@ impl VoxConnection {
     pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
         let opened = unix_now();
-        let moved = Arc::new(AtomicU64::new(opened));
+        let watch = TunnelWatch::new(opened);
         {
             // Counted and taken under one lock, so two tunnels asked for at once cannot both
             // take the last place.
@@ -1213,7 +1474,7 @@ impl VoxConnection {
                     service: service.to_owned(),
                     outbound,
                     opened,
-                    moved: Arc::clone(&moved),
+                    watch: watch.clone(),
                 },
             );
         }
@@ -1227,7 +1488,7 @@ impl VoxConnection {
             tunnels: Arc::clone(&self.tunnels),
             connection: self.connection.clone(),
             id,
-            moved,
+            watch,
         })
     }
 
@@ -1316,11 +1577,10 @@ impl VoxConnection {
         &self.session
     }
 
-    /// The negotiated TLS group code point recorded for this session
-    /// (X25519MLKEM768 = `0x11EC`).
+    /// The TLS key-exchange group this session negotiated, as rustls observed it in the
+    /// handshake (X25519MLKEM768 = `0x11EC`; nothing else is accepted).
     #[must_use]
     pub fn negotiated_group(&self) -> u16 {
-        debug_assert_eq!(self.session.negotiated_group, X25519MLKEM768_CODE_POINT);
         self.session.negotiated_group
     }
 
@@ -1352,57 +1612,53 @@ impl VoxConnection {
             .map_err(|_| Error::Unreachable("quic stream: the connection is closed"))
     }
 
-    /// Send one RFC 9221 unreliable datagram carrying `payload`. The connection
-    /// prepends the next 64-bit sequence number (ADR-011 datagram framing); the
-    /// caller never sees or chooses sequences. Fails if the framed datagram
-    /// exceeds the peer's advertised limit ([`VoxConnection::max_datagram_payload`]).
-    pub fn send_datagram(&self, payload: &[u8]) -> Result<()> {
-        let frame = lock(&self.datagram_tx).frame(payload);
-        self.connection
-            .send_datagram(bytes::Bytes::from(frame))
-            .map_err(|_| Error::MalformedBundle("quic send_datagram"))
+    /// Bind a datagram flow to the bidirectional stream `send`/`recv` (ADR-022
+    /// decision 1). The flow takes the stream: from here it carries no bytes, and the
+    /// flow ends when the stream does — dropped here, or finished, reset or stopped by
+    /// the peer. Both ends bind the same stream, so both name the flow by its ID.
+    ///
+    /// Bind only a stream whose kind's gate has already admitted the peer: a flow
+    /// accepts every datagram that names it.
+    ///
+    /// # Errors
+    /// If the connection is closed, or the stream is already bound.
+    pub fn bind_flow(&self, send: SendStream, recv: RecvStream) -> Result<DatagramFlow> {
+        self.router.bind(send, recv, FlowMode::Packets)
     }
 
-    /// Receive the next inbound datagram's **payload** that passes the
-    /// anti-replay window. Datagrams that are unframed (shorter than the sequence
-    /// prefix), duplicates, or below the window are dropped here — counted in
-    /// [`VoxConnection::datagrams_dropped`] — and never returned, exactly as
-    /// ADR-011 §"Datagram anti-replay" specifies. Only a transport-level read
-    /// failure (connection closed) is an error.
-    pub async fn recv_datagram(&self) -> Result<Vec<u8>> {
-        loop {
-            let raw = self
-                .connection
-                .read_datagram()
-                .await
-                .map_err(|_| Error::MalformedBundle("quic read_datagram"))?;
-            let Some((seq, payload)) = parse_datagram(&raw) else {
-                self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            };
-            if !lock(&self.datagram_rx).accept(seq) {
-                self.datagrams_dropped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            return Ok(payload.to_vec());
-        }
+    /// Bind a flow that delivers each datagram's context and body as it arrived,
+    /// fragments included, for a relay to [`DatagramFlow::forward`] without reading
+    /// or reassembling it (ADR-022 decision 5).
+    ///
+    /// # Errors
+    /// As [`VoxConnection::bind_flow`].
+    pub fn bind_forwarding_flow(&self, send: SendStream, recv: RecvStream) -> Result<DatagramFlow> {
+        self.router.bind(send, recv, FlowMode::Forward)
     }
 
-    /// Number of inbound datagrams this connection has dropped as replayed,
-    /// duplicate, out-of-window, or unframed.
+    /// Bind a datagram flow to the stream `send` belongs to, **sharing** it: the stream
+    /// keeps carrying bytes, and the caller must end the flow with the stream by holding
+    /// both in one object (ADR-022 decisions 1 and 7; `node::app::AppStream` is that
+    /// object). Crate-private because that discipline is not one to hand out.
+    pub(crate) fn bind_shared_flow(&self, send: &SendStream) -> Result<DatagramFlow> {
+        self.router
+            .bind_shared(u64::from(send.id()), FlowMode::Packets)
+    }
+
+    /// This connection's datagram counters: delivered, and dropped by reason.
     #[must_use]
-    pub fn datagrams_dropped(&self) -> u64 {
-        self.datagrams_dropped.load(Ordering::Relaxed)
+    pub fn datagram_stats(&self) -> DatagramStats {
+        self.router.stats()
     }
 
-    /// The maximum datagram **payload** the peer will accept right now (its
-    /// advertised datagram size minus the sequence prefix), if datagrams are
-    /// enabled on the connection.
+    /// The largest packet any flow on this connection sends as one datagram right now
+    /// (the peer's advertised datagram size less the largest flow header); larger
+    /// packets are fragmented. `None` if datagrams are not enabled on the connection.
     #[must_use]
     pub fn max_datagram_payload(&self) -> Option<usize> {
         self.connection
             .max_datagram_size()
-            .map(|n| n.saturating_sub(SEQ_PREFIX_LEN))
+            .map(|n| n.saturating_sub(MAX_PACKET_HEADER))
     }
 
     /// Close the connection with an application code + reason.

@@ -45,7 +45,7 @@ use hostile::{
     answer_circuits, ask_circuit, connect, create_room, daemon, fingerprint, free_port,
     member_signer, profile_dir, put, stranger, vox_in, CircuitAnswer, Rt,
 };
-use vox_core::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
+use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::RootSigner;
 use vox_core::nat::multiaddr::EndpointList;
@@ -199,7 +199,6 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     let s2 = stranger(0x52);
     let policy = ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        deniability_mode: DeniabilityMode::Attributable,
         ttl: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };

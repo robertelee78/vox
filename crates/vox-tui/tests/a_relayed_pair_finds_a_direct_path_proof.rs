@@ -11,8 +11,8 @@
 //! **The staging — real processes only.** A `vox node` anchor on `[::]` (dual-stack), a `vox serve`
 //! host on `127.0.0.1`, and the guest on `[::1]`, set up with `vox id`, `vox trust add` and
 //! `vox connect`; the guest then runs `vox up` and asks it for the host's service over SOCKS5, as
-//! `ssh user@<room>.vox` does. Split by address family, host and guest cannot send each other a
-//! datagram (`support/relay.rs`). The host advertises a **port forward** the proof owns
+//! `ssh user@<service>.<node>.<room>.vox` does. Split by address family, host and guest cannot
+//! send each other a datagram (`support/relay.rs`). The host advertises a **port forward** the proof owns
 //! (`support/port_forward.rs`, via the proof-only `VOX_TEST_ADVERTISE`) — an `[::1]` socket that
 //! carries datagrams to and from the host — which is therefore the pair's only possible direct
 //! path. It starts **closed** (it drops every datagram), so the only path is the anchor's circuit;
@@ -38,7 +38,9 @@
 //! **The mutations that must turn it red:** `retry_upgrades_if_due` returning at once (nothing
 //! retries — no second attempt, and the opened forward is never found); and `UPGRADE_RETRY` raised
 //! to 600 s (the retry comes too late for both bounds). And for V210-122: `DIRECT_HEAD_START` raised
-//! to 2 s, so the relay is held back past the bound.
+//! to 2 s, so the relay is held back past the bound. And for V030-22: the initiator of a dial-back
+//! holding its circuits for its own dial after the peer said its dial failed (`Dialled { reached:
+//! false }`) — measured 3017 ms, red past the same bound.
 //!
 //! Replaces `crates/vox-core/tests/relayed_path_is_retried.rs`, which ran every node in process on
 //! a NAT simulator with an injected clock.
@@ -92,18 +94,14 @@ const RELAYED_REACH_WITHIN: Duration = Duration::from_millis(1000);
 /// Start the guest's `vox forward` to the host's service through the closed forward, and read how
 /// long it says reaching the host took; it is returned still running, for the caller to stop.
 fn relayed_reach_ms(w: &ForwardedWorld) -> (u128, world::VoxProc) {
-    use world::{args, room_pass_file, VoxProc};
+    use world::{args, VoxProc};
     let mut fwd = VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &w.hostname(),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &room_pass_file(&w.guest_dir, &w.passphrase),
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",

@@ -129,6 +129,9 @@ pub struct MuxSocket {
     /// Which address each peer's newest live circuit stands at. The addresses are random, so
     /// this is the only way to get from a peer to its circuit.
     by_peer: Mutex<HashMap<Digest32, SocketAddr>>,
+    /// Which relay carries each circuit, by its address, when the caller said
+    /// ([`MuxSocket::attach_via`]) — for `vox status`, which names the relay.
+    relays: Mutex<HashMap<SocketAddr, Digest32>>,
     /// Where each inbound circuit's far end comes from, when the node said (see
     /// [`CircuitOrigin`]).
     origins: Mutex<HashMap<SocketAddr, CircuitOrigin>>,
@@ -224,6 +227,7 @@ impl MuxSocket {
             inner,
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
+            relays: Mutex::new(HashMap::new()),
             origins: Mutex::new(HashMap::new()),
             carriers: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
@@ -324,7 +328,41 @@ impl MuxSocket {
         self.circuits().len()
     }
 
+    /// [`MuxSocket::attach`], recording that `relay` carries the circuit.
+    ///
+    /// # Errors
+    /// As [`MuxSocket::attach`].
+    pub fn attach_via(
+        self: &Arc<Self>,
+        peer: &Digest32,
+        relay: &Digest32,
+        origin: Option<CircuitOrigin>,
+        carrier: Option<CircuitCarrier>,
+    ) -> Result<CircuitPort> {
+        let port = self.attach(peer, origin, carrier)?;
+        self.relays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(port.addr(), *relay);
+        Ok(port)
+    }
+
+    /// The relay carrying `peer`'s live circuit, if it has one and it was recorded.
+    #[must_use]
+    pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
+        let addr = self.circuit_addr_of(peer)?;
+        self.relays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&addr)
+            .copied()
+    }
+
     fn detach(&self, addr: SocketAddr) {
+        self.relays
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&addr);
         self.circuits().remove(&addr);
         self.origins().remove(&addr);
         self.carriers().remove(&addr);

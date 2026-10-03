@@ -49,9 +49,10 @@ pub struct LiveCore {
 ///
 /// **A frame costs what changed, not the room's history.** Every frame projected the room's whole
 /// timeline again — every row's text copied, every author named — so in a long room the TUI spent
-/// each frame on rows nobody had changed. A room's timeline only grows at its end, so the rows
+/// each frame on rows nobody had changed. When the rows already projected are unchanged, the rows
 /// added since are projected and appended; anything else (another room, a reopened one, a changed
-/// keyring, which renames authors) projects it whole again.
+/// keyring, which renames authors, a late row taking its place above them, an owed body arriving)
+/// projects it whole again.
 struct Projected {
     channel_id: Digest32,
     me: Option<Digest32>,
@@ -59,6 +60,8 @@ struct Projected {
     /// How many of the node's rows are projected, and the newest of them.
     len: usize,
     last: Option<Digest32>,
+    /// A projected row was owed (V030-10): its body may have arrived since, in place.
+    owed: bool,
     rows: std::sync::Arc<Vec<MessageView>>,
 }
 
@@ -136,14 +139,14 @@ impl LiveCore {
             }
         });
         match out {
-            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => CommandStatus::Done,
             Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
         }
     }
 
     fn send(&self, cmd: NodeCommand) -> CommandStatus {
         match self.rt.block_on(self.node.apply(cmd)) {
-            Outcome::Done | Outcome::Bound(_) => CommandStatus::Done,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } => CommandStatus::Done,
             Outcome::Failed(f) => CommandStatus::Failed(ui_error(f)),
         }
     }
@@ -191,8 +194,20 @@ impl LiveCore {
                     self.notice = Some(format!("consented to {}", self.member_name(&target)));
                 }
                 NodeEvent::SenderKeyReceived {
-                    peer, backfilled, ..
+                    channel_id,
+                    peer,
+                    backfilled,
                 } => {
+                    // **Counted here, and only here.** A key arriving renders what this node
+                    // already held as ciphertext — messages that were unreadable a moment ago
+                    // and are new to whoever is looking. This arm only set a notice, so a
+                    // room whose messages all arrived before their key showed no unread at
+                    // all. `Synced.rendered` below counts rows a sync renders, which is a
+                    // disjoint set: a backfilled row was stored by an earlier sync that could
+                    // not render it, so it is counted once, here.
+                    if backfilled > 0 && self.active != Some(channel_id) {
+                        *self.unread.entry(channel_id).or_insert(0) += backfilled as usize;
+                    }
                     self.notice = Some(if backfilled > 0 {
                         format!(
                             "{} consented to you — {backfilled} earlier message(s) now readable",
@@ -232,15 +247,27 @@ impl LiveCore {
             } else {
                 crate::ident::member_name(trusted, &r.author)
             },
+            // The wire names addressees by fingerprint; the timeline by this node's own names.
+            addressed: if r.owed {
+                String::new()
+            } else {
+                crate::agent_hook::addressed(&r.text, me.as_ref(), trusted)
+            },
             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
             timestamp: r.created_millis / 1_000,
-            body: Some(r.text.clone()),
+            body: Some(if r.owed {
+                vox_core::node::api::NOT_RECEIVED_YET.to_owned()
+            } else {
+                r.text.clone()
+            }),
+            late: r.late,
         };
         let from = match &self.projected {
             Some(p)
                 if p.channel_id == d.channel_id
                     && p.me == me
                     && p.trusted.as_slice() == trusted
+                    && !p.owed
                     && p.len > 0
                     && p.len <= d.timeline.len()
                     && d.timeline.get(p.len - 1).map(|r| r.entry_hash) == p.last =>
@@ -249,16 +276,19 @@ impl LiveCore {
             }
             _ => None,
         };
-        let rows = match (from, self.projected.take()) {
+        let (rows, owed) = match (from, self.projected.take()) {
             (Some(n), Some(mut p)) => {
                 if n < d.timeline.len() {
                     // In place when the last frame's view model is gone, as it is between frames.
                     std::sync::Arc::make_mut(&mut p.rows)
                         .extend(d.timeline.iter_from(n).map(view_of));
                 }
-                p.rows
+                (p.rows, d.timeline.iter_from(n).any(|r| r.owed))
             }
-            _ => std::sync::Arc::new(d.timeline.iter().map(view_of).collect()),
+            _ => (
+                std::sync::Arc::new(d.timeline.iter().map(view_of).collect()),
+                d.timeline.iter().any(|r| r.owed),
+            ),
         };
         self.projected = Some(Projected {
             channel_id: d.channel_id,
@@ -266,6 +296,7 @@ impl LiveCore {
             trusted: trusted.to_vec(),
             len: d.timeline.len(),
             last: d.timeline.last().map(|r| r.entry_hash),
+            owed,
             rows: std::sync::Arc::clone(&rows),
         });
         rows
@@ -342,6 +373,32 @@ impl LiveCore {
                         })
                         .collect(),
                     timeline: timeline.clone().unwrap_or_default(),
+                    // What is shared here, in this operator's own words (V030-25): the same
+                    // addresses `vox service list` prints.
+                    shared: {
+                        let mut names = vox_core::node::resolver::VoxResolver::new();
+                        for o in &nv.open_channels {
+                            names.add_room(o.channel_id, &o.local_name, &o.members);
+                        }
+                        for (fp, petname) in &nv.trusted {
+                            names.name(*fp, petname);
+                        }
+                        d.shares
+                            .iter()
+                            .map(|s| {
+                                let who = if me == Some(s.host) {
+                                    "you".to_owned()
+                                } else {
+                                    names.alias_of(&s.host)
+                                };
+                                let udp = if s.udp { " (udp)" } else { "" };
+                                format!(
+                                    "{} by {who}{udp}",
+                                    names.address_of(&d.channel_id, &s.host, &s.name)
+                                )
+                            })
+                            .collect()
+                    },
                     // **Every member held back, each on its own line** (V210-66): once one notice in
                     // the one-line hint bar, where a second was cut off at the screen's edge.
                     held_back: d
@@ -369,6 +426,9 @@ impl LiveCore {
             locking: nv.locking,
             mlock_active: nv.mlock_active,
             has_identity: nv.identity.is_some(),
+            // The tunnels this node carries are this process's (V030-11).
+            tunnels: vox_core::transport::quic::live_tunnels(),
+            closed_tunnels: vox_core::transport::quic::closed_tunnels(),
         }
     }
 }
@@ -400,12 +460,19 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::NotAdmittedAfterJoin => UiError::JoinNotAdmitted,
         Fault::Refused => UiError::Refused,
         Fault::NotAdmitted => UiError::NotAdmitted,
+        Fault::JoinedRoomEnded => UiError::RoomEnded,
+        Fault::ResponderLeft => UiError::Unreachable,
         Fault::NotConsented => UiError::NotConsented,
         Fault::NotNetworked => UiError::NotNetworked,
         Fault::AddressInUse => UiError::AddressInUse,
         Fault::AddressNotHere => UiError::AddressNotHere,
         Fault::BindFailed => UiError::BindFailed,
         Fault::AlreadyMember => UiError::AlreadyMember,
+        Fault::RoomEnded => UiError::RoomEnded,
+        Fault::LeaveNotHeard => UiError::LeaveNotHeard,
+        Fault::LeaveUndone => UiError::LeaveUndone,
+        Fault::NotCreator | Fault::NotRoomCreator => UiError::NotCreator,
+        Fault::RoomNotSynced => UiError::StillJoining,
         #[allow(unreachable_patterns)]
         _ => UiError::Internal,
     }
@@ -471,12 +538,36 @@ impl CoreHandle for LiveCore {
                 channel_id,
                 passphrase: Self::secret(&passphrase),
             }),
+            Command::CloseTunnel { id } => {
+                let which = vox_core::transport::quic::TunnelSelector {
+                    id: Some(id),
+                    ..Default::default()
+                };
+                // By number, so it names one tunnel and is never refused as ambiguous.
+                if vox_core::transport::quic::close_tunnels(&which, "closed by a person in the TUI")
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    CommandStatus::Failed(UiError::NoSuchTunnel)
+                } else {
+                    CommandStatus::Done
+                }
+            }
             Command::CloseChannel { channel_id } => {
                 if self.active == Some(channel_id) {
                     self.active = None;
                 }
                 self.send(NodeCommand::CloseChannel { channel_id })
             }
+            Command::LeaveRoom { channel_id } => {
+                // Answered once another member has the leave; the room is gone then.
+                let status = self.send(NodeCommand::LeaveRoom { channel_id });
+                if matches!(status, CommandStatus::Done) && self.active == Some(channel_id) {
+                    self.active = None;
+                }
+                status
+            }
+            Command::EndRoom { channel_id } => self.send(NodeCommand::EndRoom { channel_id }),
             Command::SelectChannel { channel_id } => {
                 self.active = channel_id;
                 if let Some(cid) = channel_id {

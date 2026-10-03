@@ -107,6 +107,14 @@ pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 /// it, which is everything ADR-012's anchor principle says it must not do.
 pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// The longest a **dial-back** (V030-22) waits for the peer's word, counted from the reach's
+/// start: the peer asked, through a coordinator, to dial this node directly. It races the reach's
+/// circuits and holds none of them back (decider, 2026-10-03): a relay-only pair takes its circuit
+/// at once, and a direct path found later replaces it. This caps a peer whose dial is still under
+/// way. Measured: the peer's
+/// post-quantum handshake took 150–575 ms on a machine at load 45–97.
+pub const DIAL_BACK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(3000);
+
 #[cfg(feature = "test-knobs")]
 fn test_advertise() -> Option<EndpointList> {
     let value = std::env::var(TEST_ADVERTISE_ENV).ok()?;
@@ -333,7 +341,17 @@ pub enum Inbound {
     /// channel's evaluator and offered services, on its own task (a tunnel lives as
     /// long as the TCP connection it carries).
     Tunnel {
-        /// The authenticated peer — the client whose `dial:` capability is enforced.
+        /// The authenticated peer — the client the host's dial gate decides on.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
+    /// An app stream (ADR-022 decision 7): its `AppOpen` has not been read yet, and its
+    /// gate — this node's keyring and the room's authors — is `node::app`'s to run.
+    App {
+        /// The authenticated peer.
         peer: Digest32,
         /// The stream's send half.
         send: SendStream,
@@ -465,6 +483,13 @@ impl NodeNet {
     /// [`crate::nat::service::RendezvousService::on_admitted`] for why this seam exists.
     pub fn on_board_growth(&mut self, hook: crate::nat::service::AdmittedHook) {
         self.service.on_admitted(hook);
+    }
+
+    /// Be told when a signed withdraw takes records off this node's board (V030-14). Set before
+    /// this is shared, like [`Self::on_board_growth`]; see
+    /// [`crate::nat::service::RendezvousService::on_withdrawn`].
+    pub fn on_board_withdraw(&mut self, hook: crate::nat::service::AdmittedHook) {
+        self.service.on_withdrawn(hook);
     }
 
     /// Which rooms this node keeps a board for when a peer brings their genesis — an anchor's
@@ -863,6 +888,7 @@ impl NodeNet {
                 Ok(Inbound::ServedCircuit { peer })
             }
             StreamKind::Tunnel => Ok(Inbound::Tunnel { peer, send, recv }),
+            StreamKind::App => Ok(Inbound::App { peer, send, recv }),
             StreamKind::Goodbye => {
                 // Marked before it is closed, so whoever sees it closed sees why. Closed here
                 // rather than left for the peer's own close, which may never arrive (see
@@ -1071,10 +1097,14 @@ impl NodeNet {
         // with no direct dial anywhere, so a pair that can only be relayed paid it on every reach:
         // a relayed `vox forward` restart took 253–271 ms, against 7–9 ms before (V210-57's bound
         // is 150 ms). A host that cannot dial its guest may then bridge while the guest's own
-        // connection is arriving; the decider rules those circuits legitimate (2026-10-02).
+        // connection is arriving; the decider rules those circuits legitimate (2026-10-02). A
+        // dial-back under way (below) races them and holds nothing back: the decider rules a
+        // relay-only pair takes its circuit at once (2026-10-03), and a direct path found later
+        // replaces it through [`Self::upgrade`].
         let candidates_none = candidates.is_empty();
+        let has_direct = !candidates_none;
         let (direct_failed, failed) = tokio::sync::watch::channel(candidates_none);
-        if !candidates.is_empty() {
+        if has_direct {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
             // The addresses go into the label: "all direct candidates failed" is not a
@@ -1089,6 +1119,7 @@ impl NodeNet {
                 (label, result)
             });
         }
+        let started = tokio::time::Instant::now();
         // **Nobody to carry a circuit yet, but somebody being dialled** (V210-57). A one-shot verb
         // reaches its host the moment its room is open, and a restarted `vox forward` did so before
         // its anchor connection existed: no candidate, no helper, "no peer is connected to carry a
@@ -1097,12 +1128,140 @@ impl NodeNet {
         // with no candidate and no helper waits for it, for at most [`DIRECT_HEAD_START`].
         let mut helpers = self.helpers(peer);
         if candidates_none && helpers.is_empty() {
-            self.wait_for_a_helper(peer, tokio::time::Instant::now() + DIRECT_HEAD_START)
+            self.wait_for_a_helper(peer, started + DIRECT_HEAD_START)
                 .await;
             if let Some(conn) = self.manager.existing(&peer) {
                 return Ok(conn);
             }
             helpers = self.helpers(peer);
+        }
+        // **Then ask the peer to dial back** (V030-22): a reach with no direct path of its own — no
+        // candidate it can dial, or a direct rung that failed — asks the peer, through each
+        // coordinator it is connected to, to dial this node directly. It is the hole-punch
+        // exchange (`coordstream`): signalling only, at most a few frames, never a data path, and
+        // the peer answers it under the same rule as any relayed punch session. A host that
+        // cannot dial its guest at all, while the guest could dial it, bridged through the anchor
+        // for every sync; now the guest dials it back, racing the circuit, and a direct
+        // connection that lands replaces the relayed one.
+        for coordinator in &helpers {
+            let observed = self.observed_or_ask(coordinator.peer_id()).await;
+            let Ok(local_eps) = self.local_endpoints() else {
+                continue;
+            };
+            let local = coordstream::punch_endpoints(observed, &local_eps);
+            let coordinator = Arc::clone(coordinator);
+            let endpoint = Arc::clone(self.manager.endpoint());
+            let now = self.now();
+            let label = format!("dial-back via {}", short_id(coordinator.peer_id()));
+            let mut failed = failed.clone();
+            let manager = Arc::clone(&self.manager);
+            set.spawn(async move {
+                // With a direct rung of its own, only once that rung has failed.
+                if has_direct {
+                    let ended = failed.wait_for(|f| *f).await.is_err();
+                    if ended && !*failed.borrow() {
+                        return (
+                            label,
+                            Err(Error::Unreachable(
+                                "not asked for: a direct connection answered first",
+                            )),
+                        );
+                    }
+                }
+                let session = async {
+                    let (mut send, mut recv) =
+                        coordstream::open_punch_session(&coordinator, peer).await?;
+                    coordstream::count_dial_back(peer, false);
+                    let plan =
+                        coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
+                    coordstream::count_dial_back(peer, true);
+                    Ok::<_, Error>((send, recv, plan))
+                }
+                .await;
+                let result = match session {
+                    Err(e) => {
+                        // Said, so a pair that bridges shows why: a dial-back the coordinator could
+                        // not even carry leaves the circuits nothing to wait for (V030-27).
+                        manager.note(
+                            peer,
+                            format!(
+                                "a dial-back could not be asked {} ms into the reach: {e}",
+                                started.elapsed().as_millis()
+                            ),
+                        );
+                        Err(e)
+                    }
+                    // **The peer's dial is the point**, not this node's: a node that cannot dial
+                    // its peer fails its own half at once. So this waits for the peer's word on its
+                    // own dial (`Dialled`) — not a guessed time: a post-quantum handshake on a
+                    // loaded machine takes from tens to hundreds of milliseconds, and a peer that
+                    // could not dial at all says so at once — and, if it connected, for its
+                    // connection to be filed. Never past the dial-back's patience.
+                    Ok((_send, mut recv, plan)) => {
+                        let answered_at = started.elapsed();
+                        let patience = started + DIAL_BACK_PATIENCE;
+                        let own = coordstream::execute_punch(endpoint, plan, peer, now);
+                        let word = coordstream::recv_dial_outcome(&mut recv);
+                        tokio::pin!(own, word);
+                        let mut own_failed: Option<Error> = None;
+                        let mut peer_said: Option<bool> = None;
+                        let outcome = loop {
+                            if peer_said == Some(true) && manager.existing(&peer).is_some() {
+                                break Err(Error::Unreachable(
+                                    "not this rung's: the peer dialled back",
+                                ));
+                            }
+                            // The peer could not dial: nothing direct is coming from it, so the
+                            // circuits are held no longer. This node's own half is given up with it
+                            // — fired at the same moment as the peer's, it shares its fate.
+                            if peer_said == Some(false) {
+                                break Err(own_failed.take().unwrap_or(Error::Unreachable(
+                                    "dial-back: the peer could not dial back",
+                                )));
+                            }
+                            tokio::select! {
+                                r = &mut own, if own_failed.is_none() => match r {
+                                    Ok(conn) => break Ok(conn),
+                                    Err(e) => own_failed = Some(e),
+                                },
+                                said = &mut word, if peer_said.is_none() => {
+                                    peer_said = Some(said.unwrap_or(false));
+                                }
+                                () = tokio::time::sleep(std::time::Duration::from_millis(10)),
+                                    if peer_said == Some(true) => {}
+                                () = tokio::time::sleep_until(patience) => {
+                                    break Err(own_failed.take().unwrap_or(Error::Unreachable(
+                                        "dial-back: no word from the peer within the patience",
+                                    )));
+                                }
+                            }
+                        };
+                        // Said, so a pair that still bridges shows why: how long the peer took to
+                        // answer, what it said of its dial, and whether its connection came.
+                        manager.note(
+                            peer,
+                            format!(
+                                "a dial-back was answered {} ms into the reach; the peer said its \
+                                 dial {}; its connection {} by {} ms",
+                                answered_at.as_millis(),
+                                match peer_said {
+                                    Some(true) => "connected",
+                                    Some(false) => "failed",
+                                    None => "was still under way",
+                                },
+                                if manager.existing(&peer).is_some() {
+                                    "had arrived"
+                                } else {
+                                    "had not arrived"
+                                },
+                                started.elapsed().as_millis()
+                            ),
+                        );
+                        outcome
+                    }
+                };
+                (label, result)
+            });
         }
         for relay in helpers {
             let endpoint = Arc::clone(self.manager.endpoint());
@@ -1111,7 +1270,6 @@ impl NodeNet {
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
             set.spawn(async move {
-                let started = tokio::time::Instant::now();
                 let deadline = started + DIRECT_HEAD_START;
                 let mut elsewhere = false;
                 loop {
@@ -1165,8 +1323,8 @@ impl NodeNet {
                         () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
                     }
                 }
-                // Said, so a pair that bridges shows why (V210-122): how long the reach waited, and
-                // whether its direct dial had failed or was still under way.
+                // Said, so a pair that bridges shows why (V210-122): how long the reach
+                // waited, and whether its direct dial had failed or was still under way.
                 manager.note(
                     peer,
                     format!(
@@ -1383,13 +1541,36 @@ impl NodeNet {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<Arc<VoxConnection>> {
+        let t0 = std::time::Instant::now();
         let observed = self.observed_or_ask(coordinator).await;
+        let asked_ms = t0.elapsed().as_millis();
         let local = coordstream::punch_endpoints(observed, &self.local_endpoints()?);
         let plan = coordstream::run_punch_responder(&mut send, &mut recv, local).await?;
-        let conn =
+        let planned_ms = t0.elapsed().as_millis();
+        let targets = join_addrs(&plan.targets);
+        let dialled =
             coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
-                .await?;
-        Ok(self.manager.adopt(conn).await)
+                .await;
+        // **Said, either way** (V030-22): this is the dial a peer that cannot reach this node asked
+        // for, and when it fails that peer bridges through its coordinator; without this, nothing
+        // on either side said why.
+        let _ = coordstream::send_dial_outcome(&mut send, dialled.is_ok()).await;
+        self.manager.note(
+            peer,
+            match &dialled {
+                Ok(_) => format!(
+                    "dialled it back at {targets} as it asked, in {} ms (its own address \
+                     known at {asked_ms} ms, the exchange done at {planned_ms} ms)",
+                    t0.elapsed().as_millis()
+                ),
+                Err(e) => format!(
+                    "could not dial it back at {targets} as it asked, after {} ms (its own \
+                     address known at {asked_ms} ms, the exchange done at {planned_ms} ms): {e}",
+                    t0.elapsed().as_millis()
+                ),
+            },
+        );
+        Ok(self.manager.adopt(dialled?).await)
     }
 
     /// What this node's board anchors: every channel it holds a genesis for, with
@@ -1425,7 +1606,6 @@ impl NodeNet {
                     channel_id,
                     members: members.len(),
                     pending: guard.current_prejoins(&channel_id, now).len(),
-                    entries: None,
                     holding: guard
                         .current_members(&channel_id, 0, now)
                         .iter()
@@ -1434,10 +1614,30 @@ impl NodeNet {
                             (r.author_id, addrs.collect())
                         })
                         .collect(),
-                    equivocations: Vec::new(),
                 }
             })
             .collect()
+    }
+
+    /// [`NodeNet::board_endpoints`] from whichever room's board has a live record for
+    /// `member` — for a dial that names a member but not a room (`vox up` across every
+    /// room, PRD-001 R20).
+    #[must_use]
+    pub fn board_endpoints_any(&self, member: &Digest32) -> EndpointList {
+        let now = self.now();
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .channels_with_genesis()
+            .iter()
+            .find_map(|cid| {
+                guard
+                    .current_members(cid, 0, now)
+                    .into_iter()
+                    .find(|r| r.author_id == *member)
+                    .map(|r| r.endpoints.clone())
+            })
+            .unwrap_or_default()
     }
 
     /// The endpoints this node's board advertises for `member` in `channel_id` — the
@@ -1515,10 +1715,12 @@ impl NodeNet {
         let ms = began.elapsed().as_millis();
         match found {
             Some((board, endpoints)) => {
+                // Said, so a person — and a proof — can see where the address came from.
                 self.manager.note(
                     member,
                     format!(
-                        "no address for it on this node's board; read {}'s in {ms} ms: {}",
+                        "its address was read from board {}'s record in {ms} ms; this node held \
+                         none: {}",
                         short_id(board),
                         endpoints
                             .addrs()
@@ -1699,6 +1901,26 @@ impl NodeNet {
         out
     }
 
+    /// Take a member that left off **this node's own** board (V030-14): its records go, and any
+    /// stamped no later than `at` are refused. This node's board is its own, so no signature is
+    /// needed — the leave on the room's log is the reason, and this node holds it.
+    pub fn forget_member_on_board(&self, channel_id: &Digest32, author: &Digest32, at: u64) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .withdraw_member(channel_id, author, at);
+    }
+
+    /// Take a room that ended off **this node's own** board (V030-14), for good.
+    pub fn forget_room_on_board(&self, channel_id: &Digest32) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .withdraw_room(channel_id, None);
+    }
+
     /// Put a framed record on **this node's own** board, without a network round
     /// trip. A node is its own first anchor, and it would be absurd to dial itself;
     /// the record still goes through the service's full policy, so a local publish
@@ -1721,32 +1943,6 @@ impl NodeNet {
             }
             _ => Err(crate::error::Error::MalformedRendezvous(
                 "local publish: unexpected response",
-            )),
-        }
-    }
-
-    /// Put back on this node's board the genesis of a room it **anchors** but does not hold.
-    /// Unlike [`Self::publish_local`] it is not pinned: an anchor keeps a board for any room a
-    /// peer brings it, so the rooms it anchors are rooms strangers can bring, and they stay
-    /// inside the bound on geneses taken from peers (`nat::store::MAX_GENESIS_CHANNELS`) across
-    /// a restart as they were before it.
-    pub fn publish_anchored(&self, genesis: &[u8]) -> Result<()> {
-        use crate::nat::service::{RendezvousRequest, RendezvousResponse};
-        let me = self.local_id();
-        let responses = self.service.handle(
-            Some(&me),
-            None,
-            &RendezvousRequest::Put {
-                record: genesis.to_vec(),
-            },
-        );
-        match responses.first() {
-            Some(RendezvousResponse::Accepted) => Ok(()),
-            Some(RendezvousResponse::Rejected(r)) => {
-                Err(crate::error::Error::RendezvousRejected(r.as_str()))
-            }
-            _ => Err(crate::error::Error::MalformedRendezvous(
-                "anchored publish: unexpected response",
             )),
         }
     }
