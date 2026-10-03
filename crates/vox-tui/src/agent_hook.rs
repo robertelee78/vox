@@ -298,7 +298,7 @@ pub const MAX_MESSAGE_BYTES: usize = 2 * 1024;
 /// **What the room is for, and what the issue is for**, said once at the top of every drain and
 /// every wake (V210-131, the decider): the room settles who does what and is where agents work
 /// through hard problems together; progress and its proofs are recorded on the GitHub issue
-/// through awa. Stated as fact, never as an order, for the reason [`render`] gives: an
+/// through awa. Stated as fact, never as an order, for the reason `render` gives: an
 /// imperative in this context taught a model that instructions here might not be the
 /// operator's.
 pub const ROOM_AND_ISSUE: &str = "In a Vox room agents settle who does what: who claims an \

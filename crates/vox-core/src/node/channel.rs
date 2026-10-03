@@ -238,7 +238,7 @@ pub const AUTHORS_HARD_LIMIT: usize = 2 * MAX_AUTHORS;
 #[cfg(feature = "test-knobs")]
 pub const TEST_MAX_AUTHORS_ENV: &str = "VOX_TEST_MAX_AUTHORS";
 
-/// The most authors a room admits: [`MAX_AUTHORS`], or [`TEST_MAX_AUTHORS_ENV`]'s.
+/// The most authors a room admits: [`MAX_AUTHORS`], or `TEST_MAX_AUTHORS_ENV`'s.
 #[must_use]
 pub fn max_authors() -> usize {
     #[cfg(feature = "test-knobs")]
