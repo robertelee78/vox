@@ -412,6 +412,19 @@ pub async fn connect_direct_within(
     now_secs: u64,
     per_attempt: Duration,
 ) -> Result<VoxConnection> {
+    let candidates = dialable_candidates(&endpoint, candidates);
+    if candidates.is_empty() {
+        return Err(Error::Unreachable("no direct candidates"));
+    }
+    connect_dialable(endpoint, candidates, expected_peer, now_secs, per_attempt).await
+}
+
+/// The candidates `endpoint`'s socket can send to, an IPv4-mapped address written as IPv4 on an
+/// IPv4 socket: what [`connect_direct_within`] dials, and what a reach counts as a direct rung
+/// (V210-122). A reach whose candidates are all outside this has no direct path, so it asks for its
+/// circuit at once rather than after a dial that could only fail.
+#[must_use]
+pub fn dialable_candidates(endpoint: &VoxEndpoint, candidates: &[SocketAddr]) -> Vec<SocketAddr> {
     // A candidate the socket cannot even address is not a candidate: quinn refuses
     // an IPv6 destination on an IPv4 socket outright, and an IPv6 socket carries IPv4 only
     // as v4-mapped addresses — which works for a socket bound to the IPv6 wildcard (`[::]`,
@@ -443,7 +456,7 @@ pub async fn connect_direct_within(
     // stands, an IPv4-bound node dropped the only address its peer can be punched at, and fired
     // nothing: measured through the shipped binary behind two userspace NATs (RP-23), the
     // responder sent not one datagram while the initiator's went unanswered at 1, 2, 4 and 7 s.
-    let candidates: Vec<SocketAddr> = candidates
+    candidates
         .iter()
         .map(|c| match (local, c.ip().to_canonical()) {
             (Some(SocketAddr::V4(_)), ip @ std::net::IpAddr::V4(_)) => {
@@ -452,11 +465,17 @@ pub async fn connect_direct_within(
             _ => *c,
         })
         .filter(reachable)
-        .collect();
-    if candidates.is_empty() {
-        return Err(Error::Unreachable("no direct candidates"));
-    }
+        .collect()
+}
 
+/// [`connect_direct_within`]'s staggered dial of candidates already known dialable.
+async fn connect_dialable(
+    endpoint: Arc<VoxEndpoint>,
+    candidates: Vec<SocketAddr>,
+    expected_peer: Digest32,
+    now_secs: u64,
+    per_attempt: Duration,
+) -> Result<VoxConnection> {
     // Each attempt carries the address it was for, so a failure can name it. Flattening
     // every candidate to one message hid, for a long time, the difference between "nothing
     // is listening there" and "something answered but was not the peer we expected" — the
