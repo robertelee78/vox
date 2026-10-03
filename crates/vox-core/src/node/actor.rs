@@ -10216,19 +10216,6 @@ impl Node {
         self.start_inbound(channel_id, peer, conn, transport);
     }
 
-    /// Whether `peer` may reconcile `channel_id`'s log with this node.
-    ///
-    /// - An **admitted author** of that room. If it is not one yet, this node's own board is
-    ///   consulted first — local, so cheap — because a member that joined through somebody
-    ///   else is on the board before it is in this node's author table, and refusing it for
-    ///   that would be the "precondition behind its own check" defect `shares_room` documents.
-    ///   Admission there takes the same M17.6 evidence as everywhere else.
-    /// - An **anchor of that room** — in the room's own anchor set, which holds this node's
-    ///   configured anchors and those the room's link named. It keeps the room's ciphertext by
-    ///   design (ADR-016 M15.2b) for members who are away. An anchor named only by *another*
-    ///   room's link is not an anchor of this one.
-    ///
-    /// For a room this node only anchors, the peer must be an author the board knows.
     /// Whether a refusal may tell `peer` **why** (#202): it is this room's session partner, or it
     /// has a member record for the room on the board. Decided without the room's lock, because
     /// the refusals that ask run before it. Anyone else is refused with the uninformative code,
@@ -10252,6 +10239,19 @@ impl Node {
             })
     }
 
+    /// Whether `peer` may reconcile `channel_id`'s log with this node: an **admitted author** of
+    /// that room. If it is not one yet, this node's own board is consulted first — local, so
+    /// cheap — because a member that joined through somebody else is on the board before it is
+    /// in this node's author table, and refusing it for that would be the "precondition behind
+    /// its own check" defect `shares_room` documents. Admission there takes the same M17.6
+    /// evidence as everywhere else.
+    ///
+    /// **Not an anchor for being one.** An anchor that is not a member holds nothing for the
+    /// room and runs no sync session (ADR-023 RL-6.1, RL-6.2), so it refuses every one. Counting
+    /// the room's anchors here, a leftover of the anchor log M23.5 deleted, gave every member a
+    /// port to each anchor: a session opened on every connection and tick, refused "epoch
+    /// mismatch", and printed as a sync that did not complete. An anchor that is a member
+    /// syncs as a member.
     async fn may_sync(&mut self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
         if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
             {
@@ -10260,9 +10260,7 @@ impl Node {
                 if channel.has_left(peer) {
                     return false;
                 }
-                if channel.is_member(peer)
-                    || channel.anchors().nodes().iter().any(|a| a.id == *peer)
-                {
+                if channel.is_member(peer) {
                     return true;
                 }
             }
