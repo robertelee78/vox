@@ -136,7 +136,9 @@ is what a person offers. A tunnel is how bytes reach it.
 - **5.1** `vox up` MUST run a SOCKS5 proxy on loopback, by default `127.0.0.1:1080`. The proxy MUST
   resolve `.vox` names itself (`socks5h`), and MUST carry each connection to the host as a tunnel.
 - **5.2** With no room argument, `vox up` MUST run in the node already holding the profile
-  (`vox daemon`). It MUST resolve names against every room that node holds, as they stand when each
+  (`vox daemon`). *Decided, not built (ADR-026):* `vox up` is a client of the account's daemon and
+  runs as the node it resolves (ADR-026 C-3); its proxy is a held session that ends, non-zero, when
+  the daemon stops (ADR-026 L-7). It MUST resolve names against every room that node holds, as they stand when each
   connection asks. A single room MAY be named.
 - **5.3** The proxy MUST refuse a literal-address CONNECT and a name it cannot resolve. It MUST NOT
   act as a general-purpose proxy.
@@ -168,13 +170,15 @@ is what a person offers. A tunnel is how bytes reach it.
 ### 7. The anchor is configuration, not an argument (M17.4)
 
 - **7.1** `vox node` MUST write its own anchor spec to `<config_dir>/anchors`, and every command MUST
-  read that file. The file is machine-wide, shared by every profile on the machine.
+  read that file. The file is machine-wide, shared by every profile on the machine. *Decided, not
+  built (ADR-026 F-1, F-3):* anchors are a per-node setting in `nodes/<name>/config/anchors`, read from the account's
+  `anchors` file when the node has none (ADR-026 F-2), so migration copies nothing.
 - **7.2** `--anchor` MUST merge with the file, not replace it.
 - **7.3** The file MUST hold one anchor spec per line (`<fingerprint>@<multiaddr>`, or a host name and
   port). `#` comments and blank lines MUST be skipped. The file MUST be rewritten whole on every
   address change, through a temporary file and a rename. A malformed line MUST NOT be skipped
   silently. The file holds no secret.
-- **7.4** A running daemon MUST re-read the file and re-resolve every spec every `ANCHOR_REFRESH`
+- **7.4** A running daemon (under ADR-026, for each attached node) MUST re-read the file and re-resolve every spec every `ANCHOR_REFRESH`
   (30 s). An anchor that moved MUST replace its old address, in the node's set and in each room's
   stored set. **Known limit:** a host name whose record moves while the file is untouched takes the
   same code path, but is not measured.
@@ -211,7 +215,8 @@ is what a person offers. A tunnel is how bytes reach it.
   It MUST be recomputed when the keyring or a room's author set changes, and on each accept. Serving
   tasks MUST be woken only when the set really changes (`publish_reachers`). A locked node MUST NOT
   recompute it, because the keyring is cleared while locked and an empty set would read as everyone
-  withdrawn.
+  withdrawn. *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* there is no locked node; a detaching node's serving
+  tasks stop before its keyring is cleared.
 - **10.6** A refused dial MUST tell the peer nothing beyond its SOCKS reply. The dialing node prints
   the reason locally (ADR-013 T-19).
 - **10.7** Restoring trust MUST restore reach in the same act. There is no separate service state.
@@ -267,6 +272,10 @@ is what a person offers. A tunnel is how bytes reach it.
   12.3 and who shared it: `vox service list <room>`, and the TUI's Shared pane.
 - **12.10** `vox serve` MUST print each share's address with the service name and the fingerprints in
   the node and room places.
+- **12.11** A service MUST be named only by its address: `vox forward` MUST take a
+  `service.node.room.vox` address and MUST NOT take a room, a member and a service as separate
+  arguments (decider, 2026-10-03). *Decided, not built:* the separate-argument form
+  `vox forward <room> <member> <service>` is still on this tree and is to be removed.
 
 Built (#339): `node::resolver`, `governance::share`, `ChannelState::{say_share, shares}`,
 `vox serve <name>=<port>`, `vox service list`, `vox forward <service>.<node>.<room>.vox [<local>]`.

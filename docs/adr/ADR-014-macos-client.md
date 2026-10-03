@@ -125,7 +125,9 @@ the client presents it.
 ### 7. Node operation and availability
 
 7.1. The app MUST embed the node and run it while the app runs. *Planned; the embedding is built
-     (11.x).*
+     (11.x).* *Decided 2026-10-03, not built (ADR-026 S-4):* the macOS app is a client of the
+     account's daemon and MUST NOT embed a node. The iOS app (v0.4.0) hosts its own node, the one
+     stated exception, because iOS runs no background daemon.
 7.2. The app MUST be able to point at any user-run node as its anchor (ADR-012). Vox MUST NOT mandate
      a topology: every option MUST be configurable, and Vox MUST NOT make any of them compulsory.
 7.3. Vox MUST also ship a headless node binary (the same Rust core, no UI) for an always-on box with a
@@ -159,6 +161,8 @@ the client presents it.
       passphrase and the identity factor again (ADR-010). *Planned.*
 10.2. The default MUST be a 5-minute idle lock plus lock on sleep. The lock MUST be configurable,
       including off, and turning it off MUST state that a warm Mac then exposes the local vault.
+      *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* 10.1–10.2 are removed: there is no node lock; a node's secrets
+      are wiped when it detaches.
 10.3. Biometrics MUST gate only the identity factor and MUST NOT replace the passphrase factor.
 10.4. Disappearing messages MUST follow the room's TTL (ADR-010), off by default.
 10.5. The app MUST hide notification previews by default and SHOULD deter screenshots where the OS

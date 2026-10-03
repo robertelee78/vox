@@ -63,30 +63,30 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: vox stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("APPARATUS: write vox stdin");
         drop(child.stdin.take());
     }
     // Bounded: a node that stops answering must fail this proof by name, not hang it.
     let deadline = Instant::now() + Duration::from_secs(120);
-    while child.try_wait().expect("try_wait").is_none() {
+    while child.try_wait().expect("APPARATUS: try_wait").is_none() {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             panic!(
-                "`vox {}` got no answer in 120 s — the node stopped answering",
+                "PRODUCT: `vox {}` got no answer in 120 s — the node stopped answering",
                 args.join(" ")
             );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -95,8 +95,10 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
 }
 
 fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: daemon stdout file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: daemon stderr file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -106,9 +108,10 @@ fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes()).unwrap();
+        .expect("APPARATUS: spawn vox daemon");
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(stdin_lines.as_bytes())
+        .expect("APPARATUS: write daemon stdin");
     drop(pipe);
     let d = Daemon(child);
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -118,7 +121,7 @@ fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
         }
         assert!(
             Instant::now() < deadline,
-            "{tag}'s daemon never answered: {}",
+            "PRODUCT (staging): {tag}'s daemon never answered: {}",
             std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(200));
@@ -127,16 +130,16 @@ fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
 
 fn identity(tmp: &Path, name: &str) -> (PathBuf, String) {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: profile directory");
     let (ok, out, err) = vox(&dir, &["id"], None);
-    assert!(ok, "vox id {name}: {err}");
+    assert!(ok, "PRODUCT (staging): vox id {name}: {err}");
     (dir, out.trim().to_owned())
 }
 
 /// The texts `vox room read` returns.
 fn read(dir: &Path, room: &str) -> Vec<String> {
     let (ok, out, err) = vox(dir, &["room", "read", room], None);
-    assert!(ok, "vox room read: {err}");
+    assert!(ok, "PRODUCT: vox room read: {err}");
     out.lines()
         .filter_map(|l| l.splitn(3, ' ').nth(2).map(str::to_owned))
         .collect()
@@ -156,12 +159,12 @@ fn until(dir: &Path, room: &str, what: &str, secs: u64, done: impl Fn(&[String])
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}; `room read` shows {last:?}");
+    panic!("PRODUCT: timed out waiting for {what}; `room read` shows {last:?}");
 }
 
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
-    assert!(ok, "vox room post {text:?}: {err}");
+    assert!(ok, "PRODUCT (staging): vox room post {text:?}: {err}");
 }
 
 fn trust(dir: &Path, fp: &str, name: &str, history: &str) {
@@ -170,13 +173,16 @@ fn trust(dir: &Path, fp: &str, name: &str, history: &str) {
         &["trust", "add", fp, "--name", name, "--history", history],
         None,
     );
-    assert!(ok, "vox trust add {name} --history {history}: {err}");
+    assert!(
+        ok,
+        "PRODUCT (staging): vox trust add {name} --history {history}: {err}"
+    );
     print!("{out}");
 }
 
 fn untrust(dir: &Path, fp: &str) {
     let (ok, _, err) = vox(dir, &["trust", "remove", fp], None);
-    assert!(ok, "vox trust remove: {err}");
+    assert!(ok, "PRODUCT (staging): vox trust remove: {err}");
 }
 
 /// `key_generations` for the room, from `vox status --json`.
@@ -199,12 +205,12 @@ fn until_generations(dir: &Path, want: u64, secs: u64) -> u64 {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("alice's key store never held {want} generation(s); last saw {last:?}");
+    panic!("PRODUCT: alice's key store never held {want} generation(s); last saw {last:?}");
 }
 
 fn join(creator: &Path, joiner: &Path, room: &str) {
     let (ok, link, err) = vox(creator, &["room", "invite", room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, _, err) = vox(
         joiner,
         &[
@@ -218,7 +224,7 @@ fn join(creator: &Path, joiner: &Path, room: &str) {
         ],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "PRODUCT (staging): vox room join: {err}");
 }
 
 #[test]
@@ -230,11 +236,11 @@ fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_nee
     let root: PathBuf = match std::env::var("VOX_PROOF_KEEP") {
         Ok(dir) => {
             let p = PathBuf::from(dir);
-            std::fs::create_dir_all(&p).unwrap();
+            std::fs::create_dir_all(&p).expect("APPARATUS: VOX_PROOF_KEEP directory");
             p
         }
         Err(_) => {
-            let t = tempfile::tempdir().unwrap();
+            let t = tempfile::tempdir().expect("APPARATUS: tempdir");
             let p = t.path().to_path_buf();
             _guard = t;
             p
@@ -253,13 +259,22 @@ fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_nee
         &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let (_, listed, _) = vox(&alice, &["room", "list"], None);
-    let room = listed.split_whitespace().next().expect("a room").to_owned();
+    let room = listed
+        .split_whitespace()
+        .next()
+        .expect("PRODUCT (staging): `vox room list` shows no room")
+        .to_owned();
     for who in [&bob, &carol] {
         join(&alice, who, &room);
     }
     // Trust runs one way (V210-161): bob and carol read alice only once they trust alice too.
+    trust(&bob, &alice_fp, "alice", "now");
+    trust(&carol, &alice_fp, "alice", "now");
+
+    // Trust is per direction (v0.2.10): a node reads only members its owner trusted. Bob and
+    // carol trust alice with the default; what each reads of hers is alice's grant to them.
     trust(&bob, &alice_fp, "alice", "now");
     trust(&carol, &alice_fp, "alice", "now");
 
@@ -288,7 +303,7 @@ fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_nee
     assert_eq!(
         count(&c, "before "),
         0,
-        "the default grant must not reveal history"
+        "PRODUCT: the default grant must not reveal history"
     );
 
     // ---- (b) R14: superseded generations go, unless a full grant still needs them -------
