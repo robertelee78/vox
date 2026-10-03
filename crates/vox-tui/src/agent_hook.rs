@@ -1190,6 +1190,13 @@ async fn read_room(
         let more = crate::coord::read_upto(client, channel_id, from, page)
             .await?
             .unwrap_or_default();
+        // Read on by arrival from the last row: a first page read in the room's order may
+        // already hold a row that arrived after it, so one already here is not added again.
+        let held: std::collections::HashSet<Digest32> = rows.iter().map(|r| r.entry_hash).collect();
+        let more: Vec<_> = more
+            .into_iter()
+            .filter(|r| !held.contains(&r.entry_hash))
+            .collect();
         if more.is_empty() {
             break;
         }

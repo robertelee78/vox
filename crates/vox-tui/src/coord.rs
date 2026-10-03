@@ -438,6 +438,11 @@ pub fn index_of(posted: &[Posted]) -> OpIndex {
 /// Up to `limit` rows after `since` (all of them when `limit` is 0), paged from the node and no
 /// further than asked (V210-120). `Ok(None)` when the node does not hold the cursor.
 ///
+/// A read from a cursor is a feed by arrival, so its next page follows the last row as a cursor;
+/// a read of the whole room is in the room's order (ADR-023 decision 1), so its next page follows
+/// the last row as a page mark. Paging the room by cursor showed a late arrival twice: once in the
+/// room's order, and again in the feed after the page boundary.
+///
 /// # Errors
 /// If the node cannot answer.
 pub async fn read_upto(
@@ -447,7 +452,7 @@ pub async fn read_upto(
     limit: usize,
 ) -> Result<Option<Vec<MessageRow>>, AppError> {
     let mut rows: Vec<MessageRow> = Vec::new();
-    let mut cursor = since;
+    let (mut cursor, mut mark) = (since, None);
     loop {
         let want = if limit == 0 {
             0
@@ -458,7 +463,7 @@ pub async fn read_upto(
             .request(&Request::Read {
                 channel_id,
                 since: cursor,
-                after: None,
+                after: mark,
                 limit: want,
             })
             .await
@@ -468,10 +473,15 @@ pub async fn read_upto(
                 let Some(last) = page.last() else {
                     return Ok(Some(rows));
                 };
-                if cursor == Some(last.entry_hash) {
+                let marker = if since.is_some() {
+                    &mut cursor
+                } else {
+                    &mut mark
+                };
+                if *marker == Some(last.entry_hash) {
                     return Err(AppError::Usage("ipc rows page did not advance".into()));
                 }
-                cursor = Some(last.entry_hash);
+                *marker = Some(last.entry_hash);
                 rows.extend(page);
                 if limit > 0 && rows.len() >= limit {
                     rows.truncate(limit);
