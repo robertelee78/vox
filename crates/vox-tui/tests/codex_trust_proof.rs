@@ -33,8 +33,9 @@
 //! proof's processes are sealed.)
 //!
 //! **Which side a red is on.** What vox said or did, read back through Codex's own API, is
-//! `PRODUCT:`. Codex not answering, not listing an entry this proof wrote, or not seeing a
-//! staged change is `CANNOT MEASURE:` (Codex is the instrument here). A fault of this proof's own
+//! `PRODUCT:`, and so is Codex not listing an entry this proof wrote: every entry has the shape
+//! `vox agent plugin codex` prints. Codex not answering, or not seeing a staged change, is
+//! `CANNOT MEASURE:` (Codex is the instrument here). A fault of this proof's own
 //! (a file, a symlink, a leaked variable) is `APPARATUS:`.
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -187,7 +188,13 @@ fn status_of(home: &Path, command: &str) -> String {
         .find(|(c, _)| c == command)
         .map(|(_, s)| s)
         .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: Codex does not list the hook {command:?} this proof wrote")
+            // Every entry this proof writes has the shape `vox agent plugin codex` prints
+            // (`plugin_entry`), so Codex not listing one is exactly #352's failure: a user who
+            // installs what Vox prints gets no hook.
+            panic!(
+                "PRODUCT: Codex does not list the hook {command:?}, written in the shape \
+                 `vox agent plugin codex` prints"
+            )
         })
 }
 
