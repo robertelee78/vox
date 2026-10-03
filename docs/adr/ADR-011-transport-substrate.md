@@ -180,8 +180,12 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
       - macOS: 8192 is granted; path 7973–8192, 0 black holes.
       - macOS with the granted buffer forced to 416 KiB or 768 KiB: the fix keeps 1452 and passes
         5 of 5 at each. The old 8192-regardless rule went red 1 of 5 at each.
-    - Not a fix for every buffer: forced to 256 KiB, macOS black-holed even at 1452 (2 of 3). That
-      is below any OS default, and is recorded, not bounded.
+    - Forced to 256 KiB, macOS black-holed even at 1452 (2 of 3) on quinn-proto 0.11.14. That was
+      quinn-proto mistaking overflow loss for a black hole, fixed in 0.11.18 (#206). Re-measured
+      on 2026-10-02 (#381): release build, every `SO_RCVBUF` capped at 256 KiB by the test
+      interposer, a 32 MiB echo through `vox forward`, 10 runs each. On 0.11.18: 0 of 10 black
+      holes, path 1452 throughout, with 105–2293 packets lost to overflow per process. Pinned back
+      to 0.11.14: 3 of 10, the dialler dropping to 1200 with 2–3 black holes.
   - Measured and **not** kept: 4 runtime workers instead of 2 (no change). A 16 MiB stream window
     with a **64 MiB** send window (more in flight, more overflow loss, and the MTU collapsed) was
     also not kept; the windows that were kept are below.
