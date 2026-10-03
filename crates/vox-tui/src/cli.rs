@@ -3048,6 +3048,7 @@ pub fn run() -> ExitCode {
             let (socket, stats) = (a.helper_socket.clone(), a.stats_file.clone());
             let allow = a.allow.iter().copied().collect();
             let metrics = a.metrics;
+            let node_name = a.room.profile.profile.clone();
             run_tunnel_verb(a.room.clone(), true, move |node, cid| async move {
                 // A running LAN answers as a `vox daemon` does (V030-04, #236): its control
                 // socket is served by the tunnel verbs' path, and its metrics here.
@@ -3058,6 +3059,7 @@ pub fn run() -> ExitCode {
                     let bound = listener.local_addr()?;
                     tokio::spawn(vox_core::node::status::serve_metrics(
                         listener,
+                        node_name,
                         node.clone(),
                     ));
                     println!("vox lan: metrics http://{bound}/metrics");

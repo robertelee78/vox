@@ -427,15 +427,24 @@ impl StatusReport {
         j
     }
 
-    /// The report as Prometheus text exposition (what `vox daemon --metrics` serves).
+    /// The report as Prometheus text exposition for the node named `node`, alone (see
+    /// [`StatusReport::to_prometheus_rows`]).
     #[must_use]
-    pub fn to_prometheus(&self) -> String {
-        let mut m = String::new();
-        let mut gauge = |name: &str, help: &str, rows: Vec<(String, u64)>| {
-            let _ = writeln!(m, "# HELP {name} {help}");
-            let _ = writeln!(m, "# TYPE {name} gauge");
+    pub fn to_prometheus(&self, node: &str) -> String {
+        let mut out = Families::default();
+        self.to_prometheus_rows(node, &mut out);
+        out.render()
+    }
+
+    /// Add this report's samples, each labelled `node="<node>"` (ADR-026 P-1), to `out`, which
+    /// may already hold other nodes' samples of the same families: a scrape of a daemon is one
+    /// exposition with each family's `HELP` and `TYPE` once, and every node's samples under it.
+    pub fn to_prometheus_rows(&self, node: &str, out: &mut Families) {
+        let me = node_label(node);
+        let mut gauge = |name: &'static str, help: &'static str, rows: Vec<(String, u64)>| {
+            out.family(name, help, Kind::Gauge);
             for (labels, v) in rows {
-                let _ = writeln!(m, "{name}{labels} {v}");
+                out.sample(name, &me, &labels, v);
             }
         };
         gauge(
@@ -577,10 +586,9 @@ impl StatusReport {
             vec![(String::new(), self.unhealthy.len() as u64)],
         );
         let d = &self.datagrams;
-        let mut counter = |name: &str, help: &str, v: u64| {
-            let _ = writeln!(m, "# HELP {name} {help}");
-            let _ = writeln!(m, "# TYPE {name} counter");
-            let _ = writeln!(m, "{name} {v}");
+        let mut counter = |name: &'static str, help: &'static str, v: u64| {
+            out.family(name, help, Kind::Counter);
+            out.sample(name, &me, "", v);
         };
         counter(
             "vox_datagrams_sent_total",
@@ -634,7 +642,144 @@ impl StatusReport {
                 + a.refused_unaccepted
                 + a.refused_locally,
         );
+    }
+}
+
+/// A metric family's type, as its `# TYPE` line says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A value that goes up and down.
+    Gauge,
+    /// A value that only goes up.
+    Counter,
+}
+
+/// A Prometheus exposition being built from several nodes' reports and the daemon's own gauges:
+/// each family's `HELP` and `TYPE` lines once, then every sample of it, in the order the
+/// families were first named. Two `TYPE` lines for one family make a scraper refuse the whole
+/// exposition, which is why a daemon's nodes cannot each render their own text and be joined.
+#[derive(Debug, Default)]
+pub struct Families {
+    order: Vec<&'static str>,
+    families: BTreeMap<&'static str, Family>,
+}
+
+#[derive(Debug)]
+struct Family {
+    help: &'static str,
+    kind: Kind,
+    samples: Vec<String>,
+}
+
+impl Families {
+    /// Name the family `name`, so its `HELP` and `TYPE` are written even when no sample follows.
+    /// A family named again keeps what it was first named with.
+    pub fn family(&mut self, name: &'static str, help: &'static str, kind: Kind) {
+        if !self.families.contains_key(name) {
+            self.order.push(name);
+            self.families.insert(
+                name,
+                Family {
+                    help,
+                    kind,
+                    samples: Vec::new(),
+                },
+            );
+        }
+    }
+
+    /// One sample of the family `name` (named first with [`Families::family`]): `node` is the
+    /// node's own label (`node="…"`, or empty for a daemon-wide value) and comes first; `labels`
+    /// is the rest, either `{a="…",b="…"}` or empty.
+    pub fn sample(&mut self, name: &'static str, node: &str, labels: &str, value: u64) {
+        let rest = labels
+            .strip_prefix('{')
+            .and_then(|l| l.strip_suffix('}'))
+            .unwrap_or(labels);
+        let set = match (node.is_empty(), rest.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("{{{node}}}"),
+            (true, false) => format!("{{{rest}}}"),
+            (false, false) => format!("{{{node},{rest}}}"),
+        };
+        if let Some(f) = self.families.get_mut(name) {
+            f.samples.push(format!("{name}{set} {value}"));
+        }
+    }
+
+    /// The exposition text.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut m = String::new();
+        for name in &self.order {
+            let Some(f) = self.families.get(name) else {
+                continue;
+            };
+            let kind = match f.kind {
+                Kind::Gauge => "gauge",
+                Kind::Counter => "counter",
+            };
+            let _ = writeln!(m, "# HELP {name} {}", f.help);
+            let _ = writeln!(m, "# TYPE {name} {kind}");
+            for line in &f.samples {
+                let _ = writeln!(m, "{line}");
+            }
+        }
         m
+    }
+}
+
+/// `node="<name>"`, with the value escaped as the exposition format asks (backslash, quote and
+/// newline), since a profile's name is the person's.
+fn node_label(node: &str) -> String {
+    let mut v = String::with_capacity(node.len());
+    for c in node.chars() {
+        match c {
+            '\\' => v.push_str("\\\\"),
+            '"' => v.push_str("\\\""),
+            '\n' => v.push_str("\\n"),
+            c => v.push(c),
+        }
+    }
+    format!("node=\"{v}\"")
+}
+
+/// What a daemon counts of itself, beside its nodes' reports (ADR-026 P-1): how many nodes are
+/// attached, and how many of their actors have panicked since it started (L-6).
+#[derive(Debug, Default)]
+pub struct DaemonMetrics {
+    /// Nodes attached now.
+    pub nodes_attached: std::sync::atomic::AtomicU64,
+    /// Node actors that panicked since the daemon started.
+    pub node_panics: std::sync::atomic::AtomicU64,
+}
+
+impl DaemonMetrics {
+    /// Add the daemon's own families to `out`, unlabelled.
+    pub fn to_prometheus_rows(&self, out: &mut Families) {
+        use std::sync::atomic::Ordering::Relaxed;
+        out.family(
+            "vox_daemon_nodes_attached",
+            "Nodes attached to this daemon.",
+            Kind::Gauge,
+        );
+        out.sample(
+            "vox_daemon_nodes_attached",
+            "",
+            "",
+            self.nodes_attached.load(Relaxed),
+        );
+        out.family(
+            "vox_daemon_node_panics_total",
+            "Node actors that panicked since the daemon started; each one detached its node.",
+            Kind::Counter,
+        );
+        out.sample(
+            "vox_daemon_node_panics_total",
+            "",
+            "",
+            self.node_panics.load(Relaxed),
+        );
     }
 }
 
@@ -1557,10 +1702,25 @@ async fn drain_after_answer(sock: &mut tokio::net::TcpStream, within: std::time:
     }
 }
 
-/// Serve Prometheus text on every connection to `listener`, until it is dropped.
-pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle) {
+/// Serve Prometheus text for the one node `handle`, named `node`, on every connection to
+/// `listener`, until it is dropped: a process that hosts one node and no daemon (`vox lan up`).
+pub async fn serve_metrics(listener: tokio::net::TcpListener, node: String, handle: NodeHandle) {
+    serve_metrics_for(listener, None, move || vec![(node.clone(), handle.clone())]).await;
+}
+
+/// Serve Prometheus text on every connection to `listener`, until it is dropped: the daemon's own
+/// families from `daemon`, then those of every node `nodes` lists at the time of the scrape, each
+/// sample labelled with its node's name. A node that does not answer is `vox_up 0` for that node.
+pub async fn serve_metrics_for<F>(
+    listener: tokio::net::TcpListener,
+    daemon: Option<std::sync::Arc<DaemonMetrics>>,
+    nodes: F,
+) where
+    F: Fn() -> Vec<(String, NodeHandle)> + Send + Sync + 'static,
+{
+    let nodes = std::sync::Arc::new(nodes);
     while let Ok((mut sock, _)) = listener.accept().await {
-        let handle = handle.clone();
+        let (daemon, nodes) = (daemon.clone(), std::sync::Arc::clone(&nodes));
         tokio::spawn(async move {
             // The request itself is not interpreted: every path answers the metrics. But it is
             // **read to its end** first, the blank line after its headers, within the same 2 s
@@ -1568,10 +1728,20 @@ pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle
             // pieces, and closing with the rest unread made the OS reset the connection, so the
             // scraper lost the answer (`Connection reset by peer`).
             read_request_head(&mut sock, std::time::Duration::from_secs(2)).await;
-            let body = match handle.status().await {
-                Ok(r) => r.to_prometheus(),
-                Err(_) => "vox_up 0\n".to_owned(),
-            };
+            let mut out = Families::default();
+            if let Some(d) = &daemon {
+                d.to_prometheus_rows(&mut out);
+            }
+            for (name, handle) in nodes() {
+                match handle.status().await {
+                    Ok(r) => r.to_prometheus_rows(&name, &mut out),
+                    Err(_) => {
+                        out.family("vox_up", "1 while the node answers.", Kind::Gauge);
+                        out.sample("vox_up", &node_label(&name), "", 0);
+                    }
+                }
+            }
+            let body = out.render();
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -1583,5 +1753,63 @@ pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle
             let _ = sock.shutdown().await;
             drain_after_answer(&mut sock, DRAIN_AFTER_ANSWER).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two nodes' reports in one exposition: each family's `HELP` and `TYPE` once, every sample
+    /// labelled with its node first, and the daemon's own families unlabelled (ADR-026 P-1).
+    #[test]
+    fn two_nodes_share_one_help_and_type_per_family() {
+        let mut out = Families::default();
+        let daemon = DaemonMetrics::default();
+        daemon
+            .nodes_attached
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        daemon.to_prometheus_rows(&mut out);
+        let a = StatusReport {
+            networked: true,
+            ..StatusReport::default()
+        };
+        a.to_prometheus_rows("alice", &mut out);
+        StatusReport::default().to_prometheus_rows("bob", &mut out);
+        let text = out.render();
+        for family in ["vox_up", "vox_networked", "vox_datagrams_sent_total"] {
+            assert_eq!(
+                text.matches(&format!("# TYPE {family} ")).count(),
+                1,
+                "{family}:\n{text}"
+            );
+        }
+        assert!(text.contains("vox_networked{node=\"alice\"} 1\n"), "{text}");
+        assert!(text.contains("vox_networked{node=\"bob\"} 0\n"), "{text}");
+        assert!(
+            text.contains("vox_datagrams_sent_total{node=\"bob\"} 0\n"),
+            "{text}"
+        );
+        assert!(text.contains("vox_daemon_nodes_attached 2\n"), "{text}");
+        assert!(text.contains("vox_daemon_node_panics_total 0\n"), "{text}");
+        // No sample of a node's family goes unlabelled.
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            assert!(
+                line.starts_with("vox_daemon_") || line.contains("{node=\""),
+                "unlabelled: {line}"
+            );
+        }
+    }
+
+    /// A sample with labels of its own keeps them after the node's.
+    #[test]
+    fn a_labelled_sample_puts_the_node_first() {
+        let mut out = Families::default();
+        out.family("vox_x", "x", Kind::Gauge);
+        out.sample("vox_x", &node_label("a\"b"), "{peer=\"P\"}", 3);
+        assert_eq!(
+            out.render(),
+            "# HELP vox_x x\n# TYPE vox_x gauge\nvox_x{node=\"a\\\"b\",peer=\"P\"} 3\n"
+        );
     }
 }

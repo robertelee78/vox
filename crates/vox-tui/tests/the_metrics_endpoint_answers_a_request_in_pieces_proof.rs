@@ -233,6 +233,7 @@ fn judge(case: &str, read: std::io::Result<usize>, got: &[u8]) -> Option<String>
 fn unhealthy_served(got: &[u8]) -> Option<u64> {
     String::from_utf8_lossy(got)
         .lines()
-        .find_map(|l| l.strip_prefix("vox_unhealthy "))
+        // Labelled with the node it counts for (ADR-026 P-1): the profile `default`.
+        .find_map(|l| l.strip_prefix("vox_unhealthy{node=\"default\"} "))
         .and_then(|v| v.trim().parse().ok())
 }

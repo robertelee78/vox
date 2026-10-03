@@ -27,6 +27,7 @@ pub mod doctor;
 pub mod ident;
 pub mod lan_cli;
 pub mod live;
+pub mod node_tasks;
 pub mod notify;
 pub mod ping;
 pub mod room_cli;
