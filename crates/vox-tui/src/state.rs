@@ -773,9 +773,6 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         "leave" => Command::LeaveRoom {
             channel_id: channel,
         },
-        "forget" => Command::ForgetRoom {
-            channel_id: channel,
-        },
         "end" => Command::EndRoom {
             channel_id: channel,
         },

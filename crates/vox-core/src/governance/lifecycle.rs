@@ -1,30 +1,25 @@
-//! The **room lifecycle** facts (tag `0x0019`, domain `vox/room-lifecycle/v1`): a member
-//! leaving, the creator ending the room for everyone, and the creator's chosen idle end
-//! (V030-08).
+//! The **room lifecycle** facts (tag `0x0019`, domain `vox/room-lifecycle/v1`): the creator, or
+//! an admin it named, ending the room for everyone, and the creator's chosen idle end (V030-08).
 //!
 //! ## Why these are log facts
 //! Membership in ADR-007 is emergent: every node admits authors from what it witnessed and
-//! keeps them. So "this member has gone" and "this room is over" can only reach the other
-//! nodes the way every other fact does: signed and on the log, where each node checks them
-//! itself and no peer can forge or suppress one it already holds.
+//! keeps them. So "this room is over" can only reach the other nodes the way every other fact
+//! does: signed and on the log, where each node checks it itself and no peer can forge or
+//! suppress one it already holds. A member leaving is its own presence statement
+//! ([`crate::governance::presence`]), not a lifecycle fact.
 //!
-//! - **Leave** is signed by the member who leaves, and names nobody else: no member can leave
-//!   on another's behalf. Once a node holds it, that member is no longer in the room: the node
-//!   stops syncing with it and delivering to it (the decider, 2026-10-01: "the node that left is
-//!   no longer in the swarm/room").
-//! - **Return** is signed by a member that left and joined again — by name and passphrase, like
-//!   any join (the decider, 2026-10-01: rejoining is just joining again). It undoes its leave.
 //! - **End** is signed by the room's creator (its genesis root admin) or an admin the creator
-//!   delegated (the decider, 2026-10-01). Once a node holds it, the room takes no new message.
+//!   delegated (the decider, 2026-10-01). Once a node holds it, the room takes no new message,
+//!   and each member's node deletes it once it has passed the end on (the decider, 2026-10-03).
 //! - **Idle end** is signed by the creator when the room is made. The room then ends once it
 //!   has seen no message for the chosen number of seconds. A room whose creator did not
 //!   choose one never ends by itself.
 //!
-//! None of the three is bound to an epoch's lifetime: a passphrase rotation does not bring a
-//! member back or reopen an ended room. The `epoch` field records when it was said.
+//! Neither is bound to an epoch's lifetime. The `epoch` field records when it was said.
 //!
 //! Body: `[kind, channelID, epoch, issuer_id, idle_secs]`, `idle_secs` 0 unless the kind is
-//! idle end.
+//! idle end. Kind codes 1 and 4 (a leave and a return, before the decider's 2026-10-03 ruling)
+//! are reserved and refused.
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -35,10 +30,6 @@ use crate::wire::{frame, parse_frame, signing_input, StructTag};
 /// Which lifecycle fact an entry states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleKind {
-    /// The issuer has left the room.
-    Leave,
-    /// The issuer, which had left, joined again.
-    Return,
     /// The room's creator has ended the room for everyone.
     End,
     /// The room's creator chose that the room end after this many seconds with no message.
@@ -48,10 +39,8 @@ pub enum LifecycleKind {
 impl LifecycleKind {
     fn code(self) -> u64 {
         match self {
-            LifecycleKind::Leave => 1,
             LifecycleKind::End => 2,
             LifecycleKind::IdleEnd(_) => 3,
-            LifecycleKind::Return => 4,
         }
     }
 
@@ -64,10 +53,8 @@ impl LifecycleKind {
 
     fn from_parts(code: u64, idle_secs: u64) -> Result<Self> {
         match (code, idle_secs) {
-            (1, 0) => Ok(LifecycleKind::Leave),
             (2, 0) => Ok(LifecycleKind::End),
             (3, s) if s > 0 => Ok(LifecycleKind::IdleEnd(s)),
-            (4, 0) => Ok(LifecycleKind::Return),
             _ => Err(Error::MalformedGovernance("room-lifecycle kind")),
         }
     }
@@ -82,7 +69,7 @@ pub struct RoomLifecycleBody {
     pub channel_id: Digest32,
     /// The membership epoch in force when it was said.
     pub epoch: u64,
-    /// The signer: the member leaving, or the creator.
+    /// The signer: the creator, or an admin it named.
     pub issuer_id: Digest32,
 }
 
@@ -189,7 +176,7 @@ impl RoomLifecycle {
     }
 
     /// Verify the issuer's signature and the `issuer_id`↔signer binding. Whether the issuer
-    /// may state this fact (itself leaving; the creator ending) is the evaluator's job.
+    /// may state this fact (the creator, or an admin ending) is the evaluator's job.
     pub fn verify(&self, issuer_root: &CompositePublicKey) -> Result<()> {
         if issuer_root.fingerprint() != self.body.issuer_id {
             return Err(Error::MalformedGovernance(

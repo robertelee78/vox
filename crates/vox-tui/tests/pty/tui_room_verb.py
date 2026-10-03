@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tui_room_verb.py <vox> <data_dir> <config_dir> <identity_pass> <room_pass> <tag> <verb> <hold_secs>
 
-Runs one room verb (`:leave`, `:end` or `:forget`, V030-08) on a profile's only room through the
+Runs one room verb (`:leave` or `:end`, V030-08) on a profile's only room through the
 shipped `vox tui`, as a person would: unlock, open the room, `:<verb>`. Then it keeps the TUI
 running for `hold_secs`, because a leave or an end is passed to the other members by this node
 while it runs, as a person's TUI would stay open.

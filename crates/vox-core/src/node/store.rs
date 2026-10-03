@@ -470,7 +470,7 @@ impl Store {
         Ok(existed)
     }
 
-    /// Delete **everything this store holds of one channel** (V030-08 `vox room forget`): every
+    /// Delete **everything this store holds of one channel** (a room left or ended, V030-08): every
     /// sealed segment of every kind and its SEK wrap, in one durable transaction. Returns how
     /// many rows went. The freed pages still hold the old bytes until the space is reused; a
     /// caller that must leave none follows with [`Store::rewrite_fresh`].

@@ -187,9 +187,6 @@ pub struct Evaluator {
 /// What a room's lifecycle facts say (V030-08), folded from the log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Lifecycle {
-    /// The members who have left, each by its own signed leave not undone by a later return,
-    /// with that leave's log entry.
-    pub departed: BTreeMap<Digest32, Digest32>,
     /// The log entry in which the creator ended the room, if it has.
     pub ended_by: Option<Digest32>,
     /// The idle end the creator chose, in seconds; `None` when it chose none.
@@ -333,6 +330,7 @@ impl Evaluator {
             GovBody::ConsentRevocation(r) => r.verify(author_key),
             GovBody::PolicyUpdate(p) => p.verify(author_key),
             GovBody::Lifecycle(l) => l.verify(author_key),
+            GovBody::Presence(p) => p.verify(author_key),
             GovBody::ServiceShare(s) => s.verify(author_key),
         }
     }
@@ -742,12 +740,9 @@ impl<'a> Resolver<'a> {
                 }
                 // A member that left and joined again starts its consents over (V030-08): it
                 // joined from scratch and holds none of the keys its earlier grants released,
-                // so they no longer describe who reads it.
-                GovBody::Lifecycle(l)
-                    if l.body.kind == crate::governance::lifecycle::LifecycleKind::Return
-                        && l.body.issuer_id == e.author_id =>
-                {
-                    last.retain(|(author, _), _| *author != l.body.issuer_id);
+                // so they no longer describe who reads it. Its statement that it is back says so.
+                GovBody::Presence(p) if p.body.here && p.body.author_id == e.author_id => {
+                    last.retain(|(author, _), _| *author != p.body.author_id);
                 }
                 _ => {}
             }
@@ -761,12 +756,10 @@ impl<'a> Resolver<'a> {
         Ok(consent)
     }
 
-    /// Fold the room-lifecycle facts (V030-08). A leave or a return counts only from the member
-    /// it names, which the signature already binds (`issuer_id` is the signer, and the signer is
-    /// the entry's author); a member's last one in canonical order says whether it is in. An end
-    /// counts from the root admin, or from an admin the creator delegated, as of the end's strict
-    /// causal past; an idle end only from the root admin. None is epoch-bound: a passphrase
-    /// rotation brings no member back and reopens no room. The last idle end wins.
+    /// Fold the room-lifecycle facts (V030-08). Each counts only from its signer (`issuer_id` is
+    /// the signer, and the signer is the entry's author). An end counts from the root admin, or
+    /// from an admin the creator delegated, as of the end's strict causal past; an idle end only
+    /// from the root admin. The last idle end wins.
     fn resolve_lifecycle(&mut self) -> Result<Lifecycle> {
         use crate::governance::lifecycle::LifecycleKind;
         let mut out = Lifecycle::default();
@@ -779,12 +772,6 @@ impl<'a> Resolver<'a> {
                 continue;
             }
             match l.body.kind {
-                LifecycleKind::Leave => {
-                    out.departed.insert(l.body.issuer_id, e.entry_hash);
-                }
-                LifecycleKind::Return => {
-                    out.departed.remove(&l.body.issuer_id);
-                }
                 LifecycleKind::End => {
                     let admin = l.body.issuer_id == self.root_admin
                         || self

@@ -87,6 +87,7 @@ pub mod genesis;
 pub mod lifecycle;
 pub mod membership;
 pub mod policy;
+pub mod presence;
 pub mod share;
 
 pub use capability::{Capability, CapabilitySet};

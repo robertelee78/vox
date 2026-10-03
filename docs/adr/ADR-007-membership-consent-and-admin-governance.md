@@ -43,7 +43,8 @@ only room governance is who sets the room's retention. This builds on identity (
   `vox room admin add|remove <member>` (an admin-delegation cert `0x0003` and its revocation `0x000E`).
   A node MUST honour an admin certificate only when the creator issued it, and a delegated admin's
   certificate MUST carry `policy` only, never `admin` (#319). The creator or an admin MAY end the room
-  for everyone (`vox room end`, a room-lifecycle fact `0x0019`, V030-08).
+  for everyone (`vox room end`, a room-lifecycle fact `0x0019`); every member's node then deletes it
+  (ADR-023 decision 7).
 - **G-6.** The only governance act MUST be setting the room's retention (the policy-update `ttl`), and
   only the creator or an admin it delegated MAY do it. The capabilities are `admin` and `policy`; every
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be
@@ -51,8 +52,7 @@ only room governance is who sets the room's retention. This builds on identity (
   capability lattice are removed (#380; `bind:`/`dial:` under #94, see Status).
 - **G-7.** A member that is not an admin MAY set a lower retention for its own node only, for one room;
   it MUST NOT set a retention higher than the room's. A node's retention value above the room's MUST be
-  ignored (built: the effective retention is the shorter of the two, ADR-010 AR-30), with a warning
-  (**planned**, #380).
+  ignored (the effective retention is the shorter of the two, ADR-010 AR-30), with a warning (#380).
 - **G-8.** The genesis service grant and `service-grant-exclusion` (`0x0013`) are withdrawn
   (ADR-017 decision 3). Wire tag `0x0013` MUST NOT be reused.
 

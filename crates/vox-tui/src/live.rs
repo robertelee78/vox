@@ -469,7 +469,8 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::BindFailed => UiError::BindFailed,
         Fault::AlreadyMember => UiError::AlreadyMember,
         Fault::RoomEnded => UiError::RoomEnded,
-        Fault::LeftRoom => UiError::LeftRoom,
+        Fault::LeaveNotHeard => UiError::LeaveNotHeard,
+        Fault::LeaveUndone => UiError::LeaveUndone,
         Fault::NotCreator | Fault::NotRoomCreator => UiError::NotCreator,
         Fault::RoomNotSynced => UiError::StillJoining,
         #[allow(unreachable_patterns)]
@@ -558,14 +559,15 @@ impl CoreHandle for LiveCore {
                 }
                 self.send(NodeCommand::CloseChannel { channel_id })
             }
-            Command::LeaveRoom { channel_id } => self.send(NodeCommand::LeaveRoom { channel_id }),
-            Command::EndRoom { channel_id } => self.send(NodeCommand::EndRoom { channel_id }),
-            Command::ForgetRoom { channel_id } => {
-                if self.active == Some(channel_id) {
+            Command::LeaveRoom { channel_id } => {
+                // Answered once another member has the leave; the room is gone then.
+                let status = self.send(NodeCommand::LeaveRoom { channel_id });
+                if matches!(status, CommandStatus::Done) && self.active == Some(channel_id) {
                     self.active = None;
                 }
-                self.send(NodeCommand::ForgetRoom { channel_id })
+                status
             }
+            Command::EndRoom { channel_id } => self.send(NodeCommand::EndRoom { channel_id }),
             Command::SelectChannel { channel_id } => {
                 self.active = channel_id;
                 if let Some(cid) = channel_id {

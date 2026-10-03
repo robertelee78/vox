@@ -622,17 +622,11 @@ pub enum NodeCommand {
         /// The channelID.
         channel_id: Digest32,
     },
-    /// Leave a room (V030-08): append this identity's signed leave. The room stays here, quiet
-    /// and readable, until it is forgotten; the other members stop syncing with this node and
-    /// delivering to it once they hold the leave, which this node passes on first.
+    /// Leave a room (V210-164): say so in the room, and once another member has that, delete
+    /// the room from this node (the decider, 2026-10-03: "leave deletes it"). Answered then, or
+    /// with [`Fault::LeaveNotHeard`] when no member took it within 30 s; the room goes once one
+    /// does.
     LeaveRoom {
-        /// The channelID.
-        channel_id: Digest32,
-    },
-    /// Forget a room (V030-08): delete everything this node holds of it. A room this identity
-    /// is still a member of is left first, and forgotten once the leave has been passed on
-    /// (or the hand-over's bound runs out): [`NodeEvent::RoomForgotten`] says when.
-    ForgetRoom {
         /// The channelID.
         channel_id: Digest32,
     },
@@ -972,6 +966,12 @@ pub enum Fault {
     /// A room this node joined has not synced with another member yet, so nothing is written
     /// to it (V210-164).
     RoomNotSynced,
+    /// A leave was written, but no other member of the room took it within the wait: the room
+    /// is held until one does (V210-164).
+    LeaveNotHeard,
+    /// A leave was overtaken: this node wrote in the room after it, or joined it again, so it is
+    /// in the room again (V210-164).
+    LeaveUndone,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
@@ -985,9 +985,6 @@ pub enum Fault {
     /// The room is over: its creator ended it, or its idle end ran out (V030-08). It takes no
     /// new message.
     RoomEnded,
-    /// This identity has left the room (V030-08): it says nothing more there, and the other
-    /// members no longer sync with it.
-    LeftRoom,
     /// Only the room's creator may do that — end the room (or an admin it delegated), or choose
     /// its idle end (V030-08).
     NotCreator,
@@ -1133,6 +1130,12 @@ impl Fault {
             Fault::RoomNotSynced => {
                 "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
             }
+            Fault::LeaveNotHeard => {
+                "no other member of the room could be told within 30s, so this node still holds it\n       it leaves as soon as one can be told, and the members see it then"
+            }
+            Fault::LeaveUndone => {
+                "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
+            }
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
             }
@@ -1143,10 +1146,7 @@ impl Fault {
                 "only the room's admin may change that, and this identity is not its admin\n       the room's creator and the admins it named are; `vox room admin list` shows who"
             }
             Fault::RoomEnded => {
-                "this room has ended — its creator ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       what was said stays readable here until you `vox room forget` it"
-            }
-            Fault::LeftRoom => {
-                "this identity has left that room, so it says nothing more there\n       `vox room forget` deletes what this node still holds of it"
+                "this room has ended — its creator or an admin ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       this node deletes it once it has passed the end on"
             }
             Fault::NotCreator => {
                 "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
@@ -1254,6 +1254,8 @@ fault_names!(
     BindFailed,
     AlreadyMember,
     RoomNotSynced,
+    LeaveNotHeard,
+    LeaveUndone,
     NotAServiceRoom,
     NotOffered,
     NameTaken,
@@ -1262,7 +1264,6 @@ fault_names!(
     AboveRoomRetention,
     RoomFromBeforeV030,
     RoomEnded,
-    LeftRoom,
     NotCreator,
     NotAnAdmin,
     NotRoomCreator,
@@ -1376,19 +1377,20 @@ pub enum NodeEvent {
         /// The channel.
         channel_id: Digest32,
     },
-    /// A room this node left or holds ended has been passed on and gone quiet (V030-08):
-    /// `handed` of `members` members were synced with after the fact; the rest learn it from
-    /// them, or from an anchor.
-    RoomQuiet {
+    /// A room this node holds ended, and the end has been passed on (V030-08): `handed` of
+    /// `members` members were synced with after it; the rest learn it from them, or from an
+    /// anchor. The room is deleted from this node next ([`NodeEvent::RoomRemoved`]).
+    RoomEnded {
         /// The room.
         channel_id: Digest32,
-        /// Members synced with after the leave or the end.
+        /// Members synced with after the end.
         handed: usize,
         /// Members it had to pass it to.
         members: usize,
     },
-    /// Everything this node held of a room was deleted (V030-08 `vox room forget`).
-    RoomForgotten {
+    /// Everything this node held of a room was deleted: it left the room (V210-164), or the
+    /// room ended (the decider, 2026-10-03).
+    RoomRemoved {
         /// The room.
         channel_id: Digest32,
     },

@@ -1,41 +1,38 @@
-//! V030-08 (#244) — **a node can leave, forget and end rooms cleanly**, driven through the shipped
-//! `vox` binary as a person or an agent runs it: real `vox daemon`s in one room, and every verb a
-//! separate `vox` process.
+//! V030-08 (#244) — **a node can leave a room, and an admin can end one, cleanly**, driven
+//! through the shipped `vox` binary as a person or an agent runs it: real `vox daemon`s in one
+//! room, and every verb a separate `vox` process.
 //!
 //! **Why.** Agents make a room per task and tear it down when the work is done (the decider,
-//! 2026-09-28). Before this, the only exit was the TUI's `:close`, which kept the room's data on
-//! disk, left the other members counting the node in and syncing with it, and nobody could end a
-//! room for everyone.
+//! 2026-09-28). Leaving deletes the room from the node that left, and ending it deletes it from
+//! every member's node, with no `forget` step (the decider, 2026-10-03).
 //!
 //! **Arms**, each a claim a person would check:
 //! - **Leave.** Alice runs `vox room leave`. Within [`WITHIN`] bob's and carol's rosters no longer
 //!   name her; from then on, while bob and carol keep posting to each other, bob opens and admits
-//!   no sync session with alice (his `vox status --json` sync row for her stays still), alice is
-//!   delivered none of the new posts, and her own post is refused as from a member who left.
+//!   no sync session with alice (his `vox status --json` sync row for her stays still), and alice
+//!   holds the room no more: her `vox room read` of it fails.
+//! - **Nothing left.** Alice leaves a room she shares with bob. The moment the leave answers,
+//!   `vox room list` lacks it and her `store.redb` no longer holds the room's id, which every one
+//!   of its rows is keyed by; it does not come back when her daemon restarts. Before the leave the
+//!   store does hold it: the control.
 //! - **Rejoin.** Alice leaves, then joins again through bob with the room's address and passphrase,
-//!   as anyone joins (the decider, 2026-10-01). Within [`WITHIN`] bob's and carol's rosters name her
-//!   again (carol learns it only from her signed return), what she posts reaches both and what bob
-//!   posts reaches her, and bob has not frozen her for signing two entries at one position: her
-//!   joined-again node continued her feed rather than restarting it.
-//! - **Forget.** Alice runs `vox room forget` on a room she is still in. It is left first (bob's
-//!   roster loses her), then nothing of the room is left on her node: `vox room list` lacks it, it
-//!   does not come back when her daemon restarts, and her `store.redb` no longer holds the room's
-//!   id, which every one of its rows is keyed by. Before the forget it does: the control.
+//!   as anyone joins. Within [`WITHIN`] bob's and carol's rosters name her again (carol learns it
+//!   only from her signed statement that she is back), what she posts reaches both and what bob
+//!   posts reaches her, and bob has not frozen her for signing two entries at one position.
 //! - **End.** Bob, who did not create the room, is refused `vox room admin add`. Alice, its
-//!   creator, makes bob and carol admins (`vox room admin add`) and takes carol's back (`remove`);
-//!   every member's `vox room admin list` says so. Carol is then refused `vox room end`, and bob, an
-//!   admin, ends the room. Afterwards carol forgets it and joins again with its address and
-//!   passphrase: she is told the room has ended, not that her passphrase is probably wrong. Within [`WITHIN`] every member's `vox room list` says it ended, every member's post
-//!   is refused, and what was said before stays readable.
+//!   creator, makes bob and carol admins and takes carol's back; every member's `vox room admin
+//!   list` says so. Carol is then refused `vox room end`, and bob, an admin, ends the room. Within
+//!   [`GONE`] the room is gone from every member's `vox room list` and store, with no forget. Then
+//!   carol joins again with its address and passphrase: she is told the room has ended, not that
+//!   her passphrase is probably wrong.
 //! - **Idle end.** Alice makes a room with `vox room create --idle-end` [`IDLE`]. A message said
 //!   before the idle time runs out keeps it going past [`IDLE`] from its creation; once nothing is
-//!   said for [`IDLE`], every member sees it ended and a post is refused. The room `support::room`
-//!   made without an idle end, idle for just as long, stays open: an idle end is never applied to
-//!   a room whose creator did not choose one.
-//!
+//!   said for [`IDLE`], it is gone from both members. The room `support::room` made without an
+//!   idle end, idle for just as long, stays: an idle end is never applied to a room whose creator
+//!   did not choose one.
 //! - **The TUI.** The same verbs typed in `vox tui` (`tests/pty/tui_room_verb.py`, a pty read
-//!   through `pyte`): carol's `:leave` drops her from alice's and bob's rosters; alice's `:end`
-//!   reaches bob's `vox room list`; alice's `:forget` leaves her store without the room's id.
+//!   through `pyte`): carol's `:leave` drops her from alice's and bob's rosters and the room from
+//!   her store; alice's `:end` takes the room off bob's `vox room list`.
 //!
 //! **Every red names which it is.** `PRODUCT:` — `vox` did the wrong thing, and what it said is
 //! quoted; `PRODUCT (staging):` — a `vox` step of the staging failed (a create, join, post or list
@@ -43,10 +40,10 @@
 //! stage (a temporary directory, a timing window, the TUI driver), so nothing about the claim was
 //! measured. The watchdog (`support/watchdog.rs`) names itself when it fires.
 //!
-//! **Mutations that must turn it red:** a member that left still synced with (leave); a member
-//! that joined again not saying it is back (rejoin); the room's rows not deleted (forget); a post
-//! taken after the end, an admin's end ignored, or a join to an ended room refused as a wrong
-//! passphrase (end); the idle end ignored (idle end).
+//! **Mutations that must turn it red:** a leave that keeps the room (leave, nothing left); a
+//! member that left still synced with (leave); an end that leaves the members' copies (end, idle
+//! end, TUI); a post taken after the end, an admin's end ignored, or a join to an ended room
+//! refused as a wrong passphrase (end).
 
 #![cfg(unix)]
 
@@ -66,6 +63,9 @@ use support::{Out, Room, Worker};
 const WITHIN: Duration = Duration::from_secs(30);
 /// The idle end the idle arm chooses.
 const IDLE: Duration = Duration::from_secs(40);
+/// How long every member may take to delete an ended room: it passes the end on first, to each
+/// member at its next sync, or for up to the node's 60 s wind-down when one cannot be reached.
+const GONE: Duration = Duration::from_secs(90);
 
 /// The room `support::room` makes, or a `PRODUCT (staging)` red naming why it could not.
 fn room_of(rt: &tokio::runtime::Runtime, tmp: &std::path::Path, names: &[&str]) -> Room {
@@ -129,6 +129,12 @@ fn sessions_with(w: &Worker, room: &str, peer: &str) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// Whether `w`'s store holds `cid`, which keys every row of the room.
+fn holds(w: &Worker, cid: &[u8]) -> bool {
+    let bytes = std::fs::read(w.paths.store_file()).unwrap_or_default();
+    bytes.windows(cid.len()).any(|x| x == cid)
 }
 
 /// `w`'s line for `room` in `vox room list`, or `None`.
@@ -202,16 +208,10 @@ fn a_member_that_left_is_synced_with_and_delivered_to_no_more() {
         "PRODUCT: bob kept syncing with alice after she left: his sessions with her went \
          {with_alice} -> {with_alice_after} while bob and carol posted"
     );
-    let read = setup(alice, &["room", "read", id]);
+    let read = alice.vox(None, &["room", "read", id]);
     assert!(
-        !read.stdout.contains("after alice left"),
-        "PRODUCT: alice was delivered posts made after she left the room: {}",
-        read.stdout
-    );
-    let o = alice.vox(None, &["room", "post", id, "alice, after leaving"]);
-    assert!(
-        !o.ok && o.stderr.contains("left"),
-        "PRODUCT: alice's post after leaving was not refused as from a member who left: {o:?}"
+        !read.ok && !read.stdout.contains("after alice left"),
+        "PRODUCT: alice still holds the room she left, and reads it: {read:?}"
     );
 }
 
@@ -349,7 +349,7 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
 
 #[test]
 #[ignore = "real daemons and an anchor, production Argon2id; CI runs it in release"]
-fn a_forgotten_room_leaves_nothing_on_the_node() {
+fn a_room_left_leaves_nothing_on_the_node() {
     watchdog::arm();
     let rt = runtime();
     let tmp = tempfile::tempdir().unwrap();
@@ -357,44 +357,40 @@ fn a_forgotten_room_leaves_nothing_on_the_node() {
     let id = room.id.clone();
     let cid = room.cid;
     let store = room.workers[0].paths.store_file();
-    let holds = |path: &std::path::Path| -> bool {
-        let bytes = std::fs::read(path).unwrap_or_default();
-        bytes.windows(cid.len()).any(|w| w == cid)
-    };
     assert!(
-        holds(&store),
-        "APPARATUS: alice's store.redb does not hold the room's id before the forget, so its \
+        holds(&room.workers[0], &cid),
+        "APPARATUS: alice's store.redb does not hold the room's id before the leave, so its \
          absence afterwards would show nothing: {}",
         store.display()
     );
 
     let (alice, bob) = (&room.workers[0], &room.workers[1]);
     let t = Instant::now();
-    let o = alice.vox(None, &["room", "forget", &id]);
-    assert!(o.ok, "PRODUCT: `vox room forget` was refused: {o:?}");
+    let o = alice.vox(None, &["room", "leave", &id]);
+    assert!(o.ok, "PRODUCT: `vox room leave` was refused: {o:?}");
     eprintln!(
-        "[proof] forget: done in {:.1}s; it said: {}",
+        "[proof] leave: done in {:.1}s; it said: {}",
         t.elapsed().as_secs_f64(),
         o.stdout.trim()
     );
-    // Checked the moment it answers: a forget that says it is done is done.
+    // Checked the moment it answers: a leave that says it is done is done.
     assert!(
-        !holds(&store),
-        "PRODUCT: `vox room forget` answered, and alice's store.redb still holds the room's id, which keys every one of its rows: {}",
+        !holds(alice, &cid),
+        "PRODUCT: `vox room leave` answered, and alice's store.redb still holds the room's id, \
+         which keys every one of its rows: {}",
         store.display()
+    );
+    assert!(
+        listed(alice, &id).is_none(),
+        "PRODUCT: `vox room list` still names the room alice left: {:?}",
+        listed(alice, &id)
     );
     let (gone, o2) = poll(bob, &["room", "roster", &id], WITHIN, |o| {
         o.ok && !o.stdout.contains(&alice.b32())
     });
     assert!(
         gone,
-        "PRODUCT: alice forgot the room without leaving it: {WITHIN:?} later, bob's roster still \
-         names her: {o2:?}"
-    );
-    assert!(
-        listed(alice, &id).is_none(),
-        "PRODUCT: `vox room list` still names the forgotten room: {:?}",
-        listed(alice, &id)
+        "PRODUCT: {WITHIN:?} after alice left, bob's roster still names her: {o2:?}"
     );
 
     // A daemon that restarts does not bring it back.
@@ -403,15 +399,15 @@ fn a_forgotten_room_leaves_nothing_on_the_node() {
     let alice = &room.workers[0];
     assert!(
         listed(alice, &id).is_none(),
-        "PRODUCT: the forgotten room came back when alice's daemon restarted: {:?}",
+        "PRODUCT: the room alice left came back when her daemon restarted: {:?}",
         listed(alice, &id)
     );
     assert!(
-        !holds(&store),
-        "PRODUCT: after a restart, alice's store.redb holds the forgotten room's id again"
+        !holds(alice, &cid),
+        "PRODUCT: after a restart, alice's store.redb holds the id of the room she left again"
     );
     eprintln!(
-        "[proof] forget: the room's id is in none of alice's store, before or after a restart"
+        "[proof] leave: the room's id is in none of alice's store, after the leave or a restart"
     );
 }
 
@@ -427,7 +423,6 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
         unreachable!()
     };
     let id = room.id.as_str();
-    setup(bob, &["room", "post", id, "said before the end"]);
     let link = setup(alice, &["room", "invite", id])
         .stdout
         .trim()
@@ -479,46 +474,34 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
         "PRODUCT: bob, an admin the creator named, was refused `vox room end`: {o:?}"
     );
     for w in [alice, bob, carol] {
-        let (ended, o) = poll(w, &["room", "list"], WITHIN, |o| {
-            o.stdout
-                .lines()
-                .any(|l| l.starts_with(&id[..12]) && l.contains("ended"))
+        let (gone, o) = poll(w, &["room", "list"], GONE, |o| {
+            o.ok && !o.stdout.lines().any(|l| l.starts_with(&id[..12]))
         });
         assert!(
-            ended,
-            "PRODUCT: {WITHIN:?} after bob, an admin, ended the room, {}'s `vox room list` \
-             does not say it ended: {o:?}",
+            gone,
+            "PRODUCT: {GONE:?} after bob, an admin, ended the room, {}'s `vox room list` still \
+             names it — an ended room must not need a forget: {o:?}",
             w.name
         );
-    }
-    eprintln!(
-        "[proof] end: every member listed the room as ended within {:.1}s",
-        t.elapsed().as_secs_f64()
-    );
-    for w in [alice, bob, carol] {
+        assert!(
+            !holds(w, &room.cid),
+            "PRODUCT: the room is off {}'s list, but its store.redb still holds the room's id",
+            w.name
+        );
         let o = w.vox(None, &["room", "post", id, "said after the end"]);
         assert!(
-            !o.ok && o.stderr.contains("ended"),
+            !o.ok,
             "PRODUCT: {}'s post was taken after the room ended: {o:?}",
             w.name
         );
     }
-    let (readable, o) = poll(carol, &["room", "read", id], WITHIN, |o| {
-        o.stdout.contains("said before the end")
-    });
-    assert!(
-        readable,
-        "PRODUCT: what was said before the end is no longer readable on carol: {o:?}"
-    );
-    assert!(
-        !o.stdout.contains("said after the end"),
-        "PRODUCT: carol shows a message said after the end: {}",
-        o.stdout
+    eprintln!(
+        "[proof] end: every member deleted the room within {:.1}s of the end",
+        t.elapsed().as_secs_f64()
     );
 
-    // Joining an ended room is refused as that, not as a wrong passphrase: carol forgets it and
-    // joins again with its address and passphrase.
-    setup(carol, &["room", "forget", id]);
+    // Joining an ended room is refused as that, not as a wrong passphrase: carol joins again with
+    // its address and passphrase.
     let o = carol.vox_in(
         None,
         &[
@@ -632,23 +615,21 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
         said.elapsed()
     );
 
-    // Nothing said for IDLE: it ends, on both members.
+    // Nothing said for IDLE: it ends, and is deleted, on both members.
     std::thread::sleep(IDLE + Duration::from_secs(5));
     for w in [alice, bob] {
-        let (ended, o) = poll(w, &["room", "list"], WITHIN, |o| {
-            o.stdout
-                .lines()
-                .any(|l| l.starts_with(&short) && l.contains("ended"))
+        let (gone, o) = poll(w, &["room", "list"], GONE, |o| {
+            o.ok && !o.stdout.lines().any(|l| l.starts_with(&short))
         });
         assert!(
-            ended,
-            "PRODUCT: {}'s `vox room list` does not say the room ended after {IDLE:?} with \
-             nothing said in it: {o:?}",
+            gone,
+            "PRODUCT: {}'s `vox room list` still names the room {GONE:?} after its {IDLE:?} \
+             idle end ran out with nothing said in it: {o:?}",
             w.name
         );
         let o = w.vox(None, &["room", "post", &short, "after the idle end"]);
         assert!(
-            !o.ok && o.stderr.contains("ended"),
+            !o.ok,
             "PRODUCT: {}'s post was taken after the room's idle end: {o:?}",
             w.name
         );
@@ -662,7 +643,7 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
     );
     assert!(
         listed(alice, control).is_some_and(|l| !l.contains("ended")),
-        "PRODUCT: the room made with no idle end is listed as ended: {:?}",
+        "PRODUCT: the room made with no idle end is gone or listed as ended: {:?}",
         listed(alice, control)
     );
     eprintln!(
@@ -723,7 +704,7 @@ fn tui_verb(w: &Worker, verb: &str, hold: Duration) {
 
 #[test]
 #[ignore = "real daemons, an anchor and `vox tui` in a pty, production Argon2id; needs pyte"]
-fn the_tui_leaves_ends_and_forgets() {
+fn the_tui_leaves_and_ends() {
     watchdog::arm();
     let rt = runtime();
     let tmp = tempfile::tempdir().unwrap();
@@ -744,30 +725,24 @@ fn the_tui_leaves_ends_and_forgets() {
             w.name
         );
     }
+    assert!(
+        !holds(&room.workers[2], &cid),
+        "PRODUCT: after carol's :leave in the TUI, her store.redb still holds the room's id: {}",
+        room.workers[2].paths.store_file().display()
+    );
 
     room.workers[0].stop_daemon();
     tui_verb(&room.workers[0], "end", Duration::from_secs(15));
     let bob = &room.workers[1];
-    let (ended, o) = poll(bob, &["room", "list"], WITHIN, |o| {
-        o.stdout
-            .lines()
-            .any(|l| l.starts_with(&id[..12]) && l.contains("ended"))
+    let (gone, o) = poll(bob, &["room", "list"], GONE, |o| {
+        o.ok && !o.stdout.lines().any(|l| l.starts_with(&id[..12]))
     });
     assert!(
-        ended,
-        "PRODUCT: after alice's :end in the TUI, bob's `vox room list` does not say the room \
-         ended: {o:?}"
+        gone,
+        "PRODUCT: {GONE:?} after alice's :end in the TUI, bob's `vox room list` still names the \
+         room: {o:?}"
     );
-
-    tui_verb(&room.workers[0], "forget", Duration::from_secs(3));
-    let store = room.workers[0].paths.store_file();
-    let bytes = std::fs::read(&store).unwrap_or_default();
-    assert!(
-        !bytes.windows(cid.len()).any(|w| w == cid),
-        "PRODUCT: after alice's :forget in the TUI, her store.redb still holds the room's id: {}",
-        store.display()
-    );
-    eprintln!("[proof] tui: :leave, :end and :forget each did what the CLI verb does");
+    eprintln!("[proof] tui: :leave and :end each did what the CLI verb does");
 }
 
 #[test]

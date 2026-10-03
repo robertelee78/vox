@@ -815,21 +815,15 @@ enum RoomCmd {
     /// and joining with it grants nothing. Goes to stdout so it pipes; the
     /// warnings go to stderr so they do not.
     Invite(RoomRefArgs),
-    /// Leave a room: the other members stop syncing with this node and delivering to it.
+    /// Leave a room: the other members are told, then the room is deleted from this node.
     ///
-    /// This node says so on the room's log, passes that to the members it can reach, and then
-    /// goes quiet in the room. What was said stays readable here until `vox room forget`.
-    /// Joining again later, with the room's address and passphrase, brings this node back.
+    /// Waits up to 30 s for another member to take the news. If none can be told by then, it
+    /// says so, and the node leaves as soon as one can. Joining again later works.
     Leave(RoomRefArgs),
-    /// Delete everything this node holds of a room.
+    /// End a room for everyone. Only the room's creator, or an admin it named, may.
     ///
-    /// A room this node is still in is left first (see `vox room leave`), and deleted once
-    /// that has been passed on to the members it can reach.
-    Forget(RoomRefArgs),
-    /// End a room for everyone. Only the room's creator may.
-    ///
-    /// Every member's node takes no new message in it from then on; what was said stays
-    /// readable on each until they `vox room forget` it.
+    /// Every member's node takes no new message in it from then on, passes the end on, and
+    /// deletes the room.
     End(RoomRefArgs),
     /// Make a member an admin of a room, take it back, or list the admins:
     /// `vox room admin add|remove <room> <member>`, `vox room admin list <room>`.
@@ -2167,7 +2161,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Create(a) => &a.profile,
                 RoomCmd::Invite(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
-                RoomCmd::Leave(a) | RoomCmd::Forget(a) | RoomCmd::End(a) => &a.profile,
+                RoomCmd::Leave(a) | RoomCmd::End(a) => &a.profile,
                 RoomCmd::Admin(a) => &a.profile,
             };
             let paths = match profile.paths() {
@@ -2315,7 +2309,6 @@ pub fn run() -> ExitCode {
                         }
                         RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
                         RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
-                        RoomCmd::Forget(a) => crate::room_cli::forget(&paths, &a.room).await,
                         RoomCmd::End(a) => crate::room_cli::end(&paths, &a.room).await,
                         RoomCmd::Admin(a) => {
                             crate::room_cli::admin(&paths, &a.action, &a.room, a.member.as_deref())
