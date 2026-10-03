@@ -1302,11 +1302,7 @@ impl SyncBook {
                 q(&t.why)
             );
         }
-        let _ = write!(
-            s,
-            "],\"tunnel_stuck_after\":{}",
-            stuck_after.as_secs()
-        );
+        let _ = write!(s, "],\"tunnel_stuck_after\":{}", stuck_after.as_secs());
         s
     }
 }

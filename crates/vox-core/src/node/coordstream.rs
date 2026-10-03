@@ -451,9 +451,8 @@ async fn copy_coord(mut recv: RecvStream, mut send: SendStream) {
 /// and fired its dial. A process may host several nodes (ADR-026 P-1), so each count is kept
 /// under (the node that asked, the target).
 #[allow(clippy::type_complexity)]
-static DIAL_BACKS: std::sync::Mutex<
-    std::collections::BTreeMap<(Digest32, Digest32), (u64, u64)>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static DIAL_BACKS: std::sync::Mutex<std::collections::BTreeMap<(Digest32, Digest32), (u64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Count the node `local`'s dial-back to `peer`: `asked` once its session is relayed, `answered`
 /// once the peer completed the exchange.

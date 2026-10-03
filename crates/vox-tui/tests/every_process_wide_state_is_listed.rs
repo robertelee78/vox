@@ -166,7 +166,10 @@ fn every_process_wide_state_is_listed() {
     let mut reds = Vec::new();
     let mut listed: BTreeMap<(String, String), (usize, &str, Option<&str>)> = BTreeMap::new();
     for (file, name, count, row, pending) in LISTED {
-        listed.insert(((*file).to_owned(), (*name).to_owned()), (*count, row, *pending));
+        listed.insert(
+            ((*file).to_owned(), (*name).to_owned()),
+            (*count, row, *pending),
+        );
     }
     for ((file, name), lines) in &found {
         match listed.get(&(file.clone(), name.clone())) {

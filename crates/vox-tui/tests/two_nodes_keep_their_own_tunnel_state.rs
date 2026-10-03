@@ -47,7 +47,7 @@ use tokio::net::{TcpListener, TcpStream};
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::SoftwareRootSigner;
 use vox_core::transport::quic::{
-    closed_tunnels, close_tunnels, live_tunnels, unix_now, TunnelSelector, VoxConnection,
+    close_tunnels, closed_tunnels, live_tunnels, unix_now, TunnelSelector, VoxConnection,
     VoxEndpoint,
 };
 use vox_core::tunnel::session;
@@ -108,7 +108,10 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
 }
 
 fn member_prefix(id: &Digest32) -> String {
-    vox_core::node::link::b32_encode(id).chars().take(12).collect()
+    vox_core::node::link::b32_encode(id)
+        .chars()
+        .take(12)
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -123,7 +126,11 @@ async fn a_node_lists_and_closes_only_its_own_tunnels() {
     let (a_to_x, _x_side) = connect(&a, &x, &mut at_x).await;
     let (b_to_y, _y_side) = connect(&b, &y, &mut at_y).await;
     let (ida, idb) = (a.local_id(), b.local_id());
-    assert_eq!(a_to_x.local_id(), ida, "APPARATUS: A's connection is not A's");
+    assert_eq!(
+        a_to_x.local_id(),
+        ida,
+        "APPARATUS: A's connection is not A's"
+    );
 
     let credit_a = a_to_x
         .carry_tunnel("a-service", true)
@@ -166,11 +173,8 @@ async fn a_node_lists_and_closes_only_its_own_tunnels() {
         by_member.is_empty() && by_number.is_empty(),
         "PRODUCT: A closed B's tunnel: by member {by_member:?}, by number {by_number:?}"
     );
-    let b_asked = tokio::time::timeout(
-        Duration::from_millis(300),
-        credit_b.watch().close_asked(),
-    )
-    .await;
+    let b_asked =
+        tokio::time::timeout(Duration::from_millis(300), credit_b.watch().close_asked()).await;
     assert!(
         b_asked.is_err(),
         "PRODUCT: B's tunnel was asked to close by A: {b_asked:?}"
@@ -226,10 +230,11 @@ async fn tunnel_nobody_reads(
         let _ = recv;
         while send.write_all(&chunk).await.is_ok() {}
     });
-    let (node_send, node_recv) = tokio::time::timeout(Duration::from_secs(10), conn.accept_stream())
-        .await
-        .expect("APPARATUS: the stream did not arrive")
-        .expect("APPARATUS: accept the stream");
+    let (node_send, node_recv) =
+        tokio::time::timeout(Duration::from_secs(10), conn.accept_stream())
+            .await
+            .expect("APPARATUS: the stream did not arrive")
+            .expect("APPARATUS: accept the stream");
     let (spliced, app) = tcp_pair().await;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -255,8 +260,7 @@ async fn a_stuck_tunnel_closes_by_its_own_nodes_setting() {
     let (a_to_x, x_to_a) = connect(&a, &x, &mut at_x).await;
     let (b_to_x, x_to_b) = connect(&b, &x, &mut at_x).await;
     let started = Instant::now();
-    let (a_done, a_writer, _a_app) =
-        tunnel_nobody_reads(Arc::new(a_to_x), Arc::new(x_to_a)).await;
+    let (a_done, a_writer, _a_app) = tunnel_nobody_reads(Arc::new(a_to_x), Arc::new(x_to_a)).await;
     let (mut b_done, b_writer, _b_app) =
         tunnel_nobody_reads(Arc::new(b_to_x), Arc::new(x_to_b)).await;
 
@@ -417,8 +421,12 @@ fn two_nodes_hold_circuits_to_one_peer_and_answer_only_their_own() {
             .expect("APPARATUS: wrap udp");
         let mux = MuxSocket::new(socket);
         let (a, b, x) = ([0xA1u8; 32], [0xB2u8; 32], [0x77u8; 32]);
-        let port_a = mux.attach(&a, &x, None, None).expect("APPARATUS: A's circuit");
-        let port_b = mux.attach(&b, &x, None, None).expect("APPARATUS: B's circuit");
+        let port_a = mux
+            .attach(&a, &x, None, None)
+            .expect("APPARATUS: A's circuit");
+        let port_b = mux
+            .attach(&b, &x, None, None)
+            .expect("APPARATUS: B's circuit");
         assert_ne!(port_a.addr(), port_b.addr(), "APPARATUS: one address twice");
         assert_eq!(
             mux.circuit_addr_of(&a, &x),
@@ -455,8 +463,16 @@ fn two_nodes_hold_circuits_to_one_peer_and_answer_only_their_own() {
             Some(port_b.addr()),
             "PRODUCT: dropping A's circuit took B's"
         );
-        assert_eq!(mux.circuit_addr_of(&a, &x), None, "PRODUCT: A's circuit outlived its port");
-        assert_eq!(mux.owner_of(port_b.addr()), Some(b), "PRODUCT: B's circuit's owner");
+        assert_eq!(
+            mux.circuit_addr_of(&a, &x),
+            None,
+            "PRODUCT: A's circuit outlived its port"
+        );
+        assert_eq!(
+            mux.owner_of(port_b.addr()),
+            Some(b),
+            "PRODUCT: B's circuit's owner"
+        );
         drop(port_b);
     });
 }

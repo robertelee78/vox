@@ -751,7 +751,8 @@ impl VoxEndpoint {
         relay: &Digest32,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach_via(&self.local_id, peer, relay, None, carrier)
+        self.mux
+            .attach_via(&self.local_id, peer, relay, None, carrier)
     }
 
     /// The relay carrying `peer`'s live circuit, if one is recorded.
@@ -969,7 +970,10 @@ impl VoxEndpoint {
         // **A circuit is answered only by the node it was attached for** (ADR-026 P-1): never by
         // another node sharing the socket, or one node's circuit would tell its relay whether
         // another is hosted here.
-        if !self.mux.serves_on(incoming.remote_address(), &self.local_id) {
+        if !self
+            .mux
+            .serves_on(incoming.remote_address(), &self.local_id)
+        {
             incoming.refuse();
             return Err(Error::Handshake(
                 "a circuit was asked for a node it does not carry".to_owned(),
