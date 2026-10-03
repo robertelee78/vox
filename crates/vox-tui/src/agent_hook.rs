@@ -434,29 +434,38 @@ fn render_header(total: usize) -> String {
     )
 }
 
+/// Bytes kept back from a turn's bound for each room's closing "more unread" line.
+const NOTE_RESERVE: usize = 256;
+
+/// Bytes kept back from a turn's bound for the one line naming the rooms not shown this turn.
+const SKIPPED_RESERVE: usize = 512;
+
 /// How much of a turn's bound (PRD-001 D9) is left, shared between the rooms with news.
+///
+/// The bound is on everything injected, headings and notes included, not only the messages.
 struct Budget {
     /// Messages still allowed this turn, of [`MAX_INJECTED_MESSAGES`].
     messages: usize,
-    /// Bytes of messages still allowed this turn, of [`MAX_INJECTED_BYTES`].
+    /// Bytes still allowed this turn, of [`MAX_INJECTED_BYTES`].
     bytes: usize,
     /// One room's fair share of messages.
     share_messages: usize,
-    /// One room's fair share of bytes.
+    /// One room's fair share of message bytes.
     share_bytes: usize,
     /// Whether nothing has been shown yet this turn.
     first: bool,
 }
 
 impl Budget {
-    /// The whole bound, shared between `speaking` rooms.
-    fn new(speaking: usize) -> Self {
+    /// What is left of the bound once `used` bytes are out, shared between `speaking` rooms.
+    fn new(speaking: usize, used: usize) -> Self {
         let speaking = speaking.max(1);
+        let bytes = MAX_INJECTED_BYTES.saturating_sub(used + SKIPPED_RESERVE);
         Self {
             messages: MAX_INJECTED_MESSAGES,
-            bytes: MAX_INJECTED_BYTES,
+            bytes,
             share_messages: (MAX_INJECTED_MESSAGES / speaking).max(1),
-            share_bytes: MAX_INJECTED_BYTES / speaking,
+            share_bytes: bytes / speaking,
             first: true,
         }
     }
@@ -512,6 +521,12 @@ fn render(
     me: Option<&Digest32>,
     budget: &mut Budget,
 ) -> (String, usize) {
+    let mut out = format!("\nIn room {room}, {} new:\n", rows.len() + beyond);
+    if let Some(n) = notice {
+        out.push_str(n);
+        out.push('\n');
+    }
+    let overhead = out.len() + NOTE_RESERVE;
     let mut body = String::new();
     let mut shown = 0usize;
     for r in rows {
@@ -521,12 +536,12 @@ fn render(
         let fits = if budget.first {
             true
         } else if shown == 0 {
-            budget.messages > 0 && one.len() <= budget.bytes
+            budget.messages > 0 && overhead + len <= budget.bytes
         } else {
             shown < budget.share_messages
                 && shown < budget.messages
                 && len <= budget.share_bytes
-                && len <= budget.bytes
+                && overhead + len <= budget.bytes
         };
         if !fits {
             break;
@@ -535,28 +550,44 @@ fn render(
         shown += 1;
         budget.first = false;
     }
-    budget.messages = budget.messages.saturating_sub(shown);
-    budget.bytes = budget.bytes.saturating_sub(body.len());
-    let mut out = format!("\nIn room {room}, {} new:\n", rows.len() + beyond);
-    if let Some(n) = notice {
-        out.push_str(n);
-        out.push('\n');
+    if shown == 0 {
+        return (String::new(), 0);
     }
     out.push_str(&body);
     let rest = rows.len() - shown + beyond;
-    if shown == 0 {
-        out.push_str(&format!(
-            "-- none shown: this turn's limit was reached; they follow on the next turn \
-             (`vox room read {room_label}` has them now) --\n"
-        ));
-    } else if rest > 0 {
+    if rest > 0 {
         out.push_str(&format!(
             "-- {rest} more unread message(s) in this room not shown; they follow on the next \
              turn (`vox room read {room_label} --since {}` has them now) --\n",
             b32_encode(&rows[shown - 1].entry_hash)
         ));
     }
+    budget.messages = budget.messages.saturating_sub(shown);
+    budget.bytes = budget.bytes.saturating_sub(out.len());
     (out, shown)
+}
+
+/// The one line naming the rooms with news that did not fit this turn, as `(heading, count)`,
+/// at most [`SKIPPED_RESERVE`] bytes: as many as fit, then how many more.
+fn render_skipped(skipped: &[(String, usize)]) -> String {
+    if skipped.is_empty() {
+        return String::new();
+    }
+    let open = "\n-- Also new, past this turn's limit; they follow on the next turn: ";
+    let close = " --\n";
+    let mut out = open.to_owned();
+    for (i, (heading, n)) in skipped.iter().enumerate() {
+        let item = format!("{}{heading}, {n}", if i == 0 { "" } else { "; " });
+        let more = skipped.len() - i;
+        let tail = format!("; and {more} more room(s)");
+        if out.len() + item.len() + tail.len() + close.len() > SKIPPED_RESERVE {
+            out.push_str(if i == 0 { &tail[2..] } else { &tail });
+            break;
+        }
+        out.push_str(&item);
+    }
+    out.push_str(close);
+    out
 }
 
 /// A room as the drain and a wake name it: its local name and the start of its id, or the id
@@ -979,13 +1010,28 @@ async fn drain(
     // Bounded (PRD-001 D9) for the whole turn, and shared between the rooms with news: what
     // did not fit is delivered next turn, so a room's cursor moves only as far as the last
     // message shown — or past everything when all of it was, or not at all when none was.
-    let mut budget = Budget::new(news.iter().filter(|d| !d.fresh.is_empty()).count());
     let total: usize = news.iter().map(|d| d.fresh.len() + d.beyond).sum();
     if news.iter().any(|d| !d.fresh.is_empty()) {
         context.push_str(&render_header(total));
     }
-    let mut upto: Vec<Upto> = Vec::with_capacity(drains.len());
-    for d in &drains {
+    let mut budget = Budget::new(
+        news.iter().filter(|d| !d.fresh.is_empty()).count(),
+        context.len(),
+    );
+    // **Oldest news first** (V210-163): the room whose oldest unread message is oldest goes
+    // first, so a room left out of one turn for lack of room leads the next, and a busy room
+    // cannot keep a quiet one silent turn after turn.
+    let mut order: Vec<usize> = (0..drains.len()).collect();
+    order.sort_by_key(|&i| {
+        drains[i]
+            .fresh
+            .first()
+            .map_or(u64::MAX, |r| r.created_millis)
+    });
+    let mut upto: Vec<Upto> = (0..drains.len()).map(|_| Upto::All).collect();
+    let mut skipped: Vec<(String, usize)> = Vec::new();
+    for &i in &order {
+        let d = &drains[i];
         let mut stop = Upto::All;
         if !d.fresh.is_empty() {
             let (text, shown) = render(
@@ -1000,12 +1046,14 @@ async fn drain(
             context.push_str(&text);
             if shown == 0 {
                 stop = Upto::Keep;
+                skipped.push((d.heading.clone(), d.fresh.len() + d.beyond));
             } else if shown < d.fresh.len() {
                 stop = Upto::At(d.fresh[shown - 1].entry_hash);
             }
         }
-        upto.push(stop);
+        upto[i] = stop;
     }
+    context.push_str(&render_skipped(&skipped));
     emit(format, raw_input, &input.event, &context);
 
     for (d, stop) in drains.iter().zip(upto) {

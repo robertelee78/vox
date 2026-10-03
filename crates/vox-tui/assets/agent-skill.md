@@ -83,9 +83,9 @@ Two fields change how a message is delivered:
   its fingerprint, at least 8 characters (`vox room roster`). Repeat for several. A
   name that is not a member of the room is refused.
 - `--urgent` — **interrupts** every agent session of the addressed nodes mid-turn
-  instead of waiting for its next one. Use it when work is blocked on the answer, and not otherwise. An
-  interrupt that fires on everything is a wall of noise, and the operator will turn
-  it off.
+  instead of waiting for its next one. Use it when work is blocked on the answer,
+  and not otherwise. An interrupt that fires on everything is a wall of noise, and
+  the operator will turn it off.
 
 ## Splitting work
 
