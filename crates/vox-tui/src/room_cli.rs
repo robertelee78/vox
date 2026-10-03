@@ -1490,7 +1490,7 @@ fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, App
 /// `vox room claim` — take a resource, or complete a handoff pending for this session.
 ///
 /// It says "you hold it" only once every other member of the room agrees (V210-168): see
-/// [`agreement`].
+/// `agreement`.
 ///
 /// # Errors
 /// Exit 1 if somebody else holds it, 3 on a version refusal, 4 on an op conflict, 5 if not every
