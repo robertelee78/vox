@@ -29,7 +29,7 @@ import os, signal, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pyte, stage, is_attached  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, CUE, TAG = sys.argv[1:7]
 EXTRA = dict(kv.split("=", 1) for kv in sys.argv[7:])
@@ -84,7 +84,7 @@ try:
             print(f"{TAG} APPARATUS: no lock cue:\n{tui.text()}")
             sys.exit(2)
         tui.pump(0.1)
-        if not said_unlocked and "unlocked" in bottom():
+        if not said_unlocked and is_attached(bottom()):
             cue("unlocked")
             said_unlocked = True
     with open(os.path.join(CUE, "lock")) as f:
