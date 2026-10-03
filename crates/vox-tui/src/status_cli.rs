@@ -14,13 +14,10 @@ use crate::app::AppError;
 
 /// `vox status`.
 pub async fn status(paths: &Paths, json: bool) -> Result<(), AppError> {
-    let sock = paths.socket_file();
-    let report = vox_core::node::status::request(&sock).await.map_err(|e| {
-        AppError::Usage(format!(
-            "no node answers at {} — start one with `vox daemon` (or `vox tui`): {e}",
-            sock.display()
-        ))
-    })?;
+    let at = crate::client::one_shot(paths)?;
+    let report = vox_core::node::status::request(&at)
+        .await
+        .map_err(|e| crate::client::said(&at, e))?;
     if json {
         println!("{report}");
         return Ok(());

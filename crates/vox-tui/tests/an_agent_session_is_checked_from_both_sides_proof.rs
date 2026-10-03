@@ -202,13 +202,28 @@ fn an_agent_session_is_checked_from_both_sides() {
 
     // ---- bob's wiring, installed from vox's own output ----
     let (alice, bob) = (&r.workers[0], &r.workers[1]);
-    let claude = bob_vox(bob, &home, &["agent", "plugin", "claude"], None);
+    let claude = bob_vox(
+        bob,
+        &home,
+        &["agent", "plugin", "claude", "--node", "default"],
+        None,
+    );
     claude.expect_ok("`vox agent plugin claude`");
     write(&home.claude(), &claude.stdout);
-    let plugin = bob_vox(bob, &home, &["agent", "plugin", "opencode"], None);
+    let plugin = bob_vox(
+        bob,
+        &home,
+        &["agent", "plugin", "opencode", "--node", "default"],
+        None,
+    );
     plugin.expect_ok("`vox agent plugin opencode`");
     write(&home.plugin(), &plugin.stdout);
-    let codex = bob_vox(bob, &home, &["agent", "plugin", "codex"], None);
+    let codex = bob_vox(
+        bob,
+        &home,
+        &["agent", "plugin", "codex", "--node", "default"],
+        None,
+    );
     codex.expect_ok("`vox agent plugin codex`");
     write(&home.codex().join("hooks.json"), &codex.stdout);
     bob_vox(bob, &home, &["agent", "trust", "codex"], None).expect_ok("`vox agent trust codex`");
@@ -225,7 +240,7 @@ fn an_agent_session_is_checked_from_both_sides() {
     bob.vox_env(
         None,
         &session_env,
-        &["agent", "hook", "--room", &room],
+        &["agent", "hook", "--node", "default", "--room", &room],
         Some(hook_input),
     )
     .expect_ok("bob's session's first drain");
@@ -345,7 +360,9 @@ fn an_agent_session_is_checked_from_both_sides() {
         let drained = w.vox_env(
             None,
             env,
-            &["agent", "hook", "--room", &room, "--format", "text"],
+            &[
+                "agent", "hook", "--node", "default", "--room", &room, "--format", "text",
+            ],
             Some(&input),
         );
         drained.expect_ok(&format!("{who}'s drain"));

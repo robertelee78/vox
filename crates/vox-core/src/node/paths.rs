@@ -261,6 +261,41 @@ impl Account {
         out
     }
 
+    /// Take the account's lock now, or `None` if another process holds it (the daemon, which
+    /// holds it for its whole life, ADR-026 D-1).
+    ///
+    /// # Errors
+    /// If `.daemon/` or the lock cannot be made.
+    pub fn try_lock(&self) -> Result<Option<std::fs::File>> {
+        let file = self.open_lock()?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(Error::Path {
+                op: "take the account lock",
+                detail: format!("{}: {e}", self.lock_file().display()),
+            }),
+        }
+    }
+
+    /// Open (creating) `.daemon/lock`, `0600`.
+    fn open_lock(&self) -> Result<std::fs::File> {
+        create_private_dir(&self.data_root)?;
+        create_private_dir(&self.daemon_dir())?;
+        let path = self.lock_file();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(&path).map_err(|e| Error::Path {
+            op: "open the account lock",
+            detail: format!("{}: {e}", path.display()),
+        })
+    }
+
     /// Take the account's lock (`.daemon/lock`, ADR-026 D-1), waiting up to
     /// [`PROFILE_PATIENCE`](crate::node::profile::PROFILE_PATIENCE) for another holder; it is
     /// released when the returned handle drops or the process ends.

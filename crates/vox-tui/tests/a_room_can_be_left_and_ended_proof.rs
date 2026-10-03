@@ -486,7 +486,11 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     // read cursor under the room, which must not outlive it.
     for w in [alice, bob, carol] {
         let session = format!(r#"{{"session_id":"end-{}","cwd":"/tmp"}}"#, w.name);
-        let o = w.vox_in(None, &["agent", "hook", "--room", &id[..8]], Some(&session));
+        let o = w.vox_in(
+            None,
+            &["agent", "hook", "--node", "default", "--room", &id[..8]],
+            Some(&session),
+        );
         assert!(
             o.ok && !cursors_of(w, id).is_empty(),
             "PRODUCT (staging): {}'s `vox agent hook` left no read cursor for the room: {o:?}",

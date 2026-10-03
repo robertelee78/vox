@@ -47,18 +47,17 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::cbor::{Decoder, Encoder};
-use crate::error::{Error, IpcHandshake, Result};
+use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
 use crate::node::app::AppStats;
-use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
+use crate::node::ipc::{read_frame, write_frame, Frame};
 use crate::node::link::b32_encode;
 use crate::transport::router::DatagramStats;
 
@@ -1517,19 +1516,19 @@ pub async fn serve_close(
     write_frame(stream, &e.finish()).await
 }
 
-/// Ask the node listening on `path` to close the tunnels `which` names: how many it closed,
+/// Ask the node `at` names to close the tunnels `which` names: how many it closed,
 /// and each as `vox status` lists it — or none, and why not, when `which` named more than one
 /// member.
 ///
 /// # Errors
 /// If the node cannot be reached, does not answer in time, or answers something else.
 pub async fn request_close(
-    path: &Path,
+    at: &crate::node::ipc::NodeSocket,
     which: &crate::transport::quic::TunnelSelector,
 ) -> Result<(u64, String)> {
     let body = tokio::time::timeout(
         crate::node::ipc::ANSWER_WITHIN,
-        exchange(path, close_body(which)),
+        exchange(at, close_body(which)),
     )
     .await
     .map_err(|_| crate::node::ipc::silent())??;
@@ -1622,23 +1621,23 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
     write_frame(stream, &body).await
 }
 
-/// Ask the node at `path` for its status, as JSON.
+/// Ask the node `at` names for its status, as JSON.
 ///
 /// **Bounded by [`ANSWER_WITHIN`](crate::node::ipc::ANSWER_WITHIN)** (V210-83): a suspended node's
 /// socket still accepts, and `vox status` against one waited for ever.
 ///
 /// # Errors
 /// If the node cannot be reached, does not answer in time, or answers something else.
-pub async fn request(path: &Path) -> Result<String> {
-    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, ask(path))
+pub async fn request(at: &crate::node::ipc::NodeSocket) -> Result<String> {
+    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, ask(at))
         .await
         .map_err(|_| crate::node::ipc::silent())?
 }
 
-async fn ask(path: &Path) -> Result<String> {
+async fn ask(at: &crate::node::ipc::NodeSocket) -> Result<String> {
     let mut e = Encoder::new();
     e.array(1).uint(T_STATUS);
-    let body = exchange(path, e.finish()).await?;
+    let body = exchange(at, e.finish()).await?;
     let mut d = Decoder::new(&body);
     if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
         return d
@@ -1655,29 +1654,17 @@ async fn ask(path: &Path) -> Result<String> {
     }
 }
 
-/// Greet the node listening on `path`, send it `request`, and return its one reply.
-async fn exchange(path: &Path, request: Vec<u8>) -> Result<Vec<u8>> {
-    let mut stream = crate::node::ipc::connect_own(path).await?;
+/// Greet the daemon as the node `at` names (ADR-026 C-2), send it `request`, and return its one
+/// reply.
+async fn exchange(at: &crate::node::ipc::NodeSocket, request: Vec<u8>) -> Result<Vec<u8>> {
+    let (mut stream, _) = crate::node::ipc::open_as(at).await?;
     // A connection that ends is named as such, never as a malformed message (V210-101); and none
     // of this is an identity bundle, which `MalformedBundle` said.
-    let Some(hello) = read_frame(&mut stream).await? else {
-        return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
-    };
-    match Frame::from_bytes(&hello)? {
-        Frame::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => {}
-        Frame::Hello { protocol, .. } => {
-            return Err(Error::Ipc(IpcHandshake::Protocol {
-                mine: PROTOCOL_VERSION,
-                theirs: protocol,
-            }))
-        }
-        _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
-    }
     if let Err(e) = write_frame(&mut stream, &request).await {
-        return Err(crate::node::ipc::named(path, e).await);
+        return Err(crate::node::ipc::named(&at.path, e).await);
     }
     let Some(body) = read_frame(&mut stream).await? else {
-        return Err(crate::node::ipc::hung_up(path).await);
+        return Err(crate::node::ipc::hung_up(&at.path).await);
     };
     Ok(body)
 }

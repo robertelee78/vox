@@ -31,7 +31,6 @@
 //! These tags sit far from the sequential ones in [`crate::node::ipc`], as its later
 //! additive tags do, so they cannot collide with a tag another branch assigns there.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,7 +41,7 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
 use crate::node::app::{AppIncoming, AppInfo, AppStream, MAX_LABELS};
-use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
+use crate::node::ipc::{read_frame, write_frame, Frame, NodeSocket};
 
 const T_APP_LISTEN: u64 = 2201;
 const T_APP_ACCEPT: u64 = 2202;
@@ -472,19 +471,9 @@ async fn splice(mut unix: UnixStream, app: AppStream) -> Result<()> {
 
 // ---- client ----------------------------------------------------------------
 
-async fn connect(path: &Path) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
-        op: "connect control socket",
-        detail: format!("{}: {e}", path.display()),
-    })?;
-    let Some(hello) = read_frame(&mut stream).await? else {
-        return Err(Error::MalformedBundle("ipc closed before hello"));
-    };
-    match Frame::from_bytes(&hello)? {
-        Frame::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => Ok(stream),
-        Frame::Hello { .. } => Err(Error::MalformedBundle("ipc protocol version")),
-        _ => Err(Error::MalformedBundle("ipc expected hello")),
-    }
+/// A connection to the daemon acting as the node `at` names (ADR-026 C-2).
+async fn connect(at: &NodeSocket) -> Result<UnixStream> {
+    Ok(crate::node::ipc::open_as(at).await?.0)
 }
 
 async fn ask(stream: &mut UnixStream, req: &AppRequest) -> Result<AppReply> {
@@ -526,8 +515,12 @@ fn refused(reason: String) -> Error {
 ///
 /// # Errors
 /// If the node is not running, or refuses.
-pub async fn listen(path: &Path, channel_id: Option<Digest32>, label: &str) -> Result<IpcListener> {
-    let mut stream = connect(path).await?;
+pub async fn listen(
+    at: &NodeSocket,
+    channel_id: Option<Digest32>,
+    label: &str,
+) -> Result<IpcListener> {
+    let mut stream = connect(at).await?;
     match ask(
         &mut stream,
         &AppRequest::Listen {
@@ -547,8 +540,8 @@ pub async fn listen(path: &Path, channel_id: Option<Digest32>, label: &str) -> R
 ///
 /// # Errors
 /// If the node is not running, or the stream is not waiting.
-pub async fn accept(path: &Path, id: u64) -> Result<(UnixStream, AppInfo)> {
-    let mut stream = connect(path).await?;
+pub async fn accept(at: &NodeSocket, id: u64) -> Result<(UnixStream, AppInfo)> {
+    let mut stream = connect(at).await?;
     match ask(&mut stream, &AppRequest::Accept { id }).await? {
         AppReply::Splice(info) => Ok((stream, info)),
         AppReply::Error(r) => Err(refused(r)),
@@ -561,13 +554,13 @@ pub async fn accept(path: &Path, id: u64) -> Result<(UnixStream, AppInfo)> {
 /// # Errors
 /// If the node is not running, would not open it, or the peer refused.
 pub async fn open(
-    path: &Path,
+    at: &NodeSocket,
     channel_id: Digest32,
     peer: Digest32,
     labels: Vec<String>,
     datagrams: bool,
 ) -> Result<(UnixStream, AppInfo)> {
-    let mut stream = connect(path).await?;
+    let mut stream = connect(at).await?;
     match ask(
         &mut stream,
         &AppRequest::Open {

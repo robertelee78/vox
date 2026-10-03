@@ -1,9 +1,9 @@
-//! ADR-020 §8 — `vox room`: the agent-facing verbs, over a **running** node.
+//! ADR-020 §8 — `vox room`: the agent-facing verbs, over an **attached** node.
 //!
-//! Every other `vox` verb spawns a node of its own. These do not, and that is the
-//! point: agent comms puts several agent sessions on one harness node (ADR-020
-//! §2, one identity per `(host, harness)`), so these connect to the control
-//! socket of a node that is already running and already unlocked.
+//! These are one-shot clients of the vox daemon (ADR-026 L-2): they never attach a node, and
+//! ask as one that is already attached. That is the point: agent comms puts several agent
+//! sessions on one harness node (ADR-020 §2, one identity per `(host, harness)`), so these
+//! reach the daemon's socket as that node, already running and already unlocked.
 //!
 //! Two consequences fall out of that, both intended:
 //!
@@ -21,7 +21,6 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 
-use vox_core::error::{Error, IpcHandshake};
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode, B32_DIGEST_LEN};
@@ -30,50 +29,15 @@ use vox_core::node::paths::Paths;
 use crate::app::AppError;
 use crate::tunnel_cli::resolve_prefix;
 
-/// Connect to the running node's control socket for this profile.
+/// Connect to the daemon as this node, which must be attached already (ADR-026 L-2: a one-shot
+/// verb never attaches).
 ///
-/// The failure an operator will actually hit is "no node is running", so it says
-/// that rather than surfacing a connect error — **and names the thing that would
-/// actually fix it.** It used to say "Start one with `vox node`", which is the first
-/// error a new person meets and it sent them in a circle: `vox node` is an anchor, it
-/// holds no room and serves no control socket, so following the advice produced this
-/// same message again, verbatim. `vox daemon` is what holds a profile's rooms and
-/// serves this socket.
+/// Each way it fails needs a different remedy, so each gets its own sentence (#191): no daemon
+/// running, the node not attached (the daemon's refusal says how to attach it), a socket that is
+/// not this user's.
 pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
-    let sock = paths.socket_file();
-    if !sock.exists() {
-        return Err(AppError::Usage(format!(
-            "no node is running for this profile, so there is nothing to ask.\n\
-             \x20      Start one:  vox daemon        (holds this profile's rooms, no \
-             terminal needed)\n\
-             \x20             or:  vox tui           (the interactive client)\n\
-             \x20      `vox node` will NOT do: it is an anchor, it holds no room and \
-             serves no socket.\n\
-             \x20      Socket: {}",
-            paths.socket_file().display()
-        )));
-    }
-    // Each way an attach fails needs a different remedy, so each gets its own sentence
-    // (#191): they were one, "nothing answered — the node may have stopped", which is true
-    // only of a stale socket, and the actual error was thrown away.
-    let mut client = IpcClient::open(&sock).await.map_err(|e| {
-        let at = sock.display();
-        AppError::Usage(match e {
-            Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
-                "a control socket exists at {at} but nothing is listening on it ({reason}) — \
-                 the node may have stopped without cleaning up. Starting a node again replaces it."
-            ),
-            Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => format!(
-                "a control socket exists at {at}, but {h}: it may be shutting down. Try again, \
-                 or start one with `vox daemon`."
-            ),
-            Error::Ipc(h) => format!("{h}. Socket: {at}"),
-            other => format!(
-                "a control socket exists at {at} but nothing answered ({other}) — the node may \
-                 have stopped without cleaning up. Starting a node again replaces it."
-            ),
-        })
-    })?;
+    let at = crate::client::one_shot(paths)?;
+    let mut client = crate::client::open(&at).await?;
     // Every author this command prints is named as this node names it (V210-162).
     crate::ident::load_names(&mut client).await;
     Ok(client)
@@ -1143,7 +1107,10 @@ pub async fn read(
 /// The services of the tunnels open to or from `member`, each with its count (`22 ×2`), from
 /// `vox status`. Empty when the node does not say.
 async fn tunnels_to(paths: &Paths, member: &Digest32) -> Vec<String> {
-    let Ok(json) = vox_core::node::status::request(&paths.socket_file()).await else {
+    let Ok(at) = crate::client::one_shot(paths) else {
+        return Vec::new();
+    };
+    let Ok(json) = vox_core::node::status::request(&at).await else {
         return Vec::new();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -1170,7 +1137,10 @@ async fn tunnels_to(paths: &Paths, member: &Digest32) -> Vec<String> {
 /// The members the node holds back for equivocating in `room` (V210-63), from `vox status`.
 /// Empty when the node does not say: the rows are still worth printing.
 async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)> {
-    let Ok(json) = vox_core::node::status::request(&paths.socket_file()).await else {
+    let Ok(at) = crate::client::one_shot(paths) else {
+        return Vec::new();
+    };
+    let Ok(json) = vox_core::node::status::request(&at).await else {
         return Vec::new();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -3743,16 +3713,6 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
 
 // ---------------------------------------------------------------- the trust keyring
 
-/// Whether a node is already serving this profile's control socket.
-///
-/// Used to decide whether a verb should ask the running node or start its own. It is a
-/// probe, not a guarantee: the node may stop between this answering and the request being
-/// made, and the caller handles that the same way it handles any other socket failure.
-pub async fn node_is_running(paths: &Paths) -> bool {
-    let sock = paths.socket_file();
-    sock.exists() && IpcClient::open(&sock).await.is_ok()
-}
-
 /// Send a keyring change, giving the identity passphrase only when the node says it needs it
 /// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
 /// gave (`--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`); it is sent at once, and a right
@@ -3917,26 +3877,46 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
     }
 }
 
-/// `vox id`, asked of the running node.
+/// `vox id`: this node's fingerprint, from the daemon when the node is attached, else from its
+/// files; a node with no identity has one made first (ADR-026 C-5).
 ///
-/// Printing your own fingerprint is the most ordinary thing a person does — it is what
-/// they send to somebody who will type it into `vox trust add` — and it needs no secret
-/// and changes nothing. It nevertheless failed outright whenever a daemon held the
-/// profile, because it went through a node of its own.
+/// Printing your own fingerprint is the most ordinary thing a person does — it is what they send
+/// to somebody who will type it into `vox trust add` — and it needs no secret and changes nothing,
+/// so it starts no daemon and attaches nothing.
 ///
-/// The socket's hello already carries it (protocol 2's `me`), so this costs no new
-/// request and no passphrase: a fingerprint is public.
-pub async fn print_identity(paths: &Paths) -> Result<(), AppError> {
-    let client = attach(paths).await?;
-    let Some(me) = client.me() else {
-        return Err(AppError::Usage(
-            "the running node has no identity yet. Make one:  vox id  (with the daemon \
-             stopped)"
-                .into(),
-        ));
+/// # Errors
+/// The node's files cannot be read, or a new identity's passphrase cannot be had.
+pub fn print_identity(
+    paths: &Paths,
+    flag: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> Result<(), AppError> {
+    let fingerprint = if vox_core::node::profile::Profile::exists(paths) {
+        let attached = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|rt| {
+                rt.block_on(async {
+                    let at = crate::client::one_shot(paths).ok()?;
+                    IpcClient::open_at(&at).await.ok()?.me()
+                })
+            });
+        match attached {
+            Some(me) => me,
+            // Not attached: the node's files say it, in the clear (a fingerprint is public).
+            None => vox_core::node::profile::Profile::open(paths.clone())?.fingerprint(),
+        }
+    } else {
+        // **A node with no identity has one made here** (ADR-026 C-5), with a passphrase asked
+        // twice at a terminal or given, never by a daemon.
+        let passphrase = zeroize::Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
+            paths, flag, file,
+        )?);
+        crate::client::create_identity(paths, &passphrase)?
     };
     // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
-    println!("{}", vox_core::node::link::b32_encode(&me));
+    println!("{}", vox_core::node::link::b32_encode(&fingerprint));
     Ok(())
 }
 

@@ -78,7 +78,7 @@ fn codex_present(home: &Path) -> bool {
 /// flat entry Codex ignores shipped while this proof stayed green (V210-133, #352).
 fn plugin_entry(command: &str) -> serde_json::Value {
     let out = Command::new(VOX)
-        .args(["agent", "plugin", "codex"])
+        .args(["agent", "plugin", "codex", "--node", "default"])
         .output()
         .expect("APPARATUS: cannot run vox agent plugin codex");
     assert!(

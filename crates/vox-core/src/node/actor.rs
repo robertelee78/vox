@@ -464,7 +464,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReachFailed { .. } => "filing a failed dial",
         NetEvent::UpgradeFailed { .. } => "filing a path upgrade that failed",
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
-        NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
+        NetEvent::AddressesDiscovered => "publishing every room at a new address",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
@@ -531,31 +531,6 @@ async fn announce(conn: &VoxConnection, prejoin_wire: &[u8]) -> crate::error::Re
     };
     client.finish();
     res
-}
-
-/// When granted mappings must be re-requested: half the shortest granted lifetime
-/// (the renewal interval RFC 6887 §11.2.1 recommends), or `None` when no gateway
-/// granted anything and so there is nothing to keep alive.
-///
-/// Half the *shortest* lifetime, not the requested one: a gateway may grant less than
-/// asked, and the mapping that expires first is the one that governs. A lifetime of
-/// zero is a **permanent** grant (UPnP routers that refuse timed leases) and never
-/// needs renewing — it is deleted when the network stops instead.
-fn renew_at(now: u64, mappings: &[crate::nat::portmap::PortMapping]) -> Option<u64> {
-    mappings
-        .iter()
-        .map(|m| m.lifetime_secs)
-        .filter(|l| *l > 0)
-        .min()
-        // `max(2)` keeps the interval at one second or more: a zero would re-request
-        // on every tick.
-        .map(|l| now + u64::from(l.max(2) / 2))
-}
-
-/// Whether a mapping is the IPv6 pinhole (`true`) rather than the IPv4 mapping: the two address
-/// families are renewed, retried and expired independently (V210-75).
-fn mapping_is_v6(m: &crate::nat::portmap::PortMapping) -> bool {
-    m.method == crate::nat::portmap::Method::PcpV6Pinhole
 }
 
 /// Where a node's endpoint binds.
@@ -792,14 +767,6 @@ const ANCHOR_DIAL_CANDIDATES: usize = 4 * crate::nat::multiaddr::MAX_ENDPOINTS;
 /// [`ANCHOR_REDIAL_SECS`].
 const ANCHOR_FLAP_SECS: u64 = 10;
 
-/// The first wait before a port-mapping renewal that got nothing back is tried again (V210-75),
-/// doubling to [`MAPPING_RETRY_MAX_SECS`]. A gateway that is restarting, or a request lost on
-/// the way, must not end renewal for the life of the node.
-const MAPPING_RETRY_SECS: u64 = 15;
-
-/// The longest wait between retries of a failed port-mapping renewal.
-const MAPPING_RETRY_MAX_SECS: u64 = 600;
-
 /// How long an anchor connection may hear nothing before every tick probes it (V210-93).
 const ANCHOR_PROBE_AFTER: Duration = Duration::from_secs(3);
 
@@ -923,12 +890,9 @@ enum NetEvent {
         /// The members it named, and their ports.
         entries: Vec<crate::node::nearby::Entry>,
     },
-    /// The ladder's publish side finished: this node now knows what to advertise, and
-    /// which mappings a gateway granted (each of which will need renewing).
-    AddressesDiscovered {
-        /// Every granted mapping or pinhole, possibly none.
-        mappings: Vec<crate::nat::portmap::PortMapping>,
-    },
+    /// The presence's publish side composed what its nodes advertise (ADR-026 D-3): this node's
+    /// records are published again with it.
+    AddressesDiscovered,
     /// A configured anchor answered its dial (ADR-016 M15.1): it gets the ordinary
     /// bookkeeping, the `Anchor` class, and every open channel's records.
     AnchorConnected {
@@ -3402,9 +3366,8 @@ pub struct Node {
     /// Each entry keeps its connection weakly, so entries for connections that are gone are
     /// dropped and the map is as small as the set of live ones.
     stream_loops: std::collections::BTreeMap<u64, std::sync::Weak<VoxConnection>>,
-    /// The gateway port mapping in force, if one was granted. Held so it can be
-    /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
-    port_mappings: Vec<crate::nat::portmap::PortMapping>,
+    /// The task telling this node each new composition of its presence's addresses.
+    addresses_task: Option<tokio::task::AbortHandle>,
     /// Per anchor that failed to connect: when it may be dialled again (unix seconds), and the
     /// wait that set it, doubling to [`ANCHOR_REDIAL_SECS`] (V210-57). No entry: dial when
     /// needed.
@@ -3429,23 +3392,9 @@ pub struct Node {
     anchor_unreached_since: BTreeMap<Digest32, u64>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
-    /// When the granted mappings must be renewed (unix seconds), or `None` when there
-    /// is nothing to renew. A mapping a gateway grants for two hours outlives no
-    /// long-running node by itself: it is re-requested at half its lifetime, the
-    /// interval RFC 6887 §11.2.1 recommends.
-    renew_mappings_at: Option<u64>,
     /// When each open room's own records are next renewed on this node's board and its anchors
     /// (V210-68, #258): half their lifetime after the last round that signed them.
     records_renew_at: BTreeMap<Digest32, u64>,
-    /// Per address family (`true` for the IPv6 pinhole, `false` for the IPv4 mapping), when the
-    /// timed lease held for it runs out (unix seconds). Until then its mapped address is still
-    /// advertised, even while its renewal is failing (V210-75).
-    mapping_expires: BTreeMap<bool, u64>,
-    /// Per address family, the wait set after the last renewal that got nothing back for it:
-    /// doubles from [`MAPPING_RETRY_SECS`] to [`MAPPING_RETRY_MAX_SECS`], and is gone once that
-    /// family is granted again (V210-75). One family's lost renewal is retried on its own clock,
-    /// not at the other's half-lifetime.
-    mapping_retry: BTreeMap<bool, u64>,
     /// ADR-025's sync ports, one per `(room, peer)`: see `node::ports`.
     ports: BTreeMap<(Digest32, Digest32), crate::node::ports::Port>,
     /// Ports waiting for an outbound slot (ADR-025 D6).
@@ -4001,7 +3950,7 @@ impl Node {
             forwards: BTreeMap::new(),
             pow_params,
             stream_loops: std::collections::BTreeMap::new(),
-            port_mappings: Vec::new(),
+            addresses_task: None,
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             anchor_window: BTreeMap::new(),
@@ -4009,10 +3958,7 @@ impl Node {
             anchors_up: BTreeMap::new(),
             anchor_unreached_since: BTreeMap::new(),
             sync_dials: BTreeSet::new(),
-            renew_mappings_at: None,
             records_renew_at: BTreeMap::new(),
-            mapping_expires: BTreeMap::new(),
-            mapping_retry: BTreeMap::new(),
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
             slots: Arc::new(std::sync::Mutex::new(crate::node::ports::Slots::default())),
@@ -4395,7 +4341,6 @@ impl Node {
                     self.note_peers_seen();
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
-                    self.renew_mappings_if_due();
                     self.renew_records_if_due().await;
                     if self.view_stale.load(std::sync::atomic::Ordering::Relaxed) {
                         self.refresh_network_view().await;
@@ -4776,7 +4721,7 @@ impl Node {
         let endpoint = link.endpoint;
         // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
         endpoint.local().set_stuck_after(self.stuck_after);
-        let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
+        let mut net = NodeNet::new(endpoint, Arc::clone(&presence), Arc::clone(&self.clock));
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
         net.serve_rooms(match (self.anchor_boards, self.serve_only.as_ref()) {
@@ -4849,12 +4794,25 @@ impl Node {
         // publish yet. The *address* discovery does run, on its own task, because it
         // talks to the network (a route probe and a gateway request) and must not hold
         // up the unlock.
-        let discover = Arc::clone(&net);
-        let tx = self.net_tx.clone();
-        tokio::spawn(async move {
-            let mappings = discover.refresh_advertised(&[]).await;
-            let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
-        });
+        // The presence discovers, maps and renews once for every node on it (ADR-026 D-3): this
+        // node is told each composition, the one already made included.
+        {
+            let mut addresses = presence.advertised();
+            if addresses.borrow().is_some() {
+                addresses.mark_changed();
+            }
+            let tx = self.net_tx.clone();
+            let task = tokio::spawn(async move {
+                while addresses.changed().await.is_ok() {
+                    if tx.send(NetEvent::AddressesDiscovered).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            if let Some(old) = self.addresses_task.replace(task.abort_handle()) {
+                old.abort();
+            }
+        }
         spawn_inbound_pump(
             net,
             link.inbound,
@@ -4867,15 +4825,25 @@ impl Node {
         // anchor holds no room and has nobody to find. Without the group, a node is found only
         // where its records say, as before.
         // On the daemon's presence the group is the daemon's (ADR-026 D-3, ADR-012 N-44).
-        if self.headless.is_none() && self.presence.as_ref().is_some_and(|(_, owned)| *owned) {
-            if let Ok(nearby) = crate::node::nearby::Nearby::open() {
-                let nearby = Arc::new(nearby);
-                let (hear, tx) = (Arc::clone(&nearby), self.net_tx.clone());
+        let nearby = if self.headless.is_none() {
+            self.presence.as_ref().and_then(|(p, _)| p.nearby())
+        } else {
+            None
+        };
+        {
+            if let Some((nearby, mut heard)) = nearby {
+                let tx = self.net_tx.clone();
                 let task = tokio::spawn(async move {
-                    while let Ok((from, entries)) = hear.hear().await {
-                        // Dropped when the actor is behind: the next one is said within
-                        // `NEARBY_EVERY_SECS`.
-                        let _ = tx.try_send(NetEvent::Heard { from, entries });
+                    loop {
+                        match heard.recv().await {
+                            // Dropped when the actor is behind: the next one is said within
+                            // `NEARBY_EVERY_SECS`.
+                            Ok((from, entries)) => {
+                                let _ = tx.try_send(NetEvent::Heard { from, entries });
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
                     }
                 });
                 self.nearby = Some(nearby);
@@ -4925,54 +4893,23 @@ impl Node {
             }
             Bind::Shared(presence) => return Ok((Arc::clone(presence.shared()), None)),
         };
-        if addr.port() != 0 {
-            return Ok((VoxEndpoint::bind(addr)?, None));
-        }
-        let file = self.paths.port_file();
-        let read_port = |f: &std::path::Path| {
-            std::fs::read_to_string(f)
-                .ok()
-                .and_then(|t| t.trim().parse::<u16>().ok())
-                .filter(|p| *p != 0)
-        };
         // The node's own port, else the data root's (ADR-026 D-3): a node moved from the layout
         // before v0.3.0 had its `port` file removed, and the migration kept its port in
         // `.daemon/port`, so it binds where members last saw it.
-        let kept = read_port(&file).or_else(|| read_port(&self.paths.account_port_file()));
-        let Some(port) = kept else {
-            let endpoint = VoxEndpoint::bind(addr)?;
-            if let Ok(at) = endpoint.local_addr() {
-                let _ = crate::node::paths::write_private_file(
-                    &file,
-                    format!("{}\n", at.port()).as_bytes(),
-                );
-            }
-            return Ok((endpoint, None));
-        };
-        let why = match VoxEndpoint::bind(std::net::SocketAddr::new(addr.ip(), port)) {
-            Ok(endpoint) => return Ok((endpoint, None)),
-            Err(crate::error::Error::LocalBind {
-                cause: crate::error::BindCause::InUse,
-                ..
-            }) => "another program holds it".to_owned(),
-            Err(e) => e.to_string(),
-        };
-        let endpoint = VoxEndpoint::bind(addr)?;
-        let now = endpoint
-            .local_addr()
-            .map_or_else(|_| "another".to_owned(), |a| a.port().to_string());
-        Ok((
-            endpoint,
-            Some(format!(
-                "this node's port {port} is not free ({why}), so it listens on port {now} this run"
-            )),
-        ))
+        crate::node::presence::NetPresence::bind_kept(
+            addr,
+            &self.paths.port_file(),
+            Some(&self.paths.account_port_file()),
+        )
     }
 
     /// Tear the network down: close every connection and the endpoint, so a locked
     /// node presents no network identity at all.
     async fn stop_network(&mut self) {
         if let Some(task) = self.nearby_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.addresses_task.take() {
             task.abort();
         }
         self.nearby = None;
@@ -5016,23 +4953,6 @@ impl Node {
             }
         }
         self.stream_loops.clear();
-        // A UPnP mapping the router granted only *permanently* (lifetime 0) would
-        // outlive this node; it is deleted, best-effort, on its own task. Timed
-        // mappings of every kind expire by themselves.
-        for m in self.port_mappings.drain(..) {
-            if m.method == crate::nat::portmap::Method::UpnpIgd && m.lifetime_secs == 0 {
-                tokio::spawn(async move {
-                    let _ = crate::nat::portmap::unmap_port_upnp(
-                        crate::nat::portmap::Protocol::Udp,
-                        m.internal_port,
-                    )
-                    .await;
-                });
-            }
-        }
-        self.renew_mappings_at = None;
-        self.mapping_expires.clear();
-        self.mapping_retry.clear();
         // Every session stops with the network (ADR-025 D1a: the node shuts down).
         self.retire_all_ports();
     }
@@ -6289,10 +6209,9 @@ impl Node {
                 self.run_sync_session(conn, peer, channel_id, epoch, send, recv)
                     .await;
             }
-            NetEvent::AddressesDiscovered { mappings } => {
+            NetEvent::AddressesDiscovered => {
                 // Re-publish every open channel's records: the addresses in them were
                 // composed before discovery and may name only loopback.
-                self.take_mappings(&mappings);
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
@@ -7662,7 +7581,10 @@ impl Node {
             let kind = if ip.is_loopback() {
                 "this machine"
             } else if self
-                .port_mappings
+                .presence
+                .as_ref()
+                .map(|(p, _)| p.port_mappings())
+                .unwrap_or_default()
                 .iter()
                 .any(|m| m.external_ip == Some(ip) && m.external_port == sa.port())
             {
@@ -9208,71 +9130,6 @@ impl Node {
         self.note_local_append(channel_id);
     }
 
-    /// Take what a discovery or a renewal was granted, **per address family** (V210-75).
-    ///
-    /// A family granted again is held anew and renewed at half its lease. A family that was held,
-    /// or was already being retried, and got nothing back this time is retried after a backoff
-    /// of its own ([`MAPPING_RETRY_SECS`] doubling to [`MAPPING_RETRY_MAX_SECS`]), and its mapping
-    /// is kept, and still advertised, until its lease runs out: the gateway most likely still
-    /// holds it, and a lost reply is not a withdrawn mapping. The next try is never later than
-    /// that lease's end, so an expired mapping stops being advertised then. A permanent grant
-    /// (lifetime zero) is never re-requested; it is deleted when the network stops.
-    ///
-    /// Both families used to come back in one list, and only an empty list was retried: one
-    /// family's lost renewal was dropped, and asked again only at the other's half-lifetime,
-    /// about when it expired.
-    fn take_mappings(&mut self, fresh: &[crate::nat::portmap::PortMapping]) {
-        let now = self.now();
-        let mut held = Vec::new();
-        let mut due: Option<u64> = None;
-        let mut sooner = |at: u64| due = Some(due.map_or(at, |d| d.min(at)));
-        for v6 in [false, true] {
-            let granted = fresh.iter().find(|m| mapping_is_v6(m) == v6).copied();
-            let had = self
-                .port_mappings
-                .iter()
-                .find(|m| mapping_is_v6(m) == v6)
-                .copied();
-            if let Some(m) = granted {
-                held.push(m);
-                self.mapping_retry.remove(&v6);
-                if m.lifetime_secs > 0 {
-                    self.mapping_expires
-                        .insert(v6, now + u64::from(m.lifetime_secs));
-                    if let Some(at) = renew_at(now, &[m]) {
-                        sooner(at);
-                    }
-                } else {
-                    self.mapping_expires.remove(&v6);
-                }
-                continue;
-            }
-            if let Some(m) = had.filter(|m| m.lifetime_secs == 0) {
-                held.push(m);
-                continue;
-            }
-            if had.is_none() && !self.mapping_retry.contains_key(&v6) {
-                continue; // never granted: no gateway for this family, nothing to keep alive
-            }
-            let wait = (self.mapping_retry.get(&v6).copied().unwrap_or(0) * 2)
-                .clamp(MAPPING_RETRY_SECS, MAPPING_RETRY_MAX_SECS);
-            self.mapping_retry.insert(v6, wait);
-            let mut at = now + wait;
-            match (had, self.mapping_expires.get(&v6).copied()) {
-                (Some(m), Some(expires)) if now < expires => {
-                    held.push(m);
-                    at = at.min(expires);
-                }
-                _ => {
-                    self.mapping_expires.remove(&v6);
-                }
-            }
-            sooner(at);
-        }
-        self.port_mappings = held;
-        self.renew_mappings_at = due;
-    }
-
     /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
     ///
     /// A node's address record lives two hours on a board ([`crate::nat::store::MAX_TTL_SECS`]),
@@ -9311,49 +9168,6 @@ impl Node {
         let half = crate::nat::store::own_record_ttl_secs() / 2;
         self.records_renew_at
             .insert(*room, self.now().saturating_add(half.max(1)));
-    }
-
-    /// Re-run the ladder's publish side when the granted mappings are halfway through
-    /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
-    ///
-    /// Nothing happens while the network is down: the renewal instant is left in place
-    /// so the next unlock's discovery supersedes it.
-    ///
-    /// The re-request runs on its own task (it talks to a gateway) and lands back as
-    /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
-    /// a renewal that came back with a *different* external port must be advertised.
-    fn renew_mappings_if_due(&mut self) {
-        let Some(due) = self.renew_mappings_at else {
-            return;
-        };
-        if self.now() < due {
-            return;
-        }
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return;
-        };
-        // Cleared now, not when the refresh returns: one renewal in flight at a time.
-        self.renew_mappings_at = None;
-        // The mappings whose lease has not run out, so a family whose renewal fails this time
-        // is still advertised at its mapped address until the lease ends (V210-75).
-        let now = self.now();
-        let leased: Vec<crate::nat::portmap::PortMapping> = self
-            .port_mappings
-            .iter()
-            .filter(|m| {
-                m.lifetime_secs == 0
-                    || self
-                        .mapping_expires
-                        .get(&mapping_is_v6(m))
-                        .is_some_and(|at| now < *at)
-            })
-            .copied()
-            .collect();
-        let tx = self.net_tx.clone();
-        tokio::spawn(async move {
-            let mappings = net.refresh_advertised(&leased).await;
-            let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
-        });
     }
 
     /// ADR-025: a local append bumped the room's generation (inside the room's own write), so the

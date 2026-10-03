@@ -317,7 +317,7 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
         hook(
             bob,
             &cc_env,
-            &["agent", "hook", "--room", &room],
+            &["agent", "hook", "--node", "default", "--room", &room],
             Some(&input),
         )
     };
@@ -325,7 +325,16 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
         hook(
             bob,
             &oc_env,
-            &["agent", "hook", "--room", &room, "--session", "session-oc"],
+            &[
+                "agent",
+                "hook",
+                "--node",
+                "default",
+                "--room",
+                &room,
+                "--session",
+                "session-oc",
+            ],
             None,
         )
     };
@@ -336,6 +345,8 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
             &[
                 "agent",
                 "hook",
+                "--node",
+                "default",
                 "--room",
                 &room,
                 "--session",

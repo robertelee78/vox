@@ -120,7 +120,7 @@ fn install_plugin(w: &Worker, fixture: &Path) -> std::path::PathBuf {
     let project = fixture.join(&w.name);
     std::fs::create_dir_all(project.join(".opencode/plugin"))
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make {}'s project: {e}", w.name));
-    let o = w.vox(None, &["agent", "plugin", "opencode"]);
+    let o = w.vox(None, &["agent", "plugin", "opencode", "--node", "default"]);
     assert!(
         o.ok && o.stdout.contains("vox agent hook"),
         "PRODUCT: `vox agent plugin opencode` did not print the plugin: {o:?}"
@@ -483,6 +483,8 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
             &[
                 "agent",
                 "hook",
+                "--node",
+                "default",
                 "--format",
                 "text",
                 "--room",

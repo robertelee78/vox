@@ -43,6 +43,13 @@
 //! A lone unlock of a copy is the control: it must pass the same row checks, or nothing here
 //! would mean anything.
 //!
+//! **What is read in this process, and why.** Every step is the shipped binary (v0.2.9's, then
+//! this build's). Two things are measured from the files a stopped run left, because no `vox`
+//! command can report them: the store's row keys — a **copy** of `store.redb` opened with `redb`,
+//! never vox-core's store and never the file a vox may hold — since "no row lost" is about rows a
+//! person never sees by name; and the vault's format version, a pure decode of its header
+//! (`IdentityVault::from_canonical_slice`), since the migration's completion is that version.
+//!
 //! Mutations that must turn it red: the store opened before the profile's lock is taken, or the
 //! lock released before the store is closed: of two started together, one is refused. The profile lock not held across the migration: in the staged
 //! arm the second process migrates the old file and renames it over the first one's, and the

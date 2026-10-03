@@ -94,6 +94,9 @@ pub struct SharedEndpoint {
     limiter: identity::AskLimiter,
     /// Set once [`SharedEndpoint::close`] has run.
     closed: tokio::sync::watch::Sender<bool>,
+    /// Each node's connections, by node, so a node gone without detaching can still have its own
+    /// closed ([`SharedEndpoint::evict`]). Closed ones are dropped as new ones are added.
+    by_node: Mutex<std::collections::HashMap<Digest32, Vec<Connection>>>,
 }
 
 /// One node on a [`SharedEndpoint`].
@@ -764,6 +767,7 @@ impl SharedEndpoint {
             registry: Mutex::new(std::collections::HashMap::new()),
             limiter: identity::AskLimiter::standard(),
             closed: tokio::sync::watch::channel(false).0,
+            by_node: Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -821,6 +825,28 @@ impl SharedEndpoint {
             .is_some_and(|r| Arc::ptr_eq(&r.local, local))
         {
             reg.remove(&local.id());
+        }
+    }
+
+    /// File `conn` under the node `local`, for [`Self::evict`].
+    fn track(&self, local: Digest32, conn: &Connection) {
+        let mut by = lock(&self.by_node);
+        let list = by.entry(local).or_default();
+        list.retain(|c| c.close_reason().is_none());
+        list.push(conn.clone());
+    }
+
+    /// **Evict a node** that went without detaching — its actor panicked (ADR-026 L-6): take it
+    /// off the exchange, and close every connection it had, as stopping. Every other node's
+    /// registration and connections are left as they are.
+    pub fn evict(&self, local: &Digest32) {
+        lock(&self.registry).remove(local);
+        let conns = lock(&self.by_node).remove(local).unwrap_or_default();
+        for c in conns {
+            c.close(
+                close_code(WireError::ShuttingDown),
+                WireError::ShuttingDown.to_string().as_bytes(),
+            );
         }
     }
 
@@ -910,6 +936,7 @@ impl SharedEndpoint {
                 "the node asked for went away during the identity exchange".to_owned(),
             ));
         };
+        self.track(local.id(), &connection);
         let mut conn = finish_connection(connection, local, &proven, now_secs, via_circuit)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
@@ -1155,6 +1182,7 @@ impl VoxEndpoint {
         let proven = identity::dial(&connection, &*signer, self.local.instance(), expected_peer)
             .await
             .map_err(|f| f.into_error(addr, &expected_peer))?;
+        self.shared.track(self.local_id, &connection);
         let mut conn = finish_connection(
             connection,
             Arc::clone(&self.local),

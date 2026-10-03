@@ -315,6 +315,12 @@ pub fn create_room(data: &Path, name: &str, pass: &str) -> (Digest32, String) {
 
 /// Open a member's profile — its daemon must already be stopped — and return its signer, so a
 /// hostile peer can connect **as that member**.
+///
+/// **In-process on purpose: this is the attacker's key, not a person's use of vox.** The proofs
+/// that call it play a member whose key was taken (or a member turned hostile) speaking the wire
+/// protocol directly; no `vox` command lets a person sign as someone else's node or send what
+/// these peers send. The profile is opened only after that member's own vox has stopped, and
+/// nothing the proof asserts is read from it.
 pub fn member_signer(data: &Path) -> Arc<vox_core::atrest::vault::VaultRootSigner> {
     let paths =
         vox_core::node::paths::Paths::resolve("default", Some(data), Some(&data.join("cfg")))
