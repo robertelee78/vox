@@ -36,11 +36,9 @@ open it, and both ends run the same steps:
 The room's lock is held one step at a time (`SessionRoom`), so two sessions on one room interleave
 safely. Duplicates are refused idempotently.
 
-Before this ADR, scheduling behaved like a hub:
-- two members posting at once each refused the other's session, then retried after a random wait;
-- past the slot cap, a due session was skipped, not queued;
-- "pushed" meant started, not completed;
-- seven maps and a flag answered one question, and disagreed.
+Scheduled like a hub, two members posting at once each refuse the other's session and retry after a
+random wait, a due session past the slot cap is skipped rather than queued, and "pushed" means
+started rather than completed.
 
 Option C, full duplex, removes the collision. It works as in switched Ethernet, TCP simultaneous
 open, Yjs `SyncStep1` from both ends, and WireGuard's simultaneous handshakes: it trades a duplicate
@@ -48,15 +46,15 @@ reconciliation for having no collision state.
 
 ## Requirements
 
-### The decider's decisions (2026-09-26)
+### The decider's decisions
 
 - **Decision 1.** The collision MUST be resolved by **option C, full duplex** (D4). The designated
   opener (A) and a glare rule (B) are rejected.
-- **Decision 2.** All of it was scheduled for v0.2.10: the defects and the collision redesign.
+- **Decision 2.** The scheduling defects and the collision redesign MUST ship together.
 - **Decision 3.** Observability MUST be simple counters in `vox status --json`, not a sync journal
   (S0b). Proofs MUST assert what a person sees, plus those counters.
-- **Decision 4.** The design review loop stopped after round 4. Implementation-level findings are
-  settled in the code and checked by the independent verifier, with no further design rounds.
+- **Decision 4.** Implementation-level findings MUST be settled in the code and checked by the
+  independent verifier.
 
 ### D1. One port per (room, peer)
 

@@ -74,7 +74,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   the room's sealed store (`SEG_SERVICES`), at most `MAX_SERVICES` (64) per room.
 - **T-8. Advertisements.** A service advertisement MUST NOT be posted as cleartext on the replicated
   log (ADR-008). If advertised, it MUST be sealed to exactly the host's explicitly approved readers in
-  that room (ADR-017, third revision: consent-bound services), per recipient like an SKDM (ADR-006),
+  that room (ADR-017 decision 3: consent-bound services), per recipient like an SKDM (ADR-006),
   as a `ServiceAdvertisement` (ADR-008 tag `0x000F`), delivered over each reader's pairwise channel
   (ADR-004) or as a log entry sealed to that audience. A member the host has not approved MUST NOT be
   able to read one. A requester MUST resolve a service only by decrypting the advertisements it can
@@ -98,9 +98,11 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   genuinely bulk transfers SHOULD use separate streams, or separate connections for true QoS
   (ADR-011). Status: priority is planned, not built; nothing on the tunnel path sets a stream
   priority.
-- **T-12. UDP.** A UDP service MUST be tunneled as `udp/<name>`: a datagram flow bound to its tunnel
-  stream after the same gate (ADR-022 decision 6, M22.3/M22.4). This covers `vox serve dns=53/udp`,
-  `vox forward dns.<node>.<room>.vox [<local>]` and SOCKS5 `UDP ASSOCIATE` in `vox up`.
+- **T-12. UDP.** A UDP service MUST be shared as `vox serve <name>=<port>/udp` and tunneled as a
+  datagram flow bound to its tunnel stream after the same gate (ADR-022 decision 6, M22.3/M22.4).
+  The dialler names only the address (`vox forward <name>.<node>.<room>.vox [<local>]`, or SOCKS5
+  `UDP ASSOCIATE` in `vox up`); that the service is UDP comes from the share, and the host's gate
+  looks it up as `udp/<name>`.
 - **T-13. The request names its room (M16.1).** A tunnel request MUST be `[channel_id, service_tag]`,
   and the host MUST resolve services per `(room, tag)`. A host MUST answer an unauthorized peer, an
   unknown room, an unknown service and a failed local connect with the same `TunnelStatus::Denied`,

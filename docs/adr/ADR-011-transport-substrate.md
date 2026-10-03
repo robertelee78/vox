@@ -285,7 +285,8 @@ connection, bound to the TLS session by its exporter.
 
 ## Related ADRs
 
-- **Depends on:** ADR-002, ADR-004, ADR-008, ADR-026 (the shared endpoint).
+- **Depends on:** ADR-002, ADR-004, ADR-008.
+- **Amended by:** ADR-026 (the shared endpoint; requirements 27–40).
 - **Depended on by:** ADR-012, ADR-013, ADR-022 (datagram flows), ADR-024 (tapered congestion
   control).
 - **ADR-019** proposes removing the AWS-LC provider this ADR uses.

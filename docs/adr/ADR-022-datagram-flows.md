@@ -26,9 +26,9 @@ PRD-001 asks for four things that need the same missing piece: carrying any UDP 
 members, fragmenting packets that do not fit one datagram (R25–R26); relayed UDP that behaves like
 UDP, dropping late packets instead of stalling behind them (R27); an app API through which a separate
 program opens a live stream or datagram flow to a member node (R29–R30); and calls, 1:1 first, then a
-small-group mesh (R32). Before this ADR, datagrams carried no flow identifier and had one reader, and
-a relay circuit carried its ends' QUIC packets on a reliable outer stream, so one lost outer packet
-stalled every inner packet behind it. The tunnel stream (ADR-013) already had a named request, a
+small-group mesh (R32). A relay circuit that carries its ends' QUIC packets on a reliable outer
+stream stalls every inner packet behind one lost outer packet, so datagrams need flows of their own.
+The tunnel stream (ADR-013) has a named request, a
 uniform `Denied` refusal, a keyring-and-author gate and teardown on withdrawn reach (`Reachers`).
 This ADR builds datagram flows once and puts UDP tunnels, relay circuits and the app API on them.
 
@@ -110,10 +110,11 @@ This ADR builds datagram flows once and puts UDP tunnels, relay circuits and the
      a new flow MUST be refused with the uniform `Denied` and MUST NOT evict another peer's flow.
 6.5. **Teardown.** Untrusting the peer or removing the service MUST end the flow at once, through
      the TCP tunnel's watch (the reacher set and the live offer, R22).
-6.6. **Surfaces.** The host: `vox serve <port>/udp`, or `vox serve <port> <port>/udp` for TCP and
-     UDP on one port (`--at` applies to every spec); on an existing room,
-     `vox service add <room> <port>/udp <addr>`. The dialer:
-     `vox forward <service>.<node>.<room>.vox <port>/udp <local-port>`, one flow per distinct client source address.
+6.6. **Surfaces.** The host: `vox serve <name>=<port>/udp`, or `vox serve <a>=<port> <b>=<port>/udp`
+     for TCP and UDP on one port (`--at` applies to every spec); on an existing room,
+     `vox service add <room> udp/<name> <addr>`. The dialer names only the address,
+     `vox forward <service>.<node>.<room>.vox [<local-port>]`, and the share says it is UDP; one
+     flow per distinct client source address.
 6.7. **SOCKS5 UDP ASSOCIATE** in `vox up` (RFC 1928 §7): a loopback relay socket; every destination
      MUST be a `service.node.room.vox` name (ADR-017); one flow per (association, destination); a datagram with `FRAG ≠ 0` MUST
      be dropped; the association MUST end with its TCP control connection.

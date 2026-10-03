@@ -4,7 +4,6 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted. Built in `crates/vox-core/src/join/` (M3), `node::joinstream` (ADR-016 M14.4)
 and `node::link`, except:
-- J-5: `<room>.vox` still resolves to the room's creator on this tree; its removal is V030-25 (#339).
 - J-24: the ≈ 1–2 s mobile solve target is not measured, because no mobile client exists (ADR-014 is
   macOS).
 
@@ -29,7 +28,7 @@ readable: who reads whom is decided by trust (ADR-007).
   (ADR-007).
 - **J-2.** A room passphrase is OPTIONAL. The core MUST NOT refuse an empty room passphrase. An identity
   passphrase is OPTIONAL by the same rule: the core MUST NOT refuse an empty identity passphrase
-  (ADR-010 AR-5).
+  (V030-36).
 - **J-3.** A join naming a room this node already holds MUST update the room's stored address to the
   new link's addresses, not refuse (V210-167): the members the link names are dialled there, and those
   that answer, with the anchors it names, are kept as the room's address. An address at which no member
@@ -38,8 +37,7 @@ readable: who reads whom is decided by trust (ADR-007).
 - **J-4.** A room made by a Vox release before v0.3.0 MUST be refused, saying to make the room again
   (`Fault::RoomFromBeforeV030`). There is no compatibility path.
 - **J-5.** Addressing a service is ADR-017's: only `service.node.room.vox` connects; `room.vox` and
-  `node.room.vox` MUST resolve to nothing. A `<room>.vox` name that resolves to the room's creator is
-  removed. **Planned:** V030-25 (#339).
+  `node.room.vox` MUST resolve to nothing. No `<room>.vox` name resolves to the room's creator.
 
 ### §"Separate rendezvous from authentication"
 
