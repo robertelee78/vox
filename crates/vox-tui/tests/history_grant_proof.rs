@@ -207,7 +207,15 @@ fn join(creator: &Path, joiner: &Path, room: &str) {
     assert!(ok, "vox room invite: {err}");
     let (ok, _, err) = vox(
         joiner,
-        &["room", "join", link.trim(), "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "r",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room join: {err}");
@@ -242,7 +250,7 @@ fn an_approval_chooses_history_and_superseded_keys_are_deleted_once_no_grant_nee
 
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room create: {err}");
