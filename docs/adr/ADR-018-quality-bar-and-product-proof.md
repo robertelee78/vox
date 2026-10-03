@@ -857,14 +857,15 @@ vox-tui's in-process `interrupt_proof`.
 tunnel throughput (`perf_r41_tunnel_throughput_proof`), relay circuits on IPv6
 (`a_circuit_carries_an_ipv6_daemon_proof`), and the 56 other binary proofs.
 
-**Claims now unmeasured until a real-use proof is written**, each tracked as its own item. Updated
-2026-09-27: most now have a real-use proof on integrate/v0.2.10, with a verdict on each: first
-connection under 2 s, direct (RP-22), punched (RP-23) and relayed (RP-24); a relayed pair upgrades
-to direct (RP-25, #49); a second circuit is decided alike (V29-15, #50); a silent stream, a `.vox`
-address and a `want` cannot stop a node (RP-03/04/05); a join is not hostage (RP-02); `vox forward`
-binds loopback only (RP-27); the at-rest Argon2id floor (RP-07). **Still unmeasured:** no consent
-without a keyring entry, M18 revocation, and #174's MTU ceiling (whose evidence is #206's path-stats
-runs).
+**Claims the deletion left unmeasured** (V210-31, #204), each tracked as its own item. Each of
+these is held by a proof that drives only `vox`: first connection under 2 s, direct (RP-22), punched
+(RP-23) and relayed (RP-24); a relayed pair upgrades to direct (RP-25, #49); a severed or second
+circuit is not taken for a live path, and a displaced relay is let go (V29-15, #50); a silent
+stream, a `.vox` address and a `want` cannot stop a node (RP-03/04/05); a join is not hostage
+(RP-02); `vox forward` binds loopback only (RP-27); no consent without a keyring entry (RP-28); M18
+revocation (RP-17); the path MTU follows the granted socket buffer (V29-26, #174); the at-rest
+Argon2id floor (RP-07). **Not yet held by real use:** V29-15's "a duplicate is resolved identically
+at both ends" (#50).
 
 **No proof is excluded by name, and one gap remains (2026-09-27, #192 and #193).**
 `cross_process_join_proof`, excluded from the blocking gate since v0.2.2 as a flake (4 of 6), passed
