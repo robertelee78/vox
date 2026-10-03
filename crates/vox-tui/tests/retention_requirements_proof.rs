@@ -34,7 +34,8 @@
 //!
 //! Mutations (each run, each red): a non-zero default retention (R6); the admin check skipped,
 //! and a change that reaches only new entries (R7); the fork check skipped for a pruned position
-//! (R10).
+//! (R10); the pre-checkpoint refusal removed (R10: bob refuses nothing below the checkpoint; this
+//! claim was `checkpoint_proof`'s, offered in-process until #227).
 
 #![cfg(unix)]
 

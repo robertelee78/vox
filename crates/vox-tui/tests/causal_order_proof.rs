@@ -28,8 +28,9 @@
 //! day-ahead claim back from `vox room read --json`.
 //!
 //! Mutations (each run, each red): `seen` ignored when ordering (proof 2); the cap removed
-//! (proof 3). Arrival order has no mutation of its own here: it was `one_order_gate`'s, an
-//! in-process gate deleted with the rest (#227).
+//! (proof 3); the order taken from arrival, the order each node stored the entries in (proof 1:
+//! the three nodes print three sequences). The last was `one_order_gate`'s, an in-process gate
+//! deleted with the rest (#227).
 //!
 //! **Proof 1 was intermittently red on v0.2.8, and not for the order** (#228). In about half of runs
 //! the second joiner of three daemons was cut off from the first post onward: 5 red of 9. Each red
