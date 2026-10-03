@@ -828,7 +828,9 @@ fn ok_or(reply: vox_core::error::Result<Frame>, doing: &str) -> Result<(), AppEr
     match reply {
         Ok(Frame::Ok) => Ok(()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("{doing}: {reason}"))),
-        Ok(other) => Err(AppError::Usage(format!("{doing}: unexpected reply {other:?}"))),
+        Ok(other) => Err(AppError::Usage(format!(
+            "{doing}: unexpected reply {other:?}"
+        ))),
         Err(e) => Err(AppError::Usage(format!("{doing}: {e}"))),
     }
 }
@@ -1012,7 +1014,10 @@ pub async fn serve(
             "vox: {} reached {service_tag:?}",
             crate::ident::author_id(client)
         ),
-        NodeEvent::PeerJoined { channel_id: c, peer } if *c == channel_id => {
+        NodeEvent::PeerJoined {
+            channel_id: c,
+            peer,
+        } if *c == channel_id => {
             println!("vox: {} joined", crate::ident::author_id(peer));
         }
         _ => {}
@@ -1258,10 +1263,7 @@ pub async fn forward_named(
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    eprintln!(
-        "vox: bound in {} ms",
-        first_attempt.elapsed().as_millis()
-    );
+    eprintln!("vox: bound in {} ms", first_attempt.elapsed().as_millis());
     println!(
         "vox: forwarding {bound} to {service} on {name} ({})",
         short(&host)

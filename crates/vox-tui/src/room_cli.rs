@@ -3713,7 +3713,6 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
 
 // ---------------------------------------------------------------- the trust keyring
 
-
 /// Send a keyring change, giving the identity passphrase only when the node says it needs it
 /// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
 /// gave (`--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`); it is sent at once, and a right

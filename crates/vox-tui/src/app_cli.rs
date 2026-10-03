@@ -95,9 +95,15 @@ pub async fn open(
     let room_id = room(&mut c, room_prefix).await?;
     let peer = member(&mut c, room_id, peer_prefix).await?;
     drop(c);
-    let (stream, info) = appipc::open(&crate::client::one_shot(paths)?, room_id, peer, labels, datagrams)
-        .await
-        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let (stream, info) = appipc::open(
+        &crate::client::one_shot(paths)?,
+        room_id,
+        peer,
+        labels,
+        datagrams,
+    )
+    .await
+    .map_err(|e| AppError::Usage(e.to_string()))?;
     eprintln!("vox app: {} to {}", info.label, b32_encode(&info.peer));
     pipe(stream, info.datagrams).await
 }

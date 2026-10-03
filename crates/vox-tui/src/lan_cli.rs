@@ -588,13 +588,17 @@ mod mac {
             mine.v6, plan.subnet_v4, plan.prefix_v6
         ));
         if allow.is_empty() {
-            say(format!(
+            say(
                 "nothing on this machine is reachable over the LAN (discovery still flows); \
                  `--allow <port>,…` opens ports"
-            ));
+                    .to_owned(),
+            );
         } else {
             let ports: Vec<String> = allow.iter().map(u16::to_string).collect();
-            say(format!("reachable over the LAN: ports {}", ports.join(", ")));
+            say(format!(
+                "reachable over the LAN: ports {}",
+                ports.join(", ")
+            ));
         }
         say("Ctrl-C to stop; the interface goes with it".to_owned());
         let mut linked: Vec<Digest32> = Vec::new();
@@ -616,10 +620,9 @@ mod mac {
                     let now = lan.plan().of(&me).copied();
                     if now != Some(mine) && !moved_said {
                         moved_said = true;
-                        say(format!(
-                            "vox lan: a member joined whose address took precedence over this \
+                        say("vox lan: a member joined whose address took precedence over this \
                              node's; restart `vox lan up` to take the new one"
-                        ));
+                            .to_owned());
                     }
                     if let Some(p) = &stats_file {
                         write_stats(p, &stats_json(&name, &me, &lan, &allow));
@@ -701,7 +704,10 @@ fn line_frame(tag: u64, text: &str) -> Vec<u8> {
     let mut e = vox_core::cbor::Encoder::new();
     e.array(2).uint(tag).text(text);
     let body = e.finish();
-    let mut framed = u32::try_from(body.len()).unwrap_or(0).to_be_bytes().to_vec();
+    let mut framed = u32::try_from(body.len())
+        .unwrap_or(0)
+        .to_be_bytes()
+        .to_vec();
     framed.extend_from_slice(&body);
     framed
 }

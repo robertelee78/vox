@@ -515,7 +515,11 @@ fn refused(reason: String) -> Error {
 ///
 /// # Errors
 /// If the node is not running, or refuses.
-pub async fn listen(at: &NodeSocket, channel_id: Option<Digest32>, label: &str) -> Result<IpcListener> {
+pub async fn listen(
+    at: &NodeSocket,
+    channel_id: Option<Digest32>,
+    label: &str,
+) -> Result<IpcListener> {
     let mut stream = connect(at).await?;
     match ask(
         &mut stream,

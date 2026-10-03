@@ -259,7 +259,9 @@ pub fn said(at: &NodeSocket, e: Error) -> AppError {
         ),
         Error::Ipc(IpcHandshake::Refused { reason }) => reason,
         Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
-            format!("the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again.")
+            format!(
+                "the daemon's socket at {path} accepted, but {h}: it may be stopping. Try again."
+            )
         }
         Error::Ipc(h) => format!("{h}. Socket: {path}"),
         other => format!("the daemon at {path} did not answer ({other})"),
@@ -550,8 +552,8 @@ pub async fn node_attach(
     let file = passphrase_file.clone();
     let _ = paths;
     let passphrase = tokio::task::spawn_blocking(move || attach_passphrase(None, file))
-    .await
-    .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??;
+        .await
+        .map_err(|e| AppError::Usage(format!("asking for a passphrase: {e}")))??;
     let keep = keep.then(|| match passphrase_file {
         Some(f) => KeepSource::File(absolute(&f)),
         None => KeepSource::None,

@@ -87,10 +87,7 @@ where
 }
 
 /// The identity passphrase sources a held verb was given.
-fn pass(
-    flag: Option<String>,
-    file: Option<std::path::PathBuf>,
-) -> crate::client::Pass {
+fn pass(flag: Option<String>, file: Option<std::path::PathBuf>) -> crate::client::Pass {
     crate::client::Pass { flag, file }
 }
 
@@ -1228,9 +1225,9 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
         NodeCmd::Detach { name, account } => block_on_client(async move {
             crate::client::node_detach(&account.as_node_args(), &name).await
         }),
-        NodeCmd::List { account } => block_on_client(async move {
-            crate::client::node_list(&account.as_node_args()).await
-        }),
+        NodeCmd::List { account } => {
+            block_on_client(async move { crate::client::node_list(&account.as_node_args()).await })
+        }
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -1822,10 +1819,7 @@ pub fn run() -> ExitCode {
                 }
             }
         }
-        Cmd::Node(AnchorArgs {
-            cmd: Some(cmd),
-            ..
-        }) => run_node_cmd(cmd),
+        Cmd::Node(AnchorArgs { cmd: Some(cmd), .. }) => run_node_cmd(cmd),
         Cmd::Node(node_args) => {
             let args = &node_args.profile;
             let paths = match args.paths_creating() {
@@ -2595,10 +2589,7 @@ pub fn run() -> ExitCode {
                     }
                     None => None,
                 };
-                let room = args
-                    .room
-                    .as_deref()
-                    .map(|r| (r, room_pp.as_deref()));
+                let room = args.room.as_deref().map(|r| (r, room_pp.as_deref()));
                 crate::tunnel_cli::up(
                     &paths,
                     &args.profile,
@@ -2629,7 +2620,10 @@ pub fn run() -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            let local = args.local.clone().unwrap_or_else(|| "127.0.0.1:0".to_owned());
+            let local = args
+                .local
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:0".to_owned());
             let waiting = crate::tunnel_cli::Waiting::server();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
@@ -2667,7 +2661,9 @@ pub fn run() -> ExitCode {
             };
             let waiting = crate::tunnel_cli::Waiting::server();
             let steps = std::sync::Arc::clone(&waiting);
-            run_session(waiting, async move { crate::lan_cli::up_held(&paths, &a, &steps).await })
+            run_session(waiting, async move {
+                crate::lan_cli::up_held(&paths, &a, &steps).await
+            })
         }
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
