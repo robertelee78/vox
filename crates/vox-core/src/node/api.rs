@@ -585,6 +585,12 @@ pub enum NodeCommand {
         /// The channelID.
         channel_id: Digest32,
     },
+    /// Leave an open room (V210-164): say so in the room, and once another member has it,
+    /// remove the room from this node.
+    LeaveChannel {
+        /// The channelID.
+        channel_id: Digest32,
+    },
     /// Author a text message in an open channel.
     SendText {
         /// The channelID.
@@ -849,6 +855,15 @@ pub enum Fault {
     BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
+    /// A room this node joined has not synced with another member yet, so nothing is written
+    /// to it (V210-164).
+    RoomNotSynced,
+    /// A leave was written, but no other member of the room took it within the wait: the room
+    /// is held until one does (V210-164).
+    LeaveNotHeard,
+    /// A leave was overtaken: this node wrote in the room after it, so it is in the room again
+    /// (V210-164).
+    LeaveUndone,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
     NotAServiceRoom,
@@ -970,6 +985,15 @@ impl Fault {
             Fault::AlreadyMember => {
                 "this profile already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
             }
+            Fault::RoomNotSynced => {
+                "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
+            }
+            Fault::LeaveNotHeard => {
+                "no other member of the room could be told within 30s, so this node still holds it\n       it leaves as soon as one can be told, and the members see it then"
+            }
+            Fault::LeaveUndone => {
+                "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
+            }
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
             }
@@ -1057,6 +1081,9 @@ fault_names!(
     AddressNotHere,
     BindFailed,
     AlreadyMember,
+    RoomNotSynced,
+    LeaveNotHeard,
+    LeaveUndone,
     NotAServiceRoom,
     NotOffered,
     NoSuchForward,

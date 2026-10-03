@@ -660,6 +660,11 @@ enum RoomCmd {
     /// Create a room on a running node. Passphrase at the terminal, or from
     /// `--passphrase-file` (`-` reads stdin).
     Create(CreateRoomArgs),
+    /// Leave a room: the other members are told, then the room is removed from this node.
+    ///
+    /// Waits up to 30 s for another member to take the news. If none can be told by then, it
+    /// says so, and the node leaves as soon as one can. Joining again later works.
+    Leave(RoomRefArgs),
     /// Print a room's address, for someone else to `vox room join` with.
     ///
     /// The address is rendezvous information, not a credential — no passphrase,
@@ -1563,7 +1568,8 @@ enum Cmd {
     /// `vox grant` are withdrawn with the model that needed them (M17.7).
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// Speak in a room over a **running** node (ADR-020) — the agent-comms verbs.
+    /// Join, create or leave a room, and speak in it, over a **running** node (ADR-020) —
+    /// the agent-comms verbs.
     ///
     /// For agents on one repository, the room settles who does what: an agent claims
     /// work there, asks there who is on what, and answers there, briefly, when asked
@@ -1573,8 +1579,9 @@ enum Cmd {
     ///
     /// Unlike every other verb, these do not start a node: they attach to the
     /// control socket of one that is already running and already unlocked, which
-    /// is how several agent sessions share one identity per machine. Only `create`
-    /// and `join` take a passphrase, and they read it from stdin.
+    /// is how several agent sessions share one identity per machine. None of them
+    /// takes the identity passphrase; `join` and `create` take the room passphrase at a
+    /// terminal, or from stdin with `--passphrase-file -`.
     #[command(subcommand)]
     Room(RoomCmd),
     /// Wire an agent session into a room (ADR-020) — Claude Code, Codex and OpenCode.
@@ -1785,6 +1792,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Join(a) => &a.profile,
                 RoomCmd::Create(a) => &a.profile,
                 RoomCmd::Invite(a) => &a.profile,
+                RoomCmd::Leave(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -1911,6 +1919,7 @@ pub fn run() -> ExitCode {
                                 .await
                         }
                         RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                        RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(
                                 &paths,

@@ -4,7 +4,7 @@
 # Rust clients over it. Crates are added to `members` as milestones land.
 [workspace]
 resolver = "2"
-members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms"]
+members = ["crates/vox-core", "crates/vox-tui", "crates/vox-agentcomms", "crates/vox-text"]
 # Test apparatus only (V210-55, #242): built on its own by the proofs that need it, never a member,
 # never linked into vox.
 exclude = ["crates/vox-test-interpose"]

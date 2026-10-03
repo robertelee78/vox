@@ -2636,6 +2636,7 @@ version = "0.2.10"
 dependencies = [
  "serde",
  "serde_json",
+ "vox-text",
 ]
 
 [[package]]
@@ -2672,10 +2673,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "vox-text",
  "x25519-dalek",
  "x509-parser 0.16.0",
  "zeroize",
 ]
+
+[[package]]
+name = "vox-text"
+version = "0.2.10"
 
 [[package]]
 name = "vox-tui"

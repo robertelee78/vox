@@ -96,6 +96,7 @@ pub mod genesis;
 pub mod invite;
 pub mod membership;
 pub mod policy;
+pub mod presence;
 pub mod rotation;
 pub mod servicegrant;
 pub mod visibility;

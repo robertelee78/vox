@@ -49,7 +49,7 @@ use std::sync::Arc;
 
 use crate::governance::capability::CapabilitySet;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
-use crate::governance::entry::GovEntry;
+use crate::governance::entry::{GovBody, GovEntry};
 use crate::governance::evaluator::Evaluator;
 use crate::governance::genesis::{ChannelPolicy, DeniabilityMode, Genesis, HistoryMode};
 use crate::governance::membership::{
@@ -146,6 +146,11 @@ const SEG_FORKS: u64 = 12;
 
 /// Encoding version of [`SEG_FORKS`].
 const FORKS_VERSION: u64 = 1;
+
+/// The not-yet-synced marker within [`SegmentKind::KeyMaterial`] (V210-164): present from a
+/// join until the room's first clean sync with another member, so a node that stops in between
+/// still writes nothing when it reopens the room. See `ChannelState::settled`.
+const SEG_UNSETTLED: u64 = 13;
 
 pub(crate) fn forks_bytes(proofs: &[&ForkProof]) -> Vec<u8> {
     let mut e = Encoder::new();
@@ -569,6 +574,13 @@ pub struct ChannelState {
     /// `Debug` output carries it).
     passphrase: Zeroizing<Vec<u8>>,
     poisoned: bool,
+    /// Whether this node holds its own feed in the room as the room does (V210-164). A room
+    /// joined starts without: this identity may have been in it before — it left, or its
+    /// profile is new — and its earlier entries are with the other members. Writing before they
+    /// arrive would sign a second entry at a place it already signed, and every member would
+    /// freeze it for that. So nothing is written until a sync with another member has ended
+    /// cleanly. A room created or reopened here holds its own feed already.
+    settled: bool,
     /// The room's **generation** (ADR-025 D1): bumped by every entry persisted, from any source.
     /// In memory; a restart resets it together with every sync port. Shared with the actor, which
     /// reads it without the room's lock; it only changes under the lock.
@@ -1194,6 +1206,7 @@ impl ChannelState {
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
             poisoned: false,
+            settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -1360,6 +1373,10 @@ impl ChannelState {
             set_aside.push(format!("{at}: an earlier entry of its author is missing"));
         }
 
+        // Joined, and not yet synced since (V210-164).
+        let settled = store
+            .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?
+            .is_none();
         // The fork proofs this room kept (V210-63), each checked as a new one would be: a proof
         // that does not verify is a tampered store, as a stored entry that fails acceptance is.
         let mut forks_kept = 0usize;
@@ -1563,6 +1580,7 @@ impl ChannelState {
             entitled,
             trust_marks,
             poisoned: false,
+            settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -1800,6 +1818,12 @@ impl ChannelState {
         if let Some(seg) = &admission_seg {
             batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION, seg)?;
         }
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_UNSETTLED,
+            &seal_segment(&sek, SegmentKind::KeyMaterial, SEG_UNSETTLED, &[1])?,
+        )?;
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();
@@ -1838,6 +1862,7 @@ impl ChannelState {
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
             poisoned: false,
+            settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -2304,13 +2329,66 @@ impl ChannelState {
     /// who kept consent permanently unable to read the messages sent before their
     /// re-key.
     pub fn rotate_sender(&mut self, profile: &Profile, now_secs: u64) -> Result<u64> {
+        let next = self.sender.rotated(now_secs)?;
+        self.rotate_sender_to(profile, next, now_secs)
+    }
+
+    /// Move this identity to a sender generation above every one its own feed shows it used here,
+    /// if it is not above them already (V210-164). Returns whether it moved.
+    ///
+    /// A node that joins a room its identity was in before — it left, or the profile is new —
+    /// starts at generation 0, and the other members still hold this identity's old key under
+    /// that number. They refuse a second key for a generation they hold, so nothing it sent would
+    /// ever read. Its feed, once synced, says what it used: each message's header names its
+    /// generation, a revocation the one it moved to, and a presence statement the one it was on.
+    pub fn catch_up_generation(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+        let me = self.me();
+        let Some(feed) = self.dag.feed(&me).filter(|f| !f.is_empty()) else {
+            return Ok(false);
+        };
+        // Generation 0 was this identity's first here whatever its feed shows.
+        let mut used = 0u64;
+        for entry in feed.iter() {
+            let Some(payload) = entry.payload.as_deref() else {
+                continue;
+            };
+            let chain = match classify_payload(payload) {
+                Ok(EntryKind::Content) => GroupMessage::from_wire(payload)
+                    .ok()
+                    .map(|m| m.header.chain_id),
+                Ok(EntryKind::Governance) => match GovBody::parse_framed(payload) {
+                    Ok(GovBody::Presence(p)) => Some(p.body.chain_id),
+                    Ok(GovBody::ConsentRevocation(r)) => Some(r.body.new_chain_id),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            used = used.max(chain.unwrap_or(0));
+        }
+        if self.sender.chain_id() > used {
+            return Ok(false);
+        }
+        let next_id = used
+            .checked_add(1)
+            .ok_or(Error::MalformedBundle("chain_id overflow"))?;
+        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now_secs)?;
+        self.rotate_sender_to(profile, next, now_secs)?;
+        Ok(true)
+    }
+
+    /// Make `next` this identity's sender generation: see [`Self::rotate_sender`].
+    fn rotate_sender_to(
+        &mut self,
+        profile: &Profile,
+        next: SenderChain,
+        now_secs: u64,
+    ) -> Result<u64> {
         if self.poisoned {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
             ));
         }
         let store = profile.store();
-        let next = self.sender.rotated(now_secs)?;
         let chain_id = next.chain_id();
         let me = self.me();
         // The mint's place in the consent order, persisted before the generation exists
@@ -2463,6 +2541,11 @@ impl ChannelState {
     /// put its fingerprint in the keyring.
     #[must_use]
     pub fn owed_consents(&self, trusted: &BTreeSet<Digest32>) -> BTreeSet<Digest32> {
+        // A consent is written to the log, which waits until this node holds its own feed; and a
+        // member that left holds no room to read in (V210-164).
+        if !self.settled {
+            return BTreeSet::new();
+        }
         let me = self.me();
         let already: BTreeSet<Digest32> = MembershipView::new(&self.evaluator).readers_of(&me);
         self.authors
@@ -2471,6 +2554,7 @@ impl ChannelState {
             .filter(|a| *a != me)
             .filter(|a| trusted.contains(a))
             .filter(|a| !already.contains(a))
+            .filter(|a| !self.has_left(a))
             .collect()
     }
 
@@ -2484,6 +2568,12 @@ impl ChannelState {
     /// [`ChannelState::accept_skdm`], so the safe direction is to send.
     #[must_use]
     pub fn owed_rekeys(&self) -> BTreeSet<Digest32> {
+        // Not before this node holds its own feed: a room joined again may yet move it to a new
+        // generation (`catch_up_generation`), and the one it holds now is not what it will send.
+        // Nor to a member that left (V210-164).
+        if !self.settled {
+            return BTreeSet::new();
+        }
         let me = self.me();
         let current = self.sender.chain_id();
         MembershipView::new(&self.evaluator)
@@ -2491,6 +2581,7 @@ impl ChannelState {
             .into_iter()
             .filter(|t| *t != me)
             .filter(|t| self.delivered.get(t).is_none_or(|d| *d < current))
+            .filter(|t| !self.has_left(t))
             .collect()
     }
 
@@ -3037,6 +3128,9 @@ impl ChannelState {
             return Err(Error::Profile(
                 "channel is poisoned after a failed persist; reopen it",
             ));
+        }
+        if !self.settled {
+            return Err(Error::RoomNotSynced);
         }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
@@ -3936,6 +4030,9 @@ impl ChannelState {
                 "channel is poisoned after a failed persist; reopen it",
             ));
         }
+        if !self.settled {
+            return Err(Error::RoomNotSynced);
+        }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) {
@@ -4095,10 +4192,79 @@ impl ChannelState {
         &self.timeline
     }
 
-    /// Known authors (M13: the creator), in fingerprint order.
+    /// The room's members, in fingerprint order: every admitted author but one that has left
+    /// (V210-164).
     #[must_use]
     pub fn members(&self) -> Vec<Digest32> {
-        self.authors.keys().copied().collect()
+        let left = self.left();
+        self.authors
+            .keys()
+            .filter(|a| !left.contains(*a))
+            .copied()
+            .collect()
+    }
+
+    /// Whether `author` has left the room: the last entry this node holds of its feed is its
+    /// own statement that it left. Anything it authored after one — it joined again — puts it
+    /// back.
+    #[must_use]
+    pub fn has_left(&self, author: &Digest32) -> bool {
+        let Some(head) = self.dag.feed(author).map(|f| f.max_seq()) else {
+            return false;
+        };
+        self.gov_entries.iter().any(|g| {
+            g.author_id == *author
+                && g.seq == head
+                && matches!(&g.body, GovBody::Presence(p) if p.body.author_id == *author && !p.body.here)
+        })
+    }
+
+    /// Every author that has left the room ([`Self::has_left`]), in one pass over the log's
+    /// governance entries: the roster is read on every view.
+    fn left(&self) -> BTreeSet<Digest32> {
+        self.gov_entries
+            .iter()
+            .filter(|g| {
+                matches!(&g.body, GovBody::Presence(p) if p.body.author_id == g.author_id && !p.body.here)
+                    && self.dag.feed(&g.author_id).map(|f| f.max_seq()) == Some(g.seq)
+            })
+            .map(|g| g.author_id)
+            .collect()
+    }
+
+    /// Write that this identity has left the room (`here` = false) or is back in it, unless its
+    /// feed already says so (V210-164). Returns whether an entry was written.
+    pub fn say_presence(&mut self, profile: &Profile, here: bool, now_secs: u64) -> Result<bool> {
+        let me = profile.signer()?.fingerprint();
+        if self.has_left(&me) != here {
+            return Ok(false);
+        }
+        let statement = crate::governance::presence::Presence::build(
+            profile.signer()?,
+            &self.channel_id,
+            self.epoch,
+            here,
+            self.sender.chain_id(),
+        )?;
+        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        Ok(true)
+    }
+
+    /// Whether this node may write in the room: see `settled`.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.settled
+    }
+
+    /// A sync with another member ended cleanly: this node holds its own feed as the room does,
+    /// and may write. Returns whether that is new.
+    pub fn settle(&mut self, store: &Store) -> Result<bool> {
+        if self.settled {
+            return Ok(false);
+        }
+        store.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?;
+        self.settled = true;
+        Ok(true)
     }
 
     /// Number of accepted log entries.

@@ -326,6 +326,11 @@ pub enum Error {
     #[error("{0}")]
     TunnelLimit(String),
 
+    /// A room this node joined has not yet synced with another member, so it writes nothing to
+    /// it (V210-164): its identity may already have entries there that it does not hold yet.
+    #[error("this room has not synced with another member since it was joined")]
+    RoomNotSynced,
+
     /// A tunnel control message (service request, stream-setup handshake) or an
     /// SSH-CA certificate was structurally malformed on parse, exceeded a size
     /// bound, or carried an out-of-domain value (ADR-013). Carries a static reason.

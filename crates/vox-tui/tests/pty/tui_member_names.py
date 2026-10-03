@@ -98,11 +98,11 @@ try:
     for w in daemons:
         if not until(lambda: run(w, "room", "list").returncode == 0, 60): apparatus(f"{w} daemon")
     stage("room create, invite, join")
-    if run("alice", "room", "create", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
+    if run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass").returncode != 0: apparatus("create")
     room = run("alice", "room", "list").stdout.split()[0]
     link = run("alice", "room", "invite", room).stdout.strip()
     for w in ("bob", "carol"):
-        j = run(w, "room", "join", link, "--name", "m", stdin="room pass")
+        j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")
         if j.returncode != 0: apparatus(f"{w} join: {j.stderr.strip()}")
     t = run("bob", "trust", "add", fp["alice"], "--name", "alice", "--identity-passphrase-file", f"{S}/idpass")
     if t.returncode != 0: apparatus(f"trust add: {t.stderr}")

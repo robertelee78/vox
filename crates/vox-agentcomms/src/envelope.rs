@@ -31,26 +31,9 @@ pub const MAX_RESOURCE: usize = 160;
 /// How many bytes of an author-chosen name [`shown`] prints.
 pub const SHOWN_NAME: usize = 64;
 
-/// Whether `c` may not appear in a name printed for somebody reading (V210-123): every control
-/// character (which includes `\n`, `\r`, VT, FF, NEL, ESC and NUL), the Unicode line and
-/// paragraph separators, and the bidirectional controls — embeddings and overrides
-/// (U+202A–U+202E), isolates (U+2066–U+2069) and the directional marks (U+200E, U+200F).
-///
-/// The bidi controls start no line, but in a terminal or an editor they reorder how the rest of
-/// one displays, so a name could make a board row read as something it does not say.
-#[must_use]
-pub fn breaks_lines(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{2028}'
-                | '\u{2029}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{200E}'
-                | '\u{200F}'
-        )
-}
+/// Whether `c` may not appear in a name printed for somebody reading (V210-123): the rule lives in
+/// `vox-text`, which the core shares for what peers say (V210-154).
+pub use vox_text::breaks_lines;
 
 /// One character of each kind [`breaks_lines`] refuses, for a proof to forge a name through
 /// each (as `agent_hook::LINE_BREAKS` is for message rows): a sanitiser that stops refusing any
@@ -78,19 +61,7 @@ pub fn is_valid_name(s: &str, max: usize) -> bool {
 /// with `…` (V210-123). [`is_valid_name`] refuses such a name on the way in; this is the
 /// second guard, for every printer, so a name that got in some other way still cannot
 /// start a line.
-#[must_use]
-pub fn shown(s: &str, max: usize) -> String {
-    let mut out = String::with_capacity(s.len().min(max) + 3);
-    for c in s.chars() {
-        let c = if breaks_lines(c) { '\u{fffd}' } else { c };
-        if out.len() + c.len_utf8() > max {
-            out.push('…');
-            break;
-        }
-        out.push(c);
-    }
-    out
-}
+pub use vox_text::shown;
 
 /// The data key naming the work item a message is about (ADR-021 §2). Its **shape** is
 /// checked ([`is_valid_work`]); its meaning never is — carried, compared byte for byte
