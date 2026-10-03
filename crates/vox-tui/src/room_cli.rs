@@ -1454,10 +1454,10 @@ pub async fn claim_resource(
     // and this node folds it as won until a claim that crossed it arrives from another member:
     // two claims made at once were both told "you hold it". So a claim this node folds as won is
     // put to every other member first, and "you hold it" waits for every one of them to fold the
-    // same. One that crossed another is put to them too, so the loser is told who really came
-    // first, which a third member's claim this node has not seen yet may be. The current state is
-    // the answer, not this post's own outcome: on a retry the resource may have moved on since the
-    // first attempt.
+    // same. One that crossed another is put to them too, so the loser is told whose claim the
+    // room orders first, which a third member's claim this node has not seen yet may be. The
+    // current state is the answer, not this post's own outcome: on a retry the resource may have
+    // moved on since the first attempt.
     //
     // Crossed: the holder's claim was not in this node's log when this one was made.
     let before = done.before.clone();
@@ -1484,14 +1484,12 @@ pub async fn claim_resource(
         Some(State::Held { owner, .. }) if *owner == me => (
             false,
             format!(
-                "{resource} is not agreed yet: {}. Your claim stands in the room: it is yours \
-                 unless such a member claimed it first. Run `vox room board {room}` later to \
-                 see who holds it, claim it again to ask again, or release it",
-                unagreed
-                    .iter()
-                    .map(|(m, why)| format!("member {} {why}", crate::ident::author_id(m)))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                "{resource} is not agreed yet: {}. Your claim is posted, but it is not sure to be \
+                 yours: a claim by such a member can still be ordered before it, even one made \
+                 after it.{} Run `vox room board {room}` later to see who holds it, claim it \
+                 again to ask again, or release it",
+                unagreed_text(&unagreed),
+                clocks_note(&unagreed),
             ),
             coord::EXIT_UNAGREED,
         ),
@@ -1500,9 +1498,14 @@ pub async fn claim_resource(
         }) if crossed(acquisition) => (
             false,
             format!(
-                "{resource} went to {}: your claims crossed and theirs came first — you did not \
-                 get it",
-                who(owner)
+                "{resource} went to {}: your claims crossed and the room orders theirs first — \
+                 you did not get it{}",
+                who(owner),
+                if clocks_note(&unagreed).is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({}.{})", unagreed_text(&unagreed), clocks_note(&unagreed))
+                }
             ),
             1,
         ),
@@ -1566,6 +1569,31 @@ pub async fn claim_resource(
         Some(("unagreed", unagreed_json.into())),
     )
 }
+
+/// Why members did not agree to a claim, as one line naming each.
+fn unagreed_text(unagreed: &[(Digest32, String)]) -> String {
+    unagreed
+        .iter()
+        .map(|(m, why)| format!("member {} {why}", crate::ident::author_id(m)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What a claimant must know when a member's clock is too far from its own (V210-168): the room
+/// orders claims by the stamps their nodes gave them, so the board can name one made later.
+fn clocks_note(unagreed: &[(Digest32, String)]) -> &'static str {
+    if unagreed
+        .iter()
+        .any(|(_, why)| why.starts_with(CLOCKS_APART))
+    {
+        " While the clocks are apart, the board can name a holder whose claim was made later."
+    } else {
+        ""
+    }
+}
+
+/// How a member whose clock is too far from the claimant's is described.
+const CLOCKS_APART: &str = "has a clock more than";
 
 /// The claim-protocol `type`s an agreement compares (V210-168).
 const CLAIM_TYPES: &[&str] = &[
@@ -1653,8 +1681,8 @@ async fn agreement(
                 Agreement::Unreachable => Some("could not be reached".to_owned()),
                 Agreement::Unanswered => Some("did not answer in time".to_owned()),
                 Agreement::ClocksApart => Some(format!(
-                    "has a clock more than {} minutes behind yours, too far apart to tell which \
-                     claim came first; set both clocks right",
+                    "{CLOCKS_APART} {} minutes away from yours, too far apart to order claims by; \
+                     set both clocks right",
                     vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
                 )),
             };

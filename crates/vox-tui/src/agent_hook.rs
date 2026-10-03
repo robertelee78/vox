@@ -237,7 +237,7 @@ fn lost_claims(
             .map(|p| p.envelope.kind.clone())
     };
     // **Lost to a claim that crossed it**, not lapsed (V210-168): no claim this session made on
-    // it since it last let it go (released or handed it off) applied, because another came first
+    // it since it last let it go (released or handed it off) applied, because another was ordered first
     // in the room's order. One that applied and then ran out lapsed, even if the session claimed
     // it again while it held it (that repeat folds `Lost`: it found the resource held, by itself).
     // A holding the session ended itself says nothing about the claims it made after.
@@ -280,11 +280,11 @@ fn lost_claims(
         .map(|(crossed, r, state)| match state {
             // Only the holder can release or hand off, and those were filtered out
             // above, so a claim that is gone and not by this session's own act LAPSED
-            // first, or never applied because one that crossed it came first; what state
+            // first, or never applied because one that crossed it was ordered first; what state
             // it is in now is the rest of the news.
             Some(State::Held { owner, .. }) if crossed => format!(
-                "You do not hold `{r}`: your claim crossed with {}'s, which came first, so they \
-                 hold it. Stop work on it.",
+                "You do not hold `{r}`: {} claimed it too, and the room orders their claim \
+                 before yours, so they hold it. Stop work on it.",
                 who(&owner.author, &owner.session)
             ),
             Some(State::Held { owner, .. }) => format!(

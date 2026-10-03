@@ -9385,6 +9385,7 @@ impl Node {
             channel_id,
             epoch,
             entry,
+            sent_millis: (self.millis_clock)(),
             types,
         };
         let view = self.view_tx.subscribe();
@@ -11753,16 +11754,21 @@ async fn admit_board_records(
 /// The posts of `ask.types` this node's view of a room holds, once it holds `ask.entry`; `None`
 /// while it does not (V210-168).
 ///
-/// **Not agreed when the clocks are too far apart**: an entry stamped more than
+/// **Not agreed when the clocks are too far apart, either way**: an entry stamped more than
 /// [`crate::node::agreestream::STAMP_LEAD_LIMIT_MILLIS`] ahead of `now_millis` does not move this
-/// node's next stamp past it, so a claim this node made next could sort first. Agreeing then
-/// could tell two claimants "you hold it"; the answer says the clocks are apart instead.
+/// node's next stamp past it, so a claim this node made next could sort first; and an asker whose
+/// clock is more than that behind this node's skipped this node's posts when it stamped, so its
+/// claim can sort before one this node already holds. Agreeing then could tell two claimants "you
+/// hold it"; the answer says the clocks are apart instead.
 fn listed(
     view: &crate::node::api::NodeView,
     ask: &crate::node::agreestream::Ask,
     now_millis: u64,
 ) -> Option<crate::node::agreestream::Answer> {
     use crate::node::agreestream::{Answer, MAX_LISTED, STAMP_LEAD_LIMIT_MILLIS};
+    if now_millis.abs_diff(ask.sent_millis) > STAMP_LEAD_LIMIT_MILLIS {
+        return Some(Answer::ClocksApart);
+    }
     let d = view
         .open_channels
         .iter()
