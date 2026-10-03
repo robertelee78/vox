@@ -89,7 +89,7 @@ impl AppError {
 /// [`ViewModel`] to render and consumes [`Command`]s the user issues. The live
 /// implementation is [`DaemonCore`] (a client of the account's daemon); [`OfflineCore`]
 /// is the no-node shell used by tests.
-/// What the TUI's status line says while creating or unlocking the identity waits for another
+/// What the TUI's status line says while creating the identity waits for another
 /// vox holding the profile.
 pub const WAITING_FOR_PROFILE_TUI: &str =
     "waiting: another vox holds this profile open, and only one at a time may write it — this goes on by itself";

@@ -86,7 +86,7 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     }
 }
 
-/// The masked onboarding/unlock prompt: the current field's label and its
+/// The masked onboarding/attach prompt: the current field's label and its
 /// **masked** value (one `•` per character for secret fields), never the text.
 fn render_prompt(frame: &mut Frame, area: Rect, p: &Prompt) {
     let h = 5.min(area.height);
