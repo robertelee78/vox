@@ -360,10 +360,12 @@ fn serves_udp(path: PathKind) {
     let (dns, dns_seen) = dns_responder();
     let (dual, dual_udp_seen) = dual_echo();
     let mut w = world(
+        // Every share is named (V030-25), and one name is one service in a room, so the UDP
+        // service on the TCP service's port takes its own name: `u<port>`.
         vec![
-            format!("{dns}/udp"),
-            dual.to_string(),
-            format!("{dual}/udp"),
+            format!("{dns}={dns}/udp"),
+            format!("{dual}={dual}"),
+            format!("u{dual}={dual}/udp"),
         ],
         true,
         path,
@@ -371,7 +373,7 @@ fn serves_udp(path: PathKind) {
     let guest = w.guest_dir.clone();
 
     // ---- proof 1: dig through a UDP forward ----
-    let (fwd, at) = w.forward_vox("forward", &guest, &format!("{dns}/udp"));
+    let (fwd, at) = w.forward_service("forward", &guest, &format!("{dns}/udp"));
     let t0 = Instant::now();
     let (answer, tries) = dig_until(at, Duration::from_secs(120));
     eprintln!(
@@ -383,7 +385,7 @@ fn serves_udp(path: PathKind) {
     assert_eq!(
         answer.as_deref(),
         Some("10.53.0.1"),
-        "PRODUCT: dig through `vox forward <room>.vox {dns}/udp` must get the responder's answer"
+        "PRODUCT: dig through `vox forward <room> <host> {dns}/udp` must get the responder's answer"
     );
     // And every later query is answered first time: the flow is up.
     let answered = (0..5).filter(|_| dig(at).is_some()).count();
@@ -396,7 +398,10 @@ fn serves_udp(path: PathKind) {
 
     // ---- vox up: TCP and UDP on the same port (proof 6), oversize (proof 4), M22.4 ----
     let (_up, proxy) = w.up("up", &guest);
-    let name = format!("{}.vox", w.room);
+    // Each service by its address, `<service>.<node>.<room>.vox` (V030-25): the name selects
+    // the service, and the port a SOCKS request carries is ignored.
+    let tcp_name = format!("{dual}.{}.{}.vox", w.host_fp, w.room);
+    let name = format!("u{dual}.{}.{}.vox", w.host_fp, w.room);
     let mut tcp = product(
         TcpStream::connect(proxy),
         &format!("connect to the SOCKS proxy `vox up` bound at {proxy}"),
@@ -416,9 +421,9 @@ fn serves_udp(path: PathKind) {
         1,
         0,
         3,
-        apparatus(u8::try_from(name.len()), "a SOCKS name length"),
+        apparatus(u8::try_from(tcp_name.len()), "a SOCKS name length"),
     ];
-    req.extend_from_slice(name.as_bytes());
+    req.extend_from_slice(tcp_name.as_bytes());
     req.extend_from_slice(&dual.to_be_bytes());
     product(tcp.write_all(&req), "send CONNECT to `vox up`");
     let mut head = [0u8; 10];
@@ -579,9 +584,9 @@ fn udp_is_carried_on_a_relayed_path() {
 fn denied(path: PathKind) {
     watchdog::arm();
     let (dns, dns_seen) = dns_responder();
-    let mut w = world(vec![format!("{dns}/udp")], false, path);
+    let mut w = world(vec![format!("{dns}={dns}/udp")], false, path);
     let guest = w.guest_dir.clone();
-    let (mut fwd, at) = w.forward_vox("stranger-forward", &guest, &format!("{dns}/udp"));
+    let (mut fwd, at) = w.forward_service("stranger-forward", &guest, &format!("{dns}/udp"));
     let (answer, tries) = dig_until(at, Duration::from_secs(15));
     let seen = dns_seen.load(Ordering::Relaxed);
     eprintln!(
@@ -629,11 +634,11 @@ fn an_untrusted_joiner_reaches_no_udp_service_relayed() {
 fn revocation(path: PathKind) {
     watchdog::arm();
     let (dns, _) = dns_responder();
-    let mut w = world(vec![format!("{dns}/udp")], true, path);
+    let mut w = world(vec![format!("{dns}={dns}/udp")], true, path);
     // `vox trust remove` must reach the running host, which `vox serve` cannot be asked.
     w.restart_host_as_daemon();
     let guest = w.guest_dir.clone();
-    let (_fwd, at) = w.forward_vox("forward", &guest, &format!("{dns}/udp"));
+    let (_fwd, at) = w.forward_service("forward", &guest, &format!("{dns}/udp"));
     let (answer, _) = dig_until(at, Duration::from_secs(180));
     assert!(
         answer.is_some(),
@@ -773,7 +778,7 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
     let lossy: Arc<Mutex<Knobs>> = Arc::default();
     let lossy_in = Arc::clone(&lossy);
     let mut w = World::build(&Setup {
-        specs: vec![format!("{sink_port}/udp")],
+        specs: vec![format!("{sink_port}={sink_port}/udp")],
         trusted: true,
         path: PathKind::Relayed,
         guest_leg: Some(Box::new(move |anchor| {
@@ -783,7 +788,7 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
         })),
     });
     let guest = w.guest_dir.clone();
-    let (_fwd, at) = w.forward_vox("forward", &guest, &format!("{sink_port}/udp"));
+    let (_fwd, at) = w.forward_service("forward", &guest, &format!("{sink_port}/udp"));
 
     let client = apparatus(UdpSocket::bind("127.0.0.1:0"), "bind the blaster");
     // Open the flow: seq 0 until the sink hears one.

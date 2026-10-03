@@ -215,13 +215,16 @@ impl UdpFlows {
         self.len() == 0
     }
 
-    /// Every live flow and its counters.
+    /// Every live flow and its counters, oldest first: a listing a person reads twice must not
+    /// reorder itself.
     #[must_use]
     pub fn snapshot(&self) -> Vec<FlowInfo> {
         let now = self.now_ms();
-        self.table()
-            .slots
-            .values()
+        let t = self.table();
+        let mut keys: Vec<&u64> = t.slots.keys().collect();
+        keys.sort_unstable();
+        keys.into_iter()
+            .filter_map(|k| t.slots.get(k))
             .map(|s| FlowInfo {
                 peer: s.peer,
                 label: s.label.clone(),

@@ -496,7 +496,9 @@ impl PathKind {
 
 /// How a [`World`] is built.
 pub struct Setup {
-    /// What the host serves: `<port>`, `<port>/udp`, …
+    /// What the host serves, each named (V030-25): `<name>=<port>`, `<name>=<port>/udp`, … A
+    /// proof names a service for its port (`22=22`, `53=53/udp`), so its tag is the port (`22`,
+    /// `udp/53`) and its address is `<port>.<host>.<room>.vox`.
     pub specs: Vec<String>,
     /// Whether the host trusts the guest.
     pub trusted: bool,
@@ -660,14 +662,15 @@ impl World {
     /// `trusted`, which is the whole authorization (ADR-017 decision 3).
     pub fn new(service_port: u16, trusted: bool) -> Self {
         Self::build(&Setup {
-            specs: vec![service_port.to_string()],
+            specs: vec![format!("{service_port}={service_port}")],
             trusted,
             path: PathKind::Direct,
             guest_leg: None,
         })
     }
 
-    /// A world serving `setup.specs` (`<port>`, `<port>/udp`) on the path `setup.path`.
+    /// A world serving `setup.specs` (`<name>=<port>`, `<name>=<port>/udp`) on the path
+    /// `setup.path`.
     pub fn build(setup: &Setup) -> Self {
         let trusted = setup.trusted;
         let tmp = tempdir();
@@ -790,6 +793,7 @@ impl World {
             service_port: setup
                 .specs
                 .first()
+                .and_then(|s| s.rsplit('=').next())
                 .and_then(|s| s.split('/').next())
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(0),
@@ -842,6 +846,12 @@ impl World {
     /// Kill the host's `vox serve` and bring the same identity and room back as
     /// `vox daemon`, on a **new** port — a restart and a path change at once.
     pub fn restart_host_as_daemon(&mut self) {
+        self.restart_host_as_daemon_with(&[]);
+    }
+
+    /// [`Self::restart_host_as_daemon`], with `extra` added to the daemon's arguments
+    /// (`--metrics 127.0.0.1:0`, say).
+    pub fn restart_host_as_daemon_with(&mut self, extra: &[&str]) {
         let old_pid = self.host.as_ref().map(|h| h.child.id());
         drop(self.host.take());
         if let Some(pid) = old_pid {
@@ -862,7 +872,10 @@ impl World {
                 &self.host_anchor,
                 "--listen",
                 self.path.host_listen(),
-            ]),
+            ])
+            .into_iter()
+            .chain(args(extra))
+            .collect::<Vec<_>>(),
         );
         let room = self.room.clone();
         daemon.expect_line("the daemon to hold the room open", |l| {
@@ -871,9 +884,18 @@ impl World {
         self.host = Some(daemon);
     }
 
-    /// `vox forward <room>.vox <spec> 0` from `dir` — the `.vox` form ADR-022 names, where
-    /// the name gives the room and its host — returning it and the address it bound.
-    pub fn forward_vox(&self, name: &str, dir: &Path, spec: &str) -> (VoxProc, SocketAddr) {
+    /// The host's first service by its address, `<service>.<node>.<room>.vox` — the only `.vox`
+    /// name that resolves (V030-25) — with the service named for its port, the host by its
+    /// fingerprint and the room by its id.
+    pub fn service_host(&self) -> String {
+        format!("{}.{}.{}.vox", self.service_port, self.host_fp, self.room)
+    }
+
+    /// `vox forward <room> <host> <service> 127.0.0.1:0` from `dir`, where `service` is a tag (`22`) or a
+    /// port spec (`53/udp` is the service `udp/53`) — returning it and the address it bound.
+    /// (The `vox forward <room>.vox <service> <local>` shape this used is withdrawn (V030-25);
+    /// `vox forward <service>.<node>.<room>.vox` needs a node already holding the profile.)
+    pub fn forward_service(&self, name: &str, dir: &Path, spec: &str) -> (VoxProc, SocketAddr) {
         // From a file, never argv (V210-72: a room passphrase on the command line is refused).
         let pass_file = dir.join(format!("{name}.room.pass"));
         std::fs::write(&pass_file, &self.passphrase)
@@ -883,9 +905,10 @@ impl World {
             dir,
             &args(&[
                 "forward",
-                &format!("{}.vox", self.room),
+                &self.room,
+                &self.host_fp,
                 spec,
-                "0",
+                "127.0.0.1:0",
                 "--passphrase-file",
                 &utf8(&pass_file),
                 "--anchor",

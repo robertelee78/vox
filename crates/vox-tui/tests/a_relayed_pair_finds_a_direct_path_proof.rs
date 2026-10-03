@@ -11,8 +11,8 @@
 //! **The staging — real processes only.** A `vox node` anchor on `[::]` (dual-stack), a `vox serve`
 //! host on `127.0.0.1`, and the guest on `[::1]`, set up with `vox id`, `vox trust add` and
 //! `vox connect`; the guest then runs `vox up` and asks it for the host's service over SOCKS5, as
-//! `ssh user@<room>.vox` does. Split by address family, host and guest cannot send each other a
-//! datagram (`support/relay.rs`). The host advertises a **port forward** the proof owns
+//! `ssh user@<service>.<node>.<room>.vox` does. Split by address family, host and guest cannot
+//! send each other a datagram (`support/relay.rs`). The host advertises a **port forward** the proof owns
 //! (`support/port_forward.rs`, via the proof-only `VOX_TEST_ADVERTISE`) — an `[::1]` socket that
 //! carries datagrams to and from the host — which is therefore the pair's only possible direct
 //! path. It starts **closed** (it drops every datagram), so the only path is the anchor's circuit;

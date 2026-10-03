@@ -298,11 +298,10 @@ pub enum Error {
         reason: String,
     },
 
-    /// A tunnel operation was refused by authorization (ADR-013): the requesting
-    /// member holds no valid `dial:<service>` capability (or the host no
-    /// `bind:<service>`), or the service is dark/unknown. Default-deny: the absence
-    /// of a grant is a denial, and a denial is indistinguishable from "no such
-    /// service" so an unauthorized member cannot even confirm a service exists.
+    /// A tunnel operation was refused (ADR-013, ADR-017 decision 3): the host does not
+    /// trust the requesting member, it is no current author of the room, or the service is
+    /// dark/unknown. Default-deny, and a denial is indistinguishable from "no such service",
+    /// so an unauthorized member cannot even confirm a service exists.
     #[error("tunnel denied: {0}")]
     TunnelDenied(&'static str),
 
@@ -323,6 +322,12 @@ pub enum Error {
     /// the person is told: how many are open, to which services, and how to free one.
     #[error("{0}")]
     TunnelLimit(String),
+
+    /// A node shares at most one service under a name in a room (V030-25): the name is the
+    /// `<service>` part of `<service>.<node>.<room>.vox`, so two under one name would make the
+    /// address mean two things. Carries the name and where the existing one lives.
+    #[error("{0:?} is already the name of a service you share in this room, at {1}")]
+    ServiceNameTaken(String, std::net::SocketAddr),
 
     /// A running tunnel was closed on purpose (V030-11): by a person (`vox tunnel close`, the
     /// TUI), at its other end, or as stuck. Carries why, in the words `vox status` shows.

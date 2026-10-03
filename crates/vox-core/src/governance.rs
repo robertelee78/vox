@@ -17,13 +17,13 @@
 //!   identical channelID by construction.
 //!
 //! ## The capability model (SPKI/SDSI/UCAN attenuation)
-//! - [`capability`] — the closed capability vocabulary: `admin` ⊇ `policy`, plus the
-//!   genesis service grant's `bind:<svc>` / `dial:<svc>`. Unknown capability =
-//!   verification failure (closed domain). **Governance is only "the creator or an
-//!   admin sets the room's retention"** (V030-32, the decider, 2026-10-02): the
-//!   `delegate`, `invite` and `passphrase-rotate` capabilities and `#role` attributes,
-//!   which no command ever issued, are removed and their tokens are refused as
-//!   unknown.
+//! - [`capability`] — the closed capability vocabulary: `admin` ⊇ `policy`. Unknown
+//!   capability = verification failure (closed domain). **Governance is only "the
+//!   creator or an admin sets the room's retention"** (V030-32, the decider,
+//!   2026-10-02): the `delegate`, `invite` and `passphrase-rotate` capabilities and
+//!   `#role` attributes, which no command ever issued, are removed, and so are the
+//!   `bind:`/`dial:` tunnel capabilities (PRD-001 R44: reach is the host's own
+//!   decision); their tokens are refused as unknown.
 //!
 //! ## The governance entry bodies (pinned canonical CBOR)
 //! All composite-signed, `(channelID, epoch)`-bound, and ride the causal log
@@ -69,9 +69,6 @@
 //! a false claim that already-readable traffic became unreadable.
 //!
 //! ## Scope boundaries (documented, not stubbed — ADR mantra)
-//! - **Tunnel capability *use*** (ABAC over `bind`/`dial`/role-tags) → M11/ADR-013:
-//!   M6 defines the caps in the lattice and the evaluator evaluates them; ADR-013
-//!   adds no parallel engine.
 //! - **SKDM *delivery*** → M4/ADR-006: a consent-grant carries only `skdm_ref`; the
 //!   SKDM travels in the pairwise session.
 //! - **TTL / at-rest erasure** → M8/ADR-010: M6 carries the TTL policy value; M8
@@ -90,7 +87,7 @@ pub mod genesis;
 pub mod lifecycle;
 pub mod membership;
 pub mod policy;
-pub mod servicegrant;
+pub mod share;
 
 pub use capability::{Capability, CapabilitySet};
 pub use cert::{AdminCert, AdminRevocation, RevocationReason};
@@ -101,4 +98,3 @@ pub use genesis::{ChannelPolicy, Genesis, HistoryMode};
 pub use lifecycle::{LifecycleKind, RoomLifecycle};
 pub use membership::MembershipView;
 pub use policy::PolicyUpdate;
-pub use servicegrant::ServiceGrantExclusion;

@@ -387,7 +387,7 @@ impl RelayWorld {
             &host_dir,
             &args(&[
                 "serve",
-                &service,
+                &format!("{service}={service}"),
                 "--anchor",
                 &v4_spec,
                 "--listen",
@@ -491,13 +491,53 @@ impl RelayWorld {
         at
     }
 
+    /// Start the guest's `vox up` for the room, on `[::1]`; returns the proxy's address and **when
+    /// the test read its `vox up on` line** — the moment a person sees it is up and asks it for
+    /// something, after both production-Argon2id unlocks. Kept where a forward is, so
+    /// [`Self::expect_still_relayed`] reads it.
+    pub fn up(&mut self) -> (SocketAddr, Instant) {
+        let (listen, spec) = self.guest_net();
+        let (listen, spec) = (listen.to_owned(), spec.to_owned());
+        let passphrase_file = self.passphrase_file();
+        let mut up = VoxProc::spawn(
+            "up",
+            &self.guest_dir,
+            &args(&[
+                "up",
+                &self.room,
+                "--passphrase-file",
+                &passphrase_file,
+                "--bind",
+                "127.0.0.1:0",
+                "--anchor",
+                &spec,
+                "--listen",
+                &listen,
+            ]),
+        );
+        let line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
+        let ready = Instant::now();
+        let bound = line
+            .split_whitespace()
+            .nth(3)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| panic!("PRODUCT: no proxy address in `vox up`'s line {line:?}"));
+        self.fwd = Some(up);
+        (bound, ready)
+    }
+
+    /// The room's name for the host's service, as a SOCKS5 client asks `vox up` for it.
+    pub fn hostname(&self) -> String {
+        format!("{}.vox", self.room)
+    }
+
     /// **The path is a relay, said by the guest.** The forward's upgrade tries a direct dial and
     /// a punch and reports that neither landed. Without this line nothing here is staging a
     /// relayed path, and the caller must not report anything.
     pub fn expect_still_relayed(&mut self) {
         self.fwd
             .as_mut()
-            .expect("APPARATUS: the proof asked for `still relayed` before it started a forward")
+            .expect("APPARATUS: the proof asked for `still relayed` before it started a forward or a proxy")
             .expect_staging_within(
                 Duration::from_secs(60),
                 "`still relayed` for the host",

@@ -49,8 +49,9 @@ pub enum StructTag {
     TlsIdentityExtension = 0x0009,
     /// `0x000A` — file chunk manifest (ADR-014).
     ChunkManifest = 0x000A,
-    /// `0x000B` — DGKA setup entry (ADR-009).
-    DgkaSetup = 0x000B,
+    // `0x000B` is RESERVED. It was the DGKA setup entry of deniable mode (ADR-009), which
+    // is removed from the code (PRD-001 R43); no build ever wrote one. It is not reused, so
+    // no bytes can ever be read as both; `from_u16` refuses it like any unknown tag.
     /// `0x000C` — personal self-channel entry (ADR-008).
     SelfChannelEntry = 0x000C,
     /// `0x000D` — channel genesis record (ADR-007).
@@ -59,17 +60,16 @@ pub enum StructTag {
     AdminDelegationRevocation = 0x000E,
     /// `0x000F` — tunnel service advertisement (ADR-013).
     ServiceAdvertisement = 0x000F,
-    /// `0x0010` — epoch-end ephemeral-signing-key publication (ADR-009).
-    EskPublication = 0x0010,
+    // `0x0010` is RESERVED: deniable mode's ephemeral-signing-key publication (ADR-009,
+    // removed, PRD-001 R43). Never written by any build, never reused.
     /// `0x0011` — transport session-establishment record (ADR-011).
     SessionEstablishment = 0x0011,
     /// `0x0012` — member prekey-bundle rendezvous record (ADR-016 M14): a
     /// member's root-signed prekey bundle on the rendezvous board.
     MemberBundleRecord = 0x0012,
-    /// `0x0013` — service-grant exclusion (ADR-007/ADR-017): withdraws the genesis
-    /// service grant from one member, which is the only way to take back a
-    /// capability nobody was ever issued a certificate for.
-    ServiceGrantExclusion = 0x0013,
+    // `0x0013` is RESERVED. It was the service-grant exclusion of the withdrawn capability
+    // model (ADR-017 M17.7, PRD-001 R44): a genesis service grant confers nothing, so there
+    // is nothing to exclude anyone from. No release ever posted one. Never reused.
     /// `0x0014` — join witness (ADR-016 M17.6): the member that actually verified a
     /// joiner's ADR-005 passphrase proof signs that it did so. A key becomes an author
     /// only on such evidence, which is what makes "no member can add another member"
@@ -85,20 +85,23 @@ pub enum StructTag {
     /// member and posted to the room's log, so any member that replicates the log carries it
     /// to a recipient who is never online with its sender.
     KeyPackage = 0x0017,
-    /// `0x0018` — room lifecycle (V030-08): a member leaving or coming back, the creator (or an
+    /// `0x0018` — service share (V030-25): a member's own statement that it shares a named
+    /// service with the room, or no longer does, so every member can list what is shared.
+    ServiceShare = 0x0018,
+    /// `0x0019` — room lifecycle (V030-08): a member leaving or coming back, the creator (or an
     /// admin it named) ending the room for everyone, or the creator's chosen idle end.
-    RoomLifecycle = 0x0018,
-    /// `0x0019` — board withdraw (V030-14): takes a member's records, or a whole room, off a
+    RoomLifecycle = 0x0019,
+    /// `0x001A` — board withdraw (V030-14): takes a member's records, or a whole room, off a
     /// rendezvous board at once.
-    BoardWithdraw = 0x0019,
-    /// `0x001A` — admin roster (V030-14): a room's current admins as its creator signed them, so
+    BoardWithdraw = 0x001A,
+    /// `0x001B` — admin roster (V030-14): a room's current admins as its creator signed them, so
     /// a board can tell a current admin's room withdraw from a removed admin's.
-    AdminRoster = 0x001A,
+    AdminRoster = 0x001B,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 25] = [
+    pub const ALL: [StructTag; 23] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -109,18 +112,16 @@ impl StructTag {
         StructTag::PreJoinRecord,
         StructTag::TlsIdentityExtension,
         StructTag::ChunkManifest,
-        StructTag::DgkaSetup,
         StructTag::SelfChannelEntry,
         StructTag::GenesisRecord,
         StructTag::AdminDelegationRevocation,
         StructTag::ServiceAdvertisement,
-        StructTag::EskPublication,
         StructTag::SessionEstablishment,
         StructTag::MemberBundleRecord,
-        StructTag::ServiceGrantExclusion,
         StructTag::JoinWitness,
         StructTag::Checkpoint,
         StructTag::KeyPackage,
+        StructTag::ServiceShare,
         StructTag::RoomLifecycle,
         StructTag::BoardWithdraw,
         StructTag::AdminRoster,
@@ -134,7 +135,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 25-element table: trivial and avoids an
+        // Linear scan over a 23-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -153,23 +154,21 @@ impl StructTag {
             StructTag::AdminCert => "vox/admin-cert/v1",
             StructTag::ConsentGrant => "vox/consent-grant/v1",
             StructTag::ConsentRevocation => "vox/consent-revocation/v1",
-            StructTag::ServiceGrantExclusion => "vox/service-grant-exclusion/v1",
             StructTag::PolicyRotation => "vox/policy-rotation/v1",
             StructTag::RendezvousRecord => "vox/rendezvous-record/v1",
             StructTag::PreJoinRecord => "vox/pre-join-record/v1",
             StructTag::TlsIdentityExtension => "vox/tls-identity-extension/v1",
             StructTag::ChunkManifest => "vox/chunk-manifest/v1",
-            StructTag::DgkaSetup => "vox/dgka-setup/v1",
             StructTag::SelfChannelEntry => "vox/self-channel-entry/v1",
             StructTag::GenesisRecord => "vox/genesis/v1",
             StructTag::AdminDelegationRevocation => "vox/admin-delegation-revocation/v1",
             StructTag::ServiceAdvertisement => "vox/service-advertisement/v1",
-            StructTag::EskPublication => "vox/esk-publication/v1",
             StructTag::SessionEstablishment => "vox/session-establishment/v1",
             StructTag::MemberBundleRecord => "vox/member-bundle-record/v1",
             StructTag::JoinWitness => "vox/join-witness/v1",
             StructTag::Checkpoint => "vox/checkpoint/v1",
             StructTag::KeyPackage => "vox/key-package/v1",
+            StructTag::ServiceShare => "vox/service-share/v1",
             StructTag::RoomLifecycle => "vox/room-lifecycle/v1",
             StructTag::BoardWithdraw => "vox/board-withdraw/v1",
             StructTag::AdminRoster => "vox/admin-roster/v1",

@@ -760,6 +760,7 @@ fn conflict(op: &str, group: &[Digest32]) -> AppError {
 /// # Errors
 /// [`EXIT_VERSION`] naming every incompatible worker, or a node error.
 pub async fn participate(
+    paths: &vox_core::node::paths::Paths,
     client: &mut IpcClient,
     channel_id: Digest32,
     room: &str,
@@ -767,9 +768,18 @@ pub async fn participate(
 ) -> Result<Snapshot, AppError> {
     let mut snap = snapshot(client, channel_id).await?;
     if !snap.announced(session) {
+        // **How it can be reached rides the hello** (V030-17): a sender on another node cannot
+        // see this node's session registrations, so it learns from the room whether an urgent
+        // message can interrupt this session.
+        let mut data = serde_json::Map::new();
+        data.insert(
+            crate::wake::WAKE_KEY.into(),
+            crate::wake::reachability(paths, session).into(),
+        );
         let hello = Draft {
             kind: HELLO.into(),
             body: format!("session {session} runs vox {VERSION}"),
+            data,
             ..Draft::default()
         };
         let op = new_op()?;

@@ -1,5 +1,5 @@
-//! The **board withdraw** (tag `0x0019`, domain `vox/board-withdraw/v1`) and the **admin roster**
-//! (tag `0x001A`, domain `vox/admin-roster/v1`), V030-14: signed statements, put on a rendezvous
+//! The **board withdraw** (tag `0x001A`, domain `vox/board-withdraw/v1`) and the **admin roster**
+//! (tag `0x001B`, domain `vox/admin-roster/v1`), V030-14: signed statements, put on a rendezvous
 //! board, that take records off it at once and say who may.
 //!
 //! A leave or an end is a fact on the room's log (V030-08), and a member's node acts on it the
@@ -132,7 +132,7 @@ impl BoardWithdraw {
         })
     }
 
-    /// Frame for the wire (tag `0x0019`): the body fields then the signature.
+    /// Frame for the wire (tag `0x001A`): the body fields then the signature.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();
@@ -248,7 +248,7 @@ impl AdminRoster {
         })
     }
 
-    /// Frame for the wire (tag `0x001A`): the body fields then the signature.
+    /// Frame for the wire (tag `0x001B`): the body fields then the signature.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();

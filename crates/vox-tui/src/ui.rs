@@ -222,13 +222,36 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         focused(ui, Focus::Timeline),
     );
     render_composer(frame, body[1], &ui.composer, focused(ui, Focus::Composer));
+    // Members above, and under them what is shared in the room (V030-25), when anything is.
+    let side = if channel.shared.is_empty() {
+        vec![cols[1]]
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(
+                    u16::try_from(channel.shared.len().saturating_add(2)).unwrap_or(u16::MAX),
+                ),
+            ])
+            .split(cols[1])
+            .to_vec()
+    };
     render_members(
         frame,
-        cols[1],
+        side[0],
         &channel.members,
         ui.selected_member,
         focused(ui, Focus::Members),
     );
+    if let Some(area) = side.get(1) {
+        let items: Vec<ListItem> = channel
+            .shared
+            .iter()
+            .map(|s| ListItem::new(Line::from(s.clone())))
+            .collect();
+        frame.render_widget(List::new(items).block(pane_block("Shared", false)), *area);
+    }
 }
 
 fn focused(ui: &UiState, pane: Focus) -> bool {
@@ -269,7 +292,11 @@ fn render_timeline(
                 ));
             }
             spans.push(Span::styled(
-                format!("{}: ", m.author_nick),
+                if m.addressed.is_empty() {
+                    format!("{}: ", m.author_nick)
+                } else {
+                    format!("{} {}: ", m.author_nick, m.addressed)
+                },
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(body));

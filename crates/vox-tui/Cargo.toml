@@ -103,6 +103,8 @@ quinn.workspace = true
 # R41's comparison flow (ADR-024) presents a certificate of its own.
 rcgen.workspace = true
 rustls.workspace = true
+# V030-33's proof offers the node only the post-quantum hybrid group, as a client of its own.
+rustls-post-quantum.workspace = true
 # V210-85's proof stops `vox connect` at its passphrase prompts, which it shows only on a terminal:
 # the test opens a pty of its own and reads the terminal's modes back after the stop.
 rustix = { workspace = true, features = ["pty", "termios"] }

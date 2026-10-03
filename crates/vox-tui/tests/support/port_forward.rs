@@ -382,7 +382,7 @@ impl ForwardedWorld {
             &host_dir,
             &args(&[
                 "serve",
-                &service_port.to_string(),
+                &format!("{service_port}={service_port}"),
                 "--anchor",
                 &anchor.v4_spec,
                 "--listen",
@@ -442,9 +442,10 @@ impl ForwardedWorld {
         }
     }
 
-    /// The name the host's service answers on through `vox up`.
+    /// The name the host's service answers on through `vox up`: `<service>.<node>.<room>.vox`,
+    /// the only `.vox` form that resolves (V030-25); the service is named for its port.
     pub fn hostname(&self) -> String {
-        format!("{}.vox", self.room)
+        format!("{}.{}.{}.vox", self.service_port, self.host_fp, self.room)
     }
 
     /// Start the guest's `vox up` on `[::1]`; returns it, the SOCKS address it bound, and when it

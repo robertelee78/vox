@@ -341,7 +341,7 @@ pub enum Inbound {
     /// channel's evaluator and offered services, on its own task (a tunnel lives as
     /// long as the TCP connection it carries).
     Tunnel {
-        /// The authenticated peer — the client whose `dial:` capability is enforced.
+        /// The authenticated peer — the client the host's dial gate decides on.
         peer: Digest32,
         /// The stream's send half.
         send: SendStream,

@@ -1,8 +1,10 @@
-//! PRD-001 R20 / ADR-017 decision 7 — **local names**: `ssh nas.family.vox`, where `nas`
-//! is the name *this* machine gave that node when it trusted it and `family` is *this*
-//! machine's name for the room. Proved with the shipped binary only: every member is a
-//! `vox daemon`, and everything they do is a `vox` verb (`vox trust add/rename/remove`,
-//! `vox room create/invite/join/roster`, `vox service add`, `vox up`, `vox forward`).
+//! PRD-001 R20 / ADR-017 decision 7 — **local names**: `ssh 22.nas.family.vox`, where `22` is
+//! the name the node shared its service under, `nas` is the name *this* machine gave that node
+//! when it trusted it and `family` is *this* machine's name for the room (V030-25:
+//! `<service>.<node>.<room>.vox` is the only `.vox` name that resolves). Proved with the
+//! shipped binary only: every member is a `vox daemon`, and everything they do is a `vox` verb
+//! (`vox trust add/rename/remove`, `vox room create/invite/join/roster`, `vox service add`,
+//! `vox up`, `vox forward`).
 //!
 //! The scene, from alice's side:
 //!
@@ -17,10 +19,10 @@
 //!    `family` through bob after alice is already in, so alice's join told her nothing about
 //!    carol: she learns that carol is a member only from the room's board, and `vox room
 //!    roster` on alice shows it.
-//! 1. `nas.family.vox` reaches bob and `laptop.family.vox` reaches carol — the member the
+//! 1. `22.nas.family.vox` reaches bob and `22.laptop.family.vox` reaches carol — the member the
 //!    name names, not the room's creator.
-//! 2. `laptop.work.vox` reaches carol through the second room, under its own name.
-//! 3. An unknown room, an unknown node, and an ambiguous node name are refused, each with
+//! 2. `22.laptop.work.vox` reaches carol through the second room, under its own name.
+//! 3. An unknown room and an unknown node are refused, and an alias already in use is refused, each with
 //!    a sentence saying which.
 //! 4. A node that is no longer trusted has no name.
 //!
@@ -287,33 +289,24 @@ impl Member {
         );
     }
 
-    /// `vox service list <room>`: whether it succeeded, and what it said. With the room
-    /// passphrase from a file, as the one-shot form needs it once no daemon holds the room.
-    fn list(&self, room: &str, pass: &str) -> (bool, String) {
-        let pass_file = self.dir.join("room.pass");
-        std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
+    /// `vox service list <room>`: whether it succeeded, and what it said. Listing opens no room,
+    /// so it takes no room passphrase (V210-149).
+    fn list(&self, room: &str) -> (bool, String) {
         let (ok, out, err) = vox(
             &self.dir,
-            &[
-                "service",
-                "list",
-                room,
-                "--passphrase-file",
-                pass_file.to_str().unwrap(),
-                "--listen",
-                "127.0.0.1:0",
-            ],
+            &["service", "list", room, "--listen", "127.0.0.1:0"],
             None,
         );
         (ok, format!("{out}{err}"))
     }
 
-    /// `vox forward <name> 22 0`: whether it bound, and what it said.
+    /// `vox forward <name> 0`, the name naming the service (V030-25): whether it bound, and what
+    /// it said.
     fn forward(&self, name: &str) -> (bool, String) {
         let mut p = VoxProc::spawn(
             &format!("{} forward {name}", self.name),
             &self.dir,
-            &args(&["forward", name, "22", "0"]),
+            &args(&["forward", name, "0"]),
         );
         let bound = p
             .line_within(Duration::from_secs(20), |l| l.contains("forwarding"))
@@ -463,7 +456,7 @@ fn a_local_name_reaches_the_node_it_names() {
     carol.serve(&family, family_pass, laptop_echo);
     carol.serve(&work, work_pass, laptop_work_echo);
     // (6) Listed while the daemon runs: `vox service list` asks it.
-    let (ok, listed) = carol.list(&work, work_pass);
+    let (ok, listed) = carol.list(&work);
     let offered = format!("22  →  {laptop_work_echo}");
     assert!(
         ok && listed.contains(&offered),
@@ -527,33 +520,32 @@ fn a_local_name_reaches_the_node_it_names() {
 
     // (1) and (2): each name reaches the node it names.
     let reached: Vec<(&str, Result<String, u8>)> = [
-        "nas.family.vox",
-        "laptop.family.vox",
-        "laptop.work.vox",
-        "NAS.Family.vox",
+        "22.nas.family.vox",
+        "22.laptop.family.vox",
+        "22.laptop.work.vox",
+        "22.NAS.Family.vox",
     ]
     .into_iter()
     .map(|n| (n, who_answers(proxy, n)))
     .collect();
     // (3): refusals, with reasons, from `vox forward`.
-    let unknown_room = alice.forward("nas.nowhere.vox");
-    let unknown_node = alice.forward("ghost.family.vox");
-    let not_there = alice.forward("nas.work.vox");
-    let named = alice.forward("laptop.family.vox");
-    // Two trusted nodes called `nas` in family: ambiguous.
+    let unknown_room = alice.forward("22.nas.nowhere.vox");
+    let unknown_node = alice.forward("22.ghost.family.vox");
+    let not_there = alice.forward("22.nas.work.vox");
+    let named = alice.forward("22.laptop.family.vox");
+    // An alias names one node: calling carol `nas` too is refused, and `nas` stays bob's.
     let rename = vox(&alice.dir, &["trust", "rename", &carol.fp, "nas"], None);
-    let ambiguous = alice.forward("nas.family.vox");
-    let ambiguous_socks = who_answers(proxy, "nas.family.vox");
+    let still_bob = who_answers(proxy, "22.nas.family.vox");
     // (4): untrusting carol takes her name away.
     let untrust = vox(&alice.dir, &["trust", "remove", &carol.fp], None);
-    let untrusted = alice.forward("nas.family.vox");
-    let now_bob = who_answers(proxy, "nas.family.vox");
-    let untrusted_laptop = who_answers(proxy, "laptop.work.vox");
+    let untrusted = alice.forward("22.nas.family.vox");
+    let now_bob = who_answers(proxy, "22.nas.family.vox");
+    let untrusted_laptop = who_answers(proxy, "22.laptop.work.vox");
 
     eprintln!(
         "reached: {reached:?}\nunknown room: {unknown_room:?}\nunknown node: {unknown_node:?}\n\
          nas in work: {not_there:?}\nforward laptop.family: {:?}\nrename: {rename:?}\n\
-         ambiguous: {ambiguous:?} / socks {ambiguous_socks:?}\nuntrust: {untrust:?}\n\
+         after the rename: {still_bob:?}\nuntrust: {untrust:?}\n\
          after untrusting carol: forward nas.family {untrusted:?}, socks nas.family \
          {now_bob:?}, laptop.work {untrusted_laptop:?}",
         named.0,
@@ -566,22 +558,22 @@ fn a_local_name_reaches_the_node_it_names() {
             .expect("APPARATUS: a name this proof did not try")
     };
     assert_eq!(
-        answered("nas.family.vox"),
+        answered("22.nas.family.vox"),
         Ok("bob".into()),
-        "PRODUCT: nas.family.vox did not reach bob's service, added to his running daemon"
+        "PRODUCT: 22.nas.family.vox did not reach bob's service, added to his running daemon"
     );
     assert_eq!(
-        answered("laptop.family.vox"),
+        answered("22.laptop.family.vox"),
         Ok("carol".into()),
-        "PRODUCT: laptop.family.vox did not reach carol's service, added to her running daemon — laptop is carol, not the room's creator"
+        "PRODUCT: 22.laptop.family.vox did not reach carol's service, added to her running daemon — laptop is carol, not the room's creator"
     );
     assert_eq!(
-        answered("laptop.work.vox"),
+        answered("22.laptop.work.vox"),
         Ok("carol-work".into()),
-        "PRODUCT: laptop.work.vox did not reach carol's work service, added to her running daemon — the same node through a second room, under that room's name"
+        "PRODUCT: 22.laptop.work.vox did not reach carol's work service, added to her running daemon — the same node through a second room, under that room's name"
     );
     assert_eq!(
-        answered("NAS.Family.vox"),
+        answered("22.NAS.Family.vox"),
         Ok("bob".into()),
         "PRODUCT: names are case-insensitive"
     );
@@ -608,15 +600,14 @@ fn a_local_name_reaches_the_node_it_names() {
         !not_there.0 && not_there.1.contains("not a member of `work`"),
         "PRODUCT: a node not in the room is refused, saying so: {not_there:?}"
     );
-    assert!(rename.0, "PRODUCT: the rename must succeed: {rename:?}");
     assert!(
-        !ambiguous.0 && ambiguous.1.contains("names 2 nodes you trust in `family`"),
-        "PRODUCT: an ambiguous name is refused, saying so: {ambiguous:?}"
+        !rename.0 && rename.2.contains("is already your name for"),
+        "PRODUCT: a second node cannot be given an alias already in use: {rename:?}"
     );
     assert_eq!(
-        ambiguous_socks,
-        Err(2),
-        "PRODUCT: the proxy refuses an ambiguous name"
+        still_bob,
+        Ok("bob".into()),
+        "PRODUCT: after the refused rename, 22.nas.family.vox is still bob's"
     );
     assert!(untrust.0, "PRODUCT: the untrust must succeed: {untrust:?}");
     assert!(
@@ -626,7 +617,7 @@ fn a_local_name_reaches_the_node_it_names() {
     assert_eq!(
         now_bob,
         Ok("bob".into()),
-        "PRODUCT: with carol untrusted, nas.family.vox is bob's again"
+        "PRODUCT: with carol untrusted, 22.nas.family.vox is bob's again"
     );
     assert_eq!(
         untrusted_laptop,
@@ -643,7 +634,7 @@ fn a_local_name_reaches_the_node_it_names() {
     // (6) The daemon stopped, the one-shot `vox service list` still shows carol's service: it
     // was kept, not only offered for the daemon's run.
     drop(carol.daemon.take());
-    let (ok, listed) = carol.list(&work, work_pass);
+    let (ok, listed) = carol.list(&work);
     assert!(
         ok && listed.contains(&offered),
         "PRODUCT: after carol's daemon stopped, `vox service list` does not show the service she \

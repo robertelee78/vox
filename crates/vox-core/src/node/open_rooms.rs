@@ -107,7 +107,8 @@ impl OpenRooms {
     ) -> Result<bool> {
         let key = <[u8; SEK_LEN]>::try_from(sek)
             .map_err(|_| Error::MalformedAtRest("open room SEK length"))?;
-        if passphrase.is_empty() || passphrase.len() > MAX_ROOM_PASSPHRASE {
+        // An empty passphrase is one (V030-36): a room made with none reopens like any other.
+        if passphrase.len() > MAX_ROOM_PASSPHRASE {
             return Err(Error::SizeLimitExceeded("open room passphrase"));
         }
         if self
@@ -170,7 +171,7 @@ impl OpenRooms {
             let key = <[u8; SEK_LEN]>::try_from(d.bytes().map_err(|_| bad("open room SEK"))?)
                 .map_err(|_| bad("open room SEK length"))?;
             let passphrase = d.bytes().map_err(|_| bad("open room passphrase"))?;
-            if passphrase.is_empty() || passphrase.len() > MAX_ROOM_PASSPHRASE {
+            if passphrase.len() > MAX_ROOM_PASSPHRASE {
                 return Err(bad("open room passphrase length"));
             }
             rooms.insert(

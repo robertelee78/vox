@@ -15,7 +15,8 @@
 //!    that makes several agent sessions share one node;
 //! 3. `vox room post` through the daemon reaches the log;
 //! 4. a wrong passphrase **fails loudly** rather than starting an unusable daemon;
-//! 5. an empty passphrase says what to do about it.
+//! 5. stdin with nothing on it says what to do about it. Nothing is not an empty passphrase,
+//!    which is one (V030-36): an empty line gives that.
 //!
 //! What a daemon does on SIGHUP is no longer here: it used to be "survives it", and it is now a
 //! clean stop like SIGINT, SIGTERM and SIGQUIT (V210-108), proved with every other long-running
@@ -194,11 +195,11 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
-        "PRODUCT: a daemon with an empty passphrase started: {err:?}"
+        "PRODUCT: a daemon given nothing on stdin started: {err:?}"
     );
     assert!(
         err.contains("passphrase"),
-        "PRODUCT: a daemon with an empty passphrase must say what is missing: {err:?}"
+        "PRODUCT: a daemon given nothing on stdin must say what is missing: {err:?}"
     );
 
     let mut child = Command::new(VOX)

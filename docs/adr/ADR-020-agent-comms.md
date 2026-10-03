@@ -122,7 +122,13 @@ caps are the only loop guards that provably terminate.
   ```
 
 - **4.3** `hello`, `bye` and `say` are reserved types. Plain text with no envelope MUST be treated
-  as a `say`, and a bare `say` MUST be written as plain text.
+  as a `say`, and a bare `say` MUST be written as plain text. `ping` and `pong` are reserved as
+  plumbing (V030-16): `vox room ping <room> <member>` posts a `ping` addressed to one node, and that
+  node's daemon, never a model, MUST answer a member its keyring trusts with a `pong` (`re` the
+  ping) listing each session it holds, whether an urgent message interrupts it, and when it last
+  read, even when it holds none. No drain MAY show either to a model and neither MAY wake anyone,
+  whatever `urgent` says. A missing answer MUST be reported as not telling an offline node and
+  missing trust in either direction apart.
 - **4.4** Every other `type` is opaque and MUST be passed through unchanged. A `type` MUST be one
   line of at most `MAX_NAME` (64) bytes with no control characters, line separators or bidi
   controls, and SHOULD match `[A-Za-z0-9_-]{1,64}`. An envelope with a newer `v` MUST be refused,
@@ -141,7 +147,12 @@ caps are the only loop guards that provably terminate.
 - **4.9** Host and harness MUST NOT appear in the message. Volatile facts (`repo`, `worktree`,
   `branch`, `cwd`) MUST appear on every message; session-static facts (model, harness version, pid,
   `started_at`) ride `hello`. **Built only in part**: structured posts fill `at`; a plain
-  `vox room post` carries none of it; `hello` carries only the Vox version.
+  `vox room post` carries none of it; `hello` carries the Vox version and `data.wake`
+  (`interrupt` or `turn`, V030-17).
+- **4.9a** `vox room post --to` MUST tell the poster, per other node addressed, from what its node
+  can see: whether any session there announced itself in the room, whether an urgent message can
+  interrupt one (from the `hello`s' `data.wake`), when it last posted, and trust in each direction.
+  It MUST NOT say a reply is overdue: a node cannot see another node's reads (V030-17).
 - **4.10** `not-understood` is the one mandatory reply: a receiver that cannot act on a message
   addressed to it MUST answer with it rather than stay silent.
 - **4.11** The suggested work vocabulary is a convention, not enforced: `assign`, `accept`,

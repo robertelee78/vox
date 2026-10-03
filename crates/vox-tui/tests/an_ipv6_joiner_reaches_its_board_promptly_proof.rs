@@ -86,7 +86,7 @@ fn an_ipv6_only_joiner_reaches_its_board_within_two_seconds() {
         &host_dir,
         &args(&[
             "serve",
-            &echo_service().to_string(),
+            &format!("{0}={0}", echo_service()),
             "--anchor",
             &v4_spec,
             "--listen",
@@ -199,7 +199,7 @@ fn a_joiner_whose_address_names_only_gone_boards_reaches_its_own_within_two_seco
         host_dir,
         &args(&[
             "serve",
-            &echo_service().to_string(),
+            &format!("{0}={0}", echo_service()),
             "--anchor",
             &room_spec,
             "--listen",

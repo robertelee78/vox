@@ -40,7 +40,7 @@ use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::genesis::Genesis;
 use crate::governance::lifecycle::RoomLifecycle;
 use crate::governance::policy::PolicyUpdate;
-use crate::governance::servicegrant::ServiceGrantExclusion;
+use crate::governance::share::ServiceShare;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::log::entry::Entry;
@@ -62,15 +62,15 @@ pub enum GovBody {
     ConsentGrant(Box<ConsentGrant>),
     /// A per-sender consent revocation (tag `0x0005`).
     ConsentRevocation(Box<ConsentRevocation>),
-    /// A service-grant exclusion (tag `0x0013`) — withdraws the genesis service
-    /// grant from one member (ADR-017).
-    ServiceGrantExclusion(Box<ServiceGrantExclusion>),
     /// A policy-update (tag `0x0006`, body kind = policy-update): the room's retention.
     /// The rotation kind under the same tag is reserved and refused (V030-32).
     PolicyUpdate(Box<PolicyUpdate>),
-    /// A room-lifecycle fact (tag `0x0018`): a member leaving, the creator ending the room, or
-    /// the creator's idle end (V030-08).
+    /// A room-lifecycle fact (tag `0x0019`): a member leaving or coming back, the creator (or
+    /// an admin) ending the room, or the creator's idle end (V030-08).
     Lifecycle(Box<RoomLifecycle>),
+    /// A member's own statement that it shares a named service, or no longer does (tag
+    /// `0x0018`).
+    ServiceShare(Box<ServiceShare>),
 }
 
 impl GovBody {
@@ -95,12 +95,12 @@ impl GovBody {
             StructTag::ConsentRevocation => Ok(GovBody::ConsentRevocation(Box::new(
                 ConsentRevocation::from_wire(bytes)?,
             ))),
-            StructTag::ServiceGrantExclusion => Ok(GovBody::ServiceGrantExclusion(Box::new(
-                ServiceGrantExclusion::from_wire(bytes)?,
-            ))),
             StructTag::RoomLifecycle => Ok(GovBody::Lifecycle(Box::new(RoomLifecycle::from_wire(
                 bytes,
             )?))),
+            StructTag::ServiceShare => Ok(GovBody::ServiceShare(Box::new(
+                ServiceShare::from_wire(bytes)?,
+            ))),
             StructTag::PolicyRotation => Ok(GovBody::PolicyUpdate(Box::new(
                 PolicyUpdate::from_wire(bytes)?,
             ))),
@@ -118,9 +118,9 @@ impl GovBody {
             GovBody::AdminRevocation(r) => (r.body.channel_id, r.body.epoch),
             GovBody::ConsentGrant(g) => (g.body.channel_id, g.body.epoch),
             GovBody::ConsentRevocation(r) => (r.body.channel_id, r.body.epoch),
-            GovBody::ServiceGrantExclusion(x) => (x.body.channel_id, x.body.epoch),
             GovBody::PolicyUpdate(p) => (p.body.channel_id, p.body.epoch),
             GovBody::Lifecycle(l) => (l.body.channel_id, l.body.epoch),
+            GovBody::ServiceShare(s) => (s.body.channel_id, s.body.epoch),
         }
     }
 
@@ -134,9 +134,9 @@ impl GovBody {
             GovBody::AdminRevocation(r) => r.body.issuer_id,
             GovBody::ConsentGrant(g) => g.body.author_id,
             GovBody::ConsentRevocation(r) => r.body.author_id,
-            GovBody::ServiceGrantExclusion(x) => x.body.issuer_id,
             GovBody::PolicyUpdate(p) => p.body.issuer_id,
             GovBody::Lifecycle(l) => l.body.issuer_id,
+            GovBody::ServiceShare(s) => s.body.author_id,
         }
     }
 }

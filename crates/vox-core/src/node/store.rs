@@ -542,7 +542,8 @@ impl Store {
     /// Delete every page of the anchor's old ciphertext copy of a room (the retired segment
     /// codes, 6 and 7): an anchor stores nothing for a room it is not a member
     /// of (ADR-023 decision 6), and pages an earlier build stored are deleted when it next opens
-    /// the store. Returns how many were deleted.
+    /// the store — where a member's vault shares the anchor's data directory; otherwise the
+    /// anchor deletes the whole file. Returns how many were deleted.
     pub fn delete_retired_anchor_pages(&self) -> Result<usize> {
         let txn = self.begin_write()?;
         let mut deleted = 0;
@@ -563,21 +564,6 @@ impl Store {
         }
         txn.commit().map_err(storage("commit"))?;
         Ok(deleted)
-    }
-
-    /// How many pages of any kind this store holds, per room — what a node keeps of each room
-    /// on disk, whatever it is. A node that is a member of no room (an anchor) is to hold none
-    /// (ADR-023 decision 6).
-    pub fn pages_by_channel(&self) -> Result<std::collections::BTreeMap<Digest32, usize>> {
-        let txn = self.begin_read()?;
-        let t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
-        let mut out: std::collections::BTreeMap<Digest32, usize> =
-            std::collections::BTreeMap::new();
-        for item in t.iter().map_err(storage("iterate segments"))? {
-            let (k, _) = item.map_err(storage("iterate segments"))?;
-            *out.entry(k.value().0).or_default() += 1;
-        }
-        Ok(out)
     }
 
     /// Write a public metadata entry (its own durable transaction). Meta holds

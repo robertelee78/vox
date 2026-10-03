@@ -348,6 +348,13 @@ pub const ROOM_AND_ISSUE: &str = "In a Vox room agents settle who does what: who
 /// a row — that difference is the whole of the attribution guarantee.
 const CONTINUATION: &str = "  | ";
 
+/// What begins the line under a reply that names the message it answers (V030-19). Neither `[`
+/// (a row) nor [`CONTINUATION`], so no author's text can make a line that reads as a preview.
+pub const IN_REPLY_TO: &str = "  \u{21b3} in reply to ";
+
+/// The most characters of the answered message's words a reply's preview shows (V030-19).
+pub const PREVIEW_CHARS: usize = 100;
+
 /// Whether `c` ends a line for *somebody* reading this output.
 ///
 /// Not just `\n`: a model, a terminal and a JSON viewer each have their own idea of
@@ -358,6 +365,12 @@ const CONTINUATION: &str = "  | ";
 pub const LINE_BREAKS: &[char] = &[
     '\n', '\r', '\u{0b}', '\u{0c}', '\u{85}', '\u{2028}', '\u{2029}',
 ];
+
+/// Whether `row` is a [`vox_agentcomms::envelope::PING`] or `PONG`, which no model is shown.
+fn is_plumbing(row: &vox_core::node::api::MessageRow) -> bool {
+    vox_agentcomms::envelope::Envelope::parse(&row.text)
+        .is_ok_and(|e| vox_agentcomms::envelope::is_plumbing(&e.kind))
+}
 
 fn is_line_break(c: char) -> bool {
     LINE_BREAKS.contains(&c)
@@ -380,14 +393,107 @@ fn is_line_break(c: char) -> bool {
 ///
 /// The author is named as the reader names it, and an addressed message says to whom
 /// (V210-161, V210-162): `[<entry> from alice to you, bob]`.
-fn render_row(out: &mut String, r: &vox_core::node::api::MessageRow, me: Option<&Digest32>) {
+///
+/// **A reply says what it answers** (V030-19). When the message is an envelope whose `re` names
+/// an entry, the line after its first is [`IN_REPLY_TO`] and that entry's own row on one line:
+/// its entry, its author and its first [`PREVIEW_CHARS`] characters, all read from the log by the
+/// entry hash ([`Parents`]). Nothing of the preview comes from the reply, so its author can point
+/// at a message but cannot make the preview say anything that message did not; a `re` the room
+/// does not hold is said to be absent, never shown as the reply wrote it.
+fn render_row(
+    out: &mut String,
+    r: &vox_core::node::api::MessageRow,
+    me: Option<&Digest32>,
+    parents: &Parents,
+) {
+    let mut row = String::new();
     render_attributed(
-        out,
+        &mut row,
         &r.entry_hash,
         &crate::ident::name_of(&r.author),
         &addressed(&r.text, me, crate::ident::names()),
         &words(&r.text),
     );
+    let Some(preview) = reply_preview(r, parents) else {
+        out.push_str(&row);
+        return;
+    };
+    // After the row's first line and before its continuations, so it reads as part of the row.
+    let (first, rest) = row.split_once('\n').unwrap_or((&row, ""));
+    out.push_str(first);
+    out.push('\n');
+    out.push_str(IN_REPLY_TO);
+    out.push_str(&preview);
+    out.push('\n');
+    out.push_str(rest);
+}
+
+/// The messages a drain's replies answer, looked up by the hashes their `re` names (V030-19), as
+/// the node answered [`crate::coord::find`], with the page the drain read.
+struct Parents {
+    /// The rows found.
+    rows: Vec<vox_core::node::api::MessageRow>,
+    /// Whether the node answered the lookup. When it did not, a message not found may still be
+    /// held, so its absence is not claimed.
+    looked_up: bool,
+}
+
+/// The one-line preview of the message `r` replies to, or `None` when it names none (V030-19).
+fn reply_preview(r: &vox_core::node::api::MessageRow, parents: &Parents) -> Option<String> {
+    let re = vox_agentcomms::envelope::Envelope::parse(&r.text)
+        .ok()?
+        .re?;
+    let Ok(hash) = b32_decode(re.trim(), "re") else {
+        return Some("a message this room does not hold".to_owned());
+    };
+    let Some(parent) = parents.rows.iter().find(|p| p.entry_hash == hash) else {
+        let entry = &b32_encode(&hash)[..8];
+        return Some(if parents.looked_up {
+            format!("[{entry}], a message this room does not hold")
+        } else {
+            format!("[{entry}], a message Vox could not look up this turn")
+        });
+    };
+    let said = if parent.owed {
+        vox_core::node::api::NOT_RECEIVED_YET.to_owned()
+    } else {
+        preview_line(&words(&parent.text))
+    };
+    Some(format!(
+        "[{} from {}] {said}",
+        &b32_encode(&parent.entry_hash)[..8],
+        crate::ident::name_of(&parent.author)
+    ))
+}
+
+/// `text` as a reply's preview shows it (V030-19): on one line, and capped, like a row. Every
+/// [`LINE_BREAKS`] character and every run of whitespace is one space; any other character that
+/// could break or reorder a line ([`vox_agentcomms::envelope::breaks_lines`]: controls, bidi
+/// overrides and isolates) is U+FFFD, replaced **before** the cut so no escape sequence is split;
+/// and it is cut at [`PREVIEW_CHARS`] characters, never inside one, ending in `…`.
+fn preview_line(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = 0usize;
+    for c in text.trim().chars() {
+        let c = if is_line_break(c) || c.is_whitespace() {
+            if out.ends_with(' ') {
+                continue;
+            }
+            ' '
+        } else if vox_agentcomms::envelope::breaks_lines(c) {
+            '\u{fffd}'
+        } else {
+            c
+        };
+        if chars == PREVIEW_CHARS {
+            out.truncate(out.trim_end().len());
+            out.push('\u{2026}');
+            return out;
+        }
+        out.push(c);
+        chars += 1;
+    }
+    out
 }
 
 /// `to <recipients>` for an addressed message, as the reader knows them, or nothing for one to
@@ -468,6 +574,101 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, to: &str,
         );
     }
     out.push('\n');
+}
+
+/// The envelope types that are agents coordinating rather than talking (V030-18): presence,
+/// progress and the claim protocol. A request or a question (`assign`, `ask`, `answer`,
+/// `not-understood`) is conversation and is never counted away.
+const CHATTER: &[&str] = &[
+    vox_agentcomms::envelope::HELLO,
+    vox_agentcomms::envelope::BYE,
+    vox_agentcomms::envelope::work::STATUS,
+    vox_agentcomms::envelope::work::WORKING,
+    vox_agentcomms::envelope::work::BLOCKED,
+    vox_agentcomms::envelope::work::RESULT,
+    vox_agentcomms::envelope::work::FAILED,
+    vox_agentcomms::envelope::work::ACCEPT,
+    vox_agentcomms::envelope::work::DECLINE,
+    vox_agentcomms::envelope::work::ACK,
+    vox_agentcomms::claim::CLAIM,
+    vox_agentcomms::claim::RELEASE,
+    vox_agentcomms::claim::HANDOFF,
+    vox_agentcomms::claim::RENEW,
+    "ping",
+    "pong",
+];
+
+/// Bytes kept back from a room's share for its one line counting chatter (V030-18): every
+/// [`CHATTER`] kind with a two-digit count, and the room's label, fit in it.
+const CHATTER_RESERVE: usize = 384;
+
+/// Who this session is, as far as the drain asks whether a row is **for** it (V030-18).
+struct Reader {
+    /// This node's fingerprint, base32, as `to` names it (V210-161).
+    me_fp: Option<String>,
+    /// This node, as a handoff names it in `data.to_fp`.
+    me: Option<Digest32>,
+    /// The session id, as a handoff names it in `data.to_session`.
+    session: String,
+    /// The entries this session posted that the drain's replies answer, found by hash: a reply to
+    /// one older than the cursor is still known for one.
+    posted: std::collections::HashSet<Digest32>,
+    /// The resources this session handed off, which a `decline` refusing one names.
+    handed_off: std::collections::BTreeSet<String>,
+}
+
+impl Reader {
+    /// Whether `e` is for this session, by any field that can say so:
+    /// - `to` names this node;
+    /// - it is a handoff reserved for it: `data.to_fp` is this node and `data.to_session` is this
+    ///   session, or names none (any session of this node may take it);
+    /// - its `re` answers an entry this session posted (a `result`, `accept` or `decline`
+    ///   answering its `assign`, an `answer` to its `ask`);
+    /// - it is a `decline` of a resource this session handed off: it carries neither `to` nor
+    ///   `re`, and without this the giver is never told.
+    ///
+    /// `claim`, `release` and `renew` name no one: they are the poster's own holding, and what
+    /// they change for this session is said by the lost-claims notice (M21.9), not by the row.
+    fn addressed_by(&self, e: &vox_agentcomms::envelope::Envelope) -> bool {
+        let data = |k: &str| e.data.get(k).and_then(serde_json::Value::as_str);
+        let to_me = self
+            .me_fp
+            .as_deref()
+            .is_some_and(|fp| e.is_addressed_to(fp));
+        let handoff_to_me = e.kind == vox_agentcomms::claim::HANDOFF
+            && self.me.is_some()
+            && data("to_fp").and_then(vox_agentcomms::claim::from_b32) == self.me
+            && data("to_session").is_none_or(|s| s.is_empty() || s == self.session);
+        let answers_mine =
+            e.re.as_deref()
+                .and_then(|re| b32_decode(re.trim(), "re").ok())
+                .is_some_and(|re| self.posted.contains(&re));
+        let declines_mine = e.kind == vox_agentcomms::envelope::work::DECLINE
+            && data("resource").is_some_and(|r| self.handed_off.contains(r));
+        to_me || handoff_to_me || answers_mine || declines_mine
+    }
+}
+
+/// The kind of `row` when the drain counts it rather than shows it (V030-18): coordination
+/// traffic ([`CHATTER`]) that is not for this session ([`Reader::addressed_by`]). `None` means it
+/// goes in full: anything for this session, prose, and anything that does not parse.
+fn chatter_kind(row: &vox_core::node::api::MessageRow, reader: &Reader) -> Option<String> {
+    let e = vox_agentcomms::envelope::Envelope::parse(&row.text).ok()?;
+    (CHATTER.contains(&e.kind.as_str()) && !reader.addressed_by(&e)).then_some(e.kind)
+}
+
+/// The one line that stands for the chatter a room's drain counted, by kind (V030-18).
+fn chatter_line(room_label: &str, chatter: &std::collections::BTreeMap<String, usize>) -> String {
+    let kinds: Vec<String> = chatter
+        .iter()
+        .map(|(kind, n)| format!("{n} {}", one_line(kind)))
+        .collect();
+    format!(
+        "{} coordination message(s) from other sessions, not shown ({}); `vox room read \
+         {room_label}` has them\n",
+        chatter.values().sum::<usize>(),
+        kinds.join(", "),
+    )
 }
 
 /// The header over a turn's messages, for `total` new messages across every room.
@@ -558,7 +759,15 @@ impl Budget {
 /// unmoved. The turn's first message is always shown, so a single oversized message cannot
 /// wedge a cursor.
 ///
-/// Returns the room's section and how many of `rows` it carries, which may be none.
+/// **Coordination chatter is counted, not shown** (V030-18). Another session's `hello`,
+/// `status`, claims and the like landed in full in the model's context every turn, though they
+/// are for the board and not for this agent. Each such row goes into one line counting them by
+/// kind; a row for this session ([`Reader::addressed_by`]) goes in full whatever its kind, and
+/// prose is never counted away. A counted row is read as surely as a shown one: the cursor passes
+/// both, and `vox room read` has the whole of it. The message bound counts only rows in full.
+///
+/// Returns the room's section and how many of `rows` it carries, shown or counted, which may be
+/// none.
 /// `beyond` is how many rows wait past those read, counted by the node: they are new too.
 /// `cursor_after` is where the session's cursor stands once the first `n` of `rows` are shown,
 /// for the closing line's `--since`: `rows` are not in the room's order when some are owed.
@@ -570,6 +779,8 @@ fn render(
     beyond: usize,
     notice: Option<&str>,
     me: Option<&Digest32>,
+    reader: &Reader,
+    parents: &Parents,
     budget: &mut Budget,
     cursor_after: &dyn Fn(usize) -> Option<Digest32>,
 ) -> (String, usize) {
@@ -578,20 +789,33 @@ fn render(
         out.push_str(n);
         out.push('\n');
     }
-    let overhead = out.len() + NOTE_RESERVE;
+    let counts_any = rows.iter().any(|r| chatter_kind(r, reader).is_some());
+    let overhead = out.len() + NOTE_RESERVE + if counts_any { CHATTER_RESERVE } else { 0 };
     let mut body = String::new();
-    let mut shown = 0usize;
+    // `shown` is how many of `rows`, from the start, this carries; `full` how many in full.
+    let (mut shown, mut full) = (0usize, 0usize);
+    let mut chatter = std::collections::BTreeMap::<String, usize>::new();
     for r in rows {
+        if let Some(kind) = chatter_kind(r, reader) {
+            // Counted, it costs only its share of the one line, reserved above.
+            if !budget.first && overhead + body.len() > budget.bytes {
+                break;
+            }
+            *chatter.entry(kind).or_default() += 1;
+            shown += 1;
+            budget.first = false;
+            continue;
+        }
         let mut one = String::new();
-        render_row(&mut one, r, me);
+        render_row(&mut one, r, me, parents);
         let len = body.len() + one.len();
         let fits = if budget.first {
             true
-        } else if shown == 0 {
+        } else if full == 0 {
             budget.messages > 0 && overhead + len <= budget.bytes
         } else {
-            shown < budget.share_messages
-                && shown < budget.messages
+            full < budget.share_messages
+                && full < budget.messages
                 && len <= budget.share_bytes
                 && overhead + len <= budget.bytes
         };
@@ -600,17 +824,21 @@ fn render(
         }
         body.push_str(&one);
         shown += 1;
+        full += 1;
         budget.first = false;
     }
     if shown == 0 {
         return (String::new(), 0);
     }
     out.push_str(&body);
+    if !chatter.is_empty() {
+        out.push_str(&chatter_line(room_label, &chatter));
+    }
     let rest = rows.len() - shown + beyond;
     if rest > 0 {
         out.push_str(&rest_line(room_label, rest, cursor_after(shown).as_ref()));
     }
-    budget.messages = budget.messages.saturating_sub(shown);
+    budget.messages = budget.messages.saturating_sub(full);
     budget.bytes = budget.bytes.saturating_sub(out.len());
     (out, shown)
 }
@@ -911,6 +1139,10 @@ struct RoomDrain {
     refused: Option<AppError>,
     /// What this session holds now, when the board could be read.
     held_now: Option<std::collections::BTreeSet<String>>,
+    /// Who this session is, for what is for it and what is chatter (V030-18).
+    reader: Reader,
+    /// The messages the news replies to (V030-19).
+    parents: Parents,
 }
 
 impl RoomDrain {
@@ -1126,6 +1358,8 @@ async fn drain(
             d.beyond,
             d.notice.as_deref(),
             me.as_ref(),
+            &d.reader,
+            &d.parents,
             &mut budget,
             &|n| d.read_to(n).0.or(d.since),
         );
@@ -1231,6 +1465,9 @@ async fn read_room(
         .iter()
         // A message not received yet has nothing to say to the agent until it is (V030-10).
         .filter(|r| !r.owed && !is_own(r, me, &input.session_id) && !ahead.contains(&r.entry_hash))
+        // **A ping or a pong is the daemons' business, never the model's** (V030-16): passed
+        // over like an own message, so the cursor still moves past it.
+        .filter(|r| !is_plumbing(r))
         .cloned()
         .collect();
 
@@ -1259,13 +1496,15 @@ async fn read_room(
             .filter(|h| seen.insert(*h))
             .collect()
     };
-    let targets = if answered.is_empty() {
-        Vec::new()
+    // `None` when the node could not answer, so a reply's preview never says a message it may
+    // hold is absent (V030-19).
+    let found = if answered.is_empty() {
+        Some(Vec::new())
     } else {
-        crate::coord::find(client, channel_id, &answered)
-            .await
-            .unwrap_or_default()
+        crate::coord::find(client, channel_id, &answered).await.ok()
     };
+    let looked_up = found.is_some();
+    let targets = found.unwrap_or_default();
     let asked = crate::wake::asked(targets.iter().chain(rows.iter()), me, &input.session_id);
     let owed = |r: &vox_core::node::api::MessageRow| {
         vox_agentcomms::envelope::Envelope::parse(&r.text).is_ok_and(|e| {
@@ -1298,7 +1537,41 @@ async fn read_room(
         None => (Vec::new(), None),
     };
 
+    // Who this session is (V030-18): its own entries among those the news answers or this read
+    // returned, and the resources it handed off, from the board.
+    let reader = Reader {
+        me_fp: me_fp.clone(),
+        me,
+        session: input.session_id.clone(),
+        posted: targets
+            .iter()
+            .chain(rows.iter())
+            .filter(|r| is_own(r, me, &input.session_id))
+            .map(|r| r.entry_hash)
+            .collect(),
+        handed_off: snap.as_ref().map_or_else(Default::default, |s| {
+            s.posted
+                .iter()
+                .filter(|p| {
+                    p.author == s.me
+                        && p.envelope.kind == vox_agentcomms::claim::HANDOFF
+                        && !p.envelope.from.is_empty()
+                        && p.envelope.from == input.session_id
+                })
+                .filter_map(|p| p.envelope.data.get("resource")?.as_str().map(str::to_owned))
+                .collect()
+        }),
+    };
+    let mut parent_rows = targets;
+    parent_rows.extend(rows.iter().cloned());
+    let parents = Parents {
+        rows: parent_rows,
+        looked_up,
+    };
+
     Ok(RoomDrain {
+        reader,
+        parents,
         heading: room_heading(&label, name),
         key: room_key,
         label,

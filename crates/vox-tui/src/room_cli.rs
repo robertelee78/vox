@@ -331,7 +331,7 @@ async fn members_of(
 /// `--to`, as the envelope carries it (V210-161): each word resolved by the poster, once, to a
 /// member's whole fingerprint, so every reader resolves it to the same node. A word that names
 /// no member is refused, saying why.
-async fn addressees(
+pub(crate) async fn addressees(
     client: &mut IpcClient,
     channel_id: Digest32,
     words: &[String],
@@ -519,7 +519,7 @@ pub async fn post_cmd(
     let (mut client, cid, room_key) = open_room(paths, room).await?;
     let to = addressees(&mut client, cid, &opts.to).await?;
     let snap = if work.is_some() {
-        coord::participate(&mut client, cid, &room_key, &session).await?
+        coord::participate(paths, &mut client, cid, &room_key, &session).await?
     } else {
         coord::snapshot(&mut client, cid).await?
     };
@@ -615,12 +615,59 @@ pub async fn post_cmd(
     // **An addressee that cannot be interrupted is named to the poster** (V210-169): the
     // message is posted, and waits in the room for that session's next turn. This node's
     // sessions only: another node decides for its own.
+    let me = client.me().map(|m| b32_encode(&m)).unwrap_or_default();
     if opts.urgent {
-        let me = client.me().map(|m| b32_encode(&m)).unwrap_or_default();
         if let Some(line) = crate::wake::uninterruptible(paths, &me, &draft.to) {
             eprintln!("vox: {line}");
         }
     }
+    // **What to expect of each other node addressed** (V030-17), from the room as it stands
+    // after the post. This node's own sessions are covered by the line above, from their
+    // registrations, which say more than the room does.
+    let others: Vec<Digest32> = draft
+        .to
+        .iter()
+        .filter(|fp| **fp != me)
+        .filter_map(|fp| crate::ident::recipient(fp))
+        .collect();
+    let reach = if others.is_empty() {
+        Vec::new()
+    } else {
+        let (outbound, inbound) = match client.request(&Request::Consents { channel_id: cid }).await
+        {
+            Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        // When each last posted as an agent: the room's structured posts, by author.
+        use vox_agentcomms::envelope::{work, SAY};
+        let kinds = [
+            SAY,
+            work::ASSIGN,
+            work::ACCEPT,
+            work::DECLINE,
+            work::WORKING,
+            work::BLOCKED,
+            work::STATUS,
+            work::RESULT,
+            work::FAILED,
+            work::ASK,
+            work::ANSWER,
+        ];
+        let rows = coord::structured(&mut client, cid, &kinds, &[]).await?;
+        others
+            .iter()
+            .map(|fp| {
+                let last = rows
+                    .iter()
+                    .filter(|r| r.author == *fp)
+                    .map(|r| r.created_millis)
+                    .max();
+                reach_of(&posting.after, fp, last, draft.urgent, &outbound, &inbound)
+            })
+            .collect()
+    };
     // **A `result` says what it has not read** (ADR-021 M21.10). A redirect addressed
     // to this session can land after its last drain and before it reports; the result
     // still posts, and the caller is shown every such message so it can follow up.
@@ -645,6 +692,9 @@ pub async fn post_cmd(
             "status": posting.status,
             "session": session,
         });
+        if !reach.is_empty() {
+            out["reach"] = reach.iter().map(Reach::json).collect();
+        }
         if is_result {
             out["unread_addressed"] = serde_json::Value::Array(
                 unread
@@ -657,6 +707,9 @@ pub async fn post_cmd(
         }
         println!("{out}");
     }
+    for r in &reach {
+        eprintln!("vox: to {}: {}", r.name, r.says);
+    }
     if !unread.is_empty() {
         eprintln!(
             "vox: your result is posted, but {} message(s) addressed to you are unread — \
@@ -668,6 +721,131 @@ pub async fn post_cmd(
         }
     }
     Ok(())
+}
+
+/// What a sender can expect of one other node it addressed (V030-17): whether any of its
+/// sessions has announced itself in this room, whether an urgent message can interrupt one, when
+/// it last posted as an agent, and trust in each direction. Only what this node can see: it never
+/// says a reply is overdue, because it cannot see another node's reads.
+struct Reach {
+    /// The node, as this node names it.
+    name: String,
+    /// The `data.wake` of each of its sessions' `hello`s still in force (no later `bye`): `""`
+    /// for a hello that did not say. Empty when none announced itself.
+    wakes: Vec<String>,
+    /// When it last posted as an agent (a structured post), ms since the epoch.
+    last_posted: Option<u64>,
+    /// Whether this identity consents to it reading, and it to this identity.
+    you_trust: bool,
+    it_trusts: bool,
+    /// The line shown.
+    says: String,
+}
+
+impl Reach {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "name": self.name,
+            "announced": !self.wakes.is_empty(),
+            "wake": self.wakes,
+            "last_posted_millis": self.last_posted,
+            "you_trust": self.you_trust,
+            "it_trusts": self.it_trusts,
+            "says": self.says,
+        })
+    }
+}
+
+/// How long ago `then` was, at `now` (both ms), coarsely: `40s`, `12m`, `3h`, `2d`.
+fn ago(now: u64, then: u64) -> String {
+    let s = now.saturating_sub(then) / 1000;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// [`Reach`] for the node `fp`, from `snap`, the room after the post, when it `last_posted`, and
+/// this identity's
+/// consents in the room in each direction.
+fn reach_of(
+    snap: &coord::Snapshot,
+    fp: &Digest32,
+    last_posted: Option<u64>,
+    urgent: bool,
+    outbound: &[Digest32],
+    inbound: &[Digest32],
+) -> Reach {
+    use vox_agentcomms::envelope::{BYE, HELLO};
+    let theirs = || snap.posted.iter().filter(|p| p.author == *fp);
+    // A session's hello is in force until a later `bye` from the same session.
+    let wakes: Vec<String> = theirs()
+        .filter(|h| h.envelope.kind == HELLO)
+        .filter(|h| {
+            !theirs().any(|b| {
+                b.envelope.kind == BYE
+                    && b.envelope.from == h.envelope.from
+                    && b.created_millis >= h.created_millis
+            })
+        })
+        .map(|h| {
+            h.envelope
+                .data
+                .get(crate::wake::WAKE_KEY)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect();
+    let mut parts = Vec::new();
+    if wakes.is_empty() {
+        parts.push("none of its sessions has announced itself in this room".to_owned());
+    } else {
+        let any = |w: &str| wakes.iter().any(|x| x == w);
+        parts.push(
+            if !urgent {
+                "not urgent, so it is read at its sessions' next turn"
+            } else if any("interrupt") {
+                "urgent may interrupt a session there"
+            } else if any("") {
+                "a hello there does not say whether it can be interrupted; it is read at the next \
+                 turn"
+            } else {
+                "urgent will not interrupt it; it is read at its sessions' next turn"
+            }
+            .to_owned(),
+        );
+    }
+    let (you_trust, it_trusts) = (outbound.contains(fp), inbound.contains(fp));
+    parts.push(
+        if you_trust {
+            "you trust it"
+        } else {
+            "you have not trusted it, so it cannot read this"
+        }
+        .to_owned(),
+    );
+    parts.push(
+        if it_trusts {
+            "it trusts you"
+        } else {
+            "it has not trusted you"
+        }
+        .to_owned(),
+    );
+    if let Some(t) = last_posted {
+        parts.push(format!("last posted {} ago", ago(snap.now_millis, t)));
+    }
+    Reach {
+        name: crate::ident::name_of(fp),
+        wakes,
+        last_posted,
+        you_trust,
+        it_trusts,
+        says: parts.join("; "),
+    }
 }
 
 /// Messages addressed to this node that this session's drain has not delivered yet: past its
@@ -781,6 +959,13 @@ fn row_json(
         "text": r.text,
         "owed": r.owed,
         "envelope": envelope,
+        // `envelope.to` as this reader names each addressee (PRD-001 R15): "you" for this node,
+        // its keyring name, or the fingerprint where it has none. Never a name another node gave.
+        "to_names": parsed.as_ref().ok().map(|e| {
+            e.to.iter()
+                .map(|t| crate::ident::recipients(std::slice::from_ref(t), crate::ident::me(), crate::ident::names()))
+                .collect::<Vec<_>>()
+        }).unwrap_or_default(),
         "parse_error": parse_error,
         "op": op,
     })
@@ -853,8 +1038,18 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
             c => text.push(c),
         }
     }
+    // **Who it is addressed to, as this reader names them** (PRD-001 R15): the wire carries
+    // fingerprints, so the raw text alone shows a reader only those. Said on a line of its own,
+    // after the text, so the `<entry> <author> <text>` columns are unchanged; a line of the text
+    // cannot begin like it, since every further line of the text is behind `  | `.
+    let to = crate::agent_hook::addressed(&r.text, crate::ident::me(), crate::ident::names());
+    let to = if to.is_empty() {
+        String::new()
+    } else {
+        format!("\n  ({to})")
+    };
     format!(
-        "{} {} {}",
+        "{} {} {}{to}",
         id(&r.entry_hash),
         crate::ident::name_of(&r.author),
         text
@@ -1358,7 +1553,7 @@ async fn run_op(
         None => coord::new_op()?,
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
-    let snap = coord::participate(&mut client, cid, &room_key, &session).await?;
+    let snap = coord::participate(paths, &mut client, cid, &room_key, &session).await?;
     let before = data
         .get("resource")
         .and_then(|v| v.as_str())
@@ -2027,16 +2222,12 @@ pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Services { channel_id }).await {
-        Ok(Frame::Services { room, services }) => {
-            let short = crate::tunnel_cli::short_id_of(&channel_id);
-            if services.is_empty() {
-                println!("vox: no services offered in {short}");
-                return Ok(());
-            }
-            println!("vox: services offered in {room} ({short})");
-            for (tag, addr) in &services {
-                println!("  {tag}  →  {addr}");
-            }
+        Ok(Frame::Services {
+            room,
+            services,
+            shared,
+        }) => {
+            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared);
             Ok(())
         }
         // The node's reason, as `vox service list` without a daemon gives it.
@@ -3232,15 +3423,12 @@ fn room_passphrase(
             )));
         }
         let first = crate::tunnel_cli::prompt_passphrase("room passphrase")?;
-        if first.is_empty() {
-            return Err(AppError::Usage(format!("no {what} was given")));
-        }
         if confirm && crate::tunnel_cli::prompt_passphrase("again")? != first {
             return Err(AppError::Usage(
                 "the two passphrases differ; nothing was done".into(),
             ));
         }
-        return Ok(first);
+        return Ok(crate::tunnel_cli::encouraged(first, "room"));
     };
     let buf = crate::tunnel_cli::passphrase_file_text(path)?;
     let p = buf
@@ -3248,20 +3436,10 @@ fn room_passphrase(
         .unwrap_or(&buf)
         .strip_suffix('\r')
         .unwrap_or_else(|| buf.strip_suffix('\n').unwrap_or(&buf));
-    if p.is_empty() {
-        // The caller's phrase is a noun phrase ("the room's passphrase", "a passphrase
-        // for the new room"), so it reads as "expected <phrase>" and never as "no a
-        // passphrase", which is what "no {what}" produced.
-        return Err(AppError::Usage(format!(
-            "expected {what} in {}, and it is empty",
-            if path == std::path::Path::new("-") {
-                "stdin".to_owned()
-            } else {
-                path.display().to_string()
-            }
-        )));
-    }
-    Ok(p.to_owned())
+    // **An empty file or stdin gives an empty passphrase on purpose** (V030-36, decider
+    // 2026-10-02: "technically optional"). It said "expected … and it is empty" and stopped. No
+    // `--passphrase-file` at all is still not one: that asks, or fails without a terminal.
+    Ok(crate::tunnel_cli::encouraged(p, "room").to_owned())
 }
 
 /// `vox room join` — join a room over a running node (ADR-020 §12).

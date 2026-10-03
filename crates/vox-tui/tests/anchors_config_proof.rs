@@ -219,7 +219,7 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
         &shared_cfg,
         &[
             "serve".into(),
-            "1".into(),
+            "1=1".into(),
             "--at".into(),
             "127.0.0.1:1".into(),
             "--listen".into(),
@@ -339,7 +339,7 @@ fn an_anchor_named_by_hostname_carries_a_join() {
         &host_cfg,
         &[
             "serve".into(),
-            "1".into(),
+            "1=1".into(),
             "--at".into(),
             "127.0.0.1:1".into(),
             "--listen".into(),

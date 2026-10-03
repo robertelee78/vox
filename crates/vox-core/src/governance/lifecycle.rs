@@ -1,4 +1,4 @@
-//! The **room lifecycle** facts (tag `0x0018`, domain `vox/room-lifecycle/v1`): a member
+//! The **room lifecycle** facts (tag `0x0019`, domain `vox/room-lifecycle/v1`): a member
 //! leaving, the creator ending the room for everyone, and the creator's chosen idle end
 //! (V030-08).
 //!
@@ -137,7 +137,7 @@ impl RoomLifecycle {
         Ok(Self { body, signature })
     }
 
-    /// Frame for the wire/storage (tag `0x0018`): body fields then the signature.
+    /// Frame for the wire/storage (tag `0x0019`): body fields then the signature.
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
         let b = &self.body;

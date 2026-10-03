@@ -17,9 +17,8 @@
 //! The PRD target is asserted on **every** end-to-end sample: "must arrive in under 1 s"
 //! is a claim about each message, not an average.
 //!
-//! The forced-relay half of R40 cannot be driven from the binary — nothing in it forces a
-//! relayed path — so it lives in `vox-core/tests/perf_r40_relayed_chat_gate.rs`, on the
-//! NAT simulator, with real nodes behind symmetric NATs.
+//! The forced-relay half of R40 is `perf_r40_relayed_chat_proof.rs`, also on the shipped
+//! binary: two daemons on different address families, so a relay circuit is their only path.
 //!
 //! ## Mutation knobs (test-side only; they never touch the product)
 //!

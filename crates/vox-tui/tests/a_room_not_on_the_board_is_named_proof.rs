@@ -82,7 +82,7 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
         &host_dir,
         &args(&[
             "serve",
-            &echo_service().to_string(),
+            &format!("{0}={0}", echo_service()),
             "--anchor",
             &spec_a,
             "--listen",

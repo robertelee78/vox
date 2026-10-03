@@ -43,7 +43,7 @@ only room governance is who sets the room's retention. This builds on identity (
   `vox room admin add|remove <member>` (an admin-delegation cert `0x0003` and its revocation `0x000E`).
   A node MUST honour an admin certificate only when the creator issued it, and a delegated admin's
   certificate MUST carry `policy` only, never `admin` (#319). The creator or an admin MAY end the room
-  for everyone (`vox room end`, a room-lifecycle fact `0x0018`, V030-08).
+  for everyone (`vox room end`, a room-lifecycle fact `0x0019`, V030-08).
 - **G-6.** The only governance act MUST be setting the room's retention (the policy-update `ttl`), and
   only the creator or an admin it delegated MAY do it. The capabilities are `admin` and `policy`; every
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be

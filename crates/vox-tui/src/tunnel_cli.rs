@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use vox_core::hash::Digest32;
 use vox_core::node::actor::{Bind, EventStreamItem, Node, NodeConfig, NodeHandle};
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
-use vox_core::node::link::{b32_decode, b32_encode, vox_hostname};
+use vox_core::node::link::{b32_decode, b32_encode};
 use vox_core::node::paths::Paths;
 
 use crate::app::AppError;
@@ -64,15 +64,6 @@ pub fn passphrase_file_text(
     Ok(text)
 }
 
-/// Where a passphrase file's text came from, for the message when it holds none.
-fn source_name(path: &std::path::Path) -> String {
-    if path == std::path::Path::new("-") {
-        "stdin".to_owned()
-    } else {
-        path.display().to_string()
-    }
-}
-
 /// How to give the identity passphrase without a terminal, for every message that needs one.
 pub const GIVE_IDENTITY_PASSPHRASE: &str =
     "Use --identity-passphrase-file <path> (`-` reads stdin), or VOX_IDENTITY_PASSPHRASE.";
@@ -99,23 +90,18 @@ pub fn identity_passphrase_given(
                 .into(),
         ));
     }
+    // **An empty passphrase is a passphrase** (V030-36, decider 2026-10-02: "technically
+    // optional"). An empty file, or the variable set to nothing, gives none on purpose, which is
+    // not the same as giving no source at all: that still asks, or fails without a terminal.
     if let Some(path) = file {
         let text = passphrase_file_text(&path)?;
         let first = text.lines().next().unwrap_or_default();
-        if first.is_empty() {
-            return Err(AppError::Usage(format!(
-                "{} is empty; an identity passphrase cannot be",
-                source_name(&path)
-            )));
-        }
-        return Ok(Some(first.to_owned()));
+        return Ok(Some(encouraged(first.to_owned(), "identity")));
     }
     // Read the variable here rather than through clap's `env`, because clap merges a flag
     // and its variable into one value and the whole point is to tell them apart.
     if let Ok(p) = std::env::var("VOX_IDENTITY_PASSPHRASE") {
-        if !p.is_empty() {
-            return Ok(Some(p));
-        }
+        return Ok(Some(encouraged(p, "identity")));
     }
     Ok(None)
 }
@@ -131,11 +117,10 @@ pub fn ask_identity_passphrase() -> Result<String, AppError> {
              \x20      {GIVE_IDENTITY_PASSPHRASE}"
         )));
     }
-    let p = prompt_passphrase("identity passphrase")?;
-    if p.is_empty() {
-        return Err(AppError::Usage("no identity passphrase was given".into()));
-    }
-    Ok(p)
+    Ok(encouraged(
+        prompt_passphrase("identity passphrase")?,
+        "identity",
+    ))
 }
 
 /// Collect the identity passphrase, asking for confirmation when the profile has no
@@ -166,18 +151,13 @@ pub fn identity_passphrase_for(
     }
     println!("vox: this profile has no identity yet; creating one.");
     let first = prompt_passphrase("new identity passphrase")?;
-    if first.is_empty() {
-        return Err(AppError::Usage(
-            "an empty identity passphrase; nothing was created".into(),
-        ));
-    }
     let again = prompt_passphrase("again")?;
     if first != again {
         return Err(AppError::Usage(
             "the two passphrases differ; nothing was created".into(),
         ));
     }
-    Ok(first)
+    Ok(encouraged(first, "identity"))
 }
 
 /// Spawn a node and make its identity usable: unlock an existing one, or create one on
@@ -467,6 +447,42 @@ async fn open_room(
     Ok((node, channel_id))
 }
 
+/// A `vox serve` spec, `<name>=<port>[/tcp|/udp]`: the port, and the service's tag — its name,
+/// or `udp/<name>` for a UDP service (ADR-022 decision 6).
+///
+/// # Errors
+/// A bare port, with how to name it (V030-25: "a share must be named"), or a name or port that
+/// is not one.
+pub fn named_spec(spec: &str) -> Result<(u16, String), AppError> {
+    let Some((name, port_spec)) = spec.split_once('=') else {
+        return Err(AppError::Usage(format!(
+            "{spec:?} has no name: every shared service is named, and reached as \
+             <name>.<node>.<room>.vox\n       name it as <name>=<port>, e.g. `vox serve ssh=22`"
+        )));
+    };
+    let label = vox_core::tunnel::udp::service_label(port_spec).ok_or_else(|| {
+        AppError::Usage(format!(
+            "{port_spec:?} is not a port: use <name>=<port>, <name>=<port>/tcp or <name>=<port>/udp"
+        ))
+    })?;
+    let port = label
+        .trim_start_matches("udp/")
+        .parse()
+        .map_err(|_| AppError::Usage(format!("{port_spec:?} is not a port")))?;
+    let name = vox_core::node::resolver::label_of(name);
+    if name.is_empty() || name.len() > vox_core::governance::share::MAX_SERVICE_NAME {
+        return Err(AppError::Usage(format!(
+            "{spec:?}: a service's name is letters, digits and `-`, at most 63 of them"
+        )));
+    }
+    let tag = if vox_core::tunnel::udp::is_udp(&label) {
+        format!("udp/{name}")
+    } else {
+        name
+    };
+    Ok((port, tag))
+}
+
 /// `vox service add`
 pub async fn service_add(
     node: &NodeHandle,
@@ -535,26 +551,49 @@ pub async fn service_list(node: &NodeHandle, channel_id: Digest32) -> Result<(),
             .unwrap_or_default();
         return Err(crate::room_cli::room_closed(&channel_id, &name));
     };
-    if detail.services.is_empty() {
-        println!("vox: no services offered in {}", short(&channel_id));
-        return Ok(());
+    let services: Vec<(String, String)> = detail
+        .services
+        .iter()
+        .map(|(tag, addr)| (tag.clone(), addr.to_string()))
+        .collect();
+    let shared = node.shared_in(channel_id).await.unwrap_or_default();
+    print_services(&detail.local_name, &channel_id, &services, &shared);
+    Ok(())
+}
+
+/// What `vox service list` prints, from a node this verb opened or from the daemon: the services
+/// shared in the room by every member, each with its address as this node writes it and who
+/// shared it (V030-25), then what this node itself offers there and where.
+pub fn print_services(
+    room: &str,
+    channel_id: &Digest32,
+    services: &[(String, String)],
+    shared: &[(String, String, bool)],
+) {
+    if shared.is_empty() {
+        println!("vox: nothing is shared in {room} ({})", short(channel_id));
+    } else {
+        println!("vox: shared in {room} ({})", short(channel_id));
+        for (address, who, udp) in shared {
+            let udp = if *udp { "  (udp)" } else { "" };
+            println!("  {address}  by {who}{udp}");
+        }
     }
-    println!(
-        "vox: services offered in {} ({})",
-        detail.local_name,
-        short(&channel_id)
-    );
-    for (tag, addr) in &detail.services {
+    if services.is_empty() {
+        println!("vox: no services offered in {}", short(channel_id));
+        return;
+    }
+    println!("vox: services offered in {room} ({})", short(channel_id));
+    for (tag, addr) in services {
         println!("  {tag}  →  {addr}");
     }
-    Ok(())
 }
 
 /// `vox forward` — serves until interrupted.
 pub async fn forward(
     node: &NodeHandle,
     channel_id: Digest32,
-    host_prefix: Option<&str>,
+    host_prefix: &str,
     service: &str,
     local: SocketAddr,
 ) -> Result<(), AppError> {
@@ -563,16 +602,8 @@ pub async fn forward(
         .open_channels
         .iter()
         .find(|d| d.channel_id == channel_id);
-    let host = match host_prefix {
-        Some(prefix) => {
-            let members: Vec<Digest32> = detail.map(|d| d.members.clone()).unwrap_or_default();
-            resolve_prefix(prefix, &members)?
-        }
-        // A `.vox` name reaches the room's genesis creator (ADR-017).
-        None => detail
-            .map(|d| d.creator)
-            .ok_or_else(|| AppError::Usage("that room is not open".into()))?,
-    };
+    let members: Vec<Digest32> = detail.map(|d| d.members.clone()).unwrap_or_default();
+    let host = resolve_prefix(host_prefix, &members)?;
     // `53/udp` is the service `udp/53`; anything that is not a port spec is a tag as is.
     let label = vox_core::tunnel::udp::service_label(service).unwrap_or_else(|| service.to_owned());
     let tag = label.as_str();
@@ -692,11 +723,13 @@ pub async fn forward(
     Ok(())
 }
 
-/// `vox serve <port>[/udp] …` — create a service room, offer the ports in it, and serve
-/// until interrupted (ADR-017 decisions 3 and 4; ADR-022 decision 6 for `/udp`).
+/// `vox serve <name>=<port>[/udp] …` — create a room, share the named services in it, and serve
+/// until interrupted (ADR-017 decisions 3 and 4; ADR-022 decision 6 for `/udp`; V030-25).
 ///
-/// The first spec creates the room; any further ones are added to it, so TCP 53 and UDP 53
-/// can be served together (`vox serve 53 53/udp`). `--at` applies to every spec.
+/// **Every share is named**: the name is the `<service>` of `<service>.<node>.<room>.vox`, the
+/// only way it is reached. A bare port is refused, saying how to name it. The first spec creates
+/// the room; any further ones are added to it (`vox serve dns=53 dns-udp=53/udp`). `--at`
+/// applies to every spec.
 ///
 /// Prints three things and says plainly that two of them must travel separately: the
 /// address is a rendezvous, and the passphrase is what turns it into access (ADR-005).
@@ -709,19 +742,23 @@ pub async fn serve(
     // Parsed before anything is created: a typo must not leave a half-made room.
     let mut services: Vec<(u16, String)> = Vec::with_capacity(specs.len());
     for spec in specs {
-        let label = vox_core::tunnel::udp::service_label(spec).ok_or_else(|| {
-            AppError::Usage(format!(
-                "{spec:?} is not a port: use <port>, <port>/tcp or <port>/udp"
-            ))
-        })?;
-        let port = label
-            .trim_start_matches("udp/")
-            .parse()
-            .map_err(|_| AppError::Usage(format!("{spec:?} is not a port")))?;
+        let (port, label) = named_spec(spec)?;
+        let name = vox_core::node::channel::service_name(&label);
+        if services
+            .iter()
+            .any(|(_, l)| vox_core::node::channel::service_name(l) == name)
+        {
+            return Err(AppError::Usage(format!(
+                "{name:?} is named twice: each service shared in a room needs its own name"
+            )));
+        }
         services.push((port, label));
     }
     let Some((port, first)) = services.first().cloned() else {
-        return Err(AppError::Usage("name at least one port to serve".into()));
+        return Err(AppError::Usage(
+            "name at least one service to share: vox serve <name>=<port>, e.g. vox serve ssh=22"
+                .into(),
+        ));
     };
     // **No anchor, no refusal** (V210-96, C1): a host on a LAN or on this machine is found
     // directly by a guest there, and an anchor bridges only hosts that cannot otherwise find each
@@ -733,6 +770,7 @@ pub async fn serve(
         .apply(NodeCommand::Serve {
             local_name: name.to_owned(),
             passphrase: Secret::new(passphrase.as_bytes().to_vec()),
+            name: vox_core::node::channel::service_name(&first).to_owned(),
             port,
             udp: vox_core::tunnel::udp::is_udp(&first),
             at,
@@ -794,16 +832,25 @@ pub async fn serve(
     println!("passphrase {}", passphrase.as_str());
     println!("           ^ send this by a different channel than the address");
     println!();
+    // The address with the fingerprints in the node and room places: what any member can use
+    // as printed, or with its own aliases for this node and this room (V030-25).
+    let me = node
+        .view()
+        .identity
+        .as_ref()
+        .map(|i| b32_encode(&i.fingerprint))
+        .unwrap_or_default();
     for (port, label) in &services {
         let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
         let proto = if vox_core::tunnel::udp::is_udp(label) {
-            "/udp"
+            " (udp)"
         } else {
             ""
         };
         println!(
-            "serving {endpoint} at port {port}{proto} of {}",
-            vox_hostname(&channel_id)
+            "sharing {endpoint} as {}.{me}.{}.vox{proto}",
+            vox_core::node::channel::service_name(label),
+            b32_encode(&channel_id)
         );
     }
     // **Not "anyone who joins with both".** That was true of the withdrawn model, where a
@@ -901,8 +948,11 @@ pub async fn connect(
     let channel_id = vox_core::node::link::InviteLink::parse(url)
         .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?
         .channel_id;
-    println!("joined. reachable as {}", vox_hostname(&channel_id));
-    println!("        run `vox up` on this machine to make that name resolve");
+    println!(
+        "joined. `vox service list {}` shows what is shared here",
+        short(&channel_id)
+    );
+    println!("        reach a service as <service>.<node>.<room>.vox, with `vox up` running");
     let _ = node.apply(NodeCommand::Shutdown).await;
     Ok(())
 }
@@ -1529,16 +1579,11 @@ pub fn room_passphrase_for(
                 .into(),
         ));
     }
+    // An empty file gives an empty passphrase on purpose (V030-36); no source at all still asks.
     if let Some(path) = file {
         let text = passphrase_file_text(path)?;
         let first = text.lines().next().unwrap_or_default();
-        if first.is_empty() {
-            return Err(AppError::Usage(format!(
-                "{} is empty; a room passphrase cannot be",
-                source_name(path)
-            )));
-        }
-        return Ok(first.to_owned());
+        return Ok(encouraged(first.to_owned(), "room"));
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Err(AppError::Usage(format!(
@@ -1546,7 +1591,19 @@ pub fn room_passphrase_for(
              \x20      {GIVE_ROOM_PASSPHRASE}"
         )));
     }
-    prompt_passphrase("room passphrase")
+    Ok(encouraged(prompt_passphrase("room passphrase")?, "room"))
+}
+
+/// `passphrase`, after one line on stderr encouraging one when it is empty (V030-36).
+///
+/// **An empty passphrase is accepted, not refused** (decider 2026-10-02: "passphrase is a good
+/// idea, but is technically optional"). The node takes one; a client may only encourage. `what`
+/// is `identity` or `room`.
+pub fn encouraged<S: AsRef<str>>(passphrase: S, what: &str) -> S {
+    if passphrase.as_ref().is_empty() {
+        eprintln!("vox: no {what} passphrase; going on without one. A passphrase is encouraged.");
+    }
+    passphrase
 }
 
 /// How to give a room passphrase without a terminal.
@@ -1621,7 +1678,9 @@ pub async fn up_all(paths: &Paths, bind: SocketAddr) -> Result<(), AppError> {
         println!("    {line}");
     }
     println!();
-    println!("then:  ssh user@<node>.<room>.vox   (the names you gave them: `vox trust list`)");
+    println!(
+        "then:  ssh user@<service>.<node>.<room>.vox   (`vox service list <room>` shows each one)"
+    );
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
     // One Ctrl-C listener for the whole loop: one made per turn misses a SIGINT that
@@ -1643,16 +1702,11 @@ pub async fn up_all(paths: &Paths, bind: SocketAddr) -> Result<(), AppError> {
     Ok(())
 }
 
-/// `vox forward <node>.<room>.vox <service> [<local>]`: resolved and carried by the node
-/// already holding this profile, until ^C (PRD-001 R20).
-pub async fn forward_named(
-    paths: &Paths,
-    name: &str,
-    service: &str,
-    local: &str,
-) -> Result<(), AppError> {
+/// `vox forward <service>.<node>.<room>.vox [<local>]`: resolved and carried by the node
+/// already holding this profile, until ^C (V030-25).
+pub async fn forward_named(paths: &Paths, name: &str, local: &str) -> Result<(), AppError> {
     let sock = paths.socket_file();
-    let (channel_id, host) = vox_core::node::nameipc::resolve(&sock, name)
+    let (channel_id, host, service) = vox_core::node::nameipc::resolve(&sock, name)
         .await
         .map_err(|e| AppError::Usage(format!("{name}: {e}")))?;
     // A bare port means loopback; `127.0.0.1:0` picks one.
@@ -1667,7 +1721,7 @@ pub async fn forward_named(
         .request(&vox_core::node::ipc::Request::Forward {
             channel_id,
             host,
-            service_tag: service.to_owned(),
+            service_tag: service.clone(),
             local,
         })
         .await
@@ -1718,7 +1772,7 @@ pub async fn trust_rename(
         )));
     }
     println!(
-        "vox: {} is now {name:?} — reachable as {}.<room>.vox",
+        "vox: {} is now {name:?} — what it shares is reachable as <service>.{}.<room>.vox",
         short(&target),
         vox_core::node::resolver::label_of(name)
     );

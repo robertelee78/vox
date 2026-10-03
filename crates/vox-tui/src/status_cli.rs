@@ -87,12 +87,15 @@ fn render(v: &Value) -> String {
     for r in arr("rooms") {
         let _ = writeln!(
             o,
-            "  {} {}  epoch {}  last sync {}  sender keys held {}",
+            "  {} {}  epoch {}  last sync {}  sender keys held {}, received {}",
             short(s(r, "id")),
             s(r, "name"),
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
             ago(now, &r["last_sync"]),
             r.get("key_generations")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            r.get("received_key_generations")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
         );
@@ -144,10 +147,11 @@ fn render(v: &Value) -> String {
         };
         let _ = writeln!(
             o,
-            "  {}  {}  rtt {} ms",
+            "  {}  {}  rtt {} ms  key exchange {}",
             short(s(p, "id")),
             path,
-            p.get("rtt_ms").and_then(Value::as_u64).unwrap_or(0)
+            p.get("rtt_ms").and_then(Value::as_u64).unwrap_or(0),
+            s(p, "tls_group")
         );
     }
     let _ = writeln!(
@@ -168,6 +172,26 @@ fn render(v: &Value) -> String {
             short(s(t, "host")),
             s(t, "service"),
             short(s(t, "room"))
+        );
+    }
+    // **Each UDP flow, with its own counts** (ADR-022 6.9, V030-34): what it put on its tunnel,
+    // what it delivered from the far side, and what a full local socket or queue dropped.
+    let _ = writeln!(o, "\nudp flows");
+    let flows = arr("udp_flows");
+    if flows.is_empty() {
+        let _ = writeln!(o, "  none");
+    }
+    for f in flows {
+        let n = |k: &str| f.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let _ = writeln!(
+            o,
+            "  {} with {}: to {} from {} dropped {}, idle {} ms",
+            s(f, "service"),
+            short(s(f, "peer")),
+            n("to"),
+            n("from"),
+            n("dropped"),
+            n("idle_ms")
         );
     }
     let d = &v["datagrams"];

@@ -37,7 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::atrest::idfactor::SignatureIdentityFactor;
 use crate::atrest::sek::{Argon2Profile, Sek};
@@ -47,7 +47,6 @@ use crate::error::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::governance::capability::CapabilitySet;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::{GovBody, GovEntry};
 use crate::governance::evaluator::Evaluator;
@@ -93,9 +92,8 @@ const SEG_SENDER: u64 = 1;
 const SEG_ANCHORS: u64 = 4;
 /// The offered-services segment id within [`SegmentKind::KeyMaterial`] (ADR-013,
 /// M16.1): the `service_tag → local address` map this node **binds** for this
-/// channel. Host configuration, not authorization — what a peer may *reach* is the
-/// `dial:` capability in the log, and the two are checked separately
-/// ([`crate::tunnel::session::accept`]).
+/// channel. Host configuration, not authorization — who may *reach* it is the host's
+/// dial gate ([`crate::tunnel::session::accept`]).
 const SEG_SERVICES: u64 = 5;
 
 /// The retained-origins segment id within [`SegmentKind::KeyMaterial`] (M18.1): the
@@ -712,7 +710,11 @@ pub struct ChannelState {
     /// more valuable. It is wiped by [`ChannelState::lock_now`] with the SEK, never
     /// written to disk, and never crosses the client boundary (no view, event or
     /// `Debug` output carries it).
-    passphrase: Zeroizing<Vec<u8>>,
+    ///
+    /// `None` once locked. An empty passphrase is a passphrase (V030-36, decider 2026-10-02:
+    /// "technically optional"), so emptiness cannot mean "locked": a room made with none was
+    /// read as locked and could never answer a join.
+    passphrase: Option<Zeroizing<Vec<u8>>>,
     /// Every content entry still holding its body, by age (ADR-023 decision 2).
     retention: RetentionIndex,
     /// This node's own retention for the room, seconds; `0` is no node limit. Set by the
@@ -798,6 +800,24 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
 /// The offered-services segment: `[version, [[tag, addr_text], …]]` in tag order (a
 /// `BTreeMap`, so the bytes are canonical). Addresses are the standard `ip:port`
 /// text, which round-trips exactly.
+/// A service shared in a room (V030-25), as the log says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// The member sharing it: the `<node>` of its address.
+    pub host: Digest32,
+    /// Its name, as its sharer gave it: the `<service>` of its address.
+    pub name: String,
+    /// Whether it carries datagrams (ADR-022).
+    pub udp: bool,
+}
+
+/// A service's name from its tag: a UDP service's tag is `udp/<name>` (ADR-022 decision 6), and
+/// the two transports share one namespace, as the address does.
+#[must_use]
+pub fn service_name(service_tag: &str) -> &str {
+    service_tag.strip_prefix("udp/").unwrap_or(service_tag)
+}
+
 fn services_bytes(services: &BTreeMap<String, SocketAddr>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(SERVICES_VERSION).array(services.len());
@@ -1209,37 +1229,7 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
-        Self::create_with_grant(
-            profile,
-            local_name,
-            channel_passphrase,
-            CapabilitySet::new(),
-            now_secs,
-            argon2,
-        )
-    }
-
-    /// Create a channel whose **genesis confers `service_grant` on every member**
-    /// (ADR-017 decision 3) — the capability-bearing room `vox serve` makes.
-    ///
-    /// Joining such a room *is* the authorization: the joiner already proved it held
-    /// the passphrase and paid the ADR-005 proof of work, and the room's purpose is
-    /// the service, so "may this member dial it" and "is this person a member" are the
-    /// same question. No certificate is issued to anyone, so the host never waits for
-    /// the guest to appear in order to grant them something.
-    ///
-    /// The grant is immutable, being part of the genesis and therefore of the
-    /// channelID — a room cannot silently *become* an access list, and one created as
-    /// an access list cannot stop being one.
-    pub fn create_with_grant(
-        profile: &Profile,
-        local_name: &str,
-        channel_passphrase: &[u8],
-        service_grant: CapabilitySet,
-        now_secs: u64,
-        argon2: Argon2Profile,
-    ) -> Result<Self> {
-        let (genesis, sek) = Self::create_genesis(profile, local_name, service_grant, now_secs)?;
+        let (genesis, sek) = Self::create_genesis(profile, local_name, now_secs)?;
         let signer = profile.signer()?;
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
@@ -1256,7 +1246,7 @@ impl ChannelState {
 
     /// The fast first step of creating a room: its genesis and a fresh room key.
     ///
-    /// Split from [`ChannelState::create_with_grant`] so the slow middle step — sealing the room
+    /// Split from [`ChannelState::create_with_profile`] so the slow middle step — sealing the room
     /// key under the passphrase with production Argon2id, seconds of CPU — can run off the node's
     /// actor, which answers nothing while it works. [`ChannelState::create_from_sealed`] is the
     /// last step.
@@ -1266,7 +1256,6 @@ impl ChannelState {
     pub fn create_genesis(
         profile: &Profile,
         local_name: &str,
-        service_grant: CapabilitySet,
         now_secs: u64,
     ) -> Result<(Genesis, Sek)> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
@@ -1278,7 +1267,7 @@ impl ChannelState {
             ttl: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
-        let genesis = Genesis::create_with_grant(signer, now_secs, policy, service_grant)?;
+        let genesis = Genesis::create(signer, now_secs, policy)?;
         Ok((genesis, Sek::generate()?))
     }
 
@@ -1375,7 +1364,7 @@ impl ChannelState {
             channel_id,
             genesis,
             local_name: local_name.to_owned(),
-            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
+            passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created: now_secs,
             epoch,
             sek,
@@ -1833,7 +1822,7 @@ impl ChannelState {
             channel_id: *channel_id,
             genesis,
             local_name,
-            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
+            passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created,
             epoch,
             sek,
@@ -1882,11 +1871,9 @@ impl ChannelState {
         gov_entries: &[GovEntry],
         now_secs: u64,
     ) -> Result<Evaluator> {
-        // The admitted authors are this node's view of *who is a member*, which is
-        // what a genesis service grant is conferred on (ADR-017 decision 3). It is
-        // local state by ADR-007's design — membership is emergent, there is no
-        // roster — and that is sound here because the decision it feeds is local too:
-        // a host serving its own service consults the keys it verified itself.
+        // The admitted authors are this node's view of *who is a member*: local state by
+        // ADR-007's design (membership is emergent, there is no roster). It confers no
+        // capability (PRD-001 R44).
         Evaluator::build_with_members(
             genesis,
             gov_entries,
@@ -2126,7 +2113,7 @@ impl ChannelState {
             channel_id: *channel_id,
             genesis: genesis.clone(),
             local_name: local_name.to_owned(),
-            passphrase: Zeroizing::new(channel_passphrase.to_vec()),
+            passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created: now_secs,
             epoch,
             sek,
@@ -2389,9 +2376,13 @@ impl ChannelState {
 
     /// Offer `service_tag` at `local`, persisted under the channel's SEK so a restart
     /// still serves it — unless `persist` is false, when it lasts only until it is removed
-    /// or this node stops. Replacing an existing tag's address is allowed (that is how a
-    /// service moves). No capability is checked: offering a port of this machine is
+    /// or this node stops. No capability is checked: offering a port of this machine is
     /// configuration, not authorization (see the body).
+    ///
+    /// **A name is shared once** (V030-25): the tag is the `<service>` of
+    /// `<service>.<node>.<room>.vox`, so a second share under a name this node already shares
+    /// here — over either transport (`udp/<name>` is the same name) — is refused, naming the one
+    /// that holds it. A service moves by being removed and shared again.
     ///
     /// Returns whether this added a tag that was not offered before.
     pub fn add_service(
@@ -2417,8 +2408,16 @@ impl ChannelState {
         // anything. A non-creator simply could not serve. Found by the agent-comms session
         // hitting it from the file-exchange side, which is where it bit first.
         let _ = profile;
-        let fresh = !self.services.contains_key(service_tag);
-        if fresh && self.services.len() >= MAX_SERVICES {
+        let name = service_name(service_tag);
+        if let Some((_, at)) = self
+            .services
+            .iter()
+            .find(|(tag, _)| service_name(tag) == name)
+        {
+            return Err(Error::ServiceNameTaken(name.to_owned(), *at));
+        }
+        let fresh = true;
+        if self.services.len() >= MAX_SERVICES {
             return Err(Error::SizeLimitExceeded("channel services"));
         }
         self.services.insert(service_tag.to_owned(), local);
@@ -2429,6 +2428,81 @@ impl ChannelState {
         }
         self.persist_services(store)?;
         Ok(fresh)
+    }
+
+    /// Write this identity's statement that it shares `service_tag` in the room, or no longer
+    /// does (V030-25), so every member can list it. A transient offer (a file being handed over)
+    /// is not a share and is not announced.
+    pub fn say_share(
+        &mut self,
+        profile: &Profile,
+        service_tag: &str,
+        shared: bool,
+        now_secs: u64,
+    ) -> Result<()> {
+        let statement = crate::governance::share::ServiceShare::build(
+            profile.signer()?,
+            &self.channel_id,
+            self.epoch,
+            service_name(service_tag),
+            crate::tunnel::udp::is_udp(service_tag),
+            shared,
+        )?;
+        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        Ok(())
+    }
+
+    /// State every share this node offers here that the log does not yet say it shares, and
+    /// return whether anything was written. A share made in a room joined and not yet synced is
+    /// offered at once but can be said only once the room settles (V210-164); this says it then.
+    pub fn say_unsaid_shares(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+        let me = profile.signer()?.fingerprint();
+        let said: BTreeSet<String> = self
+            .shares()
+            .into_iter()
+            .filter(|s| s.host == me)
+            .map(|s| s.name)
+            .collect();
+        let unsaid: Vec<String> = self
+            .services
+            .keys()
+            .filter(|tag| !self.transient.contains(*tag) && !said.contains(service_name(tag)))
+            .cloned()
+            .collect();
+        for tag in &unsaid {
+            self.say_share(profile, tag, true, now_secs)?;
+        }
+        Ok(!unsaid.is_empty())
+    }
+
+    /// Whether `service_tag` is offered and persisted: a share, not a transient offer.
+    #[must_use]
+    pub fn is_shared(&self, service_tag: &str) -> bool {
+        self.services.contains_key(service_tag) && !self.transient.contains(service_tag)
+    }
+
+    /// The services shared in this room, by every member, as the log says (V030-25): for each
+    /// `(sharer, name)` the last statement its sharer made, kept when it says shared. A member
+    /// that has left shares nothing.
+    #[must_use]
+    pub fn shares(&self) -> Vec<Share> {
+        let mut last: BTreeMap<(Digest32, String), (u64, bool, bool)> = BTreeMap::new();
+        for g in &self.gov_entries {
+            let GovBody::ServiceShare(s) = &g.body else {
+                continue;
+            };
+            if s.body.author_id != g.author_id || s.body.channel_id != self.channel_id {
+                continue;
+            }
+            let key = (g.author_id, s.body.name.clone());
+            if last.get(&key).is_none_or(|(seq, _, _)| *seq < g.seq) {
+                last.insert(key, (g.seq, s.body.udp, s.body.shared));
+            }
+        }
+        last.into_iter()
+            .filter(|((host, _), (_, _, shared))| *shared && !self.has_left(host))
+            .map(|((host, name), (_, udp, _))| Share { host, name, udp })
+            .collect()
     }
 
     /// Stop offering `service_tag`. Returns whether it was offered.
@@ -3073,6 +3147,16 @@ impl ChannelState {
         MembershipView::new(&self.evaluator).readers_of(&self.me())
     }
 
+    /// Every other member that consents to this identity reading it here: the inbound half of
+    /// [`consented`](Self::consented), off the log the same way (V030-17).
+    #[must_use]
+    pub fn consenting(&self) -> BTreeSet<Digest32> {
+        let me = self.me();
+        let mut by = MembershipView::new(&self.evaluator).readable_authors(&me, &self.members());
+        by.remove(&me);
+        by
+    }
+
     /// The admitted authors in `trusted` this identity has **not yet consented
     /// to** — who auto-consent still owes a first key release (ADR-020 §3).
     ///
@@ -3644,12 +3728,6 @@ impl ChannelState {
             return Err(e);
         }
         Ok(())
-    }
-
-    /// The capabilities this channel's genesis confers on every member (ADR-017).
-    #[must_use]
-    pub fn service_grant(&self) -> &CapabilitySet {
-        &self.genesis.body.service_grant
     }
 
     /// The room's retention, seconds (`0` = forever): the ADR-007 policy-update `ttl` in
@@ -4782,6 +4860,95 @@ impl ChannelState {
         Ok(())
     }
 
+    /// How many generations of other members' sender keys this node holds here: what `vox
+    /// status` reports beside [`Self::key_generations`], and what R14 keeps down to the ones
+    /// still needed ([`Self::prune_superseded_receivers`]).
+    #[must_use]
+    pub fn received_key_generations(&self) -> usize {
+        self.receivers.len()
+    }
+
+    /// Delete every received sender-key generation this node no longer needs (PRD-001 R14 on
+    /// the receiving side): the sender prunes its own origins ([`Self::prune_superseded_origins`]),
+    /// and a receiver that kept every generation it was ever given still opened all of them.
+    ///
+    /// A generation `c` of `author` is no longer needed once this node holds `author`'s feed
+    /// without a gap up to an entry under a later generation, and every entry under `c` in that
+    /// stretch is rendered. A sender only moves forward, so no entry under `c` can follow one
+    /// under a later generation: none can still arrive. An entry whose body has expired here
+    /// (PRD-001 R10) needs no key. **An entry whose body has not arrived and has not expired is
+    /// not received yet** (V030-10): it fills in later, and which generation it is under is
+    /// unknown until it does, so it counts as a gap. Kept: the newest generation held, and every
+    /// generation with an entry not yet rendered — no consent on the log yet, say — or that may
+    /// still be followed by one (a gap, a body still to come, or no later generation yet).
+    /// Returns how many generations went.
+    pub fn prune_superseded_receivers(&mut self, store: &Store) -> Result<usize> {
+        if self.poisoned {
+            return Ok(0);
+        }
+        let rendered: BTreeSet<Digest32> = self.timeline.iter().map(|r| r.entry_hash).collect();
+        let authors: BTreeSet<Digest32> = self.receivers.keys().map(|(a, _)| *a).collect();
+        let mut gone: Vec<(Digest32, u64)> = Vec::new();
+        for author in authors {
+            let held: Vec<u64> = self
+                .receivers
+                .range((author, 0)..=(author, u64::MAX))
+                .map(|((_, c), _)| *c)
+                .collect();
+            if held.len() <= 1 {
+                continue;
+            }
+            let Some(feed) = self.dag.feed(&author) else {
+                continue;
+            };
+            let mut newest: Option<u64> = None;
+            let mut unrendered: BTreeSet<u64> = BTreeSet::new();
+            for seq in 1..=self.dag.verified_head(&author) {
+                // A gap: what follows it is not known, so neither is what it still needs.
+                let Some(entry) = feed.get(seq) else {
+                    break;
+                };
+                let Some(payload) = entry.payload.as_deref() else {
+                    // Expired: its key is needed by nothing. Not expired: a body still to come,
+                    // under a generation not known yet — every generation from here on stays.
+                    if self.body_expired(entry.skeleton.claimed_ms, self.now_hint) {
+                        continue;
+                    }
+                    break;
+                };
+                if !matches!(classify_payload(payload), Ok(EntryKind::Content)) {
+                    continue;
+                }
+                let Ok(msg) = GroupMessage::from_wire(payload) else {
+                    continue;
+                };
+                let c = msg.header.chain_id;
+                newest = Some(newest.map_or(c, |n| n.max(c)));
+                if !rendered.contains(&entry.entry_hash()) {
+                    unrendered.insert(c);
+                }
+            }
+            let Some(newest) = newest else {
+                continue;
+            };
+            let last_held = held.last().copied().unwrap_or(0);
+            gone.extend(
+                held.iter()
+                    .filter(|c| **c < newest && **c < last_held && !unrendered.contains(c))
+                    .map(|c| (author, *c)),
+            );
+        }
+        if gone.is_empty() {
+            return Ok(0);
+        }
+        for slot in &gone {
+            // `ReceiverChain` holds its chain and skipped keys zeroized on drop.
+            self.receivers.remove(slot);
+        }
+        self.persist_receivers(store)?;
+        Ok(gone.len())
+    }
+
     /// Retry every stored content entry from `author` against the sender keys now
     /// held, rendering those that open. Called when a key arrives.
     /// The authors whose messages this node may read now (see [`Self::may_read`]).
@@ -5875,8 +6042,8 @@ impl ChannelState {
         self.sek.lock_now();
         // Wipe the retained passphrase with the SEK: after an app-lock this channel
         // can neither unseal nor answer a join until it is reopened (ADR-010/015).
-        self.passphrase.zeroize();
-        self.passphrase = Zeroizing::new(Vec::new());
+        // `Zeroizing` wipes it as it drops.
+        self.passphrase = None;
     }
 
     /// The retained channel passphrase, for answering an ADR-005 join (the only
@@ -5885,10 +6052,10 @@ impl ChannelState {
     /// Stays crate-internal: it is a secret, and the only legitimate consumer is the
     /// node's own join-responder path.
     pub(crate) fn join_passphrase(&self) -> Result<&[u8]> {
-        if self.passphrase.is_empty() {
-            return Err(Error::AtRestLocked);
-        }
-        Ok(self.passphrase.as_slice())
+        self.passphrase
+            .as_deref()
+            .map(Vec::as_slice)
+            .ok_or(Error::AtRestLocked)
     }
 
     /// The ADR-005 binding parameters for a join in this channel: its channelID,
@@ -5904,7 +6071,7 @@ impl ChannelState {
     /// Whether this channel can currently answer an inbound join.
     #[must_use]
     pub fn can_answer_join(&self) -> bool {
-        !self.passphrase.is_empty()
+        self.passphrase.is_some()
     }
 }
 

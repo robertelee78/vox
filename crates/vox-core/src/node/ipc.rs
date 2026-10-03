@@ -226,6 +226,8 @@ const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_MEMBERS: u64 = 6;
+/// [`Frame::Consents`] (V030-17).
+const T_CONSENTS: u64 = 3271;
 const T_ROOMS: u64 = 7;
 
 const T_BOUND: u64 = 8;
@@ -245,6 +247,8 @@ const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
 const T_READ: u64 = 3;
 const T_ROSTER: u64 = 4;
+/// [`Request::Consents`] (V030-17).
+const T_CONSENTS_REQ: u64 = 3270;
 const T_ROOMS_REQ: u64 = 5;
 // Protocol 3 — the service verbs an agent needs for file exchange (ADR-020 §11).
 // They exist on this socket, rather than as one-shot verbs that open the profile,
@@ -366,6 +370,12 @@ pub enum Request {
     },
     /// The members of a room.
     Roster {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Who this identity consents to reading it in a room, and who consents to it: both
+    /// directions of trust, off the room's log (V030-17).
+    Consents {
         /// The room.
         channel_id: Digest32,
     },
@@ -669,6 +679,9 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
+            Request::Consents { channel_id } => {
+                e.array(2).uint(T_CONSENTS_REQ).bytes(channel_id);
+            }
             Request::Order { channel_id } => {
                 e.array(2).uint(T_ORDER).bytes(channel_id);
             }
@@ -885,6 +898,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
+            }
+            (T_CONSENTS_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Consents { channel_id })
             }
             (T_ORDER, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -1245,6 +1264,13 @@ pub enum Frame {
         /// The room's retention, seconds.
         room: u64,
     },
+    /// What a [`Request::Consents`] asked for, each in fingerprint order.
+    Consents {
+        /// The members this identity consents to reading it.
+        outbound: Vec<Digest32>,
+        /// The members that consent to this identity reading them.
+        inbound: Vec<Digest32>,
+    },
     /// The address a [`Request::Forward`] actually bound.
     ///
     /// Its own frame rather than a reused `Ok`, because a forward asked for port
@@ -1279,6 +1305,9 @@ pub enum Frame {
         room: String,
         /// `(service tag, local address)`, in the node's order.
         services: Vec<(String, String)>,
+        /// What every member shares in the room (V030-25): `(address, sharer, udp)`, each as
+        /// this node writes it.
+        shared: Vec<(String, String, bool)>,
     },
 }
 
@@ -1341,6 +1370,16 @@ impl Frame {
                     e.bytes(m);
                 }
             }
+            Frame::Consents { outbound, inbound } => {
+                e.array(3).uint(T_CONSENTS).array(outbound.len());
+                for m in outbound {
+                    e.bytes(m);
+                }
+                e.array(inbound.len());
+                for m in inbound {
+                    e.bytes(m);
+                }
+            }
             Frame::Bound { local } => {
                 e.array(2).uint(T_BOUND).text(local);
             }
@@ -1374,10 +1413,18 @@ impl Frame {
                     e.array(2).bytes(id).text(petname);
                 }
             }
-            Frame::Services { room, services } => {
-                e.array(3).uint(T_SERVICES).text(room).array(services.len());
+            Frame::Services {
+                room,
+                services,
+                shared,
+            } => {
+                e.array(4).uint(T_SERVICES).text(room).array(services.len());
                 for (tag, local) in services {
                     e.array(2).text(tag).text(local);
+                }
+                e.array(shared.len());
+                for (address, who, udp) in shared {
+                    e.array(3).text(address).text(who).uint(u64::from(*udp));
                 }
             }
         }
@@ -1798,6 +1845,19 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc room retention"))?,
             });
         }
+        (T_CONSENTS, 3) => {
+            let mut set = |what: &'static str| -> Result<Vec<Digest32>> {
+                let n = d.array().map_err(|_| Error::MalformedIpc(what))?;
+                let mut out = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    out.push(digest(d)?);
+                }
+                Ok(out)
+            };
+            let outbound = set("ipc consents outbound")?;
+            let inbound = set("ipc consents inbound")?;
+            return Ok(Frame::Consents { outbound, inbound });
+        }
         (T_BOUND, 2) => {
             return Ok(Frame::Bound {
                 local: text(d, "ipc bound address")?,
@@ -1840,7 +1900,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Rooms { rooms });
         }
-        (T_SERVICES, 3) => {
+        (T_SERVICES, 4) => {
             let room = text(d, "ipc services room")?;
             let count = d
                 .array()
@@ -1855,7 +1915,30 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 }
                 services.push((text(d, "ipc service tag")?, text(d, "ipc service address")?));
             }
-            return Ok(Frame::Services { room, services });
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc shared array"))?;
+            let mut shared = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc shared row"))?
+                    != 3
+                {
+                    return Err(Error::MalformedIpc("ipc shared row arity"));
+                }
+                let address = text(d, "ipc shared address")?;
+                let who = text(d, "ipc shared sharer")?;
+                let udp = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc shared udp"))?
+                    != 0;
+                shared.push((address, who, udp));
+            }
+            return Ok(Frame::Services {
+                room,
+                services,
+                shared,
+            });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -2617,10 +2700,16 @@ async fn verify_operator(
     }
 }
 
-/// [`verify_operator`] for a passphrase that was given; nothing to check for one that was not
-/// (the empty string), and the node's keyring window decides.
+/// [`verify_operator`] for a passphrase that was given; for none (the empty string), the node's
+/// keyring window decides.
+///
+/// **The empty string is also a passphrase** (V030-36): an identity may have none. So an empty
+/// one is checked too, and a match counts as the passphrase entered, opening the window; a
+/// mismatch is "none given", not a wrong passphrase. Without that, an identity with no
+/// passphrase could never change its keyring once the window had passed.
 async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
     if passphrase.is_empty() {
+        let _ = verify_operator(handle, passphrase).await;
         return Ok(());
     }
     verify_operator(handle, passphrase).await
@@ -3042,6 +3131,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     .iter()
                     .map(|(tag, local)| (tag.clone(), local.to_string()))
                     .collect(),
+                shared: handle.shared_in(channel_id).await.unwrap_or_default(),
             },
             None => Frame::Error {
                 reason: "room not open".into(),
@@ -3086,6 +3176,23 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 Some(detail) => Frame::Members {
                     members: detail.members.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        // Bounded like the roster: two sets of at most a room's members.
+        Request::Consents { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Consents {
+                    outbound: detail.consented.clone(),
+                    inbound: detail.consenting.clone(),
                 },
                 None => Frame::Error {
                     reason: "room not open".into(),

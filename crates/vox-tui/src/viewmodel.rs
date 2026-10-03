@@ -55,6 +55,9 @@ pub struct MessageView {
     pub author: Digest32,
     /// The author's local nickname.
     pub author_nick: String,
+    /// Who an addressed message is to, as this node names each (PRD-001 R15): `to you, bob`,
+    /// or empty for a message to the whole room.
+    pub addressed: String,
     /// Wall-clock send time (epoch-seconds) as recorded in the entry.
     pub timestamp: u64,
     /// The rendered body if decryptable to you, else `None` (shown as a marker).
@@ -117,6 +120,9 @@ pub struct ChannelView {
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
+    /// The services shared in the room (V030-25), each as `<address> by <who>`: its address in
+    /// this operator's own aliases (fingerprints where it has none), and who shared it.
+    pub shared: Vec<String>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }

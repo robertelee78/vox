@@ -171,7 +171,7 @@ fn an_anchor_runs_and_serves_on_a_profile_made_by_vox_id() {
         &host_dir,
         &args(&[
             "serve",
-            &port.to_string(),
+            &format!("{port}={port}"),
             "--anchor",
             &spec,
             "--listen",

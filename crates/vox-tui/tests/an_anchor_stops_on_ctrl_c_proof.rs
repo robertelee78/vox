@@ -631,7 +631,7 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
             &w.host_dir,
             &args(&[
                 "serve",
-                &w.service_port.to_string(),
+                &format!("{0}={0}", w.service_port),
                 "--anchor",
                 &w.host_anchor,
                 "--listen",
