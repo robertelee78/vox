@@ -120,7 +120,7 @@ fn a_join_outlives_its_displaced_path() {
         &host_dir,
         &args(&[
             "serve",
-            &echo_service().to_string(),
+            &format!("{0}={0}", echo_service()),
             "--anchor",
             &anchor.v4_spec,
             "--listen",

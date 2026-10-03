@@ -109,7 +109,7 @@ fn stage() -> Room {
         &host_dir,
         &args(&[
             "serve",
-            &echo_service().to_string(),
+            &format!("{0}={0}", echo_service()),
             "--anchor",
             &spec,
             "--listen",

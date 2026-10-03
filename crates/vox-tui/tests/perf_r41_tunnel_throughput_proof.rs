@@ -3,9 +3,9 @@
 //! should ensure that our overlay system doesn't completely nuke that").
 //!
 //! Driven entirely through the shipped binary, the way a person sets a tunnel up: `vox node` (an
-//! anchor), `vox serve <port>` (the host, offering a **sink** that counts bytes and stamps the last
-//! one), `vox connect` (the guest joins; the host trusts it beforehand) and `vox forward` (the guest's
-//! local port into the tunnel).
+//! anchor), `vox serve <port>=<port>` (the host, offering a **sink** that counts bytes and
+//! stamps the last one), `vox connect` (the guest joins; the host trusts it beforehand) and
+//! `vox forward` (the guest's local port into the tunnel).
 //!
 //! **The same emulated link for both.** PRD-001: "raw TCP and a Vox tunnel over the same emulated real
 //! link". This process runs a link emulator: every packet of the tunnel's QUIC connection crosses a UDP
@@ -844,7 +844,7 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         &host_dir,
         &[
             "serve",
-            &port_s,
+            &format!("{port_s}={port_s}"),
             "--anchor",
             &spec,
             "--listen",

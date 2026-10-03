@@ -124,7 +124,7 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
     // A syntactically whole address, so `connect` gets as far as opening the profile.
     let link = format!("vox://{fp}?a={fp}&b=/ip4/127.0.0.1/udp/1");
     let verbs: [(&str, Vec<&str>); 5] = [
-        ("serve", vec!["serve", "9", "--listen", "127.0.0.1:0"]),
+        ("serve", vec!["serve", "9=9", "--listen", "127.0.0.1:0"]),
         (
             "forward",
             vec![
@@ -295,7 +295,12 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
             }
         }
     }
-    let (ok, said) = vox(&dir, IDPASS, &["serve", "9", "--listen", "127.0.0.1:0"], "");
+    let (ok, said) = vox(
+        &dir,
+        IDPASS,
+        &["serve", "9=9", "--listen", "127.0.0.1:0"],
+        "",
+    );
     daemon
         .kill()
         .expect("APPARATUS: could not signal the holding daemon");

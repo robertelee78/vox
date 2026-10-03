@@ -359,7 +359,14 @@ fn every_common_failure_names_its_cause() {
     let host = Proc::spawn(
         "host",
         &host_dir,
-        &["serve", &port, "--anchor", &spec, "--listen", "127.0.0.1:0"],
+        &[
+            "serve",
+            &format!("{port}={port}"),
+            "--anchor",
+            &spec,
+            "--listen",
+            "127.0.0.1:0",
+        ],
         "",
     );
     let field = |label: &str| {

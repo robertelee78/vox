@@ -43,7 +43,7 @@ use world::{args, vox_once};
 /// Everything wrong with how `dir`'s profile answers while something holds it.
 fn check_holder(holder: &str, dir: &Path, room: &str, stranger: &str, failures: &mut Vec<String>) {
     // 1. a second process on the held profile is refused, with the message.
-    let (ok, out, err) = vox_once(dir, &args(&["serve", "9", "--listen", "127.0.0.1:0"]));
+    let (ok, out, err) = vox_once(dir, &args(&["serve", "9=9", "--listen", "127.0.0.1:0"]));
     let said = format!("{out}{err}");
     eprintln!(
         "[{holder}] a second `vox serve` says: ok={ok}: {}",

@@ -78,8 +78,10 @@
 //! - **A `.vox` name for a room this machine never joined is refused at the proxy, and nothing
 //!   is dialled** (ADR-017, RP-44). The room is real: its host runs on the same anchor, trusts
 //!   this guest and offers a service that counts connections. The guest only never joined it.
-//!   The CONNECT is refused in the reply with the proxy's own reason ("no room on this machine
-//!   answers to …", not a host's refusal), and neither room's service is ever dialled.
+//!   The name is the full address, `<service>.<node>.<room>.vox` (V030-25), with the unjoined
+//!   room's id and its host's fingerprint. The CONNECT is refused in the reply with the proxy's
+//!   own reason ("no room on this machine is called …", not a host's refusal), and neither
+//!   room's service is ever dialled.
 //!
 //! Every red in those two proofs says which kind it is: **PRODUCT** (what the product did, as a
 //! person sees it), **PRODUCT (staging)** (a step vox itself performs before the claim failed),
@@ -527,7 +529,7 @@ fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
     let w = World::new(echo_service(), false);
     let guest_dir = w.guest_dir.clone();
     let (mut up, at) = w.up("stranger-up", &guest_dir);
-    let hostname = format!("{}.vox", w.room);
+    let hostname = w.service_host();
 
     // **The reply is the host's answer** (PRD-001 R23, D6). The proxy used to say
     // "succeeded" before it had asked, so a refusal looked like a connection that died.
@@ -1373,9 +1375,9 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
     w.restart_host_as_daemon();
     let guest_dir = w.guest_dir.clone();
     let (mut up, at) = w.up("guest-up", &guest_dir);
-    let name = format!("{}.vox", w.room);
+    let name = w.service_host();
 
-    // Step 1: a live session, as `ssh user@<room>.vox` holds one.
+    // Step 1: a live session, as `ssh user@<service>.<node>.<room>.vox` holds one.
     let mut s = live_session(&mut up, at, &name, port);
     let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
@@ -1470,8 +1472,9 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     let other_dir = w.tmp.path().join("other-host");
     std::fs::create_dir_all(other_dir.join("cfg"))
         .expect("APPARATUS: creating the other host's profile directory");
-    let (ok, _, err) = vox_once(&other_dir, &args(&["id"]));
+    let (ok, other_fp, err) = vox_once(&other_dir, &args(&["id"]));
     assert!(ok, "PRODUCT (staging): `vox id` (other host) failed: {err}");
+    let other_fp = other_fp.trim().to_owned();
     let (ok, out, err) = vox_once(
         &other_dir,
         &args(&["trust", "add", &w.guest_fp, "--name", "the guest"]),
@@ -1485,7 +1488,7 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
         &other_dir,
         &args(&[
             "serve",
-            &other_port.to_string(),
+            &format!("{other_port}={other_port}"),
             "--anchor",
             &w.host_anchor,
             "--listen",
@@ -1500,14 +1503,16 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
         other_room, w.room,
         "PRODUCT (staging): the other host's `vox serve` printed this world's room"
     );
-    let other_name = format!("{other_room}.vox");
+    // The unjoined room's service by its full address: the only `.vox` form that resolves
+    // anywhere (V030-25), so a refusal is about the room, not the shape of the name.
+    let other_name = format!("{other_port}.{other_fp}.{other_room}.vox");
 
     let guest_dir = w.guest_dir.clone();
     let (mut up, at) = w.up("guest-up", &guest_dir);
 
     // Control: the proxy dials a room this machine did join — otherwise a refusal below could
     // be a proxy that reaches nothing.
-    let s = live_session(&mut up, at, &format!("{}.vox", w.room), port);
+    let s = live_session(&mut up, at, &w.service_host(), port);
     let _ = s.shutdown(std::net::Shutdown::Both);
     let joined = accepted.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
@@ -1516,9 +1521,10 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     );
     eprintln!("[test] control: the joined room's name was carried; its service counted 1");
 
-    // The unjoined room's name, at its own service's port and at the joined room's: a proxy
-    // that resolved the name anywhere — the other room's host, or the room it does hold —
-    // would dial one of the two services.
+    // The unjoined room's name, at its own service's port and at the joined room's (the port
+    // selects nothing now, but a proxy that let it would show here): a proxy that resolved the
+    // name anywhere — the other room's host, or the room it does hold — would dial one of the
+    // two services.
     for p in [other_port, port] {
         let t0 = Instant::now();
         let (code, mut s) = socks5_connect(at, &other_name, p);
@@ -1540,13 +1546,13 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     // Refused **at the proxy**: its own reason, not a host's refusal relayed back.
     let why = up.try_expect_within(Duration::from_secs(10), "the proxy's own refusal", |l| {
         l.starts_with("! ")
-            && l.contains("no room on this machine answers to")
+            && l.contains("no room on this machine is called")
             && l.contains(&other_room)
     });
     assert!(
         why.is_ok(),
         "PRODUCT: vox up must refuse an unjoined room's name itself, saying no room on this \
-         machine answers to it; it said:\n{}",
+         machine is called that; it said:\n{}",
         up.transcript()
     );
     assert!(
@@ -1648,7 +1654,7 @@ fn reached_again(proxy: bool, back: Back) -> Duration {
     let mut w = World::new(echo_service(), true);
     let guest_dir = w.guest_dir.clone();
     let what = if proxy { "vox up" } else { "vox forward" };
-    let hostname = format!("{}.vox", w.room);
+    let hostname = w.service_host();
     let port = w.service_port;
     let (mut dialer, at) = if proxy {
         w.up("up", &guest_dir)

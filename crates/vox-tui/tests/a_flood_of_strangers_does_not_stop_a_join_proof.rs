@@ -4,8 +4,8 @@
 //! Two stores on a board were bounded by refusing whatever came next, and anyone could fill
 //! them:
 //! - **Pre-join slots.** A pre-join record needs nothing but a key — a joiner has no membership,
-//!   passphrase or proof of work yet — and a room's name is public (it is the `.vox` name and it
-//!   is in every invite link). A full bucket of 256 refused every later pre-join, so strangers
+//!   passphrase or proof of work yet — and a room's id is public (it is in every `.vox` address and
+//!   in every invite link). A full bucket of 256 refused every later pre-join, so strangers
 //!   who put 256 of them on a room's boards refused every real joiner for the two hours the
 //!   records live.
 //! - **Geneses.** A board took a genesis from any peer, up to 4096, and never let one go. A

@@ -1,8 +1,10 @@
-//! PRD-001 R20 / ADR-017 decision 7 — **local names**: `ssh nas.family.vox`, where `nas`
-//! is the name *this* machine gave that node when it trusted it and `family` is *this*
-//! machine's name for the room. Proved with the shipped binary only: every member is a
-//! `vox daemon`, and everything they do is a `vox` verb (`vox trust add/rename/remove`,
-//! `vox room create/invite/join/roster`, `vox service add`, `vox up`, `vox forward`).
+//! PRD-001 R20 / ADR-017 decision 7 — **local names**: `ssh 22.nas.family.vox`, where `22` is
+//! the name the node shared its service under, `nas` is the name *this* machine gave that node
+//! when it trusted it and `family` is *this* machine's name for the room (V030-25:
+//! `<service>.<node>.<room>.vox` is the only `.vox` name that resolves). Proved with the
+//! shipped binary only: every member is a `vox daemon`, and everything they do is a `vox` verb
+//! (`vox trust add/rename/remove`, `vox room create/invite/join/roster`, `vox service add`,
+//! `vox up`, `vox forward`).
 //!
 //! The scene, from alice's side:
 //!
@@ -17,9 +19,9 @@
 //!    `family` through bob after alice is already in, so alice's join told her nothing about
 //!    carol: she learns that carol is a member only from the room's board, and `vox room
 //!    roster` on alice shows it.
-//! 1. `nas.family.vox` reaches bob and `laptop.family.vox` reaches carol — the member the
+//! 1. `22.nas.family.vox` reaches bob and `22.laptop.family.vox` reaches carol — the member the
 //!    name names, not the room's creator.
-//! 2. `laptop.work.vox` reaches carol through the second room, under its own name.
+//! 2. `22.laptop.work.vox` reaches carol through the second room, under its own name.
 //! 3. An unknown room, an unknown node, and an ambiguous node name are refused, each with
 //!    a sentence saying which.
 //! 4. A node that is no longer trusted has no name.
@@ -308,12 +310,13 @@ impl Member {
         (ok, format!("{out}{err}"))
     }
 
-    /// `vox forward <name> 22 0`: whether it bound, and what it said.
+    /// `vox forward <name> 0`, the name naming the service (V030-25): whether it bound, and what
+    /// it said.
     fn forward(&self, name: &str) -> (bool, String) {
         let mut p = VoxProc::spawn(
             &format!("{} forward {name}", self.name),
             &self.dir,
-            &args(&["forward", name, "22", "0"]),
+            &args(&["forward", name, "0"]),
         );
         let bound = p
             .line_within(Duration::from_secs(20), |l| l.contains("forwarding"))
@@ -527,28 +530,28 @@ fn a_local_name_reaches_the_node_it_names() {
 
     // (1) and (2): each name reaches the node it names.
     let reached: Vec<(&str, Result<String, u8>)> = [
-        "nas.family.vox",
-        "laptop.family.vox",
-        "laptop.work.vox",
-        "NAS.Family.vox",
+        "22.nas.family.vox",
+        "22.laptop.family.vox",
+        "22.laptop.work.vox",
+        "22.NAS.Family.vox",
     ]
     .into_iter()
     .map(|n| (n, who_answers(proxy, n)))
     .collect();
     // (3): refusals, with reasons, from `vox forward`.
-    let unknown_room = alice.forward("nas.nowhere.vox");
-    let unknown_node = alice.forward("ghost.family.vox");
-    let not_there = alice.forward("nas.work.vox");
-    let named = alice.forward("laptop.family.vox");
+    let unknown_room = alice.forward("22.nas.nowhere.vox");
+    let unknown_node = alice.forward("22.ghost.family.vox");
+    let not_there = alice.forward("22.nas.work.vox");
+    let named = alice.forward("22.laptop.family.vox");
     // Two trusted nodes called `nas` in family: ambiguous.
     let rename = vox(&alice.dir, &["trust", "rename", &carol.fp, "nas"], None);
-    let ambiguous = alice.forward("nas.family.vox");
-    let ambiguous_socks = who_answers(proxy, "nas.family.vox");
+    let ambiguous = alice.forward("22.nas.family.vox");
+    let ambiguous_socks = who_answers(proxy, "22.nas.family.vox");
     // (4): untrusting carol takes her name away.
     let untrust = vox(&alice.dir, &["trust", "remove", &carol.fp], None);
-    let untrusted = alice.forward("nas.family.vox");
-    let now_bob = who_answers(proxy, "nas.family.vox");
-    let untrusted_laptop = who_answers(proxy, "laptop.work.vox");
+    let untrusted = alice.forward("22.nas.family.vox");
+    let now_bob = who_answers(proxy, "22.nas.family.vox");
+    let untrusted_laptop = who_answers(proxy, "22.laptop.work.vox");
 
     eprintln!(
         "reached: {reached:?}\nunknown room: {unknown_room:?}\nunknown node: {unknown_node:?}\n\
@@ -566,22 +569,22 @@ fn a_local_name_reaches_the_node_it_names() {
             .expect("APPARATUS: a name this proof did not try")
     };
     assert_eq!(
-        answered("nas.family.vox"),
+        answered("22.nas.family.vox"),
         Ok("bob".into()),
-        "PRODUCT: nas.family.vox did not reach bob's service, added to his running daemon"
+        "PRODUCT: 22.nas.family.vox did not reach bob's service, added to his running daemon"
     );
     assert_eq!(
-        answered("laptop.family.vox"),
+        answered("22.laptop.family.vox"),
         Ok("carol".into()),
-        "PRODUCT: laptop.family.vox did not reach carol's service, added to her running daemon — laptop is carol, not the room's creator"
+        "PRODUCT: 22.laptop.family.vox did not reach carol's service, added to her running daemon — laptop is carol, not the room's creator"
     );
     assert_eq!(
-        answered("laptop.work.vox"),
+        answered("22.laptop.work.vox"),
         Ok("carol-work".into()),
-        "PRODUCT: laptop.work.vox did not reach carol's work service, added to her running daemon — the same node through a second room, under that room's name"
+        "PRODUCT: 22.laptop.work.vox did not reach carol's work service, added to her running daemon — the same node through a second room, under that room's name"
     );
     assert_eq!(
-        answered("NAS.Family.vox"),
+        answered("22.NAS.Family.vox"),
         Ok("bob".into()),
         "PRODUCT: names are case-insensitive"
     );
@@ -626,7 +629,7 @@ fn a_local_name_reaches_the_node_it_names() {
     assert_eq!(
         now_bob,
         Ok("bob".into()),
-        "PRODUCT: with carol untrusted, nas.family.vox is bob's again"
+        "PRODUCT: with carol untrusted, 22.nas.family.vox is bob's again"
     );
     assert_eq!(
         untrusted_laptop,

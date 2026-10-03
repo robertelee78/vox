@@ -12400,17 +12400,14 @@ impl Node {
         let outcome = {
             let mut channel = shared.lock().await;
             let was_shared = channel.is_shared(service_tag);
-            channel
-                .remove_service(profile.store(), service_tag)
-                .map(|removed| {
-                    // The room is told it is no longer shared (V030-25). Not saying so leaves it
-                    // listed where nothing answers — a wrong listing, not a failed removal: the
-                    // service is gone either way.
-                    if removed && was_shared {
-                        let _ = channel.say_share(profile, service_tag, false, now);
-                    }
-                    removed
-                })
+            let removed = channel.remove_service(profile.store(), service_tag);
+            // The room is told it is no longer shared (V030-25). Not saying so leaves it listed
+            // where nothing answers — a wrong listing, not a failed removal: the service is gone
+            // either way.
+            if matches!(removed, Ok(true)) && was_shared {
+                let _ = channel.say_share(profile, service_tag, false, now);
+            }
+            removed
         };
         match outcome {
             Ok(true) => {
