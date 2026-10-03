@@ -178,6 +178,18 @@ connection, bound to the TLS session by its exporter.
 
     Signatures are composite Ed25519+ML-DSA (ADR-002), so authentication stays post-quantum. Flight 3
     MAY carry the dialler's first application bytes.
+
+    **Encoding.** Each flight MUST be one canonical CBOR array (ADR-008) in one length-prefixed frame
+    (requirement 18), led by a struct tag from `wire.rs`'s registry:
+    - `ASK = [tag_ask, version, target_fp]`;
+    - `PROVE = [tag_prove, version, target_composite_pubkey, sig]`;
+    - `CLAIM = [tag_claim, version, dialler_composite_pubkey, sig]`.
+
+    The three tags MUST be the next free tags in `wire.rs` when this is built. The highest on the
+    land tree is `0x0018`, and the governance work (V030-32) is adding `0x0019` onward, so the
+    numbers are assigned at build time against `wire.rs`, not here. `version` is 2. A frame longer
+    than 16 KiB MUST NOT be read past the cap, and MUST be refused as a malformed flight
+    (requirement 32).
 29. **The responder proves first.** The dialler MUST NOT send `CLAIM` until `PROVE` has verified
     against the identity it pinned. A dialler therefore reveals its identity only to a party that has
     just proven the pinned identity on this TLS session, as the handshake did before.
@@ -187,16 +199,23 @@ connection, bound to the TLS session by its exporter.
 31. **Direction labels.** The listener signs `vox-id/v2/resp` and the dialler `vox-id/v2/init`, so a
     flight MUST NOT verify in the other role, including between two nodes of one daemon.
 32. **Generic refusal.** One refusal, byte-identical on the wire, MUST answer: an unknown target, a
-    target attached but locked, a detached target, a malformed `ASK`, and a rate-limited source. It
-    MUST be sent only after a fixed delay drawn from the window a real `PROVE` takes, so its timing
-    does not distinguish these cases from each other.
+    target attached but locked, a detached target, a malformed or oversize flight, and a
+    rate-limited source. The refusal MUST be the connection closed with one application close code,
+    a single new `WireError` code meaning "not available" (its number assigned at build time against
+    `wire.rs`, after `Superseded` `0x0E`), with no reason text and no flight.
+    **Timing.** The listener MUST send every outcome of an `ASK`, a `PROVE` or a refusal, no earlier
+    than 50 ms after the `ASK` arrived plus a uniformly random 0–50 ms, so a refusal and a `PROVE` are
+    not told apart by timing at the scale an ML-DSA signature takes.
 33. **Nothing before the exchange.** Until flight 3 verifies, any other stream (bidirectional or
     unidirectional), any datagram, a second `ASK` or `CLAIM`, a malformed flight, or an exchange not
     finished within 5 s MUST close the connection. Nothing above the transport sees the connection,
     and no session-establishment record (requirement 12) is written, until then.
 34. **Cost discipline.** The listener MUST sign only after the per-source rate limit and the
-    pre-identity connection cap admit the `ASK`. Pre-identity connections MUST be capped (sharing the
-    accept gate, requirement 20) and MUST time out after 5 s. The node's long-term key signs once
+    pre-identity connection cap admit the `ASK`.
+    - The rate limit MUST be 8 `ASK`s per second per source IP address, with a burst of 16. An `ASK`
+      over the limit MUST get the refusal (requirement 32).
+    - Pre-identity connections MUST share the accept gate's cap of 64 handshakes in flight
+      (`HANDSHAKES_IN_FLIGHT`, requirement 20) and MUST time out after 5 s. The node's long-term key signs once
     per accepted connection.
 35. **After the exchange.** The listener MUST apply admission (trust, join gate; ADR-016) as the
     target node. The result MUST fill the verified-peer slot the handshake verifier fills today, so a
