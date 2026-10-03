@@ -185,3 +185,51 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
         t0.elapsed()
     );
 }
+
+/// **The daemon reads its relay limits from `.daemon/config`** (ADR-012 N-45, ADR-026 F-2): a
+/// value that is not a number stops it, naming the key, instead of running on the built-in limits.
+/// (The limits holding is proved on the presence's ledger in process.) Mutant: the daemon not
+/// reading `.daemon/config`.
+#[test]
+#[ignore = "real vox daemon; run in release"]
+fn the_daemon_reads_its_relay_limits_from_its_config() {
+    watchdog::arm();
+    let tmp = tempdir();
+    let home = tmp.path().join("h");
+    mkdir(&home.join("cfg"));
+    mkdir(&home.join(".daemon"));
+    std::fs::write(home.join(".daemon/config"), "relay-circuits = many\n")
+        .expect("APPARATUS: write .daemon/config");
+    let mut child = Command::new(VOX)
+        .args(["daemon", "--listen", "127.0.0.1:0"])
+        .env("VOX_DATA_DIR", &home)
+        .env("VOX_CONFIG_DIR", home.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: run vox daemon");
+    // Bounded: a daemon that ignores its config runs on, and is stopped here by its own PID.
+    let t0 = Instant::now();
+    while child.try_wait().ok().flatten().is_none() && t0.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ran_on = child.try_wait().ok().flatten().is_none();
+    if ran_on {
+        let _ = child.kill();
+    }
+    let out = child.wait_with_output().expect("APPARATUS: daemon output");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("[proof] vox daemon with `relay-circuits = many` said: {}", said.trim());
+    assert!(
+        !ran_on && !out.status.success() && said.contains("relay-circuits"),
+        "PRODUCT: a daemon whose config sets relay-circuits to no number must stop and name it; \
+         it exited {} saying: {said}",
+        out.status
+    );
+}

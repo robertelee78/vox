@@ -462,3 +462,40 @@ async fn every_node_on_a_presence_shares_its_one_nearby_group() {
     );
     presence.close().await;
 }
+
+/// **The relay limits of `.daemon/config` hold for the presence's one ledger** (ADR-012 N-45):
+/// `relay-circuits = 3` and `relay-circuits-per-asker = 2` let one asker take 2 circuits and the
+/// presence carry 3 in all; a malformed value is refused naming its key. Mutant: the ledger
+/// keeping the built-in limits whatever the config says.
+#[test]
+#[ignore = "in-process proof; run on demand"]
+fn the_relay_limits_of_the_daemon_config_hold_for_the_presences_ledger() {
+    use crate::node::circuitstream::{CircuitLedger, RelayLimits};
+    let limits = RelayLimits::parse(
+        "# relay\nlisten = 127.0.0.1:0\nrelay-circuits = 3\nrelay-circuits-per-asker = 2\n",
+    )
+    .expect("PRODUCT: a valid config was refused");
+    assert_eq!(
+        limits,
+        RelayLimits {
+            total: 3,
+            per_asker: 2
+        },
+        "PRODUCT: the limits read are not the config's"
+    );
+    let ledger = Arc::new(CircuitLedger::default());
+    ledger.set_limits(limits);
+    let (x, y, z) = (signer().fingerprint(), signer().fingerprint(), signer().fingerprint());
+    let held: Vec<_> = [x, x, x, y, y, z]
+        .iter()
+        .map(|a| ledger.take(*a))
+        .collect();
+    let taken: Vec<bool> = held.iter().map(Option::is_some).collect();
+    assert_eq!(
+        taken,
+        [true, true, false, true, false, false],
+        "PRODUCT: the ledger did not hold to 2 per asker and 3 in all"
+    );
+    let bad = RelayLimits::parse("relay-circuits = many").expect_err("PRODUCT: a bad value was taken");
+    assert!(bad.contains("relay-circuits"), "PRODUCT: the refusal did not name its key: {bad}");
+}
