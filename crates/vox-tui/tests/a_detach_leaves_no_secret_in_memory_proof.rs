@@ -781,7 +781,21 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
         !tui.cues.join("attached").exists(),
         "PRODUCT (staging): the TUI's node finished attaching, so the reopening was not in flight"
     );
+    let hup = Instant::now();
     tui.hang_up();
+    let gone = hup.elapsed();
+    // Still held when the TUI had gone: the reopen was in flight when its last holder went.
+    let held = scanner.scan();
+    println!(
+        "[proof] reopen: the TUI was gone {gone:?} after SIGHUP; the room passphrase then: {} \
+         copies",
+        held.of("room")
+    );
+    assert!(
+        held.of("room") > 0,
+        "PRODUCT (staging): the reopen had finished by the time the TUI went ({gone:?} after \
+         SIGHUP), so nothing was in flight"
+    );
     let took = wait_detached(&account, "bob2's TUI went on SIGHUP mid-attach");
     let after = scanner.scan();
     tui.stop();
