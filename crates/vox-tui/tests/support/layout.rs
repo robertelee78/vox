@@ -49,7 +49,7 @@ const REAP_GRACE: Duration = Duration::from_secs(10);
 /// to this net is worth a line in the proof's output.
 pub fn reap_daemon(data: &Path) {
     let path = daemon_lock(data);
-    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&path) else {
+    let Ok(file) = std::fs::File::open(&path) else {
         return;
     };
     if lock_is_free(&file) {
@@ -124,4 +124,17 @@ pub fn find_named(root: &Path, name: &str) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// [`reap_daemon`] for each data root it names, when it drops: a field of a harness world that is
+/// declared **first**, so it runs before the world's processes and temp dir go, and leaves the
+/// other fields free to be moved out (a world with a `Drop` of its own could not be taken apart).
+pub struct Reaper(pub Vec<PathBuf>);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        for d in &self.0 {
+            reap_daemon(d);
+        }
+    }
 }

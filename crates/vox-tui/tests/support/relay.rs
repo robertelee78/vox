@@ -317,7 +317,11 @@ impl Drop for RelayWorld {
     /// The safety net: a daemon any of the world's data roots still holds is stopped by its pid
     /// ([`reap_daemon`]) before the processes and the temp dir go.
     fn drop(&mut self) {
-        for d in [&self.host_dir, &self.guest_dir, &self.tmp.path().join("anchor")] {
+        for d in [
+            &self.host_dir,
+            &self.guest_dir,
+            &self.tmp.path().join("anchor"),
+        ] {
             reap_daemon(d);
         }
     }

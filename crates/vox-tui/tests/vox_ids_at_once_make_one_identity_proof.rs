@@ -89,7 +89,12 @@ fn leftovers(dir: &Path) -> Vec<String> {
         })
         // A directory that is not there holds no leftover only because it is not where `vox`
         // keeps them: that reads clean and measures nothing.
-        .unwrap_or_else(|e| panic!("PRODUCT (staging): no node directory at {}: {e}", dir.display()))
+        .unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT (staging): no node directory at {}: {e}",
+                dir.display()
+            )
+        })
 }
 
 #[test]

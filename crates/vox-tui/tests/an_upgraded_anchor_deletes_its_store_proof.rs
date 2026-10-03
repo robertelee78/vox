@@ -305,7 +305,9 @@ fn an_anchor_upgraded_from_a_release_that_kept_room_pages_deletes_them() {
         moved.exists()
     );
     assert!(
-        layout::node_dir(&n, layout::DEFAULT_NODE).join("node-identity.key").is_file(),
+        layout::node_dir(&n, layout::DEFAULT_NODE)
+            .join("node-identity.key")
+            .is_file(),
         "PRODUCT (staging): this build's anchor said its spec, yet its identity is not at {} — \
          the migration did not move the profile, so where its store went is not measured",
         layout::node_dir(&n, layout::DEFAULT_NODE).display()

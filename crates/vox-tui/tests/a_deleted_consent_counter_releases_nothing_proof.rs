@@ -206,7 +206,11 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
 /// The default node's `store.redb`, under `<data>/nodes/default/`.
 fn store_file(dir: &Path) -> PathBuf {
     let p = layout::node_dir(dir, layout::DEFAULT_NODE).join("store.redb");
-    assert!(p.is_file(), "PRODUCT (staging): no store at {}", p.display());
+    assert!(
+        p.is_file(),
+        "PRODUCT (staging): no store at {}",
+        p.display()
+    );
     p
 }
 

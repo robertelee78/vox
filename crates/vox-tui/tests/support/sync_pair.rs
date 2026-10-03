@@ -26,6 +26,7 @@ use vox_core::node::ipc::{Frame, IpcClient, Request};
 
 #[path = "layout.rs"]
 mod layout;
+#[allow(unused_imports)] // not every includer uses every item
 pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
