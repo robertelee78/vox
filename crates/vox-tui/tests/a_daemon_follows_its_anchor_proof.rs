@@ -284,7 +284,14 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     let (ok, _, err) = vox_stdin(
         &data,
         &cfg,
-        &["room", "create", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         Some(ROOM_PASS),
     );
     assert!(ok, "room create on the daemon: {err}");
@@ -442,7 +449,15 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         let (ok, _, err) = vox_stdin(
             &bob_data,
             &bob_cfg,
-            &["room", "join", &link, "--name", "mission"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "mission",
+            ],
             Some(ROOM_PASS),
         );
         if ok {

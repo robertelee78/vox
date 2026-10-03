@@ -430,7 +430,19 @@ fn assert_full(geneses: usize, others: usize) {
 /// fails and a join that succeeds too slowly are told apart.
 fn real_join(dir: &Path, link: &str, name: &str, what: &str) {
     let t0 = Instant::now();
-    let (ok, out, err) = vox_in(dir, &["room", "join", link, "--name", name], ROOM_PASS);
+    let (ok, out, err) = vox_in(
+        dir,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link,
+            "--name",
+            name,
+        ],
+        ROOM_PASS,
+    );
     let took = t0.elapsed();
     println!("[proof] real join of {what}: ok={ok} in {took:?}");
     assert!(
@@ -747,7 +759,15 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     let member = daemon("member", &member_dir, free_port(), &spec, &pass_file);
     let (ok, out, err) = vox_in(
         &member_dir,
-        &["room", "join", &creator_link, "--name", "first"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &creator_link,
+            "--name",
+            "first",
+        ],
         ROOM_PASS,
     );
     assert!(

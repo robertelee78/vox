@@ -285,7 +285,11 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     let eve = daemon("eve", &eve_dir, &spec, &idpass);
     let frank = daemon("frank", &frank_dir, &spec, &idpass);
 
-    let (ok, out, err) = vox_in(&alice_dir, &["room", "create", "--name", "eq"], "room pass");
+    let (ok, out, err) = vox_in(
+        &alice_dir,
+        &["room", "create", "--passphrase-file", "-", "--name", "eq"],
+        "room pass",
+    );
     assert!(ok, "PRODUCT (staging): vox room create failed: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
     assert!(ok, "PRODUCT (staging): vox room list failed: {err}");
@@ -300,7 +304,15 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for (name, d) in &members[1..] {
         let (ok, out, err) = vox_in(
             d,
-            &["room", "join", link.trim(), "--name", "eq"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "eq",
+            ],
             "room pass",
         );
         assert!(ok, "PRODUCT (staging): {name}'s join failed: {out}{err}");

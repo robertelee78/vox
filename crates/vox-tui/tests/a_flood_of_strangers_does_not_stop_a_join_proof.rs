@@ -139,7 +139,19 @@ fn flood_batch(
 
 fn join(dir: &std::path::Path, link: &str, name: &str) -> (bool, Duration, String) {
     let t0 = Instant::now();
-    let (ok, out, err) = vox_in(dir, &["room", "join", link, "--name", name], ROOM_PASS);
+    let (ok, out, err) = vox_in(
+        dir,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link,
+            "--name",
+            name,
+        ],
+        ROOM_PASS,
+    );
     (ok, t0.elapsed(), format!("{out}{err}"))
 }
 

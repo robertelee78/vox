@@ -229,7 +229,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
 
     let (ok, _, err) = vox(
         &alice_dir,
-        &["room", "create", "--name", "chat"],
+        &["room", "create", "--passphrase-file", "-", "--name", "chat"],
         Some("room passphrase\n"),
     );
     assert!(ok, "room create: {err}");
@@ -245,7 +245,15 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     assert!(ok, "invite: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
-        &["room", "join", link.trim(), "--name", "chat"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "chat",
+        ],
         Some("room passphrase\n"),
     );
     assert!(

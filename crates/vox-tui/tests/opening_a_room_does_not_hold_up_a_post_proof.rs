@@ -157,7 +157,7 @@ fn daemon(dir: &Path, tag: &str) -> Daemon {
 fn create(dir: &Path, name: &str) -> String {
     let (ok, _, err) = vox(
         dir,
-        &["room", "create", "--name", name],
+        &["room", "create", "--passphrase-file", "-", "--name", name],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(

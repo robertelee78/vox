@@ -228,7 +228,7 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     attached(&alice, "alice");
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "long"],
+        &["room", "create", "--passphrase-file", "-", "--name", "long"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room create: {err}");
@@ -292,7 +292,15 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     attached(&bob, "bob");
     let (ok, _, err) = vox(
         &bob,
-        &["room", "join", &link, "--name", "long"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "long",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room join: {err}");

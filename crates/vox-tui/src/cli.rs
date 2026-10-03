@@ -522,7 +522,9 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let identity = match crate::tunnel_cli::identity_passphrase_for(&paths, pass, pass_file) {
+    // Only what the command line gave. A read needs none, and a change asks for it only when
+    // the node says it is needed (V210-159, V210-165).
+    let given = match crate::tunnel_cli::identity_passphrase_given(pass, pass_file) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("vox: {e}");
@@ -542,14 +544,14 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
     };
     let outcome = rt.block_on(async move {
         match sub {
-            TrustCmd::List(_) => crate::room_cli::trust_list(&paths, &identity).await,
+            TrustCmd::List(_) => crate::room_cli::trust_list(&paths).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(&paths, target, &name, &identity).await
+                crate::room_cli::trust_add(&paths, target, &name, given).await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_remove(&paths, target, &identity).await
+                crate::room_cli::trust_remove(&paths, target, given).await
             }
         }
     });
@@ -643,11 +645,11 @@ enum RoomCmd {
     Send(SendFileArgs),
     /// Join a room from a `vox://` address, over a running node (ADR-020 §12).
     ///
-    /// The passphrase is read from **stdin**, never argv, which anything that can
-    /// run `ps` would see:
+    /// The passphrase is asked for at the terminal, or read from `--passphrase-file`
+    /// (`-` reads stdin); never argv, which anything that can run `ps` would see:
     ///
     /// ```text
-    /// echo 'the room passphrase' | vox room join vox://… --name mission
+    /// echo 'the room passphrase' | vox room join --passphrase-file - vox://… --name mission
     /// ```
     ///
     /// This is what makes agent comms usable on a host with no terminal: `vox
@@ -655,7 +657,8 @@ enum RoomCmd {
     /// onto it. Joining grants nothing — whether anyone can read you is their
     /// decision, made with `vox trust`.
     Join(JoinRoomArgs),
-    /// Create a room on a running node. Passphrase on stdin.
+    /// Create a room on a running node. Passphrase at the terminal, or from
+    /// `--passphrase-file` (`-` reads stdin).
     Create(CreateRoomArgs),
     /// Print a room's address, for someone else to `vox room join` with.
     ///
@@ -681,6 +684,10 @@ pub struct JoinRoomArgs {
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
+    /// Read the room passphrase from this file; `-` reads it from stdin. Without it, it is
+    /// asked for at the terminal, and with no terminal the command fails at once.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox room create`
@@ -691,6 +698,10 @@ pub struct CreateRoomArgs {
     /// A local name for the room. Never leaves this device.
     #[arg(long, default_value = "room")]
     pub name: String,
+    /// Read the new room's passphrase from this file; `-` reads it from stdin. Without it, it
+    /// is asked for twice at the terminal, and with no terminal the command fails at once.
+    #[arg(long)]
+    pub passphrase_file: Option<PathBuf>,
 }
 
 /// `vox room send`
@@ -737,8 +748,10 @@ pub struct StatusArgs {
 pub struct DaemonArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// Read the passphrase from this file instead of stdin, for a service manager
-    /// that prefers one. The file should contain the passphrase and nothing else.
+    /// Read the passphrases from this file, for a service manager that prefers one: the
+    /// identity passphrase on the first line, then any room lines. Without it the identity
+    /// passphrase is taken from `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal,
+    /// else read from stdin.
     #[arg(long)]
     pub passphrase_file: Option<PathBuf>,
 }
@@ -1503,8 +1516,9 @@ enum Cmd {
     /// third shape — an unlocked node holding this profile's rooms, serving the
     /// socket, with nothing attached to a tty.
     ///
-    /// The passphrase is read from **stdin**, deliberately not from the
-    /// environment, which is readable by anything running as the same user:
+    /// At a terminal it asks for the identity passphrase, without echo, and serves once
+    /// it is typed. Otherwise it takes it from `VOX_IDENTITY_PASSPHRASE`, or
+    /// `--passphrase-file`, or stdin:
     ///
     /// ```text
     /// echo 'my passphrase' | vox daemon
@@ -1883,8 +1897,19 @@ pub fn run() -> ExitCode {
                         RoomCmd::Send(a) => {
                             crate::room_cli::send_file(&paths, &a.room, &a.path).await
                         }
-                        RoomCmd::Join(a) => crate::room_cli::join(&paths, &a.link, &a.name).await,
-                        RoomCmd::Create(a) => crate::room_cli::create(&paths, &a.name).await,
+                        RoomCmd::Join(a) => {
+                            crate::room_cli::join(
+                                &paths,
+                                &a.link,
+                                &a.name,
+                                a.passphrase_file.as_deref(),
+                            )
+                            .await
+                        }
+                        RoomCmd::Create(a) => {
+                            crate::room_cli::create(&paths, &a.name, a.passphrase_file.as_deref())
+                                .await
+                        }
                         RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(
@@ -2258,10 +2283,28 @@ pub fn run() -> ExitCode {
         // **Ask the running node when there is one.** These three used to spawn a node of
         // their own, which redb refuses while a `vox daemon` holds the profile — so the
         // one command a person cannot skip, deciding who may read them, was unavailable
-        // exactly when they were setting up agent comms. Over the socket the request
-        // carries the identity passphrase and the node checks it, so an agent session
-        // that can reach the socket still cannot edit the keyring (ADR-020 §7).
+        // exactly when they were setting up agent comms. Over the socket the node decides:
+        // a read needs no passphrase, and a change needs it only once 30 minutes have
+        // passed since it was last entered, when this asks for it (V210-159). Whoever runs
+        // as this user is this user; the socket's file mode is the boundary.
         Cmd::Trust(sub) if trust_over_socket(&sub) => run_trust_over_socket(sub),
+        // With no node running the keyring is read from the store, sealed under the identity, so
+        // this one read needs the passphrase. Said as that, with the way to read it without one.
+        Cmd::Trust(TrustCmd::List(args))
+            if args.identity_passphrase.is_none()
+                && args.identity_passphrase_file.is_none()
+                && std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_none_or(|p| p.is_empty())
+                && !std::io::IsTerminal::is_terminal(&io::stdin()) =>
+        {
+            eprintln!(
+                "vox: no node is running, and reading the keyring without one needs the identity \
+                 passphrase: it is sealed under it. There is no terminal to ask at.\n\
+                 \x20      Start `vox daemon`, and `vox trust list` needs none.\n\
+                 \x20      {}",
+                crate::tunnel_cli::GIVE_IDENTITY_PASSPHRASE
+            );
+            ExitCode::FAILURE
+        }
         Cmd::Trust(TrustCmd::List(args)) => run_new_room_verb(
             args.profile.clone(),
             args.identity_passphrase.clone(),

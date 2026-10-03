@@ -195,7 +195,7 @@ fn read_posts(dir: &Path, room: &str) -> (BTreeSet<usize>, usize, usize) {
 fn create_room(alice: &Path, name: &str, before: &BTreeSet<String>) -> String {
     let (ok, _, err) = vox(
         alice,
-        &["room", "create", "--name", name],
+        &["room", "create", "--passphrase-file", "-", "--name", name],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room create: {err}");
@@ -221,7 +221,15 @@ fn join(bob: &Path, alice: &Path, room: &str, name: &str) {
     assert!(ok, "vox room invite: {err}");
     let (ok, _, err) = vox(
         bob,
-        &["room", "join", link.trim(), "--name", name],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            name,
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "CANNOT MEASURE: vox room join: {err}");

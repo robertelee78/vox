@@ -219,7 +219,7 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     let _carol_d = daemon(&carol, "carol", &format!("{IDENTITY}\n"));
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "c"],
+        &["room", "create", "--passphrase-file", "-", "--name", "c"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): `vox room create` failed: {err}");
@@ -233,7 +233,15 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     for (d, who) in [(&bob, "bob"), (&carol, "carol")] {
         let (ok, _, err) = vox(
             d,
-            &["room", "join", link.trim(), "--name", "c"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link.trim(),
+                "--name",
+                "c",
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(

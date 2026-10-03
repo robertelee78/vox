@@ -78,7 +78,7 @@ try:
     jenv = dict(env)
     jenv["VOX_IDENTITY_PASSPHRASE"] = IDPASS
     j = subprocess.run(
-        [VOX, "room", "join", LINK, "--name", "r"],
+        [VOX, "room", "join", "--passphrase-file", "-", LINK, "--name", "r"],
         input=ROOMPASS + "\n",
         env=jenv,
         capture_output=True,

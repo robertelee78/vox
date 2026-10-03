@@ -1875,6 +1875,29 @@ fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
     });
 }
 
+/// How long, in seconds, the identity passphrase stays good for a keyring change once it has been
+/// entered (V210-159, decider 2026-10-02). Posting and reading go on while the node runs; only a
+/// trust add or remove past this needs the passphrase again, whichever client asks.
+pub const KEYRING_WINDOW_SECS: u64 = 30 * 60;
+
+/// [`KEYRING_WINDOW_SECS`], or [`TEST_KEYRING_WINDOW_ENV`]'s seconds in a `test-knobs` build.
+fn keyring_window() -> u64 {
+    #[cfg(feature = "test-knobs")]
+    if let Some(secs) = std::env::var(TEST_KEYRING_WINDOW_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+    {
+        return secs;
+    }
+    KEYRING_WINDOW_SECS
+}
+
+/// **For proofs only.** The keyring window in seconds instead of 30 minutes, so a proof can see a
+/// keyring change refused once it has passed. Nothing a person runs sets it. Not compiled in
+/// without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_KEYRING_WINDOW_ENV: &str = "VOX_TEST_KEYRING_WINDOW_SECS";
+
 /// **For proofs only.** When set, the accept loop waits this many milliseconds between stopping
 /// and saying so (`NetEvent::Stopped`), which stands for an actor queue that is full or a task that
 /// is scheduled late. The lock-and-unlock proof uses it to land the event after an unlock started
@@ -3353,6 +3376,11 @@ pub struct Node {
     join_slots: Arc<std::sync::Mutex<crate::node::joinslots::JoinSlots>>,
     /// Slots for identity-passphrase checks; see [`VERIFIES_IN_FLIGHT`].
     verify_slots: Arc<tokio::sync::Semaphore>,
+    /// When the identity passphrase was last entered, in this node's clock's seconds: at
+    /// creation, at unlock, or at a later check that passed. Zero while locked. A keyring change
+    /// is refused once [`keyring_window`] has passed since (V210-159). Shared, because a check
+    /// passes on a blocking thread.
+    passphrase_entered_at: Arc<std::sync::atomic::AtomicU64>,
     /// The join exchanges running right now, both sides of them, the room creations sealing
     /// their key (V210-76), and the identity-passphrase checks (V210-94).
     ///
@@ -3670,6 +3698,7 @@ impl Node {
             publish_refusal_first_seen: BTreeMap::new(),
             join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
+            passphrase_entered_at: Arc::default(),
             join_tasks: tokio::task::JoinSet::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
@@ -4048,7 +4077,13 @@ impl Node {
             NodeCommand::VerifyPassphrase { passphrase } => match self.profile.as_ref() {
                 None => Outcome::Failed(Fault::NoIdentity),
                 Some(profile) => match profile.verify_passphrase(&passphrase) {
-                    Ok(()) => Outcome::Done,
+                    Ok(()) => {
+                        // An entry of it on a locked node starts no window: the unlock does.
+                        if profile.is_unlocked() {
+                            self.note_passphrase_entered();
+                        }
+                        Outcome::Done
+                    }
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 },
             },
@@ -4067,6 +4102,14 @@ impl Node {
             NodeCommand::JoinChannel { .. } => {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
+            }
+            // Only an unlocked node asks for the passphrase again. One with no identity or a
+            // locked one falls through, and says that: a passphrase would not make the change.
+            NodeCommand::Trust { .. } | NodeCommand::Untrust { .. }
+                if self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                    && !self.passphrase_entered_recently() =>
+            {
+                Outcome::Failed(Fault::PassphraseNeeded)
             }
             NodeCommand::Trust {
                 fingerprint,
@@ -4142,6 +4185,23 @@ impl Node {
         (self.clock)()
     }
 
+    /// The identity passphrase was just entered, and proved: a keyring change is allowed for
+    /// [`keyring_window`] from now (V210-159).
+    fn note_passphrase_entered(&self) {
+        self.passphrase_entered_at
+            .store(self.now().max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the identity passphrase was entered within [`keyring_window`]. Never, while
+    /// locked. A clock that went backwards counts as recent: the passphrase was entered, and the
+    /// window is kept by the next change of the clock forward, not by a wrong reading.
+    fn passphrase_entered_recently(&self) -> bool {
+        let at = self
+            .passphrase_entered_at
+            .load(std::sync::atomic::Ordering::Relaxed);
+        at != 0 && self.now().saturating_sub(at) <= keyring_window()
+    }
+
     fn create_identity(&mut self, passphrase: &Secret) -> Outcome {
         if self.profile.is_some() {
             return Outcome::Failed(Fault::IdentityExists);
@@ -4154,6 +4214,7 @@ impl Node {
         match Profile::create_noting(self.paths.clone(), passphrase, now, self.argon2, &waiting) {
             Ok(p) => {
                 self.profile = Some(p);
+                self.note_passphrase_entered();
                 // A fresh identity gets its prekey ring immediately: without it the
                 // node has nothing to publish and cannot answer PQXDH.
                 if let Err(e) = self.load_prekeys(now) {
@@ -4190,6 +4251,7 @@ impl Node {
                     drop(self.lock_all().await);
                     return Outcome::Failed(fault_of(&e));
                 }
+                self.note_passphrase_entered();
                 let _ = self.event_tx.send(NodeEvent::Unlocked);
                 self.reopen_remembered().await;
                 Outcome::Done
@@ -10180,6 +10242,8 @@ impl Node {
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
         let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
+        self.passphrase_entered_at
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         for (_, shared) in std::mem::take(&mut self.channels) {
             shared.lock().await.lock_now();
         }
@@ -10355,6 +10419,15 @@ impl Node {
             return;
         };
         let verifier = profile.passphrase_verifier();
+        // What the window stood at when the check began. A right passphrase restarts it only if
+        // nothing changed it meanwhile: a lock sets it to zero, and a check passing after that
+        // must not start a window on a locked node. While locked it is already zero, so nothing
+        // is recorded then either.
+        let (entered_at, clock) = (
+            Arc::clone(&self.passphrase_entered_at),
+            Arc::clone(&self.clock),
+        );
+        let entered_before = entered_at.load(std::sync::atomic::Ordering::Relaxed);
         let slots = Arc::clone(&self.verify_slots);
         let secret_work = Arc::clone(&self.secret_work);
         // Waiting for a slot happens here, off the actor; the check itself on a blocking
@@ -10373,7 +10446,17 @@ impl Node {
             let outcome = secret_blocking(&secret_work, move || {
                 let _slot = slot;
                 match verifier.verify(&passphrase) {
-                    Ok(()) => Outcome::Done,
+                    Ok(()) => {
+                        if entered_before != 0 {
+                            let _ = entered_at.compare_exchange(
+                                entered_before,
+                                clock().max(1),
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        Outcome::Done
+                    }
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 }
             })

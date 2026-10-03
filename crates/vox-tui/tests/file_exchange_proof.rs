@@ -320,7 +320,17 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         ]);
         assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
-    let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
+    let (ok, _, err) = alice.vox_with(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+    );
     assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let label = alice
         .vox(&["room", "list"])
@@ -339,7 +349,18 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         .to_owned();
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.
-    let (ok, out, err) = bob.vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS);
+    let (ok, out, err) = bob.vox_with(
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+    );
     assert!(
         ok,
         "PRODUCT: `vox room join` failed for bob.\nstdout: {out}\nstderr: {err}"

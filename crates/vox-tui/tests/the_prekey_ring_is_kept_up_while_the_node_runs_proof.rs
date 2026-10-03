@@ -205,7 +205,10 @@ impl Profile {
 
     /// A new room's invite link: `vox room create`, then `vox room invite` by its id.
     fn room(&self, name: &str) -> String {
-        let o = self.vox(&["room", "create", "--name", name], Some(ROOM_PASS));
+        let o = self.vox(
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(ROOM_PASS),
+        );
         assert!(o.ok, "room create {name}: {}{}", o.stdout, o.stderr);
         let o = self.vox(&["room", "list"], None);
         let id = o
@@ -376,7 +379,15 @@ fn a_session_started_before_a_rotation_completes_after_it() {
         // The join runs in the guest's daemon; `vox room join` waits for it.
         let joining = std::thread::spawn({
             let cmd = guest
-                .command(&["room", "join", &link, "--name", &format!("w{attempt}")])
+                .command(&[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    &link,
+                    "--name",
+                    &format!("w{attempt}"),
+                ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -476,7 +487,18 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
         // A join can be turned away while the host is busy admitting another (a known,
         // separate defect): retried, bounded, and said.
         let joined = (1..=4).any(|attempt| {
-            let o = guest.vox(&["room", "join", &link, "--name", &name], Some(ROOM_PASS));
+            let o = guest.vox(
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    &link,
+                    "--name",
+                    &name,
+                ],
+                Some(ROOM_PASS),
+            );
             if !o.ok {
                 eprintln!(
                     "[proof] join {i} attempt {attempt} refused: {}",

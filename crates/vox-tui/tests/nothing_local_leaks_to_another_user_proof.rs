@@ -403,7 +403,14 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
     let (ok, _, err) = alice.run(
-        &["room", "create", "--name", "mission"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
         ROOM_PASS,
         Duration::from_secs(120),
     );
@@ -427,7 +434,15 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.
     let (ok, out, err) = bob.run(
-        &["room", "join", &link, "--name", "mission"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
         ROOM_PASS,
         Duration::from_secs(120),
     );
@@ -743,7 +758,15 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
     let (ok, out, err) = carol.run(
-        &["room", "join", &link, "--name", "mission"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
         ROOM_PASS,
         Duration::from_secs(120),
     );
@@ -1101,7 +1124,14 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
         "PRODUCT: a control socket landed in the shared temp directory itself: {in_tmp:?}"
     );
     let (ok, _, err) = p.run(
-        &["room", "create", "--name", "p-only-room"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "p-only-room",
+        ],
         ROOM_PASS,
         Duration::from_secs(120),
     );

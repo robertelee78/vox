@@ -361,7 +361,15 @@ fn every_common_failure_names_its_cause() {
     // ---- (1) join with the wrong room passphrase ----
     let (ok, said, _) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         "not the passphrase\n",
         join_quick,
     );
@@ -375,7 +383,15 @@ fn every_common_failure_names_its_cause() {
     // ---- (2) join a room already held ----
     let (ok, said, _) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         &format!("{passphrase}\n"),
         join_quick,
     );
@@ -385,7 +401,15 @@ fn every_common_failure_names_its_cause() {
     );
     let (ok, said, _) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc-again"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc-again",
+        ],
         &format!("{passphrase}\n"),
         join_quick,
     );

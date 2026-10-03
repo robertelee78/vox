@@ -183,7 +183,15 @@ fn a_join_a_member_cannot_admit_says_why() {
     let joiner = Member::new(root, "joiner");
     let _joiner_d = joiner.daemon(Some(&spec));
     let (ok, out, err) = joiner.vox(
-        &["room", "join", &link, "--name", "locked"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "locked",
+        ],
         Some(ROOM_PASS),
     );
     let said = format!("{out}{err}");

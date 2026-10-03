@@ -207,7 +207,7 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
 
     let (ok, out, err) = vox_in(
         &victim_dir,
-        &["room", "create", "--name", "team"],
+        &["room", "create", "--passphrase-file", "-", "--name", "team"],
         ROOM_PASS,
     );
     assert!(ok, "CANNOT MEASURE: room create: {out}\n{err}");
@@ -223,7 +223,15 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
     let joined = (1..=6).any(|attempt| {
         let (ok, out, err) = vox_in(
             &mallory_dir,
-            &["room", "join", &link, "--name", "team"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "team",
+            ],
             ROOM_PASS,
         );
         if !ok {

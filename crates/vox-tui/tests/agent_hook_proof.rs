@@ -148,7 +148,14 @@ impl Daemon {
         let (ok, _, err) = hook(
             &data,
             &cfg,
-            &["room", "create", "--name", "agents"],
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "agents",
+            ],
             "channel passphrase",
         );
         assert!(ok, "PRODUCT (staging): vox room create failed: {err}");

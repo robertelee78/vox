@@ -240,7 +240,11 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .map(|(name, d, _)| daemon(name, d, &spec, &pass_file))
         .collect();
 
-    let (ok, out, err) = vox_in(&host_dir, &["room", "create", "--name", "team"], ROOM_PASS);
+    let (ok, out, err) = vox_in(
+        &host_dir,
+        &["room", "create", "--passphrase-file", "-", "--name", "team"],
+        ROOM_PASS,
+    );
     assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, list, _) = vox_once(&host_dir, &args(&["room", "list"]));
     let prefix = list
@@ -255,8 +259,19 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
     let attempts = |data: &Path, who: &str| {
         (1..=6).find_map(|attempt| {
             let started = Instant::now();
-            let (ok, out, err) =
-                vox_in(data, &["room", "join", &link, "--name", "team"], ROOM_PASS);
+            let (ok, out, err) = vox_in(
+                data,
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    &link,
+                    "--name",
+                    "team",
+                ],
+                ROOM_PASS,
+            );
             if !ok {
                 eprintln!("[proof] {who}'s join attempt {attempt} refused: {out} {err}");
                 std::thread::sleep(Duration::from_secs(5));

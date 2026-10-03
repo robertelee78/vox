@@ -212,6 +212,8 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         &[
             "room".into(),
             "create".into(),
+            "--passphrase-file".into(),
+            "-".into(),
             "--name".into(),
             "mission".into(),
         ],
@@ -255,6 +257,8 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         &[
             "room".into(),
             "join".into(),
+            "--passphrase-file".into(),
+            "-".into(),
             link.clone(),
             "--name".into(),
             "mission".into(),

@@ -161,7 +161,11 @@ fn a_member_whose_connection_died_is_synced_again() {
     let mut carol = daemon("carol", &carol_dir, &spec, &idpass);
     let mut bob = daemon("bob", &bob_dir, &spec, &idpass);
 
-    let (ok, out, err) = vox_in(&carol_dir, &["room", "create", "--name", "r"], "room pass");
+    let (ok, out, err) = vox_in(
+        &carol_dir,
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
+        "room pass",
+    );
     assert!(ok, "vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&carol_dir, &args(&["room", "list"]));
     assert!(ok, "vox room list: {err}");
@@ -175,7 +179,15 @@ fn a_member_whose_connection_died_is_synced_again() {
     assert!(ok, "vox room invite: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
-        &["room", "join", link.trim(), "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "r",
+        ],
         "room pass",
     );
     assert!(ok, "bob joins: {out}{err}");
