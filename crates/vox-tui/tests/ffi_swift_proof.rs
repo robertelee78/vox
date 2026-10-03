@@ -238,7 +238,17 @@ fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
     let dseen = Arc::new(Mutex::new(Vec::new()));
     expect(&daemon_out, &dseen, "vox daemon: control socket");
 
-    d.run(&["room", "create", "--name", "calls"], "room passphrase\n");
+    d.run(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "calls",
+        ],
+        "room passphrase\n",
+    );
     let room = d
         .run(&["room", "list"], "")
         .split_whitespace()

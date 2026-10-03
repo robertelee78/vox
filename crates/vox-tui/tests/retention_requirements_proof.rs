@@ -290,7 +290,7 @@ fn fork_watch(dir: &Path, secs: u64, done: impl Fn(&[String], u64) -> bool) -> (
 fn create(creator: &Path) -> String {
     let (ok, _, err) = vox(
         creator,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room create: {err}");
@@ -307,7 +307,15 @@ fn join(creator: &Path, joiner: &Path, room: &str) {
     assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, _, err) = vox(
         joiner,
-        &["room", "join", link.trim(), "--name", "r"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "r",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join: {err}");

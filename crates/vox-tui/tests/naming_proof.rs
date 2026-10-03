@@ -208,7 +208,7 @@ impl Member {
     fn create(&self, local: &str, pass: &str) -> String {
         let (ok, out, err) = vox(
             &self.dir,
-            &["room", "create", "--name", local],
+            &["room", "create", "--passphrase-file", "-", "--name", local],
             Some(&format!("{pass}\n")),
         );
         assert!(
@@ -234,7 +234,15 @@ impl Member {
     fn join(&self, link: &str, local: &str, pass: &str) {
         let (ok, out, err) = vox(
             &self.dir,
-            &["room", "join", link, "--name", local],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link,
+                "--name",
+                local,
+            ],
             Some(&format!("{pass}\n")),
         );
         assert!(
