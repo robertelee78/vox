@@ -4,7 +4,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: implemented in part, `crates/vox-tui` on integrate/v0.3.0. The `vox` binary, its live TUI over
 the embedded node, the network verbs and install/update are built. Each requirement below is marked
-*Built* or *Planned*, or says which part is built.
+*Built* or *Planned*, or says which part is built. **Decided 2026-10-03, not built (#397, ADR-026):**
+the TUI and every verb become clients of the account's one daemon (1.2, 9.1, 9.4, 12.1, 16.4–16.6
+say how); until it is built the TUI embeds the node.
 **Date**: 2026-06-20
 **Deciders**: Robert E. Lee
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui, distribution
@@ -26,7 +28,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 1.2. A user-run headless node MUST be only a ciphertext-only sync peer of the TUI's embedded node
      (ADR-008 over ADR-011). It MUST NOT hold this user's secrets or plaintext, and the TUI MUST NOT
      remote-control it. The TUI MUST hold the secrets and decrypt locally. A remote-core thin client
-     is out of scope and needs its own ADR. *Built.*
+     is out of scope and needs its own ADR. *Built.* *Decided, not built (ADR-026 S-4):* the TUI is a
+     client of the account's daemon over its control socket, which holds the node's secrets in the
+     same OS account; a headless node elsewhere stays a ciphertext-only peer.
 1.3. The runtime MUST be multi-threaded tokio. The main task MUST own the terminal and the render
      loop, a dedicated blocking task MUST read `crossterm` events, and shutdown MUST be cooperative
      through a `CancellationToken`. Rendering MUST NOT block on the core. *Built.*
@@ -136,7 +140,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 
 9.1. The TUI MUST embed the node while running, or sync with a user-run node as a ciphertext-only
      peer (1.2). The TUI MUST NOT make either compulsory. It MUST show per-room reachability and sync
-     state. *Built.*
+     state. *Built.* *Decided, not built (ADR-026):* the TUI shows the daemon's attached nodes, live
+     through attach and detach events, and acts as the node the person picks (ADR-026
+     C-3); it MUST NOT embed a node.
 9.2. New decryptable entries MUST show in the app (unread markers on the room list, a status line).
      *Built.*
 9.3. On a desktop session the TUI MUST also raise an OS notification, and over SSH it MUST fall back to
@@ -145,7 +151,7 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 9.4. `vox daemon` MUST pass every node event through the one failure reporter the CLI uses
      (`tunnel_cli::say_if_it_explains_a_failure`), so it reports an unreachable peer, a refused
      publish or a stall as `vox node` does. *Built: the daemon reported no failures at all until
-     `f3f8a94e` fixed it.*
+     `f3f8a94e` fixed it.* Under ADR-026 the reporter runs per node in the daemon.
 
 ### 10. Tunneling
 
@@ -167,9 +173,12 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 11.2. Lock MUST zeroize the room SEKs, the in-memory identity root (generate path) and the decrypted
       view models, and MUST require the identity vault and each room's passphrase again. For a
       `gpg-agent` key, Vox MUST clear only its own derived material. *Built for the generate path.*
+      *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* 11.2–11.4 are removed: the TUI is a daemon client with no node
+      lock. A node's secrets are wiped when it detaches (ADR-026 L-3).
 11.3. The TUI MUST lock after 5 minutes idle (the default) and on `SIGHUP` or a dropped connection. The
       lock MUST be configurable, including off, with a direct warning. *The 5-minute idle lock, `:lock`
-      and `SIGHUP` are built; configuring them is planned.*
+      and `SIGHUP` are built; configuring them is planned.* *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* the idle lock, `:lock` and the
+      `SIGHUP` lock go; `SIGHUP` stops the TUI cleanly and leaves its node attached.
 11.4. The node MUST track every task it hands a signer handle to and abort them all when it locks,
       before it drops the prekey ring, so no task outlives the lock holding the identity. *Built
       (`Profile::signer_arc`).*
@@ -184,7 +193,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 12.1. Paths MUST be XDG-conformant: data under `$XDG_DATA_HOME/vox/` (macOS: `~/Library/Application
       Support/vox`), with per-identity profiles in separate directories. Precedence MUST be CLI flags,
       then environment (`VOX_PROFILE`, `VOX_DATA_DIR`, `VOX_CONFIG_DIR`), then config, then defaults.
-      *Built, except the config file (12.4).*
+      *Built, except the config file (12.4).* *Decided, not built (ADR-026 C-3, F-1):* `--profile`
+      and `VOX_PROFILE` are replaced by `--node` and `VOX_NODE`, with no alias; nodes live in
+      `<data root>/nodes/<name>/`.
 12.2. Store files MUST be mode `0600` and directories `0700`. *Built.*
 12.3. Logs and panic reports MUST NOT contain plaintext, keys, passphrases or seeds. *Built for the UI
       types.*
@@ -227,6 +238,14 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
       `VOX_IDENTITY_PASSPHRASE` (read directly, not through clap's `env`), then an unechoed prompt.
       *Built.*
 16.3. A tty-less, empty stdin MUST be refused rather than tried as an empty passphrase. *Built.*
+16.4. Every passphrase source (file, environment variable, prompt) MUST be resolved in the client;
+      the daemon MUST NOT read a passphrase from its own environment (ADR-026 C-6). *Decided, not
+      built.*
+16.5. A passphrase sent to the daemon (attach, a keyring change) MUST travel in a zeroizing buffer end to end
+      (ADR-026 C-6). *Decided, not built.*
+16.6. A client that may attach a node and finds no daemon MUST start one (ADR-026 S-2) before
+      sending its request; a one-shot verb whose node is not attached MUST refuse (ADR-026 L-2).
+      *Decided, not built.*
 
 ### 17. Install and update
 

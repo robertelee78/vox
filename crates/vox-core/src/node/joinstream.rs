@@ -120,6 +120,12 @@ pub enum JoinReject {
     /// admit the joiner (V210-128): locked or closing mid-join, its store refused the write, or a
     /// key conflict. A full room has its own frame, [`JoinFrame::Full`].
     NotAdmitted = 5,
+    /// The room has ended (V030-08): it takes nobody in. Sent before the challenge, so it says
+    /// nothing about the joiner or its passphrase.
+    RoomEnded = 6,
+    /// The member that answered has left the room (V030-08), so it answers no join for it; another
+    /// member may. Sent before the challenge.
+    ResponderLeft = 7,
 }
 
 impl JoinReject {
@@ -130,6 +136,8 @@ impl JoinReject {
             3 => Some(Self::Refused),
             4 => Some(Self::Busy),
             5 => Some(Self::NotAdmitted),
+            6 => Some(Self::RoomEnded),
+            7 => Some(Self::ResponderLeft),
             _ => None,
         }
     }
@@ -143,6 +151,8 @@ impl JoinReject {
             Self::Refused => "responder refused",
             Self::Busy => "responder refused: busy answering other joins",
             Self::NotAdmitted => "responder refused: it could not admit this identity",
+            Self::RoomEnded => "responder refused: the room has ended",
+            Self::ResponderLeft => "responder refused: it has left the room",
         }
     }
 }
@@ -394,6 +404,8 @@ fn rejected(r: JoinReject) -> Error {
     match r {
         JoinReject::Busy => Error::JoinResponderBusy,
         JoinReject::NotAdmitted => Error::JoinNotAdmitted,
+        JoinReject::RoomEnded => Error::JoinRoomEnded,
+        JoinReject::ResponderLeft => Error::JoinResponderLeft,
         r => Error::JoinRefused(r.as_str()),
     }
 }
@@ -583,6 +595,10 @@ pub async fn run_initiator(
         // A member whose every join slot was held (V210-92): not a verdict on this joiner, and
         // said as such, not as the refusal a wrong passphrase gets.
         JoinFrame::Rejected(JoinReject::Busy) => return Err(Error::JoinResponderBusy),
+        // Said before the challenge too, and true of the room or the member, not the joiner
+        // (V030-08).
+        JoinFrame::Rejected(JoinReject::RoomEnded) => return Err(Error::JoinRoomEnded),
+        JoinFrame::Rejected(JoinReject::ResponderLeft) => return Err(Error::JoinResponderLeft),
         frame => frame,
     })
     else {

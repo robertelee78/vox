@@ -42,6 +42,9 @@ pub struct ChannelSummary {
     pub open: bool,
     /// Number of accepted log entries (0 while closed).
     pub entries: u64,
+    /// Whether the room is over for this node, in plain words (V030-08): this identity left it,
+    /// or it ended. `None` while it is going on, and while it is closed.
+    pub over: Option<String>,
 }
 
 /// A rendered, render-gated message.
@@ -459,6 +462,8 @@ pub struct ChannelDetail {
     /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
     /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
     pub consented: Vec<Digest32>,
+    /// The room's admins, its creator first (V030-08): who may end it.
+    pub admins: Vec<Digest32>,
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `consented`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,
@@ -617,11 +622,35 @@ pub enum NodeCommand {
         /// The channelID.
         channel_id: Digest32,
     },
-    /// Leave an open room (V210-164): say so in the room, and once another member has it,
-    /// remove the room from this node.
-    LeaveChannel {
+    /// Leave a room (V210-164): say so in the room, and once another member has that, delete
+    /// the room from this node (the decider, 2026-10-03: "leave deletes it"). Answered then, or
+    /// with [`Fault::LeaveNotHeard`] when no member took it within 30 s; the room goes once one
+    /// does.
+    LeaveRoom {
         /// The channelID.
         channel_id: Digest32,
+    },
+    /// Make a member an admin of a room, or take it back (V030-08). Only its creator may.
+    SetAdmin {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The member.
+        member: Digest32,
+        /// `true` to add, `false` to remove.
+        admin: bool,
+    },
+    /// End a room for everyone (V030-08). Only its creator may.
+    EndRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Choose a room's idle end (V030-08): it ends after `idle_secs` with nothing said in it.
+    /// Only its creator may; `vox room create --idle-end` is where it does.
+    ChooseIdleEnd {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The idle end, in seconds (more than 0).
+        idle_secs: u64,
     },
     /// Author a text message in an open channel.
     SendText {
@@ -940,8 +969,8 @@ pub enum Fault {
     /// A leave was written, but no other member of the room took it within the wait: the room
     /// is held until one does (V210-164).
     LeaveNotHeard,
-    /// A leave was overtaken: this node wrote in the room after it, so it is in the room again
-    /// (V210-164).
+    /// A leave was overtaken: this node wrote in the room after it, or joined it again, so it is
+    /// in the room again (V210-164).
     LeaveUndone,
     /// `vox up` was asked for a room that offers no service by name: its host is not fixed by
     /// the room's genesis, so there is no `.vox` name to resolve (ADR-017 decision 4).
@@ -949,6 +978,25 @@ pub enum Fault {
     /// The change is the room admin's to make — a holder of the `policy` capability — and
     /// this identity is not one (PRD-001 R7: setting a room's retention).
     NotAdmin,
+    /// A member who is not the room's creator or an admin asked to keep the room's messages
+    /// **longer** than the room does (V030-32). A member may set a shorter retention, which
+    /// governs only their own node; never a longer one.
+    AboveRoomRetention,
+    /// The room is over: its creator ended it, or its idle end ran out (V030-08). It takes no
+    /// new message.
+    RoomEnded,
+    /// Only the room's creator may do that — end the room (or an admin it delegated), or choose
+    /// its idle end (V030-08).
+    NotCreator,
+    /// Only the room's creator adds or removes an admin (#319); an admin may not.
+    NotRoomCreator,
+    /// The member named is not an admin of the room, so there is no admin to take back (V030-08).
+    NotAnAdmin,
+    /// A join reached a room that has ended (V030-08): a member said so before checking anything,
+    /// or a board that took the room off at its end did (V030-14).
+    JoinedRoomEnded,
+    /// The member a join reached has left the room (V030-08), so it answers no join for it.
+    ResponderLeft,
     /// The room's stored log was written by vox before v0.3.0, whose message format changed;
     /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
     RoomFromBeforeV030,
@@ -1091,8 +1139,29 @@ impl Fault {
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service by its address, `vox forward <service>.<node>.<room>.vox`"
             }
+            Fault::AboveRoomRetention => {
+                "a member may keep this room's messages for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"
+            }
             Fault::NotAdmin => {
-                "only the room's admin may change that, and this identity is not its admin\n       the admin is whoever created the room; ask them"
+                "only the room's admin may change that, and this identity is not its admin\n       the room's creator and the admins it named are; `vox room admin list` shows who"
+            }
+            Fault::RoomEnded => {
+                "this room has ended — its creator or an admin ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       this node deletes it once it has passed the end on"
+            }
+            Fault::NotCreator => {
+                "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
+            }
+            Fault::JoinedRoomEnded => {
+                "that room has ended — a member or its board said so — so it takes nobody in\n       your passphrase was never checked; the room is over, not your access to it"
+            }
+            Fault::ResponderLeft => {
+                "the member that answered has left that room, so it lets nobody in\n       your passphrase was never checked; ask a member still in the room for an address"
+            }
+            Fault::NotRoomCreator => {
+                "only the room's creator adds or removes an admin, and this identity did not create the room"
+            }
+            Fault::NotAnAdmin => {
+                "that member is not an admin of the room\n       `vox room admin list` shows who is"
             }
             Fault::RoomFromBeforeV030 => {
                 "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
@@ -1192,7 +1261,14 @@ fault_names!(
     NameTaken,
     NoSuchForward,
     NotAdmin,
+    AboveRoomRetention,
     RoomFromBeforeV030,
+    RoomEnded,
+    NotCreator,
+    NotAnAdmin,
+    NotRoomCreator,
+    JoinedRoomEnded,
+    ResponderLeft,
     TunnelLimit,
     Internal,
 );
@@ -1209,6 +1285,16 @@ pub enum Outcome {
     /// refused (`connecting to the forward: Connection refused`), while the other forward was
     /// never stopped at all.
     Bound(std::net::SocketAddr),
+    /// A member who is not the room's creator or an admin set their **own** node's retention
+    /// for a room, at or below the room's (V030-32): `own` seconds here, while the room keeps
+    /// `room` (`0` = forever). It changes nothing on any other node. `own == room` means the
+    /// member's own line was cleared: their node follows the room's retention again.
+    OwnRetention {
+        /// This node's retention for the room now, seconds.
+        own: u64,
+        /// The room's retention, seconds (`0` = forever).
+        room: u64,
+    },
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -1238,7 +1324,10 @@ impl Outcome {
     /// Whether the command succeeded.
     #[must_use]
     pub fn is_done(self) -> bool {
-        matches!(self, Outcome::Done | Outcome::Bound(_))
+        matches!(
+            self,
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. }
+        )
     }
 }
 
@@ -1247,6 +1336,10 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Done => f.write_str("done"),
             Outcome::Bound(local) => write!(f, "bound at {local}"),
+            Outcome::OwnRetention { own, room } => write!(
+                f,
+                "this node keeps the room's messages for {own} s; the room keeps them for {room} s"
+            ),
             Outcome::Failed(fault) => f.write_str(fault.explain()),
         }
     }
@@ -1282,6 +1375,23 @@ pub enum NodeEvent {
     /// A channel was closed.
     ChannelClosed {
         /// The channel.
+        channel_id: Digest32,
+    },
+    /// A room this node holds ended, and the end has been passed on (V030-08): `handed` of
+    /// `members` members were synced with after it; the rest learn it from them, or from an
+    /// anchor. The room is deleted from this node next ([`NodeEvent::RoomRemoved`]).
+    RoomEnded {
+        /// The room.
+        channel_id: Digest32,
+        /// Members synced with after the end.
+        handed: usize,
+        /// Members it had to pass it to.
+        members: usize,
+    },
+    /// Everything this node held of a room was deleted: it left the room (V210-164), or the
+    /// room ended (the decider, 2026-10-03).
+    RoomRemoved {
+        /// The room.
         channel_id: Digest32,
     },
     /// A peer completed an ADR-005 join against this node, which verified its
@@ -1390,6 +1500,17 @@ pub enum NodeEvent {
         channel_id: Digest32,
         /// Which record it was, and which board (`our address (board …)`).
         what: String,
+    },
+    /// This node's own `retention` file asks to keep a room's messages for longer than the room
+    /// does (V030-32). A node may keep less than its room, never more, so the room's value is the
+    /// one in force: said once, so its operator knows the file line has no effect.
+    RetentionAboveRoom {
+        /// The room.
+        channel_id: Digest32,
+        /// What the node's file asks for, seconds.
+        node: u64,
+        /// What the room keeps, seconds.
+        room: u64,
     },
     /// What happened to a connection to `peer`, said so a failure that recurs names itself (#229,
     /// after #232's CI reds): a newcomer that lost the one-connection-per-peer tie-break, a

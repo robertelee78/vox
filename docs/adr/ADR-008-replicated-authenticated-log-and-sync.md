@@ -150,11 +150,15 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   | `0x0015` | presence | `vox/presence/v1` | V210-164 (`governance/presence.rs`) |
   | `0x0016` | checkpoint | `vox/checkpoint/v1` | ADR-023 decision 3 (`log/checkpoint.rs`) |
   | `0x0017` | key-package | `vox/key-package/v1` | ADR-023 decision 4 (`node/keypackage.rs`) |
+  | `0x0018` | service-share | `vox/service-share/v1` | ADR-017 decision 12 (`governance/share.rs`) |
+  | `0x0019` | room-lifecycle | `vox/room-lifecycle/v1` | ADR-023 RL-8 (`governance/lifecycle.rs`) |
+  | `0x001A` | board-withdraw | `vox/board-withdraw/v1` | ADR-023 RL-8 (`nat/withdraw.rs`) |
+  | `0x001B` | admin-roster | `vox/admin-roster/v1` | ADR-023 RL-8 (`nat/withdraw.rs`) |
 
 - **LS-22.** New struct types MUST be appended, versioned, and a tag MUST NOT be reused. `0x000B`
   and `0x0010` belong to removed deniable mode: they stay registered and MUST NOT be produced.
   `0x0006` carries only a room's retention; policy updates beyond retention and passphrase rotation
-  are removed (V030-32, #380; the code's removal is pending under that item).
+  are removed (V030-32, #380).
 - **LS-23.** This tag space is disjoint from the ADR-003 ciphersuite-ID space. The two never
   co-occur on the wire, so a numeric overlap (`0x0001` here and there) is not a collision.
 

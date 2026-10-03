@@ -56,7 +56,7 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
 ### App-lock and memory hygiene
 
-- **AR-15.** A SEK MUST be held only in memory, and only while the identity is unlocked. A lock (manual, idle timeout, or on sleep; ADR-015 maps sleep to its triggers) MUST zeroize every SEK and the derived material.
+- **AR-15.** A SEK MUST be held only in memory, and only while the identity is unlocked. A lock (manual, idle timeout, or on sleep; ADR-015 maps sleep to its triggers) MUST zeroize every SEK and the derived material. *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* there is no node lock; a node's SEKs and derived material are zeroized when it detaches, which is the only way it stops.
 - **AR-16.** Secret memory MUST be zeroized when it is freed. The SEK MUST be `mlock`ed where the platform allows (best effort). **Not built:** derived factors, the KEK, the vault key and opened plaintext are zeroizing but not `mlock`ed.
 - **AR-17.** An opened segment's plaintext MUST be returned zeroizing (`store::open_segment` returns `Zeroizing<Vec<u8>>`). `Sek` MUST NOT implement `Clone`.
 - **AR-18.** Plaintext caches MUST live inside the SEK-sealed store and MUST NOT be written unencrypted.
@@ -77,11 +77,11 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
   These blobs MUST NOT be sealed under the Ed25519 `id_proof`, which a quantum adversary with the public key could compute.
 - **AR-23.** A version-1 vault's blobs, sealed under the identity factor (`vox/prekey-ring-sek/v1`, `vox/trust-keyring-sek/v1`), MAY be read only by the one-time migration (`node::seal_migration`).
-- **AR-24.** The prekey ring MUST be held only while the identity is unlocked and dropped on lock. A ring sealed to another identity, or tampered with, MUST fail as `AtRestUnlockFailed` and MUST NOT be silently regenerated.
+- **AR-24.** The prekey ring MUST be held only while the identity is unlocked and dropped on lock (under ADR-026, while the node is attached, and dropped on detach). A ring sealed to another identity, or tampered with, MUST fail as `AtRestUnlockFailed` and MUST NOT be silently regenerated.
 
 ### Remembered open rooms
 
-- **AR-25.** A `vox daemon` MUST reopen every room it held open (#208, V210-35). Each such room's SEK and passphrase MUST be kept in store meta under `open-rooms`, sealed with AES-256-GCM under `HKDF-SHA-256(self_seed, info = "vox/open-rooms-sek/v1")`. A room enters the set when it is created, joined or opened. It MUST leave the set only when it is closed on purpose; a stop, crash or reboot keeps it.
+- **AR-25.** A `vox daemon` MUST reopen every room it held open (#208, V210-35). *Decided, not built (ADR-026 L-2):* a node reopens its own set when it attaches, whether by hand, implicitly or from the daemon's `--keep` list. Each such room's SEK and passphrase MUST be kept in store meta under `open-rooms`, sealed with AES-256-GCM under `HKDF-SHA-256(self_seed, info = "vox/open-rooms-sek/v1")`. A room enters the set when it is created, joined or opened. It MUST leave the set only when it is closed on purpose; a stop, crash or reboot keeps it.
 - **AR-26.** This deliberately weakens the double-lock for rooms in the set: the disk plus the identity passphrase opens them. A room closed on purpose MUST keep the full double-lock.
 
 ### Retention / TTL
@@ -92,7 +92,7 @@ R-numbers are PRD-001's.
 - **AR-28 (R7).** A room's retention MUST be its ADR-007 policy-update `ttl`, set with `vox room retention <room> 1h|1w|1m|<secs>|forever`.
   - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). **Planned:** `vox room admin` is V030-13 (#319); on this tree the check is the `policy` capability, which V030-32 (#380) keeps only as far as admin and retention need.
   - A member MAY set a lower retention for its own node only (AR-29); it MUST NOT raise a room's retention for its node.
-  - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history.
+  - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history. Under ADR-026 that is the passphrase of the node the request resolves to.
   - **Planned:** a genesis carries `ttl` 0 (forever) at creation; a room's retention is set only after it is created.
 - **AR-29 (R8).** A node MUST also honour its own retention: the `retention` file in its config directory, with `default <dur>` and `<room-prefix> <dur>` lines. It MUST re-read the file every `RETENTION_REREAD_SECS`. If the file is unreadable, it MUST keep the last policy it read.
 - **AR-30 (R9).** The effective retention of a room on a node MUST be the shorter of the room's and the node's, where `0` means forever.

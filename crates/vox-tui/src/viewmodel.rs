@@ -239,6 +239,17 @@ pub enum UiError {
     BindFailed,
     /// A join named a room this profile already holds.
     AlreadyMember,
+    /// The room has ended: it takes no new message (V030-08).
+    RoomEnded,
+    /// No other member could be told of the leave within 30 s; the node leaves once one can
+    /// (V210-164).
+    LeaveNotHeard,
+    /// Something was written in the room after the leave, so this node is in it again (V210-164).
+    LeaveUndone,
+    /// Only the room's creator, or an admin it delegated, may do that (V030-08).
+    NotCreator,
+    /// The room was joined a moment ago and is still being read (V030-08).
+    StillJoining,
     /// An unexpected internal error (never carries detail).
     Internal,
 }
@@ -317,6 +328,15 @@ impl UiError {
             }
             UiError::BindFailed => "the --listen address could not be listened on",
             UiError::AlreadyMember => "you already hold that room — it is in your list",
+            UiError::RoomEnded => {
+                "this room has ended — it takes no new message, and this node deletes it soon"
+            }
+            UiError::LeaveNotHeard => {
+                "no other member could be told within 30s — the room goes once one can be"
+            }
+            UiError::LeaveUndone => "something was written here after :leave — you are in the room again",
+            UiError::NotCreator => "only the room's creator, or an admin it delegated, may end it",
+            UiError::StillJoining => "joined a moment ago and still reading the room — try again",
             UiError::Internal => "internal error",
         }
     }
@@ -387,6 +407,16 @@ pub enum Command {
     },
     /// Close an open channel (wipes its SEK from memory).
     CloseChannel {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// Leave a room (V210-164): the other members are told, then the room is deleted here.
+    LeaveRoom {
+        /// The channelID.
+        channel_id: Digest32,
+    },
+    /// End a room for everyone (V030-08); its creator only.
+    EndRoom {
         /// The channelID.
         channel_id: Digest32,
     },

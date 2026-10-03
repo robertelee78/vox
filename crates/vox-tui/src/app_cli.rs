@@ -43,7 +43,7 @@ async fn client(paths: &Paths) -> Result<IpcClient, AppError> {
 async fn room(c: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
     match c.rooms().await {
         Ok(Frame::Rooms { rooms }) => {
-            let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
             resolve_prefix(prefix, &ids)
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),

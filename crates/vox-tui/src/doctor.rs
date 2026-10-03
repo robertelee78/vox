@@ -211,7 +211,7 @@ async fn room_or_only(client: &mut IpcClient, room: Option<&str>) -> Result<Dige
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     match rooms.as_slice() {
-        [(id, _, _)] => Ok(*id),
+        [(id, _, _, _)] => Ok(*id),
         [] => Err(AppError::Usage(
             "this node holds no rooms yet: join or create one first".into(),
         )),

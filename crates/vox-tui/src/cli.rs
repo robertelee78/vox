@@ -809,17 +809,28 @@ enum RoomCmd {
     /// (the `retention` file in its config directory); the shorter wins. This is look and
     /// feel, not a security property: a modified node can keep everything.
     Retention(RetentionArgs),
-    /// Leave a room: the other members are told, then the room is removed from this node.
-    ///
-    /// Waits up to 30 s for another member to take the news. If none can be told by then, it
-    /// says so, and the node leaves as soon as one can. Joining again later works.
-    Leave(RoomRefArgs),
     /// Print a room's address, for someone else to `vox room join` with.
     ///
     /// The address is rendezvous information, not a credential — no passphrase,
     /// and joining with it grants nothing. Goes to stdout so it pipes; the
     /// warnings go to stderr so they do not.
     Invite(RoomRefArgs),
+    /// Leave a room: the other members are told, then the room is deleted from this node.
+    ///
+    /// Waits up to 30 s for another member to take the news. If none can be told by then, it
+    /// says so, and the node leaves as soon as one can. Joining again later works.
+    Leave(RoomRefArgs),
+    /// End a room for everyone. Only the room's creator, or an admin it named, may.
+    ///
+    /// Every member's node takes no new message in it from then on, passes the end on, and
+    /// deletes the room.
+    End(RoomRefArgs),
+    /// Make a member an admin of a room, take it back, or list the admins:
+    /// `vox room admin add|remove <room> <member>`, `vox room admin list <room>`.
+    ///
+    /// Only the room's creator may add or remove an admin. An admin may end the room for
+    /// everyone (`vox room end`).
+    Admin(AdminArgs),
     /// Collect a file offered in this room, verifying it against the announced
     /// SHA-256 before it is usable.
     ///
@@ -856,6 +867,23 @@ pub struct CreateRoomArgs {
     /// is asked for twice at the terminal, and with no terminal the command fails at once.
     #[arg(long)]
     pub passphrase_file: Option<PathBuf>,
+    /// End the room by itself after this long with nothing said in it: `1h`, `1w`, `1m`
+    /// (a month), or a number of seconds. Off unless given.
+    #[arg(long)]
+    pub idle_end: Option<String>,
+}
+
+/// `vox room admin`
+#[derive(Args, Debug, Clone)]
+pub struct AdminArgs {
+    #[command(flatten)]
+    pub profile: ProfileArgs,
+    /// `add`, `remove` or `list`.
+    pub action: String,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The member, by fingerprint or a unique prefix of it (for `add` and `remove`).
+    pub member: Option<String>,
 }
 
 /// `vox room retention`
@@ -2139,7 +2167,8 @@ pub fn run() -> ExitCode {
                 RoomCmd::Create(a) => &a.profile,
                 RoomCmd::Invite(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
-                RoomCmd::Leave(a) => &a.profile,
+                RoomCmd::Leave(a) | RoomCmd::End(a) => &a.profile,
+                RoomCmd::Admin(a) => &a.profile,
             };
             let paths = match profile.paths() {
                 Ok(p) => p,
@@ -2276,10 +2305,21 @@ pub fn run() -> ExitCode {
                             .await
                         }
                         RoomCmd::Create(a) => {
-                            crate::room_cli::create(&paths, &a.name, a.passphrase_file.as_deref())
-                                .await
+                            crate::room_cli::create(
+                                &paths,
+                                &a.name,
+                                a.passphrase_file.as_deref(),
+                                a.idle_end.as_deref(),
+                            )
+                            .await
                         }
                         RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                        RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
+                        RoomCmd::End(a) => crate::room_cli::end(&paths, &a.room).await,
+                        RoomCmd::Admin(a) => {
+                            crate::room_cli::admin(&paths, &a.action, &a.room, a.member.as_deref())
+                                .await
+                        }
                         RoomCmd::Retention(a) => {
                             let identity = crate::tunnel_cli::identity_passphrase_for(
                                 &paths,
@@ -2289,7 +2329,6 @@ pub fn run() -> ExitCode {
                             crate::room_cli::retention(&paths, &a.room, &a.duration, &identity)
                                 .await
                         }
-                        RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(
                                 &paths,

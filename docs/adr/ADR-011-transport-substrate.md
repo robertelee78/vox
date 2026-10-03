@@ -3,9 +3,12 @@
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
 **Status**: built (M9, `crates/vox-core/src/transport/`), except where a requirement says
-otherwise: the Vox IANA Private Enterprise Number (requirement 6), the session record's observed
-group (requirement 12) and the interop matrix (requirement 14) are not built. A TCP fallback
+otherwise: the interop matrix (requirement 14) is not built. The OID's UUID arc (requirement 6)
+and the observed group (requirement 12) are built (V030-33, #382). A TCP fallback
 (requirement 2) does not exist.
+**Decided 2026-10-03, not built (#397, ADR-026):** the identity exchange (requirements 27–40)
+replaces identity in the TLS handshake (requirements 5–8) and ALPN `vox/1`. Until it is built, the
+code does what requirements 5–8 say, and requirements 27–40 are planned.
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
@@ -34,6 +37,9 @@ design, grounded in the libp2p TLS specification, IETF `draft-ietf-tls-ecdhe-mlk
 
 ### Transport security (concrete)
 
+Requirements 5–8 describe the built identity-in-the-handshake design. They are **superseded** by
+requirements 27–40 and MUST be removed from the code when those are built.
+
 4. **PQ-hybrid key exchange.** The QUIC TLS 1.3 handshake MUST use the hybrid group X25519MLKEM768
    (code point `0x11EC`), whose key-schedule secret is `concat(ML-KEM-768 secret, X25519 secret)`.
    Only hybrid PQ groups MUST be offered or accepted; no classical-only group. The provider's
@@ -58,7 +64,8 @@ design, grounded in the libp2p TLS specification, IETF `draft-ietf-tls-ecdhe-mlk
    in the extension; the certificate's own self-signature MAY be classical.
 9. **Layering.** The transport (this ADR) and messaging (ADR-004: PQXDH + Double Ratchet, run over
    the authenticated transport) MUST stay separately keyed. Vox MUST NOT run PQXDH as the transport
-   handshake, and application or message keys MUST NOT be derived from the TLS exporter. Tunnel
+   handshake, and application or message keys MUST NOT be derived from the TLS exporter. Binding a
+   signature to the connection with the exporter (requirement 30) is not deriving a key. Tunnel
    streams (ADR-013), which are not ratcheted messages, use the transport's AEAD directly.
 
 ### Replay, 0-RTT, downgrade
@@ -75,6 +82,8 @@ design, grounded in the libp2p TLS specification, IETF `draft-ietf-tls-ecdhe-mlk
     `__rustls-post-quantum-test` feature, which only adds that field), never a constant;
     `SessionEstablishment::observed` MUST refuse a session under any group but X25519MLKEM768.
     `vox status --json` names each peer's group (`tls_group`).
+    *Decided, not built (#397):* the ALPN becomes `vox/2` (requirement 27), and the record is
+    written only after the identity exchange completes (requirement 33).
 13. **Hard failure.** A peer or library that cannot negotiate the required hybrid group MUST fail to
     connect with a clear, surfaced error and MUST NOT silently downgrade. A failure of
     authentication is reported as `SignatureInvalid`; any other handshake failure (refused, timed
@@ -82,7 +91,8 @@ design, grounded in the libp2p TLS specification, IETF `draft-ietf-tls-ecdhe-mlk
 14. **Interop is a release gate.** The supported provider set (quinn + rustls with the
     X25519MLKEM768 provider, version-pinned) and a cross-version interop matrix (each supported
     client and library pair completes the handshake and identity proof of possession, with the OID
-    and the raw-key binding pinned) MUST be release gates. The required-suite floor is versioned
+    and the raw-key binding pinned) MUST be release gates. Once requirements 27–40 are built, the
+    matrix pins the exchange's flights, signature labels and exporter label instead of the OID. The required-suite floor is versioned
     (ADR-003). *Not built:* there is no second implementation, matrix or CI job.
 
 ### Datagram flows (ADR-022 M22.1)
@@ -147,6 +157,115 @@ pair streams themselves.
 26. R41 MUST be measured against an emulated link, not against loopback (decider, PRD-001 R41 as
     clarified 2026-09-25), by `perf_r41_tunnel_throughput_proof`.
 
+### Identity exchange on a shared endpoint (ADR-026)
+
+One daemon's endpoint serves every node it hosts (ADR-026), so the TLS handshake cannot say which
+node a dialler wants without showing it on the path: a fingerprint in SNI or ALPN is readable by any
+observer (RFC 9001 §5.2; rustls has no server ECH), a QUIC connection id is the client's random
+choice, and room-keyed tags give no secret to trust-only dials, anchors or circuits. QUIC forbids TLS
+post-handshake client authentication (RFC 9001 §4.4). The identity is therefore proved inside the
+connection, bound to the TLS session by its exporter.
+
+27. **Neutral leaf.** The TLS 1.3 handshake MUST authenticate only the daemon: a self-signed leaf with
+    no identity extension, generated once per daemon run and used for every connection of that run.
+    The handshake MUST keep requirements 4, 10 and 13. The ALPN MUST be `vox/2`.
+28. **One exchange per connection,** on the first client-opened bidirectional stream, typed by its
+    first frame as the `identity` stream kind (requirement 19; its number assigned at build time),
+    immediately after the handshake, in three flights:
+    1. dialler → `ASK { target_fp }`;
+    2. listener → `PROVE { target_pubkey, instance_t, sig_target("vox-id/v2/resp" ‖ E ‖ target_fp ‖
+       instance_t) }`, or the generic refusal (requirement 32);
+    3. dialler, only after checking flight 2 against the pinned expected peer →
+       `CLAIM { dialler_pubkey, instance_d, sig_dialler("vox-id/v2/init" ‖ E ‖ target_fp ‖ dialler_fp ‖
+       instance_d) }`.
+
+    `instance_t` and `instance_d` MUST each be the signing node's 16-byte random value, drawn anew each
+    time that node attaches (ADR-026 I-3). Signatures are composite Ed25519+ML-DSA (ADR-002), so
+    authentication stays post-quantum. Flight 3 MAY carry the dialler's first application bytes.
+
+    **Encoding.** Each flight MUST be one canonical CBOR array (ADR-008) in one length-prefixed frame
+    (requirement 18), led by a struct tag from `wire.rs`'s registry:
+    - `ASK = [tag_ask, version, target_fp]`;
+    - `PROVE = [tag_prove, version, target_composite_pubkey, instance, sig]`;
+    - `CLAIM = [tag_claim, version, dialler_composite_pubkey, instance, sig]`.
+
+    The three tags MUST be the next free tags in `wire.rs` when this is built. The highest on the
+    land tree is `0x0018`, and the governance work (V030-32) is adding `0x0019` onward, so the
+    numbers are assigned at build time against `wire.rs`, not here. `version` is 2. A frame longer
+    than 16 KiB MUST NOT be read past the cap, and MUST be refused as a malformed flight
+    (requirement 32).
+29. **The responder proves first.** The dialler MUST NOT send `CLAIM` until `PROVE` has verified
+    against the identity it pinned. A dialler therefore reveals its identity only to a party that has
+    just proven the pinned identity on this TLS session, as the handshake did before.
+30. **Exporter binding.** `E` MUST be the TLS exporter output with label `vox/identity/v2`, 64 bytes.
+    The exporter is mandatory: if it cannot be read, the connection MUST be refused. (The
+    connection tie-break's fallback when the exporter is missing does not apply here.)
+31. **Direction labels.** The listener signs `vox-id/v2/resp` and the dialler `vox-id/v2/init`, so a
+    flight MUST NOT verify in the other role, including between two nodes of one daemon.
+32. **Generic refusal.** One refusal, byte-identical on the wire, MUST answer: an unknown target, a
+    detached target, a malformed or oversize flight, and a rate-limited source. (There is no locked
+    node, ADR-026 N-2.) The refusal MUST be the connection closed with one application close code,
+    a single new `WireError` code meaning "not available" (its number assigned at build time against
+    `wire.rs`, after `Superseded` `0x0E`), with no reason text and no flight.
+    **Timing.** The listener MUST send every outcome of an `ASK`, a `PROVE` or a refusal, no earlier
+    than 50 ms after the `ASK` arrived plus a uniformly random 0–50 ms, so a refusal and a `PROVE` are
+    not told apart by timing at the scale an ML-DSA signature takes.
+33. **Nothing before the exchange.** QUIC's own limits MUST hold a connection to the exchange until
+    flight 3 verifies: at most 2 client-opened bidirectional streams, 0 unidirectional streams and a
+    64 KiB connection window. The listener MUST raise them to the normal values (requirement 24) only
+    after `CLAIM` verifies. Until then:
+    - a datagram received before the listener has sent `PROVE` MUST close the connection;
+    - a second `ASK` or `CLAIM`, a malformed flight, or an exchange not finished within 5 s MUST close
+      it;
+    - nothing above the transport sees the connection, and no session-establishment record
+      (requirement 12) is written.
+
+    After the exchange, a stream that opens with the `identity` kind MUST close the connection.
+34. **Cost discipline.** The listener MUST apply the per-source rate limit before it looks the target
+    up, and MUST sign only after the rate limit and the pre-identity connection cap admit the `ASK`.
+    - The rate limit MUST be 8 `ASK`s per second per source IP address, with a burst of 16. An `ASK`
+      over the limit MUST get the refusal (requirement 32).
+    - Pre-identity connections MUST share the accept gate's cap of 64 handshakes in flight
+      (`HANDSHAKES_IN_FLIGHT`, requirement 20) and MUST time out after 5 s.
+    - A node's long-term key signs once per accepted connection. A detaching node's signer MUST be
+      unregistered from the exchange before its keys are wiped (ADR-026 L-3).
+35. **After the exchange.** The listener MUST apply admission (trust, join gate; ADR-016) as the
+    target node. The result MUST fill the verified-peer slot the handshake verifier fills today, so a
+    connection means (local node, remote node, remote process) to everything above the transport,
+    where the remote process is `sha256(remote daemon leaf ‖ instance)`: a node that re-attaches is a
+    new process (ADR-026 I-3).
+36. **Everywhere.** The exchange MUST run on every Vox connection: direct dials, hole-punched
+    connections, the inner connection of a relay circuit (ADR-012), and between two nodes of one
+    daemon over its own address.
+37. **Where the identity is carried.** After this change no certificate carries a Vox identity: the
+    composite public key travels only in `PROVE` and `CLAIM`. Requirement 6's OID and the identity
+    extension (tag `0x0009`) then apply to nothing; of #382's work (V030-33), only the session
+    record's observed group (requirement 12) stays in force.
+38. **Latency.** The exchange adds one round trip before the dialler may send and about 1.5 round
+    trips to the listener's admission. R40 (under 1 s) and R42 (under 2 s), and the hole punch's
+    attempt timeout (ADR-012 `PUNCH_ATTEMPT_TIMEOUT`), MUST be re-measured with it.
+38a. **Diagnostics.** A dialler whose expected node does not answer MUST say "nothing at `<address>`
+    answers as `<expected node>`", and MUST NOT name anyone else (ADR-026 G-1).
+39. **Accepted cost (ADR-026).** A party that knows a node's fingerprint can test, by naming it,
+    whether that node is attached at an address. The generic refusal (requirement 32)
+    keeps it from learning anything more.
+40. **Proofs**, by real use of the shipped binary (ADR-018), each with its mutant:
+    - path privacy: a UDP proxy records every datagram of setup and no fingerprint appears (mutant:
+      SNI = fingerprint);
+    - exporter binding: a `CLAIM` replayed onto another connection is refused, and a second `ASK` on
+      one connection closes it (mutants: no exporter in the signature; no one-exchange rule);
+    - reflection: a `PROVE` fed back as a `CLAIM` is refused (mutant: one shared label);
+    - responder first: a fake listener at a node's address, without its key, never receives the
+      dialler's `CLAIM` (mutant: `CLAIM` sent before `PROVE` is checked);
+    - no further oracle: unknown and detached targets and a rate-limited source get byte-identical
+      refusals in the same timing window (mutant: a distinct refusal for detached);
+    - pre-identity gating: a datagram before `PROVE` closes the connection, a third bidirectional or
+      any unidirectional stream is refused by QUIC's limits, and a flood of pre-identity connections
+      is capped and times out (mutants: the datagram router started before the exchange; the limits
+      raised before `CLAIM` verifies);
+    - re-attach: a node that detaches and re-attaches is seen by its peers as a new process (mutant:
+      the instance left out of the process identity).
+
 ## Known limits
 
 - **The interop matrix** (requirement 14) is an open release gate, awaiting the decider (V030-29
@@ -163,13 +282,15 @@ it; re-measured through `vox forward`, 0 of 10 runs black-holed (#381, V210-158,
   (owned by ADR-004); one encrypted connection carries tunnels and sync without cross-stream
   head-of-line blocking. QUIC is also the substrate for ADR-012's UDP NAT traversal.
 - **Negative.** Disabling 0-RTT costs a round trip on every reconnection. Per-connection congestion
-  control means true QoS separation needs more connections. The custom extension and composite
-  signature path is security-critical: a wrong binding breaks peer authentication. The 8192-byte
+  control means true QoS separation needs more connections. The composite signature path is
+  security-critical: a wrong binding breaks peer authentication. The identity exchange (requirements
+  27–40) adds a round trip before a dialler may send, and lets a party that knows a fingerprint probe
+  whether that node is hosted at an address. The 8192-byte
   ceiling helps only loopback and jumbo-frame links; a 1500-byte link keeps 1452.
 
 ## Related ADRs
 
-- **Depends on:** ADR-002, ADR-004, ADR-008.
+- **Depends on:** ADR-002, ADR-004, ADR-008, ADR-026 (the shared endpoint).
 - **Depended on by:** ADR-012, ADR-013, ADR-022 (datagram flows), ADR-024 (tapered congestion
   control).
 - **ADR-019** proposes removing the AWS-LC provider this ADR uses.

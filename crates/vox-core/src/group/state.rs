@@ -270,8 +270,16 @@ impl SenderChain {
     /// with `chain_id` incremented. Supersedes this generation for new messages
     /// (existing recipients keep reading the old generation's retained history).
     pub fn rotated(&self, now: u64) -> Result<Self> {
+        self.rotated_past(self.chain_id, now)
+    }
+
+    /// [`Self::rotated`], to a generation past `floor` too: a member that left and joined again
+    /// starts its sender key over, and must not reuse a generation id its earlier membership
+    /// released, which the others still hold (V030-08).
+    pub fn rotated_past(&self, floor: u64, now: u64) -> Result<Self> {
         let next_chain_id = self
             .chain_id
+            .max(floor)
             .checked_add(1)
             .ok_or(Error::MalformedBundle("chain_id overflow"))?;
         Self::new(

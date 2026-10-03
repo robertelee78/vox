@@ -80,13 +80,11 @@
 //!   (ADR-007), Vox's headline differentiator. The self-certifying genesis record
 //!   (tag `0x000D`, `channelID = SHA-256(canonical genesis)`, consistent with M3's
 //!   derivation); the closed capability vocabulary + SPKI/SDSI/UCAN attenuation
-//!   lattice (`admin` ⊇ `delegate`/`invite`/`policy`/`passphrase-rotate` + the
-//!   `#role`; the ADR-013 tunnel tokens `bind:`/`dial:` parse but confer nothing,
-//!   PRD-001 R44); the composite-signed,
-//!   `(channelID, epoch)`-bound governance entry bodies that ride the M5 log
-//!   (admin-delegation cert `0x0003` and revocation `0x000E`, consent grant
-//!   `0x0004` and revocation `0x0005`, policy-update + passphrase-rotation
-//!   `0x0006`); the
+//!   lattice (`admin` ⊇ `policy`; governance is only "the creator or an admin sets the room's
+//!   retention", V030-32; the tunnel tokens `bind:`/`dial:` are gone too, PRD-001 R44); the
+//!   composite-signed, `(channelID, epoch)`-bound governance entry bodies that ride the M5
+//!   log (admin-delegation cert `0x0003` and revocation `0x000E`, consent grant `0x0004`
+//!   and revocation `0x0005`, policy-update `0x0006`, retention only); the
 //!   **deterministic evaluator** — a total function of log state with
 //!   chain-to-genesis, monotonic attenuation, expiry, revocation-wins, and the
 //!   ascending-entry-hash tie-break — gated by a mandatory golden-vector suite;

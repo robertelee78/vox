@@ -334,6 +334,10 @@ pub struct RecordSet {
     pub prejoins: Vec<PreJoinRecord>,
     /// The channel genesis, if the board holds it.
     pub genesis: Option<Genesis>,
+    /// Who ended the room, when the board took it off at a signed end instead (V030-14). The
+    /// board's word: it checked the withdraw against the room's creator or admin roster, which a
+    /// joiner does not hold.
+    pub ended_by: Option<Digest32>,
 }
 
 /// Which rooms a board keeps for a peer that brings their genesis — the rooms it will
@@ -382,6 +386,8 @@ pub struct RendezvousService {
     clock: Clock,
     /// See [`RendezvousService::on_admitted`].
     admitted: Option<AdmittedHook>,
+    /// See [`RendezvousService::on_withdrawn`].
+    withdrawn: Option<AdmittedHook>,
     /// See [`RendezvousService::serve_rooms`].
     rooms: AnchorRooms,
 }
@@ -416,6 +422,7 @@ impl RendezvousService {
             oracle,
             clock,
             admitted: None,
+            withdrawn: None,
             rooms: AnchorRooms::Held,
         }
     }
@@ -451,6 +458,14 @@ impl RendezvousService {
     /// reconcile with, for no reason a person could see.
     pub fn on_admitted(&mut self, hook: AdmittedHook) {
         self.admitted = Some(hook);
+    }
+
+    /// Be told when a signed withdraw takes records off this board (V030-14). Nothing else
+    /// happens on a node when a room ends — its members go quiet — so without this a board that
+    /// had taken the room off kept showing it, in `vox node` and `vox status`, until something
+    /// unrelated next published the node's view.
+    pub fn on_withdrawn(&mut self, hook: AdmittedHook) {
+        self.withdrawn = Some(hook);
     }
 
     /// The shared store (for the owning node's own reads and pruning).
@@ -533,6 +548,10 @@ impl RendezvousService {
                 if kinds.contains(RecordKinds::GENESIS) {
                     if let Some(g) = store.genesis(channel_id) {
                         out.push(RendezvousResponse::Record(g.to_wire()));
+                    } else if let Some(ended) = store.room_ended(channel_id) {
+                        // In the genesis's place: the room was ended, and this is the withdraw
+                        // that took it off (V030-14).
+                        out.push(RendezvousResponse::Record(ended.to_vec()));
                     }
                 }
                 drop(store);
@@ -625,6 +644,7 @@ impl RendezvousService {
         // a refresh made two members' boards wake each other about a hundred times a second, and
         // each wake cost the actor 3–40 ms that a local post then queued behind.
         let mut grew: Option<Digest32> = None;
+        let mut withdrew: Option<Digest32> = None;
         let res = match tag {
             StructTag::RendezvousRecord => {
                 let rec =
@@ -691,6 +711,63 @@ impl RendezvousService {
                 let source = source.filter(|_| wrote(publisher, &creator));
                 store.accept_genesis(genesis, local, now, source)
             }
+            // A signed withdraw (V030-14): a member's own records, or a whole room, off this
+            // board at once — and kept off.
+            StructTag::BoardWithdraw => {
+                use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
+                let w =
+                    BoardWithdraw::from_wire(record).map_err(|e| RejectReason::for_error(&e))?;
+                let mut store = lock(&self.store);
+                let key = match w.scope {
+                    WithdrawScope::Member => {
+                        self.known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
+                    }
+                    // The creator, or a member its current roster names: an admin whose admin
+                    // was taken back is refused.
+                    WithdrawScope::Room => {
+                        let creator = store
+                            .genesis(&w.channel_id)
+                            .map(|g| g.body.creator_pubkey.clone());
+                        match creator {
+                            Some(c) if c.fingerprint() == w.author_id => Some(c),
+                            Some(_) if store.is_roster_admin(&w.channel_id, &w.author_id) => {
+                                self.known_key(&store, &w.channel_id, w.epoch, &w.author_id, now)
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                let Some(key) = key else {
+                    return Err(RejectReason::NotMember);
+                };
+                w.verify(&key).map_err(|e| RejectReason::for_error(&e))?;
+                match w.scope {
+                    WithdrawScope::Member => {
+                        store.withdraw_member(&w.channel_id, &w.author_id, w.timestamp);
+                    }
+                    WithdrawScope::Room => {
+                        store.withdraw_room(&w.channel_id, Some(record.to_vec()));
+                    }
+                }
+                withdrew = Some(w.channel_id);
+                Ok(())
+            }
+            // A room's admins, from its creator (V030-14).
+            StructTag::AdminRoster => {
+                let r = crate::nat::withdraw::AdminRoster::from_wire(record)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                let mut store = lock(&self.store);
+                let Some(creator) = store
+                    .genesis(&r.channel_id)
+                    .map(|g| g.body.creator_pubkey.clone())
+                else {
+                    return Err(RejectReason::NotMember);
+                };
+                r.verify(&creator)
+                    .map_err(|e| RejectReason::for_error(&e))?;
+                store.accept_roster(&r.channel_id, r.timestamp_ms, r.admins);
+                Ok(())
+            }
             _ => return Err(RejectReason::UnknownKind),
         };
         // Fired **after** the match, so the store guard each arm took is already gone: a hook runs
@@ -700,6 +777,9 @@ impl RendezvousService {
         // declined by the ADR-012 floor says nothing.
         if res.is_ok() {
             if let (Some(hook), Some(cid)) = (self.admitted.as_ref(), grew) {
+                hook(cid);
+            }
+            if let (Some(hook), Some(cid)) = (self.withdrawn.as_ref(), withdrew) {
                 hook(cid);
             }
         }
@@ -840,6 +920,16 @@ impl RendezvousClient {
                                 ));
                             }
                             set.genesis = Some(g);
+                        }
+                        StructTag::BoardWithdraw if kinds.contains(RecordKinds::GENESIS) => {
+                            use crate::nat::withdraw::{BoardWithdraw, WithdrawScope};
+                            let w = BoardWithdraw::from_wire(&wire)?;
+                            if w.channel_id != *channel_id || w.scope != WithdrawScope::Room {
+                                return Err(Error::MalformedRendezvous(
+                                    "rendezvous get: withdraw is not this room's end",
+                                ));
+                            }
+                            set.ended_by = Some(w.author_id);
                         }
                         _ => {
                             return Err(Error::MalformedRendezvous(

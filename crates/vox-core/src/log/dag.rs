@@ -869,6 +869,13 @@ impl Dag {
         self.ordered.iter().map(|(_, h)| *h).collect()
     }
 
+    /// The newest entry's clock in the room's order, ms: when the room last saw anything said
+    /// (V030-08's idle end). `None` for an empty log.
+    #[must_use]
+    pub fn newest_clock(&self) -> Option<u64> {
+        self.ordered.last().map(|(c, _)| *c)
+    }
+
     /// [`Dag::causal_order`] with each entry's clock: `(entry_hash, clock_ms)`, first to last.
     #[must_use]
     pub fn order_keys(&self) -> Vec<(Digest32, u64)> {

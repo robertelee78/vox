@@ -288,6 +288,16 @@ pub struct RendezvousStore {
     /// the genesis from the rendezvous and accepts it only if its hash equals the
     /// channelID it joined with).
     genesis: HashMap<Digest32, Genesis>,
+    /// `(channelID, author)` → the time of the member's withdraw (V030-14): its records stamped
+    /// no later are refused, so a peer still mirroring them cannot put them back.
+    withdrawn_members: HashMap<(Digest32, Digest32), u64>,
+    /// Rooms withdrawn whole (V030-14): nothing of them is taken again. With the signed room
+    /// withdraw that took it off when the room was ended, which a joiner is shown so it can be
+    /// told the room ended rather than that nobody published it; `None` for a node's own forget.
+    withdrawn_rooms: HashMap<Digest32, Option<Vec<u8>>>,
+    /// `channelID` → its newest admin roster as the creator signed it: `(timestamp_ms, admins)`
+    /// (V030-14). Who besides the creator may take the room off this board.
+    rosters: HashMap<Digest32, (u64, BTreeSet<Digest32>)>,
     /// The channels whose genesis this node filed itself — its own rooms and the ones it
     /// anchors. Never displaced and not counted against [`MAX_GENESIS_CHANNELS`].
     pinned: HashSet<Digest32>,
@@ -301,6 +311,113 @@ pub struct RendezvousStore {
 }
 
 impl RendezvousStore {
+    /// Take `author`'s records for `channel_id` off this board, every epoch, and refuse any
+    /// stamped at or before `timestamp` from now on (V030-14). Returns how many went.
+    pub fn withdraw_member(
+        &mut self,
+        channel_id: &Digest32,
+        author: &Digest32,
+        timestamp: u64,
+    ) -> usize {
+        let mut gone = 0usize;
+        for ((cid, _), bucket) in &mut self.members {
+            if cid == channel_id && bucket.remove(author).is_some() {
+                gone += 1;
+            }
+        }
+        for ((cid, _), bucket) in &mut self.bundles {
+            if cid == channel_id && bucket.remove(author).is_some() {
+                gone += 1;
+            }
+        }
+        let at = self
+            .withdrawn_members
+            .entry((*channel_id, *author))
+            .or_insert(0);
+        *at = (*at).max(timestamp);
+        gone
+    }
+
+    /// Take a whole room off this board — its genesis and every record — and take nothing of it
+    /// again (V030-14). `ended` is the signed room withdraw when the room was ended, kept to show
+    /// a joiner. Returns how many records went.
+    pub fn withdraw_room(&mut self, channel_id: &Digest32, ended: Option<Vec<u8>>) -> usize {
+        let mut gone = usize::from(self.genesis.remove(channel_id).is_some());
+        self.members.retain(|(cid, _), b| {
+            let keep = cid != channel_id;
+            if !keep {
+                gone += b.len();
+            }
+            keep
+        });
+        self.bundles.retain(|(cid, _), b| {
+            let keep = cid != channel_id;
+            if !keep {
+                gone += b.len();
+            }
+            keep
+        });
+        if let Some(p) = self.prejoins.remove(channel_id) {
+            gone += p.len();
+        }
+        self.withdrawn_members
+            .retain(|(cid, _), _| cid != channel_id);
+        // The genesis's bookkeeping goes with it, so a board's count of rooms stays its rooms.
+        self.pinned.remove(channel_id);
+        self.genesis_arrived.remove(channel_id);
+        self.genesis_sources.remove(channel_id);
+        self.rosters.remove(channel_id);
+        let kept = self.withdrawn_rooms.entry(*channel_id).or_default();
+        if ended.is_some() {
+            *kept = ended;
+        }
+        gone
+    }
+
+    /// The signed room withdraw an end took the room off this board with (V030-14), if it was.
+    #[must_use]
+    pub fn room_ended(&self, channel_id: &Digest32) -> Option<&[u8]> {
+        self.withdrawn_rooms.get(channel_id)?.as_deref()
+    }
+
+    /// Take the room's admin roster, if it is newer than the one held (V030-14). The caller has
+    /// checked it is the creator's. Whether it was taken.
+    pub fn accept_roster(
+        &mut self,
+        channel_id: &Digest32,
+        timestamp_ms: u64,
+        admins: impl IntoIterator<Item = Digest32>,
+    ) -> bool {
+        if self.withdrawn_rooms.contains_key(channel_id) {
+            return false;
+        }
+        match self.rosters.get(channel_id) {
+            Some((at, _)) if *at >= timestamp_ms => false,
+            _ => {
+                self.rosters
+                    .insert(*channel_id, (timestamp_ms, admins.into_iter().collect()));
+                true
+            }
+        }
+    }
+
+    /// Whether `who` is on the room's current admin roster here (V030-14).
+    #[must_use]
+    pub fn is_roster_admin(&self, channel_id: &Digest32, who: &Digest32) -> bool {
+        self.rosters
+            .get(channel_id)
+            .is_some_and(|(_, admins)| admins.contains(who))
+    }
+
+    /// Whether a withdraw refuses a record of `author` in `channel_id` stamped `timestamp`.
+    fn withdrawn(&self, channel_id: &Digest32, author: &Digest32, timestamp: u64) -> bool {
+        self.withdrawn_rooms.contains_key(channel_id)
+            || self
+                .withdrawn_members
+                .get(&(*channel_id, *author))
+                .is_some_and(|at| timestamp <= *at)
+    }
+
     /// A fresh, empty store.
     #[must_use]
     pub fn new() -> Self {
@@ -339,6 +456,9 @@ impl RendezvousStore {
             .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
         // 2. Cryptographic authenticity + author binding.
         record.verify(&author_pubkey)?;
+        if self.withdrawn(&record.channel_id, &record.author_id, record.timestamp) {
+            return Err(Error::RendezvousRejected("withdrawn"));
+        }
 
         // 3. TTL bounds and time sanity.
         if record.ttl_secs == 0 {
@@ -406,6 +526,9 @@ impl RendezvousStore {
         // 2. Record signature, author binding, bundle root == author, bundle
         //    self-signatures.
         record.verify(&author_pubkey)?;
+        if self.withdrawn(&record.channel_id, &record.author_id, record.timestamp) {
+            return Err(Error::RendezvousRejected("withdrawn"));
+        }
 
         // 3. TTL bounds and time sanity.
         if record.ttl_secs == 0 {
@@ -469,6 +592,9 @@ impl RendezvousStore {
     ) -> Result<()> {
         genesis.verify()?;
         let channel_id = genesis.channel_id();
+        if self.withdrawn_rooms.contains_key(&channel_id) {
+            return Err(Error::RendezvousRejected("withdrawn"));
+        }
         if let Some(existing) = self.genesis.get(&channel_id) {
             // Two different genesis structures cannot share a channelID unless
             // SHA-256 collided; keep the one already verified and filed.

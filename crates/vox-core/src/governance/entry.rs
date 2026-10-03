@@ -2,8 +2,8 @@
 //!
 //! Governance facts ride the causal log ([`crate::log`]) as `EntryKind::Governance`
 //! entries whose payload is one of the framed governance structs (genesis, admin
-//! cert, admin-delegation revocation, consent grant/revocation, policy-update,
-//! passphrase-rotation). This module is the **decoded, evaluator-ready** view of
+//! cert, admin-delegation revocation, consent grant/revocation, policy-update, room
+//! lifecycle). This module is the **decoded, evaluator-ready** view of
 //! such an entry: its parsed body, its 32-byte entry hash (the tie-break key and
 //! the target of a revocation reference, ADR-008), and the **causal coordinates**
 //! the deterministic evaluator needs.
@@ -38,9 +38,9 @@ use crate::error::{Error, Result};
 use crate::governance::cert::{AdminCert, AdminRevocation};
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::genesis::Genesis;
+use crate::governance::lifecycle::RoomLifecycle;
 use crate::governance::policy::PolicyUpdate;
 use crate::governance::presence::Presence;
-use crate::governance::rotation::PassphraseRotation;
 use crate::governance::share::ServiceShare;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
@@ -63,22 +63,24 @@ pub enum GovBody {
     ConsentGrant(Box<ConsentGrant>),
     /// A per-sender consent revocation (tag `0x0005`).
     ConsentRevocation(Box<ConsentRevocation>),
-    /// A policy-update (tag `0x0006`, body kind = policy-update).
+    /// A policy-update (tag `0x0006`, body kind = policy-update): the room's retention.
+    /// The rotation kind under the same tag is reserved and refused (V030-32).
     PolicyUpdate(Box<PolicyUpdate>),
-    /// A passphrase-rotation / epoch bump (tag `0x0006`, body kind = rotation).
-    PassphraseRotation(Box<PassphraseRotation>),
-    /// A member's own statement that it has left the room, or is back (tag `0x0015`).
-    Presence(Box<Presence>),
+    /// A room-lifecycle fact (tag `0x0019`): the creator (or an admin) ending the room, or the
+    /// creator's idle end (V030-08).
+    Lifecycle(Box<RoomLifecycle>),
     /// A member's own statement that it shares a named service, or no longer does (tag
     /// `0x0018`).
     ServiceShare(Box<ServiceShare>),
+    /// A member's own statement that it has left the room, or is back (tag `0x0015`).
+    Presence(Box<Presence>),
 }
 
 impl GovBody {
     /// Parse a framed governance struct from its wire bytes, dispatching on the
-    /// ADR-008 struct tag. The `0x0006` tag is disambiguated by attempting a
-    /// policy-update first and falling back to a passphrase-rotation (the two carry
-    /// distinct body-kind discriminants, so exactly one parse succeeds).
+    /// ADR-008 struct tag. Under `0x0006` only a policy-update parses; the
+    /// passphrase-rotation kind that once shared the tag is reserved, so a body of that
+    /// kind is refused as malformed (V030-32).
     ///
     /// A frame whose tag is not a governance struct is rejected with
     /// [`Error::MalformedGovernance`] — the governance plane's domain is closed.
@@ -96,20 +98,16 @@ impl GovBody {
             StructTag::ConsentRevocation => Ok(GovBody::ConsentRevocation(Box::new(
                 ConsentRevocation::from_wire(bytes)?,
             ))),
+            StructTag::RoomLifecycle => Ok(GovBody::Lifecycle(Box::new(RoomLifecycle::from_wire(
+                bytes,
+            )?))),
             StructTag::Presence => Ok(GovBody::Presence(Box::new(Presence::from_wire(bytes)?))),
             StructTag::ServiceShare => Ok(GovBody::ServiceShare(Box::new(
                 ServiceShare::from_wire(bytes)?,
             ))),
-            StructTag::PolicyRotation => {
-                // 0x0006 is shared: try policy-update, then passphrase-rotation.
-                if let Ok(pu) = PolicyUpdate::from_wire(bytes) {
-                    Ok(GovBody::PolicyUpdate(Box::new(pu)))
-                } else {
-                    Ok(GovBody::PassphraseRotation(Box::new(
-                        PassphraseRotation::from_wire(bytes)?,
-                    )))
-                }
-            }
+            StructTag::PolicyRotation => Ok(GovBody::PolicyUpdate(Box::new(
+                PolicyUpdate::from_wire(bytes)?,
+            ))),
             _ => Err(Error::MalformedGovernance("not a governance struct tag")),
         }
     }
@@ -125,9 +123,9 @@ impl GovBody {
             GovBody::ConsentGrant(g) => (g.body.channel_id, g.body.epoch),
             GovBody::ConsentRevocation(r) => (r.body.channel_id, r.body.epoch),
             GovBody::PolicyUpdate(p) => (p.body.channel_id, p.body.epoch),
-            GovBody::PassphraseRotation(r) => (r.body.channel_id, r.body.old_epoch),
-            GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
+            GovBody::Lifecycle(l) => (l.body.channel_id, l.body.epoch),
             GovBody::ServiceShare(s) => (s.body.channel_id, s.body.epoch),
+            GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
         }
     }
 
@@ -142,9 +140,9 @@ impl GovBody {
             GovBody::ConsentGrant(g) => g.body.author_id,
             GovBody::ConsentRevocation(r) => r.body.author_id,
             GovBody::PolicyUpdate(p) => p.body.issuer_id,
-            GovBody::PassphraseRotation(r) => r.body.issuer_id,
-            GovBody::Presence(p) => p.body.author_id,
+            GovBody::Lifecycle(l) => l.body.issuer_id,
             GovBody::ServiceShare(s) => s.body.author_id,
+            GovBody::Presence(p) => p.body.author_id,
         }
     }
 }
