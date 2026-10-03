@@ -86,6 +86,9 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// How long each blocking thread holding a secret waits before its work, holding it.
 const DELAY_MS: &str = "15000";
+/// The same for the reopen case, where the attach's own passphrase check is held first and a scan
+/// of the daemon takes a second or so: long enough that the reopen is still held when it is seen.
+const REOPEN_DELAY_MS: &str = "45000";
 /// How long the work has to show up in memory once started.
 const SHOWS_UP: Duration = Duration::from_secs(60);
 /// A daemon request asked while a detach settles is answered within this.
@@ -582,7 +585,7 @@ impl Tui {
 }
 
 /// The environment the daemon runs with: the scanner loaded, and each secret-holding thread slow.
-fn daemon_env(scan: &Path, delay: bool) -> Vec<(String, String)> {
+fn daemon_env(scan: &Path, delay: Option<&str>) -> Vec<(String, String)> {
     let mut env = vec![
         (
             "DYLD_INSERT_LIBRARIES".to_owned(),
@@ -590,12 +593,9 @@ fn daemon_env(scan: &Path, delay: bool) -> Vec<(String, String)> {
         ),
         ("VOX_INTERPOSE_SCAN".to_owned(), scan.display().to_string()),
     ];
-    if delay {
+    if let Some(ms) = delay {
         test_knobs::require(&["VOX_TEST_SECRET_WORK_DELAY_MS"]);
-        env.push((
-            "VOX_TEST_SECRET_WORK_DELAY_MS".to_owned(),
-            DELAY_MS.to_owned(),
-        ));
+        env.push(("VOX_TEST_SECRET_WORK_DELAY_MS".to_owned(), ms.to_owned()));
     }
     env
 }
@@ -656,7 +656,7 @@ fn a_detach_waits_for_a_room_seal_and_leaves_no_passphrase() {
         "daemon",
         &[("room", &roompass), ("identity", &identity)],
     );
-    let _daemon = account.daemon(&daemon_env(&scanner.dir, true));
+    let _daemon = account.daemon(&daemon_env(&scanner.dir, Some(DELAY_MS)));
     let mut tui = Tui::start(&account, tmp.path().join("cues"), "bob", &[]);
     tui.attached();
     let before = scanner.scan();
@@ -707,7 +707,7 @@ fn a_detach_waits_for_a_passphrase_check_and_leaves_no_passphrase() {
         "daemon",
         &[("identity", &identity)],
     );
-    let _daemon = account.daemon(&daemon_env(&scanner.dir, true));
+    let _daemon = account.daemon(&daemon_env(&scanner.dir, Some(DELAY_MS)));
     let mut tui = Tui::start(&account, tmp.path().join("cues"), "bob", &[]);
     tui.attached();
     let before = scanner.scan();
@@ -750,7 +750,7 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
         "daemon",
         &[("room", &roompass), ("identity", &identity)],
     );
-    let _daemon = account.daemon(&daemon_env(&scanner.dir, false));
+    let _daemon = account.daemon(&daemon_env(&scanner.dir, None));
     // A room bob holds open, so his node's next attach reopens it (#208).
     {
         let mut tui = Tui::start(&account, tmp.path().join("cues1"), "bob1", &[]);
@@ -770,7 +770,7 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
     }
     // The daemon again, now with each secret-holding thread slow: the reopen is held.
     drop(_daemon);
-    let _daemon = account.daemon(&daemon_env(&scanner.dir, true));
+    let _daemon = account.daemon(&daemon_env(&scanner.dir, Some(REOPEN_DELAY_MS)));
     let mut tui = Tui::start(&account, tmp.path().join("cues2"), "bob2", &[]);
     tui.started();
     tui.typed();
@@ -806,7 +806,7 @@ fn a_tui_gone_mid_attach_leaves_no_passphrase_once_its_node_detaches() {
 /// how long that took. `PRODUCT` if it never does — the TUI was his node's last holder (L-3).
 fn wait_detached(account: &Account, after: &str) -> Duration {
     let t0 = Instant::now();
-    let bound = SHOWS_UP + Duration::from_millis(DELAY_MS.parse().staged());
+    let bound = SHOWS_UP + Duration::from_millis(REOPEN_DELAY_MS.parse().staged());
     while !account.bob_detached() {
         assert!(
             t0.elapsed() < bound,
@@ -915,7 +915,7 @@ fn a_detach_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
         "daemon",
         &[("room", &roompass), ("identity", &identity)],
     );
-    let mut env = daemon_env(&scanner.dir, false);
+    let mut env = daemon_env(&scanner.dir, None);
     test_knobs::require(&["VOX_TEST_SOLVE_AT_LEAST_MS"]);
     env.push(("VOX_TEST_SOLVE_AT_LEAST_MS".to_owned(), GRIND_MS.to_owned()));
     env.push(("VOX_ANCHORS".to_owned(), spec.clone()));
