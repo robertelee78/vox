@@ -2986,6 +2986,9 @@ pub fn run() -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             };
+            let Some(socket) = socket_of(&args.profile) else {
+                return ExitCode::FAILURE;
+            };
             run_new_room_verb_with(
                 args.profile.clone(),
                 args.identity_passphrase.clone(),
@@ -2993,6 +2996,9 @@ pub fn run() -> ExitCode {
                 None,
                 || Ok(()),
                 move |node, _anchors, ()| async move {
+                    // A running forward answers for its profile, as a daemon does: `vox status`
+                    // lists its tunnels, and `vox tunnel close` closes them.
+                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
                     crate::tunnel_cli::forward_address(&node, &name, local).await
                 },
             )

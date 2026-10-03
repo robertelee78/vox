@@ -605,7 +605,7 @@ pub async fn forward_address(
     local: SocketAddr,
 ) -> Result<(), AppError> {
     let deadline = Instant::now() + REOPEN_PATIENCE;
-    let room = loop {
+    let mut room = loop {
         match node.resolve_name(name).await {
             Ok(room) => break room,
             // A room still reopening may be the one named: wait while any is closed.
@@ -618,8 +618,38 @@ pub async fn forward_address(
             Err(why) => return Err(AppError::Usage(format!("{name}: {why}"))),
         }
     };
+    // **Which transport is the share's to say**, on the room's log (V030-25). A room joined by a
+    // one-shot verb may not hold the statement yet: it arrives with the room's first sync with
+    // its sharer, which this node starts as soon as the room is open. Until it is here the name
+    // reads as a TCP service, which for a UDP share is a forward that never answers, so wait for
+    // it a while; a name no share carries is the host's to refuse.
+    let wanted = vox_core::node::channel::service_name(&room.service).to_owned();
+    let share_deadline = Instant::now() + SHARE_PATIENCE;
+    while Instant::now() < share_deadline {
+        let known = node
+            .view()
+            .open_channels
+            .iter()
+            .find(|d| d.channel_id == room.channel_id)
+            .is_some_and(|d| {
+                d.shares
+                    .iter()
+                    .any(|s| s.host == room.host && s.name == wanted)
+            });
+        if known {
+            if let Ok(again) = node.resolve_name(name).await {
+                room = again;
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     forward(node, room.channel_id, room.host, &room.service, local).await
 }
+
+/// How long a node this verb unlocked waits for the share a name names to arrive on the room's
+/// log, before forwarding to the name as given: see [`forward_address`].
+const SHARE_PATIENCE: Duration = Duration::from_secs(15);
 
 /// `vox forward` — serves until interrupted.
 pub async fn forward(
