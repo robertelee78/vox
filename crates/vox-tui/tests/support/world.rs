@@ -842,6 +842,12 @@ impl World {
     /// Kill the host's `vox serve` and bring the same identity and room back as
     /// `vox daemon`, on a **new** port — a restart and a path change at once.
     pub fn restart_host_as_daemon(&mut self) {
+        self.restart_host_as_daemon_with(&[]);
+    }
+
+    /// [`Self::restart_host_as_daemon`], with `extra` added to the daemon's arguments
+    /// (`--metrics 127.0.0.1:0`, say).
+    pub fn restart_host_as_daemon_with(&mut self, extra: &[&str]) {
         let old_pid = self.host.as_ref().map(|h| h.child.id());
         drop(self.host.take());
         if let Some(pid) = old_pid {
@@ -862,7 +868,10 @@ impl World {
                 &self.host_anchor,
                 "--listen",
                 self.path.host_listen(),
-            ]),
+            ])
+            .into_iter()
+            .chain(args(extra))
+            .collect::<Vec<_>>(),
         );
         let room = self.room.clone();
         daemon.expect_line("the daemon to hold the room open", |l| {
