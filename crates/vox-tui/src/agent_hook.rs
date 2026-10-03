@@ -237,11 +237,18 @@ fn lost_claims(
             .map(|p| p.envelope.kind.clone())
     };
     // **Lost to a claim that crossed it**, not lapsed (V210-168): no claim this session made on
-    // it ever applied, because another came first in the room's order. One that applied once and
-    // then ran out lapsed, even if the session claimed it again while it held it (that repeat
-    // folds `Lost`: it found the resource held, by itself).
+    // it since it last let it go (released or handed it off) applied, because another came first
+    // in the room's order. One that applied and then ran out lapsed, even if the session claimed
+    // it again while it held it (that repeat folds `Lost`: it found the resource held, by itself).
+    // A holding the session ended itself says nothing about the claims it made after.
     let crossed = |resource: &str| {
-        own_ops(resource)
+        let mut ops = own_ops(resource);
+        ops.sort_by_key(|p| (p.created_millis, p.entry_hash));
+        let since = ops
+            .iter()
+            .rposition(|p| matches!(p.envelope.kind.as_str(), claim::RELEASE | claim::HANDOFF))
+            .map_or(0, |i| i + 1);
+        ops[since..]
             .iter()
             .all(|p| snap.fold.outcomes.get(&p.entry_hash) != Some(&claim::Outcome::Applied))
     };

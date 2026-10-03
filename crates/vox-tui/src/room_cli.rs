@@ -1485,8 +1485,8 @@ pub async fn claim_resource(
             false,
             format!(
                 "{resource} is not agreed yet: {}. Your claim stands in the room: it is yours \
-                 unless such a member claimed it first, and if so you will be told. Claim it \
-                 again to ask again, or release it",
+                 unless such a member claimed it first. Run `vox room board {room}` later to \
+                 see who holds it, claim it again to ask again, or release it",
                 unagreed
                     .iter()
                     .map(|(m, why)| format!("member {} {why}", crate::ident::author_id(m)))
@@ -1652,6 +1652,11 @@ async fn agreement(
                 }
                 Agreement::Unreachable => Some("could not be reached".to_owned()),
                 Agreement::Unanswered => Some("did not answer in time".to_owned()),
+                Agreement::ClocksApart => Some(format!(
+                    "has a clock more than {} minutes behind yours, too far apart to tell which \
+                     claim came first; set both clocks right",
+                    vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+                )),
             };
             if let Some(r) = reason {
                 why.push((*member, r));

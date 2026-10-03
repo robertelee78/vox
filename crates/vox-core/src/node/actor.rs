@@ -9418,14 +9418,15 @@ impl Node {
             return;
         }
         let mut view = self.view_tx.subscribe();
-        let held = listed(&view.borrow_and_update(), &ask).is_some();
+        let clock = Arc::clone(&self.millis_clock);
+        let held = listed(&view.borrow_and_update(), &ask, clock()).is_some();
         if !held {
             self.sync_with(&ask.channel_id, &[peer]).await;
         }
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + crate::node::agreestream::HOLD_PATIENCE;
             let a = loop {
-                let now = listed(&view.borrow_and_update(), &ask);
+                let now = listed(&view.borrow_and_update(), &ask, clock());
                 if let Some(a) = now {
                     break a;
                 }
@@ -11751,17 +11752,28 @@ async fn admit_board_records(
 
 /// The posts of `ask.types` this node's view of a room holds, once it holds `ask.entry`; `None`
 /// while it does not (V210-168).
+///
+/// **Not agreed when the clocks are too far apart**: an entry stamped more than
+/// [`crate::node::agreestream::STAMP_LEAD_LIMIT_MILLIS`] ahead of `now_millis` does not move this
+/// node's next stamp past it, so a claim this node made next could sort first. Agreeing then
+/// could tell two claimants "you hold it"; the answer says the clocks are apart instead.
 fn listed(
     view: &crate::node::api::NodeView,
     ask: &crate::node::agreestream::Ask,
+    now_millis: u64,
 ) -> Option<crate::node::agreestream::Answer> {
-    use crate::node::agreestream::{Answer, MAX_LISTED};
+    use crate::node::agreestream::{Answer, MAX_LISTED, STAMP_LEAD_LIMIT_MILLIS};
     let d = view
         .open_channels
         .iter()
         .find(|d| d.channel_id == ask.channel_id)?;
-    if !d.timeline.iter().rev().any(|r| r.entry_hash == ask.entry) {
-        return None;
+    let asked = d
+        .timeline
+        .iter()
+        .rev()
+        .find(|r| r.entry_hash == ask.entry)?;
+    if asked.created_millis > now_millis.saturating_add(STAMP_LEAD_LIMIT_MILLIS) {
+        return Some(Answer::ClocksApart);
     }
     let at = d.structured.positions(&ask.types, &[]);
     if at.len() > MAX_LISTED {
@@ -11907,6 +11919,7 @@ async fn agree_round(
                 Asking::Answered(Answer::NotReceived) => Agreement::NotReceived,
                 Asking::Answered(Answer::NotHeld) => Agreement::NotHeld,
                 Asking::Answered(Answer::TooMany) => Agreement::TooDifferent,
+                Asking::Answered(Answer::ClocksApart) => Agreement::ClocksApart,
                 Asking::Gone => Agreement::Unreachable,
                 Asking::Unanswered => Agreement::Unanswered,
             };

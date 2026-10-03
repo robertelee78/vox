@@ -10,21 +10,28 @@
 //! - the member waits (at most [`HOLD_PATIENCE`]) until its own log holds the claim, pulling it
 //!   from the claimant if it has not arrived;
 //! - then it answers with the entry hashes of the posts it holds of the asked `type`s
-//!   ([`Answer::Holds`]), or that it never got the claim ([`Answer::NotReceived`]).
+//!   ([`Answer::Holds`]), or that it never got the claim ([`Answer::NotReceived`]), or that the
+//!   claim is stamped too far ahead of its own clock to order its own later posts after it
+//!   ([`Answer::ClocksApart`]).
 //!
 //! The claimant's node pulls whatever a member holds that it does not (bounded by
 //! [`FETCH_PATIENCE`]), and reports, member by member, what that member's log has that its own
 //! lacks and the reverse ([`Agreement`]). The client folds each member's set and says "you hold
 //! it" only when every one of them, and its own, folds to this claimant.
 //!
-//! **Why exactly one of two crossing claims wins.** Each claimant's node is a member the other
-//! asks, and it answers only once it holds the asker's claim. Its own claim is then either
-//! already in its log, so in the set it answers with and folded by the asker, or posted later,
-//! and a node stamps every post later than every post it holds
-//! (`ChannelState::stamp_after_held`), so that claim sorts after the asker's whatever the two
-//! clocks say. Either way the set each claimant folds puts the same claim first: the winner is
-//! told it holds it, and the other that it lost, and to whom, at once. The order rests on the
-//! stamps, not on the clocks agreeing.
+//! **Why at most one of two crossing claims is told "you hold it".** Each claimant's node is a
+//! member the other asks, and it answers only once it holds the asker's claim. Its own claim is
+//! then either already in its log, so in the set it answers with and folded by the asker, or
+//! posted later, and a node stamps every post later than every post it holds that is stamped no
+//! more than [`STAMP_LEAD_LIMIT_MILLIS`] ahead of its clock (`ChannelState::stamp_after_held`),
+//! so that claim sorts after the asker's. Either way the set each claimant folds puts the same
+//! claim first: the winner is told it holds it, and the other that it lost, and to whom, at once.
+//!
+//! **Clocks more than [`STAMP_LEAD_LIMIT_MILLIS`] apart break that edge**: a member whose clock
+//! is that far behind the asker's stamp would stamp its own later claim before the asker's. So it
+//! does not agree: it answers [`Answer::ClocksApart`], and the asker is not told it holds the
+//! claim. The guarantee needs clocks within that limit of each other, and says so when they are
+//! not.
 //!
 //! **Online is what the asker observes**, as for the room cap: a member it holds a connection to
 //! or reaches within [`REACH_PATIENCE`]. One it cannot reach, or that does not answer within
@@ -41,6 +48,7 @@ use quinn::{RecvStream, SendStream};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
+pub use crate::node::channel::STAMP_LEAD_LIMIT_MILLIS;
 use crate::transport::framing::{read_frame_within, write_frame};
 use crate::transport::quic::VoxConnection;
 use crate::transport::streams::{open_typed, StreamKind};
@@ -101,6 +109,10 @@ pub enum Answer {
     NotHeld,
     /// It holds more than [`MAX_LISTED`] such posts.
     TooMany,
+    /// It holds the asked entry, and it is stamped more than [`STAMP_LEAD_LIMIT_MILLIS`] ahead of
+    /// this member's clock: a post this member makes next could sort before it, so it does not
+    /// agree.
+    ClocksApart,
 }
 
 impl Ask {
@@ -167,6 +179,9 @@ impl Answer {
             Answer::TooMany => {
                 e.array(2).uint(OP_ANSWER).uint(3);
             }
+            Answer::ClocksApart => {
+                e.array(2).uint(OP_ANSWER).uint(4);
+            }
         }
         e.finish()
     }
@@ -192,6 +207,7 @@ impl Answer {
             (1, 2) => Answer::NotReceived,
             (2, 2) => Answer::NotHeld,
             (3, 2) => Answer::TooMany,
+            (4, 2) => Answer::ClocksApart,
             _ => return Err(Error::MalformedBundle("agree answer")),
         };
         d.finish()?;
@@ -310,6 +326,8 @@ pub enum Agreement {
     Unreachable,
     /// Reached, and it gave no answer within [`ASK_PATIENCE`].
     Unanswered,
+    /// Reached, and its clock is more than [`STAMP_LEAD_LIMIT_MILLIS`] behind the post's stamp.
+    ClocksApart,
 }
 
 /// What an agreement round found, for the client.
@@ -370,6 +388,9 @@ pub fn encode_report(e: &mut Encoder, r: &Report) {
             Agreement::Unanswered => {
                 e.array(1).uint(5);
             }
+            Agreement::ClocksApart => {
+                e.array(1).uint(6);
+            }
         }
     }
 }
@@ -425,6 +446,7 @@ pub fn decode_report(d: &mut Decoder<'_>) -> Result<Report> {
             (3, 1) => Agreement::TooDifferent,
             (4, 1) => Agreement::Unreachable,
             (5, 1) => Agreement::Unanswered,
+            (6, 1) => Agreement::ClocksApart,
             _ => return Err(bad("agreement report: verdict")),
         };
         members.push((m, a));
