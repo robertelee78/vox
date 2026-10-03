@@ -104,7 +104,7 @@ fn a_peers_close_reason_never_reaches_the_terminal_raw() {
     let rt = hostile::Rt::new();
     let signer = hostile::stranger(0x54);
     let ep = Arc::new(
-        rt.block_on(async { VoxEndpoint::bind(&signer, "127.0.0.1:0".parse().unwrap()) })
+        rt.block_on(async { VoxEndpoint::bind(signer.clone(), "127.0.0.1:0".parse().unwrap()) })
             .unwrap_or_else(|e| panic!("APPARATUS: the hostile peer could not bind: {e}")),
     );
     let at = ep

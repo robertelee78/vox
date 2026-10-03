@@ -56,8 +56,8 @@ fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().expect("loopback")
 }
 
-fn signer() -> SoftwareRootSigner {
-    SoftwareRootSigner::generate().expect("APPARATUS: generate an identity")
+fn signer() -> Arc<SoftwareRootSigner> {
+    Arc::new(SoftwareRootSigner::generate().expect("APPARATUS: generate an identity"))
 }
 
 /// A peer endpoint accepting on loopback; every connection it accepts is sent to the caller.
@@ -118,10 +118,10 @@ fn member_prefix(id: &Digest32) -> String {
 #[ignore = "in-process gate for ADR-026 P-1 (#402); run on demand"]
 async fn a_node_lists_and_closes_only_its_own_tunnels() {
     watchdog::arm();
-    let a = VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind A");
-    let b = VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind B");
-    let x = Arc::new(VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind X"));
-    let y = Arc::new(VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind Y"));
+    let a = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind A");
+    let b = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind B");
+    let x = Arc::new(VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind X"));
+    let y = Arc::new(VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind Y"));
     let (mut at_x, mut at_y) = (host(Arc::clone(&x)), host(Arc::clone(&y)));
     let (a_to_x, _x_side) = connect(&a, &x, &mut at_x).await;
     let (b_to_y, _y_side) = connect(&b, &y, &mut at_y).await;
@@ -250,12 +250,12 @@ async fn tunnel_nobody_reads(
 #[ignore = "in-process gate for ADR-026 P-1 (#402); run on demand"]
 async fn a_stuck_tunnel_closes_by_its_own_nodes_setting() {
     watchdog::arm();
-    let a = VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind A");
-    let b = VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind B");
+    let a = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind A");
+    let b = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind B");
     // Set A's, then B's: a process-wide setting would leave both at B's 600 s.
     a.local().set_stuck_after(Duration::from_secs(2));
     b.local().set_stuck_after(Duration::from_secs(600));
-    let x = Arc::new(VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind X"));
+    let x = Arc::new(VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind X"));
     let mut at_x = host(Arc::clone(&x));
     let (a_to_x, x_to_a) = connect(&a, &x, &mut at_x).await;
     let (b_to_x, x_to_b) = connect(&b, &x, &mut at_x).await;
@@ -314,7 +314,7 @@ fn a_nodes_stop_does_not_wait_for_another_nodes_finishing_tunnel() {
             .build()
             .expect("APPARATUS: Y's runtime");
         let y = rt.block_on(async {
-            Arc::new(VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind Y"))
+            Arc::new(VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind Y"))
         });
         y_tx.send((Arc::clone(&y), rt.handle().clone()))
             .expect("APPARATUS: hand Y over");
@@ -333,8 +333,8 @@ fn a_nodes_stop_does_not_wait_for_another_nodes_finishing_tunnel() {
         .build()
         .expect("APPARATUS: runtime");
     rt.block_on(async move {
-        let a = VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind A");
-        let b = VoxEndpoint::bind(&signer(), loopback()).expect("APPARATUS: bind B");
+        let a = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind A");
+        let b = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind B");
         let (ida, idb) = (a.local_id(), b.local_id());
         let (acc_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
         let y_accept = Arc::clone(&y);

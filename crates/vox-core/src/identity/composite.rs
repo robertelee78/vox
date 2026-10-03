@@ -353,6 +353,30 @@ pub trait RootSigner {
     }
 }
 
+/// A shared signer signs as the signer it shares: so one key can be held by an endpoint, which
+/// signs each identity-exchange flight with it (ADR-011), and by its node at once.
+impl<T: RootSigner + ?Sized> RootSigner for std::sync::Arc<T> {
+    fn public_key(&self) -> CompositePublicKey {
+        (**self).public_key()
+    }
+
+    fn fingerprint(&self) -> Digest32 {
+        (**self).fingerprint()
+    }
+
+    fn sign(&self, msg: &[u8]) -> Result<CompositeSignature> {
+        (**self).sign(msg)
+    }
+
+    fn ed25519_id_proof(&self, challenge: &[u8]) -> Result<Zeroizing<[u8; ED25519_SIG_LEN]>> {
+        (**self).ed25519_id_proof(challenge)
+    }
+
+    fn at_rest_seed(&self) -> Option<&[u8; 32]> {
+        (**self).at_rest_seed()
+    }
+}
+
 /// The complete in-software root-signing backend (ADR-002 §1).
 ///
 /// Generates and holds the composite root secret in process memory (zeroized on

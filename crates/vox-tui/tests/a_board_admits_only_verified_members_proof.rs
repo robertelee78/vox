@@ -413,10 +413,10 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         .expect("APPARATUS (harness error): the anchor's address");
 
     let rt = Rt::new();
-    let (b1, bravo_v) = rt.block_on(connect(&*bravo, victim_addr, victim_id));
-    let (_b2, bravo_a) = rt.block_on(connect(&*bravo, anchor_addr, anchor_id));
-    let (_c1, charlie_v) = rt.block_on(connect(&*charlie, victim_addr, victim_id));
-    let (_c2, charlie_a) = rt.block_on(connect(&*charlie, anchor_addr, anchor_id));
+    let (b1, bravo_v) = rt.block_on(connect(&bravo, victim_addr, victim_id));
+    let (_b2, bravo_a) = rt.block_on(connect(&bravo, anchor_addr, anchor_id));
+    let (_c1, charlie_v) = rt.block_on(connect(&charlie, victim_addr, victim_id));
+    let (_c2, charlie_a) = rt.block_on(connect(&charlie, anchor_addr, anchor_id));
     let offered_v = answer_circuits(&rt, charlie_v);
     let offered_a = answer_circuits(&rt, charlie_a);
 
@@ -723,7 +723,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     // from a member is synced with at once (ADR-025 D2), which is when it reads bravo's board.
     drop((b1, bravo_v));
     std::thread::sleep(Duration::from_secs(1));
-    let (_b3, bravo_v2) = rt.block_on(connect(&*bravo, victim_addr, victim_id));
+    let (_b3, bravo_v2) = rt.block_on(connect(&bravo, victim_addr, victim_id));
     let served = serve_board(
         &rt,
         Arc::clone(&bravo_v2),

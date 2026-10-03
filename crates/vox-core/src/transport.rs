@@ -14,11 +14,11 @@
 //!   classical-only group**, so no downgrade target. A peer that cannot negotiate
 //!   it fails to connect with a surfaced error — never a silent fallback
 //!   ([`provider`]).
-//! - **Identity authentication without a CA.** Each peer presents a self-signed
-//!   leaf carrying its Vox composite identity (ADR-002) in a custom X.509 extension
-//!   plus a composite proof-of-possession over `"vox-tls-handshake:" ‖
-//!   cert_public_key`; the verifier recovers the identity and requires it to match
-//!   the expected peer, aborting on mismatch ([`identity_cert`], [`verifier`]).
+//! - **Identity authentication without a CA, inside the connection.** The TLS handshake
+//!   authenticates only the daemon, with a neutral self-signed leaf ([`identity_cert`],
+//!   [`verifier`]); which node a connection is to is proved right after it by the identity
+//!   exchange ([`identity`]): composite signatures bound to the TLS session by its exporter, the
+//!   responder proving first. One endpoint serves every node of a daemon.
 //! - **0-RTT disabled.** Early data is never offered or accepted (replay-unsafe).
 //! - **Datagram flows.** Each datagram names the flow it belongs to; one reader per
 //!   connection routes it there and drops and counts the rest, and oversize packets
@@ -54,9 +54,8 @@
 //!   datagram primitives and the connection AEAD
 //!   ([`quic::VoxConnection::open_stream`] / `bind_flow` / `quinn`); the tunnel
 //!   service that uses them is M11.
-//! - **The identity-extension OID** is `2.25.<UUID>.1.1`, under a UUID arc Vox made once
-//!   ([`identity_cert::VOX_IDENTITY_EXT_OID_DOTTED`], V030-33): no registration is needed, and
-//!   no other organisation's arc is used.
+//! - **No certificate carries an identity** (ADR-011 requirement 37): the old identity
+//!   extension, its OID arc and its tag `0x0009` apply to nothing.
 
 pub mod congestion;
 pub mod datagram;

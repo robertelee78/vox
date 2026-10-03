@@ -565,8 +565,12 @@ pub enum Bind {
     /// comes from the ADR-012 ladder, not from here).
     Addr(std::net::SocketAddr),
     /// A caller-supplied datagram socket — a simulated network with NAT devices, or
-    /// any other substrate (`VoxEndpoint::bind_abstract`).
+    /// any other substrate (`SharedEndpoint::bind_abstract`).
     Socket(Arc<dyn quinn::AsyncUdpSocket>),
+    /// **The daemon's presence, shared with every node it hosts** (ADR-026 D-3): the node attaches
+    /// to it instead of binding, and its detach closes only its own connections (D-5). The
+    /// presence's socket, port, mapping and nearby group are the daemon's.
+    Shared(Arc<crate::node::presence::NetPresence>),
 }
 
 impl std::fmt::Debug for Bind {
@@ -574,6 +578,7 @@ impl std::fmt::Debug for Bind {
         match self {
             Bind::Addr(a) => write!(f, "Bind::Addr({a})"),
             Bind::Socket(s) => write!(f, "Bind::Socket({s:?})"),
+            Bind::Shared(p) => write!(f, "Bind::Shared({:?})", p.shared().local_addr().ok()),
         }
     }
 }
@@ -1918,138 +1923,60 @@ struct PairwiseIn {
     recv: quinn::RecvStream,
 }
 
-/// Accept connections and their streams forever, forwarding to the actor the ones
-/// that need channel state. The board is served inside `accept_stream`.
+/// **Take this node's inbound connections from its presence** (ADR-026 D-3) and serve them, for
+/// as long as the node is attached: each is filed and its streams served on a task of its own,
+/// so one slow connection holds up no other. The handshakes and identity exchanges themselves
+/// run in the presence's gate (`node::presence`), which hands over only connections already
+/// proved to be for this node.
 ///
-/// **Each connection's handshake runs on its own task, bounded, and the accept loop
-/// never waits for one.** Phase two (`finish_incoming`: the TLS handshake and admission,
-/// itself bounded at `HANDSHAKE_TIMEOUT`) is spawned per attempt, which is quinn's own
-/// documented shape — `finish_incoming` says "Spawn this; do not await it in an accept
-/// loop".
-///
-/// # What awaiting it inline cost
-/// Until v0.2.8 this loop awaited phase two, so it handled one handshake at a time. Two
-/// consequences, both measured:
-///
-/// - **A pre-authentication denial of service.** One peer that opened a connection and
-///   stalled its handshake blocked every other inbound connection for up to 30s, with no
-///   credential of any kind. Worst against an anchor, the node most likely to be public.
-/// - **The same stall with no attacker at all.** `vox connect` exits the moment it has
-///   joined, which leaves the host mid-handshake, so a second person joining right after
-///   the first was locked out for 30s. `order4.sh` (a host and two back-to-back joiners)
-///   locked the second joiner out 5 of 5 on a quiet box, and the stranger's join in
-///   `service_rehearsal_proof` failed the same way.
-///
-/// # Why it stayed inline so long
-/// ADR-017 recorded the split as tried and reverted: `m15_two_clients_behind_symmetric_
-/// nats…` timed out at 247s with it and passed serialised. That 247s was **not** the split.
-/// It was sync starvation — a room's in-flight mark let a failing anchor session take the
-/// room first every round, so the direct member session never ran — and it hit the
-/// serialised loop too, in 9 of ~15 CI runs on `main`. The evidence against the split was
-/// a different defect with the same signature.
-///
-/// With that fixed (the owed-room change in the old `run_due_syncs`, now ADR-025's ports) the split exposed one real
-/// dependency on the serial order, and it was not in this loop: `ConnectionManager`'s
-/// duplicate tie-break was "the held connection wins", which the two ends of a pair only
-/// agree on if they file the pair in the same order. Concurrent handshakes broke that, and a
-/// node could be left holding a connection its peer had closed (see `tie_key` in
-/// `node::net`). Measured with both ends logging each connection's exporter tag: 2 of 5
-/// duplicate pairs disagreed before the tie-break became order-independent, 0 of 28 after.
-///
-/// # The bound, and what a flood costs
-/// At most [`HANDSHAKES_IN_FLIGHT`] handshakes run at once. An attempt past the cap never waits
-/// in this loop — that would put the wait back into it:
-///
-/// - an attempt whose source address is **not yet validated** gets `retry()`, a QUIC Retry
-///   packet that makes the client prove it can receive at the address it claims before
-///   anything is allocated. A spoofed flood cannot answer one; a real peer pays one round
-///   trip. Before this, one spoofed packet cost an attacker a packet and cost the node a
-///   handshake slot.
-/// - an attempt that **is** validated waits for a slot on a task of its own, up to
-///   [`HANDSHAKE_WAIT`], with at most [`HANDSHAKES_WAITING`] waiting at once; past either it
-///   gets `refuse()`. It used to be refused at once (V210-86, #278): a peer that has proven
-///   itself was told "not now", which its dialler cannot tell from a failed dial and backs off
-///   like one — 1, 2, 4… seconds, doubling to half a minute. After an anchor restart every
-///   member redials within the same second, so every one past the 64th was sent away:
-///   measured against the shipped `vox node`, 300 identities dialling at once got 107–188 in,
-///   and all 511 failures were `CONNECTION_REFUSED`. A short wait costs a slot nothing, and
-///   those members are in within the burst instead of on a backoff.
-///
-/// Waiting holds a pending attempt (its first packets, which quinn bounds), not a handshake.
-/// When a burst has waited or been refused, the node says how it went
-/// ([`NodeEvent::HandshakesQueued`]).
-///
-/// **Residual, stated rather than implied:** 64 *validated* handshakes that stall still
-/// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
-/// slot, but not nothing.
-///
-/// [`NodeEvent::HandshakesQueued`]: crate::node::api::NodeEvent::HandshakesQueued
-fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
+/// Ends when the node's queue closes (it detached: its registration and the queue's sender went
+/// with it) or the presence's endpoint closes, and says so (`NetEvent::Stopped`). Also says each
+/// burst of attempts the gate made wait or refused (`NodeEvent::HandshakesQueued`).
+fn spawn_inbound_pump(
+    net: Arc<NodeNet>,
+    mut inbound: mpsc::Receiver<crate::transport::quic::VoxConnection>,
+    bursts: tokio::sync::broadcast::Receiver<crate::node::presence::HandshakeBurst>,
+    mut closed: watch::Receiver<bool>,
+    tx: mpsc::Sender<NetEvent>,
+) {
     let gone = Arc::downgrade(&net);
     tokio::spawn(async move {
-        let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
-        let queue = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_WAITING));
-        let burst = Arc::new(std::sync::Mutex::new(Burst::default()));
+        let mut bursts = Some(bursts);
         loop {
-            let Some(incoming) = net.manager().accept_incoming().await else {
-                break;
-            };
-            if let Ok(permit) = Arc::clone(&gate).try_acquire_owned() {
-                lock_burst(&burst).ran(&gate);
-                spawn_handshake(Arc::clone(&net), tx.clone(), permit, incoming);
-                continue;
-            }
-            if !incoming.remote_address_validated() {
-                // `Err` means this attempt is already a retried one; retrying it again
-                // would loop, so it is simply dropped.
-                let _ = incoming.retry();
-                continue;
-            }
-            let Ok(place) = Arc::clone(&queue).try_acquire_owned() else {
-                let over = {
-                    let mut b = lock_burst(&burst);
-                    b.refused += 1;
-                    b.over()
-                };
-                incoming.refuse();
-                // Without waiting: this loop never waits (see above), and a report lost to a full
-                // queue costs nothing but the report.
-                if let Some(over) = over {
-                    let _ = tx.try_send(over);
+            let burst = async {
+                match bursts.as_mut() {
+                    Some(b) => b.recv().await,
+                    None => std::future::pending().await,
                 }
-                continue;
             };
-            lock_burst(&burst).enter(&gate);
-            let (net, tx, gate, burst) = (
-                Arc::clone(&net),
-                tx.clone(),
-                Arc::clone(&gate),
-                Arc::clone(&burst),
-            );
-            tokio::spawn(async move {
-                let since = std::time::Instant::now();
-                let slot = tokio::time::timeout(HANDSHAKE_WAIT, Arc::clone(&gate).acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
-                drop(place);
-                let over = {
-                    let mut b = lock_burst(&burst);
-                    if slot.is_some() {
-                        b.ran(&gate);
-                    } else {
-                        b.refused += 1;
+            tokio::select! {
+                conn = inbound.recv() => {
+                    let Some(conn) = conn else { break };
+                    let (net, tx) = (Arc::clone(&net), tx.clone());
+                    tokio::spawn(async move {
+                        let filed = net.manager().take_inbound(conn).await;
+                        let _ = serve_filed(&net, &tx, filed).await;
+                    });
+                }
+                b = burst => match b {
+                    Ok(b) => {
+                        // Without waiting: a report lost to a full queue costs only the report.
+                        let _ = tx.try_send(NetEvent::HandshakesQueued {
+                            waited: b.waited,
+                            most_waiting: b.most_waiting,
+                            most_running: b.most_running,
+                            refused: b.refused,
+                            longest: b.longest,
+                        });
                     }
-                    b.leave(since.elapsed())
-                };
-                match slot {
-                    Some(permit) => spawn_handshake(Arc::clone(&net), tx.clone(), permit, incoming),
-                    None => incoming.refuse(),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => bursts = None,
+                },
+                r = closed.wait_for(|c| *c) => {
+                    let _ = r;
+                    break;
                 }
-                if let Some(over) = over {
-                    let _ = tx.send(over).await;
-                }
-            });
+            }
         }
         #[cfg(feature = "test-knobs")]
         if let Some(ms) = test_stopped_delay_ms() {
@@ -2230,21 +2157,6 @@ async fn seal_off_actor(
     Ok((sek, wrap))
 }
 
-/// Run one inbound handshake on its own task, holding `permit` for as long as it runs.
-fn spawn_handshake(
-    net: Arc<NodeNet>,
-    tx: mpsc::Sender<NetEvent>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-    incoming: quinn::Incoming,
-) {
-    tokio::spawn(async move {
-        let _permit = permit;
-        if let Some(filed) = finish_one(&net, incoming).await {
-            let _ = serve_filed(&net, &tx, filed).await;
-        }
-    });
-}
-
 /// **For proofs only.** When set to `N`, the node loses the first `N` pairwise streams that
 /// carry a hello: it resets them unread, as a stream lost with its connection is, so the sender
 /// learns only that its key was not taken. The simultaneous-session proof uses it to force what a
@@ -2277,105 +2189,6 @@ fn test_lose_hello(me: &Digest32, room: &Digest32) -> bool {
         }
         None => false,
     }
-}
-
-/// How many inbound handshakes may run at once.
-///
-/// Inline, the ceiling was one, which was the defect. This is the same bound in spirit as
-/// [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough that an
-/// attacker cannot make a node hold unbounded state.
-const HANDSHAKES_IN_FLIGHT: usize = 64;
-
-/// How many validated attempts may wait for a handshake slot at once; past it, one is refused.
-/// Twice the members of a large room (PRD-001), so a whole room redialling a restarted anchor
-/// waits rather than being turned away, and still a bound on what a flood can make a node hold.
-const HANDSHAKES_WAITING: usize = 1024;
-
-/// How long a validated attempt may wait for a handshake slot before it is refused: half of what
-/// a dialler gives one attempt (`nat::reachability::PER_ATTEMPT_TIMEOUT`, 10 s), so an attempt
-/// given a slot still has a dialler waiting for it.
-const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
-
-/// One burst of inbound attempts that had to wait for a handshake slot, from the first that
-/// waited until none is waiting.
-#[derive(Default)]
-struct Burst {
-    /// Attempts waiting now.
-    waiting: usize,
-    /// The most that waited at once.
-    most_waiting: usize,
-    /// How many waited in all.
-    waited: usize,
-    /// The most handshakes seen running at once.
-    most_running: usize,
-    /// How many were refused: no place to wait, or no slot within [`HANDSHAKE_WAIT`].
-    refused: usize,
-    /// The longest any waited.
-    longest: Duration,
-}
-
-impl Burst {
-    /// A handshake took a slot of `gate`.
-    fn ran(&mut self, gate: &tokio::sync::Semaphore) {
-        if self.waiting > 0 {
-            self.most_running = self
-                .most_running
-                .max(HANDSHAKES_IN_FLIGHT - gate.available_permits());
-        }
-    }
-
-    /// An attempt starts waiting for a slot of `gate`.
-    fn enter(&mut self, gate: &tokio::sync::Semaphore) {
-        self.most_running = self
-            .most_running
-            .max(HANDSHAKES_IN_FLIGHT - gate.available_permits());
-        self.waiting += 1;
-        self.waited += 1;
-        self.most_waiting = self.most_waiting.max(self.waiting);
-    }
-
-    /// An attempt stops waiting after `waited`. When it was the last, the burst is over and
-    /// what it came to is returned, to be said.
-    fn leave(&mut self, waited: Duration) -> Option<NetEvent> {
-        self.waiting -= 1;
-        self.longest = self.longest.max(waited);
-        self.over()
-    }
-
-    /// When nothing is left waiting, the burst is over: what it came to, to be said. A refusal
-    /// with nothing waiting is a burst of its own, so no refusal goes unsaid.
-    fn over(&mut self) -> Option<NetEvent> {
-        (self.waiting == 0).then(|| {
-            let b = std::mem::take(self);
-            NetEvent::HandshakesQueued {
-                waited: b.waited,
-                most_waiting: b.most_waiting,
-                most_running: b.most_running,
-                refused: b.refused,
-                longest: b.longest,
-            }
-        })
-    }
-}
-
-fn lock_burst(burst: &std::sync::Mutex<Burst>) -> std::sync::MutexGuard<'_, Burst> {
-    burst
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Phase two for one connection: complete the handshake and admission, or drop it.
-async fn finish_one(
-    net: &Arc<NodeNet>,
-    incoming: quinn::Incoming,
-) -> Option<crate::node::net::Filed> {
-    net.manager()
-        .finish_incoming(
-            incoming,
-            crate::transport::quic::Admission::AcceptAnyAuthenticated,
-        )
-        .await
-        .ok()
 }
 
 /// Serve a filed connection and announce it. `false` when the actor has gone away.
@@ -3543,6 +3356,9 @@ pub struct Node {
     /// endpoint needs the identity's signer, so a locked node has no network
     /// identity to present and serves nothing (M14.7d).
     net: Option<Arc<NodeNet>>,
+    /// The presence the network runs on, and whether this node made it for itself (a solo
+    /// presence, closed with the node) rather than attached to the daemon's.
+    presence: Option<(Arc<crate::node::presence::NetPresence>, bool)>,
     /// Sender the actor keeps so the network queue never closes under it.
     net_tx: mpsc::Sender<NetEvent>,
     /// Where the endpoint binds, if this node networks at all.
@@ -4173,6 +3989,7 @@ impl Node {
             checkpoint_idle_secs,
             stuck_after,
             net: None,
+            presence: None,
             net_tx,
             bind,
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
@@ -4935,16 +4752,30 @@ impl Node {
             return Ok(());
         }
         // The identity to network as: the unlocked vault's, or the headless one.
-        let (endpoint, moved) = match (self.headless.as_ref(), self.profile.as_ref()) {
-            (Some(signer), _) => self.bind_endpoint(&**signer, bind)?,
-            (None, Some(profile)) => self.bind_endpoint(profile.signer()?, bind)?,
-            (None, None) => {
-                return Err(crate::error::Error::Profile("no identity in this profile"))
+        let signer: Arc<dyn crate::identity::composite::RootSigner + Send + Sync> =
+            match (self.headless.as_ref(), self.profile.as_ref()) {
+                (Some(signer), _) => Arc::clone(signer) as _,
+                (None, Some(profile)) => profile.signer_arc()? as _,
+                (None, None) => {
+                    return Err(crate::error::Error::Profile("no identity in this profile"))
+                }
+            };
+        // The daemon's presence, or one of this node's own.
+        let (presence, owned, moved) = match bind {
+            Bind::Shared(presence) => (Arc::clone(presence), false, None),
+            other => {
+                let (shared, moved) = self.bind_endpoint(other)?;
+                (
+                    crate::node::presence::NetPresence::start(shared),
+                    true,
+                    moved,
+                )
             }
         };
+        let link = presence.attach(signer)?;
+        let endpoint = link.endpoint;
         // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
         endpoint.local().set_stuck_after(self.stuck_after);
-        let endpoint = Arc::new(endpoint);
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
@@ -5024,11 +4855,19 @@ impl Node {
             let mappings = discover.refresh_advertised(&[]).await;
             let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
         });
-        spawn_accept_loop(net, self.net_tx.clone());
+        spawn_inbound_pump(
+            net,
+            link.inbound,
+            presence.bursts(),
+            presence.shared().closed(),
+            self.net_tx.clone(),
+        );
+        self.presence = Some((presence, owned));
         // Members on this computer or the local network are found by what they say there, an
         // anchor holds no room and has nobody to find. Without the group, a node is found only
         // where its records say, as before.
-        if self.headless.is_none() {
+        // On the daemon's presence the group is the daemon's (ADR-026 D-3, ADR-012 N-44).
+        if self.headless.is_none() && self.presence.as_ref().is_some_and(|(_, owned)| *owned) {
             if let Ok(nearby) = crate::node::nearby::Nearby::open() {
                 let nearby = Arc::new(nearby);
                 let (hear, tx) = (Arc::clone(&nearby), self.net_tx.clone());
@@ -5062,7 +4901,7 @@ impl Node {
         Ok(())
     }
 
-    /// Bind the endpoint as `signer`.
+    /// Bind this node's own presence's endpoint (a solo presence; the daemon's is bound once).
     ///
     /// **A node keeps its port** (V210-167). Asked for port 0, it bound a new random port on every
     /// start, and a member finds another only at the address its board record last gave: with no
@@ -5074,23 +4913,20 @@ impl Node {
     /// recorded.
     ///
     /// [`PORT_FILE`]: crate::node::paths::PORT_FILE
-    fn bind_endpoint<S: crate::identity::composite::RootSigner>(
+    fn bind_endpoint(
         &self,
-        signer: &S,
         bind: &Bind,
-    ) -> crate::error::Result<(crate::transport::quic::VoxEndpoint, Option<String>)> {
-        use crate::transport::quic::VoxEndpoint;
+    ) -> crate::error::Result<(Arc<crate::transport::quic::SharedEndpoint>, Option<String>)> {
+        use crate::transport::quic::SharedEndpoint as VoxEndpoint;
         let addr = match bind {
             Bind::Addr(addr) => *addr,
             Bind::Socket(socket) => {
-                return Ok((
-                    VoxEndpoint::bind_abstract(signer, Arc::clone(socket))?,
-                    None,
-                ))
+                return Ok((VoxEndpoint::bind_abstract(Arc::clone(socket))?, None))
             }
+            Bind::Shared(presence) => return Ok((Arc::clone(presence.shared()), None)),
         };
         if addr.port() != 0 {
-            return Ok((VoxEndpoint::bind(signer, addr)?, None));
+            return Ok((VoxEndpoint::bind(addr)?, None));
         }
         let file = self.paths.port_file();
         let read_port = |f: &std::path::Path| {
@@ -5104,7 +4940,7 @@ impl Node {
         // `.daemon/port`, so it binds where members last saw it.
         let kept = read_port(&file).or_else(|| read_port(&self.paths.account_port_file()));
         let Some(port) = kept else {
-            let endpoint = VoxEndpoint::bind(signer, addr)?;
+            let endpoint = VoxEndpoint::bind(addr)?;
             if let Ok(at) = endpoint.local_addr() {
                 let _ = crate::node::paths::write_private_file(
                     &file,
@@ -5113,7 +4949,7 @@ impl Node {
             }
             return Ok((endpoint, None));
         };
-        let why = match VoxEndpoint::bind(signer, std::net::SocketAddr::new(addr.ip(), port)) {
+        let why = match VoxEndpoint::bind(std::net::SocketAddr::new(addr.ip(), port)) {
             Ok(endpoint) => return Ok((endpoint, None)),
             Err(crate::error::Error::LocalBind {
                 cause: crate::error::BindCause::InUse,
@@ -5121,7 +4957,7 @@ impl Node {
             }) => "another program holds it".to_owned(),
             Err(e) => e.to_string(),
         };
-        let endpoint = VoxEndpoint::bind(signer, addr)?;
+        let endpoint = VoxEndpoint::bind(addr)?;
         let now = endpoint
             .local_addr()
             .map_or_else(|_| "another".to_owned(), |a| a.port().to_string());
@@ -5166,12 +5002,18 @@ impl Node {
                 tokio::time::sleep(RELAYED_CLOSE_LEAD).await;
             }
             net.manager().close_all();
-            net.manager().endpoint().close();
-            // **The closes leave before the node goes on** (V210-93). `close` only queues each
-            // CONNECTION_CLOSE for the endpoint's driver; a process that exits straight after can
-            // take them with it, and its peers then learn it went only by inference. Bounded: a
-            // close that cannot leave is not worth a stuck shutdown.
-            let _ = tokio::time::timeout(CLOSE_FLUSH, net.manager().endpoint().wait_idle()).await;
+            // Off the exchange: nothing more is answered as this node.
+            net.manager().endpoint().unregister();
+        }
+        // **Only this node's** (ADR-026 D-5): on the daemon's presence the endpoint and every
+        // other node's connections stay as they are. A presence this node made for itself goes
+        // with it, and the closes leave before the node goes on (V210-93): `close` only queues
+        // each CONNECTION_CLOSE, and a process that exits straight after can take them with it.
+        // Bounded inside: a close that cannot leave is not worth a stuck shutdown.
+        if let Some((presence, owned)) = self.presence.take() {
+            if owned {
+                presence.close().await;
+            }
         }
         self.stream_loops.clear();
         // A UPnP mapping the router granted only *permanently* (lifetime 0) would
@@ -11903,6 +11745,11 @@ impl Node {
         // for the closes to leave — up to a couple of seconds for a peer that does not answer —
         // and none of that needs a secret, since a connection's keys are its own. A lock wipes
         // every secret at once; it does not hold the identity while the network winds down.
+        // Off the exchange first (ADR-011 requirement 34, ADR-026 L-3): the endpoint holds the
+        // signer to sign each PROVE, so it lets go of it before the keys are wiped.
+        if let Some(net) = &self.net {
+            net.manager().endpoint().unregister();
+        }
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }
