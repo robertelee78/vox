@@ -40,6 +40,11 @@ pub enum StreamKind {
     /// as up until its probing says otherwise, and reports a clean stop as silence. A stream is
     /// delivered like any data, so this is said while the connection still runs.
     Goodbye = 8,
+    /// **Does a member hold a claim this node just posted?** (V210-168): the claimant's node asks
+    /// every member it can reach, and its client says "you hold it" only when every one folds to
+    /// that claim. See `node::agreestream`. Members only. Not 9, which another branch's stream
+    /// takes.
+    Agree = 10,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -59,6 +64,7 @@ impl StreamKind {
             6 => Some(Self::Coord),
             7 => Some(Self::Circuit),
             8 => Some(Self::Goodbye),
+            10 => Some(Self::Agree),
             _ => None,
         }
     }

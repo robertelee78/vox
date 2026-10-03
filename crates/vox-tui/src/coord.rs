@@ -39,6 +39,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const EXIT_VERSION: u8 = 3;
 /// Exit status of a post whose operation id already names different content.
 pub const EXIT_CONFLICT: u8 = 4;
+/// Exit status of a claim that not every other member of the room could agree to yet: one could
+/// not be reached, did not answer, or does not fold it the same (V210-168).
+pub const EXIT_UNAGREED: u8 = 5;
 
 /// The session this process speaks for, or `None` when nothing names one.
 ///

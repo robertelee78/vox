@@ -91,8 +91,11 @@ vox room handoff "$VOX_ROOM" "gh:acme/widgets#42" --to <fingerprint-prefix>
 vox room decline "$VOX_ROOM" "gh:acme/widgets#42"        # refuse a handoff meant for you
 ```
 
-**Check the exit status.** `1` means somebody else holds it — start something else
-rather than duplicating their work. `3` means a worker in the room runs a different
+**Check the exit status.** `0` comes only once every other member agrees it is yours.
+`1` means somebody else holds it, or got it first when your claims crossed — start
+something else rather than duplicating their work. `5` means not every member could
+agree yet (the message names who could not be reached or does not agree); your claim
+stays posted, so claim again to ask again, or release it. `3` means a worker in the room runs a different
 vox version and coordination is refused until they match; the message names it — tell
 the operator, do not work around it. `4` means you reused an operation id for
 different content.
