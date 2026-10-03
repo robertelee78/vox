@@ -302,13 +302,18 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
         "PRODUCT: it must say it is shutting down"
     );
 
-    // The profile is free the moment the daemon has exited: a one-shot verb that opens it
-    // with its own node, and does not retry a busy profile, run with nothing in between.
-    let (opened, said_after) = vox(&joiner_dir, &["trust", "list"], "");
-    eprintln!("[shutdown] `vox trust list` right after the exit: opened={opened}");
+    // The node is free the moment the daemon has exited: `vox node attach`, which opens it in a
+    // new daemon and does not retry a busy node, run with nothing in between.
+    let (opened, said_after) = vox(
+        &joiner_dir,
+        &["node", "attach", "default", "--passphrase-file", "-"],
+        &format!("{IDPASS}\n"),
+    );
+    eprintln!("[shutdown] `vox node attach` right after the exit: opened={opened}");
+    let _ = vox(&joiner_dir, &["node", "detach", "default"], "");
     assert!(
         opened,
-        "PRODUCT: the profile must be free the moment the daemon has exited; `vox trust list` said: \
+        "PRODUCT: the node must be free the moment the daemon has exited; `vox node attach` said: \
          {said_after}"
     );
 
