@@ -192,7 +192,7 @@ pub struct Envelope {
     /// Where that session is working.
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub at: Context,
-    /// Petnames addressed. **Empty addresses the room.**
+    /// The nodes addressed, each by its whole fingerprint in base32. **Empty addresses the room.**
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub to: Vec<String>,
     /// The message type. `hello`, `bye` and `say` are reserved; anything else is

@@ -56,11 +56,6 @@ pub struct Session {
     pub session: String,
     /// `claude`, `opencode` or `codex`.
     pub harness: String,
-    /// The room this session is attached to.
-    pub room: String,
-    /// The petname this session answers to, when it has one.
-    #[serde(default)]
-    pub name: String,
     /// Claude Code's messaging socket, or the Vox OpenCode plugin's wake socket.
     #[serde(default)]
     pub endpoint: String,
@@ -74,8 +69,10 @@ pub struct Session {
 ///
 /// Best effort on purpose: a session that cannot be woken should still be able to
 /// read its room, so every failure here is silent and leaves the drain working.
-pub fn register(paths: &Paths, session: &str, room: &str) {
-    let name = std::env::var("VOX_AGENT_NAME").unwrap_or_default();
+///
+/// A session is woken for an urgent message addressed to its node, in any room: it hears every
+/// room its node holds (V210-161, V210-163).
+pub fn register(paths: &Paths, session: &str) {
     let reg = if let (Ok(endpoint), Ok(token)) = (
         std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
         std::env::var("CLAUDE_CODE_MESSAGING_TOKEN"),
@@ -83,8 +80,6 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
         Session {
             session: session.to_owned(),
             harness: "claude".into(),
-            room: room.to_owned(),
-            name,
             endpoint,
             token,
         }
@@ -95,8 +90,6 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
         Session {
             session: session.to_owned(),
             harness: "opencode".into(),
-            room: room.to_owned(),
-            name,
             endpoint,
             token,
         }
@@ -104,8 +97,6 @@ pub fn register(paths: &Paths, session: &str, room: &str) {
         Session {
             session: session.to_owned(),
             harness: std::env::var("VOX_HARNESS").unwrap_or_else(|_| "unknown".into()),
-            room: room.to_owned(),
-            name,
             endpoint: String::new(),
             token: String::new(),
         }

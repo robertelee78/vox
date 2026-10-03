@@ -714,9 +714,9 @@ pub fn run_node(
                                 format!(
                                     "{} holds {} back: {}",
                                     crate::tunnel_cli::short_id_of(&a.channel_id),
-                                    crate::ident::author_id(author),
+                                    crate::ident::member_name(&view.trusted, author),
                                     crate::ident::equivocation_notice(
-                                        &crate::ident::author_id(author),
+                                        &crate::ident::member_name(&view.trusted, author),
                                         *seq
                                     )
                                 )
@@ -892,10 +892,10 @@ fn may_wake(text: &str) -> bool {
     vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.urgent && !e.to.is_empty())
 }
 
-/// The interrupt decision for one entry that just landed in `channel_id`: wake every
-/// session registered for that room that this message both addresses and marks urgent
-/// (ADR-020 §6), while it has hops left (§9). Everything else waits for the session's
-/// next turn.
+/// The interrupt decision for one entry that just landed in `channel_id`: when it addresses
+/// this node and is marked urgent (ADR-020 §6), and has hops left (§9), wake every session
+/// registered on this node but the one that posted it. Everything else waits for the
+/// session's next turn.
 ///
 /// `view` is the node's view as the entry is judged: the room's log, for the hop budget
 /// of a reply chain, and the keyring, for the name the wake gives the author.
@@ -928,7 +928,6 @@ async fn judge(
         );
         return;
     }
-    let author = crate::ident::member_name(&view.trusted, &row.author);
     let room_name = view
         .channels
         .iter()
@@ -936,17 +935,24 @@ async fn judge(
         .and_then(|c| c.local_name.clone())
         .unwrap_or_default();
     let me = view.identity.as_ref().map(|i| i.fingerprint);
+    // **A message wakes the agents of the nodes it addresses** (V210-161): `to` names nodes by
+    // fingerprint, and every session of this node hears every room it holds.
+    let Some(me) = me else {
+        return;
+    };
+    if !envelope.may_interrupt(&vox_core::node::link::b32_encode(&me)) {
+        return;
+    }
+    let author = crate::ident::author_for(&view.trusted, Some(&me), &row.author);
+    let to = crate::agent_hook::addressed(&row.text, Some(&me), &view.trusted);
     for session in crate::wake::registered(paths) {
-        if session.room != room || session.name.is_empty() {
-            continue;
-        }
-        if !envelope.may_interrupt(&session.name) {
+        if row.author == me && envelope.from == session.session {
             continue;
         }
         // **Not a session already in this conversation** (V210-121): a reply chain that comes
         // back to a session that spoke in it is two agents keeping each other awake. The hop
         // budget ends such a chain eventually; this ends it at the first turn back. It queues.
-        if me.is_some_and(|me| crate::wake::in_chain(&envelope, timeline, &me, &session.session)) {
+        if crate::wake::in_chain(&envelope, timeline, &me, &session.session) {
             eprintln!(
                 "vox daemon: not interrupting session {} for {}: it already spoke in the reply \
                  chain this answers; it reads it on its next turn",
@@ -962,6 +968,7 @@ async fn judge(
             &room_name,
             &row.entry_hash,
             &author,
+            &to,
             &envelope.body,
         );
         // Recorded **before** the wake is sent, so the session's answer with no `--re` replies to
