@@ -457,7 +457,7 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     join(&alice, &carol, &room);
     trust(&alice, &bob_fp, "bob");
     trust(&alice, &carol_fp, "carol");
-    // A node reads only members it trusted (V210-118): bob and carol read alice once they trust her.
+    // Trust runs one way (V210-161): bob and carol read alice only once they trust her too.
     trust(&bob, &alice_fp, "alice");
     trust(&carol, &alice_fp, "alice");
     until_readable(&alice, &[&bob, &carol], &room);
@@ -824,7 +824,7 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     join(&alice, &carol, &room);
     trust(&alice, &bob_fp, "bob");
     trust(&alice, &carol_fp, "carol");
-    // A node reads only members it trusted (V210-118): bob and carol read alice once they trust her.
+    // Trust runs one way (V210-161): bob and carol read alice only once they trust her too.
     trust(&bob, &alice_fp, "alice");
     trust(&carol, &alice_fp, "alice");
     until_readable(&alice, &[&bob, &carol], &room);

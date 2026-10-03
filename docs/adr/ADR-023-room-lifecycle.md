@@ -1,498 +1,296 @@
 # ADR-023: Room lifecycle — one order, retention, key delivery through members, dumb anchors
 
-**Status**: **Accepted by the decider — 2026-09-25**, with the answers to its open questions (below).
-**Implementation is not yet on `main`.**
-- M23.1 (retention), M23.2 (one order) and M23.6 (checkpoints) are built on `prd1/causal-order` and
-  merged into the v0.3.0 integration (`prd1/v030`).
-- M23.3–M23.5 are in progress.
-- All are to ship in v0.3.0. A `DONE` mark below names the commit and gate on its branch.
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: Accepted by the decider, 2026-09-25. Built on integrate/v0.3.0 (M23.1–M23.6), except
+where a requirement says otherwise. Not built: a room created with a retention (RL-2.1), the
+`vox status` line for a room with no always-on member (RL-4.9), pruning a key-package once its
+recipient acknowledges it (RL-4.7), and `vox room admin` (RL-2.1). On this tree the retention check
+is still the `policy` capability, whose removal is V030-32 (#380).
 **Date**: 2026-09-24
-**Deciders**: Robert E. Lee
+**Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, ordering, retention, sender-keys, anchors
-**Depends on**: 006, 007, 008, 010, 012, 016 — and PRD-001 (R1, R6–R14, R33–R34, R40)
 
 ## Context
 
-PRD-001 records the decider's answers of 2026-09-24:
+The decider's answers of 2026-09-24 (PRD-001) set the room's lifecycle:
 
-- **R1:** rooms have no lifetime limit on the number of messages.
-- **R6–R10:** retention:
-  - history is kept forever by default;
-  - an admin may set disappearing messages for the room, and shortening it applies retroactively;
-  - a node may keep less than the room, and the shortest wins;
-  - an expired message leaves nothing visible. This is look and feel, **not** a security property.
-- **R11:** keys reach an offline member **through always-on member nodes**, never through the
-  anchor.
+- **R1:** a room has no lifetime limit on the number of messages.
+- **R6–R10:** history is kept forever by default; the room's creator or admin may make messages
+  disappear, and shortening applies retroactively; a node may keep less than the room, and the
+  shortest wins; an expired message leaves nothing visible. This is look and feel, not a security
+  property.
+- **R11:** keys reach an offline member through always-on member nodes, never through the anchor.
 - **R12:** the approver chooses history per grant, defaulting to from-approval-onward.
-- **R13:** messages appear in the **same order on every node**.
+- **R13:** messages appear in the same order on every node.
 - **R14:** sender keys that are no longer needed are deleted.
-- **R33–R34:** any always-on node can be an anchor, and an anchor stores **nothing** for rooms it is
-  not a member of.
+- **R33–R34:** any always-on node can be an anchor, and an anchor stores nothing for rooms it is not
+  a member of.
 
-What the code does today (`origin/main` 671527a):
+Before this ADR, a room's order was arrival order, retention could not be switched on, old sender
+keys were kept, keys travelled only on direct pairwise streams, and anchors kept a ciphertext log of
+rooms they were not in. Each skeleton costs about 3.5 KB (a 3,373-byte composite signature), so a
+million-message room holds about 3.5 GB of skeletons after every body has expired.
 
-- **Order is arrival order.** Entries carry no link to other authors' entries (`log/dag.rs`); the
-  timeline is `Vec<Rendered>` appended as rows decrypt (`node/channel.rs` `render_content`). Two nodes
-  can show two orders. The only timestamp is the one the author wrote into the content envelope. Since
-  v0.2.7 it is in milliseconds, which is what claims order by, and it has no happens-before
-  relationship between authors.
-- **Retention cannot be switched on.** TTL is hardcoded to `0` at room creation (`channel.rs:693`),
-  and a reload treats a pruned payload as fatal (`channel.rs:858`). The mechanism exists but has no
-  caller: `atrest/retention.rs` `prune_entry_at_ttl_disappearing` prunes the payload and the plaintext
-  cache row while keeping the signed skeleton.
-- **Old sender keys are kept.** Iteration-0 chain keys are kept for up to 256 generations
-  (`group/history.rs`), and `OriginKeyStore::prune_before` has no caller. Every room is created
-  forward-only, so nothing ever uses them.
-- **Keys travel only on direct pairwise streams.** Anchors are refused those streams
-  (`node/net.rs`). Two members who are never online together converge on ciphertext but cannot read
-  each other.
-- **Anchors keep a ciphertext log for rooms they are not in** (`node/anchor.rs`, ADR-016 M15.2b).
-  This was built precisely so that members who are never online together still converge. R34 reverses
-  it.
-- **Skeletons are large.** The composite signature is 64 + 3309 = 3373 bytes (`hash.rs`), so each
-  retained skeleton costs about 3.5 KB. A million-message room holds about 3.5 GB of skeletons even
-  after every body has expired.
+## Requirements
 
-## Decision
+### Decision 1. One order, the same on every node (R13)
 
-### 1. One order, the same on every node (R13)
+- **RL-1.1.** Each entry's signed skeleton MUST carry `seen` (at most 16 heads of other authors'
+  feeds the author had applied) and `claimed_ms` (the author's clock in milliseconds), as ADR-008
+  LS-10 specifies. The claimed time MUST be in the skeleton, not only in the encrypted envelope, so
+  that a node can place an entry it cannot decrypt. Anyone holding skeletons therefore sees the
+  claimed send time; under decision 6 no non-member holds skeletons.
+- **RL-1.2.** Every node MUST order a room's entries by ADR-008's hybrid logical clock (LS-11): an
+  author's claimed time capped at ten minutes past the entry's latest held parent (or the room's
+  genesis time for an entry naming none), sorted by `(clock, entry_hash)`. Every node holding the
+  same entry set MUST compute the identical order. The cap MUST NOT be against the receiving node's
+  clock. An author's clock can move its entry only among its concurrent peers, never ahead of
+  anything it saw.
+- **RL-1.3. Late arrivals.** An entry from a member who was offline MUST take its causal position,
+  even above rows already shown, and MUST NOT move to the bottom. A row MUST be marked late only
+  when it lands above a row the reader was already shown, meaning one placed at least
+  `LATE_AFTER_MS` (10 s) before it arrived; rows loaded when the room opens count as shown before the
+  restart. Posts that cross in flight MUST NOT be marked late. The TUI MUST prefix a late row
+  `[late]`, and `vox room read --late` (hidden) MUST list exactly the late rows.
+- **RL-1.4. Reads.** `vox room read --since` MUST be arrival-based, so a late row that lands above
+  the cursor is still delivered. A paged read of the whole room MUST continue from a page mark in
+  the room's order (`Request::Read.after`), never as an arrival cursor, so a late row is shown once
+  and in its place. `vox room read --hashes` (hidden) MUST print `<hash> <clock-ms>` for every held
+  entry, in order.
+- **RL-1.5. Claims.** Claims stay in Vox: agent comms tracks who does what (ADR-020). `seen` gives
+  claims a happens-before (`Dag::happened_before`, ADR-008 LS-13): a claim that saw another claim
+  follows it, and only truly concurrent claims fall back to the tie-break. Vox MUST NOT hard-lock a
+  claim or enforce a takeover (PRD-001 R17).
 
-- **Proposed schema change (ADR-008).** Each entry's skeleton gains
-  `seen: [entry_hash…]`: the heads of *other* authors' feeds that the author had applied when it
-  wrote the entry, at most 16 of them. The author's own previous entry is already `prev_hash`. With
-  `seen`, the log becomes a true causal DAG across authors, not a set of parallel chains. This is
-  the schema change ADR-020 §5 said was needed before claims could have a happens-before.
-- **The order.** A deterministic topological sort of the DAG. Ties between concurrent entries are
-  broken by `(author's claimed ms, entry_hash)`. Every node holding the same entry set computes the
-  identical order. The author's clock can only move an entry among its concurrent peers, never ahead
-  of anything it saw.
-- **Correction (2026-09-24, found building M23.2): the claimed time is in the skeleton too.**
-  The first version of this decision took the claimed ms from the content envelope, which is
-  encrypted. A node that cannot decrypt an ancestor (it holds no key for that author yet, or the body
-  was pruned) then cannot place it. Every entry after it lands somewhere other than on a node that
-  can decrypt it, so the order is not one order. The skeleton therefore carries `claimed_ms` beside
-  `seen`, the same value the envelope carries.
-  - **Cost:** the claimed send time is visible to anyone holding skeletons. Members already see
-    arrival time. Under R34, non-member anchors are to hold nothing (M23.5), so after M23.5 no
-    non-member holds skeletons.
-  - **The order is a hybrid logical clock.** `clock(e) = max(min(claimed_ms(e), latest(e) + 10 min),
-    latest(e) + 1)`, where `latest(e)` is the highest clock among the parents this node holds (its
-    own seq−1 and `seen`), or the room's genesis time if it has none. Entries sort by
-    `(clock, entry_hash)`. This is the topological sort with the `(claimed ms, hash)` tie-break
-    described above, computed incrementally.
-- **A claimed time far in the future is capped, relative to the entry's parents.** Without a cap,
-  one member posting "tomorrow" would lift every entry that later sees it to tomorrow.
-  - **Not against "now":** a cap on the receiving node's clock would differ from node to node, and
-    so would the order. The cap is ten minutes past the entry's latest parent (or past the genesis
-    for an entry naming none, which closes a crafted parentless entry).
-  - **What it costs an attacker:** one post moves the room's clocks at most ten minutes. Moving them
-    a day takes 144 posts, each visible and attributable.
-  - **Why ten minutes:** honest clocks drift by seconds to minutes, so honest entries are almost
-    never capped. When one is (the first post after a quiet spell), the cap moves it only among
-    entries it did not see, which is all the claimed time decides.
-  - **One lever remains:** the creator's genesis time, which only the creator signs, only once.
-- **Late arrivals.** An entry from a member who was offline takes its causal position, which may
-  be earlier than rows already shown. The UI inserts it there and marks it as arriving late. It
-  does not move to the bottom.
-- **Claims.** `seen` gives claims (vox-96's R17 work) a real happens-before: a claim that saw
-  another claim follows it. Only truly concurrent claims fall back to the tie-break.
-- **Size.** A `seen` entry is 32 bytes; 16 are about 0.5 KB, against a 3.4 KB signature.
+### Decision 2. Retention (R6–R10)
 
-### 2. Retention (R6–R10)
+- **RL-2.1. The room's policy.** The room's retention MUST be the ADR-007 policy-update `ttl`: `0`
+  means forever, any other value is disappearing after that many seconds. A room MUST default to
+  forever (R6). Only the room's creator, or an admin the creator delegated with `vox room admin`,
+  MAY set it (V030-32). The UI MUST offer 1 hour, 1 week, 1 month or a custom value (`vox room
+  retention <room> 1h|1w|1m|<secs>|forever`, where `1m` is a month). A non-admin's change MUST be
+  refused, saying that the change is the admin's (`Fault::NotAdmin`).
+  *Status:* built, with the check on the `policy` capability (the creator). Planned: `vox room admin`
+  (V030-13, #319); the capability's removal (V030-32, #380); a room created with a retention
+  (creation writes `ttl` 0, and `vox room retention` sets it after).
+- **RL-2.2. The node's policy.** A node's own retention MUST be local configuration (the `retention`
+  file in its config directory), per room or as a default. A member MAY set a lower retention for
+  its own node only; it MUST NOT raise the room's retention for its node.
+- **RL-2.3.** The effective retention MUST be the shorter of the two (shortest wins).
+- **RL-2.4. Retroactive.** Whenever the effective retention changes, and on a periodic sweep (every
+  tick of the node, so at least once a minute), every content entry older than it MUST be pruned:
+  its payload body dropped, its plaintext cache row deleted, its signed skeleton kept.
+- **RL-2.5. Age.** An entry's age MUST be measured from its author's claimed time, clamped to no
+  later than the time this node first saw it. A back-dated message can expire early; a future-dated
+  one cannot live longer. Whether a missing body is expired MUST be the receiver's own computation;
+  a body that is not expired and has not arrived is owed and shown as "not received yet" (ADR-008
+  LS-33).
+- **RL-2.6. Nothing visible remains.** A pruned row MUST NOT be rendered and MUST NOT count toward
+  unread.
+- **RL-2.7. Pruned entries are accepted.** A pruned entry whose skeleton verifies MUST be accepted
+  on reload and on sync. Sync MUST NOT ship a body a node no longer has; a peer asking for one gets
+  the skeleton.
+- **RL-2.8. Not a security property.** A modified or malicious node can keep everything. The UI and
+  the documentation MUST say so. **Open, awaiting the decider:** a pruned message's encrypted bytes
+  stay in the store file as freed pages, readable only with that room's key on that node; store
+  compaction (`Profile::compact_store`) has no caller.
+- **RL-2.9.** Claims and work items are entries like any other and MUST expire with a disappearing
+  room. In the decider's words (2026-09-25): "The agent communication is not meant to be a source of
+  truth for anything — it's just a communications coordination layer. The source of truth is the
+  accountability skill and GitHub."
 
-- **The room's policy** is the existing ADR-007 policy-update `ttl`:
-  - `0` means forever;
-  - any other value is disappearing after that many seconds;
-  - the UI offers 1 hour, 1 week, 1 month or a custom value;
-  - it is set by any holder of the `policy` capability (the admin).
-- **The node's policy** is local configuration (`retention` in the node's config directory), per
-  room or as a default.
-- **Effective retention is the minimum of the two** (shortest wins).
-- **Retroactive.** Whenever the effective retention changes, and on a periodic sweep (every minute),
-  every entry older than it is pruned:
-  - its payload body is dropped;
-  - its plaintext cache row is deleted;
-  - the signed skeleton is kept.
-- **Age** is measured by the author's claimed timestamp, clamped to be no later than the time this
-  node first saw the entry. So a back-dated message can expire early, but a future-dated one cannot
-  live longer.
-- **Nothing visible remains.** A pruned row is not rendered and does not count toward unread.
-- **Reload accepts pruned entries.** A pruned entry whose skeleton verifies is accepted on reload
-  and on sync (fixes `channel.rs:858`). Sync never ships a body a node no longer has, and a peer
-  asking for one gets the skeleton.
-- **Not a security property.** A modified or malicious node can keep everything. The UI and docs say
-  so.
-- **Claims and work items** are entries like any other, and they expire with the room. **Decided
-  2026-09-25:** "Agent communication is not meant to be a source of truth… it's a communications
-  coordination layer; the source of truth is the accountability skill and GitHub."
+### Decision 3. Skeleton growth: checkpoints (R1)
 
-### 3. Skeleton growth: checkpoints (R1)
+Decided 2026-09-25: build checkpoints now (M23.6).
 
-Keeping every skeleton forever makes an unbounded room cost about 3.5 KB per message forever. The
-proposal is **author checkpoints**:
+- **RL-3.1. Only the author checkpoints, and only its own feed.** A checkpoint MUST be the payload of
+  an ordinary signed entry in the author's own feed (struct tag `0x0016`, `vox/checkpoint/v1`, body
+  `[seq, entry_hash]`). A checkpoint by anyone else MUST NOT be honoured: it would let one member
+  make every node forget another member's signatures, which are the evidence a fork proof needs.
+  An author who never returns never checkpoints, and its old skeletons keep their signatures.
+- **RL-3.2. When the author posts one.** Only when the room's retention is not forever (a node's own
+  shorter limit does not count), and either:
+  - at least `CHECKPOINT_EVERY` (32) more of the author's entries have expired on its node since its
+    last checkpoint; or
+  - fewer have, and nothing new has expired on its node for `CHECKPOINT_IDLE_SECS` (10 min): a
+    closing checkpoint, so that no expired entry keeps its signature indefinitely.
 
-- A member may post a checkpoint entry signed by its root. It names one author's feed position
-  `(author, seq, entry_hash)` below which that author's skeletons are older than the retention window.
-- A node that holds a checkpoint may drop the **signatures** of that author's skeletons at or below
-  the named position. It keeps each entry's 32-byte hash and hash links, so the chain still verifies
-  up to the signed checkpoint.
-- **Fork detection is unaffected above the checkpoint.** Below it, a conflicting entry is refused
-  as older than the checkpoint rather than frozen as a fork. It could never be rendered anyway, because
-  its body is expired.
-- This applies only to rooms with a non-zero effective retention. A forever room keeps everything,
-  because its bodies are kept too.
+  The check MUST run on every tick, not only after a prune, so that a backlog already expired when
+  the room opens is checkpointed.
+- **RL-3.3. The position it names.** The highest one below which every content entry of the author
+  has had its body pruned on that node. Governance entries and earlier checkpoints keep their bodies
+  and MUST NOT hold it back.
+- **RL-3.4. Shedding.** A node MUST shed the signature of an entry only when the entry is at or
+  below its author's checkpoint, its body is pruned there, and the node's effective retention is not
+  forever. It MUST do so when the checkpoint arrives, or when it prunes such an entry afterwards. The
+  shed entry MUST be stored with authenticator type `0` and no bytes, and stays authentic through
+  the chain: the signed checkpoint names its position's hash, and each successor names it in
+  `prev_hash`.
+- **RL-3.5. Unsigned entries.** An unsigned entry MUST NOT verify on its own. A node MUST take one
+  only inside a sync session or a reload, provisionally, and MUST take it back at the end if no
+  signed entry of the same feed chains to it (ADR-008 LS-40). A newcomer therefore syncs signed
+  entries from the checkpoint onward and hash-chained skeletons below it, holds the same entry set,
+  and shows the same order.
+- **RL-3.6. Refusal below the line.** An entry for a position at or below its author's checkpoint
+  that the node does not hold as it is MUST be refused as pre-checkpoint, never classified as a
+  fork. In a sync session the refusal MUST NOT be fatal. Above the checkpoint, fork detection is
+  unaffected.
+- **RL-3.7.** A room whose effective retention is forever MUST keep every signature.
 
-**Decided 2026-09-25: build checkpoints now** (M23.6). As built:
+### Decision 4. Key delivery through members (R11, R14)
 
-- **Only the author checkpoints, and only its own feed.**
-  - The checkpoint is the payload of an ordinary entry in the author's own feed (struct tag
-    `0x0016`, body `[seq, entry_hash]`), signed like any entry. It names a position on the same
-    hash chain its signatures already vouch for, so it adds no trust.
-  - A checkpoint by anyone else would let one member make every node forget another member's
-    signatures, which are the evidence a fork proof needs.
-  - The cost: an author who never returns never checkpoints, and its old skeletons keep their
-    signatures. That is the conservative failure.
-- **When the author posts one.** The room's retention is not forever. A node's own shorter limit
-  does not count, because it is not the room's business. And at least 32 more of the author's
-  entries have expired on its node since its last checkpoint. A checkpoint is itself a signed
-  entry about the size one skeleton saves, so one per 32 costs about 3% of what it frees.
-  - **Or a closing checkpoint:** fewer than 32 have expired, and nothing new has expired on its
-    node for ten minutes. No expired entry keeps its signature indefinitely.
-  - **Asked on every tick, not only after a prune.** The check looks only past the last checkpoint
-    and stops at the author's first entry still holding a body, so it costs almost nothing. That is
-    what checkpoints a backlog that is already expired when the room is opened after a restart, or
-    one that expired while the room still kept everything, without waiting for another prune.
-- **Which position it names.** The highest one below which every content entry of the author has
-  had its body pruned there. Governance and earlier checkpoints keep their bodies and never hold it
-  back.
-- **Shedding.** A node sheds the signature of an entry at or below its author's checkpoint whose
-  body it has pruned, and only when its effective retention is not forever. It does so when the
-  checkpoint arrives, or when it prunes such an entry afterwards.
-  - The shed entry is stored with authenticator type `0` and no bytes.
-  - It stays authentic through the chain: the signed checkpoint names its position's hash, and
-    each entry's successor names it in `prev_hash`.
-  - An unsigned entry never verifies on its own. The DAG takes one only inside a sync session or
-    a reload, provisionally. It becomes authentic once a signed entry of the same feed chains to
-    it, and whatever never does is taken back at the end of the session.
-  - A newcomer therefore syncs signed entries from the checkpoint onward and hash-chained skeletons
-    below it. It holds the same entry set, so it holds the same order.
-- **Refusal below the line.** An entry for a position at or below its author's checkpoint that the
-  node does not hold as it is refused as pre-checkpoint, never classified as a fork. In a sync
-  session the refusal is not fatal.
+- **RL-4.1. An owed sender key goes into the log.** When a member owes another member a sender key
+  (consent granted, or a rotation) and cannot reach the recipient (the dial reports it unreachable),
+  it MUST seal the SKDM to the recipient and post it as a `key-package` log entry (struct tag
+  `0x0017`, `vox/key-package/v1`).
+- **RL-4.2. The seal.** A key-package MUST be sealed with a one-shot PQXDH to the recipient's
+  published prekey bundle (ADR-004): the package carries the PQXDH initial message and the first
+  ratchet message, whose plaintext is the SKDM. It MUST NOT be sealed in a pairwise session, because
+  sessions are not persisted and the recipient this serves is one that restarted. It uses one of the
+  recipient's one-time prekeys when one is published.
+- **RL-4.3. Direct delivery stays the fast path.** A reachable recipient MUST still get its key over
+  the pairwise stream.
+- **RL-4.4. Forward-only is preserved.** A package for a consent MUST release the sender key at its
+  current position, as direct delivery does; a package for a rotation MUST release the new
+  generation at its origin. A message sealed before the grant MUST stay unreadable to the recipient.
+- **RL-4.5. Every member node replicates it** like any entry, and an always-on member (a NAS, for
+  example) carries it to the recipient when it next syncs. No store-and-forward service is added.
+  A non-recipient MUST NOT be able to open a package.
+- **RL-4.6. What it reveals.** A key-package shows who is sending keys to whom, and when, which the
+  consent entries already reveal to members.
+- **RL-4.7. Retention of packages.** A key-package MUST be pruned once its recipient has acknowledged
+  it; the recipient's next entry listing it in `seen` is the acknowledgement. *Status:* planned.
+  Packages are kept, and are prunable by retention like any content entry.
+- **RL-4.8. R14, pruning.** A sender MUST keep only the origin key of the generation in use, plus
+  any generation a full-history grant still has to release (decision 5). A superseded generation's
+  origin key MUST be deleted (`ChannelState::prune_superseded_origins`, zeroized on drop), and
+  `vox status` MUST report the generations held per room (`key_generations`).
+- **RL-4.9. The accepted consequence (PRD-001 §7 Q7).** A room with no always-on member, whose
+  members are never online together, cannot deliver keys. `vox status` MUST say so for that room
+  ("no always-on member: keys wait for overlap"). *Status:* planned; `vox status` reports
+  `always_on_member` as unknown. The recipient's own log says why it read nothing (proof 5).
 
-### 4. Key delivery through members (R11, R14) — and why the anchor needs nothing
+### Decision 5. History per grant (R12)
 
-- **An owed sender-key message goes into the log.** When a member owes another member a sender key
-  (consent granted, or a rotation), it seals the SKDM to the recipient and posts it as a log entry of
-  a new kind, `key-package` (struct tag `0x0017`, domain `vox/key-package/v1`; `0x0015` is reserved (the v0.2.10 presence statement) and `0x0016` the M23.6 checkpoint).
-- **The seal is always a one-shot PQXDH** to the recipient's published prekey bundle (ADR-004): the
-  package carries the PQXDH initial message and the first ratchet message, which seals the SKDM.
-  **This deviates from the plan above**, which said to use the pairwise session's keys when one exists.
-  Pairwise sessions live in memory only and are never persisted, so a package sealed in one could not
-  be opened by a recipient that restarted before reading it, and a recipient that restarted is exactly
-  the offline member this delivery is for. The one-shot seal needs nothing but the prekey ring, which
-  does persist. Cost: it uses one of the recipient's one-time prekeys when one is published.
-- **Direct delivery stays the fast path.** The package is posted only when the sender cannot reach the
-  recipient (the dial reports it unreachable). A reachable recipient still gets its key over the
-  pairwise stream, as F12 left it.
-- **Forward-only is preserved.** A package for a consent releases the sender key at its current
-  position, as direct delivery does (R12); a package for a rotation releases the new generation at its
-  origin, as the M18.1 re-key does. A message sealed before the grant stays unreadable to the recipient.
-- **Every member node replicates it** like any entry. An always-on member, the NAS for example,
-  holds it and delivers it when the recipient next syncs. **No store-and-forward service is added**:
-  the log already is one.
-- **What it reveals.** A `key-package` shows who is sending keys to whom, and when. The consent
-  entries already reveal that, so it adds no new metadata to a member.
-- **Size.** With the one-shot seal it is the SKDM plus a PQXDH initial message, which carries an
-  ML-KEM-768 ciphertext (1088 bytes) alone: more than 1 KiB. This follows from the parameters; it was
-  not measured.
-- **Retention.** A `key-package` is pruned once its recipient has acknowledged it. The recipient's
-  next entry lists it in `seen`, which is the acknowledgement.
-  **Not built:** `seen` is M23.2 and is not on the base M23.3 was built on, so packages are kept.
-- **R14, pruning.** A sender keeps only the origin key of the generation in use, plus any generation
-  a *full-history* grant still has to release (decision 5). `prune_before` runs when a generation is
-  superseded. Zeroization on drop is already in place (`Zeroizing`).
-- **The consequence the decider accepted (PRD-001 §7 Q7).** A room with **no** always-on member,
-  whose members are never online together, cannot deliver keys. `vox status` must say so for that
-  room ("no always-on member: keys wait for overlap"). The `vox status` line is not built
-  (`status` is not on the v0.2.9 base); proof 5 shows the reason from the recipient's own log
-  instead.
+- **RL-5.1.** When approving a member, the approver MUST choose "from now" (the default) or "full
+  history": `vox trust add <fp> --history now|full`. The choice MUST be kept per identity in the
+  trust keyring, so it covers every room shared with that identity, now and later, and only the
+  approver's own messages, as consent always has.
+- **RL-5.2.** `now` MUST release the SKDM at the current iteration. `full` MUST release every
+  retained generation at iteration 0, oldest first, the live one last, and the consent grant MUST
+  record `FullHistory`.
+- **RL-5.3.** A grant that arrives after its key MUST make stored messages readable: a sync that
+  brings governance MUST retry the backfill for every author the node holds a key for.
+- **RL-5.4.** `--history full` MUST NOT create a gap over `MAX_SKIP` (ADR-006): a generation never
+  exceeds `ROTATE_AFTER_MESSAGES` = 1,000 = `MAX_SKIP` iterations, and backfill walks stored bodies
+  one iteration at a time.
 
-### 5. History per grant (R12)
+### Decision 6. Anchors store nothing (R33–R34)
 
-When approving a newcomer, the approver's node asks "from now" (the default) or "full history". It
-releases the SKDM at the current iteration, or at iteration 0 of each generation still within
-retention (`group/history.rs` already implements the release). The choice is the approver's, and
-covers only the approver's own messages, as consent always has.
+- **RL-6.1.** An anchor that is not a member of a room MUST hold nothing for it except rendezvous
+  board records (addresses and bundle records, small and short-lived, ADR-012) and a relay's
+  in-flight datagrams (ADR-022). It MUST refuse every sync session for such a room.
+- **RL-6.2.** The anchor's ciphertext log is removed: there MUST be no anchor log store, no anchor
+  sync session, and no `AnchorLog` / `AnchorMeta` pages (segment kinds 6 and 7 stay reserved,
+  ADR-016 NR-45).
+- **RL-6.3. Upgrade (M23.5, R45).** An anchor upgraded from a release that kept room pages MUST
+  delete them when it next opens its store. There MUST be no migration and no copy kept. Proof:
+  `crates/vox-tui/tests/an_upgraded_anchor_drops_the_pages_it_kept_proof.rs`.
+- **RL-6.4.** Convergence for members who are never online together MUST come from decision 4 and an
+  always-on member. A node that is both an anchor and a member holds the room because it is a
+  member.
 
-### 6. Anchors store nothing (R33–R34)
+### No backwards compatibility
 
-- **An anchor that is not a member of a room holds nothing for it** except:
-  - rendezvous board records: addresses and bundle records, small and short-lived (ADR-012);
-  - the relay's in-flight datagrams (ADR-022).
-- **The ciphertext anchor log is deleted:** `node/anchor.rs`, the anchor sync sessions, and
-  `SegmentKind::AnchorLog` / `AnchorMeta`.
-- Stored anchor pages on existing nodes are deleted on upgrade. There is no migration: pre-alpha,
-  one operator.
-- **What replaces it for convergence:** decision 4 plus an always-on **member**. A node that is both
-  an anchor and a member (the NAS) holds the room because it is a member, not because it is an
-  anchor.
-- **The existing gate** `node_m15_anchor_gate` ("members never online together converge through an
-  anchor") asserts the withdrawn model. It is **rewritten**, not extended: two members never online
-  together converge and read each other through an always-on member node, and a non-member anchor's
-  data directory holds zero pages for the room.
+- **RL-7.1.** The ADR-008 skeleton changes once, and every node updates; there is no compatibility
+  ceremony. A room made by vox before v0.3.0 MUST be refused when opened, with a plain reason that
+  says to make the room again (`Fault::RoomFromBeforeV030`, `node/api.rs`).
 
-## Consequences
+## Proofs
 
-**Positive.**
+Each proof drives the shipped `vox` binary and has a mutation that turns it red (ADR-018).
 
-- One order everywhere, and claims gain a real happens-before.
-- Retention becomes possible.
-- Forward secrecy improves (R14).
-- Anchors become what the decider asked for: dumb pipes with nothing worth seizing.
+1. **Same order** (decision 1): three nodes post concurrently, one offline for part of it; after
+   convergence `vox room read --hashes` prints the identical sequence on all three. Mutation:
+   arrival order. `crates/vox-tui/tests/causal_order_proof.rs`
+   `three_members_one_offline_for_a_while_show_one_order`. **Known defect:** intermittently red,
+   the second joiner cut off from the first post onward; tracked by V030-03 (#228).
+2. **Causal:** a reply posted after reading a message is ordered after it on every node, even from a
+   clock an hour behind. Mutation: `seen` ignored in the sort. Same file,
+   `a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind`. The cap: a post from a clock
+   a day ahead moves the room at most ten minutes. Mutation: cap removed.
+   `a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward`. Late rows (RL-1.3,
+   RL-1.4): `a_late_arrival_is_marked_and_posts_that_cross_are_not`,
+   `a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place`,
+   `a_late_arrival_after_a_restart_is_marked` (also tracked by #228).
+3. **Retroactive retention:** shortening a room's retention removes older messages on every member,
+   and a restart still opens the room. `crates/vox-tui/tests/retention_proof.rs`,
+   `crates/vox-tui/tests/retention_requirements_proof.rs` (R6 forever by default; R7 presets, the
+   non-admin refusal and the admin's change reaching what every member holds; R10 an expired entry's
+   skeleton still catching a fork).
+4. **Shortest wins:** a node set shorter than its room prunes at its own limit and never shows what
+   arrives expired. `retention_proof.rs`
+   `a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired`.
+5. **Offline keys through a member:** A and B never up together, C always on; B reads A's messages
+   across a rotation and none sealed before the grant. With C removed, B reads none, and its log
+   says why. Mutations: no package posted; a consent package released from the chain origin.
+   `crates/vox-tui/tests/key_package_proof.rs`.
+6. **Anchors hold nothing:** after a full session through a non-member anchor, its data directory
+   holds no store for the room (`key_package_proof.rs` step 5); an upgraded anchor deletes the pages
+   it kept (RL-6.3).
+7. **R14 and per-grant history:** after each of two rotations the sender holds one generation; a
+   `full` grant reads earlier messages and a `now` grant does not.
+   `crates/vox-tui/tests/history_grant_proof.rs`; the unread badge with `--history full`:
+   `crates/vox-tui/tests/tui_unread_backfill_proof.rs`.
+8. **Checkpoints:** a disappearing room sheds expired signatures, reopens, and a cold joiner holds
+   the same entries in the same order; a forged entry below the checkpoint is refused; a closing
+   checkpoint follows a quiet room; an expired backlog is checkpointed without another prune.
+   `crates/vox-tui/tests/checkpoint_proof.rs`.
 
-**Negative.**
-
-- Two members who are never online together **require** an always-on member.
-- The skeleton gains `seen`.
-- Late arrivals can appear above rows already read.
-- Checkpoints add a new entry kind, if they are built.
-
-**Neutral.**
-
-- There is no compatibility ceremony. The ADR-008 skeleton changes once and every node updates.
-
-## Proofs (shipped binary, mutation-checked, counts printed)
-
-1. **Same order:**
-   - three nodes post concurrently, and one of them was offline for part of it;
-   - after convergence, `vox room read` prints the identical sequence of entry hashes on all three;
-   - mutation: arrival order, and the gate goes red.
-2. **Causal:** a reply posted after reading a message is ordered after it on every node, even when
-   the replier's clock is set an hour behind.
-3. **Retroactive retention:**
-   - a room with 100 messages is switched to 1 hour, with 40 of them older;
-   - on every member, `vox room read` shows 60, and the plaintext cache holds 60 rows;
-   - a restart still opens the room.
-4. **Shortest wins:** the node is set to 1 minute, the room to 1 week, and the node prunes at
-   1 minute.
-5. **Offline keys through a member:**
-   - A and B are never up together, and C is always on;
-   - B reads every message of A's, including across a rotation;
-   - with C removed, B reads none, and B's log says why (`vox status` is to say it once built).
-6. **Anchors hold nothing:** after a full session through a non-member anchor, its data directory has
-   zero pages for the room.
-7. **R14:** after two rotations, the sender's key store holds one generation (read by a diagnostic).
+The F12 delivery proofs stay as proofs of the direct path:
+`crates/vox-tui/tests/room_of_three_keys_proof.rs`, `cross_process_join_proof.rs`,
+`trust_before_join_proof.rs`.
 
 ## Implementation plan
 
-- **M23.1** Reload and sync accept pruned entries; retention policy and sweep (decision 2).
-  Proofs 3–4. **DONE for proofs 3 and 4 and the late-arrival rule** in 24b4433 on `prd1/retention`
-  (`crates/vox-tui/tests/retention_proof.rs`, shipped binary, each mutation-checked red; counts in
-  ADR-010 §"Retention / TTL"). Not built within it: a room created with a retention (creation still
-  writes `ttl` 0; `vox room retention` sets it after), and a gate isolating "a peer asking for a
-  pruned body gets the skeleton" (the code path exists; nothing measures it alone).
-  - **R6, R7 and R10 gates** (`crates/vox-tui/tests/retention_requirements_proof.rs`, shipped
-    binary, each mutation-checked red):
-    - **R6, forever by default:** a room nobody set retention on reports `ttl` 0 on both members,
-      and after sweeps and a restart both read all 10 messages whose author's clock ran ten years
-      behind, plus 5 current ones. Mutation, room creation writes one year: red, status reads
-      `(31536000, 31536000)`.
-    - **R7, the admin's change reaches what every member already holds:**
-      - The presets are typed through the CLI's parser: `1h`, `1m` and `1w` put ttl 3600,
-        2592000 and 604800 on all three members. Mutation, a month parsed as a week: red (2592000
-        is never reported).
-      - A non-admin's `vox room retention` is refused with the admin message and changes nothing.
-      - The admin's later change from a week to 30 s leaves each member's whole `room read` as
-        exactly the 5 newer messages, with no older message and no probe. Setting forever again
-        keeps exactly those 5 past 40 s.
-      - Mutation, capability check skipped: red (the non-admin's change succeeds).
-      - Mutation, the sweep prunes nothing already held: red (alice still reads the probe, the
-        older 10 and the newer 5).
-    - **Found by R7:** a non-admin's refusal printed "the other side refused". It now says the
-      change is the room admin's (`Fault::NotAdmin`).
-    - **R10, an expired entry's skeleton still catches a fork:**
-      - Alice's node is stopped, a conflicting entry is signed with her own key and pushed to bob,
-        and her node is restarted.
-      - Bob's `vox status --json` now reports, per room, the authors it `frozen` for a fork and
-        the count it `refused_below_checkpoint`. From outside, a refusal and a fork whose held side
-        cannot incriminate look the same (both are dropped, and the session goes on), so the gate
-        reads these counts rather than waiting for a freeze that does not come.
-      - Below alice's checkpoint (seq 5, pruned, signature shed): refused 1, frozen none, and bob
-        still reads her next post.
-      - Above it (seq 52, pruned, signature kept): bob freezes alice (frozen = her fingerprint,
-        refused still 1). Carol reads her next post and bob reads it 0 times.
-      - Neither conflicting entry ends the session.
-      - Mutation, the pre-checkpoint refusal deleted (verifier-41's M10b): red, refused 0 and
-        frozen 0.
-      - Mutation, the fork check skipped for a pruned position: red, frozen `[]` above the
-        checkpoint.
+- **M23.1** Reload and sync accept pruned entries; retention policy and sweep (decision 2). Built.
+  Not built: a room created with a retention (RL-2.1). Not isolated by any proof: a peer asking for a
+  pruned body gets the skeleton (RL-2.7), tracked by V210-138 (#357).
+- **M23.2** `seen` and the deterministic causal order (decision 1). Built. Proof 1 is
+  intermittently red (#228).
+- **M23.3** `key-package` log entries (decision 4). Built. Not built: pruning a package on its
+  acknowledgement (RL-4.7) and the `vox status` line (RL-4.9). **Known defect:** when a grant opens a
+  pairwise session, only the first of several SKDMs carries the session's `Hello`; the others ride
+  streams that could reach the recipient first.
+- **M23.4** Per-grant history (decision 5) and R14 pruning (RL-4.8). Built. Not proved: that a
+  generation is kept while a full-history grant is owed and released once delivered; tracked by R14
+  (#65).
+- **M23.5** Delete the anchor log (decision 6). Built.
+- **M23.6** Checkpoints (decision 3). Built.
 
-- **M23.2** `seen` and the deterministic causal order (decision 1). Proofs 1–2. R17's
-  takeover-after-silence does not need it. Hard-lock claims (PRD-001 §7 Q5) are to be designed on it
-  if the decider answers "wait for certainty". **Built on `prd1/causal-order` (on v0.2.8). Proofs 2
-  and 3 DONE through the shipped binary. Proof 1 DONE on in-process nodes; through three daemons it
-  is intermittently red for a connectivity defect below the log, so it is NOT marked done there.**
-  - The skeleton carries `seen` (≤16 heads of other authors' feeds, strictly ascending) and
-    `claimed_ms` (decision 1, correction).
-  - **The order:** the hybrid logical clock with the ten-minute cap, sorted by `(clock, hash)`. An
-    unknown `seen` hash never blocks acceptance. When it arrives, what named it is recomputed, and
-    whatever moved takes its descendants along.
-  - **The timeline:** kept in that order. A late row is inserted at its place and flagged `late`,
-    and the TUI prefixes it `[late]`.
-    - **Revised 2026-09-25:** a row is late only when it lands above a row the reader was already
-      shown, meaning one placed at least 10 s before it arrived. Rows loaded at open count as shown
-      before the restart.
-    - The first definition ("rendered after a row now below it") also flagged ordinary
-      concurrency. Posts crossing in flight land within a second, above one another.
-    - **Proof:** `causal_order_proof::a_late_arrival_is_marked_and_posts_that_cross_are_not`,
-      shipped binary, 3 of 3 green.
-      - Crossing posts: 0 of 12 marked late on either node.
-      - Bob posts and his daemon is frozen (SIGSTOP) before its push. Alice posts 3, waits 12 s,
-        and then bob is thawed. His post lands at 15, above "meanwhile 1" at 16, and `vox room
-        read --late` lists exactly it.
-    - **Mutations, each red:** the first definition gives "alice marks crossing posts late"
-      (6 of 12); never-late gives "exactly the late post is marked late", left `[]`.
-  - **`vox room read --since` is arrival-based:** a late row lands above the cursor, and a
-    positional read would skip it forever.
-  - **Paged reads keep the two apart.** Since v0.2.9 (#183) a `Read` reply is bounded by bytes, and
-    the client asks for the next page from the last row it got. A read from a cursor continues
-    with that row as its cursor, still by arrival. A read of the whole room continues with it as
-    a **page mark** (`Request::Read.after`, in the room's order). Continued as a cursor, page 2
-    would become the arrival feed and repeat a late row already on page 1.
-    - Proved by `causal_order_proof.rs`
-      `a_room_read_in_pages_shows_a_late_arrival_once_and_in_its_place`, shipped binary: a frozen
-      bob's post lands above alice's 8 × 32 KiB rows (262,265 bytes of text). alice's whole-room
-      read shows 19 rows, 19 distinct, the late post once (at 10, above big 1 at 11) and in the
-      `--hashes` order; `read --since` carries it and all 8 big rows once each.
-    - **Mutation, red:** every page continued as a cursor gives 16 rows, 15 distinct, and "the
-      late post must be shown exactly once", left 2.
-  - **`vox room read --hashes` (hidden):** prints `<hash> <clock-ms>` for every held entry, in
-    order.
-  - **For claims:** `Dag::happened_before(a, b)` and `ChannelState::happened_before` are the
-    relation R17 is to use; nothing consumes them yet.
-  - **Proof 2 DONE:** `crates/vox-tui/tests/causal_order_proof.rs`
-    `a_reply_follows_what_it_answered_even_from_a_clock_an_hour_behind`, shipped binary.
-    - Bob's clock is −1 h (test-only `VOX_TEST_CLOCK_SKEW_MS`). The answer's stored claimed time is
-      59 min before the question's.
-    - On all three nodes the answer follows the question (11 → 13 of 14, one SHA-256).
-    - Mutation, `seen` ignored in the sort: red, "alice orders the answer (1) before the question it
-      answered (9)".
-  - **Proof 3 (the cap) DONE:** same file,
-    `a_post_from_a_clock_a_day_ahead_does_not_drag_the_room_a_day_forward`.
-    - Bob's clock is +1 day, and his stored claim is 1439 min ahead.
-    - Alice's post after reading his is placed 9 min ahead of when she wrote it, still after his,
-      on both nodes.
-    - Mutation, cap removed: red, "placed 1439 min ahead of when it was written".
-  - **Proof 1 DONE in-process:** `crates/vox-core/tests/one_order_gate.rs`, three networked `Node`s,
-    one shut down for a round and restarted.
-    - All three end with 54 entries and one SHA-256. Each timeline (48/36/30 readable rows) is an
-      ordered subsequence of it.
-    - Mutation, arrival order: red, "bob's order differs from alice's (first difference at
-      Some(0))", three different SHA-256s.
-    - Mutation, the timeline appended in arrival order: red, "alice's timeline shows 'one bob 1' out
-      of the room's order".
-  - **Proof 1 through the shipped binary:**
-    `three_members_one_offline_for_a_while_show_one_order`, 4 green and 5 red of 9 on v0.2.8.
-    - Green runs: 58/58/58 and 57/57/57 entries, one SHA-256 each time.
-    - Every red has the same signature: the second joiner is cut off from the first post onward (e.g.
-      alice 49, bob 49, carol 25). In the four whose logs were captured, its restarted daemon logs "a board would not take our address …
-      rejected: the board holds a newer record from that author".
-    - The defect is not M23.2's: 1 of 4 red on 3cac220 without it, same signature. Replaying the
-      stopped stores through `ChannelState::sync_over` converges them at once.
-    - It is skipped by name in release.yml and ci.yml with this cause, and reported as a v0.2.9
-      defect.
-- **M23.3** `key-package` log entries and R14 pruning (decision 4). Proof 5. **Key-packages
-  BUILT on `prd1/key-packages-v029`** (on `integrate/v0.2.9`; a v0.3.0 feature):
-  `crates/vox-tui/tests/key_package_proof.rs`, shipped binary. A and B never up
-  together, C always on: B read 6 of 6 of A's messages across a rotation and 0 of 1 sealed before the
-  grant; of the 2 packages A posted for B, C holds 2 and opens 0, B holds 2 and opens 2. C removed: B
-  read 0 of 3, holds 0 packages, and its log says it could not reach A with no peer to carry a
-  circuit. Mutations, each red: no package posted (B read 0 of 6); a consent package released from
-  the chain origin (B read the pre-grant message, 1 of 1). Known red, not in M23.3: the proof's setup
-  loses a sync between two live members in about 3 runs of 10, because a member's session with a
-  member that is down holds the room until the frame timeout and refuses the live member meanwhile.
-  Not built within it: R14 pruning, pruning packages on `seen`, and the `vox status` line. Only
-  forward-only grants are proved; `--history full` is not on the base. F12's direct delivery is kept as
-  the fast path rather than replaced. This replaces F12's
-  delivery mechanism: F12 is a narrow v0.2.8 fix of SKDMs sent over pairwise sessions, covering the
-  simultaneous-initiation race and trust-before-join. F12's proofs are to be kept as regression
-  gates:
-  - joiner↔joiner in a 3-member room;
-  - creator→joiner across processes through an anchor;
-  - trust-before-join.
-- **M23.4** Per-grant history (decision 5). **DONE (2026-09-25, `prd1/history-grants`)**, with the
-  R14 pruning of decision 4 that it depends on:
-  - `vox trust add <fp> --history now|full` (default `now`), additive on the control socket. The
-    choice is kept per identity in the trust keyring, so it covers every room shared with that
-    identity, now and later, and the approver's own messages only. `full` releases every retained
-    generation at iteration 0, oldest first, the live one last; the consent grant records
-    `FullHistory`.
-  - A grant that arrives after its key now makes stored messages readable: `sync_over` retries the
-    backfill for every author it holds a key for whenever governance arrives. Without it a
-    full-history grant showed only what was written after it, because the key usually lands first.
-  - R14: a superseded generation's origin key is deleted (`OriginKeyStore::retain_only`, zeroized on
-    drop) on the tick, unless a trusted identity with a full-history grant is still owed consent in
-    that room. `vox status` reports the generations held per room (`key_generations`).
-  - **Gates** (shipped binary, release, `--ignored`): `crates/vox-tui/tests/history_grant_proof.rs`
-    — alice posts 10, trusts bob with `--history full` and carol with the default, posts once more:
-    bob reads 10 of 10 earlier plus the later one, carol reads 0 of 10 plus the later one; after each
-    of two rotations alice holds 1 generation. Mutations, each red: `full` releasing only the current
-    position, and the grant-arrival backfill removed (bob shows only the later post); pruning
-    disabled (alice holds 2). `crates/vox-tui/tests/tui_unread_backfill_proof.rs` (the parked
-    unread-badge gate, now with `--history full`): the badge reads `(1 unread)` and stays 1, 3 runs
-    of 3; red with `--history now` or without the grant-arrival backfill. In this order the row is
-    counted by `Synced.rendered`, so the `SenderKeyReceived.backfilled` count in `live.rs` (for a
-    grant that lands before its key) is kept but not exercised by this gate.
-  - **Not proved:** that a generation is *kept* while a full-history grant is owed and released
-    once delivered. The code keeps it; the proof needs a member whose node is down, and on this tree
-    trusting such a member stops the trusting node answering (the consent delivery path, reported
-    separately), so neither half can be observed yet. Also: with a session opened by the grant
-    itself, only the first of several SKDMs carries the session's `Hello`; the others ride streams
-    that could reach the recipient first.
-  - **`MAX_SKIP`:** a full-history receiver starts at iteration 0. A generation never exceeds
-    `ROTATE_AFTER_MESSAGES` = 1000 = `MAX_SKIP` iterations (the runtime rotates at the bound), and
-    backfill walks stored bodies one iteration at a time, so the release itself cannot exceed the
-    skip bound. A live message that arrives before the backfill is decrypted with up to 999 skipped
-    keys cached (`MAX_CACHE` = 2000). A body missing below it (pruned by retention, or not yet
-    synced) is skipped over on the same budget. So `--history full` does not create a gap over
-    `MAX_SKIP`; it does not fix one that exists for other reasons either.
-- **M23.5** Delete the anchor log (decision 6). Rewrite `node_m15_anchor_gate`. Proof 6.
-- **M23.6** Checkpoints (decision 3). **DONE** on `prd1/causal-order` (commit in the report).
-  - `crates/vox-tui/tests/checkpoint_proof.rs`
-    `a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it`, shipped
-    binary, one author with 100 messages and then a 20 s retention.
-    - **Store bytes:** measured stopped. Before: 100 log pages, 709,945 bytes, 0 smaller than a
-      signature. After: 102 pages, 32,359 bytes, 100 smaller than a signature.
-    - **Mutation, shedding disabled:** red, "only 0 of alice's 100 expired entries shed their
-      signature". Its store held 369,859 bytes after the same expiry. The shed room is
-      337,500 bytes smaller, 3,375 per entry: the 3,373-byte signature and its CBOR length.
-    - **Restart:** alice's room reopens from the shed store.
-    - **Cold joiner:** bob joins after the shedding. He holds 104 entries in an order identical to
-      alice's 104, and his own store has 100 pages smaller than a signature. He received the
-      skeletons below the checkpoint hash-chained, not signed.
-    - **Forged entries:** a conflicting entry signed with alice's own key at seq 5 is refused with
-      "entry is at or below its author's checkpoint", and the room keeps 102 entries. An unsigned
-      one is refused too.
-    - **Mutation, pre-checkpoint refusal removed:** red, with the equivocation taken to the fork
-      path ("entry failed the acceptance predicate").
-  - **Closing checkpoint:** `a_backlog_under_a_batch_is_checkpointed_once_the_room_goes_quiet`.
-    - 10 messages expire together, and just after, 0 pages are smaller than a signature.
-    - After 20 s quiet (idle set to 15 s by the test-only `VOX_TEST_CHECKPOINT_IDLE_SECS`;
-      production is 10 min), 10 of 12 pages are.
-    - Mutation, no closing checkpoint: red, 0 of 11.
-  - **Without another prune:** `an_expired_backlog_is_checkpointed_without_waiting_for_another_prune`.
-    - The node keeps 20 s and the room keeps everything, so 40 messages are pruned and not
-      checkpointed.
-    - The room is then set to a week and the node restarted. Nothing is left to prune, and 40 of
-      42 pages are smaller than a signature.
-    - Mutation, checkpoint asked only after a prune (the first M23.6 trigger): red, 0 of 41.
+Fixed since the old text, with evidence:
+- A non-admin's refused retention change printed "the other side refused": `Fault::NotAdmin`
+  (601580e6).
+- `key_package_proof`'s setup lost a sync between two live members in about 3 runs of 10, because a
+  member's session with a member that was down held the room: 896f28a2 (#159).
+- Trusting a member whose node was down stopped the trusting node answering, so an owed grant could
+  not be released: a60e1862.
 
-## Decider's answers (2026-09-25)
+## Consequences
 
-1. **Claims and work items expire with a disappearing room.** In the decider's words: "The agent
-   communication is not meant to be a source of truth for anything — it's just a communications
-   coordination layer. The source of truth is the accountability skill and GitHub."
-2. **Build checkpoints now** (M23.6).
-3. **A late arrival is shown in its causal place, marked late.** Built in M23.2; the flag was narrowed in M23.6 to
-   rows placed above something already shown for 10 s.
+- One order everywhere, and claims gain a real happens-before.
+- Retention is possible, and is look and feel, not a guarantee.
+- Forward secrecy improves (R14).
+- Anchors are dumb pipes with nothing worth seizing.
+- Two members who are never online together require an always-on member.
+- The skeleton carries `seen` and `claimed_ms`, and checkpoints add an entry kind.
+- Late arrivals can appear above rows already read.
+- Rooms made before v0.3.0 are made again.
+
+## Related ADRs
+
+ADR-004 (PQXDH), ADR-006 (sender keys), ADR-007 (governance, retention policy), ADR-008 (the
+skeleton, the order, checkpoints on the wire), ADR-010 (at-rest pruning), ADR-012 (boards), ADR-016
+(node runtime, anchors), ADR-018 (proofs), ADR-020 (agent comms and claims), ADR-022 (datagram
+relay). PRD-001 R1, R6–R14, R17, R33–R34, R45.
