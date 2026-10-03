@@ -3859,6 +3859,11 @@ pub struct Node {
     millis_clock: crate::time::MillisClock,
     /// See [`NodeConfig::checkpoint_idle_secs`].
     checkpoint_idle_secs: u64,
+    /// How long this node gives a tunnel whose bytes wait before closing it as stuck (V030-11),
+    /// from its `tunnel-stuck-after` file: set on its endpoint's [`LocalNode`] at each start.
+    ///
+    /// [`LocalNode`]: crate::transport::quic::LocalNode
+    stuck_after: Duration,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
     event_tx: broadcast::Sender<NodeEvent>,
@@ -4079,12 +4084,12 @@ impl Node {
         } else {
             None
         };
-        // How long a stuck tunnel is given (V030-11), from the profile's config.
-        crate::tunnel::session::set_stuck_after(
-            paths
-                .tunnel_stuck_after()
-                .unwrap_or(crate::tunnel::session::STUCK_AFTER),
-        );
+        // How long a stuck tunnel is given (V030-11), from the profile's config: the node's own,
+        // kept for its endpoint (ADR-026 P-1).
+        let stuck_after = paths
+            .tunnel_stuck_after()
+            .unwrap_or(crate::tunnel::session::STUCK_AFTER)
+            .max(Duration::from_secs(1));
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
         let (event_tx, event_rx) = broadcast::channel(EVENT_QUEUE);
         // The handle keeps the sender so any number of clients may subscribe
@@ -4096,6 +4101,7 @@ impl Node {
             profile,
             millis_clock,
             checkpoint_idle_secs,
+            stuck_after,
             net: None,
             net_tx,
             bind,
@@ -4850,6 +4856,8 @@ impl Node {
                 return Err(crate::error::Error::Profile("no identity in this profile"))
             }
         };
+        // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
+        endpoint.local().set_stuck_after(self.stuck_after);
         let endpoint = Arc::new(endpoint);
         let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
@@ -5044,7 +5052,11 @@ impl Node {
             // **A finished tunnel's last bytes first.** A close drops what the peer has not yet
             // acknowledged, so a node stopped right after a reply was finished cut it short at
             // the far end (V210-81).
-            crate::tunnel::session::all_acknowledged(STOP_ACK_BOUND).await;
+            crate::tunnel::session::all_acknowledged(
+                &net.manager().endpoint().local_id(),
+                STOP_ACK_BOUND,
+            )
+            .await;
             // **Relayed connections first**, while the circuits their closes travel in still run,
             // then everything else. Closing them all at once closed each circuit's carrier in the
             // same instant, so a relayed peer never received the CONNECTION_CLOSE. It learned this
@@ -13326,6 +13338,7 @@ impl Node {
             relaying: view.relaying,
             app: self.app.stats(),
             udp_flows: self.udp_flows.snapshot(),
+            tunnel_stuck_after: self.stuck_after,
             ..StatusReport::default()
         };
         for room in &view.open_channels {

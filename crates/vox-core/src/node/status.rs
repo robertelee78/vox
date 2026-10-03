@@ -198,6 +198,10 @@ pub struct StatusReport {
     pub anchors: Vec<AnchorStatus>,
     /// What needs looking at.
     pub unhealthy: Vec<Unhealthy>,
+    /// How long this node gives a tunnel whose bytes wait before closing it as stuck (V030-11):
+    /// its own setting, not the process's (ADR-026 P-1). Said in the JSON's
+    /// `tunnel_stuck_after`, by [`SyncBook::sections_json`].
+    pub tunnel_stuck_after: std::time::Duration,
 }
 
 /// One anchor this node keeps: configured, or named by an open room.
@@ -509,7 +513,11 @@ impl StatusReport {
             "Circuits carried for other peers.",
             vec![(String::new(), self.relaying as u64)],
         );
-        let live = crate::transport::quic::live_tunnels();
+        // Only this node's: a process may host several (ADR-026 P-1).
+        let live = self
+            .identity
+            .map(|me| crate::transport::quic::live_tunnels(&me))
+            .unwrap_or_default();
         gauge(
             "vox_tunnels_served",
             "Tunnels being served now.",
@@ -1078,11 +1086,14 @@ impl SyncBook {
     /// The counters as `vox status --json` carries them: its `"sync"`, `"reach"`,
     /// `"equivocations"`, `"publish"`, `"prekeys"` and `"set_aside"` members, without the enclosing braces, for [`serve`] to add beside
     /// [`StatusReport::to_json`]'s. `equivocations` is each `(room, author, position)` the node
-    /// holds back (V210-63).
+    /// holds back (V210-63). `me` is the node whose tunnels and counts are said, and
+    /// `stuck_after` that node's stuck-tunnel setting (ADR-026 P-1).
     #[must_use]
     pub fn sections_json(
         book: &SharedSyncBook,
         equivocations: &[(Digest32, Digest32, u64)],
+        me: &Digest32,
+        stuck_after: std::time::Duration,
     ) -> String {
         // Read before the book is held: the manager takes a lock of its own.
         let held: BTreeMap<Digest32, (String, crate::node::net::PathClass)> = {
@@ -1149,8 +1160,8 @@ impl SyncBook {
         // Ladders from this book; circuits counted where every outbound circuit is asked for
         // (`circuitstream::connect_through`). Every peer either names, in one row.
         // Dial-backs (V030-22) counted where each is asked for, in the ladder.
-        let circuits = crate::node::circuitstream::outbound_circuits();
-        let dial_backs = crate::node::coordstream::dial_backs();
+        let circuits = crate::node::circuitstream::outbound_circuits(me);
+        let dial_backs = crate::node::coordstream::dial_backs(me);
         let peers: std::collections::BTreeSet<&Digest32> = b
             .ladders
             .keys()
@@ -1251,7 +1262,8 @@ impl SyncBook {
         // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and
         // when it was opened and last moved a byte (Unix seconds), so a stale one is visible.
         s.push_str("],\"tunnels\":[");
-        for (i, t) in crate::transport::quic::live_tunnels().iter().enumerate() {
+        // Only this node's tunnels: a process may host several (ADR-026 P-1).
+        for (i, t) in crate::transport::quic::live_tunnels(me).iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
@@ -1270,7 +1282,10 @@ impl SyncBook {
         // **Tunnels that ended for a reason a person should see** (V030-11): closed here, closed
         // at the other end, or closed as stuck, with why; and how long a stuck tunnel is given.
         s.push_str("],\"closed_tunnels\":[");
-        for (i, t) in crate::transport::quic::closed_tunnels().iter().enumerate() {
+        for (i, t) in crate::transport::quic::closed_tunnels(me)
+            .iter()
+            .enumerate()
+        {
             if i > 0 {
                 s.push(',');
             }
@@ -1290,7 +1305,7 @@ impl SyncBook {
         let _ = write!(
             s,
             "],\"tunnel_stuck_after\":{}",
-            crate::tunnel::session::stuck_after().as_secs()
+            stuck_after.as_secs()
         );
         s
     }
@@ -1344,14 +1359,18 @@ pub fn close_request(body: &[u8]) -> Option<crate::transport::quic::TunnelSelect
 /// If the reply cannot be written.
 pub async fn serve_close(
     stream: &mut UnixStream,
+    owner: &Digest32,
     which: &crate::transport::quic::TunnelSelector,
 ) -> Result<()> {
     // Nothing closed and a reason: the selector named more than one member.
-    let (n, said) =
-        match crate::transport::quic::close_tunnels(which, "closed by a person on this side") {
-            Ok(closed) => (closed.len() as u64, closed_said(&closed)),
-            Err(refused) => (0, refused),
-        };
+    let (n, said) = match crate::transport::quic::close_tunnels(
+        owner,
+        which,
+        "closed by a person on this side",
+    ) {
+        Ok(closed) => (closed.len() as u64, closed_said(&closed)),
+        Err(refused) => (0, refused),
+    };
     let mut e = Encoder::new();
     e.array(3).uint(T_TUNNEL_CLOSED).uint(n).text(&said);
     write_frame(stream, &e.finish()).await
@@ -1418,7 +1437,13 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
             let mut json = report.to_json();
             json.pop();
             json.push(',');
-            json.push_str(&SyncBook::sections_json(handle.sync_book(), &equivocations));
+            let me = report.identity.unwrap_or_default();
+            json.push_str(&SyncBook::sections_json(
+                handle.sync_book(),
+                &equivocations,
+                &me,
+                report.tunnel_stuck_after,
+            ));
             json.push('}');
             let mut e = Encoder::new();
             e.array(2).uint(T_STATUS_REPORT).text(&json);

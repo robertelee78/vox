@@ -448,17 +448,20 @@ async fn copy_coord(mut recv: RecvStream, mut send: SendStream) {
 /// `reach.dial_backs` and `reach.dial_backs_answered`, V030-22): a reach with no direct path of
 /// its own asks the peer, through a coordinator, to dial it back, before any circuit is asked for.
 /// Asked is a session the coordinator relayed; answered is one whose peer completed the exchange
-/// and fired its dial. One process is one node, so a process-wide count is that node's.
-static DIAL_BACKS: std::sync::Mutex<std::collections::BTreeMap<Digest32, (u64, u64)>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// and fired its dial. A process may host several nodes (ADR-026 P-1), so each count is kept
+/// under (the node that asked, the target).
+#[allow(clippy::type_complexity)]
+static DIAL_BACKS: std::sync::Mutex<
+    std::collections::BTreeMap<(Digest32, Digest32), (u64, u64)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Count a dial-back to `peer`: `asked` once its session is relayed, `answered` once the peer
-/// completed the exchange.
-pub fn count_dial_back(peer: Digest32, answered: bool) {
+/// Count the node `local`'s dial-back to `peer`: `asked` once its session is relayed, `answered`
+/// once the peer completed the exchange.
+pub fn count_dial_back(local: Digest32, peer: Digest32, answered: bool) {
     let mut all = DIAL_BACKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let row = all.entry(peer).or_default();
+    let row = all.entry((local, peer)).or_default();
     if answered {
         row.1 += 1;
     } else {
@@ -466,13 +469,24 @@ pub fn count_dial_back(peer: Digest32, answered: bool) {
     }
 }
 
-/// This node's dial-backs per target peer: (asked, answered).
+/// The node `local`'s dial-backs per target peer: (asked, answered).
 #[must_use]
-pub fn dial_backs() -> std::collections::BTreeMap<Digest32, (u64, u64)> {
+pub fn dial_backs(local: &Digest32) -> std::collections::BTreeMap<Digest32, (u64, u64)> {
     DIAL_BACKS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+        .iter()
+        .filter(|((l, _), _)| l == local)
+        .map(|((_, peer), n)| (*peer, *n))
+        .collect()
+}
+
+/// Drop the node `local`'s dial-back counts: it has left this process for good.
+pub fn forget_node(local: &Digest32) {
+    DIAL_BACKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(l, _), _| l != local);
 }
 
 /// Why a punch session could not be opened when the coordinator holds no connection to the peer

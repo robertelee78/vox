@@ -126,9 +126,14 @@ fn key(addr: SocketAddr) -> SocketAddr {
 pub struct MuxSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     circuits: Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
-    /// Which address each peer's newest live circuit stands at. The addresses are random, so
-    /// this is the only way to get from a peer to its circuit.
-    by_peer: Mutex<HashMap<Digest32, SocketAddr>>,
+    /// Which address each peer's newest live circuit stands at, for each local node the socket
+    /// carries circuits for (ADR-026 P-1): keyed (local node, remote node), so two nodes sharing
+    /// the socket hold circuits to one peer without either's taking the other's place. The
+    /// addresses are random, so this is the only way to get from a peer to its circuit.
+    by_peer: Mutex<HashMap<(Digest32, Digest32), SocketAddr>>,
+    /// Which local node each live circuit was attached for: the only node that may answer on
+    /// it ([`MuxSocket::serves_on`]).
+    owners: Mutex<HashMap<SocketAddr, Digest32>>,
     /// Which relay carries each circuit, by its address, when the caller said
     /// ([`MuxSocket::attach_via`]) — for `vox status`, which names the relay.
     relays: Mutex<HashMap<SocketAddr, Digest32>>,
@@ -227,6 +232,7 @@ impl MuxSocket {
             inner,
             circuits: Mutex::new(HashMap::new()),
             by_peer: Mutex::new(HashMap::new()),
+            owners: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
             origins: Mutex::new(HashMap::new()),
             carriers: Mutex::new(HashMap::new()),
@@ -247,11 +253,15 @@ impl MuxSocket {
     /// torn down: the dialling end aborts its driver once the connection it carried closes, and
     /// that ends the relay's streams and the far end's driver in turn (`circuitstream`).
     ///
+    /// `local` is the node the circuit is for: only it may answer on the circuit, and its
+    /// circuits are found apart from any other node's on this socket (ADR-026 P-1).
+    ///
     /// # Errors
     /// If the OS CSPRNG is unavailable. Vox never falls back to a weaker source, and a
     /// guessable circuit address would leak which peers this node relays to.
     pub fn attach(
         self: &Arc<Self>,
+        local: &Digest32,
         peer: &Digest32,
         origin: Option<CircuitOrigin>,
         carrier: Option<CircuitCarrier>,
@@ -273,7 +283,8 @@ impl MuxSocket {
         if let Some(carrier) = carrier {
             self.carriers().insert(addr, carrier);
         }
-        self.by_peer().insert(*peer, addr);
+        self.owners().insert(addr, *local);
+        self.by_peer().insert((*local, *peer), addr);
         drop(circuits);
         Ok(CircuitPort {
             addr,
@@ -312,20 +323,42 @@ impl MuxSocket {
         self.origins.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The address `peer`'s newest live circuit stands at, if it has one.
+    /// The address the node `local`'s newest live circuit to `peer` stands at, if it has one.
     #[must_use]
-    pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<SocketAddr> {
-        self.by_peer().get(peer).copied()
+    pub fn circuit_addr_of(&self, local: &Digest32, peer: &Digest32) -> Option<SocketAddr> {
+        self.by_peer().get(&(*local, *peer)).copied()
     }
 
-    fn by_peer(&self) -> std::sync::MutexGuard<'_, HashMap<Digest32, SocketAddr>> {
+    fn by_peer(&self) -> std::sync::MutexGuard<'_, HashMap<(Digest32, Digest32), SocketAddr>> {
         self.by_peer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The number of live circuits.
+    fn owners(&self) -> std::sync::MutexGuard<'_, HashMap<SocketAddr, Digest32>> {
+        self.owners.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The local node the live circuit at `addr` was attached for, if `addr` is one.
     #[must_use]
-    pub fn circuit_count(&self) -> usize {
-        self.circuits().len()
+    pub fn owner_of(&self, addr: SocketAddr) -> Option<Digest32> {
+        self.owners().get(&key(addr)).copied()
+    }
+
+    /// **Whether `target` may answer a connection that arrived from `addr`** (ADR-026 P-1):
+    /// anyone on the wire, but on a circuit only the node it was attached for. A circuit is one
+    /// node's path to one peer; an ask over it for another node of this socket is refused, so a
+    /// relay cannot use one node's circuit to learn whether another is hosted here.
+    #[must_use]
+    pub fn serves_on(&self, addr: SocketAddr, target: &Digest32) -> bool {
+        match self.owner_of(addr) {
+            Some(owner) => owner == *target,
+            None => !self.is_circuit(addr),
+        }
+    }
+
+    /// The number of live circuits attached for the node `local`.
+    #[must_use]
+    pub fn circuit_count(&self, local: &Digest32) -> usize {
+        self.owners().values().filter(|o| *o == local).count()
     }
 
     /// [`MuxSocket::attach`], recording that `relay` carries the circuit.
@@ -334,12 +367,13 @@ impl MuxSocket {
     /// As [`MuxSocket::attach`].
     pub fn attach_via(
         self: &Arc<Self>,
+        local: &Digest32,
         peer: &Digest32,
         relay: &Digest32,
         origin: Option<CircuitOrigin>,
         carrier: Option<CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        let port = self.attach(peer, origin, carrier)?;
+        let port = self.attach(local, peer, origin, carrier)?;
         self.relays
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -347,10 +381,11 @@ impl MuxSocket {
         Ok(port)
     }
 
-    /// The relay carrying `peer`'s live circuit, if it has one and it was recorded.
+    /// The relay carrying the node `local`'s live circuit to `peer`, if it has one and it was
+    /// recorded.
     #[must_use]
-    pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
-        let addr = self.circuit_addr_of(peer)?;
+    pub fn circuit_relay_of(&self, local: &Digest32, peer: &Digest32) -> Option<Digest32> {
+        let addr = self.circuit_addr_of(local, peer)?;
         self.relays
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -366,6 +401,7 @@ impl MuxSocket {
         self.circuits().remove(&addr);
         self.origins().remove(&addr);
         self.carriers().remove(&addr);
+        self.owners().remove(&addr);
         self.by_peer().retain(|_, a| *a != addr);
     }
 

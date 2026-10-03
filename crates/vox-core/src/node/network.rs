@@ -1171,10 +1171,10 @@ impl NodeNet {
                 let session = async {
                     let (mut send, mut recv) =
                         coordstream::open_punch_session(&coordinator, peer).await?;
-                    coordstream::count_dial_back(peer, false);
+                    coordstream::count_dial_back(endpoint.local_id(), peer, false);
                     let plan =
                         coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
-                    coordstream::count_dial_back(peer, true);
+                    coordstream::count_dial_back(endpoint.local_id(), peer, true);
                     Ok::<_, Error>((send, recv, plan))
                 }
                 .await;
