@@ -273,6 +273,15 @@ pub enum Inbound {
         /// The stream's receive half.
         recv: RecvStream,
     },
+    /// The peer asks whether this node holds a claim it posted (V210-168).
+    Agree {
+        /// The authenticated peer, a member.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
     /// The peer wants an ADR-008 sync session.
     Sync {
         /// The authenticated peer.
@@ -791,6 +800,7 @@ impl NodeNet {
             StreamKind::Join => Ok(Inbound::Join { peer, send, recv }),
             StreamKind::Pairwise => Ok(Inbound::Pairwise { peer, send, recv }),
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
+            StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
             StreamKind::Coord => {
                 // The answer to `WHOAMI` is this connection's source address as *this*
                 // node sees it — the peer's reflexive address (ADR-012 rung 3).

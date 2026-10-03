@@ -390,6 +390,15 @@ fn heard_count(quic: &quinn::Connection) -> u64 {
 /// ack-eliciting.
 const PROBE_BYTE: u8 = 0;
 
+/// Send one liveness probe on `conn` (see [`PROBE_BYTE`]): a live peer's QUIC stack ACKs it within
+/// a round trip, whatever its application is doing. Whether it could be sent.
+#[must_use]
+pub fn probe(conn: &VoxConnection) -> bool {
+    conn.quinn()
+        .send_datagram(bytes::Bytes::from_static(&[PROBE_BYTE]))
+        .is_ok()
+}
+
 /// The least time between two probes [`ConnectionManager::close_if_unanswering`] counts.
 const PROBE_SPACING: Duration = Duration::from_millis(900);
 

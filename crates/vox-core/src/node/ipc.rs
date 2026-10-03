@@ -281,6 +281,10 @@ const T_COUNT: u64 = 1200;
 // holds, so a service just added could not be listed. Not a protocol bump: additive, and a node
 // that does not know it answers with an error.
 const T_SERVICES_REQ: u64 = 18;
+// V210-168: ask every member whether it holds a claim this node posted.
+const T_AGREE: u64 = 123;
+/// [`Frame::Agreement`] (V210-168).
+const T_AGREEMENT: u64 = 1201;
 
 /// What a client sends.
 ///
@@ -457,6 +461,17 @@ pub enum Request {
         /// The entry hashes wanted; at most [`MAX_FIND`].
         entries: Vec<Digest32>,
     },
+    /// Ask every other member of a room whether it holds this node's post `entry`, and compare
+    /// the posts of `types` each holds with this node's own (V210-168), answered as
+    /// [`Frame::Agreement`]. What a claim waits for before it says "you hold it".
+    Agree {
+        /// The room.
+        channel_id: Digest32,
+        /// The post.
+        entry: Digest32,
+        /// The `type`s compared; at most [`crate::node::agreestream::MAX_TYPES`].
+        types: Vec<String>,
+    },
 }
 
 /// The most entries one [`Request::Find`] may name.
@@ -513,6 +528,20 @@ impl Request {
             }
             Request::Post { channel_id, text } => {
                 e.array(3).uint(T_POST).bytes(channel_id).text(text);
+            }
+            Request::Agree {
+                channel_id,
+                entry,
+                types,
+            } => {
+                e.array(4)
+                    .uint(T_AGREE)
+                    .bytes(channel_id)
+                    .bytes(entry)
+                    .array(types.len());
+                for t in types {
+                    e.text(t);
+                }
             }
             Request::Read {
                 channel_id,
@@ -740,6 +769,25 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Count { channel_id, since })
             }
+            (T_AGREE, 4) => {
+                let channel_id = digest(&mut d)?;
+                let entry = digest(&mut d)?;
+                let n = d.array().map_err(|_| Error::MalformedIpc("ipc types"))?;
+                if n > crate::node::agreestream::MAX_TYPES {
+                    return Err(Error::MalformedIpc("ipc too many types"));
+                }
+                let mut types = Vec::with_capacity(n);
+                for _ in 0..n {
+                    types.push(text(&mut d, "ipc type")?);
+                }
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Agree {
+                    channel_id,
+                    entry,
+                    types,
+                })
+            }
             (T_FIND, 3) => {
                 let channel_id = digest(&mut d)?;
                 let n = d.array().map_err(|_| Error::MalformedIpc("ipc entries"))?;
@@ -918,6 +966,11 @@ pub enum Frame {
         /// Why it failed.
         reason: String,
     },
+    /// Where every other member stands on a post, answering [`Request::Agree`] (V210-168).
+    Agreement {
+        /// The report.
+        report: crate::node::agreestream::Report,
+    },
     /// How many rows a [`Request::Count`] found, and the room's newest row.
     Count {
         /// The count.
@@ -994,6 +1047,10 @@ impl Frame {
             }
             Frame::Error { reason } => {
                 e.array(2).uint(T_ERROR).text(reason);
+            }
+            Frame::Agreement { report } => {
+                e.array(2).uint(T_AGREEMENT);
+                crate::node::agreestream::encode_report(&mut e, report);
             }
             Frame::Count { n, last } => {
                 e.array(3)
@@ -1352,6 +1409,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc error reason"))?
                     .to_owned(),
             })
+        }
+        (T_AGREEMENT, 2) => {
+            let report = crate::node::agreestream::decode_report(d)?;
+            return Ok(Frame::Agreement { report });
         }
         (T_COUNT, 3) => {
             let n = d.uint().map_err(|_| Error::MalformedIpc("ipc count"))?;
@@ -2457,6 +2518,32 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: "room not open".into(),
             },
         },
+        Request::Agree {
+            channel_id,
+            entry,
+            types,
+        } => {
+            let (report, wait) = tokio::sync::oneshot::channel();
+            match handle
+                .apply(crate::node::api::NodeCommand::Agree {
+                    channel_id,
+                    entry,
+                    types,
+                    report,
+                })
+                .await
+            {
+                crate::node::api::Outcome::Done => match wait.await {
+                    Ok(report) => Frame::Agreement { report },
+                    Err(_) => Frame::Error {
+                        reason: "the node stopped before its members answered".into(),
+                    },
+                },
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            }
+        }
         Request::Roster { channel_id } => {
             let view = handle.view();
             match view

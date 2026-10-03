@@ -729,6 +729,19 @@ pub enum NodeCommand {
         /// The channel.
         channel_id: Digest32,
     },
+    /// Ask every other member of a room whether it holds this node's post `entry`, and which
+    /// posts of `types` it holds (V210-168): the agreement a claim waits for before it says "you
+    /// hold it". The report goes on `report`; the outcome is `Done` once it is sent.
+    Agree {
+        /// The room.
+        channel_id: Digest32,
+        /// This node's post every member must hold.
+        entry: Digest32,
+        /// The `type`s whose posts are compared.
+        types: Vec<String>,
+        /// Where the report goes.
+        report: tokio::sync::oneshot::Sender<crate::node::agreestream::Report>,
+    },
     /// Stop the actor (locks first).
     Shutdown,
     /// Change nothing and answer `Done`: proof that the actor is taking commands. A control

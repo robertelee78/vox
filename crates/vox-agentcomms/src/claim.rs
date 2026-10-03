@@ -49,8 +49,16 @@
 //! **Causality between authors.** Two agents' entries have no causal edge in the log
 //! (ADR-008 gives no cross-author parent). Millisecond timestamps make ties rare, but
 //! a tie is still decided by entry hash, and an author's clock is only its claim
-//! about when it acted. So a `release` guarantees that **the releaser no longer
-//! holds the resource**, not that the resource is unowned.
+//! about when it acted. One edge does hold: a node stamps each post later than every
+//! post it already holds that is stamped no more than ten minutes ahead of its own
+//! clock (V210-168), so a post made after another was seen sorts after it unless that
+//! other is stamped more than ten minutes ahead of the poster's clock. Posts made
+//! without seeing each other are ordered by their stamps alone. When a claim's node
+//! held a post stamped further ahead than that, or a member's clock is that far from
+//! the claimant's, a post made later can be ordered first: the claim then does not
+//! say "you hold it", it says why.
+//! So a `release` guarantees that **the releaser no longer holds the resource**, not
+//! that the resource is unowned.
 
 use std::collections::BTreeMap;
 

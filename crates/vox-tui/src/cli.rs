@@ -608,10 +608,13 @@ enum RoomCmd {
     /// The room is the record of who holds what. Holding an item is not progress: the
     /// attempt itself is recorded on the GitHub issue through awa.
     ///
-    /// A claim is a **message, not a lock**: nothing is reserved in the node.
-    /// Ownership is whatever the room's log resolves to, so every member computes
-    /// the same answer with nobody coordinating. `--ttl` is what makes an agent
-    /// that dies holding work release it without anyone noticing it died.
+    /// A claim is a post in the room: ownership is whatever the room's log resolves
+    /// to, the same on every member. It says "you hold it" (exit 0) only once every
+    /// other member has the claim and resolves it the same way. Of two claims made at
+    /// once, the one the room orders first wins, and the other is told at once who got
+    /// it (exit 1). A member that cannot be reached, or does not agree yet, is named
+    /// and the exit status is 5; the claim stays posted. `--ttl` is what makes an
+    /// agent that dies holding work release it without anyone noticing it died.
     ///
     /// Ownership is per **session** (ADR-021 §4): the session comes from `--session`,
     /// `VOX_SESSION`, or the harness (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).

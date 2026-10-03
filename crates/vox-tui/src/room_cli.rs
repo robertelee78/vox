@@ -99,15 +99,23 @@ fn held_since(since_secs: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let ago = now.saturating_sub(since_secs);
-    let elapsed = if ago < 60 {
-        format!("{ago}s ago")
-    } else if ago < 3600 {
-        format!("{}m ago", ago / 60)
-    } else if ago < 86_400 {
-        format!("{}h{:02}m ago", ago / 3600, (ago % 3600) / 60)
+    // A stamp can be later than this clock: another member's clock is ahead, or a post was
+    // stamped after one it held (V210-168). Say so rather than "0s ago".
+    let span = |n: u64| {
+        if n < 60 {
+            format!("{n}s")
+        } else if n < 3600 {
+            format!("{}m", n / 60)
+        } else if n < 86_400 {
+            format!("{}h{:02}m", n / 3600, (n % 3600) / 60)
+        } else {
+            format!("{}d", n / 86_400)
+        }
+    };
+    let elapsed = if since_secs > now {
+        format!("{} ahead of this clock", span(since_secs - now))
     } else {
-        format!("{}d ago", ago / 86_400)
+        format!("{} ago", span(now - since_secs))
     };
     // A fixed-offset UTC stamp without pulling in a date library: the fields are
     // arithmetic on the epoch, and the only calendar subtlety is leap years.
@@ -1181,6 +1189,8 @@ fn parse_cursor(s: &str) -> Result<Digest32, AppError> {
 // Claims are **messages, not locks**. Nothing here reserves anything in the node:
 // the state is whatever `claim::fold` computes from the room's log, so two workers
 // on one version converge on the same answer without either asking a coordinator.
+// Converge, not agree at once: so a claim says "you hold it" only after every other
+// member has it and folds it the same (V210-168; exit 5 when one cannot be reached).
 //
 // What ADR-021 changed, and why each verb now carries so much:
 //
@@ -1225,6 +1235,10 @@ struct Done {
     outcome: Option<Outcome>,
     session: String,
     room: String,
+    /// The room's id.
+    cid: Digest32,
+    /// The resource's state just before the post, as this node folded it.
+    before: Option<State>,
 }
 
 /// Run one claim-protocol operation end to end: session, version gate, post exactly
@@ -1265,6 +1279,11 @@ async fn run_op(
     };
     let (mut client, cid, room_key) = open_room(paths, room).await?;
     let snap = coord::participate(&mut client, cid, &room_key, &session).await?;
+    let before = data
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .and_then(|r| snap.fold.resources.get(r))
+        .cloned();
     let draft = Draft {
         kind: kind.into(),
         body,
@@ -1278,10 +1297,11 @@ async fn run_op(
         .outcomes
         .get(&posting.entry_hash)
         .cloned();
-    // **A claim is recorded when it is made** (V210-79), so one that lapses before this
+    // **A renewal is recorded when it is made** (V210-79), so a holding that lapses before this
     // session's next drain is still reported lost there. By what the operation did, not by
-    // what the fold says now: a short ttl can already have run out by the read-back.
-    if matches!(kind, claim::CLAIM | claim::RENEW) && outcome == Some(Outcome::Applied) {
+    // what the fold says now: a short ttl can already have run out by the read-back. A claim is
+    // recorded by `claim_resource`, once the room's members have answered (V210-168).
+    if kind == claim::RENEW && outcome == Some(Outcome::Applied) {
         if let Some(resource) = draft.data.get("resource").and_then(|v| v.as_str()) {
             crate::agent_hook::note_held(paths, &room_key, &session, resource);
         }
@@ -1291,6 +1311,8 @@ async fn run_op(
         outcome,
         session,
         room: room_key,
+        cid,
+        before,
     })
 }
 
@@ -1368,6 +1390,21 @@ fn report(
     ok: bool,
     said: &str,
 ) -> Result<(), AppError> {
+    report_as(done, kind, resource, opts, ok, said, 1, None)
+}
+
+/// [`report`] with the exit status a refusal ends with, and anything a verb adds to its JSON.
+#[allow(clippy::too_many_arguments)]
+fn report_as(
+    done: &Done,
+    kind: &str,
+    resource: &str,
+    opts: &CoordOpts,
+    ok: bool,
+    said: &str,
+    code: u8,
+    extra: Option<(&str, serde_json::Value)>,
+) -> Result<(), AppError> {
     let me = Owner {
         author: done.posting.after.me,
         session: done.session.clone(),
@@ -1380,30 +1417,31 @@ fn report(
             .resources
             .get(resource)
             .map(|s| state_json(resource, s, &me));
-        println!(
-            "{}",
-            serde_json::json!({
-                "schema": "vox.room.op/1",
-                "room": done.room,
-                "type": kind,
-                "resource": resource,
-                "session": done.session,
-                "entry_hash": claim::b32(&done.posting.entry_hash),
-                "op": done.posting.op,
-                "status": done.posting.status,
-                "outcome": outcome_json(done.outcome.as_ref()),
-                "ok": ok,
-                "state": state,
-            })
-        );
+        let mut out = serde_json::json!({
+            "schema": "vox.room.op/1",
+            "room": done.room,
+            "type": kind,
+            "resource": resource,
+            "session": done.session,
+            "entry_hash": claim::b32(&done.posting.entry_hash),
+            "op": done.posting.op,
+            "status": done.posting.status,
+            "outcome": outcome_json(done.outcome.as_ref()),
+            "ok": ok,
+            "state": state,
+        });
+        if let (Some((key, value)), Some(map)) = (extra, out.as_object_mut()) {
+            map.insert(key.to_owned(), value);
+        }
+        println!("{out}");
     } else if ok {
         println!("{said}");
     }
     if ok {
         Ok(())
-    } else if opts.json {
+    } else if opts.json || code != 1 {
         Err(AppError::Refused {
-            code: 1,
+            code,
             message: said.to_owned(),
         })
     } else {
@@ -1451,8 +1489,12 @@ fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, App
 
 /// `vox room claim` — take a resource, or complete a handoff pending for this session.
 ///
+/// It says "you hold it" only once every other member of the room agrees (V210-168): see
+/// [`agreement`].
+///
 /// # Errors
-/// Exit 1 if somebody else holds it, 3 on a version refusal, 4 on an op conflict.
+/// Exit 1 if somebody else holds it, 3 on a version refusal, 4 on an op conflict, 5 if not every
+/// member could agree.
 pub async fn claim_resource(
     paths: &Paths,
     room: &str,
@@ -1470,7 +1512,7 @@ pub async fn claim_resource(
     if let Some(t) = ttl_secs {
         data.insert("ttl_secs".into(), t.into());
     }
-    let done = run_op(
+    let mut done = run_op(
         paths,
         room,
         opts,
@@ -1483,12 +1525,76 @@ pub async fn claim_resource(
         author: done.posting.after.me,
         session: done.session.clone(),
     };
-    // **Say whether it was won.** A claim is a message, not a lock: an earlier claim
-    // beats this one, and an agent that cannot tell would start work somebody else is
-    // already doing. The current state is the answer, not this post's own outcome —
-    // on a retry the resource may have moved on since the first attempt.
-    let (ok, said) = match done.posting.after.fold.resources.get(&resource) {
-        Some(State::Held { owner, .. }) if *owner == me => (true, format!("you hold {resource}")),
+    // **Say whether it was won, and only once the room agrees** (V210-168). A claim is a post,
+    // and this node folds it as won until a claim that crossed it arrives from another member:
+    // two claims made at once were both told "you hold it". So a claim this node folds as won is
+    // put to every other member first, and "you hold it" waits for every one of them to fold the
+    // same. One that crossed another is put to them too, so the loser is told whose claim the
+    // room orders first, which a third member's claim this node has not seen yet may be. The
+    // current state is the answer, not this post's own outcome: on a retry the resource may have
+    // moved on since the first attempt.
+    //
+    // Crossed: the holder's claim was not in this node's log when this one was made.
+    let before = done.before.clone();
+    let crossed = move |acquisition: &[u8; 32]| match &before {
+        Some(State::Held { acquisition: a, .. }) => a != acquisition,
+        _ => true,
+    };
+    let mut unagreed: Vec<(Digest32, String)> = Vec::new();
+    let ask_the_room = match done.posting.after.fold.resources.get(&resource) {
+        Some(State::Held { owner, .. }) if *owner == me => true,
+        Some(State::Held { acquisition, .. }) => crossed(acquisition),
+        Some(State::Pending { .. }) => false,
+        None => true,
+    };
+    if ask_the_room {
+        let (fold, why) = agreement(paths, &done, &me, &resource).await?;
+        done.posting.after.fold = fold;
+        unagreed = why;
+    }
+    let (ok, said, code) = match done.posting.after.fold.resources.get(&resource) {
+        Some(State::Held { owner, .. }) if *owner == me && unagreed.is_empty() => {
+            (true, format!("you hold {resource}"), 1)
+        }
+        Some(State::Held { owner, .. }) if *owner == me => (
+            false,
+            format!(
+                "{resource} is not agreed yet: {}. Your claim is posted, but it is not sure to be \
+                 yours{}.{} Run `vox room board {room}` later to see who holds it, claim it \
+                 again to ask again, or release it",
+                unagreed_text(&me.author, &unagreed),
+                // A member that has not agreed can still post a claim ordered first. A post the
+                // claim is stamped before is already made: the note below says what that means.
+                if unagreed.iter().any(|(_, w)| !w.starts_with(STAMPED_AHEAD)) {
+                    ": a claim by such a member can still be ordered before it, even one made \
+                     after it"
+                } else {
+                    ""
+                },
+                clocks_note(&unagreed),
+            ),
+            coord::EXIT_UNAGREED,
+        ),
+        Some(State::Held {
+            owner, acquisition, ..
+        }) if crossed(acquisition) => (
+            false,
+            format!(
+                "{resource} went to {}: your claims crossed and the room orders theirs first — \
+                 you did not get it{}",
+                who(owner),
+                if clocks_note(&unagreed).is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({}.{})",
+                        unagreed_text(&me.author, &unagreed),
+                        clocks_note(&unagreed)
+                    )
+                }
+            ),
+            1,
+        ),
         Some(State::Held {
             owner,
             since_millis,
@@ -1500,6 +1606,7 @@ pub async fn claim_resource(
                 who(owner),
                 millis_as_time(*since_millis)
             ),
+            1,
         ),
         Some(State::Pending {
             to_fp, to_session, ..
@@ -1513,6 +1620,7 @@ pub async fn claim_resource(
                     .map(|s| format!("/{}", session_name(s)))
                     .unwrap_or_default()
             ),
+            1,
         ),
         None => (
             false,
@@ -1520,9 +1628,201 @@ pub async fn claim_resource(
                 "{resource} is not held by anyone, including you — the claim has not \
                  converged yet; run `vox room board {room}` to check"
             ),
+            1,
         ),
     };
-    report(&done, claim::CLAIM, &resource, opts, ok, &said)
+    // **Recorded once the room has answered** (V210-79, V210-168): a session that holds it, agreed
+    // or not yet, is told at its next drain if it stops holding it; one told it lost is not told
+    // again that it "lapsed".
+    if matches!(
+        done.posting.after.fold.resources.get(&resource),
+        Some(State::Held { owner, .. }) if *owner == me
+    ) {
+        crate::agent_hook::note_held(paths, &done.room, &done.session, &resource);
+    }
+    let unagreed_json: Vec<serde_json::Value> = unagreed
+        .iter()
+        .map(|(m, why)| serde_json::json!({"member": claim::b32(m), "why": why}))
+        .collect();
+    report_as(
+        &done,
+        claim::CLAIM,
+        &resource,
+        opts,
+        ok,
+        &said,
+        code,
+        Some(("unagreed", unagreed_json.into())),
+    )
+}
+
+/// Why members did not agree to a claim, as one line naming each: `me` is the claimant, named
+/// "you".
+fn unagreed_text(me: &Digest32, unagreed: &[(Digest32, String)]) -> String {
+    let name = |m: &Digest32| {
+        if m == me {
+            "you".to_owned()
+        } else {
+            format!("member {}", crate::ident::author_id(m))
+        }
+    };
+    let mut parts: Vec<String> = unagreed
+        .iter()
+        .filter(|(_, why)| !why.starts_with(STAMPED_AHEAD))
+        .map(|(m, why)| format!("{} {why}", name(m)))
+        .collect();
+    // The authors of posts the claim is stamped before, in one clause: it is one cause.
+    let ahead: Vec<String> = unagreed
+        .iter()
+        .filter(|(_, why)| why.starts_with(STAMPED_AHEAD))
+        .map(|(m, _)| name(m))
+        .collect();
+    if !ahead.is_empty() {
+        parts.push(format!(
+            "your node holds posts by {} stamped more than {} minutes ahead of your clock, and \
+             your claim is stamped before them although it was made after; check the clocks",
+            ahead.join(" and "),
+            vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+        ));
+    }
+    parts.join("; ")
+}
+
+/// What a claimant must know when clocks are too far apart (V210-168): the room orders claims by
+/// the stamps their nodes gave them, so the board can name a holder whose claim was made later.
+fn clocks_note(unagreed: &[(Digest32, String)]) -> String {
+    let mut note = String::new();
+    if unagreed
+        .iter()
+        .any(|(_, why)| why.starts_with(CLOCKS_APART))
+    {
+        note.push_str(
+            " While the clocks are apart, the board can name a holder whose claim was made later.",
+        );
+    }
+    if unagreed
+        .iter()
+        .any(|(_, why)| why.starts_with(STAMPED_AHEAD))
+    {
+        note.push_str(
+            " The room orders claims by their stamps, so it can order yours before a claim made \
+             earlier, whose maker may have been told they hold it.",
+        );
+    }
+    note
+}
+
+/// How a member whose clock is too far from the claimant's is described.
+const CLOCKS_APART: &str = "has a clock more than";
+
+/// How the author of a post the claim is stamped before, although made after, is described.
+const STAMPED_AHEAD: &str = "made a post stamped more than";
+
+/// The claim-protocol `type`s an agreement compares (V210-168).
+const CLAIM_TYPES: &[&str] = &[
+    claim::CLAIM,
+    claim::RELEASE,
+    claim::HANDOFF,
+    claim::RENEW,
+    vox_agentcomms::envelope::work::DECLINE,
+];
+
+/// How many agreement rounds a claim asks for while claim posts keep arriving between the node's
+/// answer and this client's read of the same posts.
+const AGREE_TRIES: usize = 3;
+
+/// **Does every other member of the room fold this claim as `me`'s?** (V210-168)
+///
+/// The node asks every member it can reach whether it holds this claim, and which claim posts it
+/// holds, pulls what they hold that it does not, and reports each member's set against its own
+/// ([`vox_core::node::agreestream`]). Each set is folded here, as this node's own is. Returns
+/// this node's fold after that, and, for every member that does not fold to `me`, why.
+async fn agreement(
+    paths: &Paths,
+    done: &Done,
+    me: &Owner,
+    resource: &str,
+) -> Result<(claim::Fold, Vec<(Digest32, String)>), AppError> {
+    use vox_core::node::agreestream::Agreement;
+    let mut client = attach(paths).await?;
+    let types: Vec<String> = CLAIM_TYPES.iter().map(|t| (*t).to_owned()).collect();
+    for _ in 0..AGREE_TRIES {
+        let report = match client
+            .request(&Request::Agree {
+                channel_id: done.cid,
+                entry: done.posting.entry_hash,
+                types: types.clone(),
+            })
+            .await
+        {
+            Ok(Frame::Agreement { report }) => report,
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
+        // The node compared its posts as they were when it answered; these must be the same ones.
+        let rows = coord::structured(&mut client, done.cid, CLAIM_TYPES, &[]).await?;
+        if rows.len() as u64 != report.mine {
+            continue;
+        }
+        let posted = coord::posted_of(&rows);
+        let now = coord::now_millis();
+        let own = claim::fold(&posted, coord::VERSION, now);
+        let mut why = Vec::new();
+        for (member, stands) in &report.members {
+            let reason = match stands {
+                Agreement::Holds { unseen, .. } if !unseen.is_empty() => {
+                    Some("holds claims this node has not received".to_owned())
+                }
+                Agreement::Holds { absent, .. } => {
+                    let theirs: Vec<Posted> = posted
+                        .iter()
+                        .filter(|p| !absent.contains(&p.entry_hash))
+                        .cloned()
+                        .collect();
+                    match claim::fold(&theirs, coord::VERSION, now)
+                        .resources
+                        .get(resource)
+                    {
+                        Some(State::Held { owner, .. }) if owner == me => None,
+                        Some(State::Held { owner, .. }) => {
+                            Some(format!("sees {} holding it", who(owner)))
+                        }
+                        Some(State::Pending { .. }) => {
+                            Some("sees it reserved by a handoff".to_owned())
+                        }
+                        None => Some("sees nobody holding it".to_owned()),
+                    }
+                }
+                Agreement::NotReceived => Some(
+                    "has not received your claim (each of you must trust the other)".to_owned(),
+                ),
+                Agreement::NotHeld => Some("does not count you a member of this room".to_owned()),
+                Agreement::TooDifferent => {
+                    Some("holds claims too different from this node's to compare".to_owned())
+                }
+                Agreement::Unreachable => Some("could not be reached".to_owned()),
+                Agreement::Unanswered => Some("did not answer in time".to_owned()),
+                Agreement::ClocksApart => Some(format!(
+                    "{CLOCKS_APART} {} minutes away from yours, too far apart to order claims by; \
+                     set both clocks right",
+                    vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+                )),
+                Agreement::StampedAhead => Some(format!(
+                    "{STAMPED_AHEAD} {} minutes ahead of your clock, and your claim is stamped \
+                     before it although it was made after; check both clocks",
+                    vox_core::node::agreestream::STAMP_LEAD_LIMIT_MILLIS / 60_000
+                )),
+            };
+            if let Some(r) = reason {
+                why.push((*member, r));
+            }
+        }
+        return Ok((own, why));
+    }
+    Err(AppError::Usage(
+        "the room's claims kept changing while its members were asked; run the claim again".into(),
+    ))
 }
 
 /// `vox room release` — give a resource up. Only the exact holding session's release

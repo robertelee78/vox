@@ -112,8 +112,16 @@ vox room decline 774jx5ejeztm "gwa:acme/widgets:prd-1:codec"   # refuse a handof
 Holding an item is not progress. Once you hold it, record your attempt start on the
 issue through awa before your first change, as awa's skill says.
 
-**Check the exit status.** `1` means somebody else holds it — start something else
-rather than duplicating their work. `3` means a worker in the room runs a different
+**Check the exit status.** `0` comes only once every other member agrees it is yours.
+`1` means somebody else holds it, or the room ordered theirs first when your claims
+crossed — start something else rather than duplicating their work. `5` means not every
+member could agree yet (the message names who could not be reached, does not agree, has
+a clock too far from yours, or made a post stamped too far ahead of your clock). Your
+claim stays posted but is not sure to be yours: a claim by one of those members can still
+be ordered before it, and when stamps are that far off, yours can be ordered before a
+claim made earlier. You may start; if another wins, a later turn tells you to stop. Check
+`vox room board`, claim again to ask again, or release it. `3` means
+a worker in the room runs a different
 vox version and coordination is refused until they match; the message names it — tell
 the operator, do not work around it. `4` means you reused an operation id for
 different content.
