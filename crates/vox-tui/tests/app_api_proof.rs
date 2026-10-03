@@ -1277,8 +1277,9 @@ fn a_datagram_for_no_flow_or_an_unknown_context_is_dropped_and_counted() {
             .await
             .expect("CANNOT MEASURE: the attacker could not open a stream");
         let mut kind = vox_core::cbor::Encoder::new();
-        kind.array(1)
-            .uint(u64::from(vox_core::transport::streams::StreamKind::App.as_u8()));
+        kind.array(1).uint(u64::from(
+            vox_core::transport::streams::StreamKind::App.as_u8(),
+        ));
         let open = vox_core::node::app::AppOpen {
             channel_id: room_id,
             labels: vec![LABEL.to_owned()],
@@ -1338,7 +1339,11 @@ fn a_datagram_for_no_flow_or_an_unknown_context_is_dropped_and_counted() {
     );
 
     // 20 for a flow nobody opened, and 20 with a context this version does not define.
-    paced((0..N).map(|i| frame_packet(flow + 4 * (1000 + i), b"nobody")).collect());
+    paced(
+        (0..N)
+            .map(|i| frame_packet(flow + 4 * (1000 + i), b"nobody"))
+            .collect(),
+    );
     paced((0..N).map(|_| unknown_context(b"context two")).collect());
     let mid = datagrams_until(&s.alice, &bob_fp, |v| {
         !v.is_null()
@@ -1350,7 +1355,11 @@ fn a_datagram_for_no_flow_or_an_unknown_context_is_dropped_and_counted() {
     send.reset(0u32.into())
         .expect("CANNOT MEASURE: the attacker could not reset its stream");
     let ended = listen.exited_within(TIMEOUT);
-    paced((0..N).map(|_| frame_packet(flow, b"after the end")).collect());
+    paced(
+        (0..N)
+            .map(|_| frame_packet(flow, b"after the end"))
+            .collect(),
+    );
     let after = datagrams_until(&s.alice, &bob_fp, |v| {
         !v.is_null() && dn(v, "unknown_flow") >= dn(&mid, "unknown_flow") + N
     });

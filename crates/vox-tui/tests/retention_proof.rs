@@ -610,9 +610,13 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
     for i in 1..=10 {
         post(&alice, &room, &format!("old {i}"));
     }
-    until(&bob, &room, "PRODUCT (staging): bob to read the 10", 60, |t| {
-        count(t, "old ") == 10
-    });
+    until(
+        &bob,
+        &room,
+        "PRODUCT (staging): bob to read the 10",
+        60,
+        |t| count(t, "old ") == 10,
+    );
     let posted = Instant::now();
     for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
         until(

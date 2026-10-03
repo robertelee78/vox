@@ -56,9 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use world::{
-    args, lossy_proxy, size_limited_proxy, vox_once, PathKind, Setup, VoxProc, World,
-};
+use world::{args, lossy_proxy, size_limited_proxy, vox_once, PathKind, Setup, VoxProc, World};
 
 /// What the test DNS responder answers every `A` query with.
 const ANSWER: [u8; 4] = [10, 53, 0, 1];
@@ -977,7 +975,7 @@ fn a_circuit_crosses_legs_of_different_datagram_sizes() {
     let clamp: Arc<Mutex<Option<Arc<AtomicU64>>>> = Arc::default();
     let clamp_in = Arc::clone(&clamp);
     let mut w = World::build(&Setup {
-        specs: vec![format!("{dual}/udp")],
+        specs: vec![format!("{dual}={dual}/udp")],
         trusted: true,
         path: PathKind::Relayed,
         guest_leg: Some(Box::new(move |anchor| {

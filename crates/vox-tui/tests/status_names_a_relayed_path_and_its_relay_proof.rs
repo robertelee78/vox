@@ -36,7 +36,7 @@ fn status_names_a_relayed_path_and_its_relay() {
     watchdog::arm();
     let port = echo_service();
     let w = World::build(&Setup {
-        specs: vec![port.to_string()],
+        specs: vec![format!("{port}={port}")],
         trusted: true,
         path: PathKind::Relayed,
         guest_leg: None,
@@ -60,7 +60,10 @@ fn status_names_a_relayed_path_and_its_relay() {
     let until = Instant::now() + Duration::from_secs(30);
     let (row, json) = loop {
         let (ok, out, err) = vox_once(&guest, &args(&["status", "--json"]));
-        assert!(ok, "PRODUCT: the guest's `vox status --json` failed: {out}{err}");
+        assert!(
+            ok,
+            "PRODUCT: the guest's `vox status --json` failed: {out}{err}"
+        );
         let v: Value = serde_json::from_str(&out)
             .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` did not parse ({e}): {out}"));
         let row = v["peers"]
