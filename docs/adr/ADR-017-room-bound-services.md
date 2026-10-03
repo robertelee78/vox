@@ -136,7 +136,9 @@ is what a person offers. A tunnel is how bytes reach it.
 - **5.1** `vox up` MUST run a SOCKS5 proxy on loopback, by default `127.0.0.1:1080`. The proxy MUST
   resolve `.vox` names itself (`socks5h`), and MUST carry each connection to the host as a tunnel.
 - **5.2** With no room argument, `vox up` MUST run in the node already holding the profile
-  (`vox daemon`). It MUST resolve names against every room that node holds, as they stand when each
+  (`vox daemon`). *Decided, not built (ADR-026):* `vox up` is a client of the account's daemon and
+  runs as the node it resolves (ADR-026 C-3); its proxy is a held session that ends, non-zero, when
+  the daemon stops (ADR-026 L-7). It MUST resolve names against every room that node holds, as they stand when each
   connection asks. A single room MAY be named.
 - **5.3** The proxy MUST refuse a literal-address CONNECT and a name it cannot resolve. It MUST NOT
   act as a general-purpose proxy.
@@ -168,13 +170,15 @@ is what a person offers. A tunnel is how bytes reach it.
 ### 7. The anchor is configuration, not an argument (M17.4)
 
 - **7.1** `vox node` MUST write its own anchor spec to `<config_dir>/anchors`, and every command MUST
-  read that file. The file is machine-wide, shared by every profile on the machine.
+  read that file. The file is machine-wide, shared by every profile on the machine. *Decided, not
+  built (ADR-026 F-1, F-3):* anchors are a per-node setting in `nodes/<name>/config`; migration copies
+  the machine-wide file into every migrated node's config.
 - **7.2** `--anchor` MUST merge with the file, not replace it.
 - **7.3** The file MUST hold one anchor spec per line (`<fingerprint>@<multiaddr>`, or a host name and
   port). `#` comments and blank lines MUST be skipped. The file MUST be rewritten whole on every
   address change, through a temporary file and a rename. A malformed line MUST NOT be skipped
   silently. The file holds no secret.
-- **7.4** A running daemon MUST re-read the file and re-resolve every spec every `ANCHOR_REFRESH`
+- **7.4** A running daemon (under ADR-026, for each attached node) MUST re-read the file and re-resolve every spec every `ANCHOR_REFRESH`
   (30 s). An anchor that moved MUST replace its old address, in the node's set and in each room's
   stored set. **Known limit:** a host name whose record moves while the file is untouched takes the
   same code path, but is not measured.
