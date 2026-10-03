@@ -11,6 +11,14 @@
 //! notification to a file, so what is counted is the shipped binary's own decision to
 //! notify. Kill bob: exactly one "unreachable" notification. Leave him dead for three
 //! minutes: still exactly one. Start him again: exactly one "recovered".
+//!
+//! The anchor's proof stages the other condition R37 names, an anchor that cannot be reached,
+//! and the rule ADR-012 sets for it: an anchor only bridges hosts that cannot otherwise find each
+//! other, so one this node does not need alarms no one.
+//!
+//! **A red names its side:** `PRODUCT:` quotes what the daemon notified or `vox status` said; a
+//! `vox` step the scene needs that fails is `PRODUCT (staging):`; the test's own files and
+//! sockets are `APPARATUS:`; a scene that could not be staged as described is `CANNOT MEASURE:`.
 
 #![cfg(unix)]
 
@@ -46,14 +54,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: vox's stdin")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -64,15 +72,15 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
 /// `vox status --json`, parsed.
 fn status(data: &Path) -> Value {
     let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
-    assert!(ok, "vox status failed: {err}");
-    serde_json::from_str(&out).expect("vox status --json prints JSON")
+    assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
+    serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` printed no JSON ({e}): {out}"))
 }
 
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: a free UDP port")
         .port()
 }
 
@@ -85,7 +93,7 @@ fn port_free(port: u16) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    panic!("127.0.0.1:{port} was never released by the stopped daemon");
+    panic!("PRODUCT (staging): 127.0.0.1:{port} was never released by the stopped process");
 }
 
 /// The notifications the script has recorded, one per line.
@@ -112,13 +120,13 @@ fn wait_until(what: &str, within: Duration, mut f: impl FnMut() -> bool) {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("timed out waiting for {what}");
+    panic!("PRODUCT: timed out waiting for {what}");
 }
 
 /// A member's profile directory, as the harness lays it out (`cfg` inside it).
 fn member_dir(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
     let d = tmp.path().join(name);
-    std::fs::create_dir_all(d.join("cfg")).unwrap();
+    std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: a profile directory");
     d
 }
 
@@ -143,7 +151,7 @@ fn daemon(
             "--anchor",
             anchor,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ]),
         env,
     );
@@ -154,7 +162,10 @@ fn daemon(
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!(
+        "PRODUCT (staging): {name}'s daemon never answered `vox room list`; it said:\n{}",
+        p.transcript()
+    );
 }
 
 /// The script `VOX_NOTIFY_COMMAND` runs: one line per notification, into `file`.
@@ -168,8 +179,9 @@ fn notify_script(tmp: &tempfile::TempDir, file: &Path) -> PathBuf {
             file.display()
         ),
     )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    .expect("APPARATUS: write the notify script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("APPARATUS: make the notify script executable");
     script
 }
 
@@ -198,9 +210,9 @@ fn desktop_stub(tmp: &tempfile::TempDir, file: &Path) -> PathBuf {
     dir
 }
 
-/// The scene both proofs share: an anchor, and alice's and bob's daemons trusting each other
-/// in one room, alice's notifying through `script`. Returns when alice's `vox status` shows
-/// bob connected.
+/// The scene the proofs share: an anchor, and alice's and bob's daemons trusting each other in one
+/// room, alice's daemon run with `alice_env` (how it notifies). Returns when alice's `vox status`
+/// shows bob connected.
 struct Scene {
     _anchor: VoxProc,
     anchor: String,
@@ -213,14 +225,19 @@ struct Scene {
     pass_file: PathBuf,
 }
 
-fn scene(tmp: &tempfile::TempDir, script: &Path, before_alice: impl FnOnce(&Path)) -> Scene {
+fn scene(
+    tmp: &tempfile::TempDir,
+    alice_env: &[(&str, &str)],
+    before_alice: impl FnOnce(&Path),
+) -> Scene {
     let anchor_dir = member_dir(tmp, "anchor");
     let alice_dir = member_dir(tmp, "alice");
     let bob_dir = member_dir(tmp, "bob");
     // The identity passphrase, and a line that opens the room once there is one: that is
     // what reopens bob's room when his daemon starts again.
     let pass_file = tmp.path().join("passphrases");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n{ROOM_PASS}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n{ROOM_PASS}\n"))
+        .expect("APPARATUS: write the passphrase file");
 
     let mut anchor = VoxProc::spawn(
         "anchor",
@@ -236,25 +253,19 @@ fn scene(tmp: &tempfile::TempDir, script: &Path, before_alice: impl FnOnce(&Path
 
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let (alice_id, bob_id) = (fp(&alice_dir), fp(&bob_dir));
     for (d, peer, name) in [(&alice_dir, &bob_id, "bob"), (&bob_dir, &alice_id, "alice")] {
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", peer, "--name", name]));
-        assert!(ok, "vox trust add {name}: {out}{err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {out}{err}");
     }
     before_alice(&alice_dir);
 
     let (alice_port, bob_port) = (free_udp_port(), free_udp_port());
-    let script = script.to_str().unwrap();
     let alice = daemon(
-        "alice",
-        &alice_dir,
-        alice_port,
-        &spec,
-        &pass_file,
-        &[("VOX_NOTIFY_COMMAND", script)],
+        "alice", &alice_dir, alice_port, &spec, &pass_file, alice_env,
     );
     let bob = daemon("bob", &bob_dir, bob_port, &spec, &pass_file, &[]);
 
@@ -263,17 +274,17 @@ fn scene(tmp: &tempfile::TempDir, script: &Path, before_alice: impl FnOnce(&Path
         &["room", "create", "--passphrase-file", "-", "--name", "ops"],
         ROOM_PASS,
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("ops"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the room alice made is not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let deadline = Instant::now() + SETUP;
     loop {
         let (ok, out, err) = vox_in(
@@ -294,14 +305,19 @@ fn scene(tmp: &tempfile::TempDir, script: &Path, before_alice: impl FnOnce(&Path
         }
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: bob never joined: {out}{err}"
+            "PRODUCT (staging): bob never joined: {out}{err}"
         );
         std::thread::sleep(Duration::from_secs(5));
     }
 
-    wait_until("alice's daemon to reach bob's", SETUP, || {
-        connected(&status(&alice_dir), &bob_id)
-    });
+    let reached = Instant::now() + SETUP;
+    while !connected(&status(&alice_dir), &bob_id) {
+        assert!(
+            Instant::now() < reached,
+            "PRODUCT (staging): alice's daemon never reached bob's within {SETUP:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     Scene {
         _anchor: anchor,
         anchor: spec,
@@ -324,12 +340,13 @@ fn connected(s: &Value, peer: &str) -> bool {
 }
 
 #[test]
-#[ignore = "an anchor and two real daemons, one killed for three minutes; CI runs it in release"]
+#[ignore = "an anchor and two real daemons, one killed for three minutes; run on demand"]
 fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let file = tmp.path().join("notifications.log");
     let script = notify_script(&tmp, &file);
+    let script = script.to_str().expect("APPARATUS: a UTF-8 temp path");
     let Scene {
         _anchor,
         anchor,
@@ -340,7 +357,7 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
         bob_port,
         bob_id,
         pass_file,
-    } = scene(&tmp, &script, |_| {});
+    } = scene(&tmp, &[("VOX_NOTIFY_COMMAND", script)], |_| {});
     let bob_short: String = bob_id.chars().take(12).collect();
 
     // Two checks' worth, so a notification for a healthy state would have fired by now.
@@ -349,7 +366,7 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
     assert_eq!(
         count(&healthy, "unreachable", &bob_short),
         0,
-        "nothing about bob while he is up: {healthy:?}"
+        "PRODUCT: a notification about bob while he is up: {healthy:?}"
     );
 
     // Kill bob's daemon by its PID. QUIC notices at its idle timeout.
@@ -373,7 +390,7 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
     assert_eq!(
         count(&held, "unreachable", &bob_short),
         1,
-        "three minutes of one condition is one notification, not one per check: {held:?}"
+        "PRODUCT: three minutes of one condition is one notification, not one per check: {held:?}"
     );
 
     // Bring bob back on the same port; his passphrase file reopens the room.
@@ -401,24 +418,25 @@ fn a_condition_notifies_once_when_it_starts_and_once_when_it_clears() {
     assert_eq!(
         count(&end, "unreachable", &bob_short) - count(&end, "recovered", &bob_short),
         1,
-        "still exactly one raised"
+        "PRODUCT: still exactly one raised: {end:?}"
     );
     assert_eq!(
         count(&end, "recovered", &bob_short),
         1,
-        "and exactly one when it cleared"
+        "PRODUCT: and exactly one when it cleared: {end:?}"
     );
 }
 
 /// **Opt-out.** With `notify = off` in alice's config the same death raises nothing, and
 /// the daemon says at start that notifications are off.
 #[test]
-#[ignore = "an anchor and two real daemons, one killed; CI runs it in release"]
+#[ignore = "an anchor and two real daemons, one killed; run on demand"]
 fn notify_off_raises_nothing() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let file = tmp.path().join("notifications.log");
     let script = notify_script(&tmp, &file);
+    let script = script.to_str().expect("APPARATUS: a UTF-8 temp path");
     let Scene {
         _anchor,
         mut alice,
@@ -426,11 +444,12 @@ fn notify_off_raises_nothing() {
         mut bob,
         bob_id,
         ..
-    } = scene(&tmp, &script, |alice_dir| {
+    } = scene(&tmp, &[("VOX_NOTIFY_COMMAND", script)], |alice_dir| {
         let config = Paths::resolve("default", Some(alice_dir), Some(&alice_dir.join("cfg")))
-            .unwrap()
+            .expect("APPARATUS: alice's profile paths")
             .config_file();
-        std::fs::write(config, "# set by the proof\nnotify = off\n").unwrap();
+        std::fs::write(config, "# set by the proof\nnotify = off\n")
+            .expect("APPARATUS: write alice's config");
     });
     std::thread::sleep(Duration::from_secs(2));
     let _ = bob.child.kill();
@@ -456,11 +475,11 @@ fn notify_off_raises_nothing() {
     );
     assert!(
         lines.is_empty(),
-        "notify = off must raise nothing about {short}"
+        "PRODUCT: notify = off must raise nothing about {short}: {lines:?}"
     );
     assert!(
         said.contains("notifications off"),
-        "and the daemon must say they are off"
+        "PRODUCT: the daemon must say at start that notifications are off; it said:\n{said}"
     );
 }
 
@@ -474,19 +493,42 @@ fn anchor_reached(s: &Value, id: &str) -> Option<bool> {
         .and_then(|a| a["reached"].as_bool())
 }
 
-/// **An anchor that cannot be reached** (PRD-001 R37). alice's daemon keeps one anchor; the anchor
-/// is killed by its PID: exactly one "unreachable" notification naming it, after
-/// `ANCHOR_UNREACHABLE_SECS` (60 s) and not before, and still one half a minute later. The anchor
-/// is started again on the same port with the same profile: exactly one "recovered".
+/// Whether alice's `vox status --json` shows a live **direct** connection to `peer`.
+fn direct_to(s: &Value, peer: &str) -> bool {
+    s["peers"].as_array().is_some_and(|ps| {
+        ps.iter()
+            .any(|p| p["id"].as_str() == Some(peer) && p["path"].as_str() == Some("direct"))
+    })
+}
+
+/// How long an anchor this node does not need is watched for a notification that must not come:
+/// past `ANCHOR_UNREACHABLE_SECS` (60 s), and two of the notifier's checks more.
+const UNNEEDED_WATCH: Duration = Duration::from_secs(80);
+
+/// **An anchor that cannot be reached, alarming only when this node needs it** (PRD-001 R37,
+/// ADR-012: an anchor only bridges hosts that cannot otherwise find each other).
+///
+/// alice and bob share a room over a **direct** connection, and alice keeps one anchor.
+/// 1. **Not needed.** The anchor is killed by its PID while bob is reached directly: over
+///    [`UNNEEDED_WATCH`], past the 60 s an anchor restarting is given, nothing is raised about it.
+/// 2. **Needed.** bob's daemon is killed too, so alice has a trusted member she reaches by no
+///    direct connection, and an anchor is what would bridge them: exactly one "unreachable"
+///    notification naming the anchor, and still one half a minute later.
+/// 3. The anchor is started again on the same port with the same profile: exactly one
+///    "recovered".
 ///
 /// **Through the desktop's own notifier**, not `VOX_NOTIFY_COMMAND`: alice's daemon finds a
 /// recording `osascript` (macOS) or `notify-send` (Linux) first on its `PATH`, so this shows the
 /// shipped binary invoking the platform notifier, and that it hands it the right title and body.
 /// The other proofs here observe through `VOX_NOTIFY_COMMAND`.
+///
+/// Mutations: an anchor line raised whether or not the node needs it goes red at (1); no anchor
+/// line at all goes red at (2).
 #[test]
-#[ignore = "an anchor and a real daemon, the anchor killed for over a minute; CI runs it in release"]
+#[ignore = "an anchor and two real daemons, the anchor killed for over two minutes; run on demand"]
 fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
-    watchdog::arm();
+    // Setup, 80 s of an unneeded anchor, up to 150 s for the needed one, then its return.
+    watchdog::arm_for(Duration::from_secs(900));
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let file = tmp.path().join("notifications.log");
     // The desktop's own notifier, not `VOX_NOTIFY_COMMAND`: a recording `osascript` (macOS) or
@@ -497,41 +539,45 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
         stub_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let anchor_dir = member_dir(&tmp, "anchor");
-    let alice_dir = member_dir(&tmp, "alice");
-    let pass_file = tmp.path().join("passphrases");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: passphrase file");
-
-    let anchor_port = free_udp_port();
-    let listen = format!("127.0.0.1:{anchor_port}");
-    let node = |dir: &Path| VoxProc::spawn("anchor", dir, &args(&["node", "--listen", &listen]));
-    let mut anchor = node(&anchor_dir);
-    let spec = anchor
-        .expect_line("an --anchor spec", |l| {
-            l.trim_start().contains("@/ip4/127.0.0.1/udp/")
-        })
-        .trim()
-        .to_owned();
-    let anchor_id = spec.split('@').next().unwrap_or_default().to_owned();
+    let Scene {
+        _anchor: mut the_anchor,
+        anchor,
+        alice: _alice,
+        alice_dir,
+        mut bob,
+        bob_id,
+        ..
+    } = scene(&tmp, &[("PATH", path.as_str())], |_| {});
+    let anchor_id = anchor.split('@').next().unwrap_or_default().to_owned();
     let anchor_short: String = anchor_id.chars().take(12).collect();
+    let anchor_port: u16 = anchor
+        .rsplit('/')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("APPARATUS: no port in the anchor spec {anchor}"));
+    let about_anchor = |lines: &[String]| count(lines, "unreachable", &anchor_short);
+    let flagged = |s: &Value| {
+        s["unhealthy"].as_array().is_some_and(|u| {
+            u.iter().any(|l| {
+                l["key"]
+                    .as_str()
+                    .is_some_and(|k| k == format!("anchor-unreachable:{anchor_id}"))
+            })
+        })
+    };
 
-    let (ok, _, err) = vox_once(&alice_dir, &args(&["id"]));
-    assert!(ok, "PRODUCT: vox id: {err}");
-    let _alice = daemon(
-        "alice",
-        &alice_dir,
-        free_udp_port(),
-        &spec,
-        &pass_file,
-        &[("PATH", path.as_str())],
-    );
     let reached = Instant::now() + SETUP;
-    while anchor_reached(&status(&alice_dir), &anchor_id) != Some(true) {
+    loop {
+        let s = status(&alice_dir);
+        if anchor_reached(&s, &anchor_id) == Some(true) && direct_to(&s, &bob_id) {
+            break;
+        }
         assert!(
             Instant::now() < reached,
-            "CANNOT MEASURE: precondition unmet: alice never reached her anchor {anchor_short}: \
-             {}",
-            status(&alice_dir)["anchors"]
+            "CANNOT MEASURE: alice never both reached her anchor {anchor_short} and held a direct \
+             connection to bob: anchors {}, peers {}",
+            s["anchors"],
+            s["peers"]
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -539,39 +585,69 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
     std::thread::sleep(Duration::from_secs(11));
     let healthy = notes(&file);
     assert_eq!(
-        count(&healthy, "unreachable", &anchor_short),
+        about_anchor(&healthy),
         0,
         "PRODUCT: a notification about the anchor while it is up: {healthy:?}"
     );
 
-    // Kill the anchor by its PID.
+    // (1) Not needed: the anchor is killed by its PID while bob is reached directly.
     let killed = Instant::now();
-    let _ = anchor.child.kill();
-    let _ = anchor.child.wait();
-    let until = killed + Duration::from_secs(150);
-    while count(&notes(&file), "unreachable", &anchor_short) == 0 {
+    let _ = the_anchor.child.kill();
+    let _ = the_anchor.child.wait();
+    while killed.elapsed() < UNNEEDED_WATCH {
+        let s = status(&alice_dir);
+        assert!(
+            direct_to(&s, &bob_id),
+            "CANNOT MEASURE: alice lost her direct connection to bob {:?} after the anchor was \
+             killed, so whether she needs the anchor changed under the measurement: peers {}",
+            killed.elapsed(),
+            s["peers"]
+        );
+        let raised = notes(&file);
+        assert!(
+            about_anchor(&raised) == 0 && !flagged(&s),
+            "PRODUCT: an anchor this node does not need alarmed a person (ADR-012: an anchor only \
+             bridges hosts that cannot otherwise find each other): {:?} after it was killed, with \
+             bob reached directly, alice's status flags {} and the notifier got {raised:?}",
+            killed.elapsed(),
+            s["unhealthy"]
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!(
+        "[proof] (1) the anchor down {:?} with bob reached directly: nothing raised",
+        killed.elapsed()
+    );
+
+    // (2) Needed: bob's daemon is killed too, so no trusted member is reached directly.
+    let bob_killed = Instant::now();
+    let _ = bob.child.kill();
+    let _ = bob.child.wait();
+    let until = bob_killed + Duration::from_secs(150);
+    while about_anchor(&notes(&file)) == 0 {
         assert!(
             Instant::now() < until,
-            "PRODUCT: no notification {:?} after alice's anchor {anchor_short} was killed; her \
-             status says {}; notifications: {:?}",
+            "PRODUCT: no notification about the anchor {anchor_short}, down {:?}, {:?} after bob \
+             was killed left alice a member she reaches by no direct connection; her status says \
+             {}; notifications: {:?}",
             killed.elapsed(),
+            bob_killed.elapsed(),
             status(&alice_dir)["unhealthy"],
             notes(&file)
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    let raised_after = killed.elapsed();
+    let raised_after = bob_killed.elapsed();
     // Half a minute more of the same condition.
     std::thread::sleep(Duration::from_secs(30));
     let held = notes(&file);
-    eprintln!("[proof] raised {raised_after:?} after the anchor was killed; 30 s later: {held:?}");
-    assert!(
-        raised_after >= Duration::from_secs(60),
-        "PRODUCT: the anchor was called unreachable after {raised_after:?}, before the 60 s an \
-         anchor restarting is given: {held:?}"
+    eprintln!(
+        "[proof] (2) raised {raised_after:?} after bob was killed (the anchor down {:?}); 30 s \
+         later: {held:?}",
+        killed.elapsed()
     );
     assert_eq!(
-        count(&held, "unreachable", &anchor_short),
+        about_anchor(&held),
         1,
         "PRODUCT: one condition is one notification, not one per check: {held:?}"
     );
@@ -595,10 +671,14 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
          {body:?}: it got {raised:?}"
     );
 
-    // The anchor again, same profile, same port.
-    drop(anchor);
+    // (3) The anchor again, same profile, same port.
+    drop(the_anchor);
     port_free(anchor_port);
-    let _anchor_again = node(&anchor_dir);
+    let _anchor_again = VoxProc::spawn(
+        "anchor",
+        &tmp.path().join("anchor"),
+        &args(&["node", "--listen", &format!("127.0.0.1:{anchor_port}")]),
+    );
     let back = Instant::now();
     let until = back + Duration::from_secs(120);
     while count(&notes(&file), "recovered", &anchor_short) == 0 {
@@ -615,12 +695,9 @@ fn an_unreachable_anchor_notifies_once_and_once_when_it_is_back() {
     let recovered_after = back.elapsed();
     std::thread::sleep(Duration::from_secs(11));
     let end = notes(&file);
-    eprintln!("[proof] recovered {recovered_after:?} after the anchor was back: {end:?}");
+    eprintln!("[proof] (3) recovered {recovered_after:?} after the anchor was back: {end:?}");
     assert_eq!(
-        (
-            count(&end, "unreachable", &anchor_short),
-            count(&end, "recovered", &anchor_short)
-        ),
+        (about_anchor(&end), count(&end, "recovered", &anchor_short)),
         (2, 1),
         "PRODUCT: exactly one raised (the recovered line repeats its text) and one cleared: \
          {end:?}"
@@ -645,6 +722,7 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
     let tmp = tempfile::tempdir().expect("APPARATUS: a tempdir");
     let file = tmp.path().join("notifications.log");
     let script = notify_script(&tmp, &file);
+    let script = script.to_str().expect("APPARATUS: a UTF-8 temp path");
     let Scene {
         _anchor: mut the_anchor,
         anchor,
@@ -655,7 +733,7 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
         bob_port,
         pass_file,
         ..
-    } = scene(&tmp, &script, |_| {});
+    } = scene(&tmp, &[("VOX_NOTIFY_COMMAND", script)], |_| {});
     let anchor_port = anchor.rsplit('/').next().unwrap_or_default().to_owned();
     let room: String = status(&alice_dir)["rooms"][0]["id"]
         .as_str()

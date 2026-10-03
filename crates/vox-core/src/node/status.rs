@@ -15,9 +15,12 @@
 //!
 //! - a room with other members that has not completed a sync in [`STALE_SYNC_SECS`];
 //! - a **trusted** member of an open room this node was connected to and no longer is;
-//! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_SECS`]. An
-//!   anchor only bridges hosts that cannot otherwise find each other (ADR-012), so the line says
-//!   what that costs and what it does not: peers this node reaches directly are unaffected.
+//! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_SECS`], while
+//!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
+//!   (ADR-012), so an anchor this node does not need alarms no one: the line is raised only while
+//!   an open room has a trusted member this node does not hold a direct connection to (one it
+//!   reaches over a relay, or not at all). Every member reached directly, or no member at all,
+//!   and a lost anchor costs nothing now. The line says what it costs and what it does not.
 //!
 //! An untrusted member that is offline is not flagged: nothing this node does depends on
 //! reaching it. A trusted one is who this node reads, and is read by.
@@ -259,7 +262,15 @@ impl StatusReport {
                 }
             }
         }
-        if self.networked {
+        // Whether this node needs an anchor now (ADR-012: an anchor only bridges): some open room
+        // has a trusted member it holds no direct connection to.
+        let direct = |id: &Digest32| self.peers.iter().any(|p| p.id == *id && p.path == "direct");
+        let needs_a_bridge = self.rooms.iter().any(|room| {
+            room.members
+                .iter()
+                .any(|m| !m.me && m.trusted && !direct(&m.id))
+        });
+        if self.networked && needs_a_bridge {
             for a in &self.anchors {
                 let Some(since) = a.unreached_since else {
                     continue;
