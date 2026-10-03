@@ -351,14 +351,18 @@ fn migrate(first: First) {
         "default",
         &[
             "daemon",
+            "--node",
+            "default",
             "--listen",
             "127.0.0.1:0",
             "--passphrase-file",
             &pass,
         ],
     );
-    d.wait_for("PRODUCT", "its control socket", |l| {
-        l.contains("control socket")
+    // The node is attached once the daemon says its identity: since ADR-026 the account's
+    // control socket is announced before the foreground node attaches.
+    d.wait_for("PRODUCT", "its identity", |l| {
+        l.starts_with("vox daemon: identity ")
     });
     let rooms = ok("PRODUCT", new, &root, "default", &["room", "list"], "").0;
     let notify = d.wait_for("PRODUCT", "that notifications are off", |l| {
