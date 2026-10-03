@@ -2145,6 +2145,9 @@ pub fn run() -> ExitCode {
                 );
                 ExitCode::SUCCESS
             }
+            // The entry is a matcher group holding `hooks`, as Claude Code's is: Codex 0.160
+            // lists a bare `{ "command": … }` entry as no hook at all, so the room never
+            // drained (V210-169).
             "codex" => {
                 println!(
                     "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
@@ -2157,6 +2160,8 @@ pub fn run() -> ExitCode {
                      — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
                      drain into nothing.\n     The hook drains every room the node holds.\n     \
+                     Vox never interrupts a Codex session: an urgent message to one waits \
+                     for its next turn, and a poster on the same node is told so.\n     \
                      Install the skill beside it: {}",
                     skill_install("codex", skill_dir("codex").unwrap_or_default())
                 );

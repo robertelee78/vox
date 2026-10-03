@@ -58,6 +58,9 @@ struct HookInput {
     /// The prompt this turn runs on (`UserPromptSubmit`'s `prompt`): a person's words, or a
     /// wake the harness was handed as its own user message.
     prompt: String,
+    /// Whether the input is Codex's ([`crate::wake::codex_input`]): its `transcript_path` names
+    /// a Codex rollout, or it carries Codex's `turn_id`.
+    codex: bool,
 }
 
 fn parse_input(raw: &str) -> HookInput {
@@ -78,6 +81,12 @@ fn parse_input(raw: &str) -> HookInput {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        codex: crate::wake::codex_input(
+            v.get("transcript_path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            v.get("turn_id").is_some(),
+        ),
     }
 }
 
@@ -956,7 +965,7 @@ async fn drain(
     // session id and what the harness put in our environment (ADR-020 §6). It is a
     // side effect of the drain rather than a step an operator configures, and the
     // next turn rewrites it, so a stale entry corrects itself.
-    crate::wake::register(paths, &input.session_id);
+    crate::wake::register(paths, &input.session_id, input.codex);
 
     let mut drains = Vec::new();
     // **One room that cannot be read does not silence the others** (V210-163): it is named,

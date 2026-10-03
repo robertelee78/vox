@@ -451,7 +451,7 @@ conventions and vocabulary; a hook guarantees the read.
 | Harness | Drain at turn start | Push into a live session |
 | --- | --- | --- |
 | Claude Code | `UserPromptSubmit` hook returning `hookSpecificOutput.additionalContext` | `CLAUDE_CODE_MESSAGING_SOCKET` (between tool calls; new turn if idle) |
-| Codex | `UserPromptSubmit` hook; plain stdout becomes `additionalContext`. **MUST** be synchronous (`async: true` is observation-only) | `turn/start` when idle. **Mid-turn, `turn/start` is accepted but folded into the running turn** (no new turn; measured by Orca on codex-cli 0.147.0, 0.150.1 and 0.153.4), so a mid-turn delivery uses `turn/steer` with `expectedTurnId` (ctm's path). Corrected 2026-09-25 (M19.12); this row said "`turn/start` — ungated, valid both idle and mid-turn at `rust-v0.155.1`" |
+| Codex | `UserPromptSubmit` hook; plain stdout becomes `additionalContext`. **MUST** be synchronous (`async: true` is observation-only) | **Not used by Vox** (M19.6): a quit session's thread can stay loaded, so a wake could start a turn nobody is in. For reference: `turn/start` when idle; mid-turn, `turn/start` is folded into the running turn (Orca, codex-cli 0.147.0, 0.150.1 and 0.153.4), and ctm delivers with `turn/steer` and `expectedTurnId` (M19.12) |
 | OpenCode | plugin `chat.message`, mutating `output.parts` | `POST /session/:id/prompt_async` — valid mid-turn |
 
 Claude Code and Codex share the hook name *and* the injection field, so one mechanism covers both.
@@ -968,7 +968,7 @@ Both unknowns are already spiked; neither remains open.
   > (`Content::VERSION = 2`, `CACHE_VERSION = 2`, version 1 still read); `work_board_proof` went
   > 1-in-3 failing → **6 of 6** at loads 4–45 and is back in the blocking release gate.
 
-- **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex named and not implemented. §6 says queue always and interrupt only when
+- **M19.6 — the interrupt path. DONE 2026-09-22**, for Claude Code and OpenCode; Codex wakes are not supported, and the poster is told so (V210-169). §6 says queue always and interrupt only when
   *addressed* and *urgent*; the queue half is built and proven, this is the other half. It is the
   most speculative milestone left, because all three mechanisms are undocumented and the OpenCode
   work showed what that costs — four confident hypotheses, each with a run that appeared to confirm
@@ -1008,10 +1008,18 @@ Both unknowns are already spiked; neither remains open.
 
   Built as designed: `vox agent hook` records the session's wake channel as a side effect of the
   drain, and `vox daemon` — the only thing that sees every entry land *and* knows which local
-  sessions exist — decides and delivers. Codex is **named and not implemented**: this build has no
-  verified path to its app-server socket from a hook's environment, so waking it reports plainly
-  that it cannot, and the message waits for the session's next turn. That is the correct
-  degradation, because queueing always is the default and the interrupt is the optimisation.
+  sessions exist — decides and delivers. **Codex wakes are not supported** (decided 2026-10-02,
+  V210-169). Codex's shared app-server keeps a session's thread loaded for a while after the user
+  quits, so a `turn/start` or `turn/steer` sent there can start a model turn in a session nobody is
+  in, and Vox **MUST NOT** start a model run. Vox **MUST NOT** send either to Codex. A Codex session
+  **MUST** be registered from the hook's input (its rollout `transcript_path` or `turn_id`), before
+  any Claude Code variables a Codex started from a Claude Code terminal inherits. A wake is addressed to a node, not a session (V210-161), so a Codex session needs no
+  name. When an urgent post addresses the poster's own node and no session of that node can be
+  interrupted (only Codex sessions, or none that left Vox a way to reach it), `vox room post` **MUST**
+  tell the poster so in one line, and that each session reads the message at its next turn. That line
+  speaks only for the poster's node: another node wakes its own sessions, or not, and a poster there
+  is not told. The message waits in the room, because
+  queueing always is the default and the interrupt is the optimisation.
 
   > **Named defect, 2026-09-24 (ADR-021 F17) — measured: the OpenCode half of this milestone never
   > worked for a hand-opened session.** OpenCode 1.18.32 sets no `OPENCODE_SERVER_URL`, and a plain TUI
@@ -1141,7 +1149,7 @@ Both unknowns are already spiked; neither remains open.
   app-server `turn/start` works mid-turn (corrected 2026-09-25). Orca measured (codex-cli 0.147.0, 0.150.1 and 0.153.4) that a
   mid-turn `turn/start` is **folded into the running turn**, and ctm delivers mid-turn with `turn/steer`
   and `expectedTurnId`. The text **MUST** say so, and any Codex wake **MUST** use `turn/steer` for a
-  running turn. Implementing the Codex wake is not decided here.
+  running turn. Vox does not wake Codex (M19.6, decided 2026-10-02), so neither is sent.
 
 A TUI view for the operator is explicitly deferred until a real room has misbehaved and shown what
 needs filtering.

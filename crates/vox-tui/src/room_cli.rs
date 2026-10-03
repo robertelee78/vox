@@ -597,6 +597,15 @@ pub async fn post_cmd(
     };
     let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
+    // **An addressee that cannot be interrupted is named to the poster** (V210-169): the
+    // message is posted, and waits in the room for that session's next turn. This node's
+    // sessions only: another node decides for its own.
+    if opts.urgent {
+        let me = client.me().map(|m| b32_encode(&m)).unwrap_or_default();
+        if let Some(line) = crate::wake::uninterruptible(paths, &me, &draft.to) {
+            eprintln!("vox: {line}");
+        }
+    }
     // **A `result` says what it has not read** (ADR-021 M21.10). A redirect addressed
     // to this session can land after its last drain and before it reports; the result
     // still posts, and the caller is shown every such message so it can follow up.
