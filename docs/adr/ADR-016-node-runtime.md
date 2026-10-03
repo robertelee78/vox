@@ -296,8 +296,34 @@ Two supporting facts follow from moving it:
   the v0.2.9 integration tree failed 0 of 2 (Alice ran ~40,000 empty sessions with Carol in two
   minutes; Bob ran none). With the fix it passed 3 of 3 in 10–12s.
 
-  Still open: the member→anchor session in that gate fails every time (`sync failed: transport`),
-  in greens as well as reds; and opening a stream has no deadline.
+  Still open: opening a stream has no deadline.
+
+  **Member→anchor sessions on a relayed path (V210-139, 2026-10-02).** This section used to say
+  "the member→anchor session in that gate fails every time (`sync failed: transport`), in greens as
+  well as reds". "That gate" was `node_m15_anchor_gate`, from "A peer skipped behind a busy room": a
+  headless anchor and two members behind symmetric NATs on the in-process virtual network, their
+  pair on a circuit through the anchor. It was not `node_m19_untrust_lock_gate`, which had no
+  anchor. Both gates were deleted (V29-17).
+
+  Measured with the shipped binary on a relayed path, on loopback: an anchor (`vox node --listen
+  [::]:0`) and three daemons, Alice on `127.0.0.1`, Bob and Carol on `[::1]`. Alice cannot send Bob
+  or Carol a datagram, so their pairs ride the anchor's circuit (it reported 2 circuits carried).
+  Bob read Alice's post over the circuit 0.07–0.13 s after she posted. In each member's
+  `vox status`, the anchor's row showed 0 failed sessions (Alice's went from 15 to 19 completed;
+  Bob's had one partial, a session that ended without error short of some entries), and no daemon
+  logged a sync with the anchor that did not complete. Alice then killed Carol, removed her
+  with `vox trust remove`, posted once with Bob online (he read it in 0.07 s, re-keyed over the
+  circuit), and posted again after Bob stopped. Alice stopped. Bob, back with only the anchor
+  online, read the second post 0.01 s after his daemon answered, so the anchor held it from Alice's
+  sessions alone. Carol, back with everyone for 20 s, read neither post. Mutant (every session
+  with an anchor refused or not started after a removal): Bob had not read the second post 60 s
+  after he was back, PRODUCT. Alice's `failed` count for the anchor stayed 0 under that mutant, so
+  the count alone does not show it.
+
+  **What this does not cover.** No address is translated, no mapping is symmetric, and no hole
+  punch is tried and defeated: the members reach the anchor at their real addresses. Members
+  behind real NATs could not be built without root, so whether the failure seen in
+  `node_m15_anchor_gate` occurs behind NATs is still open.
 
 ### Milestones and gates
 
@@ -996,9 +1022,18 @@ These record the concrete decisions made building this ADR (`crates/vox-core/src
   Gate `crates/vox-tui/tests/a_dead_member_does_not_stall_the_room_proof.rs` (a real anchor and three
   real daemons; Carol's daemon killed by PID; five posts from Alice timed to Bob's `vox room read`,
   bound 1 s, R40): 56–65 ms each, 2 runs. Mutation, guard keyed by room again: posts waited 30.0 s and
-  29.3 s, red. Not covered here: a member that restarts under the **same** identity while the old
-  session still waits is refused as the same pair until that session ends. restart-probe's held-
-  connection probe (582f18a) closes the dead connection when the newcomer is filed.
+  29.3 s, red.
+- **A member that restarts under the same identity is read again at once (V210-139, 2026-10-02).**
+  When its old process dies mid-session, the first connection from the new process closes every
+  connection to the old one (`ConnectionManager::file_inner`, V210-57). That ends the sessions still
+  waiting on them, and the pair syncs again. The held-connection probe (582f18a) is no longer what
+  does this: it now probes only connections to the newcomer's own process. Measured through the
+  shipped binary (an anchor and three daemons; Carol SIGKILLed and restarted 4 times; 3 posts from
+  Alice after each restart, timed to Carol's `vox room read`, bound 1 s): 12 of 12 in each of three
+  runs, all under 0.15 s (0.012–0.139 s). With the probe disabled: 12 of 12 in each of two runs,
+  under 0.1 s. Reverting 582f18a cannot show this case, so the supersession is the mutant: disabled,
+  4 of 12 were late in each of three runs, 1.8–26.9 s, PRODUCT. With the supersession disabled and
+  the probe extended to every process: 4 of 12 late, 2.1–18.1 s.
 
 ## Links
 **Depends on**: ADR-002, ADR-003, ADR-005, ADR-006, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012,
