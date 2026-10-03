@@ -81,7 +81,7 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
 ### Remembered open rooms
 
-- **AR-25.** A `vox daemon` MUST reopen every room it held open (#208, V210-35). Each such room's SEK and passphrase MUST be kept in store meta under `open-rooms`, sealed with AES-256-GCM under `HKDF-SHA-256(self_seed, info = "vox/open-rooms-sek/v1")`. A room enters the set when it is created, joined or opened. It MUST leave the set only when it is closed on purpose; a stop, crash or reboot keeps it.
+- **AR-25.** A `vox daemon` MUST reopen every room it held open (#208, V210-35). *Decided, not built (ADR-026 L-2):* a node reopens its own set when it attaches, whether by hand, implicitly or from the daemon's `--keep` list. Each such room's SEK and passphrase MUST be kept in store meta under `open-rooms`, sealed with AES-256-GCM under `HKDF-SHA-256(self_seed, info = "vox/open-rooms-sek/v1")`. A room enters the set when it is created, joined or opened. It MUST leave the set only when it is closed on purpose; a stop, crash or reboot keeps it.
 - **AR-26.** This deliberately weakens the double-lock for rooms in the set: the disk plus the identity passphrase opens them. A room closed on purpose MUST keep the full double-lock.
 
 ### Retention / TTL
@@ -92,7 +92,7 @@ R-numbers are PRD-001's.
 - **AR-28 (R7).** A room's retention MUST be its ADR-007 policy-update `ttl`, set with `vox room retention <room> 1h|1w|1m|<secs>|forever`.
   - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). **Planned:** `vox room admin` is V030-13 (#319); on this tree the check is the `policy` capability, which V030-32 (#380) keeps only as far as admin and retention need.
   - A member MAY set a lower retention for its own node only (AR-29); it MUST NOT raise a room's retention for its node.
-  - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history.
+  - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history. Under ADR-026 that is the passphrase of the node the request resolves to.
   - **Planned:** a genesis carries `ttl` 0 (forever) at creation; a room's retention is set only after it is created.
 - **AR-29 (R8).** A node MUST also honour its own retention: the `retention` file in its config directory, with `default <dur>` and `<room-prefix> <dur>` lines. It MUST re-read the file every `RETENTION_REREAD_SECS`. If the file is unreadable, it MUST keep the last policy it read.
 - **AR-30 (R9).** The effective retention of a room on a node MUST be the shorter of the room's and the node's, where `0` means forever.
