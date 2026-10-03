@@ -385,7 +385,7 @@ change; per-session cryptographic identity; central coordination (orchestrator, 
 trust score); IP-level anonymity (ADR-017); an MCP delivery path; file bytes in the log; a spawned
 instance of anything (1.5); a council feature (a council is an `ask` in a room whose agents span
 model families); an operator hold on messages (trust and room membership are the controls); hosted
-agent sandboxes that allow only HTTP out. A TUI view for agent rooms is deferred until a real room
+agent sandboxes that allow only HTTP out. A TUI view for agent comms is deferred until a real room
 has shown what needs filtering.
 
 ## Consequences

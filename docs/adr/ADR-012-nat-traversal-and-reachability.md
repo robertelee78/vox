@@ -133,6 +133,10 @@ fine, sans anchor".
 - **N-21. Relay first, upgrade later (M15.1b).**
   - `NodeNet::reach` MUST start the direct dial and a circuit through every connected helper at once
     and return whichever lands first.
+  - A pair that can only be relayed MUST take its relay circuit at once. A dial-back (V030-22) MAY
+    race the circuit, and MUST NOT hold or delay it (decider, 2026-10-03). **Planned:** on this tree
+    a circuit waits up to `DIRECT_HEAD_START` (500 ms, `node/network.rs:108`) and, after a join, for
+    the dial-back (V030-27, 17b262ed).
   - When that is relayed, the node MUST run `upgrade` behind it: a direct dial and a punch through
     every helper, raced, each bounded by `PUNCH_ATTEMPT_TIMEOUT` (6 s).
   - A circuit attempt abandoned because another rung won MUST tear itself down.
