@@ -1,13 +1,10 @@
-//! The navigation / input state machine and the local verification transitions
-//! (ADR-015 §"Navigation & input", §"Verification ceremony").
+//! The navigation / input state machine (ADR-015 §"Navigation & input").
 //!
-//! This is pure interaction logic — no terminal, no core — so it is driven by
-//! injected key events in tests (the ADR-015 input-injection state-machine gate).
-//! It owns *UI* state (which screen/pane has focus, the command-palette overlay,
-//! selection indices) and translates input into either a navigation mutation or a
-//! [`Command`] for the core. The authoritative data (members, timeline, consent,
-//! verification) lives in the [`ViewModel`] pushed from the core; this module never
-//! invents trust state.
+//! This is pure interaction logic — no terminal, no core. It owns *UI* state
+//! (which screen/pane has focus, the command-palette overlay, selection indices)
+//! and translates input into either a navigation mutation or a [`Command`] for the
+//! core. The authoritative data (members, timeline, trust) lives in the
+//! [`ViewModel`] pushed from the core; this module never invents trust state.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use secrecy::SecretString;

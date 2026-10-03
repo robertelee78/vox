@@ -11,7 +11,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
-  consent   Carol, whom Bob never trusted, is not shown "trusted"; Alice, whom he did, is;
+  consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
+            whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
+            "← in-only" for Carol, though nothing comes in from her);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
             the help line names none of them: the TUI offers only what vox supports (V210-155);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
@@ -222,13 +224,14 @@ try:
     stage("consent")
     # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
     # judging Carol.
-    alice_ok = tui.until(lambda: "trusted" in (label_of("alice")[0] or ""), 60, 1)
+    ALICE, CAROL = "trusted · reads you", "not trusted · you don't read each other"
+    alice_ok = tui.until(lambda: (label_of("alice")[0] or "").strip() == ALICE, 60, 1)
     if label_of("carol")[0] is None: apparatus("carol is not in bob's members pane:\n" + "\n".join(pane()))
     if not alice_ok:
-        apparatus("bob's pane never showed alice trusted, so a 'not trusted' for carol shows "
-                  "nothing: " + repr(label_of("alice")[0]))
+        apparatus(f"bob's pane never showed alice {ALICE!r}, so carol's label shows nothing: "
+                  + repr(label_of("alice")[0]))
     carol_label = label_of("carol")[0]
-    claim("consent", "trusted" not in carol_label,
+    claim("consent", carol_label.strip() == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
 
     stage("unknown")

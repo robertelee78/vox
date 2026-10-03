@@ -1,8 +1,7 @@
 //! The typed core↔UI boundary (ADR-015 §"Typed core↔UI boundary").
 //!
-//! core→UI carries **latest-wins state** ([`ViewModel`], delivered over a
-//! `watch`) and **ordered events that must never coalesce** ([`Event`], over an
-//! `mpsc`). UI→core carries [`Command`]s (over an `mpsc`).
+//! core→UI carries **latest-wins state** ([`ViewModel`]); UI→core carries
+//! [`Command`]s.
 //!
 //! ## Binding contract: no secrets cross here
 //! Every type in this module carries **only rendered/redacted view data** —
@@ -17,26 +16,23 @@
 use secrecy::SecretString;
 use vox_core::hash::Digest32;
 
-/// Per-member key-verification state (ADR-007/ADR-015). Distinct from consent.
+/// Where a member stands with you here: trust is yours to give, per member (ADR-020 §3). Your node
+/// takes a member's key only if your trust keyring names it, and releases yours only to such a
+/// member (V210-148). Read off the keyring and the room's log; nothing in the TUI sets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verification {
-    /// Trust-on-first-use: seen but not verified. The default for a new member.
-    UnverifiedTofu,
-    /// Verified via a successful QR scan or numeric safety-code compare.
-    Verified,
-    /// A previously-known key changed; the member must be re-verified before trust.
-    KeyChanged,
-}
-
-/// Whether a member may read *your* messages here: whether this node released it your key,
-/// which it does only to a member your trust keyring names (ADR-020 §3, V210-148). A mirror
-/// of trust, read off the room's log; nothing in the TUI sets it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutboundConsent {
-    /// You trust the member, and it holds your key: it can read your messages.
-    Granted,
-    /// You do not trust the member (or no longer do): it cannot read what you write.
-    Revoked,
+pub enum Trust {
+    /// The member is you.
+    You,
+    /// Your keyring names the member: your node takes its key and releases yours to it.
+    Trusted {
+        /// Whether it holds your key here, so it can read what you write.
+        reads_you: bool,
+    },
+    /// Your keyring does not name the member: your node refuses its key, so you cannot read it.
+    NotTrusted {
+        /// Whether it still holds your key here.
+        reads_you: bool,
+    },
 }
 
 /// A member as surfaced to the UI (ADR-015 member pane). Fingerprints and nicknames
@@ -47,12 +43,8 @@ pub struct MemberView {
     pub id: Digest32,
     /// A local, user-assigned nickname (or a short fingerprint if unset).
     pub nickname: String,
-    /// Key-verification state.
-    pub verification: Verification,
-    /// Your outbound consent toward this member.
-    pub outbound: OutboundConsent,
-    /// The grouped-decimal safety code for verifying this member (ADR-015).
-    pub safety_code: String,
+    /// Where the member stands with you.
+    pub trust: Trust,
 }
 
 /// A timeline entry as surfaced to the UI. Carries decrypted display text only when
@@ -164,29 +156,6 @@ pub struct ViewModel {
     pub notice: Option<String>,
 }
 
-/// An ordered core→UI event that must never coalesce (`mpsc`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// A new decryptable entry arrived in a channel (drives unread + notifications).
-    NewEntry {
-        /// The channel the entry belongs to.
-        channel_id: Digest32,
-        /// The rendered entry.
-        entry: MessageView,
-    },
-    /// A member's key changed — verification reset to `KeyChanged` (ADR-015).
-    KeyChangeAlert {
-        /// The affected channel.
-        channel_id: Digest32,
-        /// The member whose key changed.
-        member: Digest32,
-    },
-    /// A recoverable error to surface in the alert log. A **typed** error, not a
-    /// free string, so no plaintext/secret can ever leak through the error channel
-    /// (ADR-015 log-redaction). Producers map their failure to a [`UiError`].
-    Error(UiError),
-}
-
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline
 /// UX"). Each renders to a fixed human string — there is no free-form text path, so
 /// an error can never carry plaintext, a key, or a passphrase into the UI/logs.
@@ -208,8 +177,6 @@ pub enum UiError {
     Unreachable,
     /// The channel epoch advanced (passphrase rotation); re-sync needed.
     EpochMismatch,
-    /// A member's key changed and must be re-verified before trust.
-    KeyChanged,
     /// You have no consent from a member yet ("you'll see them once they consent").
     MissingConsent,
     /// A received entry/structure was malformed (maps ADR-008 wire codes).
@@ -287,7 +254,6 @@ impl UiError {
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
-            UiError::KeyChanged => "a member's key changed — re-verify before trusting",
             UiError::MissingConsent => "you'll see this member once they consent to you",
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",

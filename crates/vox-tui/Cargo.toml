@@ -48,7 +48,6 @@ vox-core = { path = "../vox-core" }
 vox-agentcomms = { path = "../vox-agentcomms" }
 ratatui.workspace = true
 crossterm.workspace = true
-qrcode.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
