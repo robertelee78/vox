@@ -3039,6 +3039,16 @@ impl ChannelState {
         MembershipView::new(&self.evaluator).readers_of(&self.me())
     }
 
+    /// Every other member that consents to this identity reading it here: the inbound half of
+    /// [`consented`](Self::consented), off the log the same way (V030-17).
+    #[must_use]
+    pub fn consenting(&self) -> BTreeSet<Digest32> {
+        let me = self.me();
+        let mut by = MembershipView::new(&self.evaluator).readable_authors(&me, &self.members());
+        by.remove(&me);
+        by
+    }
+
     /// The admitted authors in `trusted` this identity has **not yet consented
     /// to** — who auto-consent still owes a first key release (ADR-020 §3).
     ///

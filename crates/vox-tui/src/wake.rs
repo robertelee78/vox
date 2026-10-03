@@ -122,6 +122,34 @@ pub fn now_millis() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// The `data` key of a session's `hello` saying how it can be reached (V030-17).
+pub const WAKE_KEY: &str = "wake";
+/// How `session` can be reached, as its `hello` says it (`data.wake`, V030-17): `interrupt` when
+/// it left Vox a wake channel (Claude Code's messaging socket, or the Vox OpenCode plugin's), else
+/// `turn` — it reads the room at its next turn, and nothing can start one (Codex: V210-169).
+///
+/// Its registration decides when it has one: a Codex started from a Claude Code terminal
+/// inherits that terminal's socket, and its hook registered it as Codex from its own input. With
+/// no registration (no hook ran), what the harness put in the environment.
+#[must_use]
+pub fn reachability(paths: &Paths, session: &str) -> &'static str {
+    if let Some(reg) = load(paths, session) {
+        return if reg.harness != "codex" && !reg.endpoint.is_empty() {
+            "interrupt"
+        } else {
+            "turn"
+        };
+    }
+    let set = |k: &str| std::env::var_os(k).is_some();
+    if (set("CLAUDE_CODE_MESSAGING_SOCKET") && set("CLAUDE_CODE_MESSAGING_TOKEN"))
+        || (set("VOX_OPENCODE_WAKE_SOCKET") && set("VOX_OPENCODE_WAKE_TOKEN"))
+    {
+        "interrupt"
+    } else {
+        "turn"
+    }
+}
+
 /// Record how this session can be woken, from what the harness put in the
 /// environment, and that its turn is running: the drain runs at the start of one.
 ///

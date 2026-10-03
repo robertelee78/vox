@@ -224,6 +224,8 @@ const T_OK: u64 = 3;
 const T_ERROR: u64 = 4;
 const T_ROWS: u64 = 5;
 const T_MEMBERS: u64 = 6;
+/// [`Frame::Consents`] (V030-17).
+const T_CONSENTS: u64 = 3271;
 const T_ROOMS: u64 = 7;
 
 const T_BOUND: u64 = 8;
@@ -241,6 +243,8 @@ const T_SUBSCRIBE: u64 = 1;
 const T_POST: u64 = 2;
 const T_READ: u64 = 3;
 const T_ROSTER: u64 = 4;
+/// [`Request::Consents`] (V030-17).
+const T_CONSENTS_REQ: u64 = 3270;
 const T_ROOMS_REQ: u64 = 5;
 // Protocol 3 — the service verbs an agent needs for file exchange (ADR-020 §11).
 // They exist on this socket, rather than as one-shot verbs that open the profile,
@@ -351,6 +355,12 @@ pub enum Request {
     },
     /// The members of a room.
     Roster {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Who this identity consents to reading it in a room, and who consents to it: both
+    /// directions of trust, off the room's log (V030-17).
+    Consents {
         /// The room.
         channel_id: Digest32,
     },
@@ -623,6 +633,9 @@ impl Request {
             Request::Roster { channel_id } => {
                 e.array(2).uint(T_ROSTER).bytes(channel_id);
             }
+            Request::Consents { channel_id } => {
+                e.array(2).uint(T_CONSENTS_REQ).bytes(channel_id);
+            }
             Request::Order { channel_id } => {
                 e.array(2).uint(T_ORDER).bytes(channel_id);
             }
@@ -810,6 +823,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Roster { channel_id })
+            }
+            (T_CONSENTS_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Consents { channel_id })
             }
             (T_ORDER, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -1128,6 +1147,13 @@ pub enum Frame {
         /// Member fingerprints, in the order the node holds them.
         members: Vec<Digest32>,
     },
+    /// What a [`Request::Consents`] asked for, each in fingerprint order.
+    Consents {
+        /// The members this identity consents to reading it.
+        outbound: Vec<Digest32>,
+        /// The members that consent to this identity reading them.
+        inbound: Vec<Digest32>,
+    },
     /// The address a [`Request::Forward`] actually bound.
     ///
     /// Its own frame rather than a reused `Ok`, because a forward asked for port
@@ -1220,6 +1246,16 @@ impl Frame {
             Frame::Members { members } => {
                 e.array(2).uint(T_MEMBERS).array(members.len());
                 for m in members {
+                    e.bytes(m);
+                }
+            }
+            Frame::Consents { outbound, inbound } => {
+                e.array(3).uint(T_CONSENTS).array(outbound.len());
+                for m in outbound {
+                    e.bytes(m);
+                }
+                e.array(inbound.len());
+                for m in inbound {
                     e.bytes(m);
                 }
             }
@@ -1632,6 +1668,19 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 members.push(digest(d)?);
             }
             return Ok(Frame::Members { members });
+        }
+        (T_CONSENTS, 3) => {
+            let mut set = |what: &'static str| -> Result<Vec<Digest32>> {
+                let n = d.array().map_err(|_| Error::MalformedIpc(what))?;
+                let mut out = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    out.push(digest(d)?);
+                }
+                Ok(out)
+            };
+            let outbound = set("ipc consents outbound")?;
+            let inbound = set("ipc consents inbound")?;
+            return Ok(Frame::Consents { outbound, inbound });
         }
         (T_BOUND, 2) => {
             return Ok(Frame::Bound {
@@ -2876,6 +2925,23 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 Some(detail) => Frame::Members {
                     members: detail.members.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        // Bounded like the roster: two sets of at most a room's members.
+        Request::Consents { channel_id } => {
+            let view = handle.view();
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Consents {
+                    outbound: detail.consented.clone(),
+                    inbound: detail.consenting.clone(),
                 },
                 None => Frame::Error {
                     reason: "room not open".into(),

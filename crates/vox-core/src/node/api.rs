@@ -458,6 +458,9 @@ pub struct ChannelDetail {
     /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
     /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
     pub consented: Vec<Digest32>,
+    /// The other members that consent to this identity reading them here, in fingerprint order:
+    /// the inbound half of `consented`, off the log the same way (V030-17).
+    pub consenting: Vec<Digest32>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
