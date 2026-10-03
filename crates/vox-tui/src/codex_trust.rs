@@ -126,9 +126,9 @@ impl Drop for AppServer {
 }
 
 /// Whether `command` is exactly Vox's drain hook: bare `vox`, or the absolute path of
-/// **this** `vox` (`this_exe`, canonicalised), then `agent hook`, then only `--node`, `--room`,
-/// `--session`, `--profile` (plain values) and `--format` — and nothing a shell would
-/// interpret.
+/// **this** `vox` (`this_exe`, canonicalised), then `agent hook`, then exactly one `--node`, and
+/// only `--room` and `--session` (plain values) and `--format` besides — and nothing a shell would
+/// interpret. `--node` is required (ADR-020 2.1, 8.5): a hook without it acts as no node.
 ///
 /// Two things are deliberately refused though `vox agent hook` accepts them:
 /// - **any other absolute path**, even one ending in `/vox`: `/tmp/evil/vox agent hook`
@@ -138,8 +138,8 @@ impl Drop for AppServer {
 ///   today can be retargeted tomorrow, and Codex's hash covers only the command text;
 /// - **`--data-dir` and `--config-dir`**: they choose which profile's rooms land in the
 ///   agent's context, so a tampered entry could aim the hook at an attacker's profile.
-///   `vox agent plugin codex` never emits them; `--profile` selects a profile within the
-///   operator's own directories.
+///   `vox agent plugin codex` never emits them; `--node` names a node within the operator's own
+///   directories.
 #[must_use]
 pub fn is_vox_hook(command: &str, this_exe: Option<&std::path::Path>) -> bool {
     let plain = |v: &str| {
@@ -157,11 +157,13 @@ pub fn is_vox_hook(command: &str, this_exe: Option<&std::path::Path>) -> bool {
     if !exe_ok || flags.len() % 2 != 0 {
         return false;
     }
-    flags.chunks(2).all(|pair| match pair {
-        ["--room" | "--session" | "--profile" | "--node", v] => plain(v),
-        ["--format", v] => matches!(*v, "auto" | "claude" | "text"),
-        _ => false,
-    })
+    let nodes = flags.chunks(2).filter(|p| p[0] == "--node").count();
+    nodes == 1
+        && flags.chunks(2).all(|pair| match pair {
+            ["--room" | "--session" | "--node", v] => plain(v),
+            ["--format", v] => matches!(*v, "auto" | "claude" | "text"),
+            _ => false,
+        })
 }
 
 /// Vox's hook entries in a `hooks/list` result: `(key, currentHash, trusted, command)`,

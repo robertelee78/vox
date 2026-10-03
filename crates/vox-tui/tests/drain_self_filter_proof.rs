@@ -85,7 +85,10 @@ fn drain(w: &Worker, r: &str, session: &str) -> String {
 fn post(w: &Worker, r: &str, session: &str, body: &str) {
     let o = w.vox_in(
         Some(session),
-        &["room", "post", r, "--type", "status", "-"],
+        // An `ask`, which the drain shows in full: a `status` from another session is
+        // coordination chatter, counted and not shown (V030-18), so it cannot say whether the
+        // drain kept or dropped it.
+        &["room", "post", r, "--type", "ask", "-"],
         Some(body),
     );
     assert!(o.ok, "PRODUCT (staging): {o:?}");
