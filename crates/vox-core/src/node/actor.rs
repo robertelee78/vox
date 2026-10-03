@@ -4149,18 +4149,30 @@ impl Node {
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
-            // **Stored anchor pages are deleted on upgrade** (ADR-023 decision 6): an anchor
-            // kept a ciphertext copy of every room it served until then, and holds none now.
-            if node.anchor_boards && node.paths.store_file().is_file() {
-                // The profile's lock first (V210-100): this opens the profile's store, as every
-                // other vox on the profile does, and lets it go only after the store is closed.
+            // **An upgraded anchor deletes its store file** (ADR-023 decision 6; decider,
+            // 2026-10-02, R45): an anchor kept a ciphertext copy of every room it served in it
+            // until then, and keeps nothing on disk for a room now, so the file goes whole.
+            let store_file = node.paths.store_file();
+            if node.anchor_boards && store_file.is_file() {
+                // The profile's lock first (V210-100), as every other vox on the profile takes
+                // it: nothing else has the store open while it goes.
                 let lock = crate::node::profile::lock_profile(&node.paths, &profile_wait)?;
-                let store_file = node.paths.store_file();
-                crate::node::profile::open_letting_go(|| {
-                    crate::node::store::Store::open(&store_file)
-                })?
-                .keep_lock(lock)
-                .delete_retired_anchor_pages()?;
+                if crate::node::profile::Profile::exists(&node.paths) {
+                    // **Unless a member's vault is here too**: then the store is that member's
+                    // rooms, run as `vox node` on the same data directory. Only the anchor's own
+                    // retired pages go; the member's data is never touched.
+                    crate::node::profile::open_letting_go(|| {
+                        crate::node::store::Store::open(&store_file)
+                    })?
+                    .keep_lock(lock)
+                    .delete_retired_anchor_pages()?;
+                } else {
+                    std::fs::remove_file(&store_file).map_err(|e| Error::Path {
+                        op: "delete the anchor's retired store",
+                        detail: format!("{}: {e}", store_file.display()),
+                    })?;
+                    drop(lock);
+                }
             }
             node.start_network()?;
         }
