@@ -46,7 +46,7 @@ use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::transport::identity_cert::build_leaf_certificate;
 use crate::transport::mux::{CircuitPort, MuxSocket};
-use crate::transport::provider::{client_config, server_config, X25519MLKEM768_CODE_POINT};
+use crate::transport::provider::{client_config, server_config};
 use crate::transport::router::{
     DatagramFlow, DatagramRouter, DatagramStats, FlowMode, MAX_PACKET_HEADER,
 };
@@ -969,11 +969,10 @@ fn finish_connection(
     // running, which must not happen — treat as an auth failure.
     let peer_id = verified.fingerprint().ok_or(Error::SignatureInvalid)?;
 
-    // Confirm the negotiated named group is the hybrid PQ group. quinn exposes the
-    // negotiated group via the rustls handshake data attached to the connection.
-    confirm_vox_alpn(&connection)?;
-
-    let session = SessionEstablishment::new(peer_id, now_secs);
+    // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
+    // actually negotiated; a session under any group but the post-quantum hybrid is refused.
+    let group = confirm_handshake(&connection)?;
+    let session = SessionEstablishment::observed(peer_id, group, now_secs)?;
     // The peer's leaf certificate is generated per endpoint — per process — and bound to the
     // identity by a signature (`identity_cert`), so its digest says which *process* of the
     // identity this connection is to (V210-57).
@@ -1005,29 +1004,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Confirm this handshake ran under the Vox TLS configuration, by its ALPN.
+/// Confirm this handshake ran under the Vox TLS configuration, by its ALPN, and return the
+/// key-exchange group it **negotiated**, read from rustls through quinn's handshake data
+/// (V030-33).
 ///
-/// **It does not observe the negotiated key-exchange group, and it is named for what
-/// it checks because it used to be named for what it does not.** It was
-/// `confirm_hybrid_group`, documented as confirming X25519MLKEM768 and as surfacing
-/// "a clear error if a future config regression ever widened the offered groups" —
-/// which it would not have done. Widening `kx_groups` leaves this function passing,
-/// since the ALPN is unchanged. The defence in depth the old name promised was not
-/// there, and a reader auditing the connection path had every reason to believe it
-/// was.
-///
-/// What actually guarantees the group is upstream of here and is sound: the provider
-/// offers exactly one `kx_group`, so there is no downgrade target to negotiate to;
-/// `provider::assert_pq_only` enforces that at every config
-/// boundary; and TLS 1.3 binds the negotiated parameters into the Finished MAC, so a
-/// mismatch breaks the handshake rather than passing quietly. The group cannot be
-/// checked *here* because quinn 0.11 gates rustls's
-/// `negotiated_key_exchange_group` behind a test-only cfg, so the value rustls holds
-/// is not reachable from the connection.
-///
-/// The ALPN check is still worth keeping: it confirms a Vox-configured handshake
-/// completed, and a non-Vox config would not carry this protocol.
-fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
+/// It used to check only the ALPN while the session record wrote the group from a constant, so
+/// the downgrade-auditability record restated the configuration rather than observing the
+/// handshake. Now the record carries what rustls negotiated, and
+/// [`SessionEstablishment::observed`] refuses a session under any group but X25519MLKEM768 —
+/// defence in depth beneath the provider, which offers no other group
+/// (`provider::assert_pq_only`), and TLS 1.3, which binds the group into the Finished MAC.
+fn confirm_handshake(connection: &Connection) -> Result<u16> {
     let Some(hd) = connection.handshake_data() else {
         return Err(Error::SignatureInvalid);
     };
@@ -1035,7 +1022,9 @@ fn confirm_vox_alpn(connection: &Connection) -> Result<()> {
         return Err(Error::SignatureInvalid);
     };
     match &hd.protocol {
-        Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => Ok(()),
+        Some(p) if p.as_slice() == crate::transport::provider::VOX_ALPN => {
+            Ok(u16::from(hd.negotiated_key_exchange_group))
+        }
         _ => Err(Error::SignatureInvalid),
     }
 }
@@ -1517,11 +1506,10 @@ impl VoxConnection {
         &self.session
     }
 
-    /// The negotiated TLS group code point recorded for this session
-    /// (X25519MLKEM768 = `0x11EC`).
+    /// The TLS key-exchange group this session negotiated, as rustls observed it in the
+    /// handshake (X25519MLKEM768 = `0x11EC`; nothing else is accepted).
     #[must_use]
     pub fn negotiated_group(&self) -> u16 {
-        debug_assert_eq!(self.session.negotiated_group, X25519MLKEM768_CODE_POINT);
         self.session.negotiated_group
     }
 

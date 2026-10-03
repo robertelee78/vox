@@ -89,7 +89,10 @@ blake2b_simd = { version = "1.0", default-features = false, features = ["std"] }
 quinn = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "runtime-tokio"] }
 # The congestion controller's interface names quinn-proto's `RttEstimator`, which quinn does not
 # re-export (transport::congestion). No features: quinn selects them.
-quinn-proto = { version = "0.11", default-features = false }
+# `__rustls-post-quantum-test` adds one field and nothing else: the key-exchange group rustls
+# negotiated, on the handshake data, which the session record reports and a node refuses a session
+# by (V030-33). Its name says "test" only because quinn's own PQ test reads it; the feature is empty.
+quinn-proto = { version = "0.11", default-features = false, features = ["__rustls-post-quantum-test"] }
 # Diagnostics for the tapered congestion controller's tier switches (ADR-024): debug events under
 # `vox::congestion`, printed only where a subscriber is installed. Already in the tree through quinn.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
