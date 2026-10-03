@@ -7,9 +7,9 @@
 //! of state into a `Frame`, it is covered by `TestBackend` render-snapshot tests.
 //!
 //! ## Accessibility (ADR-015)
-//! State is **never** signalled by colour alone: verification / consent / Block
-//! each render as a glyph **and** a text label (so they survive `NO_COLOR`,
-//! monochrome terminals, and screen readers).
+//! State is **never** signalled by colour alone: trust and reachability each render
+//! as a text label (so they survive `NO_COLOR`, monochrome terminals, and screen
+//! readers).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -18,35 +18,21 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::Frame;
 
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
-use crate::viewmodel::{
-    InboundVisibility, MemberView, MessageView, OutboundConsent, Reachability, SyncStatus,
-    Verification, ViewModel,
-};
+use crate::viewmodel::{MemberView, MessageView, Reachability, SyncStatus, Trust, ViewModel};
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
 pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 
-/// A short, colour-independent label + glyph for a verification state.
+/// Where a member stands with you, in words: whether you trust it, and whether it reads you here.
+/// Nothing for yourself.
 #[must_use]
-pub fn verification_label(v: Verification) -> &'static str {
-    match v {
-        Verification::Verified => "✓ verified",
-        Verification::UnverifiedTofu => "? unverified",
-        Verification::KeyChanged => "! key-changed",
-    }
-}
-
-/// A label for the combined consent/visibility/block state of a member.
-#[must_use]
-pub fn consent_label(m: &MemberView) -> &'static str {
-    if m.blocked {
-        return "⊘ blocked";
-    }
-    match (m.outbound, m.inbound) {
-        (OutboundConsent::Granted, InboundVisibility::Visible) => "↔ trusted",
-        (OutboundConsent::Granted, InboundVisibility::Hidden) => "→ out-only",
-        (OutboundConsent::Revoked, InboundVisibility::Visible) => "← in-only",
-        (OutboundConsent::Revoked, InboundVisibility::Hidden) => "· none",
+pub fn trust_label(t: Trust) -> Option<&'static str> {
+    match t {
+        Trust::You => None,
+        Trust::Trusted { reads_you: true } => Some("trusted · reads you"),
+        Trust::Trusted { reads_you: false } => Some("trusted · cannot read you yet"),
+        Trust::NotTrusted { reads_you: true } => Some("not trusted · still reads you"),
+        Trust::NotTrusted { reads_you: false } => Some("not trusted · you don't read each other"),
     }
 }
 
@@ -299,15 +285,12 @@ fn render_members(
             } else {
                 "  "
             };
-            // Always glyph + label, never colour-only (a11y).
-            ListItem::new(vec![
-                Line::from(format!("{marker}{}", m.nickname)),
-                Line::from(format!(
-                    "    {} · {}",
-                    verification_label(m.verification),
-                    consent_label(m)
-                )),
-            ])
+            // Always words, never colour alone (a11y).
+            let mut lines = vec![Line::from(format!("{marker}{}", m.nickname))];
+            if let Some(label) = trust_label(m.trust) {
+                lines.push(Line::from(format!("    {label}")));
+            }
+            ListItem::new(lines)
         })
         .collect();
     let list = List::new(items).block(pane_block("Members", focus));

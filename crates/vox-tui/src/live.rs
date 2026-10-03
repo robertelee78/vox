@@ -12,12 +12,10 @@
 //! becomes the node's zeroizing [`Secret`] and is dropped. Every outcome maps to
 //! the closed [`CommandStatus`] / [`UiError`] set — no free text from the core.
 //!
-//! Consent, reachability and sync are the node's own state, never assumed (V210-82): consent is
-//! who this identity consents to on the room's log, a room is online when the node holds a
-//! connection to another of its members, and sync says how many peers it is connected to.
-//! Verification is shown as unverified for every other member: the node exposes no safety code to
-//! compare, so there is nothing a mark could rest on, and `:verify` says it is not available. The
-//! ADR-015 visibility and block verbs report `NotAvailableYet` too.
+//! Trust, reachability and sync are the node's own state, never assumed (V210-82): a member's
+//! trust is whether the keyring names it and whether it holds this identity's key on the room's
+//! log, a room is online when the node holds a connection to another of its members, and sync
+//! says how many peers it is connected to.
 
 use std::collections::BTreeMap;
 
@@ -28,8 +26,8 @@ use vox_core::node::api::{Fault, NodeCommand, NodeEvent, NodeView, Outcome, Secr
 
 use crate::app::CoreHandle;
 use crate::viewmodel::{
-    ChannelSummary, ChannelView, Command, CommandStatus, InboundVisibility, MemberView,
-    MessageView, OutboundConsent, Reachability, SyncStatus, UiError, Verification, ViewModel,
+    ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, Reachability,
+    SyncStatus, Trust, UiError, ViewModel,
 };
 
 /// The TUI's binding to a running node.
@@ -327,25 +325,19 @@ impl LiveCore {
                                 } else {
                                     crate::ident::member_name(&nv.trusted, m)
                                 },
-                                // Nothing to compare yet (see the module doc), so nobody else
-                                // is shown verified.
-                                verification: if is_me {
-                                    Verification::Verified
-                                } else {
-                                    Verification::UnverifiedTofu
+                                // Off the keyring and the room's log: this node releases its key
+                                // only to a member its keyring trusts (V210-148), and takes a
+                                // member's key only if it trusts it.
+                                trust: {
+                                    let reads_you = d.consented.binary_search(m).is_ok();
+                                    if is_me {
+                                        Trust::You
+                                    } else if nv.trusted.iter().any(|(t, _)| t == m) {
+                                        Trust::Trusted { reads_you }
+                                    } else {
+                                        Trust::NotTrusted { reads_you }
+                                    }
                                 },
-                                // Off the room's log: granted only where this node released its key,
-                                // which it does only to a member its keyring trusts (V210-148).
-                                outbound: if is_me || d.consented.binary_search(m).is_ok() {
-                                    OutboundConsent::Granted
-                                } else {
-                                    OutboundConsent::Revoked
-                                },
-                                inbound: InboundVisibility::Visible,
-                                blocked: false,
-                                // Safety codes need both parties' public keys; the
-                                // node exposes them with the member bundle work (M14).
-                                safety_code: String::new(),
                             }
                         })
                         .collect(),
@@ -468,17 +460,10 @@ impl CoreHandle for LiveCore {
             Command::CreateChannel {
                 local_name,
                 passphrase,
-                deniable,
-            } => {
-                if deniable {
-                    // ADR-009 is implemented but not enabled for shipping.
-                    return CommandStatus::Failed(UiError::NotAvailableYet);
-                }
-                self.send(NodeCommand::CreateChannel {
-                    local_name,
-                    passphrase: Self::secret(&passphrase),
-                })
-            }
+            } => self.send(NodeCommand::CreateChannel {
+                local_name,
+                passphrase: Self::secret(&passphrase),
+            }),
             Command::OpenChannel {
                 channel_id,
                 passphrase,
@@ -502,9 +487,6 @@ impl CoreHandle for LiveCore {
             Command::SendText { channel_id, text } => {
                 self.send(NodeCommand::SendText { channel_id, text })
             }
-            // A mark needs a comparison behind it, and the node exposes no safety code to
-            // compare yet: marking a member verified on the word alone was a false claim (V210-82).
-            Command::MarkVerified { .. } => CommandStatus::Failed(UiError::NotAvailableYet),
             Command::Join {
                 local_name,
                 link,
@@ -515,9 +497,6 @@ impl CoreHandle for LiveCore {
                 passphrase: Self::secret(&passphrase),
             }),
             Command::Invite { channel_id } => self.send(NodeCommand::Invite { channel_id }),
-            Command::SetVisibility { .. } | Command::Block { .. } | Command::Unblock { .. } => {
-                CommandStatus::Failed(UiError::NotAvailableYet)
-            }
         }
     }
 

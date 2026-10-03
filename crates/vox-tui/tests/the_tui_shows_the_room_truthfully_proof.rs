@@ -12,9 +12,11 @@
 //! - `scrolls`: PageUp brings m-001 into view, and End returns to m-071;
 //! - `clamp`: PageUp well past the oldest line, then one PageDown, shows m-011 first (the scroll
 //!   ran on past the top, so PageDown needed as many presses again before the view moved);
-//! - `consent`: Carol, whom Bob never trusted, is not shown "trusted", while Alice is (the pane
-//!   said "consented" for everyone);
-//! - `verify`: `:verify` does not mark Carol "verified" (it did, with nothing compared);
+//! - `consent`: Carol, whom Bob never trusted, reads "not trusted · you don't read each other", and
+//!   Alice "trusted · reads you" (the pane said "consented" for everyone, then "? unverified" on
+//!   every row and "← in-only" for Carol, though Bob's node refuses her key; V210-155);
+//! - `unknown`: `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command",
+//!   and the help line names none of them (they only said "not available yet"; V210-155);
 //! - `sync`: the status bar says how many peers the node is connected to, the anchor and at least
 //!   one member, so 2 or more (it said "idle" always);
 //! - `reach`: back on the channel list, the room reads "● online" while Bob's node is connected
@@ -28,8 +30,8 @@
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
-//! top, a scroll not clamped to the oldest line, `OutboundConsent::Granted` for everyone, the local
-//! verification mark, `SyncStatus` hard-coded (idle, or any one count), or `Reachability`
+//! top, a scroll not clamped to the oldest line, every member shown `Trust::Trusted`, a stub command
+//! restored, `SyncStatus` hard-coded (idle, or any one count), or `Reachability`
 //! hard-coded either way. It passes only on the script's PASS with all 11 claims ok; its
 //! apparatus failures (exit 2: `pyte` missing, a join or a precondition that did not happen, such
 //! as Alice never shown trusted) fail as CANNOT MEASURE, never as a pass.
@@ -97,8 +99,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             out.code
         ),
         _ => panic!(
-            "the TUI must show the room's newest message, follow and scroll, show trust, \
-             verification, reachability and sync as the node has them: red claims: {:?}",
+            "PRODUCT: the TUI must show the room's newest message, follow and scroll, show trust, \
+             offer only working commands, reachability and sync as the node has them: red claims: {:?}",
             claims
                 .iter()
                 .filter(|l| l.contains(" RED: "))

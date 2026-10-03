@@ -11,8 +11,11 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
-  consent   Carol, whom Bob never trusted, is not shown "trusted"; Alice, whom he did, is;
-  verify    `:verify` on Carol does not show her "verified" (the node has nothing to compare);
+  consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
+            whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
+            "← in-only" for Carol, though nothing comes in from her);
+  unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
+            the help line names none of them: the TUI offers only what vox supports (V210-155);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
             one member, so 2 or more (it said "idle" always);
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
@@ -221,26 +224,35 @@ try:
     stage("consent")
     # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
     # judging Carol.
-    alice_ok = tui.until(lambda: "trusted" in (label_of("alice")[0] or ""), 60, 1)
+    ALICE, CAROL = "trusted · reads you", "not trusted · you don't read each other"
+    # The pane's border is part of the row: the label is what sits between its edges.
+    bare = lambda row: (row or "").strip().strip("│").strip()
+    alice_ok = tui.until(lambda: bare(label_of("alice")[0]) == ALICE, 60, 1)
     if label_of("carol")[0] is None: apparatus("carol is not in bob's members pane:\n" + "\n".join(pane()))
     if not alice_ok:
-        apparatus("bob's pane never showed alice trusted, so a 'not trusted' for carol shows "
-                  "nothing: " + repr(label_of("alice")[0]))
+        apparatus(f"bob's pane never showed alice {ALICE!r}, so carol's label shows nothing: "
+                  + repr(label_of("alice")[0]))
     carol_label = label_of("carol")[0]
-    claim("consent", "trusted" not in carol_label,
+    claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
 
-    stage("select carol")
-    for _ in range(8):
-        if label_of("carol")[1]:
-            break
-        tui.key("\x1b[B", 0.5)  # Down
-    if not label_of("carol")[1]: apparatus("could not put the marker on carol:\n" + "\n".join(pane()))
-
-    stage("verify")
-    tui.key(":verify\r", 2)
-    v = label_of("carol")[0]
-    claim("verify", "verified" in v and "unverified" in v and "✓" not in v, f"carol after :verify: {v.strip()!r}")
+    stage("unknown")
+    # Each answer is read after `:invite`, a command vox supports, has replaced the status line, so
+    # an "unknown command" seen is this command's answer and not the one before it.
+    def bottom():
+        return "\n".join(r.rstrip() for r in tui.display()[-3:])
+    REMOVED = ("show", "hide", "block", "unblock", "verify")
+    answers = {}
+    for c in REMOVED:
+        tui.key(":invite\r", 2)
+        if "unknown command" in bottom():
+            apparatus(f":invite left the status line saying unknown command, so :{c}'s answer shows nothing:\n{bottom()}")
+        tui.key(f":{c}\r", 2)
+        answers[c] = bottom().split("\n")[-1].strip()
+    screen = "\n".join(tui.display())
+    named = [c for c in REMOVED if f":{c}" in screen]
+    claim("unknown", all("unknown command" in v for v in answers.values()) and not named,
+          f"answers: {answers!r}; the help line names: {named!r}")
 
     stage("sync")
     def peers():

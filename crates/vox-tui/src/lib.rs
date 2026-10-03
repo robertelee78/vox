@@ -1,11 +1,9 @@
 //! Vox Lux — Rust TUI client library (ADR-015).
 //!
 //! The terminal-native client over `vox-core`, linked directly as a Rust crate
-//! (no FFI). This library crate holds the testable, presentation-agnostic pieces —
-//! verification primitives, the typed core↔UI boundary, the navigation/consent
-//! state machine, QR rendering, and the ratatui view — so they are covered by
-//! `TestBackend` render-snapshot and input-injection tests (the ADR-015 release
-//! gate). The `vox` binary (`main.rs`) wires them to a live terminal and the core.
+//! (no FFI). This library crate holds the presentation-agnostic pieces — the typed
+//! core↔UI boundary, the navigation state machine and the ratatui view. The `vox`
+//! binary (`main.rs`) wires them to a live terminal and the core.
 //!
 //! ## Secret-handling contract (binding, ADR-015)
 //! Only **rendered/redacted view models** cross into UI types here — decrypted text
@@ -26,7 +24,6 @@ pub mod codex_trust;
 pub mod coord;
 pub mod ident;
 pub mod live;
-pub mod qr;
 pub mod room_cli;
 pub mod shell;
 pub mod state;
@@ -34,6 +31,5 @@ pub mod status_cli;
 pub mod tunnel_cli;
 pub mod ui;
 pub mod update;
-pub mod verify;
 pub mod viewmodel;
 pub mod wake;

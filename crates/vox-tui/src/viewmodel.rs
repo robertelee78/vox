@@ -1,8 +1,7 @@
 //! The typed core↔UI boundary (ADR-015 §"Typed core↔UI boundary").
 //!
-//! core→UI carries **latest-wins state** ([`ViewModel`], delivered over a
-//! `watch`) and **ordered events that must never coalesce** ([`Event`], over an
-//! `mpsc`). UI→core carries [`Command`]s (over an `mpsc`).
+//! core→UI carries **latest-wins state** ([`ViewModel`]); UI→core carries
+//! [`Command`]s.
 //!
 //! ## Binding contract: no secrets cross here
 //! Every type in this module carries **only rendered/redacted view data** —
@@ -17,36 +16,23 @@
 use secrecy::SecretString;
 use vox_core::hash::Digest32;
 
-/// Per-member key-verification state (ADR-007/ADR-015). Distinct from consent.
+/// Where a member stands with you here: trust is yours to give, per member (ADR-020 §3). Your node
+/// takes a member's key only if your trust keyring names it, and releases yours only to such a
+/// member (V210-148). Read off the keyring and the room's log; nothing in the TUI sets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verification {
-    /// Trust-on-first-use: seen but not verified. The default for a new member.
-    UnverifiedTofu,
-    /// Verified via a successful QR scan or numeric safety-code compare.
-    Verified,
-    /// A previously-known key changed; the member must be re-verified before trust.
-    KeyChanged,
-}
-
-/// Whether a member may read *your* messages here: whether this node released it your key,
-/// which it does only to a member your trust keyring names (ADR-020 §3, V210-148). A mirror
-/// of trust, read off the room's log; nothing in the TUI sets it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutboundConsent {
-    /// You trust the member, and it holds your key: it can read your messages.
-    Granted,
-    /// You do not trust the member (or no longer do): it cannot read what you write.
-    Revoked,
-}
-
-/// Your **inbound** visibility preference for a member (ADR-007): whether you want
-/// to render *their* messages. Independent of consent and verification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InboundVisibility {
-    /// You render this member's messages.
-    Visible,
-    /// You have opted out of rendering this member's messages.
-    Hidden,
+pub enum Trust {
+    /// The member is you.
+    You,
+    /// Your keyring names the member: your node takes its key and releases yours to it.
+    Trusted {
+        /// Whether it holds your key here, so it can read what you write.
+        reads_you: bool,
+    },
+    /// Your keyring does not name the member: your node refuses its key, so you cannot read it.
+    NotTrusted {
+        /// Whether it still holds your key here.
+        reads_you: bool,
+    },
 }
 
 /// A member as surfaced to the UI (ADR-015 member pane). Fingerprints and nicknames
@@ -57,17 +43,8 @@ pub struct MemberView {
     pub id: Digest32,
     /// A local, user-assigned nickname (or a short fingerprint if unset).
     pub nickname: String,
-    /// Key-verification state.
-    pub verification: Verification,
-    /// Your outbound consent toward this member.
-    pub outbound: OutboundConsent,
-    /// Your inbound visibility for this member.
-    pub inbound: InboundVisibility,
-    /// `true` if you have Blocked this member (revoked outbound + hidden inbound).
-    /// Block is **not** removal — the member stays listed (ADR-007/ADR-015).
-    pub blocked: bool,
-    /// The grouped-decimal safety code for verifying this member (ADR-015).
-    pub safety_code: String,
+    /// Where the member stands with you.
+    pub trust: Trust,
 }
 
 /// A timeline entry as surfaced to the UI. Carries decrypted display text only when
@@ -179,29 +156,6 @@ pub struct ViewModel {
     pub notice: Option<String>,
 }
 
-/// An ordered core→UI event that must never coalesce (`mpsc`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// A new decryptable entry arrived in a channel (drives unread + notifications).
-    NewEntry {
-        /// The channel the entry belongs to.
-        channel_id: Digest32,
-        /// The rendered entry.
-        entry: MessageView,
-    },
-    /// A member's key changed — verification reset to `KeyChanged` (ADR-015).
-    KeyChangeAlert {
-        /// The affected channel.
-        channel_id: Digest32,
-        /// The member whose key changed.
-        member: Digest32,
-    },
-    /// A recoverable error to surface in the alert log. A **typed** error, not a
-    /// free string, so no plaintext/secret can ever leak through the error channel
-    /// (ADR-015 log-redaction). Producers map their failure to a [`UiError`].
-    Error(UiError),
-}
-
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline
 /// UX"). Each renders to a fixed human string — there is no free-form text path, so
 /// an error can never carry plaintext, a key, or a passphrase into the UI/logs.
@@ -227,8 +181,6 @@ pub enum UiError {
     Unreachable,
     /// The channel epoch advanced (passphrase rotation); re-sync needed.
     EpochMismatch,
-    /// A member's key changed and must be re-verified before trust.
-    KeyChanged,
     /// You have no consent from a member yet ("you'll see them once they consent").
     MissingConsent,
     /// A received entry/structure was malformed (maps ADR-008 wire codes).
@@ -254,8 +206,6 @@ pub enum UiError {
     KeyringFull,
     /// Persisting to the store failed; reopen the channel.
     Storage,
-    /// This action needs the network milestone (M14) — not available yet.
-    NotAvailableYet,
     /// The other side refused: the channel passphrase is wrong, or it is not
     /// accepting joins for that channel. Deliberately coarse — the responder does not
     /// say which, so neither does this (ADR-005).
@@ -314,7 +264,6 @@ impl UiError {
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
             UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
-            UiError::KeyChanged => "a member's key changed — re-verify before trusting",
             UiError::MissingConsent => "you'll see this member once they consent to you",
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",
@@ -333,7 +282,6 @@ impl UiError {
             UiError::Storage => "could not save — reopen the channel",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
-            UiError::NotAvailableYet => "not available yet (needs the network milestone)",
             UiError::Refused => "refused — check the channel passphrase",
             UiError::NotNetworked => "not connected (unlock first)",
             UiError::AddressInUse => {
@@ -429,8 +377,6 @@ pub enum Command {
         local_name: String,
         /// The channel passphrase (out-of-band; redacted/zeroized).
         passphrase: SecretString,
-        /// Whether authorship is deniable (genesis-immutable; default attributable).
-        deniable: bool,
     },
     /// Join a channel from a `vox://` invite link plus the passphrase, which travels
     /// out of band and is deliberately **not** in the link (ADR-016).
@@ -454,36 +400,6 @@ pub enum Command {
         channel_id: Digest32,
         /// The plaintext to send (becomes ciphertext in the core).
         text: String,
-    },
-    /// Set inbound visibility for a member.
-    SetVisibility {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member.
-        member: Digest32,
-        /// The desired visibility.
-        visibility: InboundVisibility,
-    },
-    /// Block a member (revoke outbound + hide inbound); not removal.
-    Block {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to block.
-        member: Digest32,
-    },
-    /// Unblock a member (restore your outbound consent + your inbound preference).
-    Unblock {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The member to unblock.
-        member: Digest32,
-    },
-    /// Mark a member verified after a successful scan/compare.
-    MarkVerified {
-        /// The channel context.
-        channel_id: Digest32,
-        /// The verified member.
-        member: Digest32,
     },
     /// Lock the app now (zeroize SEK + identity root, require re-auth).
     Lock,
