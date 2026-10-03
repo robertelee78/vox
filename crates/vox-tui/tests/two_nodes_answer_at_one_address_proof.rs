@@ -36,11 +36,25 @@ use std::time::{Duration, Instant};
 
 use world::{args, echo_service, mkdir, tempdir, vox_once, VoxProc, IDENTITY, VOX};
 
-/// Make node `name` in the account at `dir`: its fingerprint.
+/// Make node `name` in the account at `dir`, as a person does (`vox node create`): its
+/// fingerprint.
 fn make_node(dir: &Path, name: &str) -> String {
-    let (ok, out, err) = vox_once(dir, &args(&["id", "--profile", name]));
-    assert!(ok, "APPARATUS: vox id for {name}: {out}{err}");
+    let pf = pass_file(dir);
+    let (ok, out, err) = vox_once(
+        dir,
+        &args(&["node", "create", name, "--passphrase-file", &pf]),
+    );
+    assert!(ok, "APPARATUS: vox node create {name}: {out}{err}");
+    let (ok, out, err) = vox_once(dir, &args(&["id", "--node", name]));
+    assert!(ok, "APPARATUS: vox --node {name} id: {out}{err}");
     out.trim().to_owned()
+}
+
+/// The identity passphrase in a file under `dir`, for the verbs that read one.
+fn pass_file(dir: &Path) -> String {
+    let p = dir.join("identity.pass");
+    std::fs::write(&p, format!("{IDENTITY}\n")).expect("APPARATUS: passphrase file");
+    p.to_str().expect("APPARATUS: utf-8 path").to_owned()
 }
 
 /// An agent hook turn of `session` as node `node`, in the account at `dir`.
@@ -77,16 +91,22 @@ fn short(fp: &str) -> String {
     fp.chars().take(26).collect()
 }
 
-/// A remote on its own account at `dir`, serving an echo service and told `a` and `b` are
-/// anchors at `at`.
+/// A remote on its own account at `dir` (node `r`, its own daemon), serving an echo service and
+/// told `a` and `b` are anchors at `at`.
 fn remote(dir: &Path, at: &str, a: &str, b: &str) -> VoxProc {
     mkdir(&dir.join("cfg"));
+    let _ = make_node(dir, "r");
+    let pf = pass_file(dir);
     let service = echo_service().to_string();
     VoxProc::spawn(
         "remote",
         dir,
         &args(&[
             "serve",
+            "--node",
+            "r",
+            "--identity-passphrase-file",
+            &pf,
             &format!("{service}={service}"),
             "--anchor",
             &format!("{a}@{at}"),
