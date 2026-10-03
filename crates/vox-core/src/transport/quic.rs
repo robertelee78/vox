@@ -693,6 +693,37 @@ impl VoxEndpoint {
     }
 }
 
+/// The most of what a peer wrote that vox prints (V210-154): a connection-close reason is the
+/// peer's to fill, up to what fits in a packet.
+pub const PEER_TEXT: usize = 200;
+
+/// Text a peer wrote, as vox may print it (V210-154): through the same sanitiser as an author's
+/// name in a room (V210-123), so it stays on one line and drives nothing in the terminal, and
+/// capped at [`PEER_TEXT`] bytes.
+#[must_use]
+pub fn peer_text(s: &str) -> String {
+    vox_text::shown(s.trim(), PEER_TEXT)
+}
+
+/// A connection's end as vox may print it (V210-154). quinn's own rendering of a close quotes
+/// the peer's reason byte for byte, escape sequences and line breaks included; this gives the
+/// same facts with the reason through [`peer_text`].
+#[must_use]
+pub fn closed_text(e: &quinn::ConnectionError) -> String {
+    use quinn::ConnectionError as C;
+    let said = |reason: &[u8]| match String::from_utf8_lossy(reason).trim() {
+        "" => String::new(),
+        r => format!(": {}", peer_text(r)),
+    };
+    match e {
+        C::ConnectionClosed(c) => format!("aborted by peer: {}{}", c.error_code, said(&c.reason)),
+        C::ApplicationClosed(a) => {
+            format!("closed by peer: code {}{}", a.error_code, said(&a.reason))
+        }
+        other => peer_text(&other.to_string()),
+    }
+}
+
 /// What a failed QUIC handshake is reported as: a failure of authentication as
 /// [`Error::SignatureInvalid`], anything else by its own cause ([`Error::Handshake`]).
 ///
@@ -718,7 +749,7 @@ fn handshake_failed(e: quinn::ConnectionError, verified: &VerifiedPeer) -> Error
         C::TransportError(t) if tls(t.code) => Error::HandshakeAuth(format!(
             "this node refused the peer ({}): {}",
             alert(t.code),
-            verified.rejection().unwrap_or(t.reason)
+            peer_text(&verified.rejection().unwrap_or(t.reason))
         )),
         // The peer refused this node, and sent only its alert.
         C::ConnectionClosed(c) if tls(c.error_code) => Error::HandshakeAuth(format!(
@@ -726,7 +757,7 @@ fn handshake_failed(e: quinn::ConnectionError, verified: &VerifiedPeer) -> Error
             alert(c.error_code),
             match String::from_utf8_lossy(&c.reason).trim() {
                 "" => String::new(),
-                r => format!(": {r}"),
+                r => format!(": {}", peer_text(r)),
             }
         )),
         C::ConnectionClosed(c) if c.error_code == quinn::TransportErrorCode::CONNECTION_REFUSED => {
@@ -734,7 +765,7 @@ fn handshake_failed(e: quinn::ConnectionError, verified: &VerifiedPeer) -> Error
         }
         C::TimedOut => Error::Handshake("the peer did not answer".to_owned()),
         C::LocallyClosed => Error::Handshake("this node's endpoint is closing".to_owned()),
-        other => Error::Handshake(other.to_string()),
+        other => Error::Handshake(closed_text(&other)),
     }
 }
 
