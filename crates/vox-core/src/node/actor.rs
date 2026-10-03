@@ -782,6 +782,8 @@ enum NetEvent {
         room: Digest32,
         /// Every node the address names but this one.
         named: BootstrapSet,
+        /// The members that answered there.
+        answered: Vec<Digest32>,
         /// The join's answer.
         reply: oneshot::Sender<Outcome>,
     },
@@ -5447,8 +5449,13 @@ impl Node {
     async fn handle_net_unboxed(&mut self, event: NetEvent) {
         match event {
             NetEvent::Heard { from, entries } => self.heard_nearby(from, &entries).await,
-            NetEvent::AddressReached { room, named, reply } => {
-                self.keep_room_address(room, &named, reply).await;
+            NetEvent::AddressReached {
+                room,
+                named,
+                answered,
+                reply,
+            } => {
+                self.keep_room_address(room, &named, &answered, reply).await;
             }
             NetEvent::Reopened {
                 channel_id,
@@ -7301,9 +7308,10 @@ impl Node {
 
     /// A room's address given for a room this node already holds: **the address is where its host
     /// is now** (V210-167). It was refused ("already holds that room"), so a member whose host
-    /// had moved had no way to say where it went. The members it names are dialled there; once
-    /// one answers, everything the address names is kept as the room's (`keep_room_address`), so
-    /// the next start dials it there too. An address nobody answers at changes nothing: a stale
+    /// had moved had no way to say where it went. The members it names are dialled there, even
+    /// when a connection to one is held elsewhere; the members that answer there, and the anchors
+    /// it names, are kept as the room's (`keep_room_address`), so the next start dials them there
+    /// too. An address nobody answers at changes nothing: a stale
     /// one from chat history must not overwrite where the room's members really are. `Done` once
     /// a member answered; `Unreachable` (said with why) when none did; `BadLink` when the address
     /// names no other member of the room, which is so when this node is its host.
@@ -7348,16 +7356,19 @@ impl Node {
             for (peer, candidates) in members {
                 let net = Arc::clone(&net);
                 dials.spawn(async move {
-                    let got = net.manager().connect_to(peer, &candidates).await;
+                    // Not `connect_to`: it hands back a connection held on another port or
+                    // through a relay without dialling, and that says nothing about this
+                    // address.
+                    let got = net.manager().answers_at(peer, &candidates).await;
                     (peer, candidates, got)
                 });
             }
-            let mut reached = false;
+            let mut answered: Vec<Digest32> = Vec::new();
             let mut missed: Vec<String> = Vec::new();
             while let Some(Ok((peer, candidates, got))) = dials.join_next().await {
                 match got {
                     Ok(conn) => {
-                        reached = true;
+                        answered.push(peer);
                         let endpoints = crate::nat::multiaddr::EndpointList::new(
                             candidates.into_iter().map(Into::into).collect(),
                         )
@@ -7375,32 +7386,46 @@ impl Node {
                     }
                 }
             }
-            if reached {
-                let _ = tx
-                    .send(NetEvent::AddressReached { room, named, reply })
-                    .await;
-            } else {
+            if answered.is_empty() {
                 let _ = events.send(NodeEvent::JoinFailed {
                     reason: format!("nobody answered at that address: {}", missed.join("; ")),
                 });
                 let _ = reply.send(Outcome::Failed(Fault::Unreachable));
+            } else {
+                let _ = tx
+                    .send(NetEvent::AddressReached {
+                        room,
+                        named,
+                        answered,
+                        reply,
+                    })
+                    .await;
             }
         });
     }
 
-    /// A held room's address that a member answered at: keep every node it names as the room's
-    /// at that address, dial the anchors it names, and answer the join `Done` (V210-167).
+    /// A held room's address that a member answered at: keep, as the room's, the members that
+    /// answered there and the anchors it names, dial those anchors, and answer the join `Done`
+    /// (V210-167). A member it names that did not answer keeps the address this node had for it:
+    /// only an answer shows a member is where the address says.
     async fn keep_room_address(
         &mut self,
         room: Digest32,
         named: &BootstrapSet,
+        answered: &[Digest32],
         reply: oneshot::Sender<Outcome>,
     ) {
         let mut anchors: Vec<(Digest32, Vec<std::net::SocketAddr>)> = Vec::new();
         if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
             let mut channel = shared.lock().await;
+            let mut kept = BootstrapSet::new();
+            for n in named.nodes() {
+                if answered.contains(&n.id) || !channel.is_author(&n.id) {
+                    let _ = kept.add(n.clone());
+                }
+            }
             if let Some(profile) = self.profile.as_ref() {
-                let _ = channel.add_anchors(profile.store(), named);
+                let _ = channel.add_anchors(profile.store(), &kept);
             }
             let mut own = BootstrapSet::new();
             for n in channel.anchors().nodes() {
