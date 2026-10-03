@@ -11,6 +11,12 @@
 //!   bound. Here the host's `vox serve` is killed and the same room brought back by
 //!   `vox daemon` on a **different port**, and the *same* forward must carry a new
 //!   connection.
+//! - **A restarted host is reached again promptly, by a forward and by a proxy** (V210-141). The
+//!   host's process is killed and the room brought back by `vox daemon`, on a new port and on the
+//!   same port, and the first connection a running `vox forward` or `vox up` makes afterwards
+//!   must reach the new process within V210-57's host-restart bound, [`HOST_BACK_WITHIN`], one
+//!   attempt and no retry. A dialer that kept its stale connection to the dead process would wait
+//!   out the silence rule (30 s) or QUIC's idle timeout (about 60 s) instead.
 //! - **A refused SOCKS CONNECT is refused in the reply, and says why** (R23, D6). `vox up`
 //!   replied "succeeded" before it had asked the host, so a refusal looked like a
 //!   connection that died.
@@ -63,8 +69,8 @@
 //! ## Why it is `#[ignore]`d
 //!
 //! Production Argon2id on several profiles plus a real ADR-005 proof of work per test, and a
-//! wait on QUIC's idle timeout in the restart proof. CI runs these in release with the other
-//! real-parameter proofs.
+//! wait on QUIC's idle timeout in the restart proof. They run on demand, in release, by name:
+//! CI runs no tests.
 
 #![cfg(unix)]
 
@@ -88,7 +94,7 @@ use world::{
 const QUIET: Duration = Duration::from_secs(75);
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW + a QUIC idle timeout, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW + a QUIC idle timeout, driving the real binary; run on demand"]
 fn a_forward_carries_a_new_connection_after_its_host_restarts() {
     watchdog::arm();
     let mut w = World::new(echo_service(), true);
@@ -142,7 +148,7 @@ fn a_forward_carries_a_new_connection_after_its_host_restarts() {
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW + 75 s of quiet, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW + 75 s of quiet, driving the real binary; run on demand"]
 fn a_quiet_session_still_carries_bytes() {
     watchdog::arm();
     let w = World::new(echo_service(), true);
@@ -199,7 +205,7 @@ fn a_quiet_session_still_carries_bytes() {
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn removing_a_service_cuts_its_live_sessions_within_a_second() {
     watchdog::arm();
     let mut w = World::new(echo_service(), true);
@@ -255,7 +261,7 @@ fn removing_a_service_cuts_its_live_sessions_within_a_second() {
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn a_backend_reset_reaches_the_far_client_as_a_reset() {
     watchdog::arm();
     let w = World::new(resetting_service(), true);
@@ -290,7 +296,7 @@ fn a_backend_reset_reaches_the_far_client_as_a_reset() {
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn a_refused_forward_resets_the_application_and_says_why() {
     watchdog::arm();
     // The guest joined with the address and the passphrase and was never trusted.
@@ -334,7 +340,7 @@ fn a_refused_forward_resets_the_application_and_says_why() {
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
     watchdog::arm();
     // The guest joined with the address and the passphrase and was never trusted.
@@ -398,7 +404,7 @@ fn live_session(up: &mut VoxProc, at: std::net::SocketAddr, name: &str, port: u1
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
     watchdog::arm();
     let (port, accepted) = counting_echo_service();
@@ -492,7 +498,7 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
 }
 
 #[test]
-#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; CI runs it in release"]
+#[ignore = "production Argon2id profiles + a real PoW, driving the real binary; run on demand"]
 fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dialled() {
     watchdog::arm();
     let (port, accepted) = counting_echo_service();
@@ -602,4 +608,187 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     );
     eprintln!("[test] both refused at the proxy; the services counted 1 (the control) and 0");
     drop(other);
+}
+
+/// V210-57's bound for a host restart (`BACK_WITHIN` in `an_anchor_that_restarts_is_redialled_
+/// promptly_proof`): the first connection after the host is back reaches it within this.
+const HOST_BACK_WITHIN: Duration = Duration::from_secs(10);
+
+/// How a restarted host comes back.
+#[derive(Clone, Copy, Debug)]
+enum Back {
+    /// On a different port: what `World::restart_host_as_daemon` does.
+    NewPort,
+    /// On the port it had, so the dialer's stale connection still names a live address.
+    SamePort,
+}
+
+/// The UDP port the host's process listens on, read from the system (`lsof` on its PID).
+fn host_udp_port(w: &World) -> u16 {
+    let pid = w
+        .host
+        .as_ref()
+        .expect("APPARATUS: a running host")
+        .child
+        .id();
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-iUDP", "-Fn", "-P", "-n"])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not run lsof to read the host's port: {e}"));
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .find_map(|a| a.rsplit(':').next()?.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("CANNOT MEASURE: lsof found no UDP port for the host's pid {pid}: {text:?}")
+        })
+}
+
+/// Kill the host and bring the same identity and room back as `vox daemon`, as `back` says.
+/// Returns when the daemon holds the room.
+fn restart_host(w: &mut World, back: Back) {
+    match back {
+        Back::NewPort => w.restart_host_as_daemon(),
+        Back::SamePort => {
+            let port = host_udp_port(w);
+            drop(w.host.take());
+            let pass_file = w.tmp.path().join("daemon-passphrases");
+            std::fs::write(
+                &pass_file,
+                format!("{}\n{}\n", world::IDENTITY, w.passphrase),
+            )
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
+            let listen = format!("127.0.0.1:{port}");
+            let mut daemon = world::VoxProc::spawn(
+                "host-daemon",
+                &w.host_dir,
+                &args(&[
+                    "daemon",
+                    "--passphrase-file",
+                    &world::utf8(&pass_file),
+                    "--anchor",
+                    &w.anchor_spec,
+                    "--listen",
+                    &listen,
+                ]),
+            );
+            let room = w.room.clone();
+            daemon.expect_within(
+                Duration::from_secs(60),
+                &format!("the restarted daemon to hold the room open on port {port}"),
+                |l| l.starts_with("vox daemon: holding room") && l.contains(&room),
+            );
+            w.host = Some(daemon);
+        }
+    }
+}
+
+/// One world, one dialer, one restart: the first connection after it reaches the new process
+/// within [`HOST_BACK_WITHIN`]. `proxy` says whether the dialer is `vox up` (else `vox forward`).
+fn reached_again(proxy: bool, back: Back) -> Duration {
+    let mut w = World::new(echo_service(), true);
+    let guest_dir = w.guest_dir.clone();
+    let what = if proxy { "vox up" } else { "vox forward" };
+    let hostname = format!("{}.vox", w.room);
+    let port = w.service_port;
+    let (mut dialer, at) = if proxy {
+        w.up("up", &guest_dir)
+    } else {
+        w.forward("forward", &guest_dir)
+    };
+    // One connection through the dialer, echoed; `Err` says how it failed.
+    let once = |payload: &[u8], patience: Duration| -> Result<Vec<u8>, String> {
+        if proxy {
+            let (code, mut s) = socks5_connect(at, &hostname, port);
+            if code != 0 {
+                return Err(format!("SOCKS reply {code}"));
+            }
+            s.set_read_timeout(Some(patience))
+                .map_err(|e| format!("APPARATUS: {e}"))?;
+            s.write_all(payload).map_err(|e| e.to_string())?;
+            let mut back = vec![0u8; payload.len()];
+            s.read_exact(&mut back).map_err(|e| e.to_string())?;
+            Ok(back)
+        } else {
+            round_trip(at, payload, patience).map_err(|e| e.to_string())
+        }
+    };
+    let before = once(b"before the restart", Duration::from_secs(120)).unwrap_or_else(|e| {
+        panic!(
+            "PRODUCT (staging): {what} carried nothing before the host restarted ({e}): vox \
+             failed to carry a fresh connection.\nIt said:\n{}",
+            dialer.transcript()
+        )
+    });
+    assert!(
+        before == b"before the restart",
+        "PRODUCT: the bytes changed crossing {what} before the restart: {:?}",
+        String::from_utf8_lossy(&before)
+    );
+    restart_host(&mut w, back);
+    // Timed from the restarted daemon holding its room: one attempt, as an application makes.
+    let t0 = Instant::now();
+    let after = once(
+        b"after the restart",
+        HOST_BACK_WITHIN + Duration::from_secs(60),
+    );
+    let took = t0.elapsed();
+    eprintln!(
+        "[test] {what}, host back on {back:?}: first connection {took:?} after the restart ({})",
+        match &after {
+            Ok(b) => format!("echoed {:?}", String::from_utf8_lossy(b)),
+            Err(e) => format!("failed: {e}"),
+        }
+    );
+    // How the dialer let go of the dead process, as it said it (times from the daemon holding
+    // its room): the record of the mechanism ADR-013 names, green or red.
+    for l in dialer.said_since(t0) {
+        if l.contains("vox: connection to") {
+            eprintln!("[test] {what} said: {l}");
+        }
+    }
+    let host_said = w.host.as_mut().map(|h| h.transcript()).unwrap_or_default();
+    match after {
+        Ok(b) if b == b"after the restart" => {}
+        Ok(b) => panic!(
+            "PRODUCT: the bytes changed crossing {what} after the restart: {:?}",
+            String::from_utf8_lossy(&b)
+        ),
+        Err(e) => panic!(
+            "PRODUCT: {what}'s first connection after its host restarted on {back:?} failed after \
+             {took:?}: {e}.\nIt said:\n{}\nThe restarted host said:\n{host_said}",
+            dialer.transcript()
+        ),
+    }
+    assert!(
+        took <= HOST_BACK_WITHIN,
+        "PRODUCT: {what}'s first connection after its host restarted on {back:?} took {took:?}, \
+         past V210-57's {HOST_BACK_WITHIN:?}: it waited on its stale connection to the dead \
+         process (V210-141).\nIt said:\n{}\nThe restarted host said:\n{host_said}",
+        dialer.transcript()
+    );
+    took
+}
+
+#[test]
+#[ignore = "four worlds with production Argon2id profiles + a real PoW each, driving the real binary; run on demand"]
+fn a_restarted_host_is_reached_again_promptly_by_a_forward_and_by_a_proxy() {
+    watchdog::arm();
+    let mut took = Vec::new();
+    for proxy in [false, true] {
+        for back in [Back::NewPort, Back::SamePort] {
+            took.push((proxy, back, reached_again(proxy, back)));
+        }
+    }
+    eprintln!(
+        "[test] V210-141: first connection after a host restart, each within {HOST_BACK_WITHIN:?}: {}",
+        took.iter()
+            .map(|(p, b, t)| format!(
+                "{} {b:?} {:.2}s",
+                if *p { "up" } else { "forward" },
+                t.as_secs_f64()
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }

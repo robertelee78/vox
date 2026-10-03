@@ -312,9 +312,22 @@ Built in `crates/vox-core/src/tunnel/` — spec and code in lockstep:
       **withdrawn**; a liveness-based replacement is v0.2.9 item #6, not built here. Until it lands this
       gate can fail for that reason: the restarted host unreachable through the anchor for as long as
       the anchor holds the dead connection.
-    - **Residual, stated:** those 60 s are the dialer's own stale connection. A request opened on it
-      waits for QUIC's idle timeout before `open_tunnel` retries on a fresh one, so the first connection
-      after a host restart takes about a minute. Bounding that wait is not done.
+    - **The dialer's own stale connection no longer costs a minute (V210-141).** Once the restarted
+      host process is back, a connection from it reaches the dialer, and a connection from a new
+      process of an identity supersedes every connection to the process before
+      (`ConnectionManager::file_inner`, V210-57): the stale one is closed, the request waiting on it
+      fails, and `open_tunnel` retries on the new connection one `HOST_POLL` later. Two slower rules
+      back it up. The invite names the host as a place to reach the room, so the dialer holds it as
+      an anchor and probes it once it falls quiet; nothing answering for `ANCHOR_SILENCE_IS_LOSS`
+      (8 s) closes it (`close_if_unanswering`, V210-93). Last, a connection silent past
+      `SILENCE_IS_DEATH` (30 s) gives way (`tend_liveness`). Measured on the release binary, the host
+      killed and brought back by `vox daemon` on a new port and on its own: the dialer said the old
+      connection was closed about 1.0 s after the daemon held its room, and the first connection
+      through `vox forward` and through `vox up` was echoed in 1.26–1.27 s, inside V210-57's 10 s
+      host-restart bound. With the supersede rule taken out, the anchor probe closed it and the first
+      connection took 7.8–8.7 s; with the probe taken out too, it waited for the silence rule and
+      took 30.7 s, and the proof is red as PRODUCT. Proof:
+      `tunnel_honesty_proof::a_restarted_host_is_reached_again_promptly_by_a_forward_and_by_a_proxy`.
 - **The SSH CA is narrowed to optional (decider, 2026-09-21).** The Decision above offers "`ssh` over Vox"
   partly as a Vox-issued OpenSSH certificate bound to the Vox identity, replacing host-key TOFU and
   `authorized_keys`. That is **no longer a requirement of this ADR.** The decider's reasoning, recorded
