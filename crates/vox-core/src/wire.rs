@@ -49,8 +49,9 @@ pub enum StructTag {
     TlsIdentityExtension = 0x0009,
     /// `0x000A` — file chunk manifest (ADR-014).
     ChunkManifest = 0x000A,
-    /// `0x000B` — DGKA setup entry (ADR-009).
-    DgkaSetup = 0x000B,
+    // `0x000B` is RESERVED. It was the DGKA setup entry of deniable mode (ADR-009), which
+    // is removed from the code (PRD-001 R43); no build ever wrote one. It is not reused, so
+    // no bytes can ever be read as both; `from_u16` refuses it like any unknown tag.
     /// `0x000C` — personal self-channel entry (ADR-008).
     SelfChannelEntry = 0x000C,
     /// `0x000D` — channel genesis record (ADR-007).
@@ -59,8 +60,8 @@ pub enum StructTag {
     AdminDelegationRevocation = 0x000E,
     /// `0x000F` — tunnel service advertisement (ADR-013).
     ServiceAdvertisement = 0x000F,
-    /// `0x0010` — epoch-end ephemeral-signing-key publication (ADR-009).
-    EskPublication = 0x0010,
+    // `0x0010` is RESERVED: deniable mode's ephemeral-signing-key publication (ADR-009,
+    // removed, PRD-001 R43). Never written by any build, never reused.
     /// `0x0011` — transport session-establishment record (ADR-011).
     SessionEstablishment = 0x0011,
     /// `0x0012` — member prekey-bundle rendezvous record (ADR-016 M14): a
@@ -90,7 +91,7 @@ pub enum StructTag {
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 23] = [
+    pub const ALL: [StructTag; 21] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -101,12 +102,10 @@ impl StructTag {
         StructTag::PreJoinRecord,
         StructTag::TlsIdentityExtension,
         StructTag::ChunkManifest,
-        StructTag::DgkaSetup,
         StructTag::SelfChannelEntry,
         StructTag::GenesisRecord,
         StructTag::AdminDelegationRevocation,
         StructTag::ServiceAdvertisement,
-        StructTag::EskPublication,
         StructTag::SessionEstablishment,
         StructTag::MemberBundleRecord,
         StructTag::ServiceGrantExclusion,
@@ -124,7 +123,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 23-element table: trivial and avoids an
+        // Linear scan over a 21-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -149,12 +148,10 @@ impl StructTag {
             StructTag::PreJoinRecord => "vox/pre-join-record/v1",
             StructTag::TlsIdentityExtension => "vox/tls-identity-extension/v1",
             StructTag::ChunkManifest => "vox/chunk-manifest/v1",
-            StructTag::DgkaSetup => "vox/dgka-setup/v1",
             StructTag::SelfChannelEntry => "vox/self-channel-entry/v1",
             StructTag::GenesisRecord => "vox/genesis/v1",
             StructTag::AdminDelegationRevocation => "vox/admin-delegation-revocation/v1",
             StructTag::ServiceAdvertisement => "vox/service-advertisement/v1",
-            StructTag::EskPublication => "vox/esk-publication/v1",
             StructTag::SessionEstablishment => "vox/session-establishment/v1",
             StructTag::MemberBundleRecord => "vox/member-bundle-record/v1",
             StructTag::JoinWitness => "vox/join-witness/v1",

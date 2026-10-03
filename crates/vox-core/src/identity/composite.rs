@@ -408,7 +408,7 @@ impl SoftwareRootSigner {
     ///
     /// Returns secret material in a [`Zeroizing`] buffer (non-`Copy`, wiped on
     /// drop) so no bare `[u8; 32]` seed copy lingers at a call site. Used by the
-    /// backup bundle builder (M1) and the epoch-end ESK publication (M7).
+    /// backup bundle builder (M1).
     #[must_use]
     pub(crate) fn ed25519_seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.secret.ed.to_bytes())

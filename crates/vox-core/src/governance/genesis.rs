@@ -213,7 +213,7 @@ pub struct GenesisBody {
 
 impl GenesisBody {
     /// Canonical-CBOR body in the ADR-007 field order:
-    /// `[nonce, created, [history_mode, deniability_mode, ttl, min_suite],
+    /// `[nonce, created, [history_mode, retired_deniability (always 0), ttl, min_suite],
     ///   [service_grant_token…], creator_pubkey, [sign_algo]]`. `sign_algo` is the
     /// composite signature class (the only algorithm a genesis record commits to);
     /// `min_suite` is the ADR-003 ciphersuite floor the channel is created at; the
