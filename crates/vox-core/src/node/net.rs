@@ -343,7 +343,7 @@ pub const RETIRE_GRACE_SECS: u64 = 60;
 /// ends agree on the new one. Two **live** connections both keep hearing keep-alives, so a
 /// live duplicate still goes to `tie_key`, which both ends compute identically.
 ///
-/// **Only what authenticates is heard** (V210-140, #359): see [`heard_count`]. The count was of
+/// **Only what authenticates is heard** (V210-140, #359): see `heard_count`. The count was of
 /// datagrams routed to the connection, before authentication, so an on-path attacker that knew a
 /// connection ID could keep a dead connection looking alive with garbage, until the idle timeout.
 pub const SILENCE_IS_DEATH: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() * 3 / 2);
@@ -409,7 +409,7 @@ fn probe_patience(rtt: Duration) -> Duration {
 ///
 /// `None` is an answer, or a connection that cannot be probed (no datagram support) or that
 /// closed on its own meanwhile — none of which is evidence that a live peer is absent.
-/// `Some(before)` is no answer, with the [`heard_count`] the probe started from, so the
+/// `Some(before)` is no answer, with the `heard_count` the probe started from, so the
 /// verdict can be re-checked at the moment it is acted on (see [`ConnectionManager::file_inner`]).
 async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     let quic = conn.quinn();
@@ -432,7 +432,7 @@ async fn probe_unanswered(conn: &VoxConnection) -> Option<u64> {
     }
 }
 
-/// Connections a probe found unanswered, each with the [`heard_count`] its probe started
+/// Connections a probe found unanswered, each with the `heard_count` its probe started
 /// from. Closed only inside [`ConnectionManager::file_inner`], under the connection lock.
 type Unanswered = Vec<(Arc<VoxConnection>, u64)>;
 
@@ -443,7 +443,7 @@ pub struct ConnectionManager {
     /// Connections a better path displaced, with the time each may be closed. They
     /// keep serving what is already on them; nothing new is opened on them.
     retiring: Mutex<Vec<(Arc<VoxConnection>, u64)>>,
-    /// Per connection (by [`VoxConnection::serial`]): its [`heard_count`] when
+    /// Per connection (by [`VoxConnection::serial`]): its `heard_count` when
     /// last sampled, and when that count last moved. The evidence [`SILENCE_IS_DEATH`] reads.
     /// Not keyed by quinn's stable id, which a new connection can reuse from a freed one and
     /// so inherit its silence.
@@ -675,7 +675,7 @@ impl ConnectionManager {
         Some(conn)
     }
 
-    /// How long `conn` has received nothing, sampling its [`heard_count`] now. A connection
+    /// How long `conn` has received nothing, sampling its `heard_count` now. A connection
     /// never sampled before counts as heard this instant: the first sample is the baseline.
     fn silent_for(&self, conn: &VoxConnection) -> Duration {
         let received = heard_count(conn.quinn());
