@@ -25,6 +25,9 @@
 //!    names a room, a member and a service is refused.
 //! 8. An address naming no share in a room bob has synced is refused at once, saying so: within
 //!    [`IMMEDIATE`], PRD-001 R23's bound (#69), with no wait for a share that is not coming.
+//! 9. The same for UDP: alice also shares `nas-dns` over UDP. `vox forward nas-dns.nas-box.fam.vox`
+//!    carries bob's datagrams to it and back, and an address naming no UDP share (`dns.…`) is
+//!    refused at once, saying so, rather than bound and its datagrams dropped.
 //!
 //! **A red names its side.** A `vox` command that fails while the scene is set is PRODUCT
 //! (staging); what this proof claims is PRODUCT, quoting what vox said; the proof's own files,
@@ -177,6 +180,44 @@ fn echo(owner: &'static str) -> SocketAddr {
     at
 }
 
+/// A UDP service that answers each datagram with `<owner>:<datagram>`.
+fn udp_echo(owner: &'static str) -> SocketAddr {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: a UDP echo socket");
+    let at = sock
+        .local_addr()
+        .expect("APPARATUS: the UDP echo's address");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let mut out = format!("{owner}:").into_bytes();
+            out.extend_from_slice(&buf[..n]);
+            let _ = sock.send_to(&out, from);
+        }
+    });
+    at
+}
+
+/// `vox forward <address>` on `dir`, expected to be refused: whether it exited refused within
+/// 30 s, how long it took, and what it said.
+fn forward_refused(dir: &Path, who: &str, address: &str) -> (bool, Duration, String) {
+    let t = Instant::now();
+    let mut p = VoxProc::spawn(who, dir, &args(&["forward", address, "127.0.0.1:0"]));
+    let status = loop {
+        match p.child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if t.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => break None,
+            Err(e) => panic!("APPARATUS: wait for {who}: {e}"),
+        }
+    };
+    let took = t.elapsed();
+    std::thread::sleep(Duration::from_millis(200));
+    let said = p.transcript();
+    (status.is_some_and(|st| !st.success()), took, said)
+}
+
 /// A CONNECT through the proxy to `host`; the stream, or the SOCKS reply code.
 fn socks(proxy: SocketAddr, host: &str) -> Result<TcpStream, u8> {
     let mut s = TcpStream::connect(proxy).expect("PRODUCT: `vox up`'s proxy refused a connection");
@@ -269,7 +310,7 @@ fn listed(dir: &Path, room: &str, want: &[String]) -> (bool, String) {
 fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
-    let (ssh_at, nfs_at) = (echo("ssh"), echo("nfs"));
+    let (ssh_at, nfs_at, dns_at) = (echo("ssh"), echo("nfs"), udp_echo("dns"));
 
     let anchor_dir = tmp.path().join("anchor");
     std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: the anchor's directory");
@@ -315,6 +356,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
             "serve",
             &format!("nas-ssh={}", ssh_at.port()),
             &format!("nas-nfs={}", nfs_at.port()),
+            &format!("nas-dns={}/udp", dns_at.port()),
             "--anchor",
             &spec,
             "--listen",
@@ -559,6 +601,58 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     );
     drop(fwd);
 
+    // (9) UDP: the share by its address carries datagrams; a name no UDP share carries is refused.
+    let mut dns_fwd = VoxProc::spawn(
+        "bob forward nas-dns",
+        &bob_dir,
+        &args(&["forward", "nas-dns.nas-box.fam.vox", "127.0.0.1:0"]),
+    );
+    let dns_line = dns_fwd.expect_line("PRODUCT: `vox forward` of a UDP share binds", |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let dns_bound: SocketAddr = dns_line
+        .split_whitespace()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("PRODUCT: vox forward said {dns_line:?}"));
+    let dns_answer = {
+        let c = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: a UDP client");
+        c.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("APPARATUS: a UDP read timeout");
+        let mut buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let _ = c.send_to(b"query", dns_bound);
+            if let Ok((n, _)) = c.recv_from(&mut buf) {
+                break Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+        }
+    };
+    drop(dns_fwd);
+    let (dns_refused, dns_took, dns_said) =
+        forward_refused(&bob_dir, "bob forward dns", "dns.nas-box.fam.vox");
+    eprintln!(
+        "forward nas-dns: {dns_line:?} answered {dns_answer:?}\nforward dns (no such share): \
+         refused={dns_refused} after {dns_took:?}: {dns_said}"
+    );
+    assert!(
+        dns_line.contains("udp/nas-dns") && dns_answer.as_deref() == Some("dns:query"),
+        "PRODUCT: `vox forward nas-dns.nas-box.fam.vox` must carry datagrams to alice's UDP share \
+         and back: {dns_line:?} answered {dns_answer:?}"
+    );
+    assert!(
+        dns_refused && dns_said.contains("shares no service called `dns`"),
+        "PRODUCT: a forward to an address naming no UDP share must be refused, saying so, not \
+         bound with its datagrams dropped: {dns_said}"
+    );
+    assert!(
+        dns_took <= IMMEDIATE,
+        "PRODUCT: a forward to an address naming no UDP share took {dns_took:?} to be refused; R23 \
+         bounds a refusal at {IMMEDIATE:?}"
+    );
     // (8) No share of that name, in a room bob has synced: refused at once, through his daemon.
     let t_absent = Instant::now();
     let mut absent = VoxProc::spawn(
@@ -594,7 +688,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     );
     eprintln!(
         "[proof] 2 services reached by 6 addresses through 2 members' own words; 4 shorter names \
-         resolved to nothing; a duplicate name and a bare port refused; forward by address only"
+         resolved to nothing; a duplicate name and a bare port refused; forward by address only; absent TCP and UDP shares refused at once"
     );
     let _ = (
         bob_daemon.transcript(),
