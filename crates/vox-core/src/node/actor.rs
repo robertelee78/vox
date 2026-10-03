@@ -183,6 +183,8 @@ const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// holding a room, a wait per room would park the actor for seconds on a single publish. See
 /// `Node::view_of`.
 const VIEW_LOCK_PATIENCE: Duration = Duration::from_millis(250);
+/// How long [`NodeHandle::open_detail`] waits for an open room's detail to reach the view.
+const OPEN_DETAIL_PATIENCE: Duration = Duration::from_secs(2);
 
 /// A room's summary for the view, from its state.
 fn summary_of(ch: &ChannelState) -> ChannelSummary {
@@ -3040,6 +3042,40 @@ impl NodeHandle {
     #[must_use]
     pub fn watch(&self) -> watch::Receiver<NodeView> {
         self.view_rx.clone()
+    }
+
+    /// A room's detail, or `None` if this node does not hold the room open (V210-149).
+    ///
+    /// A room the view counts as open can still be missing its detail for a moment: the view
+    /// keeps a room's previous detail while a sync session holds its lock, and a room just opened
+    /// has none yet. So that case waits, up to two seconds, for a view that carries
+    /// it, rather than calling an open room "not open".
+    pub async fn open_detail(&self, channel_id: Digest32) -> Option<ChannelDetail> {
+        let mut rx = self.view_rx.clone();
+        let deadline = tokio::time::Instant::now() + OPEN_DETAIL_PATIENCE;
+        loop {
+            {
+                let view = rx.borrow_and_update();
+                if let Some(d) = view
+                    .open_channels
+                    .iter()
+                    .find(|d| d.channel_id == channel_id)
+                {
+                    return Some(d.clone());
+                }
+                if !view
+                    .channels
+                    .iter()
+                    .any(|c| c.channel_id == channel_id && c.open)
+                {
+                    return None;
+                }
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return None,
+            }
+        }
     }
 
     /// Apply a command and await its outcome. [`Fault::ShuttingDown`] if the

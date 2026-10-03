@@ -329,13 +329,17 @@ pub async fn open_profile(
 }
 
 /// Spawn a node, unlock it, and open one room — the preamble every verb shares.
+///
+/// With no room passphrase it opens nothing: the room is resolved among the profile's rooms and
+/// left as the unlock left it, open if the profile holds it open, closed if it was closed on
+/// purpose (`vox service list`, V210-149).
 async fn open_room(
     paths: Paths,
     listen: SocketAddr,
     anchors: vox_core::nat::bootstrap::BootstrapSet,
     identity_passphrase: &str,
     room_prefix: &str,
-    room_passphrase: &str,
+    room_passphrase: Option<&str>,
 ) -> Result<(NodeHandle, Digest32), AppError> {
     let cfg = NodeConfig::new().bind(Bind::Addr(listen)).anchors(anchors);
     let socket = paths.socket_file();
@@ -369,6 +373,9 @@ async fn open_room(
         return Err(AppError::Usage("this profile holds no rooms".into()));
     }
     let channel_id = resolve_prefix(room_prefix, &known)?;
+    let Some(room_passphrase) = room_passphrase else {
+        return Ok((node, channel_id));
+    };
     let out = node
         .apply(NodeCommand::OpenChannel {
             channel_id,
@@ -432,22 +439,22 @@ pub async fn service_remove(
     Ok(())
 }
 
-/// `vox service list`
+/// `vox service list`, on a node this verb unlocked and which opened no room for it.
 ///
 /// # Errors
-/// If the room is not open: a request this cannot answer fails, with the reason, rather than
-/// printing it and exiting 0 for a script to read as success (V210-149). The wording is the one a
-/// running daemon gives for the same request (V030-24), so the two paths say the same thing.
-pub fn service_list(node: &NodeHandle, channel_id: Digest32) -> Result<(), AppError> {
-    let view = node.view();
-    let Some(detail) = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == channel_id)
-    else {
-        return Err(AppError::Usage(
-            "cannot list that room's services: room not open".to_owned(),
-        ));
+/// If the profile does not hold the room open (V210-149): it fails, non-zero, rather than
+/// printing a reason and exiting 0 for a script to read as success. The words are the ones a
+/// running daemon answers the same request with, so the two say the same thing.
+pub async fn service_list(node: &NodeHandle, channel_id: Digest32) -> Result<(), AppError> {
+    let Some(detail) = node.open_detail(channel_id).await else {
+        let view = node.view();
+        let name = view
+            .channels
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .and_then(|c| c.local_name.clone())
+            .unwrap_or_default();
+        return Err(crate::room_cli::room_closed(&channel_id, &name));
     };
     if detail.services.is_empty() {
         println!("vox: no services offered in {}", short(&channel_id));
@@ -1238,8 +1245,8 @@ pub struct RoomTarget {
     pub identity_passphrase: String,
     /// The room's id, or a unique prefix.
     pub room: String,
-    /// The room's passphrase.
-    pub room_passphrase: String,
+    /// The room's passphrase, or `None` for a verb that opens no room.
+    pub room_passphrase: Option<String>,
 }
 
 /// Shared entry: open the room, run `body`, shut down.
@@ -1268,7 +1275,7 @@ where
         target.anchors,
         &target.identity_passphrase,
         &target.room,
-        &target.room_passphrase,
+        target.room_passphrase.as_deref(),
     );
     let (node, channel_id) = tokio::select! {
         opened = opening => opened?,

@@ -170,18 +170,24 @@ async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Digest32, AppEr
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
     if let Some((_, name, false)) = rooms.iter().find(|(r, _, _)| *r == id) {
-        let which = if name.is_empty() {
-            format!("room {}", b32_encode(&id))
-        } else {
-            format!("room {name:?} ({})", b32_encode(&id))
-        };
-        return Err(AppError::Usage(format!(
-            "{which} is closed on this node, so there is nothing to read or post. A daemon \
-             reopens every room it held open, so this one was closed in `vox tui` or did not \
-             reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
-        )));
+        return Err(room_closed(&id, name));
     }
     Ok(id)
+}
+
+/// What every verb says of a room the node holds closed, with a daemon or without one
+/// (`vox service list`'s one-shot form, V210-149).
+pub(crate) fn room_closed(id: &Digest32, name: &str) -> AppError {
+    let which = if name.is_empty() {
+        format!("room {}", b32_encode(id))
+    } else {
+        format!("room {name:?} ({})", b32_encode(id))
+    };
+    AppError::Usage(format!(
+        "{which} is closed on this node, so there is nothing to read or post. A daemon \
+         reopens every room it held open, so this one was closed in `vox tui` or did not \
+         reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
+    ))
 }
 
 /// Every `vox` verb identifies a room or a member by its **base32** rendering —
@@ -1518,6 +1524,39 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot remove {tag:?}: {reason}")))
         }
+        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox service list`, asked of the node already running this profile (V030-24).
+///
+/// `add` and `remove` go to the daemon (V030-06), but `list` opened the profile itself, which
+/// redb refuses while the daemon holds it: a person who had just added a service could not list
+/// it. It prints what the one-shot form prints (`tunnel_cli::service_list`).
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, or the node cannot say.
+pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client.request(&Request::Services { channel_id }).await {
+        Ok(Frame::Services { room, services }) => {
+            let short = crate::tunnel_cli::short_id_of(&channel_id);
+            if services.is_empty() {
+                println!("vox: no services offered in {short}");
+                return Ok(());
+            }
+            println!("vox: services offered in {room} ({short})");
+            for (tag, addr) in &services {
+                println!("  {tag}  →  {addr}");
+            }
+            Ok(())
+        }
+        // The node's reason, as `vox service list` without a daemon gives it.
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
+            "cannot list that room's services: {reason}"
+        ))),
         Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
