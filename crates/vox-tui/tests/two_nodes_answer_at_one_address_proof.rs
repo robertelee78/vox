@@ -225,7 +225,10 @@ fn the_daemon_reads_its_relay_limits_from_its_config() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    eprintln!("[proof] vox daemon with `relay-circuits = many` said: {}", said.trim());
+    eprintln!(
+        "[proof] vox daemon with `relay-circuits = many` said: {}",
+        said.trim()
+    );
     assert!(
         !ran_on && !out.status.success() && said.contains("relay-circuits"),
         "PRODUCT: a daemon whose config sets relay-circuits to no number must stop and name it; \

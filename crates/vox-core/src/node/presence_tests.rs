@@ -485,17 +485,22 @@ fn the_relay_limits_of_the_daemon_config_hold_for_the_presences_ledger() {
     );
     let ledger = Arc::new(CircuitLedger::default());
     ledger.set_limits(limits);
-    let (x, y, z) = (signer().fingerprint(), signer().fingerprint(), signer().fingerprint());
-    let held: Vec<_> = [x, x, x, y, y, z]
-        .iter()
-        .map(|a| ledger.take(*a))
-        .collect();
+    let (x, y, z) = (
+        signer().fingerprint(),
+        signer().fingerprint(),
+        signer().fingerprint(),
+    );
+    let held: Vec<_> = [x, x, x, y, y, z].iter().map(|a| ledger.take(*a)).collect();
     let taken: Vec<bool> = held.iter().map(Option::is_some).collect();
     assert_eq!(
         taken,
         [true, true, false, true, false, false],
         "PRODUCT: the ledger did not hold to 2 per asker and 3 in all"
     );
-    let bad = RelayLimits::parse("relay-circuits = many").expect_err("PRODUCT: a bad value was taken");
-    assert!(bad.contains("relay-circuits"), "PRODUCT: the refusal did not name its key: {bad}");
+    let bad =
+        RelayLimits::parse("relay-circuits = many").expect_err("PRODUCT: a bad value was taken");
+    assert!(
+        bad.contains("relay-circuits"),
+        "PRODUCT: the refusal did not name its key: {bad}"
+    );
 }

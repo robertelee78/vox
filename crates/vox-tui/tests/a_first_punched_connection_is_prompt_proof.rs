@@ -455,7 +455,11 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
             eprintln!(
                 "[proof] sample {i} ({}): host → guest {} delivered / {} dropped; guest → \
                  host {} delivered / {} dropped",
-                if direct_at.is_none() { "never punched" } else { "direct with nothing dropped" },
+                if direct_at.is_none() {
+                    "never punched"
+                } else {
+                    "direct with nothing dropped"
+                },
                 count(true, true),
                 count(true, false),
                 count(false, true),
