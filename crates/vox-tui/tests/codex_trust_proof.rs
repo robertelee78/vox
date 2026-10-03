@@ -18,7 +18,8 @@
 //!
 //! **Not proved here:** that a trusted hook then fires in a live Codex turn. That needs a
 //! model login inside the isolated `CODEX_HOME`, and this proof does not take the
-//! operator's credentials. Trust is Codex's own gate, reported by Codex's own API.
+//! operator's credentials; `codex_live_proof` does, sandboxed and on request (#169). Trust is
+//! Codex's own gate, reported by Codex's own API.
 //!
 //! **Codex gets none of this process's environment.** Every `codex` the proof starts, and every
 //! `vox agent trust codex` (which starts a `codex app-server` of its own, inheriting what vox
