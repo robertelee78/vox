@@ -2093,11 +2093,12 @@ fn test_stopped_delay_ms() -> Option<u64> {
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_ADDRESS_ENV: &str = "VOX_TEST_HOLD_ADDRESS_MS";
 
-/// Whether [`TEST_HOLD_ADDRESS_ENV`] still keeps this node's address record for `channel_id` off
-/// the boards: its time counts from the first call for that room.
+/// Whether [`TEST_HOLD_ADDRESS_ENV`] still keeps the node `me`'s address record for `channel_id`
+/// off the boards: its time counts from that node's first call for that room, kept per (node,
+/// room) because a process may host several nodes (ADR-026 P-1).
 #[cfg(feature = "test-knobs")]
-fn test_hold_address(channel_id: &Digest32) -> bool {
-    static FIRST: std::sync::Mutex<BTreeMap<Digest32, std::time::Instant>> =
+fn test_hold_address(me: &Digest32, channel_id: &Digest32) -> bool {
+    static FIRST: std::sync::Mutex<BTreeMap<(Digest32, Digest32), std::time::Instant>> =
         std::sync::Mutex::new(BTreeMap::new());
     let Some(ms) = std::env::var(TEST_HOLD_ADDRESS_ENV)
         .ok()
@@ -2109,7 +2110,7 @@ fn test_hold_address(channel_id: &Digest32) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let since = *first
-        .entry(*channel_id)
+        .entry((*me, *channel_id))
         .or_insert_with(std::time::Instant::now);
     since.elapsed() < Duration::from_millis(ms)
 }
@@ -2124,11 +2125,11 @@ fn test_hold_address(channel_id: &Digest32) -> bool {
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_ROOM_FROM_ANCHORS_ENV: &str = "VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS";
 
-/// Whether [`TEST_HOLD_ROOM_FROM_ANCHORS_ENV`] still keeps `channel_id` off this node's anchors:
-/// its time counts from the first call for that room.
+/// Whether [`TEST_HOLD_ROOM_FROM_ANCHORS_ENV`] still keeps `channel_id` off the node `me`'s
+/// anchors: its time counts from that node's first call for that room (ADR-026 P-1).
 #[cfg(feature = "test-knobs")]
-fn test_hold_room_from_anchors(channel_id: &Digest32) -> bool {
-    static FIRST: std::sync::Mutex<BTreeMap<Digest32, std::time::Instant>> =
+fn test_hold_room_from_anchors(me: &Digest32, channel_id: &Digest32) -> bool {
+    static FIRST: std::sync::Mutex<BTreeMap<(Digest32, Digest32), std::time::Instant>> =
         std::sync::Mutex::new(BTreeMap::new());
     let Some(ms) = std::env::var(TEST_HOLD_ROOM_FROM_ANCHORS_ENV)
         .ok()
@@ -2140,7 +2141,7 @@ fn test_hold_room_from_anchors(channel_id: &Digest32) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let since = *first
-        .entry(*channel_id)
+        .entry((*me, *channel_id))
         .or_insert_with(std::time::Instant::now);
     since.elapsed() < Duration::from_millis(ms)
 }
@@ -2241,21 +2242,29 @@ fn spawn_handshake(
 #[cfg(feature = "test-knobs")]
 pub const TEST_LOSE_HELLOS_ENV: &str = "VOX_TEST_LOSE_HELLOS";
 
-/// Whether this inbound hello is one [`TEST_LOSE_HELLOS_ENV`] says to lose.
+/// Whether this inbound hello, to the node `me` in `room`, is one [`TEST_LOSE_HELLOS_ENV`] says
+/// to lose: the first `N` of each (node, room), since a process may host several nodes (ADR-026
+/// P-1).
 #[cfg(feature = "test-knobs")]
-fn test_lose_hello() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
-    LEFT.get_or_init(|| {
-        AtomicU64::new(
-            std::env::var(TEST_LOSE_HELLOS_ENV)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-        )
-    })
-    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-    .is_ok()
+fn test_lose_hello(me: &Digest32, room: &Digest32) -> bool {
+    static LEFT: std::sync::Mutex<BTreeMap<(Digest32, Digest32), u64>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let mut left = LEFT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = left.entry((*me, *room)).or_insert_with(|| {
+        std::env::var(TEST_LOSE_HELLOS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    match n.checked_sub(1) {
+        Some(rest) => {
+            *n = rest;
+            true
+        }
+        None => false,
+    }
 }
 
 /// How many inbound handshakes may run at once.
@@ -5171,7 +5180,7 @@ impl Node {
             ("our address", address.to_wire()),
         ];
         #[cfg(feature = "test-knobs")]
-        if test_hold_address(channel_id) {
+        if test_hold_address(&conn.local_id(), channel_id) {
             own.pop();
         }
         let mirrored = net.board_records(channel_id, epoch);
@@ -5197,7 +5206,7 @@ impl Node {
         }
         crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
         #[cfg(feature = "test-knobs")]
-        let held = test_hold_room_from_anchors(channel_id);
+        let held = test_hold_room_from_anchors(&conn.local_id(), channel_id);
         let conn = Arc::clone(conn);
         let tx = self.net_tx.clone();
         let cid = *channel_id;
@@ -5878,7 +5887,7 @@ impl Node {
             admission,
         ) {
             #[cfg(feature = "test-knobs")]
-            let held = test_hold_address(channel_id);
+            let held = test_hold_address(&net.manager().endpoint().local_id(), channel_id);
             #[cfg(not(feature = "test-knobs"))]
             let held = false;
             if !held {
@@ -11469,7 +11478,16 @@ impl Node {
             return;
         }
         #[cfg(feature = "test-knobs")]
-        if matches!(stream.first, PairwiseFrame::Hello { .. }) && test_lose_hello() {
+        if matches!(stream.first, PairwiseFrame::Hello { .. })
+            && test_lose_hello(
+                &self
+                    .net
+                    .as_ref()
+                    .map(|n| n.manager().endpoint().local_id())
+                    .unwrap_or_default(),
+                &room,
+            )
+        {
             eprintln!("vox: {TEST_LOSE_HELLOS_ENV}: an inbound hello was lost, unread");
             let PairwiseIn {
                 mut send, mut recv, ..
