@@ -11,16 +11,22 @@
 //!
 //! [`an_older_release_updates_itself_and_refuses_a_bad_download`] downloads the **published**
 //! previous release and runs *its* `vox update` — the journey a person takes, but measuring an
-//! artifact this tree cannot change. It is optional: it runs only with
-//! `VOX_PROOF_UPDATE_JOURNEY=1`, and says `NOT RUN` otherwise.
+//! artifact this tree cannot change. It is an optional proof (docs/release/optional-proofs.md):
+//! it is compiled only with vox-tui's `optional-proofs` feature, and without it a stand-in of the
+//! same name says `OPTIONAL PROOF NOT RUN`. It blocks nothing, and it accepts no gap.
 //!
 //! A red says which side it is on: `PRODUCT:` for a claim `vox` failed, quoting what it said;
 //! `CANNOT MEASURE:` for a claim the world could not be asked (GitHub unreachable, nothing
-//! published to update from), and `APPARATUS:` for the proof's own I/O failing. Set
-//! `VOX_PROOF_ALLOW_UNPROVEN=<id-or-prefix>[,…]` to accept a named CANNOT MEASURE gap.
+//! published to update from), and `APPARATUS:` for the proof's own I/O failing. For the blocking
+//! test, `VOX_PROOF_ALLOW_UNPROVEN=<id-or-prefix>[,…]` accepts a named CANNOT MEASURE gap; the
+//! optional one reads no such variable.
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/optional_proof.rs"]
+mod optional_proof;
+optional_proof::not_run!(an_older_release_updates_itself_and_refuses_a_bad_download);
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -225,6 +231,7 @@ fn github_reachable() -> Result<(), String> {
 
 /// The version `stable` is serving for this target, straight from the release record. `Err`
 /// says why there is none: the network, or nothing published.
+#[cfg(feature = "optional-proofs")]
 fn published_version(triple: &str) -> Result<String, String> {
     let tmp = tmpdir();
     let out = tmp.path().join("record.json");
@@ -249,6 +256,7 @@ fn published_version(triple: &str) -> Result<String, String> {
 /// The version of the newest release *other than* `newest` that carries our asset, if GitHub
 /// will say. `gh` is the only thing that can list releases without an asset name to guess at;
 /// when it is absent or unauthenticated the journey claim is reported unproven, not skipped.
+#[cfg(feature = "optional-proofs")]
 fn earlier_release(newest: &str) -> Result<String, String> {
     let asset = format!("vox-{}", target_triple());
     let out = Command::new("gh")
@@ -285,6 +293,7 @@ fn earlier_release(newest: &str) -> Result<String, String> {
 /// `v0.1.0` and `v0.2.0` execute the downloaded candidate to read its `--version` while
 /// still holding it open for writing, and Linux returns `ETXTBSY` from `execve` on a file
 /// with an open writable descriptor. Every `vox update` on those builds dies there.
+#[cfg(feature = "optional-proofs")]
 const FIRST_WORKING_LINUX_UPDATER: &str = "0.2.1";
 
 /// Whether `older`'s **own** updater is known to be incapable of updating on this platform.
@@ -300,6 +309,7 @@ const FIRST_WORKING_LINUX_UPDATER: &str = "0.2.1";
 /// fixed in this tree, named in the reason with the versions involved, and the condition
 /// must **clear itself** — which this does, as soon as the newest release other than the
 /// current one carries the fix. It narrows to nothing rather than being renewed.
+#[cfg(feature = "optional-proofs")]
 fn updater_is_broken_on_this_platform(older: &str) -> bool {
     if cfg!(target_os = "macos") {
         return false; // macOS takes the Developer ID path and never executes the candidate.
@@ -324,9 +334,14 @@ fn allowed_gaps() -> Vec<String> {
 }
 
 /// Print every claim and receipt, then fail: `PRODUCT:` for a claim `vox` failed, and
-/// `CANNOT MEASURE:` for a claim the world could not be asked, unless that gap is accepted.
-fn dispose(title: &str, claims: &[Claim], receipts: &BTreeMap<String, String>) {
-    let allowed = allowed_gaps();
+/// `CANNOT MEASURE:` for a claim the world could not be asked, unless that gap is accepted
+/// (only where `accept_gaps`: an optional proof accepts none).
+fn dispose(title: &str, claims: &[Claim], receipts: &BTreeMap<String, String>, accept_gaps: bool) {
+    let allowed = if accept_gaps {
+        allowed_gaps()
+    } else {
+        Vec::new()
+    };
     println!("\n--- {title} ---");
     for c in claims {
         println!("  [{}] {} — {}", c.status, c.id, c.detail);
@@ -540,21 +555,16 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
         ));
     }
 
-    dispose("vox update proof", &claims, &receipts);
+    dispose("vox update proof", &claims, &receipts, true);
 }
 
-/// **Optional** (`VOX_PROOF_UPDATE_JOURNEY=1`): the published previous release updates itself
+/// **Optional** (the `optional-proofs` feature): the published previous release updates itself
 /// to the newest, and the same binary refuses a download whose digest does not match its record.
 /// Both run a binary GitHub already serves, so they measure that artifact as much as this tree.
+#[cfg(feature = "optional-proofs")]
 #[test]
+#[ignore = "optional: runs the published previous release's `vox update` through GitHub"]
 fn an_older_release_updates_itself_and_refuses_a_bad_download() {
-    if std::env::var_os("VOX_PROOF_UPDATE_JOURNEY").is_none() {
-        eprintln!(
-            "NOT RUN (opt-in: VOX_PROOF_UPDATE_JOURNEY): journey.update_replaces_an_older_install \
-             and verify.digest_mismatch_is_refused run the published previous release"
-        );
-        return;
-    }
     watchdog::arm();
     let mut claims: Vec<Claim> = Vec::new();
     let mut receipts: BTreeMap<String, String> = BTreeMap::new();
@@ -664,5 +674,5 @@ fn an_older_release_updates_itself_and_refuses_a_bad_download() {
         }
     }
 
-    dispose("vox update journey (optional)", &claims, &receipts);
+    dispose("vox update journey (optional)", &claims, &receipts, false);
 }
