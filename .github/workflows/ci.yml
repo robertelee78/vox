@@ -16,10 +16,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # No gap is accepted here (no VOX_PROOF_ALLOW_UNPROVEN). The live-model proofs, and every other
-  # proof too heavy or too timing-bound to block, are optional (decider, 2026-10-01): they run only
-  # with vox-tui's `optional-proofs` feature, so CI compiles them and never runs them. Without it,
-  # a stand-in in each one's place prints `OPTIONAL PROOF NOT RUN` and passes.
 
 jobs:
   # **Every commit must build, not merely the tip.** `git bisect` compiles the commit it
@@ -73,102 +69,36 @@ jobs:
             echo "::endgroup::"
           done
 
-  build-test:
-    name: build · clippy · fmt · test
-    # ADR-015 scopes clients to macOS + Linux; the core is checked on both.
+  build-lint:
+    name: build · clippy · fmt
+    # No tests run in CI (decider, 2026-10-02): "I hate gates ... even the tests that test how a user
+    # would use a product should be done ad hoc on demand as opposed to be part of the normal build or
+    # CI process". CI compiles Vox and checks formatting and common code mistakes, nothing more. The
+    # checks that drive the shipped `vox` as a person would are run by hand, when someone asks.
+    # ADR-015 scopes clients to macOS + Linux; both compile.
     strategy:
-      # Both platforms report. Without this, one failure cancels the other and the second
-      # platform's state is never learned — which is how a red ubuntu hid macOS for ten runs.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # 120, not 45: both platforms were cancelled at 45 minutes on v0.2.9's merge with nothing red.
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # macOS's Spotlight indexes the checkout and gigabytes of build output while the timing
-      # proofs run: on a fresh runner it took R41's emulator to 74-90% of the link, and to a clean
-      # 98% with indexing off (diag run 36228035025). The runner is a throwaway VM.
-      - name: Stop Spotlight indexing (macOS)
-        if: runner.os == 'macOS'
-        run: sudo mdutil -a -i off
       # rust-toolchain.toml pins the channel + components (rustfmt, clippy).
-      # `shell_setup_proof` measures real shells. A shell that is absent is reported unproven and
-      # FAILS (ADR-018 §3), so the runners install the ones it proves against rather than the
-      # proof being excused. ubuntu-latest ships neither zsh nor fish; macOS ships zsh only.
-      - name: Install the shells the proofs measure
-        run: |
-          if [ "$RUNNER_OS" = Linux ]; then
-            sudo apt-get update && sudo apt-get install -y zsh fish
-          else
-            brew install fish
-          fi
-          zsh --version && fish --version && bash --version | head -1
-      # `codex_trust_proof` asks Codex itself whether Vox's hook is trusted and refuses to pass
-      # without `codex` on PATH (an absent Codex is not a pass). Pinned to the version it was
-      # measured on: the app-server's `hooks/list` statuses are Codex's, not Vox's, to change.
-      - name: Install the Codex the trust proof measures
-        run: npm install -g @openai/codex@0.157.0 && codex --version
-      # `tui_member_names_proof` reads the real `vox tui`'s screen through the `pyte` terminal
-      # emulator, and fails as CANNOT MEASURE without it (#198). Pinned to the version it was
-      # measured on, in a venv of its own: the runners' Python is externally managed (PEP 668).
-      - name: Install the terminal emulator the TUI proof reads the screen with
-        run: |
-          python3 -m venv "$RUNNER_TEMP/pyte"
-          "$RUNNER_TEMP/pyte/bin/pip" install --quiet pyte==0.8.2
-          echo "VOX_PYTE_PATH=$("$RUNNER_TEMP/pyte/bin/python" -c 'import site; print(site.getsitepackages()[0])')" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format check
         run: cargo fmt --all --check
-      # Vox is pure Rust (ADR-001 principle 10): there are no optional native
-      # backends to feature-gate; the default build IS the whole build.
+      - name: Build (release)
+        run: cargo build --release --workspace
+      # `--all-targets` also compiles every check, so one that no longer builds is caught here
+      # without running it.
       - name: Clippy (default, pure-Rust)
         run: cargo clippy --all-targets -- -D warnings
-      # The mutant sender (vox-core's `mutant-sender` feature, ADR-025 P9/P10) is never in a
-      # default build, so it is linted and documented on its own here.
       - name: Clippy (mutant sender)
         run: cargo clippy -p vox-core --features mutant-sender -- -D warnings
-      # The test-only knobs (`test-knobs`, V210-105) are in no shipped build either; the proofs
-      # build with them, and refuse a `vox` without them as CANNOT MEASURE.
       - name: Clippy (test knobs)
         run: cargo clippy --all-targets --features vox-tui/test-knobs -- -D warnings
-      - name: Test (default, pure-Rust)
-        run: cargo test --workspace --no-fail-fast --features vox-tui/test-knobs
-        env:
-          # `update_proof` asks GitHub which releases exist, to find one to update *from*.
-          GH_TOKEN: ${{ github.token }}
-      - name: Docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-      - name: Docs (mutant sender)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc -p vox-core --no-deps --features mutant-sender
-      - name: Docs (test knobs)
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features vox-tui/test-knobs
-      # The proofs that drive the shipped `vox` with production parameters (Argon2id, real
-      # sockets), too slow unoptimized and therefore `#[ignore]`d in the debug suite. Every test in
-      # the workspace drives the shipped binary as a person would (ADR-018, "Only real use of the
-      # product is a test", 2026-09-26). Run here in release.
-      # No proof is excluded by name any more (V210-19, #192): `cross_process_join_proof`, excused
-      # as a flake since v0.2.2, passed 20 of 20 on integrate/v0.2.10 and is back in this gate.
-      # `--no-fail-fast`: one red must not hide the rest (v0.2.9 left ~120 binaries unrun behind one).
-      # ADR-025's P9 and P10 proofs run a deliberately misbehaving sync sender as the faulty peer
-      # (no `vox` command makes a correct node misbehave). It is built here from this commit, into
-      # its own path, and named to them by VOX_MUTANT_SENDER; the script rebuilds the shipped
-      # binary with the default features afterwards and checks that it does not carry the mutant.
-      # Without this both proofs fail as CANNOT MEASURE (run 36389831839).
-      - name: Build the mutant sender (ADR-025 P9, P10)
-        run: |
-          path=$(scripts/build-mutant-sender.sh)
-          echo "VOX_MUTANT_SENDER=$path" >> "$GITHUB_ENV"
-      - name: Real-parameter gates (release)
-        run: |
-          cargo test --release --workspace --no-fail-fast --features vox-tui/test-knobs -- --ignored
-      # The optional proofs (docs/release/optional-proofs.md) block nothing and are never run here
-      # (decider, 2026-10-01). They are kept ready for troubleshooting, so this only builds them,
-      # with RUSTFLAGS' -D warnings: a change that breaks one is caught now, not on the day it is
-      # needed. It is not a test. It builds even when a gate above went red, so a red run still
-      # says whether the kit compiles.
-      - name: Compile optional proofs (not run; troubleshooting kit)
-        if: ${{ !cancelled() }}
-        run: cargo test --release -p vox-tui --features optional-proofs --no-run
+      - name: Clippy (optional proofs)
+        run: cargo clippy -p vox-tui --all-targets --features optional-proofs -- -D warnings
