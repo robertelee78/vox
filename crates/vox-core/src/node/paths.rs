@@ -1,8 +1,13 @@
 //! Profile paths (ADR-016 §"Persistence: redb, sealed segments, XDG layout";
 //! ADR-015 §"XDG-conformant layout").
 //!
-//! - config: `$XDG_CONFIG_HOME/vox/` (macOS: `~/Library/Application Support/vox/`)
-//! - data:   `$XDG_DATA_HOME/vox/<profile>/` holding `vault.cbor` and `store.redb`
+//! - config: `$XDG_CONFIG_HOME/vox/` (macOS: `~/Library/Application Support/vox/`), the
+//!   account's settings, read for any node that has no file of its own (ADR-026 F-2)
+//! - data:   `$XDG_DATA_HOME/vox/` is the **data root** (ADR-026 F-1): `.daemon/` holds what is
+//!   the daemon's (lock, socket, port, log, attach list, settings) and `nodes/<name>/` holds one
+//!   node each — `vault.cbor` or `node-identity.key`, `store.redb`, its own `config/` directory,
+//!   `cursors/` and `sessions/`. A data root in the layout before v0.3.0 (`<data root>/<name>/`)
+//!   is moved by [`crate::node::layout::migrate`] the first time this build resolves a node.
 //!
 //! Precedence (ADR-015), highest first: explicit override, then the
 //! `VOX_CONFIG_DIR` / `VOX_DATA_DIR` env vars, then the XDG env vars, then the
@@ -63,53 +68,337 @@ pub const SESSION_DIR: &str = "sessions";
 pub const PORT_FILE: &str = "port";
 /// The default profile name.
 pub const DEFAULT_PROFILE: &str = "default";
+/// The directory under the data root holding one directory per node (ADR-026 F-1).
+pub const NODES_DIR: &str = "nodes";
+/// The directory under the data root holding what is the daemon's, not any node's (ADR-026 F-1).
+pub const DAEMON_DIR: &str = ".daemon";
+/// A node's own settings directory, inside its node directory (ADR-026 F-1, F-2). It holds
+/// today's config file names; a file missing here is read from the account's config directory.
+pub const NODE_CONFIG_DIR: &str = "config";
+/// The daemon's control socket, in `.daemon/` (ADR-026 C-1).
+pub const DAEMON_SOCKET_FILE: &str = "vox.sock";
+/// The daemon's lock, in `.daemon/` (ADR-026 D-1): held for the daemon's whole life, and by
+/// [`crate::node::layout::migrate`] while it moves directories.
+pub const DAEMON_LOCK_FILE: &str = "lock";
+/// The daemon's log, in `.daemon/` (ADR-026 S-2).
+pub const DAEMON_LOG_FILE: &str = "log";
+/// The nodes the daemon attaches when it starts, in `.daemon/` (ADR-026 L-4).
+pub const DAEMON_ATTACH_FILE: &str = "attach";
+/// The longest node name, in bytes (ADR-026 N-1a).
+pub const NODE_NAME_MAX: usize = 64;
 
-/// Resolved, created profile paths.
+/// A node's name (ADR-026 N-1a): one path component of 1–64 bytes from `[a-z0-9._-]`, not
+/// starting with `.`, folded to lower case before use; `nodes` is refused (and `.daemon`, by
+/// its leading dot), since both are directories of the data root.
+///
+/// **Folded, not refused, for upper case**, so `Alice` and `alice` are one node rather than two
+/// directories that differ only on a case-sensitive filesystem — and the same directory on
+/// macOS's default one, where two names would have shared one identity unseen.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NodeName(String);
+
+impl NodeName {
+    /// Parse and fold `s` (see [`NodeName`]).
+    ///
+    /// # Errors
+    /// [`Error::Path`] saying which rule `s` breaks.
+    pub fn parse(s: &str) -> Result<Self> {
+        let folded = s.to_ascii_lowercase();
+        let bad = |why: String| {
+            Err(Error::Path {
+                op: "node name",
+                detail: format!("{s:?} {why}"),
+            })
+        };
+        if folded.is_empty() || folded.len() > NODE_NAME_MAX {
+            return bad(format!("must be 1 to {NODE_NAME_MAX} bytes long"));
+        }
+        if let Some(c) = folded
+            .chars()
+            .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')))
+        {
+            return bad(format!(
+                "holds {c:?}; a node name is letters a-z, digits, '.', '_' and '-'"
+            ));
+        }
+        if folded.starts_with('.') {
+            return bad("must not start with '.'".into());
+        }
+        if folded == NODES_DIR {
+            return bad(format!("is reserved: {NODES_DIR}/ holds the nodes"));
+        }
+        Ok(Self(folded))
+    }
+
+    /// The folded name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for NodeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One OS account's Vox: its data root and its config directory (ADR-026 §7), resolved by the
+/// ADR-015 precedence and **not created** by resolving, so asking which nodes an account holds
+/// makes none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    /// The data root: `.daemon/` and `nodes/` live here.
+    pub data_root: PathBuf,
+    /// The account's config directory, read for any setting a node has no file of its own for.
+    pub config_dir: PathBuf,
+}
+
+impl Account {
+    /// The account the overrides, the env vars or the platform default name.
+    ///
+    /// # Errors
+    /// If neither an override, the env vars nor `HOME` names a directory.
+    pub fn of(data_override: Option<&Path>, config_override: Option<&Path>) -> Result<Self> {
+        let (data_root, config_dir) = roots(data_override, config_override)?;
+        Ok(Self {
+            data_root,
+            config_dir,
+        })
+    }
+
+    /// `<data root>/.daemon`.
+    #[must_use]
+    pub fn daemon_dir(&self) -> PathBuf {
+        self.data_root.join(DAEMON_DIR)
+    }
+
+    /// `<data root>/.daemon/vox.sock`, or the short fallback when that path is too long (see
+    /// [`socket_path_in`]).
+    #[must_use]
+    pub fn socket(&self) -> PathBuf {
+        socket_path_in(&self.daemon_dir(), DAEMON_SOCKET_FILE)
+    }
+
+    /// `<data root>/.daemon/lock`.
+    #[must_use]
+    pub fn lock_file(&self) -> PathBuf {
+        self.daemon_dir().join(DAEMON_LOCK_FILE)
+    }
+
+    /// `<data root>/.daemon/port`: the one UDP port of this data root (ADR-026 D-3).
+    #[must_use]
+    pub fn port_file(&self) -> PathBuf {
+        self.daemon_dir().join(PORT_FILE)
+    }
+
+    /// `<data root>/.daemon/log`.
+    #[must_use]
+    pub fn log_file(&self) -> PathBuf {
+        self.daemon_dir().join(DAEMON_LOG_FILE)
+    }
+
+    /// `<data root>/.daemon/attach`.
+    #[must_use]
+    pub fn attach_file(&self) -> PathBuf {
+        self.daemon_dir().join(DAEMON_ATTACH_FILE)
+    }
+
+    /// `<data root>/.daemon/config`: the daemon's own settings (listen, metrics, relay limits).
+    #[must_use]
+    pub fn daemon_config_file(&self) -> PathBuf {
+        self.daemon_dir().join(CONFIG_FILE)
+    }
+
+    /// `<data root>/nodes`.
+    #[must_use]
+    pub fn nodes_dir(&self) -> PathBuf {
+        self.data_root.join(NODES_DIR)
+    }
+
+    /// `<data root>/nodes/<name>`, not created.
+    #[must_use]
+    pub fn node_dir(&self, name: &NodeName) -> PathBuf {
+        self.nodes_dir().join(name.as_str())
+    }
+
+    /// Resolve and create `name`'s directories.
+    ///
+    /// # Errors
+    /// If a directory cannot be created `0700`.
+    pub fn node_paths(&self, name: &NodeName) -> Result<Paths> {
+        let profile_dir = self.node_dir(name);
+        create_private_dir(&self.data_root)?;
+        create_private_dir(&self.nodes_dir())?;
+        create_private_dir(&profile_dir)?;
+        create_private_dir(&self.config_dir)?;
+        Ok(Paths {
+            config_dir: self.config_dir.clone(),
+            profile_dir,
+            data_root: self.data_root.clone(),
+        })
+    }
+
+    /// Every node this account holds: each directory of `nodes/` with a valid name holding a
+    /// vault or a headless key, sorted by name.
+    #[must_use]
+    pub fn nodes_on_disk(&self) -> Vec<NodeName> {
+        let Ok(dir) = std::fs::read_dir(self.nodes_dir()) else {
+            return Vec::new();
+        };
+        let mut out: Vec<NodeName> = dir
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                let p = e.path();
+                p.join(VAULT_FILE).is_file()
+                    || p.join(crate::node::headless::IDENTITY_FILE).is_file()
+            })
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                NodeName::parse(&name).ok().filter(|n| n.as_str() == name)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Take the account's lock (`.daemon/lock`, ADR-026 D-1), waiting up to
+    /// [`PROFILE_PATIENCE`](crate::node::profile::PROFILE_PATIENCE) for another holder; it is
+    /// released when the returned handle drops or the process ends.
+    ///
+    /// # Errors
+    /// If `.daemon/` or the lock cannot be made, or another vox holds the lock past the wait.
+    pub fn lock(&self) -> Result<std::fs::File> {
+        create_private_dir(&self.data_root)?;
+        create_private_dir(&self.daemon_dir())?;
+        let path = self.lock_file();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|e| Error::Path {
+            op: "open the account lock",
+            detail: format!("{}: {e}", path.display()),
+        })?;
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(Error::Path {
+                        op: "take the account lock",
+                        detail: format!("{}: {e}", path.display()),
+                    })
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {}
+            }
+            if started.elapsed() >= crate::node::profile::PROFILE_PATIENCE {
+                return Err(Error::Path {
+                    op: "take the account lock",
+                    detail: format!(
+                        "another vox has held {} for {} s; stop it, or wait for it to finish",
+                        path.display(),
+                        crate::node::profile::PROFILE_PATIENCE.as_secs()
+                    ),
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+/// Resolved, created paths of one node (the name `Paths` keeps from when a node was a
+/// "profile").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
-    /// `…/vox/` config directory (created).
+    /// The account's config directory: read for a setting this node has no file of its own for
+    /// (ADR-026 F-2). Created.
     pub config_dir: PathBuf,
-    /// `…/vox/<profile>/` data directory (created).
+    /// `<data root>/nodes/<name>/`, the node's directory (created).
     pub profile_dir: PathBuf,
+    /// The data root the node directory is under.
+    pub data_root: PathBuf,
 }
 
 impl Paths {
-    /// Resolve and create the directories for `profile`, honoring the ADR-015
+    /// Resolve and create the directories for node `profile`, honoring the ADR-015
     /// precedence. `data_override` / `config_override` are the CLI-flag layer.
+    ///
+    /// **The first resolve of this build moves a data root of the layout before v0.3.0**
+    /// ([`crate::node::layout::migrate`], ADR-026 F-3), so whichever verb a person runs first
+    /// after upgrading finds its node where this build keeps it. Until the daemon (ADR-026 §5)
+    /// exists to run it at its start, this is where a profile is first opened.
+    ///
+    /// # Errors
+    /// A name that is not a node name ([`NodeName`]), a data root the migration refuses (an
+    /// older vox still running on it), or a directory that cannot be created.
     pub fn resolve(
         profile: &str,
         data_override: Option<&Path>,
         config_override: Option<&Path>,
     ) -> Result<Self> {
-        if profile.is_empty() || profile.contains(['/', '\\']) || profile == "." || profile == ".."
-        {
-            return Err(Error::Path {
-                op: "profile name",
-                detail: "must be a single non-empty path component".into(),
-            });
+        let name = NodeName::parse(profile)?;
+        let account = Account::of(data_override, config_override)?;
+        crate::node::layout::migrate(&account, Some(&name))?;
+        account.node_paths(&name)
+    }
+
+    /// The account this node belongs to.
+    #[must_use]
+    pub fn account(&self) -> Account {
+        Account {
+            data_root: self.data_root.clone(),
+            config_dir: self.config_dir.clone(),
         }
-        let data_root = match data_override {
-            Some(p) => p.to_path_buf(),
-            None => match std::env::var_os("VOX_DATA_DIR") {
-                Some(v) => PathBuf::from(v),
-                None => default_data_root()?,
-            },
-        };
-        let config_dir = match config_override {
-            Some(p) => p.to_path_buf(),
-            None => match std::env::var_os("VOX_CONFIG_DIR") {
-                Some(v) => PathBuf::from(v),
-                None => default_config_root()?,
-            },
-        };
-        let profile_dir = data_root.join(profile);
-        create_private_dir(&data_root)?;
-        create_private_dir(&profile_dir)?;
-        create_private_dir(&config_dir)?;
-        Ok(Self {
-            config_dir,
-            profile_dir,
-        })
+    }
+
+    /// `<profile_dir>/config`, the node's own settings directory (ADR-026 F-1).
+    #[must_use]
+    pub fn node_config_dir(&self) -> PathBuf {
+        self.profile_dir.join(NODE_CONFIG_DIR)
+    }
+
+    /// Where to **read** the setting file `file` from (ADR-026 F-2): the node's own
+    /// `config/<file>` if it is there, else the account's.
+    ///
+    /// A node's file wins whole, line for line: it is never merged with the account's, so what a
+    /// person reads in the node's file is everything that node is set to.
+    #[must_use]
+    pub fn config_path(&self, file: &str) -> PathBuf {
+        let own = self.node_config_dir().join(file);
+        if std::fs::symlink_metadata(&own).is_ok() {
+            own
+        } else {
+            self.config_dir.join(file)
+        }
+    }
+
+    /// Where to **write** the setting file `file`: always the node's own `config/<file>`, made
+    /// from the account's file first when the node has none, so a change to one line keeps the
+    /// lines this node was reading from the account's (ADR-026 F-2).
+    ///
+    /// # Errors
+    /// If the node's config directory or the copy cannot be written.
+    pub fn own_config_path(&self, file: &str) -> Result<PathBuf> {
+        let own = self.node_config_dir().join(file);
+        if std::fs::symlink_metadata(&own).is_ok() {
+            return Ok(own);
+        }
+        create_private_dir(&self.node_config_dir())?;
+        match std::fs::read(self.config_dir.join(file)) {
+            Ok(bytes) => write_private_file(&own, &bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Path {
+                    op: "read the account's setting",
+                    detail: format!("{}: {e}", self.config_dir.join(file).display()),
+                })
+            }
+        }
+        Ok(own)
     }
 
     /// `<profile_dir>/vault.cbor`.
@@ -151,27 +440,13 @@ impl Paths {
     /// socket that is not this user's ([`check_socket_owner`]).
     #[must_use]
     pub fn socket_file(&self) -> PathBuf {
-        let natural = self.profile_dir.join(SOCKET_FILE);
-        if natural.as_os_str().len() < SUN_PATH_BUDGET {
-            return natural;
-        }
-        let digest = crate::hash::domain_hash(
-            "vox/control-socket/v1",
-            self.profile_dir.as_os_str().as_encoded_bytes(),
-        );
-        let mut name = String::new();
-        for byte in &digest[..8] {
-            use std::fmt::Write as _;
-            let _ = write!(name, "{byte:02x}");
-        }
-        name.push_str(".sock");
-        socket_fallback_dir().join(name)
+        socket_path_in(&self.profile_dir, SOCKET_FILE)
     }
 
-    /// The settings file for this profile ([`CONFIG_FILE`]).
+    /// The settings file to read for this node ([`CONFIG_FILE`]; [`Self::config_path`]).
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
-        self.config_dir.join(CONFIG_FILE)
+        self.config_path(CONFIG_FILE)
     }
 
     /// `<profile_dir>/port` ([`PORT_FILE`]).
@@ -180,29 +455,38 @@ impl Paths {
         self.profile_dir.join(PORT_FILE)
     }
 
-    /// The anchors file for this profile ([`ANCHORS_FILE`]).
+    /// `<data root>/.daemon/port`: the data root's one port (ADR-026 D-3), which the migration
+    /// fills from the port a node of the old layout bound, so its published address stays valid.
+    #[must_use]
+    pub fn account_port_file(&self) -> PathBuf {
+        self.data_root.join(DAEMON_DIR).join(PORT_FILE)
+    }
+
+    /// The anchors file to read for this node ([`ANCHORS_FILE`]; [`Self::config_path`]).
     #[must_use]
     pub fn anchors_file(&self) -> PathBuf {
-        self.config_dir.join(ANCHORS_FILE)
+        self.config_path(ANCHORS_FILE)
     }
 
-    /// The node's retention file for this profile ([`RETENTION_FILE`],
-    /// [`crate::node::retention::RetentionConfig`]).
+    /// The retention file to read for this node ([`RETENTION_FILE`],
+    /// [`crate::node::retention::RetentionConfig`]; [`Self::config_path`]). A change is written
+    /// to the node's own ([`Self::own_config_path`]).
     #[must_use]
     pub fn retention_file(&self) -> PathBuf {
-        self.config_dir.join(RETENTION_FILE)
+        self.config_path(RETENTION_FILE)
     }
 
-    /// Which rooms `vox node` serves, for this profile ([`SERVE_FILE`]).
+    /// Which rooms `vox node` serves, for this node ([`SERVE_FILE`]; [`Self::config_path`]).
     #[must_use]
     pub fn serve_file(&self) -> PathBuf {
-        self.config_dir.join(SERVE_FILE)
+        self.config_path(SERVE_FILE)
     }
 
-    /// How long a stuck tunnel is given, for this profile ([`TUNNEL_STUCK_FILE`]).
+    /// How long a stuck tunnel is given, for this node ([`TUNNEL_STUCK_FILE`];
+    /// [`Self::config_path`]).
     #[must_use]
     pub fn tunnel_stuck_file(&self) -> PathBuf {
-        self.config_dir.join(TUNNEL_STUCK_FILE)
+        self.config_path(TUNNEL_STUCK_FILE)
     }
 
     /// The time the profile's [`TUNNEL_STUCK_FILE`] names, if it names one.
@@ -227,10 +511,10 @@ impl Paths {
         (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
-    /// The download-directory file for this profile ([`DOWNLOADS_FILE`]).
+    /// The download-directory file for this node ([`DOWNLOADS_FILE`]; [`Self::config_path`]).
     #[must_use]
     pub fn downloads_file(&self) -> PathBuf {
-        self.config_dir.join(DOWNLOADS_FILE)
+        self.config_path(DOWNLOADS_FILE)
     }
 
     /// Where an agent session's read cursor for one room is kept
@@ -294,6 +578,58 @@ fn sanitize(s: &str) -> String {
         let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// The data root and the config directory, by the ADR-015 precedence [`Paths::resolve`] uses,
+/// **without creating either**.
+///
+/// # Errors
+/// If neither an override, the env vars nor `HOME` names a directory.
+pub fn roots(
+    data_override: Option<&Path>,
+    config_override: Option<&Path>,
+) -> Result<(PathBuf, PathBuf)> {
+    let data_root = match data_override {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::var_os("VOX_DATA_DIR") {
+            Some(v) => PathBuf::from(v),
+            None => default_data_root()?,
+        },
+    };
+    let config_dir = match config_override {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::var_os("VOX_CONFIG_DIR") {
+            Some(v) => PathBuf::from(v),
+            None => default_config_root()?,
+        },
+    };
+    Ok((data_root, config_dir))
+}
+
+/// The control socket `file` in `dir`, or its short fallback when that path does not fit a Unix
+/// socket address (see [`Paths::socket_file`]): `<tmp>/vox-<uid>/<16 hex>.sock`, the hex a digest
+/// of `dir`, so it is deterministic and distinct per directory.
+#[must_use]
+pub fn socket_path_in(dir: &Path, file: &str) -> PathBuf {
+    let natural = dir.join(file);
+    if natural.as_os_str().len() < SUN_PATH_BUDGET {
+        return natural;
+    }
+    fallback_socket_for(dir)
+}
+
+/// The short fallback a control socket for `dir` would have been bound at, whether or not `dir`'s
+/// own path is too long (the migration removes a stale one).
+#[must_use]
+pub(crate) fn fallback_socket_for(dir: &Path) -> PathBuf {
+    let digest = crate::hash::domain_hash("vox/control-socket/v1", dir.as_os_str().as_encoded_bytes());
+    let mut name = String::new();
+    for byte in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(name, "{byte:02x}");
+    }
+    name.push_str(".sock");
+    socket_fallback_dir().join(name)
 }
 
 fn home_dir() -> Result<PathBuf> {

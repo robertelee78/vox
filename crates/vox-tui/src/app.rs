@@ -2111,7 +2111,11 @@ fn write_anchors_file(
     listening: &[String],
 ) -> std::io::Result<std::path::PathBuf> {
     use std::fmt::Write as _;
-    let path = paths.anchors_file();
+    // The account's file, not this node's own (ADR-026 F-2): every node on this machine reads
+    // it unless it keeps an anchors file of its own, so each of them reaches its anchor unasked.
+    let path = paths
+        .config_dir
+        .join(vox_core::node::paths::ANCHORS_FILE);
     let mut body = String::from(
         "# Written by `vox node`. Anchors this profile publishes to, reads from and reaches\n\
          # peers through: one <fingerprint>@<multiaddr> per line. Add anchors on other\n\

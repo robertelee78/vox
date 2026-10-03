@@ -1544,6 +1544,26 @@ pub struct NodeArgs {
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
+/// The node `vox node` runs its anchor as. One node is one identity (ADR-026 F-3), so a node
+/// holding a vault keeps its anchor's key in node `<name>-anchor` — where the migration put the
+/// key of a directory that held both — and `--serve trusted` still reads the vault's trust list
+/// from `<name>`. Otherwise the anchor is the named node itself.
+fn anchor_paths(paths: Paths) -> vox_core::error::Result<Paths> {
+    if !paths.vault_file().is_file() {
+        return Ok(paths);
+    }
+    let raw = paths
+        .profile_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_owned();
+    let name = vox_core::node::paths::NodeName::parse(&raw)?;
+    let anchor = vox_core::node::layout::anchor_name_of(&name)?;
+    println!("vox node: node {name} holds a vault; its anchor runs as node {anchor}");
+    paths.account().node_paths(&anchor)
+}
+
 impl NodeArgs {
     /// The `--serve` choice: the flag (or `VOX_SERVE`), else the config directory's `serve`
     /// file, else `anyone`. A `serve` file that says anything else is refused, not guessed at.
@@ -2089,6 +2109,13 @@ pub fn run() -> ExitCode {
             };
             let serve_only = match node_args.serve_only(&paths) {
                 Ok(s) => s,
+                Err(e) => {
+                    eprintln!("vox node: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let paths = match anchor_paths(paths) {
+                Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox node: {e}");
                     return ExitCode::FAILURE;
