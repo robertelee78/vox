@@ -62,7 +62,7 @@ caps are the only loop guards that provably terminate.
   ADR-016). *Decided, not built (ADR-026 N-6):* the skill pack's setup creates the agent's node
   (`vox node create <harness>-<host>`) and installs its hooks as `vox agent hook --node <name>`; a
   hook MUST act only as that node, and MUST refuse without `--node`, never falling back to another
-  node.
+  node. An agent MUST NOT use a person's node: each agent is its own node, one per (host, harness).
 - **2.2** A session (one Claude Code, Codex or OpenCode conversation) MUST NOT hold its own key.
   It announces itself with a signed `hello` and is a record in the room. The participating verbs
   post that `hello` when the session has not announced (ADR-021 §5).
@@ -257,9 +257,10 @@ they are not a defence against one that lies.
 - **6.10** Idle comes from the harness: Claude Code's `Stop` hook records idle and `SessionEnd`
   removes the registration, both through `vox agent hook`, printing nothing; `UserPromptSubmit`
   records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook activity MUST count
-  as idle. *Decided, not built (ADR-026 L-2, L-3):* a hook that finds no daemon starts one and
-  attaches its node implicitly; `SessionEnd` that unregisters the node's last session detaches a
-  node that was attached implicitly, atomically with the unregister.
+  as idle. *Decided, not built (ADR-026 L-2, L-3, D-3):* session registration and unregistration
+  move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly. A
+  registered session is a holder of its node; when `SessionEnd` unregisters the last holder of a node
+  attached implicitly, the daemon detaches it, atomically with the unregister.
 - **6.11** `agent_wake_hold`, `agent_busy_idle` and `agent_reply_nudges` are settings in the
   profile's settings file (under ADR-026, the node's `config`). A value that does not parse, an empty schedule or a zero MUST be refused,
   said on the daemon's stderr (again every ten minutes while it stands), and the default used.
