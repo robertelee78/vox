@@ -387,7 +387,7 @@ impl RelayWorld {
             &host_dir,
             &args(&[
                 "serve",
-                &service,
+                &format!("{service}={service}"),
                 "--anchor",
                 &v4_spec,
                 "--listen",

@@ -3,9 +3,9 @@
 //!
 //! **The claim.** Two people have met: the guest has joined the host's room, the host trusts the
 //! guest, and nothing is running on the guest's side. The guest starts `vox up` and asks it for the
-//! host's service (`ssh user@<room>.vox` does exactly this, over SOCKS5). The wait from that moment
-//! until the pair is **on a direct path** — rung 1, a direct dial of an address the host advertises —
-//! must be under 2 s, and so must the wait until the request is answered by any path at all.
+//! host's service (`ssh user@<service>.<node>.<room>.vox` does exactly this, over SOCKS5). The
+//! wait from that moment until the pair is **on a direct path** — rung 1, a direct dial of an
+//! address the host advertises — must be under 2 s, and so must the wait until the request is answered by any path at all.
 //!
 //! **The staging — real processes only.** A `vox node` anchor on `[::]` (dual-stack), a `vox serve`
 //! host on `127.0.0.1`, and the guest on `[::1]`, set up with `vox id`, `vox trust add` and

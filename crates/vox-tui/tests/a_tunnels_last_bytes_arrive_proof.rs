@@ -231,7 +231,7 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         &host_dir,
         &args(&[
             "serve",
-            &backend.to_string(),
+            &format!("{backend}={backend}"),
             "--anchor",
             &anchor.v4_spec,
             "--listen",

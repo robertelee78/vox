@@ -21,14 +21,8 @@ Built on integrate/v0.3.0:
 - refusal of rooms made before v0.3.0 (11.4).
 
 Where this tree's code differs from these requirements:
-- **Addressing (decision 12)** is being built under #339 (V030-25). This tree still resolves
-  `<node>.<room>.vox`, where the node part is a keyring petname and the room part is the local room
-  name, and still resolves `<room-id>.vox` to the creator of a room whose genesis carries a service
-  grant (`node::resolver`). It has no service names.
-- **The genesis service grant and `0x0013`** are still encoded, decoded and, for a room `vox serve`
-  makes, still set. Their removal is #94 (R44) and #339 (11.4).
-- **`vox serve`** still creates a room, with a generated passphrase and a genesis grant, and offers
-  the ports in it. Binding a service into a room that already exists is `vox service add`. Naming the
+- **`vox serve`** still creates a room, with a generated passphrase, and shares the named services in
+  it. Binding a service into a room that already exists is `vox service add`. Naming the
   audience and non-audience is not built (4.1, 4.2).
 - **Passphrase rotation** is removed by V030-32, but its code is still on this tree; the removal is
   pending under #380 (11.3).
@@ -128,8 +122,8 @@ is what a person offers. A tunnel is how bytes reach it.
   the members of the room who cannot. Status: not built. `vox serve` prints the rule, not the lists.
 - **4.3** A shared service MUST have a name, given by the sharing node and unique per node per room.
   `vox serve` with no name MUST be refused (decision 12, #339).
-- **4.4** The port in a request MUST be a Vox-layer identifier that the host translates to the local
-  endpoint it declared. The endpoint defaults to `127.0.0.1:<port>`. `--at` MUST set a different one.
+- **4.4** The service's name (12.6) MUST be what the host translates to the local endpoint it
+  declared. The endpoint defaults to `127.0.0.1:<port>`. `--at` MUST set a different one.
 - **4.5** `vox serve` MUST NOT refuse for lack of an anchor. A host found directly by its guests
   needs none. It MUST withhold an address that would name no route at all, and say why
   (`NodeEvent::AddressWithheld`, V210-96).
@@ -239,7 +233,8 @@ is what a person offers. A tunnel is how bytes reach it.
   removal is pending under #380.
 - **11.4** A room made before v0.3.0 MUST be refused, with "make the room again"
   (`Fault::RoomFromBeforeV030`). The genesis service grant MUST be removed, along with `<room-id>.vox`
-  resolving to a room's creator (R44, #94; #339). Status: still on this tree, as above.
+  resolving to a room's creator (R44, #94; #339). The grant slot stays in the genesis layout, always
+  empty; a genesis carrying a token is refused as a room made before v0.3.0. `0x0013` is reserved.
 - **M17.8** A governance entry MUST count only if its epoch equals the epoch established in its
   strict causal past (`Evaluator::in_effect`, ADR-007), so a replayed pre-rotation grant buys nothing.
 - **M17.13** Superseded by 11.4.
@@ -249,13 +244,33 @@ is what a person offers. A tunnel is how bytes reach it.
 - **12.1** Only `service.node.room.vox` MUST connect. `node.room.vox` and `room.vox` MUST resolve to
   nothing: no connection, no refusal naming services, and no listing.
 - **12.2** The node and room parts MUST be the resolving client's own aliases, or the fingerprints.
-  The service part MUST be the name the sharing node set, which is unique per node per room.
+  The service part MUST be the name the sharing node set, which is unique per node per room, or the
+  service's fingerprint, `SHA-256("vox/service-fingerprint/v1" ‖ room id ‖ sharer fingerprint ‖ name)`.
 - **12.3** Wherever Vox shows a service address, it MUST render the node and room parts with the
   viewer's own alias, or the fingerprint where the viewer set none.
 - **12.4** `<room-id>.vox`, resolving to a room's creator, MUST NOT resolve. The genesis service grant
   behind it is removed.
+- **12.5** A three-part name whose words match nothing on this node, or more than one thing, MUST be
+  refused with a sentence saying which, to this node's operator only. Only the SOCKS reply code
+  reaches the tool.
+- **12.6** The port in a SOCKS request MUST NOT select the service; the name does. A UDP service is
+  asked for as `udp/<name>`.
+- **12.7** A service name MUST be one DNS label of at most 63 characters. `vox serve` takes each share
+  as `<name>=<port>[/tcp|/udp]`. One name MUST NOT be shared twice by a node in a room, over either
+  transport; the second share MUST be refused, naming it. A service moves by being removed and shared
+  again.
+- **12.8** A share MUST be stated on the room's log as a `0x0018` service-share statement
+  (`vox/service-share/v1`), signed by its sharer: the name, its transport, and whether it is shared or
+  withdrawn. The last statement a sharer made about a name wins. A member that has left shares nothing.
+  A transient offer (a file being handed over) MUST NOT be stated.
+- **12.9** A member MUST be able to list what is shared in a room, with each address rendered as in
+  12.3 and who shared it: `vox service list <room>`, and the TUI's Shared pane.
+- **12.10** `vox serve` MUST print each share's address with the service name and the fingerprints in
+  the node and room places.
 
-Status: being built under #339 (V030-25). The detailed mechanics of decision 12 belong to that item.
+Built (#339): `node::resolver`, `governance::share`, `ChannelState::{say_share, shares}`,
+`vox serve <name>=<port>`, `vox service list`, `vox forward <service>.<node>.<room>.vox [<local>]`.
+Proved by `crates/vox-tui/tests/a_service_is_reached_only_by_its_address_proof.rs`.
 
 ### 13. Boundaries
 

@@ -81,7 +81,8 @@
 //!   (tag `0x000D`, `channelID = SHA-256(canonical genesis)`, consistent with M3's
 //!   derivation); the closed capability vocabulary + SPKI/SDSI/UCAN attenuation
 //!   lattice (`admin` ⊇ `delegate`/`invite`/`policy`/`passphrase-rotate` + the
-//!   ADR-013 tunnel caps `bind:`/`dial:`/`#role`); the composite-signed,
+//!   `#role`; the ADR-013 tunnel tokens `bind:`/`dial:` parse but confer nothing,
+//!   PRD-001 R44); the composite-signed,
 //!   `(channelID, epoch)`-bound governance entry bodies that ride the M5 log
 //!   (admin-delegation cert `0x0003` and revocation `0x000E`, consent grant
 //!   `0x0004` and revocation `0x0005`, policy-update + passphrase-rotation

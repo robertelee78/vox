@@ -229,7 +229,7 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     let mut host = Proc::spawn(
         "host",
         &host_dir,
-        &["serve", "9", "--anchor", &spec, "--listen", "127.0.0.1:0"],
+        &["serve", "9=9", "--anchor", &spec, "--listen", "127.0.0.1:0"],
         "",
     );
     let field = |label: &str| {

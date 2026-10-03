@@ -31,7 +31,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 
 use crate::atrest::sek::Argon2Profile;
 use crate::error::Error;
-use crate::governance::capability::{Capability, CapabilitySet};
 use crate::hash::Digest32;
 use crate::nat::bootstrap::{BootstrapNode, BootstrapSet};
 use crate::nat::record::{MemberBundleRecord, RendezvousRecord};
@@ -261,6 +260,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
             .iter()
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
+        shares: ch.shares(),
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
@@ -3300,6 +3300,37 @@ impl NodeHandle {
         self.view_rx.clone()
     }
 
+    /// The services shared in an open room (V030-25), each as `(address, sharer, udp)`: its
+    /// address and its sharer written as **this** node writes them — its own aliases for the
+    /// node and the room where it has them, the fingerprints where it has not — or `None` if the
+    /// room is not open.
+    pub async fn shared_in(&self, channel_id: Digest32) -> Option<Vec<(String, String, bool)>> {
+        let detail = self.open_detail(channel_id).await?;
+        let (tx, rx) = oneshot::channel();
+        self.net_tx.send(NetEvent::Names(tx)).await.ok()?;
+        let names = rx.await.ok()?;
+        let me = self
+            .view_rx
+            .borrow()
+            .identity
+            .as_ref()
+            .map(|i| i.fingerprint);
+        Some(
+            detail
+                .shares
+                .iter()
+                .map(|s| {
+                    let who = if Some(s.host) == me {
+                        "you".to_owned()
+                    } else {
+                        names.alias_of(&s.host)
+                    };
+                    (names.address_of(&channel_id, &s.host, &s.name), who, s.udp)
+                })
+                .collect(),
+        )
+    }
+
     /// A room's detail, or `None` if this node does not hold the room open (V210-149).
     ///
     /// A room the view counts as open can still be missing its detail for a moment: the view
@@ -4258,6 +4289,7 @@ impl Node {
                     if let NodeCommand::Serve {
                         local_name,
                         passphrase,
+                        name: service,
                         port,
                         udp,
                         at,
@@ -4265,11 +4297,11 @@ impl Node {
                     {
                         let endpoint =
                             at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], port)));
-                        // A UDP service is served as `udp/<port>` (ADR-022 decision 6).
+                        // A UDP service is served as `udp/<name>` (ADR-022 decision 6).
                         let tag = if udp {
-                            format!("udp/{port}")
+                            format!("udp/{service}")
                         } else {
-                            port.to_string()
+                            service
                         };
                         self.begin_create_channel(
                             local_name,
@@ -11787,16 +11819,9 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
         };
-        // A service room's genesis grant names its port (ADR-017): it is retained on the wire
-        // (M17.13) and grants nothing, and the room's `.vox` name is the same for a UDP service
-        // (ADR-022 decision 6). The service's tag is what the host's gate is asked about.
-        let grant = match &service {
-            Some((tag, _)) => CapabilitySet::from_iter_caps([Capability::dial(
-                tag.strip_prefix("udp/").unwrap_or(tag).to_owned(),
-            )]),
-            None => crate::governance::capability::CapabilitySet::new(),
-        };
-        let (genesis, sek) = match ChannelState::create_genesis(profile, &local_name, grant, now) {
+        // A service room's genesis is like any other room's: it carries no grant (PRD-001 R44).
+        // The service is the host's to offer, and its gate decides who reaches it.
+        let (genesis, sek) = match ChannelState::create_genesis(profile, &local_name, now) {
             Ok(g) => g,
             Err(e) => {
                 let _ = reply.send(Outcome::Failed(fault_of(&e)));
@@ -11847,9 +11872,9 @@ impl Node {
     /// Finish a service room whose key was sealed off the actor, and offer its one service,
     /// atomically (ADR-017).
     ///
-    /// The two halves are one command because either alone is a lie: a room with a
-    /// service grant and no service hands out an address for nothing, and a service in a
-    /// room nobody can join is unreachable. If the service cannot be offered the room is
+    /// The two halves are one command because either alone is a lie: a service room with
+    /// no service hands out an address for nothing, and a service in a room nobody can
+    /// join is unreachable. If the service cannot be offered the room is
     /// not kept.
     fn finish_serve_room<'a>(
         &'a mut self,
@@ -11871,7 +11896,13 @@ impl Node {
             return Outcome::Failed(Fault::NoIdentity);
         };
         let id = channel.channel_id();
-        if let Err(e) = channel.add_service(profile.store(), profile, tag, endpoint, true) {
+        let now = self.now();
+        // Offered and said to the room (V030-25) together: a share its members cannot list is
+        // half a share.
+        if let Err(e) = channel
+            .add_service(profile.store(), profile, tag, endpoint, true)
+            .and_then(|_| channel.say_share(profile, tag, true, now))
+        {
             // Drop the room rather than keep a half-made one. Nothing outside this
             // function has seen it: it is not in `self.channels` and has not been
             // published, so forgetting it here is the whole of the rollback.
@@ -12258,6 +12289,12 @@ impl Node {
             }
             ch.catch_up_generation(profile, now)
                 .and_then(|_| ch.say_presence(profile, true, now))
+                .map(|back| {
+                    // Shares made while the room was unsettled are said now (V030-25). A share
+                    // left unsaid is offered but unlisted, which is not worth failing the room.
+                    let said = ch.say_unsaid_shares(profile, now).unwrap_or(false);
+                    back || said
+                })
         };
         match back {
             Ok(true) => self.note_local_append(channel_id),
@@ -12354,9 +12391,8 @@ impl Node {
         Outcome::Done
     }
 
-    /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). The `bind:`
-    /// capability is checked by the channel, so a node cannot offer what the log does
-    /// not let it offer.
+    /// Offer a local TCP service in a channel (ADR-013 Bind, M16.1). Offering needs no
+    /// capability (ADR-017 M17.7); who may reach it is the host's dial gate.
     async fn add_service(
         &mut self,
         channel_id: &Digest32,
@@ -12370,12 +12406,35 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
+        let now = self.now();
         let outcome = {
             let mut channel = shared.lock().await;
-            channel.add_service(profile.store(), profile, service_tag, local, persist)
+            channel
+                .add_service(profile.store(), profile, service_tag, local, persist)
+                .and_then(|_| {
+                    // A share is said to the room so its members can list it (V030-25); a
+                    // transient offer — a file being handed over — is not a share. If it cannot
+                    // be said, the service is not offered either.
+                    if !persist {
+                        return Ok(());
+                    }
+                    // A room joined and not yet synced cannot be written to (V210-164): the share
+                    // is offered now and said when the room settles (`say_unsaid_shares`).
+                    match channel.say_share(profile, service_tag, true, now) {
+                        Err(crate::error::Error::RoomNotSynced) => Ok(()),
+                        Err(e) => {
+                            let _ = channel.remove_service(profile.store(), service_tag);
+                            Err(e)
+                        }
+                        Ok(()) => Ok(()),
+                    }
+                })
         };
         match outcome {
-            Ok(_) => {
+            Ok(()) => {
+                if persist {
+                    self.note_local_append(channel_id);
+                }
                 self.refresh_reachers().await;
                 Outcome::Done
             }
@@ -12397,12 +12456,22 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
+        let now = self.now();
         let outcome = {
             let mut channel = shared.lock().await;
-            channel.remove_service(profile.store(), service_tag)
+            let was_shared = channel.is_shared(service_tag);
+            let removed = channel.remove_service(profile.store(), service_tag);
+            // The room is told it is no longer shared (V030-25). Not saying so leaves it listed
+            // where nothing answers — a wrong listing, not a failed removal: the service is gone
+            // either way.
+            if matches!(removed, Ok(true)) && was_shared {
+                let _ = channel.say_share(profile, service_tag, false, now);
+            }
+            removed
         };
         match outcome {
             Ok(true) => {
+                self.note_local_append(channel_id);
                 self.refresh_reachers().await;
                 Outcome::Done
             }
@@ -12415,30 +12484,21 @@ impl Node {
     /// member through the whole ADR-012 ladder, then bind the port.
     /// Bring up the SOCKS5 entry point for one room (ADR-017 decision 5).
     ///
-    /// The room's host is its genesis creator, which is why this needs nothing but the
-    /// room: no advertisement to wait for, and no configuration to hold. The connection to
-    /// that host is established here, through the ADR-012 ladder, so the proxy never dials
-    /// a peer itself — it asks the node for a connection and refuses if there is none.
+    /// Names resolve as `<service>.<node>.<room>.vox` (V030-25) against this node's rooms and
+    /// keyring as they stand when each connection asks. The connection to the sharing node is
+    /// established per request, through the ADR-012 ladder, so the proxy never dials a peer
+    /// itself — it asks the node for a connection and refuses if there is none.
     async fn bring_up(&mut self, channel_id: &Digest32, bind: std::net::SocketAddr) -> Outcome {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let (genesis, local_name) = {
-            let ch = shared.lock().await;
-            (ch.genesis().clone(), ch.local_name().to_owned())
-        };
-        // The name to tell the person. A `vox serve` room keeps its `<room-id>.vox` name for
-        // its creator; every room's members are reachable as `<node>.<room>.vox` (ADR-017
-        // decision 7), which is what names resolve against — this node's rooms and keyring,
-        // as they stand when each connection asks.
-        let hostname = if genesis.body.service_grant.is_empty() {
-            format!(
-                "<node>.{}.vox",
-                crate::node::resolver::label_of(&local_name)
-            )
-        } else {
-            crate::node::link::vox_hostname(channel_id)
-        };
+        let local_name = shared.lock().await.local_name().to_owned();
+        // The name to tell the person: a service shared in the room is
+        // `<service>.<node>.<room>.vox` (V030-25), and nothing shorter is an address.
+        let hostname = format!(
+            "<service>.<node>.{}.vox",
+            crate::node::resolver::label_of(&local_name)
+        );
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
@@ -12513,12 +12573,12 @@ impl Node {
         let view = self.view_tx.borrow().clone();
         for room in &view.open_channels {
             names.add_room(room.channel_id, &room.local_name, &room.members);
+            for share in &room.shares {
+                names.add_share(room.channel_id, share.host, &share.name);
+            }
         }
         for (fp, petname) in self.trust.iter() {
             names.name(*fp, petname);
-        }
-        for shared in self.channels.values() {
-            names.insert(shared.lock().await.genesis());
         }
         names
     }
@@ -13766,6 +13826,7 @@ fn fault_of(e: &Error) -> Fault {
         Error::LadderExhausted(_) => Fault::Unreachable,
         Error::LocalBind { cause, .. } => Fault::of_bind(*cause),
         Error::TunnelLimit(_) => Fault::TunnelLimit,
+        Error::ServiceNameTaken(..) => Fault::NameTaken,
         Error::RoomNotSynced => Fault::RoomNotSynced,
         Error::Profile("no identity in this profile") => Fault::NoIdentity,
         Error::Profile("identity already exists in this profile") => Fault::IdentityExists,

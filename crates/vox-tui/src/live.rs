@@ -373,6 +373,32 @@ impl LiveCore {
                         })
                         .collect(),
                     timeline: timeline.clone().unwrap_or_default(),
+                    // What is shared here, in this operator's own words (V030-25): the same
+                    // addresses `vox service list` prints.
+                    shared: {
+                        let mut names = vox_core::node::resolver::VoxResolver::new();
+                        for o in &nv.open_channels {
+                            names.add_room(o.channel_id, &o.local_name, &o.members);
+                        }
+                        for (fp, petname) in &nv.trusted {
+                            names.name(*fp, petname);
+                        }
+                        d.shares
+                            .iter()
+                            .map(|s| {
+                                let who = if me == Some(s.host) {
+                                    "you".to_owned()
+                                } else {
+                                    names.alias_of(&s.host)
+                                };
+                                let udp = if s.udp { " (udp)" } else { "" };
+                                format!(
+                                    "{} by {who}{udp}",
+                                    names.address_of(&d.channel_id, &s.host, &s.name)
+                                )
+                            })
+                            .collect()
+                    },
                     // **Every member held back, each on its own line** (V210-66): once one notice in
                     // the one-line hint bar, where a second was cut off at the screen's edge.
                     held_back: d

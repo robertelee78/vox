@@ -2037,16 +2037,12 @@ pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Services { channel_id }).await {
-        Ok(Frame::Services { room, services }) => {
-            let short = crate::tunnel_cli::short_id_of(&channel_id);
-            if services.is_empty() {
-                println!("vox: no services offered in {short}");
-                return Ok(());
-            }
-            println!("vox: services offered in {room} ({short})");
-            for (tag, addr) in &services {
-                println!("  {tag}  →  {addr}");
-            }
+        Ok(Frame::Services {
+            room,
+            services,
+            shared,
+        }) => {
+            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared);
             Ok(())
         }
         // The node's reason, as `vox service list` without a daemon gives it.

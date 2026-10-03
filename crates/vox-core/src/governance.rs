@@ -18,12 +18,13 @@
 //!
 //! ## The capability model (SPKI/SDSI/UCAN attenuation)
 //! - [`capability`] — the closed capability vocabulary (`admin` ⊇ `delegate`,
-//!   `invite`, `policy`, `passphrase-rotate`, plus ADR-013 tunnel caps
-//!   `bind:<svc>` / `dial:<svc>` and role-tag attributes `#tag`) and the
+//!   `invite`, `policy`, `passphrase-rotate`, and role-tag attributes `#tag`) and the
 //!   attenuation lattice ("a delegation grants only capabilities at or below its
-//!   own"). Unknown capability = verification failure (closed domain). Tunnel caps
-//!   are *defined* here and *used* by M11/ADR-013 — one evaluator, no parallel
-//!   engine.
+//!   own"). Unknown capability = verification failure (closed domain). The ADR-013
+//!   tunnel tokens `bind:<svc>` / `dial:<svc>` still **parse**, because rooms made by
+//!   v0.1.0–v0.2.x carry them in certificates and geneses, but they confer nothing:
+//!   tunnel reach is the host's own decision, never a capability (ADR-017 M17.7,
+//!   PRD-001 R44).
 //!
 //! ## The governance entry bodies (pinned canonical CBOR)
 //! All composite-signed, `(channelID, epoch)`-bound, and ride the causal log
@@ -97,7 +98,7 @@ pub mod membership;
 pub mod policy;
 pub mod presence;
 pub mod rotation;
-pub mod servicegrant;
+pub mod share;
 pub mod visibility;
 
 pub use capability::{Capability, CapabilitySet};
@@ -110,5 +111,4 @@ pub use invite::{Invite, InviteMode};
 pub use membership::MembershipView;
 pub use policy::PolicyUpdate;
 pub use rotation::PassphraseRotation;
-pub use servicegrant::ServiceGrantExclusion;
 pub use visibility::VisibilitySet;

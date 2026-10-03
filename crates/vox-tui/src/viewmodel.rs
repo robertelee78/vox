@@ -120,6 +120,9 @@ pub struct ChannelView {
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
+    /// The services shared in the room (V030-25), each as `<address> by <who>`: its address in
+    /// this operator's own aliases (fingerprints where it has none), and who shared it.
+    pub shared: Vec<String>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }

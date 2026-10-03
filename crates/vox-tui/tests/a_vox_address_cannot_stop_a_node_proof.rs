@@ -1,8 +1,8 @@
 //! RP-04 — **a stranger holding only a `.vox` address cannot stop a node**, through the shipped
 //! binary.
 //!
-//! A room's channelID is its public `.vox` name; it is in every invite link. A stranger with
-//! any valid Vox identity and that name can climb from `Unknown` to `PendingJoiner` by itself:
+//! A room's channelID is public: it is the `<room>` part of every `.vox` address shared in it,
+//! and it is in every invite link. A stranger with any valid Vox identity and that id can climb from `Unknown` to `PendingJoiner` by itself:
 //!
 //! 1. connect — any authenticated Vox identity is admitted;
 //! 2. open `Rendezvous`, which `Unknown` may;
@@ -19,7 +19,7 @@
 //! test-side client speaking the Vox wire protocol with a fresh identity and nothing else: no
 //! `vox` command can publish a bare pre-join and then open a silent `Join` stream, and the
 //! attacker is not a person using vox. It is handed only the victim's fingerprint and address
-//! (what any peer dialling it has) and the room's id, which is the `.vox` name.
+//! (what any peer dialling it has) and the room's id, which is in every `.vox` address.
 //!
 //! **Asserted.**
 //! 1. Step 3 is **accepted** by the victim. This is the load-bearing assertion: if it were
@@ -294,7 +294,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     let (ok, _, err) = vox_once(&victim_dir, &args(&["room", "post", &prefix, "hello"]));
     assert!(ok, "PRODUCT (staging): first post: {err}");
     let (_, rows, _) = vox_once(&victim_dir, &args(&["room", "read", &prefix, "--json"]));
-    // The room's id in full: the `.vox` name, and all the stranger is given.
+    // The room's id in full: the `<room>` of a `.vox` address, and all the stranger is given.
     let room = rows
         .lines()
         .find_map(|l| {

@@ -62,43 +62,8 @@ const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// Length of a 32-byte digest in unpadded base32.
 /// Characters in the base32 rendering of a 32-byte digest — how every `vox`
 /// verb identifies a room, a member or an entry, and the same 52 characters that
-/// begin an invite link and a `.vox` name.
+/// begin an invite link.
 pub const B32_DIGEST_LEN: usize = 52;
-
-/// The DNS suffix a Vox name ends in (ADR-017 decision 4). It is resolved only on a
-/// machine running `vox up`, from rooms that machine has joined — there is no global
-/// namespace and nothing is looked up off the machine.
-pub const VOX_TLD: &str = ".vox";
-
-/// The person-facing hostname of a room: `<52-char-base32-channelID>.vox`.
-///
-/// It is the *same 52 characters that begin the invite link*, so a client derives the
-/// name from the link it was given with no additional field anywhere, and the name is
-/// self-certifying: it decodes to the channelID, which is the hash of the genesis
-/// (ADR-008), so a typo names a room this machine has not joined and fails locally
-/// instead of being misdirected.
-#[must_use]
-pub fn vox_hostname(channel_id: &Digest32) -> String {
-    let mut out = b32_encode(channel_id);
-    out.push_str(VOX_TLD);
-    out
-}
-
-/// The channelID a `.vox` hostname names, or [`Error::MalformedLink`].
-///
-/// Case-insensitive (DNS is), and strict about everything else: the label must be
-/// exactly the 52 base32 characters of a digest, so a subdomain, a padded label or a
-/// truncated one is refused rather than guessed at.
-pub fn channel_of_hostname(host: &str) -> Result<Digest32> {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    let label = host
-        .strip_suffix(VOX_TLD)
-        .ok_or(Error::MalformedLink("not a .vox hostname"))?;
-    if label.contains('.') {
-        return Err(Error::MalformedLink("a .vox hostname has one label"));
-    }
-    b32_decode(label, "vox hostname")
-}
 
 /// Encode a 32-byte digest as lowercase unpadded base32 (the link's, and the CLI's,
 /// rendering of a fingerprint).

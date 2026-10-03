@@ -47,7 +47,6 @@ use crate::error::{Error, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::governance::capability::CapabilitySet;
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::entry::{GovBody, GovEntry};
 use crate::governance::evaluator::Evaluator;
@@ -93,9 +92,8 @@ const SEG_SENDER: u64 = 1;
 const SEG_ANCHORS: u64 = 4;
 /// The offered-services segment id within [`SegmentKind::KeyMaterial`] (ADR-013,
 /// M16.1): the `service_tag → local address` map this node **binds** for this
-/// channel. Host configuration, not authorization — what a peer may *reach* is the
-/// `dial:` capability in the log, and the two are checked separately
-/// ([`crate::tunnel::session::accept`]).
+/// channel. Host configuration, not authorization — who may *reach* it is the host's
+/// dial gate ([`crate::tunnel::session::accept`]).
 const SEG_SERVICES: u64 = 5;
 
 /// The retained-origins segment id within [`SegmentKind::KeyMaterial`] (M18.1): the
@@ -773,6 +771,24 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
 /// The offered-services segment: `[version, [[tag, addr_text], …]]` in tag order (a
 /// `BTreeMap`, so the bytes are canonical). Addresses are the standard `ip:port`
 /// text, which round-trips exactly.
+/// A service shared in a room (V030-25), as the log says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// The member sharing it: the `<node>` of its address.
+    pub host: Digest32,
+    /// Its name, as its sharer gave it: the `<service>` of its address.
+    pub name: String,
+    /// Whether it carries datagrams (ADR-022).
+    pub udp: bool,
+}
+
+/// A service's name from its tag: a UDP service's tag is `udp/<name>` (ADR-022 decision 6), and
+/// the two transports share one namespace, as the address does.
+#[must_use]
+pub fn service_name(service_tag: &str) -> &str {
+    service_tag.strip_prefix("udp/").unwrap_or(service_tag)
+}
+
 fn services_bytes(services: &BTreeMap<String, SocketAddr>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(SERVICES_VERSION).array(services.len());
@@ -1184,37 +1200,7 @@ impl ChannelState {
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
-        Self::create_with_grant(
-            profile,
-            local_name,
-            channel_passphrase,
-            CapabilitySet::new(),
-            now_secs,
-            argon2,
-        )
-    }
-
-    /// Create a channel whose **genesis confers `service_grant` on every member**
-    /// (ADR-017 decision 3) — the capability-bearing room `vox serve` makes.
-    ///
-    /// Joining such a room *is* the authorization: the joiner already proved it held
-    /// the passphrase and paid the ADR-005 proof of work, and the room's purpose is
-    /// the service, so "may this member dial it" and "is this person a member" are the
-    /// same question. No certificate is issued to anyone, so the host never waits for
-    /// the guest to appear in order to grant them something.
-    ///
-    /// The grant is immutable, being part of the genesis and therefore of the
-    /// channelID — a room cannot silently *become* an access list, and one created as
-    /// an access list cannot stop being one.
-    pub fn create_with_grant(
-        profile: &Profile,
-        local_name: &str,
-        channel_passphrase: &[u8],
-        service_grant: CapabilitySet,
-        now_secs: u64,
-        argon2: Argon2Profile,
-    ) -> Result<Self> {
-        let (genesis, sek) = Self::create_genesis(profile, local_name, service_grant, now_secs)?;
+        let (genesis, sek) = Self::create_genesis(profile, local_name, now_secs)?;
         let signer = profile.signer()?;
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
@@ -1231,7 +1217,7 @@ impl ChannelState {
 
     /// The fast first step of creating a room: its genesis and a fresh room key.
     ///
-    /// Split from [`ChannelState::create_with_grant`] so the slow middle step — sealing the room
+    /// Split from [`ChannelState::create_with_profile`] so the slow middle step — sealing the room
     /// key under the passphrase with production Argon2id, seconds of CPU — can run off the node's
     /// actor, which answers nothing while it works. [`ChannelState::create_from_sealed`] is the
     /// last step.
@@ -1241,7 +1227,6 @@ impl ChannelState {
     pub fn create_genesis(
         profile: &Profile,
         local_name: &str,
-        service_grant: CapabilitySet,
         now_secs: u64,
     ) -> Result<(Genesis, Sek)> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
@@ -1253,7 +1238,7 @@ impl ChannelState {
             ttl: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
-        let genesis = Genesis::create_with_grant(signer, now_secs, policy, service_grant)?;
+        let genesis = Genesis::create(signer, now_secs, policy)?;
         Ok((genesis, Sek::generate()?))
     }
 
@@ -1855,11 +1840,9 @@ impl ChannelState {
         gov_entries: &[GovEntry],
         now_secs: u64,
     ) -> Result<Evaluator> {
-        // The admitted authors are this node's view of *who is a member*, which is
-        // what a genesis service grant is conferred on (ADR-017 decision 3). It is
-        // local state by ADR-007's design — membership is emergent, there is no
-        // roster — and that is sound here because the decision it feeds is local too:
-        // a host serving its own service consults the keys it verified itself.
+        // The admitted authors are this node's view of *who is a member*: local state by
+        // ADR-007's design (membership is emergent, there is no roster). It confers no
+        // capability (PRD-001 R44).
         Evaluator::build_with_members(
             genesis,
             gov_entries,
@@ -2361,9 +2344,13 @@ impl ChannelState {
 
     /// Offer `service_tag` at `local`, persisted under the channel's SEK so a restart
     /// still serves it — unless `persist` is false, when it lasts only until it is removed
-    /// or this node stops. Replacing an existing tag's address is allowed (that is how a
-    /// service moves). No capability is checked: offering a port of this machine is
+    /// or this node stops. No capability is checked: offering a port of this machine is
     /// configuration, not authorization (see the body).
+    ///
+    /// **A name is shared once** (V030-25): the tag is the `<service>` of
+    /// `<service>.<node>.<room>.vox`, so a second share under a name this node already shares
+    /// here — over either transport (`udp/<name>` is the same name) — is refused, naming the one
+    /// that holds it. A service moves by being removed and shared again.
     ///
     /// Returns whether this added a tag that was not offered before.
     pub fn add_service(
@@ -2389,8 +2376,16 @@ impl ChannelState {
         // anything. A non-creator simply could not serve. Found by the agent-comms session
         // hitting it from the file-exchange side, which is where it bit first.
         let _ = profile;
-        let fresh = !self.services.contains_key(service_tag);
-        if fresh && self.services.len() >= MAX_SERVICES {
+        let name = service_name(service_tag);
+        if let Some((_, at)) = self
+            .services
+            .iter()
+            .find(|(tag, _)| service_name(tag) == name)
+        {
+            return Err(Error::ServiceNameTaken(name.to_owned(), *at));
+        }
+        let fresh = true;
+        if self.services.len() >= MAX_SERVICES {
             return Err(Error::SizeLimitExceeded("channel services"));
         }
         self.services.insert(service_tag.to_owned(), local);
@@ -2401,6 +2396,82 @@ impl ChannelState {
         }
         self.persist_services(store)?;
         Ok(fresh)
+    }
+
+    /// Write this identity's statement that it shares `service_tag` in the room, or no longer
+    /// does (V030-25), so every member can list it. A transient offer (a file being handed over)
+    /// is not a share and is not announced.
+    pub fn say_share(
+        &mut self,
+        profile: &Profile,
+        service_tag: &str,
+        shared: bool,
+        now_secs: u64,
+    ) -> Result<()> {
+        let statement = crate::governance::share::ServiceShare::build(
+            profile.signer()?,
+            &self.channel_id,
+            self.epoch,
+            service_name(service_tag),
+            crate::tunnel::udp::is_udp(service_tag),
+            shared,
+        )?;
+        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        Ok(())
+    }
+
+    /// State every share this node offers here that the log does not yet say it shares, and
+    /// return whether anything was written. A share made in a room joined and not yet synced is
+    /// offered at once but can be said only once the room settles (V210-164); this says it then.
+    pub fn say_unsaid_shares(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+        let me = profile.signer()?.fingerprint();
+        let said: BTreeSet<String> = self
+            .shares()
+            .into_iter()
+            .filter(|s| s.host == me)
+            .map(|s| s.name)
+            .collect();
+        let unsaid: Vec<String> = self
+            .services
+            .keys()
+            .filter(|tag| !self.transient.contains(*tag) && !said.contains(service_name(tag)))
+            .cloned()
+            .collect();
+        for tag in &unsaid {
+            self.say_share(profile, tag, true, now_secs)?;
+        }
+        Ok(!unsaid.is_empty())
+    }
+
+    /// Whether `service_tag` is offered and persisted: a share, not a transient offer.
+    #[must_use]
+    pub fn is_shared(&self, service_tag: &str) -> bool {
+        self.services.contains_key(service_tag) && !self.transient.contains(service_tag)
+    }
+
+    /// The services shared in this room, by every member, as the log says (V030-25): for each
+    /// `(sharer, name)` the last statement its sharer made, kept when it says shared. A member
+    /// that has left shares nothing.
+    #[must_use]
+    pub fn shares(&self) -> Vec<Share> {
+        let left = self.left();
+        let mut last: BTreeMap<(Digest32, String), (u64, bool, bool)> = BTreeMap::new();
+        for g in &self.gov_entries {
+            let GovBody::ServiceShare(s) = &g.body else {
+                continue;
+            };
+            if s.body.author_id != g.author_id || s.body.channel_id != self.channel_id {
+                continue;
+            }
+            let key = (g.author_id, s.body.name.clone());
+            if last.get(&key).is_none_or(|(seq, _, _)| *seq < g.seq) {
+                last.insert(key, (g.seq, s.body.udp, s.body.shared));
+            }
+        }
+        last.into_iter()
+            .filter(|((host, _), (_, _, shared))| *shared && !left.contains(host))
+            .map(|((host, name), (_, udp, _))| Share { host, name, udp })
+            .collect()
     }
 
     /// Stop offering `service_tag`. Returns whether it was offered.
@@ -3613,12 +3684,6 @@ impl ChannelState {
             return Err(e);
         }
         Ok(())
-    }
-
-    /// The capabilities this channel's genesis confers on every member (ADR-017).
-    #[must_use]
-    pub fn service_grant(&self) -> &CapabilitySet {
-        &self.genesis.body.service_grant
     }
 
     /// The room's retention, seconds (`0` = forever): the ADR-007 policy-update `ttl` in

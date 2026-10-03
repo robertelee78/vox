@@ -320,7 +320,7 @@ fn a_cli_failure_tells_the_truth() {
         &host_dir,
         &[
             "serve",
-            &service_port,
+            &format!("{service_port}={service_port}"),
             "--anchor",
             &spec,
             "--listen",
@@ -821,7 +821,7 @@ fn a_holder_runs_without_its_control_socket() {
         &host_dir,
         &[
             "serve",
-            &service_port,
+            &format!("{service_port}={service_port}"),
             "--anchor",
             &spec,
             "--listen",
@@ -1116,7 +1116,7 @@ fn a_connect_stopped_by_a_signal_says_why() {
         &host_dir,
         &[
             "serve",
-            &service_port,
+            &format!("{service_port}={service_port}"),
             "--anchor",
             &spec,
             "--listen",

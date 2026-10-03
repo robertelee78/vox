@@ -22,9 +22,9 @@
 //!    because what is under test is whether bytes cross the overlay untouched;
 //! 2. `vox node` — the headless anchor, whose printed `<fingerprint>@<addr>` line this
 //!    test **parses and uses**, so an unusable spec (defect 2 above) fails here;
-//! 3. `vox serve <port>` — the host. Its printed room id, `vox://` address and
-//!    **generated passphrase** are parsed and used verbatim, so a passphrase that does
-//!    not match itself (defect 1) fails here;
+//! 3. `vox serve <port>=<port>` — the host, sharing the service under the name `<port>`.
+//!    Its printed room id, `vox://` address and **generated passphrase** are parsed and used
+//!    verbatim, so a passphrase that does not match itself (defect 1) fails here;
 //! 4. `vox connect <address>` — the guest joining with that passphrase, one-shot;
 //! 5. `vox up <room>` — the guest's SOCKS5 entry point, whose bound address is parsed;
 //! 6. a **real SOCKS5 client** in this test, sending the `.vox` hostname (`socks5h`
@@ -374,7 +374,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         &host_dir,
         &[
             "serve".into(),
-            service_port.to_string(),
+            format!("{service_port}={service_port}"),
             "--anchor".into(),
             anchor_spec.clone(),
             "--listen".into(),
@@ -396,14 +396,15 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     // Parsed from `vox serve`'s own output, which is the point: this proof is coupled to the
     // product's surface on purpose, so changing what a person sees means updating the proof.
     // (It caught me doing exactly that — M17.7 moved the hostname onto the `serving` line and
-    // this timed out until it was brought back into step.)
-    let hostname_line = host.expect_line("the .vox hostname", |l| {
-        l.starts_with("serving ") && l.contains(".vox")
+    // this timed out until it was brought back into step; V030-25 made it the `sharing` line,
+    // `sharing <endpoint> as <service>.<node>.<room>.vox`.)
+    let hostname_line = host.expect_line("the service's .vox address", |l| {
+        l.starts_with("sharing ") && l.contains(" as ") && l.contains(".vox")
     });
     let hostname = hostname_line
         .split_whitespace()
         .last()
-        .unwrap_or_else(|| panic!("PRODUCT: no hostname on the serving line: {hostname_line:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT: no address on the sharing line: {hostname_line:?}"))
         .to_owned();
     // And the line that tells a person who can actually reach it must no longer say
     // "anyone who joins", which was true only of the withdrawn model.
@@ -419,8 +420,12 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         "PRODUCT: serve printed an address that is not vox://: {address}"
     );
     assert!(
-        hostname.ends_with(".vox"),
-        "PRODUCT: serve printed a hostname that is not .vox: {hostname}"
+        hostname.ends_with(".vox")
+            && hostname.starts_with(&format!("{service_port}."))
+            && hostname.contains(&room)
+            && hostname.split('.').count() == 4,
+        "PRODUCT: serve printed an address that is not <service>.<node>.<room>.vox for service \
+         {service_port} in room {room}: {hostname}"
     );
     assert!(
         !address.contains(&passphrase),
@@ -446,9 +451,11 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         ok,
         "PRODUCT: vox connect failed.\nstdout:\n{out}\nstderr:\n{err}"
     );
+    // A room answers on nothing (V030-25): `vox connect` says how to see what is shared
+    // there, not a name for the room.
     assert!(
-        out.contains("joined") && out.contains(&hostname),
-        "PRODUCT: connect should say what the room answers on ({hostname}).\n{out}"
+        out.contains("joined") && out.contains("vox service list"),
+        "PRODUCT: connect should say how to see what is shared in the room it joined.\n{out}"
     );
 
     // 5. `vox up` — the guest's entry point. Parse where it bound.

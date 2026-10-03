@@ -311,7 +311,7 @@ fn a_a_host_with_no_anchor_prints_its_address_and_a_guest_joins() {
     let host_fp = two_identities(&guest_dir, &host_dir);
     // No --anchor, no --listen: as a person on a LAN runs it. (`r=` always names the host as the
     // responder; `a=` is the host named as a place to reach the room.)
-    let mut host = VoxProc::spawn("host", &host_dir, &args(&["serve", "22"]));
+    let mut host = VoxProc::spawn("host", &host_dir, &args(&["serve", "22=22"]));
     let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
     let address = after_label(
         &address.unwrap_or_else(|| {
@@ -370,7 +370,7 @@ fn b_anchors_that_are_down_do_not_hold_back_the_address() {
         specs.push(spec);
     }
     let host_fp = two_identities(&guest_dir, &host_dir);
-    let mut serve = vec!["serve", "22", "--listen", "127.0.0.1:0"];
+    let mut serve = vec!["serve", "22=22", "--listen", "127.0.0.1:0"];
     for spec in &specs {
         serve.extend(["--anchor", spec.as_str()]);
     }
@@ -474,7 +474,7 @@ fn c_a_guest_who_needs_the_anchor_joins_once_the_host_says_it_took_the_room() {
         &host_dir,
         &args(&[
             "serve",
-            "22",
+            "22=22",
             "--anchor",
             &anchor.v4_spec,
             "--listen",
@@ -586,7 +586,7 @@ fn d_a_join_asks_every_board_the_address_names() {
         &host_dir,
         &args(&[
             "serve",
-            "22",
+            "22=22",
             "--anchor",
             &a4_spec,
             "--anchor",
@@ -703,7 +703,7 @@ fn e_an_address_that_would_lead_nowhere_is_withheld_and_why_is_said() {
     let mut host = VoxProc::spawn_env(
         "host",
         &host_dir,
-        &args(&["serve", "22"]),
+        &args(&["serve", "22=22"]),
         &[("VOX_TEST_ADVERTISE", "none")],
     );
     let said = line_within(&mut host, ROOM_WITHIN + WITHHELD_WITHIN, |l| {
@@ -789,7 +789,7 @@ fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
         &host_dir,
         &args(&[
             "serve",
-            "22",
+            "22=22",
             "--anchor",
             &anchor_spec,
             "--listen",

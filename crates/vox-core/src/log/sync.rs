@@ -491,7 +491,7 @@ pub fn frontiers_of(dag: &Dag) -> Vec<FeedFrontier> {
 ///   different valid hashes would otherwise never exchange the conflicting entry
 ///   and no fork proof would form (ADR-008 §"Fork / equivocation handling"). The
 ///   pulled conflicting entry is fed into DAG fork handling, which freezes the
-///   author on an attributable proof and raises an alarm on a deniable one.
+///   author on the proof.
 #[must_use]
 pub fn wants_for(dag: &Dag, remote: &[FeedFrontier]) -> Vec<WantRange> {
     let mut wants = Vec::new();
@@ -615,8 +615,8 @@ pub fn wire_error_for(err: &Error) -> WireError {
         Error::UnsupportedVersion { .. } => WireError::ProtocolVersionUnsupported,
         Error::UnknownAlgoId(_) | Error::UnexpectedAlgo { .. } => WireError::UnknownAlgoId,
         Error::SuiteBelowFloor { .. } => WireError::SuiteBelowFloor,
-        // Signature/authenticator failures, malformed structures, the deniable
-        // boundary, and oversize/CBOR malformation are all "this authenticator/
+        // Signature/authenticator failures, malformed structures, and oversize/CBOR
+        // malformation are all "this authenticator/
         // structure is not acceptable" → AuthenticatorInvalid. (Size limits are a
         // structural rejection; there is no dedicated size code in the M0 table.)
         _ => WireError::AuthenticatorInvalid,
@@ -649,9 +649,8 @@ pub enum ApplyOutcome {
     Duplicate,
     /// The entry conflicted with a stored one at the same `(author, seq)`: a fork.
     /// This is a *local security event*, NOT a wire-protocol violation — it is
-    /// recorded/surfaced (an attributable fork freezes the author; a deniable one
-    /// raises an alarm) and sync **continues**. The stream is not closed for a
-    /// fork (ADR-008 §"Fork / equivocation handling").
+    /// recorded/surfaced (the fork freezes the author) and sync **continues**. The stream is
+    /// not closed for a fork (ADR-008 §"Fork / equivocation handling").
     Fork,
     /// The entry was for a position at or below its author's checkpoint that this node does
     /// not hold as it (ADR-023 decision 3): refused, not stored, not a fork. Nothing a peer

@@ -224,7 +224,7 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
         &host_dir,
         &args(&[
             "serve",
-            &service,
+            &format!("{service}={service}"),
             "--anchor",
             &anchor_spec,
             "--listen",

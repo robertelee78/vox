@@ -1629,12 +1629,12 @@ pub struct TrustRemoveArgs {
 pub struct ForwardArgs {
     #[command(flatten)]
     pub room: RoomArgs,
-    /// The member hosting the service (its fingerprint, or a unique prefix). When the room
-    /// is given as `<name>.vox` the host is the name's, and this is the service instead.
-    pub host: String,
-    /// The service to reach: `<port>`, `<port>/udp`, or any tag the host serves. With a
-    /// `<name>.vox` room, the local port to listen on.
-    pub tag: String,
+    /// The member sharing the service (its fingerprint, or a unique prefix). When the room
+    /// is given as a service's address, `<service>.<node>.<room>.vox`, the local port or
+    /// address to listen on instead.
+    pub host: Option<String>,
+    /// The service to reach, by the name its sharer gave it. Not given with an address.
+    pub tag: Option<String>,
     /// Where to listen locally; port 0 picks one.
     #[arg(default_value = "127.0.0.1:0")]
     pub local: SocketAddr,
@@ -1645,9 +1645,10 @@ pub struct ForwardArgs {
 pub struct ServeArgs {
     #[command(flatten)]
     pub profile: ProfileArgs,
-    /// The ports to offer: `<port>` (TCP), `<port>/tcp` or `<port>/udp`. The port is also
-    /// the service's name: guests reach it at this port of the room's `.vox` hostname.
-    /// The first creates the room; `vox serve 53 53/udp` serves both.
+    /// The services to share, each named: `<name>=<port>` (TCP), `<name>=<port>/tcp` or
+    /// `<name>=<port>/udp`. A member reaches each as `<name>.<node>.<room>.vox`, and only that
+    /// way; a bare port is refused. The first creates the room; `vox serve ssh=22 dns=53/udp`
+    /// shares both.
     #[arg(required = true, num_args = 1..)]
     pub ports: Vec<String>,
     /// The local endpoint to carry connections to, when it is not `127.0.0.1:<port>`.
@@ -2844,18 +2845,12 @@ pub fn run() -> ExitCode {
             })
         }
         Cmd::Forward(args) => {
-            // Two shapes. `vox forward <room> <host> <service> [local]`, and the `.vox` one
-            // ADR-022 names: `vox forward <name>.vox <service> [<local-port>]`, where the
-            // name gives both the room and its host (the genesis creator, ADR-017), so the
-            // positionals shift left by one.
-            let mut room = args.room.clone();
-            // `<node>.<room>.vox`: a name in this machine's own words, resolved by the node
-            // already holding the profile, which carries the forward (PRD-001 R20).
+            // Two shapes. `vox forward <room> <host> <service> [local]`, and a service's address,
+            // `vox forward <service>.<node>.<room>.vox [<local>]` (V030-25), resolved by the node
+            // already holding the profile, which carries the forward.
+            let room = args.room.clone();
             let name = room.room.trim().to_ascii_lowercase();
-            if name
-                .strip_suffix(".vox")
-                .is_some_and(|labels| labels.contains('.'))
-            {
+            if name.ends_with(".vox") {
                 let paths = match room.profile.paths() {
                     Ok(p) => p,
                     Err(e) => {
@@ -2863,39 +2858,31 @@ pub fn run() -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                let (service, local) = (label_of(&args.host), args.tag.clone());
+                if args.tag.is_some() {
+                    eprintln!(
+                        "vox: a service's address names the service already: \
+                         vox forward <service>.<node>.<room>.vox [<local>]"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let local = args
+                    .host
+                    .clone()
+                    .unwrap_or_else(|| "127.0.0.1:0".to_owned());
                 return run_attached(async move {
-                    crate::tunnel_cli::forward_named(&paths, &name, &service, &local).await
+                    crate::tunnel_cli::forward_named(&paths, &name, &local).await
                 });
             }
-            let (host, tag, local) = if room.room.trim().ends_with(".vox") {
-                let cid = match vox_core::node::link::channel_of_hostname(&room.room) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("vox: {}: {e}", room.room);
-                        return ExitCode::FAILURE;
-                    }
-                };
-                room.room = vox_core::node::link::b32_encode(&cid);
-                let local = match args.tag.parse::<u16>() {
-                    Ok(port) => SocketAddr::from(([127, 0, 0, 1], port)),
-                    Err(_) => match args.tag.parse::<SocketAddr>() {
-                        Ok(a) => a,
-                        Err(_) => {
-                            eprintln!(
-                                "vox: {:?} is not a local port or address to listen on",
-                                args.tag
-                            );
-                            return ExitCode::FAILURE;
-                        }
-                    },
-                };
-                (None, args.host.clone(), local)
-            } else {
-                (Some(args.host.clone()), args.tag.clone(), args.local)
+            let (Some(host), Some(tag)) = (args.host.clone(), args.tag.clone()) else {
+                eprintln!(
+                    "vox: name the member and the service: vox forward <room> <member> <service> \
+                     [<local>], or vox forward <service>.<node>.<room>.vox [<local>]"
+                );
+                return ExitCode::FAILURE;
             };
+            let local = args.local;
             run_tunnel_verb(room, true, move |node, cid| async move {
-                crate::tunnel_cli::forward(&node, cid, host.as_deref(), &tag, local).await
+                crate::tunnel_cli::forward(&node, cid, &host, &tag, local).await
             })
         }
         Cmd::Lan(LanCmd::Helper(a)) => match crate::lan_cli::run_helper(&a.socket) {

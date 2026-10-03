@@ -312,7 +312,9 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         .unwrap_or_else(|| panic!("no port in {line:?}"));
     let (_bob_up, bob_proxy) = bob.up();
     let (_mal_up, mal_proxy) = mallory.up();
-    let url = format!("http://alice.files.vox:{port}/report.bin");
+    // `<service>.<node>.<room>.vox` (V030-25): the share's service is named for its port, `alice`
+    // is what bob and mallory each call her, and `files` what each calls the room.
+    let url = format!("http://{port}.alice.files.vox:{port}/report.bin");
 
     // Fetch 1: bob, with curl through his own `vox up`.
     let (curl_ok, curled) = curl(bob_proxy, &url);

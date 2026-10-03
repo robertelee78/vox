@@ -72,7 +72,7 @@ fn a_dial_that_reaches_another_node_names_who_answered() {
         &host_dir,
         &args(&[
             "serve",
-            &service,
+            &format!("{service}={service}"),
             "--anchor",
             &wrong,
             "--listen",
