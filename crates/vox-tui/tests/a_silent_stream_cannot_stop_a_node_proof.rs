@@ -19,7 +19,7 @@
 //! 1. The escalation: mallory's `Sync` stream reaches the victim's sync handler — an honest
 //!    session over it is answered with the victim's `HAVE`, which lists the victim's feed. If
 //!    this fails the attacker would be refused at the stream-kind gate and the rest would
-//!    measure a refusal, so it is `CANNOT MEASURE`, never a pass.
+//!    measure a refusal, so it is `PRODUCT (staging)`, never a pass.
 //! 2. While mallory holds silent `Sync` streams open (a new one every 2 s, none of which ever
 //!    carries a byte), **five `vox room post` on the victim, 2 s apart, each return in under
 //!    5 s**, and the
@@ -31,14 +31,15 @@
 //!
 //! **Which side a red is on.** A slow or failed post or read is `PRODUCT:` and quotes what vox
 //! said; a `vox` step of the setup that failed (an identity, a room, the first post) is
-//! `PRODUCT (staging):`; the escalation or the attack not holding is `CANNOT MEASURE:`; a fault of this proof's own (a file, a runtime, a signal) is `APPARATUS:`.
+//! `PRODUCT (staging):`; the escalation or the attack not holding is `PRODUCT (staging):`; a fault of this proof's own (a file, a runtime, a signal) is `APPARATUS:`.
 //! Mallory joins **once**: a join turned away is the product's red, not something to retry past.
 //! The bound is read against an **apparatus clock** that is only the apparatus: the time to start
-//! a `vox --version` right after any slow post. A quiet post on the victim before the attack is
+//! `/usr/bin/true`, a process that is not vox, right after any slow post (a vox slow even only to
+//! start reads as the product's). A quiet post on the victim before the attack is
 //! the product's baseline, never part of that clock: one that fails, or misses [`PATIENCE`] while
 //! the clock is within [`APPARATUS_BUDGET`], is `PRODUCT (staging):` (the node is slow with no
 //! attack at all). A post during the attack over [`PATIENCE`] while the clock was over
-//! [`APPARATUS_BUDGET`] is CANNOT MEASURE; otherwise it is the product's, with the quiet post's
+//! [`APPARATUS_BUDGET`] is APPARATUS (runner stalled); otherwise it is the product's, with the quiet post's
 //! time quoted.
 //!
 //! **Mutation that must turn it red.** Put the sync-preamble read back on the actor: in
@@ -164,7 +165,9 @@ struct Rt(Option<tokio::runtime::Runtime>);
 impl std::ops::Deref for Rt {
     type Target = tokio::runtime::Runtime;
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.0
+            .as_ref()
+            .expect("APPARATUS: a process the proof started")
     }
 }
 
@@ -211,14 +214,21 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
-/// The apparatus clock: how long this machine takes, now, to start a `vox` that does nothing
-/// (`vox --version` on the profile at `data`). A stalled runner stalls this too.
-fn apparatus_spawn(data: &Path) -> Duration {
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let (ok, out, err) = vox_once(data, &args(&["--version"]));
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
         ok,
-        "APPARATUS: `vox --version` failed, so the apparatus clock cannot be read: {out}{err}"
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -394,7 +404,7 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
                 raw_sync::now(),
             )
             .await
-            .expect("CANNOT MEASURE: mallory's identity did not connect to the victim");
+            .expect("PRODUCT (staging): mallory's identity did not connect to the victim");
         (endpoint, Arc::new(conn))
     });
     let _answered = raw_sync::answer_victim(Arc::clone(&conn));
@@ -417,7 +427,7 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
         std::thread::sleep(Duration::from_millis(500));
     }
     let honest = reached.expect(
-        "CANNOT MEASURE: mallory's Sync stream was never answered with the victim's HAVE, so a \
+        "PRODUCT (staging): mallory's Sync stream was never answered with the victim's HAVE, so a \
          silent one would be refused at the stream-kind gate and this would measure a refusal",
     );
     println!(
@@ -434,10 +444,10 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
     );
     println!("[proof] baseline: a quiet post took {quiet:?} (ok={ok}) before the attack");
     if !(ok && quiet < PATIENCE) {
-        let apparatus = apparatus_spawn(&victim_dir);
+        let apparatus = apparatus_spawn();
         assert!(
-            ok || apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+            !ok || apparatus <= APPARATUS_BUDGET,
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (`/usr/bin/true`, budget \
              {APPARATUS_BUDGET:?}) right after the quiet post took {quiet:?}, so the runner, not \
              the node, may be slow. The post said: {said}"
         );
@@ -474,7 +484,7 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
     while opened.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         assert!(
             t0.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: no silent stream could be opened"
+            "PRODUCT (staging): no silent stream could be opened"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -499,10 +509,10 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
              silent Sync streams open. It said: {said}"
         );
         if t >= PATIENCE || !ok {
-            let apparatus = apparatus_spawn(&victim_dir);
+            let apparatus = apparatus_spawn();
             assert!(
                 apparatus <= APPARATUS_BUDGET,
-                "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+                "APPARATUS (runner stalled): apparatus took {apparatus:?} (`/usr/bin/true`, budget \
                  {APPARATUS_BUDGET:?}) while post {i} took {t:?}"
             );
             panic!(
@@ -536,7 +546,7 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
     let first_still_held = rt.block_on(async {
         let (_send, recv) = held
             .first_mut()
-            .expect("CANNOT MEASURE: no silent stream is held");
+            .expect("PRODUCT (staging): no silent stream is held");
         let mut buf = [0u8; 16];
         tokio::time::timeout(Duration::from_millis(300), recv.read(&mut buf))
             .await
@@ -544,17 +554,17 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
     });
     assert!(
         first_still_held,
-        "CANNOT MEASURE: the victim had already closed or refused the first silent stream, so \
+        "PRODUCT (staging): the victim had already closed or refused the first silent stream, so \
          the attack was not holding"
     );
     assert!(
         conn.quinn().close_reason().is_none(),
-        "CANNOT MEASURE: mallory's connection closed during the attack: {:?}",
+        "PRODUCT (staging): mallory's connection closed during the attack: {:?}",
         conn.quinn().close_reason()
     );
     assert!(
         streams >= 4,
-        "CANNOT MEASURE: only {streams} silent stream(s) were opened"
+        "PRODUCT (staging): only {streams} silent stream(s) were opened"
     );
     println!(
         "[proof] {POSTS} posts, slowest {:?}, while {streams} silent Sync streams were held",

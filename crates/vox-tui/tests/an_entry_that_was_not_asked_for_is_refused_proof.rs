@@ -30,7 +30,7 @@
 //! **(2) is a negative claim, so every read it rests on must have worked.** The harness's read
 //! returns no rows when the control socket fails, which would read as "never stored". Once Bob has
 //! read "p9 visible", every later read must still show it: a read that does not is a blind read,
-//! and any blind read in the watch makes (2) CANNOT MEASURE rather than green. Reds on (2) and (3)
+//! and any blind read in the watch makes (2) PRODUCT (staging) rather than green. Reds on (2) and (3)
 //! are PRODUCT and quote Bob's own transcript.
 //!
 //! ## Mutation
@@ -133,7 +133,7 @@ fn an_entry_that_was_not_asked_for_is_refused() {
     );
     assert!(
         announced(&alice_d, MODE),
-        "CANNOT MEASURE: alice's daemon never announced the mutant mode {MODE:?}\nalice:\n{}",
+        "APPARATUS (the mutant peer): alice's daemon never announced the mutant mode {MODE:?}\nalice:\n{}",
         alice_d.transcript()
     );
     assert!(
@@ -149,7 +149,7 @@ fn an_entry_that_was_not_asked_for_is_refused() {
     );
     assert!(
         reads > 0 && blind == 0,
-        "CANNOT MEASURE: {blind} of {reads} reads after \"p9 visible\" came back without it, so \
+        "PRODUCT (staging): {blind} of {reads} reads after \"p9 visible\" came back without it, so \
          \"p9 hidden\" not being read is not evidence it was refused (a failed control-socket read \
          returns no rows)\nbob:\n{}",
         bob_d.transcript()

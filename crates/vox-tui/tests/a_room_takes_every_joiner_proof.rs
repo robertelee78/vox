@@ -23,8 +23,8 @@
 //!
 //! **Asserted:** every one of the 301 joins succeeds. A red names each failed joiner, what its
 //! `vox connect` said, and what the anchor and the host said of their connection to it — a
-//! product verdict. Apparatus faults say so: a `vox id` or a staging line that never came is
-//! `CANNOT MEASURE`, and the watchdog names itself.
+//! product verdict. A `vox id` or a staging line that never came is `PRODUCT (staging)`; the
+//! proof's own faults say `APPARATUS`, and the watchdog names itself.
 //!
 //! **Mutation that must turn it red:** an unanswered probe closing the held connection again
 //! (`ConnectionManager::file_inner`): joins fail `closed by the peer` again, at the 1–2% the defect
@@ -71,7 +71,7 @@ fn profile() -> &'static str {
 
 fn dir(tmp: &Path, name: &str) -> PathBuf {
     let d = tmp.join(name);
-    std::fs::create_dir_all(d.join("cfg")).unwrap();
+    std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     d
 }
 
@@ -88,7 +88,7 @@ struct Room {
 }
 
 fn stage() -> Room {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let anchor_dir = dir(tmp.path(), "anchor");
     let host_dir = dir(tmp.path(), "host");
     let mut anchor = VoxProc::spawn(
@@ -100,10 +100,10 @@ fn stage() -> Room {
         .expect_line("the anchor's spec", |l| l.contains("@/ip4/127.0.0.1/udp/"))
         .split_whitespace()
         .find(|w| w.contains("@/ip4/127.0.0.1/udp/"))
-        .expect("CANNOT MEASURE: the anchor's spec")
+        .expect("PRODUCT (staging): the anchor's spec")
         .to_owned();
     let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (host): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let mut host = VoxProc::spawn(
         "host",
         &host_dir,
@@ -127,13 +127,16 @@ fn stage() -> Room {
         "passphrase",
     );
     let pass_file = tmp.path().join("room-passphrase");
-    std::fs::write(&pass_file, &passphrase).unwrap();
+    std::fs::write(&pass_file, &passphrase).expect("APPARATUS: write a staging file");
     Room {
         _anchor: Mutex::new(anchor),
         host: Mutex::new(host),
         spec,
         address,
-        pass_file: pass_file.to_str().unwrap().to_owned(),
+        pass_file: pass_file
+            .to_str()
+            .expect("APPARATUS: a path that is not UTF-8")
+            .to_owned(),
         tmp,
     }
 }
@@ -152,7 +155,7 @@ impl Room {
     fn join(&self, name: &str) -> Joined {
         let d = dir(self.tmp.path(), name);
         let (ok, fp, err) = vox_once(&d, &args(&["id"]));
-        assert!(ok, "CANNOT MEASURE: vox id ({name}): {fp}{err}");
+        assert!(ok, "PRODUCT (staging): vox id ({name}): {fp}{err}");
         let t = Instant::now();
         let (ok, out, err) = vox_once(
             &d,
@@ -200,13 +203,18 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
                 }
                 let j = r.join(&format!("m{i:03}"));
                 {
-                    let mut s = slowest.lock().unwrap();
+                    let mut s = slowest
+                        .lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned");
                     *s = (*s).max(j.took);
                 }
                 if j.ok {
                     joined.fetch_add(1, Ordering::SeqCst);
                 } else {
-                    failed.lock().unwrap().push((i, j.fp, j.said));
+                    failed
+                        .lock()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
+                        .push((i, j.fp, j.said));
                 }
                 let done = i + 1;
                 if done.is_multiple_of(BATCH) {
@@ -216,7 +224,10 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
                         profile(),
                         done / BATCH,
                         joined.load(Ordering::SeqCst),
-                        failed.lock().unwrap().len(),
+                        failed
+                            .lock()
+                            .expect("APPARATUS: a lock the proof holds was poisoned")
+                            .len(),
                         first.elapsed().as_secs_f64()
                     );
                 }
@@ -226,7 +237,9 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
     let staged = joined.load(Ordering::SeqCst);
     let last = r.join("last");
     let since_first = first.elapsed();
-    let failed = failed.into_inner().unwrap();
+    let failed = failed
+        .into_inner()
+        .expect("APPARATUS: a lock the proof holds was poisoned");
     eprintln!(
         "[proof] {} {staged} of {MEMBERS} staged joins succeeded, {} failed; the next joiner: {} \
          in {:.1}s, {:.0}s after the first join began; slowest staged join {:.1}s",
@@ -235,7 +248,10 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
         if last.ok { "joined" } else { "REFUSED" },
         last.took.as_secs_f64(),
         since_first.as_secs_f64(),
-        slowest.lock().unwrap().as_secs_f64(),
+        slowest
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .as_secs_f64(),
     );
     let shown: Vec<String> = failed
         .iter()
@@ -246,7 +262,7 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
             let short: String = fp.chars().take(12).collect();
             let about = |p: &Mutex<VoxProc>| {
                 p.lock()
-                    .unwrap()
+                    .expect("APPARATUS: a lock the proof holds was poisoned")
                     .said_since(first)
                     .into_iter()
                     .filter(|l| l.contains(&format!("connection to {short}")))
@@ -262,7 +278,7 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
         .collect();
     assert!(
         failed.is_empty() && staged == MEMBERS,
-        "{} of {MEMBERS} joins failed as the room grew ({} {}), the first at m{:03}:\n{}",
+        "PRODUCT: {} of {MEMBERS} joins failed as the room grew ({} {}), the first at m{:03}:\n{}",
         failed.len(),
         profile(),
         if last.ok {
@@ -275,10 +291,10 @@ fn every_joiner_of_a_three_hundred_member_room_gets_in() {
     );
     assert!(
         last.ok,
-        "the room had {} members and its next joiner was refused ({}):\n{}\nthe host said:\n{}",
+        "PRODUCT: the room had {} members and its next joiner was refused ({}):\n{}\nthe host said:\n{}",
         staged + 1,
         profile(),
         last.said,
-        r.host.lock().unwrap().said_since(first).join("\n")
+        r.host.lock().expect("APPARATUS: a lock the proof holds was poisoned").said_since(first).join("\n")
     );
 }

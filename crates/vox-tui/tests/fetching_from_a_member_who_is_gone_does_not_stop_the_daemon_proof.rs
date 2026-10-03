@@ -25,7 +25,7 @@
 //! same posts with no fetch running: the product's baseline, never part of the apparatus clock,
 //! so one that fails or misses [`ANSWER_WITHIN`] is `PRODUCT (staging):`. The **apparatus clock**
 //! is only the apparatus: the time to run `/usr/bin/true`, not vox, right after any slow post. A slow
-//! post is `CANNOT MEASURE` only while that clock is over [`APPARATUS_BUDGET`].
+//! post is `APPARATUS (runner stalled)` only while that clock is over [`APPARATUS_BUDGET`].
 //!
 //! Mutation: the dial back on the actor (the parent of this change) — (2) and (3) go red.
 
@@ -283,7 +283,7 @@ fn apparatus_spawn() -> Duration {
     t.elapsed()
 }
 
-/// Red if a post missed [`ANSWER_WITHIN`]: `CANNOT MEASURE` when the apparatus clock taken right
+/// Red if a post missed [`ANSWER_WITHIN`]: `APPARATUS (runner stalled)` when the apparatus clock taken right
 /// after it is over [`APPARATUS_BUDGET`], otherwise `side` (the product's). A post that failed
 /// is the product's, whatever the clock.
 fn answered_within(side: &str, what: &str, ok: bool, took: Duration, said: &str) {
@@ -294,7 +294,7 @@ fn answered_within(side: &str, what: &str, ok: bool, took: Duration, said: &str)
     let apparatus = apparatus_spawn();
     assert!(
         apparatus <= APPARATUS_BUDGET,
-        "CANNOT MEASURE: apparatus took {apparatus:?} (`/usr/bin/true`, budget \
+        "APPARATUS (runner stalled): apparatus took {apparatus:?} (`/usr/bin/true`, budget \
          {APPARATUS_BUDGET:?}) right after {what} took {took:?}, so the runner, not the node, may \
          be slow"
     );
@@ -468,7 +468,7 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
     );
     assert!(
         !got,
-        "CANNOT MEASURE: the fetch from a member who is gone succeeded, so nothing was dialled: \
+        "PRODUCT (staging): the fetch from a member who is gone succeeded, so nothing was dialled: \
          {said}"
     );
     let all = answers.iter().map(|(t, ..)| *t).collect::<Vec<_>>();

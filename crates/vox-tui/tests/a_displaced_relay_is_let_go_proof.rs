@@ -355,7 +355,7 @@ fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
     assert_eq!(
         first,
         Some(false),
-        "CANNOT MEASURE: the first request, with the forward closed, should have been answered over \
+        "PRODUCT (staging): the first request, with the forward closed, should have been answered over \
          the anchor's circuit (Some(false)); it was {first:?}.\nup:\n{}",
         up.transcript()
     );
@@ -374,7 +374,7 @@ fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
     }
     let Some(direct_at) = direct_at else {
         panic!(
-            "CANNOT MEASURE: {UPGRADE_WITHIN:?} after the forward opened, no request rode it — there \
+            "PRODUCT (staging): {UPGRADE_WITHIN:?} after the forward opened, no request rode it — there \
              is no displaced relayed path to watch.\nup:\n{}",
             up.transcript()
         );
@@ -404,13 +404,13 @@ fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
     );
     assert_eq!(
         over_circuit, 0,
-        "a request rode the circuit after the direct path took over — the displaced path was still \
+        "PRODUCT: a request rode the circuit after the direct path took over — the displaced path was still \
          in use, so letting it go is not what is being measured"
     );
     assert_eq!(
         n,
         0,
-        "NOT LET GO: the anchor still carries {n} circuit(s) {took:?} after the direct path took over, \
+        "PRODUCT: NOT LET GO: the anchor still carries {n} circuit(s) {took:?} after the direct path took over, \
          past the 60 s grace — a pair that went direct keeps its relay for good.\nanchor:\n{}",
         w.anchor.proc.transcript()
     );
@@ -427,7 +427,7 @@ fn a_relayed_path_a_direct_one_displaced_is_let_go_after_its_grace() {
 /// for as long as it does. The defect this holds against closed on the timer alone, which reached
 /// the person as `Connection reset by peer` mid-session whenever a better path came along.
 ///
-/// **Observed, never assumed** (CANNOT MEASURE otherwise): the session's first echo rode the
+/// **Observed, never assumed** (PRODUCT (staging) otherwise): the session's first echo rode the
 /// circuit (the forward was closed and carried none of it); after the forward opened a *new*
 /// request rode it (the pair went direct); the host or the guest reported its relayed connection
 /// displaced; and every later echo on the session still crossed the anchor, not the forward — it
@@ -497,12 +497,12 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
     );
     assert!(
         !direct,
-        "CANNOT MEASURE: the session's first echo crossed the forward while it was closed"
+        "APPARATUS: the session's first echo crossed the forward while it was closed"
     );
     let n = w.anchor.circuits(Duration::from_secs(2));
     assert!(
         n >= 1,
-        "CANNOT MEASURE: the anchor reports {n} circuits with the session open — it is not on a \
+        "PRODUCT (staging): the anchor reports {n} circuits with the session open — it is not on a \
          relayed path.\nanchor:\n{}",
         w.anchor.proc.transcript()
     );
@@ -535,7 +535,7 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
     both_ends_keep_the_same_connection(&mut w, &mut up, direct_at.is_some(), opened);
     let Some(direct_at) = direct_at else {
         panic!(
-            "CANNOT MEASURE: {UPGRADE_WITHIN:?} after the forward opened, no request rode it — there \
+            "PRODUCT (staging): {UPGRADE_WITHIN:?} after the forward opened, no request rode it — there \
              is no displaced path under the session.\nup:\n{}",
             up.transcript()
         );
@@ -552,7 +552,7 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
     let (host_displaced, up_displaced) = (displaced(&w.host), displaced(&up));
     assert!(
         host_displaced.is_some() || up_displaced.is_some(),
-        "CANNOT MEASURE: a request rode the forward, but neither side reported its relayed \
+        "PRODUCT (staging): a request rode the forward, but neither side reported its relayed \
          connection displaced.\nup:\n{}\nhost:\n{}",
         up.transcript(),
         w.host.transcript()
@@ -579,7 +579,7 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
         );
         assert!(
             !direct,
-            "CANNOT MEASURE: an echo on the session crossed the forward {:?} after the upgrade — it \
+            "PRODUCT (staging): an echo on the session crossed the forward {:?} after the upgrade — it \
              was not on the displaced path",
             direct_at.elapsed()
         );
@@ -588,7 +588,7 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
     let n = w.anchor.circuits(Duration::from_secs(2));
     assert!(
         n >= 1,
-        "CANNOT MEASURE: the session answered, but the anchor reports {n} circuits — it was not \
+        "PRODUCT (staging): the session answered, but the anchor reports {n} circuits — it was not \
          on the displaced path.\nanchor:\n{}",
         w.anchor.proc.transcript()
     );
@@ -612,7 +612,7 @@ fn a_tunnel_on_a_displaced_path_is_not_cut_by_its_grace() {
 /// connection started at 0: a member could open 16 tunnels relayed and 16 more direct, and closing
 /// one of the old ones freed nothing on the count that refused the next.
 ///
-/// **Staging, observed** (CANNOT MEASURE otherwise): 15 sessions through `vox up` while the
+/// **Staging, observed** (PRODUCT (staging) otherwise): 15 sessions through `vox up` while the
 /// forward is closed, each echoing over the anchor's circuit; the forward opens, and a 16th
 /// request rides it (the pair went direct, reported displaced by either side), and is held.
 ///
@@ -662,7 +662,7 @@ fn the_tunnel_cap_holds_across_a_path_upgrade() {
         let (ok, direct) = echo(&mut s, &w);
         assert!(
             ok && !direct,
-            "CANNOT MEASURE: relayed session {i} did not echo over the circuit (came back: {ok}, \
+            "PRODUCT (staging): relayed session {i} did not echo over the circuit (came back: {ok}, \
              crossed the forward: {direct})"
         );
         relayed.push(s);
@@ -683,7 +683,7 @@ fn the_tunnel_cap_holds_across_a_path_upgrade() {
     }
     let Some(mut on_direct) = on_direct else {
         panic!(
-            "CANNOT MEASURE: {UPGRADE_WITHIN:?} after the forward opened, no request rode it — the \
+            "PRODUCT (staging): {UPGRADE_WITHIN:?} after the forward opened, no request rode it — the \
              pair never went direct.\nup:\n{}",
             up.transcript()
         );
@@ -697,7 +697,7 @@ fn the_tunnel_cap_holds_across_a_path_upgrade() {
     };
     assert!(
         displaced(&w.host) || displaced(&up),
-        "CANNOT MEASURE: a request rode the forward, but neither side reported its relayed \
+        "PRODUCT (staging): a request rode the forward, but neither side reported its relayed \
          connection displaced, so the member may not have two connections.\nup:\n{}\nhost:\n{}",
         up.transcript(),
         w.host.transcript()
@@ -705,7 +705,7 @@ fn the_tunnel_cap_holds_across_a_path_upgrade() {
     let (ok, _) = echo(&mut relayed[0], &w);
     assert!(
         ok,
-        "CANNOT MEASURE: a relayed session stopped answering after the upgrade, so the displaced \
+        "PRODUCT: a relayed session stopped answering after the upgrade, so the displaced \
          path no longer carries the 15"
     );
     eprintln!(

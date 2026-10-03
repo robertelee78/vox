@@ -130,7 +130,7 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
                     Ok(0) | Err(_) => return,
                     Ok(n) => sink
                         .lock()
-                        .unwrap()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
                         .push_str(&String::from_utf8_lossy(&buf[..n])),
                 }
             }
@@ -138,11 +138,17 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     }
     let d = Daemon(child, said);
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !d.1.lock().unwrap().contains("control socket") {
+    while !d
+        .1
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .contains("control socket")
+    {
         assert!(
             Instant::now() < deadline,
             "PRODUCT: a daemon never served its control socket:\n{}",
-            d.1.lock().unwrap()
+            d.1.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
         );
         std::thread::sleep(Duration::from_millis(50));
     }

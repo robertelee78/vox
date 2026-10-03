@@ -34,7 +34,7 @@
 //! **Control, same run:** both NATs made **symmetric** (a new mapping per destination, so the
 //! observed address is useless to the peer and no punch can work). The pair must stay relayed —
 //! answered, but not one payload byte peer to peer — or the emulator leaks and this proof reports
-//! CANNOT MEASURE.
+//! APPARATUS.
 //!
 //! **The mutation that must turn it red:** drop the punch rung from `NodeNet::upgrade` (no
 //! coordinator is asked). The pair is answered over the circuit and never reaches a direct path.
@@ -104,14 +104,14 @@ struct NatWorld {
 impl NatWorld {
     fn new(kind: Kind) -> Self {
         let started = Instant::now();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
         let (anchor_dir, host_dir, guest_dir) = (
             tmp.path().join("anchor"),
             tmp.path().join("host"),
             tmp.path().join("guest"),
         );
         for d in [&anchor_dir, &host_dir, &guest_dir] {
-            std::fs::create_dir_all(d.join("cfg")).unwrap();
+            std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         }
         let anchor_port = free_in_both_families();
         let nats = TwoNats::start(kind, anchor_port);
@@ -130,19 +130,19 @@ impl NatWorld {
             })
             .trim()
             .to_owned();
-        let (fp, _) = spec.split_once('@').expect("fp@addr");
+        let (fp, _) = spec.split_once('@').expect("PRODUCT: fp@addr");
         let host_spec = format!("{fp}@/ip4/127.0.0.1/udp/{}", nats.anchor_for_host.port());
         let guest_spec = format!("{fp}@/ip6/::1/udp/{}", nats.anchor_for_guest.port());
 
         let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
         let (ok, _host_fp, err) = vox_once(&host_dir, &args(&["id"]));
-        assert!(ok, "vox id (host): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (host): {err}");
         let (ok, out, err) = vox_once(
             &host_dir,
             &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
         );
-        assert!(ok, "trust add: {out}\n{err}");
+        assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
         let service_port = echo_service();
         let mut host = VoxProc::spawn(
             "host",
@@ -184,7 +184,7 @@ impl NatWorld {
         );
         assert!(
             ok,
-            "CANNOT MEASURE ({kind:?}): the guest could not join through its NAT (after {:?}).\n\
+            "PRODUCT (staging) ({kind:?}): the guest could not join through its NAT (after {:?}).\n\
              stdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
             t0.elapsed(),
             host.transcript()
@@ -226,9 +226,9 @@ impl NatWorld {
         let bound = line
             .split_whitespace()
             .nth(3)
-            .expect("an address")
+            .expect("PRODUCT: an address")
             .parse()
-            .expect("a socket address");
+            .expect("PRODUCT: a socket address");
         (up, bound, ready)
     }
 
@@ -321,7 +321,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         let first = request(&w, proxy, &payload);
         assert!(
             first.is_some(),
-            "CANNOT MEASURE: behind symmetric NATs the guest's request was not answered at all — \
+            "PRODUCT (staging): behind symmetric NATs the guest's request was not answered at all — \
              the anchor's circuit, the one path that must exist, did not carry it.\nup:\n{}",
             up.transcript()
         );
@@ -343,7 +343,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         );
         assert!(
             w.nats.p2p_to_host() == 0 && w.nats.p2p_to_guest() == 0,
-            "CANNOT MEASURE: behind symmetric NATs the pair still moved {} B peer to peer — a path \
+            "APPARATUS: behind symmetric NATs the pair still moved {} B peer to peer — a path \
              leaks around the emulator, so a direct path behind the cone NATs would prove nothing",
             w.nats.p2p_to_host() + w.nats.p2p_to_guest()
         );
@@ -364,7 +364,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         let answered = Instant::now();
         let Some(first_direct) = first else {
             panic!(
-                "sample {i}: the first request to the host was not answered.\nup:\n{}",
+                "PRODUCT: sample {i}: the first request to the host was not answered.\nup:\n{}",
                 up.transcript()
             );
         };
@@ -473,7 +473,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
         if direct_at.is_some() {
             assert!(
                 filtered >= 1,
-                "CANNOT MEASURE (sample {i}): the pair went direct and no NAT dropped a single \
+                "APPARATUS (sample {i}): the pair went direct and no NAT dropped a single \
                  unsolicited datagram — the filter this proof depends on was not in the way"
             );
         }
@@ -508,7 +508,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
     }
     assert!(
         never == 0 && over_any == 0 && over_punched == 0,
-        "R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
+        "PRODUCT: R42 punch: a first connection must complete in under {TARGET:?}. {over_any} of {SAMPLES} \
          first answers took longer (slowest {any_max:?}); {over_punched} of {SAMPLES} reached the \
          punched path at or past it (slowest {punched_max:?}), {never} never within {GIVE_UP:?}"
     );

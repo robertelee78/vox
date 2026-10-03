@@ -17,7 +17,7 @@
 //!
 //! 3. **the window was reached**: at least one joiner was told "not a member of the room yet"
 //!    (`NotYetMember`), the honest name for it, which the push retry resolves. A run in which none
-//!    was is `CANNOT MEASURE: staging not achieved`, never a pass: it would have passed with the
+//!    was is `PRODUCT (staging)`, never a pass: it would have passed with the
 //!    defect present (V210-106).
 //!
 //! **How the window is forced.** It is a race between the joiner's first session with its anchor
@@ -100,7 +100,7 @@ impl Load {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()
-                    .expect("spawn yes")
+                    .expect("APPARATUS: spawn yes")
             })
             .collect();
         eprintln!("[proof] load: {cores} `yes` process(es), one per core");
@@ -134,14 +134,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -160,7 +160,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, env: &[(&str, &
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
         env,
     );
@@ -171,7 +173,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, env: &[(&str, &
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("CANNOT MEASURE (staging not achieved): {name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -182,14 +184,14 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     // A join per joiner; unlocks: a `vox id` and a daemon per member, two `trust add`s per joiner,
     // and the room created.
     watchdog::arm_for_setup(JOINERS.len() as u32, 4 * JOINERS.len() as u32 + 3);
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
 
     let anchor_dir = dir("anchor");
     let mut anchor = VoxProc::spawn(
@@ -208,7 +210,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     let alice_dir = dir("alice");
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "CANNOT MEASURE (staging not achieved): vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let alice_fp = fp(&alice_dir);
@@ -218,7 +220,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         .lines()
         .find_map(|l| l.split("identity ").nth(1))
         .map(|f| f.trim().to_owned())
-        .expect("CANNOT MEASURE (staging not achieved): the anchor names its identity");
+        .expect("PRODUCT (staging): the anchor names its identity");
     let mut names: Vec<(String, &str)> =
         vec![(anchor_fp, "the anchor"), (alice_fp.clone(), "alice")];
     let joiners: Vec<(&str, std::path::PathBuf)> = JOINERS.iter().map(|n| (*n, dir(n))).collect();
@@ -226,15 +228,9 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         let their = fp(d);
         names.push((their.clone(), name));
         let (ok, out, err) = vox_once(&alice_dir, &args(&["trust", "add", &their, "--name", name]));
-        assert!(
-            ok,
-            "CANNOT MEASURE (staging not achieved): alice trusts {name}: {out}{err}"
-        );
+        assert!(ok, "PRODUCT (staging): alice trusts {name}: {out}{err}");
         let (ok, out, err) = vox_once(d, &args(&["trust", "add", &alice_fp, "--name", "alice"]));
-        assert!(
-            ok,
-            "CANNOT MEASURE (staging not achieved): {name} trusts alice: {out}{err}"
-        );
+        assert!(ok, "PRODUCT (staging): {name} trusts alice: {out}{err}");
     }
 
     let mut alice = daemon("alice", &alice_dir, &spec, &idpass, &[]);
@@ -250,20 +246,14 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         ],
         &format!("{ROOM_PASS}\n"),
     );
-    assert!(
-        ok,
-        "CANNOT MEASURE (staging not achieved): vox room create: {out}{err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(
-        ok,
-        "CANNOT MEASURE (staging not achieved): vox room list: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("family"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("CANNOT MEASURE (staging not achieved): room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): room not listed: {list}"))
         .to_owned();
 
     // The joiners' daemons are up before the load: what is measured is the join, not start-up.
@@ -288,10 +278,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         let _load = Load::start();
         for (name, d, _) in &procs {
             let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-            assert!(
-                ok,
-                "CANNOT MEASURE (staging not achieved): vox room invite: {err}"
-            );
+            assert!(ok, "PRODUCT (staging): vox room invite: {err}");
             let (ok, out, err) = vox_in(
                 d,
                 &[
@@ -378,7 +365,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     // have passed too.
     assert!(
         not_yet > 0,
-        "CANNOT MEASURE (staging not achieved): no joiner's sync was told \"not a member yet\", so \
+        "PRODUCT (staging): no joiner's sync was told \"not a member yet\", so \
          no joiner synced with the anchor while it knew it only by its pre-join record, though each \
          held its address record back for {HOLD_ADDRESS_MS} ms"
     );

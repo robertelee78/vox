@@ -89,17 +89,17 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn vox");
+    let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
         child
             .stdin
             .as_mut()
-            .expect("stdin")
+            .expect("APPARATUS: stdin")
             .write_all(text.as_bytes())
-            .expect("write stdin");
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
         drop(child.stdin.take());
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -109,8 +109,10 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
 
 /// Start `vox daemon` with `stdin_lines` piped in, its output to files next to the profile.
 fn daemon(dir: &std::path::Path, tag: &str, stdin_lines: &str) -> Daemon {
-    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out"))).unwrap();
-    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err"))).unwrap();
+    let out = std::fs::File::create(dir.join(format!("daemon-{tag}.out")))
+        .expect("APPARATUS: create a staging file");
+    let err = std::fs::File::create(dir.join(format!("daemon-{tag}.err")))
+        .expect("APPARATUS: create a staging file");
     let mut child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_DATA_DIR", dir)
@@ -120,10 +122,11 @@ fn daemon(dir: &std::path::Path, tag: &str, stdin_lines: &str) -> Daemon {
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     // Write, then close: the daemon reads stdin to EOF before it binds its socket.
-    let mut pipe = child.stdin.take().expect("daemon stdin");
-    pipe.write_all(stdin_lines.as_bytes()).unwrap();
+    let mut pipe = child.stdin.take().expect("APPARATUS: daemon stdin");
+    pipe.write_all(stdin_lines.as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     Daemon(child)
 }
@@ -141,7 +144,7 @@ fn attached(dir: &std::path::Path, tag: &str) -> String {
         std::thread::sleep(Duration::from_millis(200));
     }
     panic!(
-        "{tag}'s daemon never answered: {last}\nits stderr: {}",
+        "PRODUCT (staging): {tag}'s daemon never answered: {last}\nits stderr: {}",
         std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default()
     );
 }
@@ -173,7 +176,9 @@ fn read_posts(
         let page: Vec<serde_json::Value> = out
             .lines()
             .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad row ({e}): {l}")))
+            .map(|l| {
+                serde_json::from_str(l).unwrap_or_else(|e| panic!("PRODUCT: bad row ({e}): {l}"))
+            })
             .collect();
         for row in &page {
             if let Some(n) = row["text"]
@@ -190,7 +195,7 @@ fn read_posts(
                 since = Some(
                     last["entry_hash"]
                         .as_str()
-                        .expect("every row carries its entry hash")
+                        .expect("PRODUCT: every row carries its entry hash")
                         .to_owned(),
                 );
             }
@@ -204,23 +209,23 @@ fn read_posts(
 #[ignore = "real vox daemons, 1,500 CLI posts and production Argon2id; optional, run it in release"]
 fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_them_all() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     for d in [&alice, &bob] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
 
     // ---- two identities that consent to each other, decided before any daemon runs ----
     let mut fps = Vec::new();
     for dir in [&alice, &bob] {
         let (ok, out, err) = vox(dir, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         fps.push(out.trim().to_owned());
     }
     for (dir, fp, name) in [(&alice, &fps[1], "bob"), (&bob, &fps[0], "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", name], None);
-        assert!(ok, "vox trust add {name}: {err}");
+        assert!(ok, "PRODUCT (staging): vox trust add {name}: {err}");
     }
 
     // ---- alice: a room, and POSTS posts from one author --------------------------------
@@ -231,12 +236,12 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
         &["room", "create", "--passphrase-file", "-", "--name", "long"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room create: {err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let listed = attached(&alice, "alice");
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("a room id in `room list`")
+        .expect("PRODUCT: a room id in `room list`")
         .to_owned();
 
     let started = Instant::now();
@@ -244,7 +249,7 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
         let (ok, _, err) = vox(&alice, &["room", "post", &room, &format!("post {i}")], None);
         assert!(
             ok,
-            "post {i} of {POSTS} was refused after {} succeeded: {err} — one author may post \
+            "PRODUCT: post {i} of {POSTS} was refused after {} succeeded: {err} — one author may post \
              without limit (PRD-001 R1/R3)",
             i - 1
         );
@@ -259,7 +264,7 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     assert_eq!(
         (before.len(), before_rows),
         (1_500, 1_500),
-        "every post reads back once before the restart"
+        "PRODUCT: every post reads back once before the restart"
     );
 
     // ---- restart: the room must open, with every row --------------------------------------
@@ -274,19 +279,19 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     );
     assert!(
         listed.contains("long") && !listed.contains("[closed]"),
-        "the room with {POSTS} posts from one author did not reopen after a restart: \
+        "PRODUCT: the room with {POSTS} posts from one author did not reopen after a restart: \
          {listed:?} — PRD-001 D1\nalice's daemon said: {}",
         std::fs::read_to_string(alice.join("daemon-second.err")).unwrap_or_default()
     );
     assert_eq!(
         (after.len(), after_rows),
         (1_500, 1_500),
-        "every post reads back once after the restart"
+        "PRODUCT: every post reads back once after the restart"
     );
 
     // ---- bob joins cold and must read every row ------------------------------------------
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let link = link.trim().to_owned();
     let bob_daemon = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
     attached(&bob, "bob");
@@ -303,12 +308,12 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
         ],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "vox room join: {err}");
+    assert!(ok, "PRODUCT (staging): vox room join: {err}");
     // ---- bob's log catches up: he renders the post alice makes after his join ----------
     let joined = Instant::now();
     let after_join = format!("post {}", POSTS + 1);
     let (ok, _, err) = vox(&alice, &["room", "post", &room, &after_join], None);
-    assert!(ok, "alice's post after bob joined: {err}");
+    assert!(ok, "PRODUCT: alice's post after bob joined: {err}");
     let deadline = joined + Duration::from_secs(300);
     let caught_up = loop {
         let (ok, out, _) = vox(&bob, &["room", "read", &room, "--json"], None);
@@ -337,7 +342,7 @@ fn a_room_past_a_thousand_posts_from_one_author_reopens_and_a_newcomer_holds_the
     );
     assert!(
         caught_up,
-        "a newcomer's log must catch up with the whole history, of any size (PRD-001 R1): bob \
+        "PRODUCT: a newcomer's log must catch up with the whole history, of any size (PRD-001 R1): bob \
          never rendered {after_join:?}, which his log can accept only after all {POSTS} of \
          alice's earlier posts, within {took:?}\nbob's daemon said: {}",
         std::fs::read_to_string(bob.join("daemon-bob.err")).unwrap_or_default()

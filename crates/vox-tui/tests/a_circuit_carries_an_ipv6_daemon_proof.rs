@@ -30,8 +30,8 @@
 //! `vox trust add`, `vox connect` and `vox up` on the guest — the guest must join the host's room
 //! and reach its service over SOCKS5 (`<room>.vox`), [`SYM_REQUESTS`] times, every byte through the
 //! anchor and none peer to peer.
-//! - A process that never used its NAT, or a single payload byte peer to peer, is `CANNOT
-//!   MEASURE`: the emulator would not be what is being measured.
+//! - A process that never used its NAT, or a single payload byte peer to peer, is
+//!   `APPARATUS`: the emulator would not be what is being measured.
 //! - The join failing is a PRODUCT red naming the relay path: behind symmetric NATs the relay is the
 //!   only path, so a failed join is that path not being established.
 //! - A request not answered, once the join has proved the relay up, is a PRODUCT red that names the
@@ -109,11 +109,17 @@ fn a_guest_on_an_ipv6_socket_reaches_its_host_through_a_relay_circuit() {
     let back =
         round_trip(at, b"across the circuit", Duration::from_secs(120)).unwrap_or_else(|e| {
             panic!(
-                "no echo through the forward ({e}).\nforward:\n{}",
-                w.fwd.as_mut().unwrap().transcript()
+                "PRODUCT: no echo through the forward ({e}).\nforward:\n{}",
+                w.fwd
+                    .as_mut()
+                    .expect("APPARATUS: a process the proof started")
+                    .transcript()
             )
         });
-    assert_eq!(back, b"across the circuit", "bytes must cross unchanged");
+    assert_eq!(
+        back, b"across the circuit",
+        "PRODUCT: bytes must cross unchanged"
+    );
     w.assert_relayed("after the echo");
     w.expect_still_relayed();
     eprintln!("[test] echo crossed the circuit, and the forward reports the path relayed");
@@ -138,7 +144,7 @@ const HOST_HOLD_MS: &str = "3000";
 /// Staged with the test-only `VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS`: the host's publish rounds to the
 /// anchor fail for [`HOST_HOLD_MS`] and are retried on their backoff. The guest asks at once.
 /// - The guest must say it is waiting for the room (`vox: waiting: …`), or the staging was not
-///   achieved: CANNOT MEASURE.
+///   achieved: PRODUCT (staging).
 /// - It must then join through the relay, within the join's patience: PRODUCT, quoting it.
 ///
 /// **The mutation that must turn it red:** the join's repeated search removed, so a search that
@@ -168,7 +174,7 @@ fn a_guest_that_arrives_before_the_anchor_holds_the_room_still_joins_through_the
     );
     assert!(
         waited,
-        "CANNOT MEASURE (precondition unmet): the guest joined without saying it waited for the \
+        "PRODUCT (staging): the guest joined without saying it waited for the \
          room, so the anchor already held it and the moment V210-143 is about was not staged; the \
          joiner said:\n{err}"
     );
@@ -201,18 +207,18 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("CANNOT MEASURE: the harness could not spawn vox");
+        .expect("APPARATUS: the harness could not spawn vox");
     if let Some(text) = stdin {
         let mut pipe = child
             .stdin
             .take()
-            .expect("CANNOT MEASURE: the harness has no stdin pipe");
+            .expect("APPARATUS: the harness has no stdin pipe");
         pipe.write_all(text.as_bytes())
-            .expect("CANNOT MEASURE: the harness could not write to stdin");
+            .expect("PRODUCT (staging): the harness could not write to stdin");
     }
     let out = child
         .wait_with_output()
-        .expect("CANNOT MEASURE: the harness could not wait for vox");
+        .expect("APPARATUS: the harness could not wait for vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -248,7 +254,10 @@ impl Drop for Daemon {
 
 impl Daemon {
     fn said(&self) -> String {
-        self.1.lock().unwrap().clone()
+        self.1
+            .lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .clone()
     }
 }
 
@@ -262,12 +271,13 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("CANNOT MEASURE: the harness could not spawn a daemon");
+        .expect("APPARATUS: the harness could not spawn a daemon");
     let mut pipe = child
         .stdin
         .take()
-        .expect("CANNOT MEASURE: the harness has no stdin pipe");
-    pipe.write_all(format!("{IDPASS}\n").as_bytes()).unwrap();
+        .expect("APPARATUS: the harness has no stdin pipe");
+    pipe.write_all(format!("{IDPASS}\n").as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     let said = Arc::new(Mutex::new(String::new()));
     for stream in [
@@ -292,7 +302,7 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
                     Ok(0) | Err(_) => return,
                     Ok(n) => sink
                         .lock()
-                        .unwrap()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
                         .push_str(&String::from_utf8_lossy(&buf[..n])),
                 }
             }
@@ -300,11 +310,17 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
     }
     let d = Daemon(child, said);
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !d.1.lock().unwrap().contains("control socket") {
+    while !d
+        .1
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .contains("control socket")
+    {
         assert!(
             Instant::now() < deadline,
             "PRODUCT: a `vox daemon` never served its control socket:\n{}",
-            d.1.lock().unwrap()
+            d.1.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -319,7 +335,7 @@ fn signal(pids: &[u32], sig: &str) {
             .is_ok_and(|s| s.success());
         assert!(
             ok,
-            "CANNOT MEASURE: the harness could not send {sig} to process {pid}"
+            "APPARATUS: the harness could not send {sig} to process {pid}"
         );
     }
 }
@@ -327,9 +343,9 @@ fn signal(pids: &[u32], sig: &str) {
 /// Circuits `dir`'s node has asked a relay for to `peer` (`vox status --json` `reach.circuits`).
 fn circuits_to(dir: &std::path::Path, peer: &str) -> u64 {
     let (ok, out, err) = vox(dir, &["status", "--json"], None);
-    assert!(ok, "CANNOT MEASURE: vox status --json: {err}");
+    assert!(ok, "PRODUCT (staging): vox status --json: {err}");
     let v: serde_json::Value = serde_json::from_str(out.trim())
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: vox status --json is not JSON ({e}): {out}"));
+        .unwrap_or_else(|e| panic!("PRODUCT: vox status --json is not JSON ({e}): {out}"));
     v["reach"]
         .as_array()
         .into_iter()
@@ -368,7 +384,7 @@ fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
 ///
 /// 1. The anchor is frozen, and bob and carol trust each other at once, which makes each dial the
 ///    other. The run waits until each has asked the relay for a circuit to the other (`vox status
-///    --json`), or it is `CANNOT MEASURE`.
+///    --json`), or it is `PRODUCT (staging)`.
 /// 2. bob and carol are frozen and the anchor runs: it hands each the other's circuit request,
 ///    which waits in the frozen member, and then waits for their answers.
 /// 3. The anchor is frozen again and bob and carol run: each takes the other's circuit (one attach
@@ -380,7 +396,7 @@ fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
 /// order in two lost only one dial, the other connected, and the members read each other anyway.
 ///
 /// **Asserted, as the members see it:** each reads a post of the other's within [`BOUND`] of the
-/// release. A `PRODUCT:` red is the product's verdict; `CANNOT MEASURE` is the staging not achieved.
+/// release. A `PRODUCT:` red is the product's verdict; `PRODUCT (staging)` is the staging not achieved.
 ///
 /// **Mutation that must turn it red:** in `MuxSocket::attach`, remove the earlier circuit to the
 /// same peer when a new one is attached (the code before V210-80).
@@ -388,13 +404,13 @@ fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
 #[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
 fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dirs: Vec<std::path::PathBuf> = ["alice", "bob", "carol"]
         .iter()
         .map(|n| tmp.path().join(n))
         .collect();
     for d in &dirs {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let (alice_dir, bob_dir, carol_dir) = (&dirs[0], &dirs[1], &dirs[2]);
     let anchor = Anchor::start(&tmp.path().join("anchor"));
@@ -457,7 +473,7 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
             ],
             Some(&format!("{ROOMPASS}\n")),
         );
-        assert!(ok, "CANNOT MEASURE: a join failed: {err}");
+        assert!(ok, "PRODUCT (staging): a join failed: {err}");
     }
 
     // Fresh processes, so neither holds a connection to the other from the joins.
@@ -470,7 +486,7 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
             vox(bob_dir, &["room", "list"], None).1.contains(&room)
                 && vox(carol_dir, &["room", "list"], None).1.contains(&room)
         }),
-        "CANNOT MEASURE: a restarted daemon never listed the room"
+        "PRODUCT (staging): a restarted daemon never listed the room"
     );
 
     // ---- precondition: neither has dialled the other ----
@@ -481,7 +497,7 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     );
     assert!(
         before == (0, 0),
-        "CANNOT MEASURE: bob and carol already asked for circuits to each other before the \
+        "PRODUCT (staging): bob and carol already asked for circuits to each other before the \
          freeze: {before:?}"
     );
     let marks = (bob.said().lines().count(), carol.said().lines().count());
@@ -522,11 +538,16 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
         // 4. Each member hears its own circuit is open.
         signal(&anchor_pid, "-CONT");
         let released = Instant::now();
-        (asked, released, b.join().unwrap(), c.join().unwrap())
+        (
+            asked,
+            released,
+            b.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            c.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
     });
     assert!(
         asked,
-        "CANNOT MEASURE: bob and carol did not both ask the frozen relay for a circuit to each \
+        "PRODUCT (staging): bob and carol did not both ask the frozen relay for a circuit to each \
          other within 5 s, so the crossing was not staged"
     );
     assert!(b.0, "PRODUCT: bob trusts carol: {}", b.2);
@@ -582,7 +603,7 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     // 1. The escalation: both dials went through the relay.
     assert!(
         after.0 > before.0 && after.1 > before.1,
-        "CANNOT MEASURE: the dials did not cross: bob asked for {} circuit(s) to carol, carol {} \
+        "PRODUCT (staging): the dials did not cross: bob asked for {} circuit(s) to carol, carol {} \
          to bob",
         after.0,
         after.1
@@ -622,7 +643,7 @@ enum Outcome {
 fn sym_request(proxy: SocketAddr, host: &str, port: u16, payload: &[u8]) -> Outcome {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(proxy).unwrap_or_else(|e| {
-        panic!("CANNOT MEASURE (harness error): could not open a TCP connection to vox up at {proxy}: {e}")
+        panic!("PRODUCT (staging): could not open a TCP connection to vox up at {proxy}: {e}")
     });
     let _ = s.set_read_timeout(Some(Duration::from_secs(90)));
     let io = |what: &str, e: std::io::Error| Outcome::ProxyBroke(format!("{what}: {e}"));
@@ -637,7 +658,7 @@ fn sym_request(proxy: SocketAddr, host: &str, port: u16, payload: &[u8]) -> Outc
         return Outcome::ProxyBroke(format!("method reply {hello:?}, not no-auth"));
     }
     let Ok(len) = u8::try_from(host.len()) else {
-        panic!("CANNOT MEASURE (harness error): host name {host:?} is too long for SOCKS5");
+        panic!("APPARATUS (harness error): host name {host:?} is too long for SOCKS5");
     };
     let mut req = vec![0x05, 0x01, 0x00, 0x03, len];
     req.extend_from_slice(host.as_bytes());
@@ -681,7 +702,7 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let tmp = tempfile::tempdir()
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error): no temp dir: {e}"));
+        .unwrap_or_else(|e| panic!("APPARATUS (harness error): no temp dir: {e}"));
     let (anchor_dir, host_dir, guest_dir) = (
         tmp.path().join("anchor"),
         tmp.path().join("host"),
@@ -690,14 +711,14 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
     for d in [&anchor_dir, &host_dir, &guest_dir] {
         std::fs::create_dir_all(d.join("cfg")).unwrap_or_else(|e| {
             panic!(
-                "CANNOT MEASURE (harness error): could not make {}: {e}",
+                "APPARATUS (harness error): could not make {}: {e}",
                 d.display()
             )
         });
     }
     let anchor_port = UdpSocket::bind("[::]:0")
         .and_then(|s| s.local_addr())
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE (harness error): no free UDP port: {e}"))
+        .unwrap_or_else(|e| panic!("APPARATUS (harness error): no free UDP port: {e}"))
         .port();
     let nats = TwoNats::start(Kind::Symmetric, anchor_port);
     let advertise = format!("{},{}", nats.anchor_for_host, nats.anchor_for_guest);
@@ -722,14 +743,14 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
     let guest_spec = format!("{fp}@/ip6/::1/udp/{}", nats.anchor_for_guest.port());
 
     let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (guest): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
     let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: vox id (host): {err}");
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let (ok, out, err) = vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
     );
-    assert!(ok, "CANNOT MEASURE: trust add: {out}\n{err}");
+    assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
     let service_port = echo_service();
     let mut host = VoxProc::spawn(
         "host",
@@ -777,7 +798,7 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
     );
     assert!(
         host_maps > 0 && guest_maps > 0,
-        "CANNOT MEASURE: a process never sent through its NAT (host {host_maps}, guest \
+        "APPARATUS: a process never sent through its NAT (host {host_maps}, guest \
          {guest_maps} mappings), so the NATs are not in the path"
     );
     // Behind symmetric NATs the anchor's relay is the only path, so a join that fails is the
@@ -826,7 +847,7 @@ fn two_hosts_behind_symmetric_nats_reach_a_service_through_the_anchor() {
     );
     assert!(
         p2p == 0,
-        "CANNOT MEASURE: behind symmetric NATs the pair moved {p2p} B peer to peer — a path leaks \
+        "APPARATUS: behind symmetric NATs the pair moved {p2p} B peer to peer — a path leaks \
          around the emulator, so the anchor was not the only path"
     );
     // A shortfall says only what the requests showed. The join ran over its own circuit, so it

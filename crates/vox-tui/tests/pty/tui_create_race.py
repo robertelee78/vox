@@ -11,10 +11,11 @@ creating anything.)
 Each TUI runs in a pty at 160x50 and its screen is read through the `pyte` terminal emulator:
 raw ANSI cannot be grepped, because the TUI repaints only what changed.
 
-Prints `<tag> SAID: <status line>` with what the second TUI answered. Exit 0 = it answered; 2 =
-apparatus (pyte missing, no first-run prompt, the first TUI made nothing, no answer); 1 = the
-driver hung (`HUNG at <stage>`, with its stack: `vox_pty.py`, V210-54). The caller judges the
-words. Both TUIs are killed by their PIDs, with bounded waits.
+Prints `<tag> SAID: <status line>` with what the second TUI answered. Exit 0 = it answered; 1 =
+the TUI failed (`<tag> RED: PRODUCT: <what>`, with its screen: no first-run prompt, the first TUI
+made nothing, no answer to the second create) or the driver hung (`HUNG at <stage>`, with its
+stack: `vox_pty.py`, V210-54); 2 = apparatus, the driver's own machinery only (pyte missing). The
+caller judges the words. Both TUIs are killed by their PIDs, with bounded waits.
 """
 import os, sys
 
@@ -47,8 +48,8 @@ try:
 
     for name, t in (("first", first), ("second", second)):
         if not t.until(lambda: "create identity" in t.text().lower(), 60):
-            print(f"{TAG} APPARATUS: the {name} TUI never asked to create an identity:\n{t.text()}")
-            sys.exit(2)
+            print(f"{TAG} RED: PRODUCT: the {name} TUI never asked to create an identity:\n{t.text()}")
+            sys.exit(1)
 
     stage("the first TUI creates")
     first_before = status(first)
@@ -57,8 +58,8 @@ try:
     # Production Argon2id: sealing takes seconds. Made, the prompt is gone and the status changes.
     if not first.until(lambda: status(first) != first_before
                        and "create identity" not in first.text().lower(), 90):
-        print(f"{TAG} APPARATUS: the first TUI made no identity:\n{first.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT: the first TUI made no identity:\n{first.text()}")
+        sys.exit(1)
     first.pump(2)
     print(f"{TAG} the first TUI made it: {' '.join(status(first).split())}")
 
@@ -73,7 +74,8 @@ try:
         code = 0
         print(f"{TAG} SAID: {' '.join(status(second).split())}")
     else:
-        print(f"{TAG} APPARATUS: no answer to the second create; the screen:\n{second.text()}")
+        code = 1
+        print(f"{TAG} RED: PRODUCT: no answer to the second create; the screen:\n{second.text()}")
     for t in tuis:
         t.key("\x1b", 0.5)
         t.key(":q\r", 1)

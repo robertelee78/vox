@@ -138,12 +138,18 @@ fn vox(data: &Path, argv: &[&str], stdin: &str) -> (bool, Duration, String, Stri
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     // Read the pipes on their own threads: a full pipe would block the child.
-    let mut out_pipe = child.stdout.take().unwrap();
-    let mut err_pipe = child.stderr.take().unwrap();
+    let mut out_pipe = child
+        .stdout
+        .take()
+        .expect("APPARATUS: a piped stdio handle");
+    let mut err_pipe = child
+        .stderr
+        .take()
+        .expect("APPARATUS: a piped stdio handle");
     let out_t = std::thread::spawn(move || {
         let mut s = Vec::new();
         let _ = std::io::Read::read_to_end(&mut out_pipe, &mut s);
@@ -155,7 +161,7 @@ fn vox(data: &Path, argv: &[&str], stdin: &str) -> (bool, Duration, String, Stri
         s
     });
     let ok = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.try_wait().expect("APPARATUS: poll a child process") {
             break status.success();
         }
         if t0.elapsed() >= VERB_CAP {
@@ -169,8 +175,18 @@ fn vox(data: &Path, argv: &[&str], stdin: &str) -> (bool, Duration, String, Stri
     (
         ok,
         took,
-        String::from_utf8_lossy(&out_t.join().unwrap()).into_owned(),
-        String::from_utf8_lossy(&err_t.join().unwrap()).into_owned(),
+        String::from_utf8_lossy(
+            &out_t
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
+        .into_owned(),
+        String::from_utf8_lossy(
+            &err_t
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
+        .into_owned(),
     )
 }
 
@@ -214,7 +230,7 @@ fn append_to_visible(
                 after = row
                     .split_whitespace()
                     .next()
-                    .expect("a row starts with its entry hash")
+                    .expect("PRODUCT: a row starts with its entry hash")
                     .to_owned();
                 break;
             }
@@ -347,26 +363,28 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         std::env::set_var("VOX_TEST_WATCHDOG_SECS", "3000");
     }
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("alice");
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create a staging directory");
     let (ok, _, _, err) = vox(&data, &["id"], "");
-    assert!(ok, "APPARATUS (precondition not met): vox id: {err}");
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
     let pass_file = tmp.path().join("identity.pass");
-    std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+    std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
     let daemon_args = args(&[
         "daemon",
         "--listen",
         "127.0.0.1:0",
         "--passphrase-file",
-        pass_file.to_str().unwrap(),
+        pass_file
+            .to_str()
+            .expect("APPARATUS: a path that is not UTF-8"),
     ]);
     let mut daemon = Some(VoxProc::spawn("alice", &data, &daemon_args));
     let deadline = Instant::now() + SETUP;
     while !vox(&data, &["room", "list"], "").0 {
         assert!(
             Instant::now() < deadline,
-            "APPARATUS (precondition not met): the daemon never answered `vox room list`"
+            "PRODUCT (staging): the daemon never answered `vox room list`"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -375,15 +393,12 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         &["room", "create", "--passphrase-file", "-", "--name", "long"],
         ROOM_PASS,
     );
-    assert!(
-        ok,
-        "APPARATUS (precondition not met): room create: {out}\n{err}"
-    );
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, _, list, _) = vox(&data, &["room", "list"], "");
     let room = list
         .split_whitespace()
         .next()
-        .expect("APPARATUS (precondition not met): the room in `vox room list`")
+        .expect("PRODUCT (staging): the room in `vox room list`")
         .to_owned();
 
     // ---- staging: POSTS messages, from WRITERS shells at once ---------------------------
@@ -400,7 +415,10 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .sum()
     });
     println!(
         "[proof] staged {posted} of {POSTS} posts of {TEXT_LEN} bytes in {:?}",
@@ -408,7 +426,7 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     );
     assert!(
         posted == POSTS,
-        "APPARATUS (precondition not met): only {posted} of {POSTS} posts were taken"
+        "PRODUCT (staging): only {posted} of {POSTS} posts were taken"
     );
 
     // ---- the read -----------------------------------------------------------------------
@@ -470,7 +488,7 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         .lines()
         .last()
         .and_then(|l| l.split_whitespace().next())
-        .expect("APPARATUS (precondition not met): the long room's newest row")
+        .expect("PRODUCT (staging): the long room's newest row")
         .to_owned();
     let (long, long_last) = append_to_visible(&data, &room, "long", newest);
     let long_burst = burst_to_visible(&data, &room, "long", &long_last);
@@ -484,8 +502,10 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         &[
             VOX,
             "tuilong",
-            data.to_str().unwrap(),
-            data.join("cfg").to_str().unwrap(),
+            data.to_str().expect("APPARATUS: a path that is not UTF-8"),
+            data.join("cfg")
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
             "long",
             &TUI_POSTS.to_string(),
             IDENTITY,
@@ -520,7 +540,7 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     }
     let Some(sent) = sent else {
         panic!(
-            "APPARATUS (precondition not met): the TUI driver passed without a time: {}",
+            "APPARATUS: the TUI driver passed without a time: {}",
             out.stdout
         );
     };
@@ -554,32 +574,23 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         ],
         ROOM_PASS,
     );
-    assert!(
-        ok,
-        "APPARATUS (precondition not met): room create: {out}\n{err}"
-    );
+    assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");
     let (_, _, list, _) = vox(&data, &["room", "list"], "");
     let short_room = list
         .lines()
         .find(|l| l.split_whitespace().nth(1) == Some("short"))
         .and_then(|l| l.split_whitespace().next())
-        .expect("APPARATUS (precondition not met): the short room in `vox room list`")
+        .expect("PRODUCT (staging): the short room in `vox room list`")
         .to_owned();
     let (ok, _, _, err) = vox(&data, &["room", "post", &short_room, "first"], "");
-    assert!(
-        ok,
-        "APPARATUS (precondition not met): the short room's first post: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): the short room's first post: {err}");
     let (ok, _, first, err) = vox(&data, &["room", "read", &short_room], "");
-    assert!(
-        ok,
-        "APPARATUS (precondition not met): reading the short room: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): reading the short room: {err}");
     let first = first
         .lines()
         .last()
         .and_then(|l| l.split_whitespace().next())
-        .expect("APPARATUS (precondition not met): the short room's first row")
+        .expect("PRODUCT (staging): the short room's first row")
         .to_owned();
     let (short, short_last) = append_to_visible(&data, &short_room, "short", first);
     let short_burst = burst_to_visible(&data, &short_room, "short", &short_last);
@@ -595,7 +606,7 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     );
     assert!(
         short_burst < BURST_APPARATUS,
-        "APPARATUS (precondition not met): {BURST} messages posted at once to a fresh room took \
+        "PRODUCT (staging): {BURST} messages posted at once to a fresh room took \
          {short_burst:?} to be readable, past {BURST_APPARATUS:?} with no history at all, so this \
          machine cannot measure what history costs"
     );

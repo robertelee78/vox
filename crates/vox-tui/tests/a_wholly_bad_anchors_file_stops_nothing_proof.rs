@@ -36,7 +36,7 @@
 //! unlocks with the right passphrase, never answers `:close`, or stops reading what is typed. A
 //! step this proof needs that is not the claim (a fingerprint to write into the file, a room id
 //! to read back, the TUI driver's own apparatus: pyte missing, its staging, its own error) is
-//! `CANNOT MEASURE`.
+//! `APPARATUS`.
 //!
 //! **The mutation that must turn it red:** `ProfileArgs::anchor_set` returns the
 //! `AnchorsFileUnusable` error again instead of saying it and carrying on (the V210-75 refusal).
@@ -452,14 +452,14 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     // `:close`, or no longer reading what is typed (`HUNG`) is the product.
     assert!(
         out.has_verdict("bob"),
-        "CANNOT MEASURE: the TUI driver was stopped from outside before it gave a verdict, at \
+        "APPARATUS: the TUI driver was stopped from outside before it gave a verdict, at \
          stage {:?} (exit {:?}): {said}",
         out.stage.as_deref().unwrap_or("(before its first stage)"),
         out.code
     );
     assert!(
         !said.contains("bob APPARATUS"),
-        "CANNOT MEASURE: the TUI driver's own apparatus failed (exit {:?}): {said}",
+        "APPARATUS: the TUI driver's own apparatus failed (exit {:?}): {said}",
         out.code
     );
     assert!(
@@ -523,7 +523,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     );
     assert!(
         status.is_some_and(|s| !s.success()),
-        "CANNOT MEASURE: carol's `vox connect` did not fail with the room's host stopped, so this \
+        "PRODUCT (staging): carol's `vox connect` did not fail with the room's host stopped, so this \
          arm did not stage a host that is down; it exited {status:?} and said:\n{said}"
     );
     let host = &alice_fp[..12];

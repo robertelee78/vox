@@ -13,9 +13,11 @@ It prints, for the caller to judge (nothing is asserted here):
 - `<tag> OPEN <start> <end>`: from the passphrase's Enter to the first `vox room read <open_room>`
   that succeeded (the room is open on the node).
 
-Exit 0 = staged and measured; 2 = apparatus (pyte missing, no unlock, no closed room found, the
-room never opened); 1 = the driver hung (`vox_pty.py`). The TUI is killed by its PID, with bounded
-waits; every `vox` it runs is bounded too.
+Exit 0 = staged and measured; 1 = the product's red (`RED: PRODUCT (staging):` the TUI never
+unlocked, the post room never answered through its socket, the closed room was already open, no
+room asked for its passphrase, or the room never opened), or the driver hung (`vox_pty.py`);
+2 = apparatus (pyte missing). The TUI is killed by its PID, with bounded waits; every `vox` it
+runs is bounded too.
 """
 import os, subprocess, sys, threading, time
 
@@ -79,18 +81,20 @@ try:
     tui.pump(3)
     tui.key(IDPASS + "\r", 1)
     if not tui.until(lambda: "unlocked" in status(), 90):
-        print(f"{TAG} APPARATUS: the TUI never unlocked:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): the TUI never unlocked within 90 s:\n{tui.text()}")
+        sys.exit(1)
     stage("the post room answers through the TUI's socket")
     end = time.time() + 60
     while not vox("room", "read", POST_ROOM, cap=20)[0]:
         if time.time() > end:
-            print(f"{TAG} APPARATUS: {POST_ROOM} never answered through the TUI's socket")
-            sys.exit(2)
+            print(f"{TAG} RED: PRODUCT (staging): `vox room read {POST_ROOM}` never answered "
+                  "through the TUI's socket within 60 s")
+            sys.exit(1)
         tui.pump(0.5)
     if vox("room", "read", OPEN_ROOM, cap=20)[0]:
-        print(f"{TAG} APPARATUS: {OPEN_ROOM} is already open; nothing to open")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): {OPEN_ROOM}, closed on purpose, was opened by "
+              "the unlock on its own")
+        sys.exit(1)
 
     stage("post before the open")
     posting.set()
@@ -108,8 +112,9 @@ try:
         tui.key("\x1b", 0.8)  # back to the list from an open room
         tui.key("\x1b[B", 0.8)  # down
     if not prompted:
-        print(f"{TAG} APPARATUS: no room asked for its passphrase:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): Enter on each room in the list, closed one "
+              f"included, never asked for a passphrase:\n{tui.text()}")
+        sys.exit(1)
 
     stage("open it")
     for c in ROOMPASS:
@@ -124,8 +129,9 @@ try:
             open_end = time.time() - T0
             break
     if open_end is None:
-        print(f"{TAG} APPARATUS: {OPEN_ROOM} never opened within {OPEN_CAP}s:\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT (staging): {OPEN_ROOM} never opened within {OPEN_CAP}s of "
+              f"its passphrase:\n{tui.text()}")
+        sys.exit(1)
 
     stage("post after the open")
     tui.pump(AROUND)

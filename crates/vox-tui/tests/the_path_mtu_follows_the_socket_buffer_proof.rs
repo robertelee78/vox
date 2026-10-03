@@ -115,7 +115,7 @@ fn everything_said(mut proc: VoxProc) -> Vec<String> {
         let left = deadline.saturating_duration_since(Instant::now());
         assert!(
             !left.is_zero(),
-            "CANNOT MEASURE: {}'s output did not reach EOF within 30 s of its exit, so a notice \
+            "APPARATUS, CANNOT MEASURE: {}'s output did not reach EOF within 30 s of its exit, so a notice \
              could still be unread. It said:\n{}",
             proc.name,
             said.join("\n")
@@ -218,7 +218,7 @@ fn run_arm(granted: usize, short: bool, staged: Option<&std::path::Path>) {
 fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
     let text = std::fs::read_to_string(log).unwrap_or_else(|e| {
         panic!(
-            "CANNOT MEASURE (staging not achieved): no interposer log {}: {e}",
+            "APPARATUS, CANNOT MEASURE: no interposer log {}: {e}",
             log.display()
         )
     });
@@ -230,14 +230,14 @@ fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
     });
     assert!(
         clamped,
-        "CANNOT MEASURE (staging not achieved): {name} (pid {pid}) recorded no SO_RCVBUF request \
+        "APPARATUS, CANNOT MEASURE: {name} (pid {pid}) recorded no SO_RCVBUF request \
          clamped to {CAP} bytes, so the interposer did not stage its short grant"
     );
 }
 
 #[cfg(not(target_os = "macos"))]
 fn staged_for(_log: &std::path::Path, _pid: u32, _name: &str) {
-    unreachable!("the staged arm runs only on a Mac");
+    unreachable!("APPARATUS: the staged arm runs only on a Mac");
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
     if cfg!(target_os = "macos") {
         assert!(
             !short,
-            "CANNOT MEASURE: this Mac granted {granted} bytes of the 4 MiB asked for \
+            "APPARATUS, CANNOT MEASURE: this Mac granted {granted} bytes of the 4 MiB asked for \
              (kern.ipc.maxsockbuf below 8 MiB?); the macOS arms of this proof start from a full \
              grant"
         );
@@ -264,7 +264,7 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
     if cfg!(target_os = "linux") {
         assert!(
             short,
-            "CANNOT MEASURE: this Linux host granted the full {granted} bytes read back \
+            "APPARATUS, CANNOT MEASURE: this Linux host granted the full {granted} bytes read back \
              (net.core.rmem_max at least 4 MiB?); the Linux arm of this proof is the short grant, \
              and a full one here would pass without ever measuring the 1452 notice"
         );
@@ -284,7 +284,7 @@ fn a_process_reports_the_1452_ceiling_exactly_when_its_buffer_is_short() {
         let clamped = granted_receive_buffer(CAP);
         assert!(
             clamped < FULL_READ_BACK,
-            "CANNOT MEASURE: asking for {CAP} bytes read back {clamped}, not short of \
+            "APPARATUS, CANNOT MEASURE: asking for {CAP} bytes read back {clamped}, not short of \
              {FULL_READ_BACK}"
         );
         let dir = tempfile::tempdir().expect("APPARATUS: no temp dir for the interposer log");

@@ -102,12 +102,12 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     let (ok, took, out, err) = w.join_guest();
     assert!(
         ok,
-        "CANNOT PROVE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
+        "PRODUCT: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
 
     let guest_fp = {
         let (ok, out, err) = world::vox_once(&w.guest_dir, &world::args(&["id"]));
-        assert!(ok, "vox id (guest): {err}");
+        assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
         out.trim().chars().take(26).collect::<String>()
     };
     // Only what the anchor says from the first forward on counts for the restart claims.
@@ -123,19 +123,26 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         let back =
             round_trip(at, payload.as_bytes(), Duration::from_secs(120)).unwrap_or_else(|e| {
                 panic!(
-                    "CANNOT PROVE (sample {n}): no echo through the forward ({e}).\n{}",
-                    w.fwd.as_mut().unwrap().transcript()
+                    "PRODUCT (sample {n}): no echo through the forward ({e}).\n{}",
+                    w.fwd
+                        .as_mut()
+                        .map(world::VoxProc::transcript)
+                        .unwrap_or_default()
                 )
             });
         assert_eq!(
             back,
             payload.as_bytes(),
-            "sample {n}: the echo came back changed"
+            "PRODUCT: sample {n}: the echo came back changed"
         );
         w.expect_still_relayed();
-        let said = w.fwd.as_mut().unwrap().transcript();
+        let said = w
+            .fwd
+            .as_mut()
+            .map(world::VoxProc::transcript)
+            .unwrap_or_default();
         let sample = reached(&said).unwrap_or_else(|| {
-            panic!("sample {n}: the forward never said how long reaching the host took:\n{said}")
+            panic!("PRODUCT: sample {n}: the forward never said how long reaching the host took:\n{said}")
         });
         before_its_anchor.push(
             said.lines()
@@ -169,7 +176,7 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     for (m, line) in &samples {
         assert!(
             Duration::from_millis(*m) < R42,
-            "a first relayed connection took {m} ms, over PRD-001 R42's {R42:?}: {line}"
+            "PRODUCT: a first relayed connection took {m} ms, over PRD-001 R42's {R42:?}: {line}"
         );
     }
     // ---- a restart is as quick as a first start, and the anchor supersedes, never weighs ----

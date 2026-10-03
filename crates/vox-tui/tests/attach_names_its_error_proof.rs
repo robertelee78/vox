@@ -50,7 +50,7 @@ fn room_list(dir: &Path) -> (bool, String) {
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ANCHORS")
         .output()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -59,17 +59,17 @@ fn room_list(dir: &Path) -> (bool, String) {
 
 /// A fresh profile directory and where its control socket goes.
 fn profile() -> (tempfile::TempDir, std::path::PathBuf) {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let sock_dir = tmp.path().join("d").join("default");
-    std::fs::create_dir_all(&sock_dir).unwrap();
-    std::fs::create_dir_all(tmp.path().join("c")).unwrap();
+    std::fs::create_dir_all(&sock_dir).expect("APPARATUS: create a staging directory");
+    std::fs::create_dir_all(tmp.path().join("c")).expect("APPARATUS: create a staging directory");
     let sock = sock_dir.join("node.sock");
     (tmp, sock)
 }
 
 /// Serve one connection on `sock` with `answer`, on a thread.
 fn serve_once(sock: &Path, answer: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static) {
-    let l = UnixListener::bind(sock).unwrap();
+    let l = UnixListener::bind(sock).expect("APPARATUS: bind a socket");
     std::thread::spawn(move || {
         if let Ok((s, _)) = l.accept() {
             answer(s);
@@ -81,7 +81,7 @@ fn serve_once(sock: &Path, answer: impl FnOnce(std::os::unix::net::UnixStream) +
 fn check(case: &str, dir: &Path, said: &[&str], unsaid: &[&str]) -> (usize, usize) {
     let (ok, err) = room_list(dir);
     eprintln!("[receipt] {case}: exit ok={ok}\n  stderr: {}", err.trim());
-    assert!(!ok, "{case}: `vox room list` must fail: {err}");
+    assert!(!ok, "PRODUCT: {case}: `vox room list` must fail: {err}");
     let hit = said.iter().filter(|w| err.contains(*w)).count();
     let avoided = unsaid.iter().filter(|w| !err.contains(*w)).count();
     eprintln!(
@@ -90,12 +90,15 @@ fn check(case: &str, dir: &Path, said: &[&str], unsaid: &[&str]) -> (usize, usiz
         unsaid.len()
     );
     for w in said {
-        assert!(err.contains(w), "{case}: the message must say {w:?}: {err}");
+        assert!(
+            err.contains(w),
+            "PRODUCT: {case}: the message must say {w:?}: {err}"
+        );
     }
     for w in unsaid {
         assert!(
             !err.contains(w),
-            "{case}: the message must not say {w:?}: {err}"
+            "PRODUCT: {case}: the message must not say {w:?}: {err}"
         );
     }
     (hit, avoided)
@@ -108,7 +111,7 @@ fn a_failed_attach_says_why_in_a_persons_words() {
 
     // (1) A stale socket: the file is there, nobody listens.
     let (stale, sock) = profile();
-    drop(UnixListener::bind(&sock).unwrap());
+    drop(UnixListener::bind(&sock).expect("APPARATUS: bind a socket"));
     check(
         "stale socket",
         stale.path(),
@@ -138,7 +141,9 @@ fn a_failed_attach_says_why_in_a_persons_words() {
             me: None,
         }
         .to_bytes();
-        let len = u32::try_from(body.len()).unwrap().to_be_bytes();
+        let len = u32::try_from(body.len())
+            .expect("APPARATUS: a request the proof built fits in u32")
+            .to_be_bytes();
         let _ = s.write_all(&len);
         let _ = s.write_all(&body);
         std::thread::sleep(std::time::Duration::from_secs(2));

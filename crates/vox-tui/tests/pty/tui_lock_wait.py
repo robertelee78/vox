@@ -23,8 +23,9 @@ Prints, each on its own line:
 - `<tag> AFTER: <status line>` — the status line once the TUI answered, after SIGCONT;
 - `<tag> SCREEN:` and the screen while waiting, when anything above is not clean.
 
-Exit 0 = it ran to the end (the caller judges the lines); 2 = apparatus (pyte missing, no
-prompt, no answer after SIGCONT); 1 = the driver hung (`HUNG at <stage>`, `vox_pty.py`). The TUI
+Exit 0 = it ran to the end (the caller judges the lines); 1 = the TUI failed (`<tag> RED:
+PRODUCT: <what>`, with its screen: no prompt, no answer to the unlock or after SIGCONT) or the driver hung (`HUNG
+at <stage>`, `vox_pty.py`); 2 = apparatus, the driver's own machinery only (pyte missing). The TUI
 is killed by its PID, with bounded waits.
 """
 import os, signal, sys, time
@@ -99,8 +100,8 @@ try:
         stage("resume the holder")
         resume()
         if not tui.until(lambda: "unlock" in tui.text().lower(), 120):
-            print(f"{TAG} APPARATUS: the TUI never showed its unlock prompt:\n{tui.text()}")
-            sys.exit(2)
+            print(f"{TAG} RED: PRODUCT: the TUI never showed its unlock prompt:\n{tui.text()}")
+            sys.exit(1)
         tui.pump(1)
         check_screen()
         stage("unlock")
@@ -110,12 +111,13 @@ try:
             code = 0
             print(f"{TAG} AFTER: {status()}")
         else:
-            print(f"{TAG} APPARATUS: no answer to the unlock; the screen:\n{tui.text()}")
+            code = 1
+            print(f"{TAG} RED: PRODUCT: no answer to the unlock; the screen:\n{tui.text()}")
     else:
         stage("prompt")
         if not tui.until(lambda: "create identity" in tui.text().lower(), 60):
-            print(f"{TAG} APPARATUS: the TUI never showed its create prompt:\n{tui.text()}")
-            sys.exit(2)
+            print(f"{TAG} RED: PRODUCT: the TUI never showed its create prompt:\n{tui.text()}")
+            sys.exit(1)
         tui.pump(1)
         stage("give the passphrase, and wait on the lock")
         tui.key(IDPASS + "\r", 0.5)
@@ -134,7 +136,8 @@ try:
             code = 0
             print(f"{TAG} AFTER: {status()}")
         else:
-            print(f"{TAG} APPARATUS: no answer after SIGCONT; the screen:\n{tui.text()}")
+            code = 1
+            print(f"{TAG} RED: PRODUCT: no answer after SIGCONT; the screen:\n{tui.text()}")
     tui.key(":q\r", 1)
 except Hung as h:
     print(f"{TAG} HUNG at {h}")

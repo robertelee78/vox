@@ -61,7 +61,11 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
 
 ### A published release (needs the network and `gh`)
 
-**Planned, not yet built here (#301):** `update_proof`'s `journey.*` and `verify.*` claims, which run an already-published `vox update` through GitHub, are to be optional. Group D's change to `update_proof.rs` (branch `fix/v210-106-groupD`) moves them into their own test, `an_older_release_updates_itself_and_refuses_a_bad_download`, behind the opt-in `VOX_PROOF_UPDATE_JOURNEY=1`, which says `NOT RUN` without it. Once that lands, the test is to move behind `optional-proofs` with a stand-in like every other proof here, and a row for it is to be added here.
+| Proof | Helps troubleshoot | Run | Needs | Time |
+|---|---|---|---|---|
+| `update_proof::an_older_release_updates_itself_and_refuses_a_bad_download` | A person on the previous release runs `vox update` and is not moved to the newest, or a download whose digest does not match its record is installed anyway (claims `journey.update_replaces_an_older_install` and `verify.digest_mismatch_is_refused`). It runs a binary GitHub already serves, so it measures that artifact as much as this tree. | `cargo test --release -p vox-tui --features optional-proofs --test update_proof -- --ignored --exact an_older_release_updates_itself_and_refuses_a_bad_download` | the network, `curl` and `gh` (it lists the releases); it accepts no gap, so an unreachable GitHub or no earlier release reads `CANNOT MEASURE` | not timed here |
+
+`update_proof`'s other test, `vox_update_replaces_an_install_it_owns_and_refuses_the_rest`, measures this build's refusals, record lookup, `--check` and `--rollback`, and is not optional.
 
 ### Timing a person feels (needs a real machine; a CI VM's stalls make these unreliable)
 

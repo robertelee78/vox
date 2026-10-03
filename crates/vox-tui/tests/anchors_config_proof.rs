@@ -410,7 +410,7 @@ fn an_anchor_named_by_hostname_carries_a_join() {
     }
     assert!(
         replaced,
-        "CANNOT MEASURE: staging not achieved: the invite names no address of the host itself to \
+        "PRODUCT (staging): the invite names no address of the host itself to \
          make unreachable: {address}"
     );
     let behind_nat = format!("{base}?{}", kept.join("&"));

@@ -53,7 +53,7 @@ fn aad(version: u64) -> &'static [u8] {
     match version {
         1 => b"vox/identity-vault-aead/v1",
         2 => b"vox/identity-vault-aead/v2",
-        v => panic!("CANNOT MEASURE: a vault of unknown version {v}"),
+        v => panic!("PRODUCT (staging): `vox id` wrote a vault of unknown version {v}"),
     }
 }
 
@@ -72,7 +72,7 @@ fn cbor_head(buf: &[u8], at: &mut usize, major: u8) -> u64 {
     assert_eq!(
         b >> 5,
         major,
-        "CANNOT MEASURE: vault CBOR major type at byte {at}"
+        "PRODUCT (staging): the vault `vox id` wrote has the wrong CBOR major type at byte {at}"
     );
     *at += 1;
     let info = b & 0x1f;
@@ -82,7 +82,7 @@ fn cbor_head(buf: &[u8], at: &mut usize, major: u8) -> u64 {
         25 => 2,
         26 => 4,
         27 => 8,
-        _ => panic!("CANNOT MEASURE: indefinite CBOR in the vault"),
+        _ => panic!("PRODUCT (staging): the vault `vox id` wrote holds indefinite CBOR"),
     };
     let mut v = 0u64;
     for _ in 0..n {
@@ -93,7 +93,8 @@ fn cbor_head(buf: &[u8], at: &mut usize, major: u8) -> u64 {
 }
 
 fn cbor_bytes(buf: &[u8], at: &mut usize) -> Vec<u8> {
-    let len = usize::try_from(cbor_head(buf, at, 2)).unwrap();
+    let len = usize::try_from(cbor_head(buf, at, 2))
+        .expect("PRODUCT: the vault holds a length that does not fit in memory");
     let out = buf[*at..*at + len].to_vec();
     *at += len;
     out
@@ -101,13 +102,21 @@ fn cbor_bytes(buf: &[u8], at: &mut usize) -> Vec<u8> {
 
 fn parse_vault(buf: &[u8]) -> Vault {
     let mut at = 0;
-    assert_eq!(cbor_head(buf, &mut at, 4), 5, "CANNOT MEASURE: vault arity");
+    assert_eq!(
+        cbor_head(buf, &mut at, 4),
+        5,
+        "PRODUCT (staging): the vault `vox id` wrote has the wrong arity"
+    );
     let version = cbor_head(buf, &mut at, 0);
     let profile_id = cbor_head(buf, &mut at, 0);
     let salt = cbor_bytes(buf, &mut at);
     let nonce = cbor_bytes(buf, &mut at);
     let ciphertext = cbor_bytes(buf, &mut at);
-    assert_eq!(at, buf.len(), "CANNOT MEASURE: trailing bytes in the vault");
+    assert_eq!(
+        at,
+        buf.len(),
+        "PRODUCT (staging): the vault `vox id` wrote has trailing bytes"
+    );
     Vault {
         version,
         profile_id,
@@ -119,18 +128,19 @@ fn parse_vault(buf: &[u8]) -> Vault {
 
 /// Whether the vault opens under a key derived with these Argon2id parameters.
 fn opens_with(v: &Vault, m_cost_kib: u32, t_cost: u32) -> bool {
-    let params = argon2::Params::new(m_cost_kib, t_cost, P_COST, Some(32)).unwrap();
+    let params = argon2::Params::new(m_cost_kib, t_cost, P_COST, Some(32))
+        .expect("APPARATUS: Argon2id parameters the proof chose");
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut factor = [0u8; 32];
     argon
         .hash_password_into(IDENTITY.as_bytes(), &v.salt, &mut factor)
-        .unwrap();
+        .expect("PRODUCT: the vault's salt cannot key Argon2id");
     let mut key = [0u8; 32];
     hkdf::Hkdf::<sha2::Sha256>::new(None, &factor)
         .expand(HKDF_INFO, &mut key)
-        .unwrap();
+        .expect("APPARATUS: HKDF of a 32-byte key");
     Aes256Gcm::new_from_slice(&key)
-        .unwrap()
+        .expect("APPARATUS: a 32-byte AES key")
         .decrypt(
             Nonce::from_slice(&v.nonce),
             Payload {
@@ -142,7 +152,10 @@ fn opens_with(v: &Vault, m_cost_kib: u32, t_cost: u32) -> bool {
 }
 
 fn find(dir: &Path, name: &str, found: &mut Vec<PathBuf>) {
-    for e in std::fs::read_dir(dir).unwrap().flatten() {
+    for e in std::fs::read_dir(dir)
+        .expect("APPARATUS: list a directory")
+        .flatten()
+    {
         let p = e.path();
         if p.is_dir() {
             find(&p, name, found);
@@ -156,12 +169,12 @@ fn find(dir: &Path, name: &str, found: &mut Vec<PathBuf>) {
 #[ignore = "production Argon2id, three derivations in the test; run in release"]
 fn the_vault_the_binary_writes_opens_only_under_the_adr_floor() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let data = tmp.path().join("person");
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create a staging directory");
 
     let (ok, fp, err) = vox_once(&data, &args(&["id"]));
-    assert!(ok, "CANNOT MEASURE: `vox id` failed: {err}");
+    assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
     println!("[proof] `vox id` created identity {}", fp.trim());
 
     let mut vaults = Vec::new();
@@ -169,9 +182,9 @@ fn the_vault_the_binary_writes_opens_only_under_the_adr_floor() {
     assert_eq!(
         vaults.len(),
         1,
-        "CANNOT MEASURE: expected one vault file under the profile, found {vaults:?}"
+        "PRODUCT (staging): `vox id` should leave one vault file under the profile, found {vaults:?}"
     );
-    let bytes = std::fs::read(&vaults[0]).unwrap();
+    let bytes = std::fs::read(&vaults[0]).expect("APPARATUS: read a staging file");
     let v = parse_vault(&bytes);
     println!(
         "[proof] vault {}: {} bytes, version {}, profile id {}, salt {} B, nonce {} B, \
@@ -187,7 +200,7 @@ fn the_vault_the_binary_writes_opens_only_under_the_adr_floor() {
     assert_eq!(
         (v.salt.len(), v.nonce.len()),
         (16, 12),
-        "CANNOT MEASURE: the vault's salt and nonce are not the ADR-010 sizes"
+        "PRODUCT (staging): the vault's salt and nonce are not the ADR-010 sizes"
     );
 
     let at_floor = opens_with(&v, FLOOR_M_COST_KIB, FLOOR_T_COST);
@@ -199,7 +212,7 @@ fn the_vault_the_binary_writes_opens_only_under_the_adr_floor() {
     );
     assert!(
         at_floor,
-        "the vault `vox id` wrote does not open under Argon2id at the ADR-010 floor \
+        "PRODUCT: the vault `vox id` wrote does not open under Argon2id at the ADR-010 floor \
          ({FLOOR_M_COST_KIB} KiB, {FLOOR_T_COST} passes, parallelism {P_COST}): the binary \
          derived its identity key with other parameters (opens with half the memory: \
          {half_memory}; with one pass fewer: {one_pass_fewer}). If they were raised deliberately, \
@@ -207,7 +220,7 @@ fn the_vault_the_binary_writes_opens_only_under_the_adr_floor() {
     );
     assert!(
         !half_memory && !one_pass_fewer,
-        "CANNOT MEASURE: the vault opened under parameters other than the floor's, so opening \
+        "APPARATUS: this proof's own Argon2id check is broken: the vault opened under parameters other than the floor's, so opening \
          proves nothing about which were used"
     );
 }

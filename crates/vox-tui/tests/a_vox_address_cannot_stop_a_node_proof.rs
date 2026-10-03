@@ -25,7 +25,7 @@
 //! 1. Step 3 is **accepted** by the victim. This is the load-bearing assertion: if it were
 //!    refused the stranger would stay `Unknown`, its `Join` streams would be refused at the
 //!    stream-kind gate, and everything after would measure a refusal against a node that could
-//!    still be wide open. A refusal is `CANNOT MEASURE`, never a pass.
+//!    still be wide open. A refusal is `PRODUCT (staging)`, never a pass.
 //! 2. While the stranger holds silent `Join` streams open (a new one every 2 s, none carrying a
 //!    byte after its kind), **five `vox room post` on the victim, 2 s apart, each return in
 //!    under 5 s**, and the victim's `vox room read` shows all five.
@@ -33,13 +33,15 @@
 //!    silent streams were opened, and the first is still open at the victim's end — accepted
 //!    and waited on, not refused.
 //!
-//! **Which side a slow post is on.** The apparatus clock is only the apparatus: a `vox --version`
-//! on the same timeline, the cost of starting `vox` at all. Before the attack, one quiet `vox room
+//! **Which side a slow post is on.** The apparatus clock is only the apparatus: `/usr/bin/true`
+//! on the same timeline, the cost of starting a process that is not vox (a vox slow even only to
+//! start reads as the product's). Before the attack, one quiet `vox room
 //! post` is timed as the product's baseline, never as part of that clock. It must answer within
 //! [`PATIENCE`]: a quiet post that fails, or misses the bound while the clock is within
 //! [`APPARATUS_BUDGET`], is `PRODUCT (staging):` (the node is slow with no attack at all). A post
-//! during the attack that misses the bound is followed at once by the clock. If that apparatus
-//! took more than [`APPARATUS_BUDGET`], the red is `CANNOT MEASURE: apparatus took X`; otherwise
+//! during the attack that vox refuses is `PRODUCT:` whatever the clock. One that misses the bound,
+//! or that the proof's own cap stopped, is followed at once by the clock. If that apparatus
+//! took more than [`APPARATUS_BUDGET`], the red is `APPARATUS (runner stalled): apparatus took X`; otherwise
 //! it is `PRODUCT: took X (apparatus Y, quiet Z)`. Fixture failures are `APPARATUS:`.
 //!
 //! **Mutation that must turn it red.** Put the join-request read back on the actor: in
@@ -80,7 +82,7 @@ const SILENT_EVERY: Duration = Duration::from_secs(2);
 /// are open by the last one.
 const GAP: Duration = Duration::from_secs(2);
 const SETUP: Duration = Duration::from_secs(120);
-/// The most starting `vox --version` may take before a slow post is the runner's, not the node's.
+/// The most starting `/usr/bin/true` may take before a slow post is the runner's, not the node's.
 const APPARATUS_BUDGET: Duration = Duration::from_millis(2500);
 const ROOM_PASS: &str = "room passphrase";
 
@@ -228,6 +230,25 @@ fn fingerprint(data: &Path) -> [u8; 32] {
     })
 }
 
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
+    let t = Instant::now();
+    let ok = std::process::Command::new("/usr/bin/true")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
+    assert!(
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
+    );
+    t.elapsed()
+}
+
 #[test]
 #[ignore = "real vox processes and production Argon2id; run in release"]
 fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
@@ -317,7 +338,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
                 t,
             )
             .await
-            .expect("CANNOT MEASURE: step 1 — a valid identity must be admitted");
+            .expect("PRODUCT (staging): step 1 — a valid identity must be admitted");
 
         // ---- step 3, the assertion this proof stands on ---------------------------------
         let ring = PrekeyRing::generate(&stranger, &[0x3B; 32], t)
@@ -329,17 +350,17 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             &stranger,
             &cid,
             bundle,
-            EndpointList::new(Vec::new()).unwrap(),
+            EndpointList::new(Vec::new()).expect("APPARATUS: build the stand-in peer's records"),
             1,
             t,
         )
         .expect("APPARATUS: the stranger's pre-join record");
         let mut rendezvous = RendezvousClient::open(&conn)
             .await
-            .expect("CANNOT MEASURE: step 2 — `Unknown` may open a Rendezvous stream");
+            .expect("PRODUCT (staging): step 2 — `Unknown` may open a Rendezvous stream");
         if let Err(why) = rendezvous.put(&prejoin.to_wire()).await {
             panic!(
-                "CANNOT MEASURE: step 3 — the victim refused the stranger's pre-join ({why:?}), \
+                "PRODUCT (staging): step 3 — the victim refused the stranger's pre-join ({why:?}), \
                  so the stranger never became a PendingJoiner and its Join streams would be \
                  refused at the stream-kind gate: this would measure a refusal, not a wedge"
             );
@@ -359,10 +380,10 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     );
     println!("[proof] quiet post: ok={ok} in {quiet:?}");
     if !(ok && quiet < PATIENCE) {
-        let (_, apparatus, _) = vox_timed(&victim_dir, &["--version"], PATIENCE * 8);
+        let apparatus = apparatus_spawn();
         assert!(
-            ok || apparatus <= APPARATUS_BUDGET,
-            "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+            !ok || apparatus <= APPARATUS_BUDGET,
+            "APPARATUS (runner stalled): apparatus took {apparatus:?} (`/usr/bin/true`, budget \
              {APPARATUS_BUDGET:?}) right after the quiet post took {quiet:?}, so the runner, not \
              the node, may be slow. The post said: {said}"
         );
@@ -398,7 +419,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     while opened.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         assert!(
             t0.elapsed() < Duration::from_secs(10),
-            "CANNOT MEASURE: no silent Join stream could be opened"
+            "PRODUCT (staging): no silent Join stream could be opened"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -416,11 +437,18 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             opened.load(std::sync::atomic::Ordering::SeqCst)
         );
         took.push(t);
+        // A post vox refused, before the proof's own cap stopped it, is the product's whatever
+        // the clock; only a slow post (or one the cap cut) can be the runner's.
+        assert!(
+            ok || t >= PATIENCE * 8,
+            "PRODUCT: post {i} of {POSTS} on the victim failed in {t:?} while a stranger holding \
+             only the room's .vox name held silent Join streams open. It said: {said}"
+        );
         if !(ok && t < PATIENCE) {
-            let (_, apparatus, _) = vox_timed(&victim_dir, &["--version"], PATIENCE * 8);
+            let apparatus = apparatus_spawn();
             assert!(
                 apparatus <= APPARATUS_BUDGET,
-                "CANNOT MEASURE: apparatus took {apparatus:?} (`vox --version`, budget \
+                "APPARATUS (runner stalled): apparatus took {apparatus:?} (`/usr/bin/true`, budget \
                  {APPARATUS_BUDGET:?}) right after post {i} took {t:?}, so the runner, not the \
                  node, may be slow. The post said: {said}"
             );
@@ -458,7 +486,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     let first_still_held = rt.block_on(async {
         let (_send, recv) = held
             .first_mut()
-            .expect("CANNOT MEASURE: no silent stream was held");
+            .expect("PRODUCT (staging): no silent stream was held");
         let mut buf = [0u8; 16];
         tokio::time::timeout(Duration::from_millis(300), recv.read(&mut buf))
             .await
@@ -466,17 +494,17 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     });
     assert!(
         first_still_held,
-        "CANNOT MEASURE: the victim had already closed or refused the first silent Join stream, \
+        "PRODUCT (staging): the victim had already closed or refused the first silent Join stream, \
          so the attack was not holding"
     );
     assert!(
         conn.quinn().close_reason().is_none(),
-        "CANNOT MEASURE: the stranger's connection closed during the attack: {:?}",
+        "PRODUCT (staging): the stranger's connection closed during the attack: {:?}",
         conn.quinn().close_reason()
     );
     assert!(
         streams >= 4,
-        "CANNOT MEASURE: only {streams} silent stream(s) were opened"
+        "PRODUCT (staging): only {streams} silent stream(s) were opened"
     );
     println!(
         "[proof] {POSTS} posts, slowest {:?}, while {streams} silent Join streams were held",

@@ -361,7 +361,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: the pair never read each other\nalice:\n{}\nbob:\n{}",
+            "PRODUCT (staging): the pair never read each other\nalice:\n{}\nbob:\n{}",
             alice_d.transcript(),
             bob_d.transcript()
         );
@@ -377,7 +377,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     ];
     assert!(
         control.iter().all(|m| m.is_some_and(|m| m <= BOUND)),
-        "CANNOT MEASURE: with no tunnel at all, a post was not read within {BOUND:?}"
+        "PRODUCT (staging): with no tunnel at all, a post was not read within {BOUND:?}"
     );
 
     // Alice offers a file far larger than a tunnel's window.
@@ -405,7 +405,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     while !rb.texts(cb).iter().any(|t| t.contains("big.bin")) {
         assert!(
             offered.elapsed() < Duration::from_secs(60),
-            "CANNOT MEASURE: Bob never read Alice's offer\nsend: {}\n{}",
+            "PRODUCT (staging): Bob never read Alice's offer\nsend: {}\n{}",
             std::fs::read_to_string(&send_out).unwrap_or_default(),
             std::fs::read_to_string(send_out.with_extension("err")).unwrap_or_default()
         );
@@ -436,7 +436,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         while collected(&dir) == 0 {
             assert!(
                 t0.elapsed() < Duration::from_secs(60),
-                "CANNOT MEASURE: collector {g} received nothing\n{}\n{}",
+                "PRODUCT (staging): collector {g} received nothing\n{}\n{}",
                 std::fs::read_to_string(&out).unwrap_or_default(),
                 std::fs::read_to_string(out.with_extension("err")).unwrap_or_default()
             );
@@ -450,8 +450,14 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     let held: Vec<u64> = gets.iter().map(|(_, d)| collected(d)).collect();
     eprintln!("[proof] frozen collectors hold {held:?} of {FILE_BYTES} bytes each");
     assert!(
-        held.iter().all(|&b| b > 0 && b < FILE_BYTES as u64),
-        "CANNOT MEASURE: a collector was not mid-transfer when frozen: {held:?}"
+        held.iter().all(|&b| b > 0),
+        "PRODUCT (staging): a `vox room get` had collected nothing of big.bin when frozen: \
+         {held:?}"
+    );
+    assert!(
+        held.iter().all(|&b| b < FILE_BYTES as u64),
+        "APPARATUS, CANNOT MEASURE: the proof's file was too small; a collector had all of it \
+         when frozen: {held:?}"
     );
     let send_pid = send.0.id();
     let offsets = stalled(|| read_offsets(send_pid, "big.bin"));
@@ -463,7 +469,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     );
     assert!(
         offsets.as_ref().is_some_and(|o| o.len() == 2) && unread >= TAKEN,
-        "CANNOT MEASURE: the download tunnels did not take the window: the sender's reads \
+        "APPARATUS, CANNOT MEASURE: the download tunnels did not take the window: the sender's reads \
          {offsets:?}, {unread} bytes unread of the {TAKEN} needed"
     );
 
@@ -501,7 +507,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         taken
             .as_ref()
             .is_some_and(|t| t.iter().all(|&b| b > 0) && t.iter().sum::<u64>() >= TAKEN),
-        "CANNOT MEASURE: the upload tunnels did not take the window: written {taken:?} of the \
+        "APPARATUS, CANNOT MEASURE: the upload tunnels did not take the window: written {taken:?} of the \
          {TAKEN} needed"
     );
     let upload = phase(&alice, &bob, &mut ra, &mut rb, ca, cb, &room, "upload");
@@ -566,7 +572,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     );
     assert!(
         at_cap.is_some() && past_cap.is_some(),
-        "CANNOT MEASURE: the cap arm's writes kept advancing past {STALL_WITHIN:?}: the first \
+        "APPARATUS, CANNOT MEASURE: the cap arm's writes kept advancing past {STALL_WITHIN:?}: the first \
          {cap} took {at_cap:?}, the {EXTRA} past the cap {past_cap:?}"
     );
     assert!(

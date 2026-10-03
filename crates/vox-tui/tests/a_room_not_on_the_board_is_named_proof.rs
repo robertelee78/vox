@@ -103,7 +103,7 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
     );
     assert!(
         address.contains(&spec_a[..52]),
-        "CANNOT MEASURE: the address must name anchor A, or B is not the only board the join can \
+        "PRODUCT (staging): the address must name anchor A, or B is not the only board the join can \
          reach: {address}"
     );
 

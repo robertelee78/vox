@@ -96,7 +96,7 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
             .take()
             .expect("APPARATUS: vox's stdin")
             .write_all(s.as_bytes())
-            .unwrap_or_else(|e| panic!("APPARATUS: could not write vox {argv:?}'s stdin: {e}"));
+            .unwrap_or_else(|e| panic!("PRODUCT (staging): vox exited without reading its stdin (could not write vox {argv:?}'s stdin): {e}"));
     }
     let out = child
         .wait_with_output()
@@ -536,7 +536,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     assert_eq!(
         ours.len(),
         3,
-        "CANNOT MEASURE: the reader opens only {ours:?} with the vault's own key"
+        "APPARATUS, CANNOT MEASURE: the reader opens only {ours:?} with the vault's own key"
     );
     assert!(
         theirs.is_empty(),
@@ -575,12 +575,12 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     println!("[proof] v0.2.9 profile: vault v{version_before}; blobs {before:?}; the attacker opens {theirs_before:?}");
     assert_eq!(
         version_before, 1,
-        "CANNOT MEASURE: {PREVIOUS} did not write a version-1 vault"
+        "APPARATUS, CANNOT MEASURE: {PREVIOUS} did not write a version-1 vault"
     );
     for want in ["trust keyring", "prekey ring"] {
         assert!(
             theirs_before.contains(&want),
-            "CANNOT MEASURE: the attacker's keys do not open {PREVIOUS}'s {want}, so they are not \
+            "APPARATUS, CANNOT MEASURE: the attacker's keys do not open {PREVIOUS}'s {want}, so they are not \
              the keys {PREVIOUS} sealed with, and nothing below would mean anything"
         );
     }
@@ -600,7 +600,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     let before_scan = occurrences(&disk, &old_seals);
     assert!(
         before_scan.iter().all(|n| *n >= 1),
-        "CANNOT MEASURE: the raw scan does not find {PREVIOUS}'s seals in its own store: {before_scan:?}"
+        "APPARATUS, CANNOT MEASURE: the raw scan does not find {PREVIOUS}'s seals in its own store: {before_scan:?}"
     );
 
     let listed = ok(&new, &carol, &["trust", "list"], None);
@@ -641,7 +641,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         live_scan.iter().all(|n| *n >= 1),
-        "CANNOT MEASURE: the raw scan does not find the migrated store's own seals: {live_scan:?}"
+        "APPARATUS, CANNOT MEASURE: the raw scan does not find the migrated store's own seals: {live_scan:?}"
     );
     assert!(
         after_scan.iter().all(|n| *n == 0),
@@ -695,7 +695,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     let small_scan_before = occurrences(&small, &small_old);
     assert!(
         small_old.len() == 2 && small_scan_before.iter().all(|n| *n >= 1),
-        "CANNOT MEASURE: {PREVIOUS}'s keyring and ring are not both found in the small profile's \
+        "APPARATUS, CANNOT MEASURE: {PREVIOUS}'s keyring and ring are not both found in the small profile's \
          raw files: {} blob(s), {small_scan_before:?}",
         small_old.len()
     );
@@ -714,7 +714,7 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     );
     assert!(
         small_live.iter().all(|n| *n >= 1),
-        "CANNOT MEASURE: the raw scan does not find the small profile's new seals: {small_live:?}"
+        "APPARATUS, CANNOT MEASURE: the raw scan does not find the small profile's new seals: {small_live:?}"
     );
     assert!(
         small_scan_after.iter().all(|n| *n == 0),
@@ -850,12 +850,14 @@ fn plant_mallory(disk: &Disk) {
         )
         .unwrap_or_else(|e| panic!("APPARATUS: sealing the attacker's keyring: {e}"));
         let store = Store::open(&disk.store_file).unwrap_or_else(|e| {
-            panic!("CANNOT MEASURE: the attacker could not open the stopped store to plant: {e}")
+            panic!("APPARATUS, CANNOT MEASURE: the attacker could not open the stopped store to plant: {e}")
         });
         let mut blob = sealed.nonce.to_vec();
         blob.extend_from_slice(&sealed.ciphertext);
         store
             .put_meta(trust::TRUST_META_KEY, &blob)
-            .unwrap_or_else(|e| panic!("CANNOT MEASURE: planting the attacker's keyring: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("APPARATUS, CANNOT MEASURE: planting the attacker's keyring: {e}")
+            });
     }
 }

@@ -84,12 +84,13 @@ fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, Stri
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn vox");
+        .expect("APPARATUS: spawn vox");
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).expect("write");
+        let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+        pipe.write_all(text.as_bytes())
+            .expect("PRODUCT (staging): vox exited without reading its stdin");
     }
-    let out = child.wait_with_output().expect("wait");
+    let out = child.wait_with_output().expect("APPARATUS: wait");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -138,9 +139,10 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str, lose_hellos: bool) 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn a daemon");
-    let mut pipe = child.stdin.take().expect("stdin");
-    pipe.write_all(format!("{IDPASS}\n").as_bytes()).unwrap();
+        .expect("APPARATUS: spawn a daemon");
+    let mut pipe = child.stdin.take().expect("APPARATUS: stdin");
+    pipe.write_all(format!("{IDPASS}\n").as_bytes())
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
     drop(pipe);
     let said = Arc::new(Mutex::new(String::new()));
     for stream in [
@@ -165,7 +167,7 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str, lose_hellos: bool) 
                     Ok(0) | Err(_) => return,
                     Ok(n) => sink
                         .lock()
-                        .unwrap()
+                        .expect("APPARATUS: a lock the proof holds was poisoned")
                         .push_str(&String::from_utf8_lossy(&buf[..n])),
                 }
             }
@@ -173,11 +175,17 @@ fn daemon(dir: &std::path::Path, listen: &str, anchor: &str, lose_hellos: bool) 
     }
     let d = Daemon(child, said);
     let deadline = Instant::now() + Duration::from_secs(90);
-    while !d.1.lock().unwrap().contains("control socket") {
+    while !d
+        .1
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned")
+        .contains("control socket")
+    {
         assert!(
             Instant::now() < deadline,
-            "a daemon never served its socket:\n{}",
-            d.1.lock().unwrap()
+            "PRODUCT: a daemon never served its socket:\n{}",
+            d.1.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -189,7 +197,7 @@ fn signal(pid: u32, sig: &str) {
         .args([sig, &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success());
-    assert!(ok, "kill {sig} {pid}");
+    assert!(ok, "APPARATUS: kill {sig} {pid}");
 }
 
 #[test]
@@ -210,20 +218,20 @@ fn race(lose_hellos: bool) {
         test_knobs::require(&[LOSE_HELLOS]);
     }
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dirs: Vec<std::path::PathBuf> = ["alice", "bob", "carol"]
         .iter()
         .map(|n| tmp.path().join(n))
         .collect();
     for d in &dirs {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let (alice_dir, bob_dir, carol_dir) = (&dirs[0], &dirs[1], &dirs[2]);
     let anchor = Anchor::start(&tmp.path().join("anchor"));
     let mut fps = Vec::new();
     for d in &dirs {
         let (ok, out, err) = vox(d, &["id"], None);
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         fps.push(out.trim().to_owned());
     }
     // alice and bob on IPv4, carol on IPv6: bob and carol reach each other only through
@@ -241,28 +249,28 @@ fn race(lose_hellos: bool) {
     // alice's room; alice and each joiner trust each other. bob and carol do NOT, yet.
     for (i, name) in [(1usize, "bob"), (2, "carol")] {
         let (ok, _, err) = vox(alice_dir, &["trust", "add", &fps[i], "--name", name], None);
-        assert!(ok, "alice trusts {name}: {err}");
+        assert!(ok, "PRODUCT (staging): alice trusts {name}: {err}");
         let (ok, _, err) = vox(
             &dirs[i],
             &["trust", "add", &fps[0], "--name", "alice"],
             None,
         );
-        assert!(ok, "{name} trusts alice: {err}");
+        assert!(ok, "PRODUCT (staging): {name} trusts alice: {err}");
     }
     let (ok, _, err) = vox(
         alice_dir,
         &["room", "create", "--passphrase-file", "-", "--name", "race"],
         Some(&format!("{ROOMPASS}\n")),
     );
-    assert!(ok, "room create: {err}");
+    assert!(ok, "PRODUCT (staging): room create: {err}");
     let listed = vox(alice_dir, &["room", "list"], None).1;
     let room = listed
         .split_whitespace()
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
-        .expect("a room id in `room list`")
+        .expect("PRODUCT: a room id in `room list`")
         .to_owned();
     let (ok, link, err) = vox(alice_dir, &["room", "invite", &room], None);
-    assert!(ok, "invite: {err}");
+    assert!(ok, "PRODUCT (staging): invite: {err}");
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
@@ -277,25 +285,25 @@ fn race(lose_hellos: bool) {
             ],
             Some(&format!("{ROOMPASS}\n")),
         );
-        assert!(ok, "CANNOT MEASURE: a join failed: {err}");
+        assert!(ok, "PRODUCT (staging): a join failed: {err}");
     }
 
     // ---- precondition: bob and carol cannot read each other yet ----
-    let (ok, _, _) = vox(carol_dir, &["room", "post", &room, "CAROL-BEFORE"], None);
-    assert!(ok);
+    let (ok, _, err) = vox(carol_dir, &["room", "post", &room, "CAROL-BEFORE"], None);
+    assert!(ok, "PRODUCT (staging): carol's post failed: {err}");
     assert!(
         until("alice reads carol", 60, || reads(
             alice_dir,
             &room,
             "CAROL-BEFORE"
         )),
-        "CANNOT MEASURE: carol's post never reached alice"
+        "PRODUCT (staging): carol's post never reached alice"
     );
     std::thread::sleep(Duration::from_secs(3));
     assert!(
         !reads(bob_dir, &room, "CAROL-BEFORE"),
-        "CANNOT MEASURE: bob already reads carol before either trusts the other, so this \
-         run's keys did not come from the exchange it means to race"
+        "PRODUCT: bob reads carol's post before either trusts the other; a node must read only \
+         members its owner trusted"
     );
 
     // ---- the race: both open their sessions while the relay between them is frozen ----
@@ -305,10 +313,13 @@ fn race(lose_hellos: bool) {
     let (b, c) = std::thread::scope(|s| {
         let b = s.spawn(|| vox(bob_dir, &["trust", "add", &fps[2], "--name", "carol"], None));
         let c = s.spawn(|| vox(carol_dir, &["trust", "add", &fps[1], "--name", "bob"], None));
-        (b.join().unwrap(), c.join().unwrap())
+        (
+            b.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            c.join().unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        )
     });
-    assert!(b.0, "bob trusts carol: {}", b.2);
-    assert!(c.0, "carol trusts bob: {}", c.2);
+    assert!(b.0, "PRODUCT: bob trusts carol: {}", b.2);
+    assert!(c.0, "PRODUCT: carol trusts bob: {}", c.2);
     std::thread::sleep(FREEZE.saturating_sub(frozen.elapsed()));
     signal(anchor_pid, "-CONT");
     let thawed = Instant::now();
@@ -329,24 +340,29 @@ fn race(lose_hellos: bool) {
     let (mut bob_reads_carol, mut carol_reads_bob) = (false, false);
     let mut n = 0;
     while !(bob_reads_carol && carol_reads_bob) && Instant::now() < deadline {
-        let (ok, _, _) = vox(
+        let (ok, _, err) = vox(
             bob_dir,
             &["room", "post", &room, &format!("BOB-PROBE-{n:02}")],
             None,
         );
-        assert!(ok);
-        let (ok, _, _) = vox(
+        assert!(ok, "PRODUCT: bob's probe post {n} failed: {err}");
+        let (ok, _, err) = vox(
             carol_dir,
             &["room", "post", &room, &format!("CAROL-PROBE-{n:02}")],
             None,
         );
-        assert!(ok);
+        assert!(ok, "PRODUCT: carol's probe post {n} failed: {err}");
         std::thread::sleep(Duration::from_secs(2));
         carol_reads_bob |= reads(carol_dir, &room, "BOB-PROBE-");
         bob_reads_carol |= reads(bob_dir, &room, "CAROL-PROBE-");
         n += 1;
     }
-    let lost = |d: &Daemon| d.1.lock().unwrap().matches(LOST_SAID).count();
+    let lost = |d: &Daemon| {
+        d.1.lock()
+            .expect("APPARATUS: a lock the proof holds was poisoned")
+            .matches(LOST_SAID)
+            .count()
+    };
     let (bob_lost, carol_lost) = (lost(&bob), lost(&carol));
     eprintln!(
         "[proof] release={} lose_hellos={lose_hellos}: after the race ({n} probe rounds, \
@@ -358,20 +374,22 @@ fn race(lose_hellos: bool) {
     if lose_hellos {
         assert!(
             bob_lost == 1 && carol_lost == 1,
-            "CANNOT MEASURE: the knob did not lose one hello at each end (bob {bob_lost}, carol \
+            "APPARATUS, CANNOT MEASURE: the test knob {LOSE_HELLOS} did not lose one hello at each end (bob {bob_lost}, carol \
              {carol_lost}), so this run did not force the split"
         );
     } else {
         assert_eq!(
             (bob_lost, carol_lost),
             (0, 0),
-            "a daemon lost a hello with {LOSE_HELLOS} unset"
+            "PRODUCT: a daemon lost a hello with {LOSE_HELLOS} unset"
         );
     }
     // A red names its mechanism from the daemons' own record: every key the other end did not
     // take, and why.
     let record = |d: &Daemon| {
-        let said = d.1.lock().unwrap();
+        let said =
+            d.1.lock()
+                .expect("APPARATUS: a lock the proof holds was poisoned");
         let lines: Vec<&str> = said
             .lines()
             .filter(|l| l.contains("did not take our key") || l.contains(LOST_SAID))
@@ -380,7 +398,7 @@ fn race(lose_hellos: bool) {
     };
     assert!(
         bob_reads_carol && carol_reads_bob,
-        "two members who opened their sessions at once did not converge: bob reads carol = \
+        "PRODUCT: two members who opened their sessions at once did not converge: bob reads carol = \
          {bob_reads_carol}, carol reads bob = {carol_reads_bob}\n--- bob's daemon:\n{}\n--- \
          carol's daemon:\n{}",
         record(&bob),

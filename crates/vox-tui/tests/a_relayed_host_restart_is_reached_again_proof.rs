@@ -31,8 +31,9 @@
 //!
 //! **The apparatus's own time is measured on the same timeline**, so a slow runner is never read
 //! as a slow product: while it waits, the proof records how far each of its 200 ms sleeps
-//! overshot, and once the echo is back it times a no-op `vox --version`. A trial over the bound
-//! whose apparatus took more than [`APPARATUS_BUDGET`] says `CANNOT MEASURE: apparatus took X`;
+//! overshot, and once the echo is back it times `/usr/bin/true`, a process that is not vox (a vox
+//! slow even only to start reads as the product's). A trial over the bound
+//! whose apparatus took more than [`APPARATUS_BUDGET`] says `APPARATUS (runner stalled): apparatus took X`;
 //! otherwise an over-bound trial is `PRODUCT: took X (apparatus Y)`.
 //!
 //! `#[ignore]`d: production Argon2id and a real PoW per trial. Run it in release.
@@ -51,7 +52,7 @@ mod relay;
 use std::time::{Duration, Instant};
 
 use relay::{RelayWorld, Split};
-use world::{round_trip, VoxProc, VOX};
+use world::{round_trip, VoxProc};
 
 /// Trials; each is a fresh anchor, host and guest.
 const RESTARTS: usize = 5;
@@ -72,22 +73,21 @@ const GIVE_UP: Duration = Duration::from_secs(90);
 /// `vox` — before a trial over the bound is the runner's, not the product's.
 const APPARATUS_BUDGET: Duration = Duration::from_secs(2);
 
-/// How long a no-op `vox --version` takes to run here and now: the runner's own stall, on the
-/// timeline being measured.
-fn noop_vox() -> Duration {
-    let dir = tempfile::tempdir().expect("APPARATUS: no temp dir for the no-op vox");
+/// The apparatus clock: how long this machine takes, now, to start a process that is **not**
+/// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
+/// even only to start, does not, so it reads as the product's (the #332 trap).
+fn apparatus_spawn() -> Duration {
     let t = Instant::now();
-    let out = std::process::Command::new(VOX)
-        .arg("--version")
-        .env("VOX_DATA_DIR", dir.path())
-        .env("VOX_CONFIG_DIR", dir.path().join("cfg"))
+    let ok = std::process::Command::new("/usr/bin/true")
         .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run a no-op vox: {e}"));
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn /usr/bin/true for the apparatus clock: {e}"))
+        .success();
     assert!(
-        out.status.success(),
-        "APPARATUS: the no-op `vox --version` failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        ok,
+        "APPARATUS: /usr/bin/true failed, so the apparatus clock cannot be read"
     );
     t.elapsed()
 }
@@ -113,7 +113,10 @@ fn trial(n: usize) -> (Duration, Duration) {
         round_trip(at, b"before the crash", Duration::from_secs(120)).unwrap_or_else(|e| {
             panic!(
                 "PRODUCT (staging, trial {n}): no echo before the crash ({e}).\n{}",
-                w.fwd.as_mut().unwrap().transcript()
+                w.fwd
+                    .as_mut()
+                    .expect("APPARATUS: a process the proof started")
+                    .transcript()
             )
         });
     assert_eq!(
@@ -140,14 +143,17 @@ fn trial(n: usize) -> (Duration, Duration) {
             "PRODUCT (trial {n}): the forward never reached the restarted host ({attempts} \
              attempts in {:?}).\nforward:\n{}",
             crashed.elapsed(),
-            w.fwd.as_mut().unwrap().transcript()
+            w.fwd
+                .as_mut()
+                .expect("APPARATUS: a process the proof started")
+                .transcript()
         );
         let slept = Instant::now();
         std::thread::sleep(Duration::from_millis(200));
         overshoot = overshoot.max(slept.elapsed().saturating_sub(Duration::from_millis(200)));
     }
     let (from_crash, from_ready) = (crashed.elapsed(), ready.elapsed());
-    let apparatus = overshoot + noop_vox();
+    let apparatus = overshoot + apparatus_spawn();
     w.assert_relayed("after the restarted host was reached");
     eprintln!(
         "[test] trial {n}: reached again {:.1}s after the crash, {:.1}s after the daemon held the \
@@ -187,7 +193,7 @@ fn a_relayed_host_that_restarts_is_reached_again_through_the_same_forward() {
         .collect();
     assert!(
         stalled.is_empty(),
-        "CANNOT MEASURE: apparatus took over {APPARATUS_BUDGET:?} on {} trial(s) over the bound: {}",
+        "APPARATUS (runner stalled): apparatus took over {APPARATUS_BUDGET:?} on {} trial(s) over the bound: {}",
         stalled.len(),
         said(&stalled)
     );

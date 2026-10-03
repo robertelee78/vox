@@ -656,7 +656,8 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     let t4 = tag_of(&different.wait_for("vox: offering", Duration::from_secs(60)));
     assert!(
         t4.len() > 21 && t4[..21] != t2[..21],
-        "CANNOT MEASURE: the different twin has the same content hash ({t4} vs {t2})"
+        "PRODUCT: `vox room send` offered two files with different contents under the same \
+         content hash ({t4} vs {t2})"
     );
     until(
         "PRODUCT",
@@ -897,10 +898,11 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
 
     // ---- (3) a get ended by SIGTERM, SIGHUP or SIGKILL closes its forward ----
     let Some(_) = listening(bob_daemon.pid()) else {
-        panic!("CANNOT MEASURE: lsof cannot be run here");
+        panic!("APPARATUS, CANNOT MEASURE: lsof cannot be run here");
     };
     let ports = |pid: u32| {
-        listening(pid).unwrap_or_else(|| panic!("CANNOT MEASURE: lsof could not be run on {pid}"))
+        listening(pid)
+            .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: lsof could not be run on {pid}"))
     };
     let big = tmp.path().join("stalled.bin");
     std::fs::write(&big, vec![7u8; 1 << 20]).expect("APPARATUS: the stalled file");
@@ -1059,7 +1061,8 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
     let q = Profile::new(&tmp.path().join("b".repeat(90)), &t_env);
     assert!(
         p.data.join("default").join("node.sock").as_os_str().len() > 104,
-        "CANNOT MEASURE: the profile path is short enough for the natural socket"
+        "APPARATUS, CANNOT MEASURE: the proof's profile path is short enough for the natural \
+         socket"
     );
     p.id();
     q.id();
@@ -1288,8 +1291,8 @@ fn an_accept_error_does_not_end_the_control_socket() {
     );
     assert!(
         ungreeted >= 1,
-        "CANNOT MEASURE: {greeted} connections were all greeted; the daemon never ran out of \
-         descriptors"
+        "APPARATUS, CANNOT MEASURE: {greeted} connections were all greeted; the proof's \
+         descriptor limit never ran the daemon out of descriptors"
     );
     drop(held);
     std::thread::sleep(Duration::from_millis(500));

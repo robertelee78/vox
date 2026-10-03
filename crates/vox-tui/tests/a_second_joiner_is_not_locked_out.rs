@@ -129,7 +129,7 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
     let second = w.tmp.path().join("second");
     let third = w.tmp.path().join("third");
     for d in [&second, &third] {
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     // A peer holds a handshake open with the host; the joiners arrive while it does. Its
     // handshake is a fresh one straight after the first joiner, so the host must answer it
@@ -150,14 +150,21 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
                 );
             }
         }
+        // The client's own setup failing is the staging's; the host ending the handshake
+        // before it answered is the product's.
         Ok(Hold::Ended(error)) => panic!(
-            "CANNOT MEASURE (APPARATUS): staging not achieved, the holding client's attempt \
-             ended before the host answered it, so no handshake was held: {error}"
+            "{}: the holding client's attempt ended before the host answered it, so no \
+             handshake was held: {error}",
+            if error.starts_with("the holding client's") {
+                "APPARATUS"
+            } else {
+                "PRODUCT (staging)"
+            }
         ),
         // Every sender gone with no word: the holding thread died before it could say why (a
         // panic in the staging). Nothing was held, so the host was never asked.
         Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
-            "CANNOT MEASURE (APPARATUS): staging not achieved, the holding client stopped after \
+            "APPARATUS: the holding client stopped after \
              {:?} without holding a handshake or saying why, so the host was never asked",
             sent.elapsed()
         ),
@@ -187,7 +194,7 @@ fn two_joiners_back_to_back_both_get_in_promptly() {
     );
     let (Some(h2), Some(h3)) = (waited_on_others(&err2), waited_on_others(&err3)) else {
         panic!(
-            "CANNOT MEASURE (APPARATUS): a joiner's `join got in` line did not carry its board, dial \
+            "APPARATUS: a joiner's `join got in` line did not carry its board, dial \
              and exchange steps, so the proof cannot tell its wait on others from its own work. \
              Both joins succeeded (asserted above), so this is not a failure a person sees: the \
              line is the proof's measure, and a change to its format is the parser's to follow\n---- the second \
@@ -215,7 +222,7 @@ fn host_endpoint(w: &World) -> SocketAddr {
     let at = format!("a={}&b=/ip4/127.0.0.1/udp/", w.host_fp);
     let tail = w.address.split(&at).nth(1).unwrap_or_else(|| {
         panic!(
-            "CANNOT MEASURE (APPARATUS): the proof cannot find the host's UDP endpoint in the \
+            "APPARATUS: the proof cannot find the host's UDP endpoint in the \
                  room address `vox` printed, {}. The joins dial with that same address and are \
                  judged on their own, so a change in its format is this parser's to follow, not a \
                  failure a person sees",
@@ -229,7 +236,7 @@ fn host_endpoint(w: &World) -> SocketAddr {
         .parse()
         .unwrap_or_else(|e| {
             panic!(
-                "CANNOT MEASURE (APPARATUS): the proof cannot read the host's port in the room \
+                "APPARATUS: the proof cannot read the host's port in the room \
                  address `vox` printed, {}: {e}",
                 w.address
             )
@@ -337,6 +344,9 @@ fn hold(host: SocketAddr, events: &mpsc::Sender<Hold>) -> Result<(), String> {
             .map_err(|e| format!("the holding client's connect: {e}"))?;
         // An end after the answer is the hold running out, as designed; the receiver has moved
         // on and ignores it.
-        connecting.await.map(drop).map_err(|e| e.to_string())
+        connecting
+            .await
+            .map(drop)
+            .map_err(|e| format!("the host ended the handshake: {e}"))
     })
 }

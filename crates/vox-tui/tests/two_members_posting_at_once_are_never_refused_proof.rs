@@ -11,8 +11,16 @@
 //! Here both post at once, then nothing is posted until every member has read every other's
 //! post, and each crossing is timed. Nothing re-pushes, so a push abandoned to the interval shows.
 //!
+//! ## Which side a late crossing is on
+//! A crossing is timed by `vox room read`s in a loop, so it is only known to lie between the last
+//! read that missed it and the first that saw it. It is **PRODUCT** late only when a read that
+//! *started* past [`BOUND`] — plus whatever the runner itself stalled meanwhile, measured on the
+//! same timeline by a thread that sleeps 10 ms at a time — still did not show it. A crossing whose
+//! window straddles the bound only because of the poll gap or a runner stall is **CANNOT
+//! MEASURE**, never a pass and never a product verdict.
+//!
 //! The warm-up (everyone reads everyone) can meet #200's pairwise-session race, which fails as
-//! CANNOT MEASURE, never as a pass.
+//! `PRODUCT (staging)`, never as a pass: it is `vox` that did not deliver.
 //!
 //! ## ADR-025 P6
 //! vox-0e's gate (3bb6ca1, on `test/two-member-collisions`), adapted as ADR-025's P6: besides
@@ -31,6 +39,8 @@ mod watchdog;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
@@ -55,9 +65,11 @@ struct Member {
 impl Member {
     fn new(root: &Path, name: &'static str) -> Self {
         let (data, cfg) = (root.join(name).join("data"), root.join(name).join("cfg"));
-        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&cfg)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", cfg.display()));
         let pass = root.join(format!("{name}.pass"));
-        std::fs::write(&pass, ID_PASS).unwrap();
+        std::fs::write(&pass, ID_PASS)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass.display()));
         Self {
             name,
             data,
@@ -82,11 +94,20 @@ impl Member {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn vox");
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX}: {e}"));
         if let Some(s) = stdin {
-            child.stdin.take().unwrap().write_all(s.as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: the child's stdin was not piped")
+                .write_all(s.as_bytes())
+                .unwrap_or_else(|e| panic!("PRODUCT (staging): vox exited without reading its stdin (could not write vox's stdin): {e}"));
         }
-        let out = child.wait_with_output().unwrap();
+        let out = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("APPARATUS: could not wait for vox: {e}"));
         let r = (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -102,19 +123,39 @@ impl Member {
         r
     }
 
-    /// This member's sync counters, from the shipped `vox status --json`.
+    /// This member's busy refusals, summed over its sync rows, from the shipped
+    /// `vox status --json`. A missing field is not a zero: it cannot say whether anything was
+    /// refused.
     fn busy_refused(&self) -> u64 {
         let (ok, out, err) = self.vox(&["status", "--json"], None);
-        assert!(ok, "{}: vox status --json: {err}", self.name);
-        let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status JSON");
-        v["sync"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .map(|r| r["busy_refused"].as_u64().unwrap_or(0))
-                    .sum()
+        assert!(
+            ok,
+            "PRODUCT: {}'s `vox status --json` failed: {err}",
+            self.name
+        );
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT: {}'s `vox status --json` is not JSON ({e}): {out}",
+                self.name
+            )
+        });
+        let Some(rows) = v["sync"].as_array() else {
+            panic!(
+                "PRODUCT (staging): {}'s `vox status --json` has no `sync` rows: {out}",
+                self.name
+            );
+        };
+        rows.iter()
+            .map(|r| {
+                r["busy_refused"].as_u64().unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT (staging): a sync row in {}'s `vox status --json` has no \
+                         `busy_refused`: {r}",
+                        self.name
+                    )
+                })
             })
-            .unwrap_or(0)
+            .sum()
     }
 
     fn fingerprint(&self) -> String {
@@ -122,11 +163,17 @@ impl Member {
             &[
                 "id",
                 "--identity-passphrase-file",
-                self.pass.to_str().unwrap(),
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: a non-UTF-8 temp path"),
             ],
             None,
         );
-        assert!(ok, "{} id: {err}", self.name);
+        assert!(
+            ok,
+            "PRODUCT (staging): {}'s `vox id` failed: {err}",
+            self.name
+        );
         out.trim().to_owned()
     }
 
@@ -145,15 +192,20 @@ impl Member {
             .env("VOX_CONFIG_DIR", &self.cfg)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(err).unwrap()))
+            .stderr(Stdio::from(std::fs::File::create(err).unwrap_or_else(
+                |e| panic!("APPARATUS: could not create {}: {e}", err.display()),
+            )))
             .spawn()
-            .expect("spawn vox daemon");
-        let deadline = Instant::now() + Duration::from_secs(60);
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} daemon: {e}"));
+        let started = Instant::now();
         while !self.vox(&["room", "list"], None).0 {
             assert!(
-                Instant::now() < deadline,
-                "{}'s daemon never answered",
-                self.name
+                started.elapsed() < Duration::from_secs(60),
+                "PRODUCT (staging): {}'s daemon never answered `vox room list` \
+                 in {:?}; its stderr:\n{}",
+                self.name,
+                started.elapsed(),
+                std::fs::read_to_string(err).unwrap_or_default()
             );
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -163,17 +215,23 @@ impl Member {
 
 fn spawn_anchor(root: &Path) -> (Proc, String) {
     let (a_data, a_cfg) = (root.join("anchor/data"), root.join("anchor/cfg"));
-    std::fs::create_dir_all(&a_cfg).unwrap();
+    std::fs::create_dir_all(&a_cfg)
+        .unwrap_or_else(|e| panic!("APPARATUS: could not make {}: {e}", a_cfg.display()));
     let anchor_out = root.join("anchor.out");
+    let anchor_err = root.join("anchor.err");
+    let file = |p: &Path| {
+        std::fs::File::create(p)
+            .unwrap_or_else(|e| panic!("APPARATUS: could not create {}: {e}", p.display()))
+    };
     let anchor = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &a_data)
             .env("VOX_CONFIG_DIR", &a_cfg)
-            .stdout(Stdio::from(std::fs::File::create(&anchor_out).unwrap()))
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(file(&anchor_out)))
+            .stderr(Stdio::from(file(&anchor_err)))
             .spawn()
-            .expect("spawn vox node"),
+            .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} node: {e}")),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -186,7 +244,9 @@ fn spawn_anchor(root: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "the anchor never printed its spec"
+            "PRODUCT (staging): the anchor never printed its spec in 60 s; \
+             it said:\n{text}\n{}",
+            std::fs::read_to_string(&anchor_err).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -201,11 +261,61 @@ const BOUND: Duration = Duration::from_secs(12);
 /// gives the old code many chances to show it.
 const ROUNDS: usize = 60;
 
+/// The runner's own stalls, on the proof's timeline: a thread that sleeps [`TICK`] at a time and
+/// records how late each wake was. Time the runner lost is time no `vox` could have used either.
+struct Stalls {
+    late: Arc<Mutex<Vec<(Instant, Duration)>>>,
+    stop: Arc<AtomicBool>,
+}
+
+const TICK: Duration = Duration::from_millis(10);
+
+impl Stalls {
+    fn start() -> Self {
+        let late = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (l, s) = (Arc::clone(&late), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let before = Instant::now();
+                std::thread::sleep(TICK);
+                let woke = Instant::now();
+                let over = woke.duration_since(before).saturating_sub(TICK);
+                if over > Duration::from_millis(2) {
+                    if let Ok(mut v) = l.lock() {
+                        v.push((woke, over));
+                    }
+                }
+            }
+        });
+        Self { late, stop }
+    }
+
+    /// How long the runner stalled between `from` and `to`.
+    fn within(&self, from: Instant, to: Instant) -> Duration {
+        self.late
+            .lock()
+            .map(|v| {
+                v.iter()
+                    .filter(|(at, _)| *at >= from && *at <= to)
+                    .map(|(_, d)| *d)
+                    .sum()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for Stalls {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 #[test]
-#[ignore = "a real anchor and three real daemons with production Argon2id, 40 rounds; CI runs it in release"]
+#[ignore = "a real anchor and two real daemons with production Argon2id, 60 rounds; CI runs it in release"]
 fn two_members_posting_at_once_are_never_refused() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temporary directory");
     let root = tmp.path();
     let (anchor, spec) = spawn_anchor(root);
     let members = [Member::new(root, "alice"), Member::new(root, "bob")];
@@ -221,11 +331,15 @@ fn two_members_posting_at_once_are_never_refused() {
                         "--name",
                         other.name,
                         "--identity-passphrase-file",
-                        m.pass.to_str().unwrap(),
+                        m.pass.to_str().expect("APPARATUS: a non-UTF-8 temp path"),
                     ],
                     None,
                 );
-                assert!(ok, "{} trusts {}: {err}", m.name, other.name);
+                assert!(
+                    ok,
+                    "PRODUCT (staging): {} could not trust {}: {err}",
+                    m.name, other.name
+                );
             }
         }
     }
@@ -245,49 +359,39 @@ fn two_members_posting_at_once_are_never_refused() {
         ],
         Some(ROOM_PASS),
     );
-    assert!(ok, "create: {err}");
-    let room = alice
-        .vox(&["room", "list"], None)
-        .1
-        .split_whitespace()
-        .next()
-        .expect("a room")
-        .to_owned();
-    let link = alice
-        .vox(&["room", "invite", &room], None)
-        .1
-        .trim()
-        .to_owned();
-    for m in [bob] {
-        let mut joined = false;
-        for attempt in 1..=6 {
-            if m.vox(
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    &link,
-                    "--name",
-                    "mission",
-                ],
-                Some(ROOM_PASS),
-            )
-            .0
-            {
-                joined = true;
-                eprintln!("[receipt] {} joined on attempt {attempt}", m.name);
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(5));
-        }
-        assert!(
-            joined,
-            "{} never joined, which is not what this proves",
-            m.name
-        );
-    }
-    // Everyone reads everyone before Carol dies: keys have flowed and every pair has a session.
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox room create` failed: {err}"
+    );
+    let (_, list, err) = alice.vox(&["room", "list"], None);
+    let Some(room) = list.split_whitespace().next().map(str::to_owned) else {
+        panic!("PRODUCT (staging): alice's `vox room list` names no room: {list}{err}");
+    };
+    let (ok, link, err) = alice.vox(&["room", "invite", &room], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox room invite` failed: {err}"
+    );
+    let link = link.trim().to_owned();
+    // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
+    // and retrying would hide it.
+    let (ok, out, err) = bob.vox(
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
+        Some(ROOM_PASS),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's `vox room join` failed: {out}{err}"
+    );
+    // Everyone reads everyone before the anchor stops: keys have flowed and every pair has a session.
     let mut pending: Vec<(&str, &str)> = Vec::new();
     for r in &members {
         for w in &members {
@@ -301,7 +405,7 @@ fn two_members_posting_at_once_are_never_refused() {
     while !pending.is_empty() {
         assert!(
             start.elapsed() < Duration::from_secs(90),
-            "CANNOT MEASURE: {pending:?} still unread after 90 s, before anyone died"
+            "PRODUCT (staging): {pending:?} still unread after 90 s, before anyone died"
         );
         round += 1;
         for w in &members {
@@ -310,7 +414,11 @@ fn two_members_posting_at_once_are_never_refused() {
                     &["room", "post", &room, &format!("warm-{}-{round}", w.name)],
                     None,
                 );
-                assert!(ok, "{} posts: {err}", w.name);
+                assert!(
+                    ok,
+                    "PRODUCT (staging): {}'s warm-up post failed: {err}",
+                    w.name
+                );
             }
         }
         std::thread::sleep(Duration::from_secs(1));
@@ -331,8 +439,10 @@ fn two_members_posting_at_once_are_never_refused() {
     // read every other's post. A push that collides past the quick retries is then carried only by
     // its own retry: with the old code, left to the 30 s interval; with the fix, backed off.
     let refused_before: Vec<u64> = members.iter().map(Member::busy_refused).collect();
+    let stalls = Stalls::start();
     let mut worst = Duration::ZERO;
     let mut late: Vec<String> = Vec::new();
+    let mut unmeasured: Vec<String> = Vec::new();
     for r in 1..=ROUNDS {
         std::thread::scope(|s| {
             for m in &members {
@@ -342,7 +452,11 @@ fn two_members_posting_at_once_are_never_refused() {
                         &["room", "post", room, &format!("round-{r}-{}", m.name)],
                         None,
                     );
-                    assert!(ok, "{} posts: {err}", m.name);
+                    assert!(
+                        ok,
+                        "PRODUCT: {}'s `vox room post` in round {r} failed: {err}",
+                        m.name
+                    );
                 });
             }
         });
@@ -355,27 +469,47 @@ fn two_members_posting_at_once_are_never_refused() {
                 }
             }
         }
-        let mut seen_at: Vec<(String, Duration)> = Vec::new();
+        // Per crossing: when it was seen (the end of the read that showed it), and when the last
+        // read that did not show it started — the crossing lies between the two.
+        let mut seen_at: Vec<(String, &str, Duration, Duration)> = Vec::new();
+        let mut missed_at: std::collections::HashMap<(&str, &str), Duration> =
+            std::collections::HashMap::new();
+        // Every `vox room read` this round, per reader: when it started and when it returned. A
+        // read that itself took past the bound is a person waiting that long, whatever the poll.
+        let mut reads: Vec<(&str, Duration, Duration)> = Vec::new();
         while !unseen.is_empty() && posted.elapsed() < Duration::from_secs(45) {
             for rd in &members {
                 if !unseen.iter().any(|(x, _)| *x == rd.name) {
                     continue;
                 }
-                let (_, out, _) = rd.vox(&["room", "read", &room], None);
+                let asked = posted.elapsed();
+                let (ok, out, err) = rd.vox(&["room", "read", &room], None);
+                assert!(
+                    ok,
+                    "PRODUCT: {}'s `vox room read` in round {r} failed: {err}",
+                    rd.name
+                );
                 let at = posted.elapsed();
+                reads.push((rd.name, asked, at));
                 unseen.retain(|(x, w)| {
-                    let got = *x == rd.name && out.contains(&format!("round-{r}-{w}"));
-                    if got {
-                        seen_at.push((format!("{w}->{x}"), at));
+                    if *x != rd.name {
+                        return true;
                     }
-                    !got
+                    if out.contains(&format!("round-{r}-{w}")) {
+                        let missed = missed_at.get(&(*x, *w)).copied().unwrap_or_default();
+                        seen_at.push((format!("{w}->{x}"), x, at, missed));
+                        false
+                    } else {
+                        missed_at.insert((*x, *w), asked);
+                        true
+                    }
                 });
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         let slowest = seen_at
             .iter()
-            .map(|(_, d)| *d)
+            .map(|(_, _, d, _)| *d)
             .max()
             .unwrap_or(Duration::MAX);
         eprintln!(
@@ -387,43 +521,98 @@ fn two_members_posting_at_once_are_never_refused() {
             }
         );
         worst = worst.max(slowest);
-        for (who, d) in &seen_at {
+        // A crossing past the bound is the product's if a read that started past the bound, plus
+        // what the runner stalled meanwhile, still missed it; or if one of the reader's own `vox
+        // room read`s took past the bound, less what the runner stalled during it, since a person
+        // waits on that read. Otherwise the poll gap or the runner may have made it look late.
+        let mut judge = |who: String, reader: &str, missed: Duration, seen: Option<Duration>| {
+            let stalled = stalls.within(posted, posted + missed);
+            let shown = match seen {
+                Some(d) => format!("seen at {d:?}"),
+                None => "never seen within 45 s".to_owned(),
+            };
+            let slow_read = reads
+                .iter()
+                .filter(|(n, asked, _)| *n == reader && seen.is_none_or(|d| *asked < d))
+                .map(|(_, asked, at)| {
+                    let stall = stalls.within(posted + *asked, posted + *at);
+                    ((*at - *asked).saturating_sub(stall), *at - *asked, stall)
+                })
+                .max();
+            if missed > BOUND + stalled {
+                late.push(format!(
+                    "round {r} {who}: still unread by a read started at {missed:?}, {shown} \
+                     (runner stalled {stalled:?})"
+                ));
+            } else if let Some((net, took, stall)) = slow_read.filter(|(net, _, _)| *net > BOUND) {
+                late.push(format!(
+                    "round {r} {who}: {shown}; one of {reader}'s `vox room read`s itself took \
+                     {took:?} (runner stalled {stall:?} during it, so {net:?} was vox's)"
+                ));
+            } else {
+                unmeasured.push(format!(
+                    "round {r} {who}: {shown}, but the last read that missed it started at \
+                     {missed:?} and the runner stalled {stalled:?}, so it may have landed within \
+                     {BOUND:?}"
+                ));
+            }
+        };
+        for (who, reader, d, missed) in &seen_at {
             if *d > BOUND {
-                late.push(format!("round {r} {who}: {d:?}"));
+                judge(who.clone(), reader, *missed, Some(*d));
             }
         }
         for (x, w) in &unseen {
-            late.push(format!("round {r} {w}->{x}: never within 45 s"));
+            let missed = missed_at.get(&(*x, *w)).copied().unwrap_or_default();
+            judge(format!("{w}->{x}"), x, missed, None);
         }
     }
     std::thread::sleep(Duration::from_secs(1));
     let refused: Vec<u64> = members
         .iter()
         .zip(&refused_before)
-        .map(|(m, b)| m.busy_refused() - b)
+        .map(|(m, b)| {
+            let now = m.busy_refused();
+            now.checked_sub(*b).unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT: {}'s busy_refused went backwards ({b} -> {now}); this proof never \
+                     restarts a daemon, so vox restarted it or reset its counters",
+                    m.name
+                )
+            })
+        })
         .collect();
     eprintln!(
-        "{ROUNDS} rounds, slowest crossing {worst:?}, {} late",
-        late.len()
+        "{ROUNDS} rounds, slowest crossing {worst:?}, {} late, {} unmeasurable",
+        late.len(),
+        unmeasured.len()
     );
     println!(
-        "[proof] P6: {ROUNDS} rounds, slowest crossing {worst:?}, {} late; busy_refused alice {} \
-         bob {}",
+        "[proof] P6: {ROUNDS} rounds, slowest crossing {worst:?}, {} late, {} unmeasurable; \
+         busy_refused alice {} bob {}",
         late.len(),
+        unmeasured.len(),
         refused[0],
         refused[1]
     );
     assert_eq!(
         refused.iter().sum::<u64>(),
         0,
-        "two members posting at once refused each other (SessionBusy): alice {}, bob {}",
+        "PRODUCT: two members posting at once refused each other (SessionBusy, from \
+         `vox status --json`): alice {}, bob {}",
         refused[0],
         refused[1]
     );
     assert!(
         late.is_empty(),
-        "with every member posting at once, a post crossed later than {BOUND:?}: {late:?} — a push \
-         that kept colliding was left to the 30 s interval"
+        "PRODUCT: with every member posting at once, a post crossed later than {BOUND:?}: \
+         {late:?} (a push that kept colliding was left to the 30 s interval, or `vox room read` \
+         itself kept the reader waiting)"
+    );
+    assert!(
+        unmeasured.is_empty(),
+        "APPARATUS, CANNOT MEASURE: a crossing's window straddled {BOUND:?} only through the poll gap or a \
+         runner stall: {unmeasured:?}"
     );
     drop(daemons);
 }

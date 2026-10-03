@@ -15,7 +15,7 @@
 //!    node **pins that node** (`r=<alice>`), so Alice is, by the product's own rule, the first
 //!    member any joiner reaches for. The proof asserts the pin is there rather than hoping.
 //! 2. Bob joins, and Alice and Bob trust each other; the room is ready when each has rendered
-//!    a post by the other (precondition — `CANNOT MEASURE` if not).
+//!    a post by the other (precondition — `PRODUCT (staging)` if not).
 //! 3. Alice's and Bob's daemons trust Carol (and she them) before she joins.
 //! 4. **Alice's daemon is killed by its PID** and reaped: the member the join tries first is
 //!    offline.
@@ -131,16 +131,16 @@ impl Member {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn vox");
+            .expect("APPARATUS: spawn vox");
         if let Some(text) = stdin {
             child
                 .stdin
                 .take()
-                .unwrap()
+                .expect("APPARATUS: a piped stdio handle")
                 .write_all(text.as_bytes())
-                .unwrap();
+                .expect("PRODUCT (staging): vox exited without reading its stdin");
         }
-        let out = child.wait_with_output().expect("vox ran");
+        let out = child.wait_with_output().expect("APPARATUS: vox ran");
         let r = (
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -170,13 +170,15 @@ impl Member {
                 "--name",
                 other.name,
                 "--identity-passphrase-file",
-                self.pass.to_str().unwrap(),
+                self.pass
+                    .to_str()
+                    .expect("APPARATUS: a path that is not UTF-8"),
             ],
             None,
         );
         assert!(
             ok,
-            "APPARATUS (staging not achieved): {} trusts {}: {o}{e}",
+            "PRODUCT (staging): {} trusts {}: {o}{e}",
             self.name, other.name
         );
     }
@@ -184,9 +186,9 @@ impl Member {
 
 fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     let data = tmp.join(name);
-    std::fs::create_dir_all(data.join("cfg")).unwrap();
+    std::fs::create_dir_all(data.join("cfg")).expect("APPARATUS: create a staging directory");
     let pass = tmp.join(format!("{name}.pass"));
-    std::fs::write(&pass, ID_PASS).unwrap();
+    std::fs::write(&pass, ID_PASS).expect("APPARATUS: write a staging file");
     let mut m = Member {
         name,
         data,
@@ -196,20 +198,23 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         daemon: None,
     };
     let (ok, out, err) = m.vox(
-        &["id", "--identity-passphrase-file", m.pass.to_str().unwrap()],
+        &[
+            "id",
+            "--identity-passphrase-file",
+            m.pass
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
+        ],
         None,
     );
-    assert!(
-        ok,
-        "APPARATUS (staging not achieved): {name}: vox id: {err}"
-    );
+    assert!(ok, "PRODUCT (staging): {name}: vox id: {err}");
     m.fp = out.trim().to_owned();
     assert_eq!(
         m.fp.len(),
         52,
-        "APPARATUS (staging not achieved): {name}: a fingerprint from vox id"
+        "PRODUCT (staging): {name}: a fingerprint from vox id"
     );
-    let err = std::fs::File::create(&m.err).unwrap();
+    let err = std::fs::File::create(&m.err).expect("APPARATUS: create a staging file");
     let child = Command::new(VOX)
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
@@ -221,13 +226,13 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         .stdout(Stdio::null())
         .stderr(Stdio::from(err))
         .spawn()
-        .expect("spawn vox daemon");
+        .expect("APPARATUS: spawn vox daemon");
     m.daemon = Some(Proc(child));
     let deadline = Instant::now() + Duration::from_secs(90);
     while !m.vox(&["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "APPARATUS, CANNOT MEASURE: {name}'s daemon never answered"
+            "PRODUCT (staging): {name}'s daemon never answered"
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -236,17 +241,19 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
 
 fn anchor(tmp: &Path) -> (Proc, String) {
     let dir = tmp.join("anchor");
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging directory");
     let out = tmp.join("anchor.out");
     let p = Proc(
         Command::new(VOX)
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
-            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stdout(Stdio::from(
+                std::fs::File::create(&out).expect("APPARATUS: create a staging file"),
+            ))
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vox node"),
+            .expect("APPARATUS: spawn vox node"),
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -259,7 +266,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "APPARATUS, CANNOT MEASURE: the anchor never printed its spec"
+            "PRODUCT (staging): the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -279,11 +286,7 @@ fn posts_until_read(
     while Instant::now() < deadline {
         n += 1;
         let (ok, _, e) = author.vox(&["room", "post", room, &format!("{tag} {n}")], None);
-        assert!(
-            ok,
-            "APPARATUS (staging not achieved): {} posts: {e}",
-            author.name
-        );
+        assert!(ok, "PRODUCT (staging): {} posts: {e}", author.name);
         std::thread::sleep(Duration::from_secs(1));
         if reader.reads(room, &format!("{tag} ")) {
             return Some(n);
@@ -297,7 +300,7 @@ fn posts_until_read(
 fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     watchdog::arm();
     label_reds();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let mut alice = member(tmp.path(), "alice", &spec);
     let bob = member(tmp.path(), "bob", &spec);
@@ -308,16 +311,16 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         &["room", "create", "--passphrase-file", "-", "--name", "team"],
         Some(&format!("{ROOM_PASS}\n")),
     );
-    assert!(ok, "APPARATUS (staging not achieved): room create: {e}");
+    assert!(ok, "PRODUCT (staging): room create: {e}");
     let room = alice
         .vox(&["room", "list"], None)
         .1
         .split_whitespace()
         .next()
-        .expect("the new room in `vox room list`")
+        .expect("PRODUCT: the new room in `vox room list`")
         .to_owned();
     let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
-    assert!(ok, "APPARATUS (staging not achieved): invite: {e}");
+    assert!(ok, "PRODUCT (staging): invite: {e}");
     let link = link.trim().to_owned();
     let pinned = link
         .split(['?', '&'])
@@ -326,7 +329,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     assert_eq!(
         pinned.as_deref(),
         Some(alice.fp.as_str()),
-        "APPARATUS, CANNOT MEASURE: the link `vox room invite` printed does not pin alice, so alice is not \
+        "PRODUCT (staging): the link `vox room invite` printed does not pin alice, so alice is not \
          provably the first member a join reaches for: {link}"
     );
 
@@ -345,7 +348,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     );
     assert!(
         ok,
-        "APPARATUS, CANNOT MEASURE: bob's join, with every member up, failed (if this names \
+        "PRODUCT (staging): bob's join, with every member up, failed (if this names \
          `authenticator invalid` it is #217): {o}{e}"
     );
     alice.trust(&bob);
@@ -355,7 +358,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     eprintln!("[proof] ready: alice->bob after {ab:?} posts, bob->alice after {ba:?} posts");
     assert!(
         ab.is_some() && ba.is_some(),
-        "APPARATUS, CANNOT MEASURE: alice and bob never read each other (alice->bob {ab:?}, bob->alice {ba:?})"
+        "PRODUCT (staging): alice and bob never read each other (alice->bob {ab:?}, bob->alice {ba:?})"
     );
 
     // ---- everyone trusts carol before she joins, so what she reads is only the join's doing ----
@@ -365,7 +368,12 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     carol.trust(&bob);
 
     // ---- alice goes away: killed by PID and reaped ----
-    let alice_pid = alice.daemon.as_ref().unwrap().0.id();
+    let alice_pid = alice
+        .daemon
+        .as_ref()
+        .expect("APPARATUS: a process the proof started")
+        .0
+        .id();
     drop(alice.daemon.take());
     let still = Command::new("kill")
         .args(["-0", &alice_pid.to_string()])
@@ -374,7 +382,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         .is_ok_and(|s| s.success());
     assert!(
         !still,
-        "APPARATUS, CANNOT MEASURE: alice's daemon (pid {alice_pid}) is still alive"
+        "APPARATUS: the proof's kill did not stop alice's daemon (pid {alice_pid})"
     );
     eprintln!("[proof] alice's daemon pid {alice_pid} killed and reaped");
 
@@ -400,9 +408,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         JOIN_BOUND.as_secs()
     );
     if !ok && format!("{o}{e}").contains("authenticator invalid") {
-        panic!(
-            "APPARATUS, CANNOT MEASURE: carol's join hit #217 (`authenticator invalid`): {o}{e}"
-        );
+        panic!("PRODUCT: carol's join hit #217 (`authenticator invalid`): {o}{e}");
     }
     assert!(
         ok,
@@ -416,7 +422,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         .rfind(|l| l.contains("join got in"))
         .map(str::to_owned)
         .unwrap_or_else(|| {
-            panic!("APPARATUS, CANNOT MEASURE: carol's daemon printed no `join got in` line")
+            panic!("PRODUCT: carol's join got in but her daemon printed no `join got in` line")
         });
     let step_secs = |name: &str| -> f64 {
         steps
@@ -430,7 +436,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     let (solve, seal) = (step_secs("solve"), step_secs("seal"));
     assert!(
         solve > 0.0 && seal > 0.0,
-        "APPARATUS, CANNOT MEASURE: carol's daemon did not name her join's solve and seal: {steps}"
+        "PRODUCT: carol's daemon did not name her join's solve and seal: {steps}"
     );
     let work = took.saturating_sub(Duration::from_secs_f64(solve + seal));
     eprintln!(

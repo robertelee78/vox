@@ -94,14 +94,14 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("APPARATUS: a piped stdio handle")
         .write_all(stdin.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("vox finished");
+        .expect("PRODUCT (staging): vox exited without reading its stdin");
+    let out = child.wait_with_output().expect("APPARATUS: vox finished");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -122,7 +122,9 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> V
             "--anchor",
             spec,
             "--passphrase-file",
-            pass_file.to_str().unwrap(),
+            pass_file
+                .to_str()
+                .expect("APPARATUS: a path that is not UTF-8"),
         ]),
         &[("VOX_TEST_RECORD_TTL_SECS", ttl)],
     );
@@ -133,7 +135,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> V
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    panic!("{name}'s daemon never answered `vox room list`");
+    panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
 /// A node's publish counters at one instant (`vox status --json`): its renewals, its rounds, and
@@ -148,13 +150,13 @@ struct Publish {
 
 fn publish(data: &Path) -> Publish {
     let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
-    assert!(ok, "vox status --json: {err}");
-    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("status is JSON");
+    assert!(ok, "PRODUCT (staging): vox status --json: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).expect("PRODUCT: status is JSON");
     let p = &v["publish"];
     let n = |what: &str| {
         p[what]
             .as_u64()
-            .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{what}: {out}"))
+            .unwrap_or_else(|| panic!("PRODUCT: status has no publish.{what}: {out}"))
     };
     Publish {
         renewals: n("renewals"),
@@ -171,7 +173,7 @@ fn per_cause(
 ) -> std::collections::BTreeMap<String, u64> {
     p[what]
         .as_object()
-        .unwrap_or_else(|| panic!("CANNOT MEASURE: status has no publish.{what}: {out}"))
+        .unwrap_or_else(|| panic!("PRODUCT: status has no publish.{what}: {out}"))
         .iter()
         .map(|(k, n)| (k.clone(), n.as_u64().unwrap_or(0)))
         .collect()
@@ -194,7 +196,9 @@ fn moved(
 
 /// `address` without the `a=<who>&b=<endpoint>` pair naming `who`: what is left names the anchor.
 fn without_endpoint_of(address: &str, who: &str) -> String {
-    let (head, query) = address.split_once('?').expect("an address with a query");
+    let (head, query) = address
+        .split_once('?')
+        .expect("PRODUCT: an address with a query");
     let parts: Vec<&str> = query.split('&').collect();
     let mut kept = Vec::new();
     let mut i = 0;
@@ -228,9 +232,9 @@ fn a_round_to_one_anchor_does_not_put_off_the_others() {
 /// A free loopback UDP port, for an anchor that must come back where it was.
 fn free_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
+        .expect("APPARATUS: bind a socket")
         .local_addr()
-        .unwrap()
+        .expect("APPARATUS: read a socket the proof bound")
         .port()
 }
 
@@ -259,7 +263,7 @@ fn stop(mut p: VoxProc) {
     while p.child.try_wait().ok().flatten().is_none() {
         assert!(
             Instant::now() < deadline,
-            "CANNOT MEASURE: anchor {pid} did not stop within 10 s of SIGINT"
+            "PRODUCT (staging): anchor {pid} did not stop within 10 s of SIGINT"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -274,10 +278,10 @@ fn idle_then_join(churn: bool) {
     // other's (found by V210-68's verifier).
     let ttl = if churn { CHURN_TTL } else { TTL };
     let ttl_s = ttl.to_string();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);
-        std::fs::create_dir_all(d.join("cfg")).unwrap();
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
     let (anchor_dir, second_dir, alice_dir, bob_dir, carol_dir) = (
@@ -288,7 +292,7 @@ fn idle_then_join(churn: bool) {
         dir("carol"),
     );
     let idpass = tmp.path().join("idpass");
-    std::fs::write(&idpass, IDENTITY).unwrap();
+    std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
 
     let (anchor, spec) = anchor_on("anchor", &anchor_dir, free_port(), &ttl_s);
     // Anchor B, only with `churn`: on a port it can come back to.
@@ -300,7 +304,7 @@ fn idle_then_join(churn: bool) {
     };
     let fp = |d: &Path| {
         let (ok, out, err) = vox_once(d, &args(&["id"]));
-        assert!(ok, "vox id: {err}");
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
         out.trim().to_owned()
     };
     let alice_fp = fp(&alice_dir);
@@ -321,17 +325,17 @@ fn idle_then_join(churn: bool) {
         ],
         "room pass",
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (ok, list, err) = vox_once(&alice_dir, &args(&["room", "list"]));
-    assert!(ok, "vox room list: {err}");
+    assert!(ok, "PRODUCT (staging): vox room list: {err}");
     let room = list
         .lines()
         .find(|l| l.contains("quiet"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("room not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT: room not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let link = link.trim().to_owned();
     let (ok, out, err) = vox_in(
         &bob_dir,
@@ -346,7 +350,7 @@ fn idle_then_join(churn: bool) {
         ],
         "room pass",
     );
-    assert!(ok, "bob joins: {out}{err}");
+    assert!(ok, "PRODUCT (staging): bob joins: {out}{err}");
 
     // ---- nobody does anything for several lifetimes -----------------------------------------
     let alice_before = publish(&alice_dir);
@@ -385,7 +389,7 @@ fn idle_then_join(churn: bool) {
     assert_eq!(
         causes.values().sum::<u64>(),
         rounds,
-        "CANNOT MEASURE: alice's rounds by cause {causes:?} do not add up to her {rounds} rounds"
+        "PRODUCT: alice's rounds by cause {causes:?} do not add up to her {rounds} rounds"
     );
 
     // ---- Carol, who has only the anchor ----------------------------------------------------
@@ -394,11 +398,14 @@ fn idle_then_join(churn: bool) {
     let mut reconnects = 0u64;
     if let Some((_, b_spec)) = &second {
         // Through A alone: B's pair goes too.
-        let b_fp = b_spec.split('@').next().unwrap();
+        let b_fp = b_spec
+            .split('@')
+            .next()
+            .expect("APPARATUS: split yields at least one part");
         anchor_only = without_endpoint_of(&anchor_only, b_fp);
         assert!(
             !anchor_only.contains(b_fp),
-            "CANNOT MEASURE: anchor B is still in the address: {anchor_only}"
+            "APPARATUS: anchor B is still in the address: {anchor_only}"
         );
         // B came back as often as asked, and Alice reached it again each time: otherwise there
         // were no rounds to B alone to put anything off.
@@ -429,13 +436,13 @@ fn idle_then_join(churn: bool) {
         );
         assert!(
             reached >= 8 && widest < (ttl / 2) as f64,
-            "CANNOT MEASURE: alice reached anchor B {reached} time(s) while idle, at most \
+            "PRODUCT (staging): alice reached anchor B {reached} time(s) while idle, at most \
              {widest:.1}s apart; the arm needs rounds to B alone closer than half a lifetime"
         );
     }
     assert!(
         !anchor_only.contains(&format!("a={alice_fp}&b=")),
-        "CANNOT MEASURE: Alice's endpoint is still in the address: {anchor_only}"
+        "APPARATUS: Alice's endpoint is still in the address: {anchor_only}"
     );
     let carol = daemon("carol", &carol_dir, &spec, &idpass, &ttl_s);
     let t = Instant::now();
@@ -473,15 +480,15 @@ fn idle_then_join(churn: bool) {
     );
     assert!(
         joined,
-        "a node idle for {LIFETIMES} record lifetimes was not findable on its anchor's board: \
+        "PRODUCT: a node idle for {LIFETIMES} record lifetimes was not findable on its anchor's board: \
          {out}{err}"
     );
     let steps = steps.unwrap_or_else(|| {
-        panic!("CANNOT MEASURE: carol's daemon printed no `join got in` line: {said:#?}")
+        panic!("PRODUCT (staging): carol's daemon printed no `join got in` line: {said:#?}")
     });
     assert!(
         !steps.contains("address poll"),
-        "after {LIFETIMES} idle lifetimes the anchor's board no longer held a member's address: \
+        "PRODUCT: after {LIFETIMES} idle lifetimes the anchor's board no longer held a member's address: \
          carol's join had to wait for one — {steps}"
     );
     // One renewal per room per half-lifetime, however many boards it reaches: two a lifetime,
@@ -490,7 +497,7 @@ fn idle_then_join(churn: bool) {
     let (least, most) = (2 * LIFETIMES - 1, 2 * LIFETIMES + 1);
     assert!(
         (least..=most).contains(&renewed),
-        "alice's node renewed its records {renewed} times over {LIFETIMES} idle lifetimes; \
+        "PRODUCT: alice's node renewed its records {renewed} times over {LIFETIMES} idle lifetimes; \
          expected {least}..={most}"
     );
     // **Every round has a cause, and each cause is bounded by the design** (V210-68). While
@@ -512,24 +519,24 @@ fn idle_then_join(churn: bool) {
         .collect();
     assert!(
         unasked.is_empty(),
-        "alice's node published while idle for causes the idle room did not ask for: \
+        "PRODUCT: alice's node published while idle for causes the idle room did not ask for: \
          {unasked:?} (all: {causes:?})"
     );
     assert!(
         (renewed..=renewed * anchors_n).contains(&(count("renewal") + folded("renewal"))),
-        "alice's renewal rounds {} (and {} renewal asks folded into another round) are not one \
+        "PRODUCT: alice's renewal rounds {} (and {} renewal asks folded into another round) are not one \
          to {anchors_n} per renewal ({renewed} renewals)",
         count("renewal"),
         folded("renewal")
     );
     assert!(
         count("anchor_returned") <= reconnects,
-        "alice's rounds to a returned anchor {} exceed anchor B's {reconnects} return(s)",
+        "PRODUCT: alice's rounds to a returned anchor {} exceed anchor B's {reconnects} return(s)",
         count("anchor_returned")
     );
     assert!(
         count("board_news") <= bob_renewed * anchors_n,
-        "alice passed on {} rounds of news while bob renewed only {bob_renewed} time(s) \
+        "PRODUCT: alice passed on {} rounds of news while bob renewed only {bob_renewed} time(s) \
          ({anchors_n} anchor(s))",
         count("board_news")
     );

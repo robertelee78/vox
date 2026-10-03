@@ -244,11 +244,11 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
     let host_port = format!("/udp/{}", host_listen.port());
     assert!(
         address.contains(&decoy_port) && address.contains(&host_port),
-        "CANNOT MEASURE: the host's address does not carry both the decoy's and its own: {address}"
+        "PRODUCT (staging): the host's address does not carry both the decoy's and its own: {address}"
     );
     assert!(
         address.find(&decoy_port) < address.find(&host_port),
-        "CANNOT MEASURE: the decoy's address is not offered first: {address}"
+        "PRODUCT (staging): the decoy's address is not offered first: {address}"
     );
 
     // The guest joins. Bounded here, by its PID: a spinning dial never returns.
@@ -316,7 +316,7 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
     // the attempt that failed was the fast failure this proof exists for.
     assert!(
         to_decoy > 0 && from_decoy > 0,
-        "CANNOT MEASURE: the guest never completed an exchange with the decoy \
+        "PRODUCT (staging): the guest never completed an exchange with the decoy \
          ({to_decoy} datagram(s) to it, {from_decoy} back), so no attempt failed fast.\n\
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );

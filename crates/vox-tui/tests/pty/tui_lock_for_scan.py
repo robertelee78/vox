@@ -19,8 +19,10 @@ locks it with `:lock` when the proof says so (V210-94). The proof talks to it th
 `VOX_PTY_DYLD_INSERT=<path>` among the K=V becomes the TUI's `DYLD_INSERT_LIBRARIES`: named
 otherwise so that no protected binary on the way (a system Python) drops it.
 
-Exit 0 = the TUI started, locked on cue and was stopped; 2 = apparatus (pyte missing, no cue, never
-said locked); 1 = the driver hung (`HUNG at <stage>`, with its stack: `vox_pty.py`, V210-54). The
+Exit 0 = the TUI started, locked on cue and was stopped; 1 = the TUI never said locked (`<tag>
+RED: PRODUCT: …`, with its screen) or the driver hung (`HUNG at <stage>`, with its stack:
+`vox_pty.py`, V210-54); 2 = apparatus, the driver's own machinery only (pyte missing, no cue from
+the proof). The
 TUI is killed by its PID, with bounded waits.
 """
 import os, signal, sys, time
@@ -103,8 +105,8 @@ try:
         return "LOCKED" in b and "\u2022" not in b
 
     if not tui.until(locked_now, 120, 0.05):
-        print(f"{TAG} APPARATUS: the TUI never showed itself locked ({how}):\n{tui.text()}")
-        sys.exit(2)
+        print(f"{TAG} RED: PRODUCT: the TUI never showed itself locked ({how}):\n{tui.text()}")
+        sys.exit(1)
     # Whether the TUI said "locking…" while it waited: the proof checks it for a typed `:lock`.
     waited = time.time() - asked
     cue("locked", f"{'said-locking' if said_locking else 'silent'} {waited:.3f}")
