@@ -141,7 +141,7 @@ fn daemon(
     env: &[(&str, &str)],
 ) -> VoxProc {
     let listen = format!("127.0.0.1:{port}");
-    let p = VoxProc::spawn_env(
+    let mut p = VoxProc::spawn_env(
         name,
         data,
         &args(&[
