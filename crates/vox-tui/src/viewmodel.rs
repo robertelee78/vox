@@ -55,6 +55,9 @@ pub struct MessageView {
     pub author: Digest32,
     /// The author's local nickname.
     pub author_nick: String,
+    /// Who an addressed message is to, as this node names each (PRD-001 R15): `to you, bob`,
+    /// or empty for a message to the whole room.
+    pub addressed: String,
     /// Wall-clock send time (epoch-seconds) as recorded in the entry.
     pub timestamp: u64,
     /// The rendered body if decryptable to you, else `None` (shown as a marker).

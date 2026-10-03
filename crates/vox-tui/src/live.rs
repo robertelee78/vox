@@ -247,6 +247,12 @@ impl LiveCore {
             } else {
                 crate::ident::member_name(trusted, &r.author)
             },
+            // The wire names addressees by fingerprint; the timeline by this node's own names.
+            addressed: if r.owed {
+                String::new()
+            } else {
+                crate::agent_hook::addressed(&r.text, me.as_ref(), trusted)
+            },
             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
             timestamp: r.created_millis / 1_000,
             body: Some(if r.owed {

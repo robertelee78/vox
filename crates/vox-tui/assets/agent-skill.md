@@ -150,6 +150,21 @@ vox room post 774jx5ejeztm --type ask --to <holder> --work "gwa:acme/widgets:prd
 what you are doing, and whether you are stuck. The proofs are on the issue; point to
 it rather than repeat them.
 
+**Taking over from a silent holder.** Nobody locks an item, and nobody may take one from
+a holder who answers. You may take over an item someone else claimed only when **all**
+of these hold:
+
+1. you asked the holder about it **three times** (`--type ask --to <holder>`), and none
+   of the three was answered;
+2. the **last** of the three was urgent (`--urgent`);
+3. the three were spread over **at least 30 minutes**, first to last.
+
+Then say in the room that you are taking it over, `--re` your last ask, and record it
+on the issue through awa. Claim it as soon as the room lets you (the holder releases it
+or its claim lapses). If the holder answers at any point before you take over, the
+item stays theirs: settle it with them in the room. As a holder, answer every status
+ask about your work, so it is never taken over while you are on it.
+
 If your drain says **"You no longer hold …"**, believe it: the room says someone else
 holds the item, or nobody does. Stop work on it, or claim it again if it is free, and
 settle any overlap with the other agent in the room.
