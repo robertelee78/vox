@@ -1027,7 +1027,21 @@ impl NodeNet {
         // dialable address that never answers and a helper that refuses to relay call for
         // opposite next steps.
         let mut set: JoinSet<(String, Result<VoxConnection>)> = JoinSet::new();
-        let candidates = direct_candidates(endpoints);
+        // Only what this node's socket can send to is a direct path (V210-122): a reach whose peer
+        // advertises only addresses it cannot dial has no direct rung, and asks for its circuit at
+        // once rather than after a dial that could only fail.
+        let advertised = direct_candidates(endpoints);
+        let candidates =
+            crate::nat::reachability::dialable_candidates(self.manager.endpoint(), &advertised);
+        if candidates.is_empty() && !advertised.is_empty() {
+            self.manager.note(
+                peer,
+                format!(
+                    "this node's socket cannot dial any address it advertises ({})",
+                    join_addrs(&advertised)
+                ),
+            );
+        }
         // **Direct first, by a head start** (V210-122, ADR-012): every circuit waits
         // [`DIRECT_HEAD_START`] before it asks a relay for anything, and gives way at once to a
         // direct connection to the peer — this ladder's own direct rung, a dial elsewhere in the
@@ -1069,25 +1083,8 @@ impl NodeNet {
         // with no candidate and no helper waits for it, for at most [`DIRECT_HEAD_START`].
         let mut helpers = self.helpers(peer);
         if candidates_none && helpers.is_empty() {
-            let began = tokio::time::Instant::now();
-            let until = began + DIRECT_HEAD_START;
-            while helpers.is_empty()
-                && self.manager.existing(&peer).is_none()
-                && self.manager.any_direct_dial_under_way()
-                && tokio::time::Instant::now() < until
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                helpers = self.helpers(peer);
-            }
-            let waited = began.elapsed().as_millis();
-            if waited > 0 {
-                self.manager.note(
-                    peer,
-                    format!(
-                        "nobody to carry a circuit yet; waited {waited} ms for a dial under way"
-                    ),
-                );
-            }
+            self.wait_for_a_helper(peer, tokio::time::Instant::now() + DIRECT_HEAD_START)
+                .await;
             if let Some(conn) = self.manager.existing(&peer) {
                 return Ok(conn);
             }
@@ -1312,6 +1309,27 @@ impl NodeNet {
             .collect()
     }
 
+    /// **Nobody connected to help reach `peer` yet, but somebody being dialled** (V210-57): wait,
+    /// until `until` at most, while a direct dial is under way anywhere in this node (an anchor's,
+    /// say) and neither a helper nor `peer` itself is connected. Says how long it waited.
+    async fn wait_for_a_helper(&self, peer: Digest32, until: tokio::time::Instant) {
+        let began = tokio::time::Instant::now();
+        while self.helpers(peer).is_empty()
+            && self.manager.existing(&peer).is_none()
+            && self.manager.any_direct_dial_under_way()
+            && tokio::time::Instant::now() < until
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let waited = began.elapsed().as_millis();
+        if waited > 0 {
+            self.manager.note(
+                peer,
+                format!("nobody to carry a circuit yet; waited {waited} ms for a dial under way"),
+            );
+        }
+    }
+
     /// The initiator's side of rung 3 on its own: ask `coordinator` to carry a punch
     /// session to `peer`, run the DCUtR exchange, and fire the synchronized dial.
     pub async fn punch_through(
@@ -1447,15 +1465,11 @@ impl NodeNet {
         let began = tokio::time::Instant::now();
         let until = began + DIRECT_HEAD_START;
         let mut boards = self.helpers(member);
-        while boards.is_empty()
-            && self.manager.existing(&member).is_none()
-            && self.manager.any_direct_dial_under_way()
-            && tokio::time::Instant::now() < until
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        if boards.is_empty() {
+            self.wait_for_a_helper(member, until).await;
             boards = self.helpers(member);
         }
-        if boards.is_empty() {
+        if boards.is_empty() || self.manager.existing(&member).is_some() {
             return local;
         }
         let mut reads: JoinSet<Option<(Digest32, EndpointList)>> = JoinSet::new();
