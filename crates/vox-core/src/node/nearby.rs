@@ -25,7 +25,7 @@
 //! A hearer accepts the window before and after its own as well, so clocks a little apart still
 //! match.
 //!
-//! Datagram: [`MAGIC`], then up to [`ENTRIES_PER_DATAGRAM`] entries of [`ENTRY_LEN`] bytes.
+//! Datagram: `MAGIC`, then up to `ENTRIES_PER_DATAGRAM` entries of `ENTRY_LEN` bytes.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
