@@ -318,6 +318,7 @@ impl Evaluator {
             GovBody::PolicyUpdate(p) => p.verify(author_key),
             GovBody::PassphraseRotation(r) => r.verify(author_key),
             GovBody::Presence(p) => p.verify(author_key),
+            GovBody::ServiceShare(s) => s.verify(author_key),
         }
     }
 

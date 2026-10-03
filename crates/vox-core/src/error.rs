@@ -323,6 +323,12 @@ pub enum Error {
     #[error("{0}")]
     TunnelLimit(String),
 
+    /// A node shares at most one service under a name in a room (V030-25): the name is the
+    /// `<service>` part of `<service>.<node>.<room>.vox`, so two under one name would make the
+    /// address mean two things. Carries the name and where the existing one lives.
+    #[error("{0:?} is already the name of a service you share in this room, at {1}")]
+    ServiceNameTaken(String, std::net::SocketAddr),
+
     /// A running tunnel was closed on purpose (V030-11): by a person (`vox tunnel close`, the
     /// TUI), at its other end, or as stuck. Carries why, in the words `vox status` shows.
     #[error("the tunnel was {0}")]

@@ -413,9 +413,10 @@ where
     // then hung up, and neither the tool nor the person could tell a refusal from a
     // network fault.
     //
-    // **The port is the service tag** (ADR-017 decision 4), so nothing here invents a name,
-    // and the **host** decides whether the dial is allowed — this side claims nothing.
-    let tag = port.to_string();
+    // **The name's `<service>` is the service asked for** (V030-25): the port the tool dialled
+    // selects nothing, and the **host** decides whether the dial is allowed — this side claims
+    // nothing.
+    let tag = room.service.clone();
     // `_carried` and `_credit` are held for the whole splice (see [`open_tunnel`]): the path, and
     // the tunnel's receive window of its own on it.
     let (send, recv, _carried, credit) =
@@ -555,7 +556,7 @@ where
                             continue;
                         }
                     };
-                    let label = format!("udp/{port}");
+                    let label = format!("udp/{}", room.service);
                     let Some(guard) = flows.admit(room.host, &label) else { continue };
                     let (tx, rx) = tokio::sync::mpsc::channel(udp::CLIENT_QUEUE);
                     let (dialer, relay, refused) =

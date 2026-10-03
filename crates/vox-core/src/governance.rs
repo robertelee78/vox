@@ -98,6 +98,7 @@ pub mod membership;
 pub mod policy;
 pub mod presence;
 pub mod rotation;
+pub mod share;
 pub mod visibility;
 
 pub use capability::{Capability, CapabilitySet};

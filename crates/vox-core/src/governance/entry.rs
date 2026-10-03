@@ -41,6 +41,7 @@ use crate::governance::genesis::Genesis;
 use crate::governance::policy::PolicyUpdate;
 use crate::governance::presence::Presence;
 use crate::governance::rotation::PassphraseRotation;
+use crate::governance::share::ServiceShare;
 use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::log::entry::Entry;
@@ -68,6 +69,9 @@ pub enum GovBody {
     PassphraseRotation(Box<PassphraseRotation>),
     /// A member's own statement that it has left the room, or is back (tag `0x0015`).
     Presence(Box<Presence>),
+    /// A member's own statement that it shares a named service, or no longer does (tag
+    /// `0x0018`).
+    ServiceShare(Box<ServiceShare>),
 }
 
 impl GovBody {
@@ -93,6 +97,9 @@ impl GovBody {
                 ConsentRevocation::from_wire(bytes)?,
             ))),
             StructTag::Presence => Ok(GovBody::Presence(Box::new(Presence::from_wire(bytes)?))),
+            StructTag::ServiceShare => Ok(GovBody::ServiceShare(Box::new(
+                ServiceShare::from_wire(bytes)?,
+            ))),
             StructTag::PolicyRotation => {
                 // 0x0006 is shared: try policy-update, then passphrase-rotation.
                 if let Ok(pu) = PolicyUpdate::from_wire(bytes) {
@@ -120,6 +127,7 @@ impl GovBody {
             GovBody::PolicyUpdate(p) => (p.body.channel_id, p.body.epoch),
             GovBody::PassphraseRotation(r) => (r.body.channel_id, r.body.old_epoch),
             GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
+            GovBody::ServiceShare(s) => (s.body.channel_id, s.body.epoch),
         }
     }
 
@@ -136,6 +144,7 @@ impl GovBody {
             GovBody::PolicyUpdate(p) => p.body.issuer_id,
             GovBody::PassphraseRotation(r) => r.body.issuer_id,
             GovBody::Presence(p) => p.body.author_id,
+            GovBody::ServiceShare(s) => s.body.author_id,
         }
     }
 }

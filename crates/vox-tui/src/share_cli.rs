@@ -229,7 +229,7 @@ pub async fn share(
     println!("     collect it with: vox room get {room} {name}");
     println!(
         "     or through `vox up`: curl --socks5-hostname <proxy> \
-         http://<your-name-for-{me}>.<room>.vox:{port}/{name} -o {name}"
+         http://{tag}.<your-name-for-{me}>.<room>.vox:{port}/{name} -o {name}"
     );
     match (count, for_) {
         (Some(n), _) => println!("     stops after {n} fetch(es), or ^C"),

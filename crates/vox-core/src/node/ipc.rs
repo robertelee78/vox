@@ -1161,6 +1161,9 @@ pub enum Frame {
         room: String,
         /// `(service tag, local address)`, in the node's order.
         services: Vec<(String, String)>,
+        /// What every member shares in the room (V030-25): `(address, sharer, udp)`, each as
+        /// this node writes it.
+        shared: Vec<(String, String, bool)>,
     },
 }
 
@@ -1244,10 +1247,18 @@ impl Frame {
                     e.array(2).bytes(id).text(petname);
                 }
             }
-            Frame::Services { room, services } => {
-                e.array(3).uint(T_SERVICES).text(room).array(services.len());
+            Frame::Services {
+                room,
+                services,
+                shared,
+            } => {
+                e.array(4).uint(T_SERVICES).text(room).array(services.len());
                 for (tag, local) in services {
                     e.array(2).text(tag).text(local);
+                }
+                e.array(shared.len());
+                for (address, who, udp) in shared {
+                    e.array(3).text(address).text(who).uint(u64::from(*udp));
                 }
             }
         }
@@ -1668,7 +1679,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             }
             return Ok(Frame::Rooms { rooms });
         }
-        (T_SERVICES, 3) => {
+        (T_SERVICES, 4) => {
             let room = text(d, "ipc services room")?;
             let count = d
                 .array()
@@ -1683,7 +1694,30 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 }
                 services.push((text(d, "ipc service tag")?, text(d, "ipc service address")?));
             }
-            return Ok(Frame::Services { room, services });
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc shared array"))?;
+            let mut shared = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc shared row"))?
+                    != 3
+                {
+                    return Err(Error::MalformedIpc("ipc shared row arity"));
+                }
+                let address = text(d, "ipc shared address")?;
+                let who = text(d, "ipc shared sharer")?;
+                let udp = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc shared udp"))?
+                    != 0;
+                shared.push((address, who, udp));
+            }
+            return Ok(Frame::Services {
+                room,
+                services,
+                shared,
+            });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -2832,6 +2866,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     .iter()
                     .map(|(tag, local)| (tag.clone(), local.to_string()))
                     .collect(),
+                shared: handle.shared_in(channel_id).await.unwrap_or_default(),
             },
             None => Frame::Error {
                 reason: "room not open".into(),

@@ -767,6 +767,24 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
 /// The offered-services segment: `[version, [[tag, addr_text], …]]` in tag order (a
 /// `BTreeMap`, so the bytes are canonical). Addresses are the standard `ip:port`
 /// text, which round-trips exactly.
+/// A service shared in a room (V030-25), as the log says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    /// The member sharing it: the `<node>` of its address.
+    pub host: Digest32,
+    /// Its name, as its sharer gave it: the `<service>` of its address.
+    pub name: String,
+    /// Whether it carries datagrams (ADR-022).
+    pub udp: bool,
+}
+
+/// A service's name from its tag: a UDP service's tag is `udp/<name>` (ADR-022 decision 6), and
+/// the two transports share one namespace, as the address does.
+#[must_use]
+pub fn service_name(service_tag: &str) -> &str {
+    service_tag.strip_prefix("udp/").unwrap_or(service_tag)
+}
+
 fn services_bytes(services: &BTreeMap<String, SocketAddr>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(SERVICES_VERSION).array(services.len());
@@ -2322,9 +2340,13 @@ impl ChannelState {
 
     /// Offer `service_tag` at `local`, persisted under the channel's SEK so a restart
     /// still serves it — unless `persist` is false, when it lasts only until it is removed
-    /// or this node stops. Replacing an existing tag's address is allowed (that is how a
-    /// service moves). No capability is checked: offering a port of this machine is
+    /// or this node stops. No capability is checked: offering a port of this machine is
     /// configuration, not authorization (see the body).
+    ///
+    /// **A name is shared once** (V030-25): the tag is the `<service>` of
+    /// `<service>.<node>.<room>.vox`, so a second share under a name this node already shares
+    /// here — over either transport (`udp/<name>` is the same name) — is refused, naming the one
+    /// that holds it. A service moves by being removed and shared again.
     ///
     /// Returns whether this added a tag that was not offered before.
     pub fn add_service(
@@ -2350,8 +2372,16 @@ impl ChannelState {
         // anything. A non-creator simply could not serve. Found by the agent-comms session
         // hitting it from the file-exchange side, which is where it bit first.
         let _ = profile;
-        let fresh = !self.services.contains_key(service_tag);
-        if fresh && self.services.len() >= MAX_SERVICES {
+        let name = service_name(service_tag);
+        if let Some((_, at)) = self
+            .services
+            .iter()
+            .find(|(tag, _)| service_name(tag) == name)
+        {
+            return Err(Error::ServiceNameTaken(name.to_owned(), *at));
+        }
+        let fresh = true;
+        if self.services.len() >= MAX_SERVICES {
             return Err(Error::SizeLimitExceeded("channel services"));
         }
         self.services.insert(service_tag.to_owned(), local);
@@ -2362,6 +2392,59 @@ impl ChannelState {
         }
         self.persist_services(store)?;
         Ok(fresh)
+    }
+
+    /// Write this identity's statement that it shares `service_tag` in the room, or no longer
+    /// does (V030-25), so every member can list it. A transient offer (a file being handed over)
+    /// is not a share and is not announced.
+    pub fn say_share(
+        &mut self,
+        profile: &Profile,
+        service_tag: &str,
+        shared: bool,
+        now_secs: u64,
+    ) -> Result<()> {
+        let statement = crate::governance::share::ServiceShare::build(
+            profile.signer()?,
+            &self.channel_id,
+            self.epoch,
+            service_name(service_tag),
+            crate::tunnel::udp::is_udp(service_tag),
+            shared,
+        )?;
+        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        Ok(())
+    }
+
+    /// Whether `service_tag` is offered and persisted: a share, not a transient offer.
+    #[must_use]
+    pub fn is_shared(&self, service_tag: &str) -> bool {
+        self.services.contains_key(service_tag) && !self.transient.contains(service_tag)
+    }
+
+    /// The services shared in this room, by every member, as the log says (V030-25): for each
+    /// `(sharer, name)` the last statement its sharer made, kept when it says shared. A member
+    /// that has left shares nothing.
+    #[must_use]
+    pub fn shares(&self) -> Vec<Share> {
+        let left = self.left();
+        let mut last: BTreeMap<(Digest32, String), (u64, bool, bool)> = BTreeMap::new();
+        for g in &self.gov_entries {
+            let GovBody::ServiceShare(s) = &g.body else {
+                continue;
+            };
+            if s.body.author_id != g.author_id || s.body.channel_id != self.channel_id {
+                continue;
+            }
+            let key = (g.author_id, s.body.name.clone());
+            if last.get(&key).is_none_or(|(seq, _, _)| *seq < g.seq) {
+                last.insert(key, (g.seq, s.body.udp, s.body.shared));
+            }
+        }
+        last.into_iter()
+            .filter(|((host, _), (_, _, shared))| *shared && !left.contains(host))
+            .map(|((host, name), (_, udp, _))| Share { host, name, udp })
+            .collect()
     }
 
     /// Stop offering `service_tag`. Returns whether it was offered.

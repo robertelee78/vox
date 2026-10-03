@@ -52,9 +52,7 @@ fn empty_grant_slot(d: &mut Decoder<'_>) -> Result<()> {
     if d.array()? == 0 {
         Ok(())
     } else {
-        Err(Error::MalformedGovernance(
-            "a room made before v0.3.0 (its genesis carries a withdrawn service grant); recreate it",
-        ))
+        Err(Error::LogFormatBeforeV030)
     }
 }
 
@@ -379,7 +377,9 @@ impl Genesis {
             .uint(ttl)
             .uint(min_suite)
             .array(0)
-            .bytes(&creator_pubkey).array(1).uint(sign_algo);
+            .bytes(&creator_pubkey)
+            .array(1)
+            .uint(sign_algo);
         let body = GenesisBody::from_canonical_body(&be.finish())?;
 
         let sig_arr: [u8; crate::hash::COMPOSITE_SIG_LEN] = sig_bytes

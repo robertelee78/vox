@@ -78,10 +78,11 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle, req: NameReques
             let body = match handle.resolve_name(&name).await {
                 Ok(room) => {
                     let mut e = Encoder::new();
-                    e.array(3)
+                    e.array(4)
                         .uint(T_RESOLVED)
                         .bytes(&room.channel_id)
-                        .bytes(&room.host);
+                        .bytes(&room.host)
+                        .text(&room.service);
                     e.finish()
                 }
                 Err(why) => error(why),
@@ -161,11 +162,11 @@ fn reason(body: &[u8]) -> Error {
     }
 }
 
-/// Resolve `name` with the node at `path`: `(room, member)`.
+/// Resolve `name` with the node at `path`: `(room, member, service)`.
 ///
 /// # Errors
 /// If no node answers, or the name leads nowhere — with the node's reason.
-pub async fn resolve(path: &Path, name: &str) -> Result<(Digest32, Digest32)> {
+pub async fn resolve(path: &Path, name: &str) -> Result<(Digest32, Digest32, String)> {
     let mut stream = connect(path).await?;
     write_frame(
         &mut stream,
@@ -176,7 +177,7 @@ pub async fn resolve(path: &Path, name: &str) -> Result<(Digest32, Digest32)> {
         .await?
         .ok_or(Error::MalformedBundle("ipc closed before reply"))?;
     let mut d = Decoder::new(&body);
-    if let (Ok(3), Ok(T_RESOLVED)) = (d.array(), d.uint()) {
+    if let (Ok(4), Ok(T_RESOLVED)) = (d.array(), d.uint()) {
         let mut digest = || -> Result<Digest32> {
             Digest32::try_from(
                 d.bytes()
@@ -184,7 +185,12 @@ pub async fn resolve(path: &Path, name: &str) -> Result<(Digest32, Digest32)> {
             )
             .map_err(|_| Error::MalformedBundle("ipc naming"))
         };
-        return Ok((digest()?, digest()?));
+        let (room, host) = (digest()?, digest()?);
+        let service = d
+            .text()
+            .map_err(|_| Error::MalformedBundle("ipc naming"))?
+            .to_owned();
+        return Ok((room, host, service));
     }
     Err(reason(&body))
 }
