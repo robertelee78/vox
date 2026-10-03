@@ -774,6 +774,13 @@ fn row_json(
         "text": r.text,
         "owed": r.owed,
         "envelope": envelope,
+        // `envelope.to` as this reader names each addressee (PRD-001 R15): "you" for this node,
+        // its keyring name, or the fingerprint where it has none. Never a name another node gave.
+        "to_names": parsed.as_ref().ok().map(|e| {
+            e.to.iter()
+                .map(|t| crate::ident::recipients(std::slice::from_ref(t), crate::ident::me(), crate::ident::names()))
+                .collect::<Vec<_>>()
+        }).unwrap_or_default(),
         "parse_error": parse_error,
         "op": op,
     })
@@ -846,8 +853,18 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
             c => text.push(c),
         }
     }
+    // **Who it is addressed to, as this reader names them** (PRD-001 R15): the wire carries
+    // fingerprints, so the raw text alone shows a reader only those. Said on a line of its own,
+    // after the text, so the `<entry> <author> <text>` columns are unchanged; a line of the text
+    // cannot begin like it, since every further line of the text is behind `  | `.
+    let to = crate::agent_hook::addressed(&r.text, crate::ident::me(), crate::ident::names());
+    let to = if to.is_empty() {
+        String::new()
+    } else {
+        format!("\n  ({to})")
+    };
     format!(
-        "{} {} {}",
+        "{} {} {}{to}",
         id(&r.entry_hash),
         crate::ident::name_of(&r.author),
         text
