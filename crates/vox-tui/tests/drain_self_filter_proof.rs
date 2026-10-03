@@ -197,7 +197,9 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
         .expect("APPARATUS: create a staging directory");
     std::fs::write(
         project.join(".opencode/plugin/vox.js"),
-        vox_tui::agent_hook::OPENCODE_PLUGIN,
+        vox_tui::agent_hook::opencode_plugin(
+            &vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: the node name"),
+        ),
     )
     .expect("APPARATUS: write a staging file");
     let bin_dir = fixture.join("bin");
