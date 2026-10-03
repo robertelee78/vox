@@ -207,6 +207,16 @@ Decided 2026-09-25: build checkpoints now (M23.6).
   ceremony. A room made by vox before v0.3.0 MUST be refused when opened, with a plain reason that
   says to make the room again (`Fault::RoomFromBeforeV030`, `node/api.rs`).
 
+### Leaving and ending a room (decider, 2026-10-03)
+
+- **RL-8.1. Leave.** `vox room leave` MUST post the node's presence statement (`0x0015`) and MUST
+  delete the room from the node once another member has that statement (V210-164). *Built.*
+- **RL-8.2. End.** The room's creator, or an admin it delegated (ADR-007 G-5), MAY end the room. A room
+  that is ended MUST be deleted automatically on every member's node. *Decided, not built* (V030-08,
+  #244).
+- **RL-8.3.** There MUST NOT be a `vox room forget`: leaving and ending are the only ways a room
+  leaves a node.
+
 ## Proofs
 
 Each proof drives the shipped `vox` binary and has a mutation that turns it red (ADR-018).

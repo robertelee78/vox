@@ -49,6 +49,8 @@ only room governance is who sets the room's retention. This builds on identity (
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be
   refused as unknown. Policy updates beyond retention, passphrase rotation, invite modes and the
   capability lattice are removed (#380; `bind:`/`dial:` under #94, see Status).
+  *Decided 2026-10-03, not built:* the creator or an admin MAY also end the room, which deletes it on
+  every member's node (ADR-023 RL-8.2, #244).
 - **G-7.** A member that is not an admin MAY set a lower retention for its own node only, for one room;
   it MUST NOT set a retention higher than the room's. A node's retention value above the room's MUST be
   ignored (built: the effective retention is the shorter of the two, ADR-010 AR-30), with a warning

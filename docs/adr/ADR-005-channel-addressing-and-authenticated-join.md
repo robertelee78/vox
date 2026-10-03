@@ -90,8 +90,10 @@ readable: who reads whom is decided by trust (ADR-007).
   member cap (ADR-007 G-22).
 - **J-19. (M14.7c)** A node MUST hold a room's passphrase live while the room is open, because a CPace
   responder needs it at handshake time and nothing derived from it can stand in. It MUST be held in a
-  zeroizing buffer and wiped from memory on lock and on close. A daemon's set of open rooms keeps it
-  sealed at rest so the rooms reopen after a restart (#208; ADR-010).
+  zeroizing buffer and wiped from memory on lock and on close (under ADR-026, on detach and on close). A daemon's set of open rooms keeps it
+  sealed at rest so the rooms reopen after a restart (#208; ADR-010). *Decided, not built (ADR-026):*
+  the set is per node, and a node's rooms reopen when it attaches. A room passphrase given to a join
+  travels to the daemon over the control socket in a zeroizing buffer (ADR-026 C-6).
 
 ### §Post-join
 
