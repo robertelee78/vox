@@ -16,12 +16,19 @@
 //! A node that has the machine to itself (today's `vox daemon` and `vox serve`) runs on a presence
 //! of its own, made for it and closed with it.
 
+use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Semaphore};
 
 use crate::error::Result;
+use crate::hash::Digest32;
+use crate::nat::multiaddr::{EndpointList, Multiaddr};
+use crate::nat::portmap::PortMapping;
+use crate::node::circuitstream::CircuitLedger;
+use crate::node::nearby::{Entry, Nearby};
 use crate::identity::composite::RootSigner;
 use crate::transport::quic::{unix_now, SharedEndpoint, VoxConnection, VoxEndpoint};
 
@@ -111,11 +118,155 @@ fn lock_burst(b: &Mutex<Burst>) -> std::sync::MutexGuard<'_, Burst> {
     b.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// **The machine's one presence**: the shared endpoint and the gate in front of it.
+/// **The machine's one presence**: the shared endpoint and the gate in front of it, and what the
+/// daemon keeps once for every node on it (ADR-026 D-3, ADR-012 N-41–N-45): the addresses the
+/// ladder's publish side composed and the gateway mappings behind them, the reflexive addresses
+/// peers report, the relay ledger and the nearby group.
 pub struct NetPresence {
     shared: Arc<SharedEndpoint>,
     bursts: broadcast::Sender<HandshakeBurst>,
     accept: tokio::task::AbortHandle,
+    /// What every node on this presence advertises (ADR-012 N-46: one ip:port for all), composed
+    /// once per presence. `None` until the first discovery has run.
+    advertised: watch::Sender<Option<EndpointList>>,
+    /// The gateway mappings in force, renewed and retried per address family (N-43).
+    mapping: Mutex<Mapping>,
+    /// The task that discovers, maps and renews.
+    mapper: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Wakes the mapper for a discovery now.
+    rediscover: Arc<tokio::sync::Notify>,
+    /// What each peer reports as this presence's source address, by (the local node it reported
+    /// to, the reporter): one socket, so every node's reporters describe the same address
+    /// (ADR-012 rung 3, N-43). Never published.
+    observed: Mutex<BTreeMap<(Digest32, Digest32), Multiaddr>>,
+    /// The one relay ledger (N-45): the relay caps hold across every node on the presence.
+    ledger: Arc<CircuitLedger>,
+    /// The nearby group, opened for the first node that wants it (N-44), and what it hears, said
+    /// to every node.
+    nearby: Mutex<Option<NearbyGroup>>,
+}
+
+/// The nearby group of a presence: the socket, what it hears, and the task that hears it.
+struct NearbyGroup {
+    nearby: Arc<Nearby>,
+    heard: broadcast::Sender<(IpAddr, Vec<Entry>)>,
+    task: tokio::task::AbortHandle,
+}
+
+/// The gateway mappings of a presence, per address family (V210-75): `false` for the IPv4
+/// mapping, `true` for the IPv6 pinhole.
+#[derive(Default)]
+struct Mapping {
+    /// The mappings in force.
+    held: Vec<PortMapping>,
+    /// When each family's timed lease runs out (unix seconds). Until then its mapped address is
+    /// still advertised, even while its renewal is failing.
+    expires: BTreeMap<bool, u64>,
+    /// The wait set after the last renewal that got nothing back for a family, doubling from
+    /// [`MAPPING_RETRY_SECS`] to [`MAPPING_RETRY_MAX_SECS`].
+    retry: BTreeMap<bool, u64>,
+}
+
+/// The first wait before a port-mapping renewal that got nothing back is tried again (V210-75),
+/// doubling to [`MAPPING_RETRY_MAX_SECS`]. A gateway that is restarting, or a request lost on
+/// the way, must not end renewal for the life of the presence.
+const MAPPING_RETRY_SECS: u64 = 15;
+
+/// The longest wait between retries of a failed port-mapping renewal.
+const MAPPING_RETRY_MAX_SECS: u64 = 600;
+
+/// When `mappings` must be renewed: half the shortest timed lifetime, the interval RFC 6887
+/// §11.2.1 recommends. `None` if none is timed.
+fn renew_at(now: u64, mappings: &[PortMapping]) -> Option<u64> {
+    mappings
+        .iter()
+        .map(|m| m.lifetime_secs)
+        .filter(|l| *l > 0)
+        .min()
+        // `max(2)` keeps the interval at one second or more.
+        .map(|l| now + u64::from(l.max(2) / 2))
+}
+
+/// Whether a mapping is the IPv6 pinhole (`true`) rather than the IPv4 mapping.
+fn mapping_is_v6(m: &PortMapping) -> bool {
+    m.method == crate::nat::portmap::Method::PcpV6Pinhole
+}
+
+impl Mapping {
+    /// Take what a discovery or a renewal was granted, **per address family** (V210-75), and say
+    /// when the next renewal or retry is due.
+    ///
+    /// A family granted again is held anew and renewed at half its lease. A family that was held,
+    /// or was already being retried, and got nothing back this time is retried after a backoff of
+    /// its own, and its mapping is kept, and still advertised, until its lease runs out: the
+    /// gateway most likely still holds it, and a lost reply is not a withdrawn mapping. The next
+    /// try is never later than that lease's end. A permanent grant (lifetime zero) is never
+    /// re-requested; it is deleted when the presence closes.
+    fn take(&mut self, fresh: &[PortMapping], now: u64) -> Option<u64> {
+        let mut held = Vec::new();
+        let mut due: Option<u64> = None;
+        let mut sooner = |at: u64| due = Some(due.map_or(at, |d| d.min(at)));
+        for v6 in [false, true] {
+            let granted = fresh.iter().find(|m| mapping_is_v6(m) == v6).copied();
+            let had = self.held.iter().find(|m| mapping_is_v6(m) == v6).copied();
+            if let Some(m) = granted {
+                held.push(m);
+                self.retry.remove(&v6);
+                if m.lifetime_secs > 0 {
+                    self.expires.insert(v6, now + u64::from(m.lifetime_secs));
+                    if let Some(at) = renew_at(now, &[m]) {
+                        sooner(at);
+                    }
+                } else {
+                    self.expires.remove(&v6);
+                }
+                continue;
+            }
+            if let Some(m) = had.filter(|m| m.lifetime_secs == 0) {
+                held.push(m);
+                continue;
+            }
+            if had.is_none() && !self.retry.contains_key(&v6) {
+                continue; // never granted: no gateway for this family, nothing to keep alive
+            }
+            let wait = (self.retry.get(&v6).copied().unwrap_or(0) * 2)
+                .clamp(MAPPING_RETRY_SECS, MAPPING_RETRY_MAX_SECS);
+            self.retry.insert(v6, wait);
+            let mut at = now + wait;
+            match (had, self.expires.get(&v6).copied()) {
+                (Some(m), Some(expires)) if now < expires => {
+                    held.push(m);
+                    at = at.min(expires);
+                }
+                _ => {
+                    self.expires.remove(&v6);
+                }
+            }
+            sooner(at);
+        }
+        self.held = held;
+        due
+    }
+
+    /// The mappings whose lease has not run out, offered again at a renewal so a family whose
+    /// renewal fails is still advertised at its mapped address until the lease ends.
+    fn leased(&self, now: u64) -> Vec<PortMapping> {
+        self.held
+            .iter()
+            .filter(|m| {
+                m.lifetime_secs == 0
+                    || self
+                        .expires
+                        .get(&mapping_is_v6(m))
+                        .is_some_and(|at| now < *at)
+            })
+            .copied()
+            .collect()
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// A node's attachment to a [`NetPresence`]: its view of the endpoint, and the connections
@@ -133,11 +284,172 @@ impl NetPresence {
     pub fn start(shared: Arc<SharedEndpoint>) -> Arc<Self> {
         let (bursts, _) = broadcast::channel(16);
         let accept = spawn_accept_loop(Arc::clone(&shared), bursts.clone());
-        Arc::new(Self {
+        let presence = Arc::new(Self {
             shared,
             bursts,
             accept,
-        })
+            advertised: watch::channel(None).0,
+            mapping: Mutex::new(Mapping::default()),
+            mapper: Mutex::new(None),
+            rediscover: Arc::new(tokio::sync::Notify::new()),
+            observed: Mutex::new(BTreeMap::new()),
+            ledger: Arc::new(CircuitLedger::default()),
+            nearby: Mutex::new(None),
+        });
+        let mapper = spawn_mapper(Arc::downgrade(&presence));
+        *lock(&presence.mapper) = Some(mapper);
+        presence
+    }
+
+    /// Bind a presence on `addr` **keeping its port** (V210-167, ADR-012 N-42): the port in
+    /// `port_file` (else in `fallback`) is bound again, so the address records every node
+    /// published stay valid. A first start records the port it was given; if another program
+    /// holds the kept port, another is bound for this run, the file keeps the old one, and the
+    /// second value says so. A port given explicitly is bound as given and not recorded.
+    ///
+    /// # Errors
+    /// As [`SharedEndpoint::bind`].
+    pub fn bind_kept(
+        addr: std::net::SocketAddr,
+        port_file: &std::path::Path,
+        fallback: Option<&std::path::Path>,
+    ) -> Result<(Arc<SharedEndpoint>, Option<String>)> {
+        if addr.port() != 0 {
+            return Ok((SharedEndpoint::bind(addr)?, None));
+        }
+        let read_port = |f: &std::path::Path| {
+            std::fs::read_to_string(f)
+                .ok()
+                .and_then(|t| t.trim().parse::<u16>().ok())
+                .filter(|p| *p != 0)
+        };
+        let kept = read_port(port_file).or_else(|| fallback.and_then(read_port));
+        let Some(port) = kept else {
+            let endpoint = SharedEndpoint::bind(addr)?;
+            if let Ok(at) = endpoint.local_addr() {
+                let _ = crate::node::paths::write_private_file(
+                    port_file,
+                    format!("{}\n", at.port()).as_bytes(),
+                );
+            }
+            return Ok((endpoint, None));
+        };
+        let why = match SharedEndpoint::bind(std::net::SocketAddr::new(addr.ip(), port)) {
+            Ok(endpoint) => return Ok((endpoint, None)),
+            Err(crate::error::Error::LocalBind {
+                cause: crate::error::BindCause::InUse,
+                ..
+            }) => "another program holds it".to_owned(),
+            Err(e) => e.to_string(),
+        };
+        let endpoint = SharedEndpoint::bind(addr)?;
+        let now = endpoint
+            .local_addr()
+            .map_or_else(|_| "another".to_owned(), |a| a.port().to_string());
+        Ok((
+            endpoint,
+            Some(format!(
+                "this node's port {port} is not free ({why}), so it listens on port {now} this run"
+            )),
+        ))
+    }
+
+    /// What every node on this presence advertises, as a watch: `None` until the first discovery
+    /// has run, then each new composition.
+    #[must_use]
+    pub fn advertised(&self) -> watch::Receiver<Option<EndpointList>> {
+        self.advertised.subscribe()
+    }
+
+    /// What every node on this presence advertises now, if a discovery has run.
+    #[must_use]
+    pub fn advertised_now(&self) -> Option<EndpointList> {
+        self.advertised.borrow().clone()
+    }
+
+    /// The gateway mappings in force.
+    #[must_use]
+    pub fn port_mappings(&self) -> Vec<PortMapping> {
+        lock(&self.mapping).held.clone()
+    }
+
+    /// Run the ladder's publish side again now (a node's network changed).
+    pub fn rediscover(&self) {
+        self.rediscover.notify_one();
+    }
+
+    /// Remember what `reporter`, asked by the local node `local`, said this presence's source
+    /// address is.
+    pub fn note_observed(&self, local: Digest32, reporter: Digest32, addr: Multiaddr) {
+        lock(&self.observed).insert((local, reporter), addr);
+    }
+
+    /// Forget what `reporter` told `local` (its connection is gone).
+    pub fn forget_observed(&self, local: &Digest32, reporter: &Digest32) {
+        lock(&self.observed).remove(&(*local, *reporter));
+    }
+
+    /// The address the reporters agree they see for this presence, if any: the one most report,
+    /// counting each reporter once whichever node it told.
+    #[must_use]
+    pub fn observed_addr(&self) -> Option<Multiaddr> {
+        let observed = lock(&self.observed);
+        let mut by_reporter: BTreeMap<Digest32, Multiaddr> = BTreeMap::new();
+        for ((_, reporter), addr) in observed.iter() {
+            by_reporter.insert(*reporter, *addr);
+        }
+        let mut tally: Vec<(Multiaddr, usize)> = Vec::new();
+        for addr in by_reporter.values() {
+            match tally.iter_mut().find(|(a, _)| a == addr) {
+                Some((_, n)) => *n += 1,
+                None => tally.push((*addr, 1)),
+            }
+        }
+        tally.into_iter().max_by_key(|(_, n)| *n).map(|(a, _)| a)
+    }
+
+    /// Discard every reflexive address, so the next punch asks again: they are true only of the
+    /// network the machine was on when they were asked.
+    pub fn refresh_observed(&self) {
+        lock(&self.observed).clear();
+    }
+
+    /// The one relay ledger of this presence (ADR-012 N-45).
+    #[must_use]
+    pub fn ledger(&self) -> &Arc<CircuitLedger> {
+        &self.ledger
+    }
+
+    /// The nearby group (ADR-012 N-44), opened once for the first node that asks, and what it
+    /// hears from now on. `None` if the group cannot be opened here.
+    pub fn nearby(&self) -> Option<(Arc<Nearby>, broadcast::Receiver<(IpAddr, Vec<Entry>)>)> {
+        let mut group = lock(&self.nearby);
+        if group.is_none() {
+            let nearby = Arc::new(Nearby::open().ok()?);
+            let (heard, _) = broadcast::channel(64);
+            let (hear, tx) = (Arc::clone(&nearby), heard.clone());
+            let task = tokio::spawn(async move {
+                while let Ok(said) = hear.hear().await {
+                    let _ = tx.send(said);
+                }
+            })
+            .abort_handle();
+            *group = Some(NearbyGroup {
+                nearby,
+                heard,
+                task,
+            });
+        }
+        group
+            .as_ref()
+            .map(|g| (Arc::clone(&g.nearby), g.heard.subscribe()))
+    }
+
+    /// **A node gone without detaching** — its actor panicked (ADR-026 L-6): take it off the
+    /// exchange and close every connection it had, as stopping. Nothing of any other node's is
+    /// touched.
+    pub fn evict(&self, local: &Digest32) {
+        self.shared.evict(local);
     }
 
     /// Bind a presence on `addr` ([`SharedEndpoint::bind`]).
@@ -178,6 +490,26 @@ impl NetPresence {
     /// connection on it close, and the closes are given a moment to leave.
     pub async fn close(&self) {
         self.accept.abort();
+        if let Some(mapper) = lock(&self.mapper).take() {
+            mapper.abort();
+        }
+        if let Some(g) = lock(&self.nearby).take() {
+            g.task.abort();
+        }
+        // A UPnP mapping the router granted only *permanently* (lifetime 0) would outlive the
+        // presence: it is deleted, best-effort, on its own task. Timed mappings of every kind
+        // expire by themselves (N-43: the daemon's stop unmaps; a node's detach never does).
+        for m in std::mem::take(&mut lock(&self.mapping).held) {
+            if m.method == crate::nat::portmap::Method::UpnpIgd && m.lifetime_secs == 0 {
+                tokio::spawn(async move {
+                    let _ = crate::nat::portmap::unmap_port_upnp(
+                        crate::nat::portmap::Protocol::Udp,
+                        m.internal_port,
+                    )
+                    .await;
+                });
+            }
+        }
         self.shared.close();
         let _ = tokio::time::timeout(CLOSE_FLUSH, self.shared.wait_idle()).await;
     }
@@ -186,7 +518,57 @@ impl NetPresence {
 impl Drop for NetPresence {
     fn drop(&mut self) {
         self.accept.abort();
+        if let Some(mapper) = lock(&self.mapper).take() {
+            mapper.abort();
+        }
+        if let Some(g) = lock(&self.nearby).take() {
+            g.task.abort();
+        }
     }
+}
+
+/// **The presence's publish side** (ADR-012, N-43): compose what its nodes advertise — routable
+/// addresses, a gateway-mapped one when one can be had, loopback — once for the presence, then
+/// renew each granted mapping at half its lease and retry a family that got nothing back, until
+/// the presence goes. A node asking for a discovery ([`NetPresence::rediscover`]) wakes it early.
+fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        let mut leased: Vec<PortMapping> = Vec::new();
+        loop {
+            let (bound, wake) = {
+                let Some(p) = presence.upgrade() else { return };
+                let Ok(bound) = p.shared.local_addr() else {
+                    return;
+                };
+                (bound, Arc::clone(&p.rediscover))
+            };
+            let (list, granted) =
+                crate::nat::reachability::advertise_endpoints(bound, &leased).await;
+            let due = {
+                let Some(p) = presence.upgrade() else { return };
+                let now = unix_now();
+                let due = {
+                    let mut m = lock(&p.mapping);
+                    let due = m.take(&granted, now);
+                    leased = m.leased(now);
+                    due
+                };
+                p.advertised.send_replace(Some(list));
+                due
+            };
+            match due {
+                Some(at) => {
+                    let wait = Duration::from_secs(at.saturating_sub(unix_now()).max(1));
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        () = wake.notified() => {}
+                    }
+                }
+                None => wake.notified().await,
+            }
+        }
+    })
+    .abort_handle()
 }
 
 /// **The accept loop and its gate**, moved here from the node (it was `actor::spawn_accept_loop`):

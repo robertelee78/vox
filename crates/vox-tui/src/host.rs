@@ -724,6 +724,15 @@ impl Router {
         cause: DetachCause,
     ) {
         let _ = a.detached.send(true);
+        // A panicked actor never ran its own stop (ADR-026 L-6): the presence takes the node off
+        // the exchange and closes its connections, and only its own (D-5).
+        if matches!(cause, DetachCause::Panicked(_)) {
+            if let (Some(fp), Some(Bind::Shared(presence))) =
+                (a.fingerprint, (self.inner.defaults.bind)(&node))
+            {
+                presence.evict(&fp);
+            }
+        }
         if let Some(tasks) = a.tasks.take() {
             tasks.stop().await;
         }
