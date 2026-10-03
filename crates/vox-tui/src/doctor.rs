@@ -103,7 +103,7 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
         Ok(c) => {
             checks.push(ok(
                 "node",
-                format!("the node answers at {}", paths.socket_file().display()),
+                format!("the node answers at {}", paths.account().socket().display()),
             ));
             Some(c)
         }

@@ -1295,15 +1295,9 @@ async fn drain(
     raw_input: &str,
     format: Format,
 ) -> Result<(), AppError> {
-    let sock = paths.socket_file();
-    if !sock.exists() {
-        return Err(AppError::Usage(
-            "no node is running for this profile, so there is nothing to read".into(),
-        ));
-    }
-    let mut client = IpcClient::open(&sock)
-        .await
-        .map_err(|e| AppError::Usage(e.to_string()))?;
+    // Over the account socket as this node, which the session's registration attached (ADR-026
+    // C-1, N-6): never attaching anything itself.
+    let mut client = crate::client::open(&crate::client::one_shot(paths)?).await?;
     let me = client.me();
     if me.is_none() {
         return Err(AppError::Usage(

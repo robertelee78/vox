@@ -160,7 +160,8 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             anchor_specs: args.profile.anchors.clone(),
             listen: args.profile.listen.to_string(),
             patience: shutdown_patience(),
-            node_sockets: true,
+            // Every client speaks to the account socket (#406): no node serves one of its own.
+            node_sockets: false,
         },
     );
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
@@ -253,10 +254,8 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
 /// The node `vox daemon` was named (C-3's first step): `--node` / `VOX_NODE`, or a `--profile`
 /// other than the default while the clients still pass it.
 fn named_node(args: &DaemonArgs) -> Result<Option<NodeName>, AppError> {
-    let given = args.node.clone().or_else(|| {
-        (args.profile.profile != DEFAULT_PROFILE).then(|| args.profile.profile.clone())
-    });
-    given
+    args.node
+        .clone()
         .map(|n| NodeName::parse(&n).map_err(|e| AppError::Usage(e.to_string())))
         .transpose()
 }

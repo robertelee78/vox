@@ -1011,6 +1011,42 @@ impl DaemonClient {
     }
 }
 
+/// The nodes the daemon at `path` has attached, read from its hello with a plain blocking
+/// connection, so a caller with no runtime, or on a blocking thread, can ask; none when nothing
+/// answers within `wait`. Nothing is sent: the hello names no secret, and a socket that is not
+/// this user's is not read.
+#[must_use]
+pub fn attached_nodes(path: &std::path::Path, wait: std::time::Duration) -> Vec<NodeName> {
+    use std::io::Read as _;
+    if crate::node::paths::check_socket_owner(path).is_err() {
+        return Vec::new();
+    }
+    let Ok(mut s) = std::os::unix::net::UnixStream::connect(path) else {
+        return Vec::new();
+    };
+    let _ = s.set_read_timeout(Some(wait));
+    let mut len = [0u8; 4];
+    if s.read_exact(&mut len).is_err() {
+        return Vec::new();
+    }
+    let len = u32::from_be_bytes(len) as usize;
+    if len > crate::node::ipc::MAX_FRAME {
+        return Vec::new();
+    }
+    let mut body = vec![0u8; len];
+    if s.read_exact(&mut body).is_err() {
+        return Vec::new();
+    }
+    match DaemonFrame::from_bytes(&body) {
+        Ok(DaemonFrame::Hello { attached, .. }) => attached
+            .into_iter()
+            .filter(|n| n.state == NodeState::Attached)
+            .map(|n| n.name)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

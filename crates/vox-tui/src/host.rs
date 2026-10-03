@@ -319,6 +319,8 @@ impl Router {
             hold: g
                 .hold
                 .map(|h| Box::new(h) as Box<dyn std::any::Any + Send + Sync>),
+            // `vox lan up`: the daemon asks the root helper for the device itself (S-5).
+            extension: Some(std::sync::Arc::new(crate::lan_cli::LanUp)),
         })
     }
 

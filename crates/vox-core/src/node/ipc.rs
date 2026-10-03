@@ -2412,6 +2412,7 @@ pub const ACTOR_WITHIN: std::time::Duration = std::time::Duration::from_secs(60)
 /// (V210-83). A node that is merely slow at this request answers both, and is waited for.
 async fn while_answering<T>(
     path: &Path,
+    node: Option<&crate::node::paths::NodeName>,
     exchange: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::pin!(exchange);
@@ -2422,15 +2423,22 @@ async fn while_answering<T>(
             out = &mut exchange => return out,
             alive = async {
                 tokio::time::sleep(ANSWER_WITHIN).await;
-                still_answering(path).await
+                still_answering(path, node).await
             } => alive?,
         }
     }
 }
 
 /// Whether the node at `path` greets a new connection and its actor answers a ping, or why not.
-async fn still_answering(path: &Path) -> Result<()> {
-    let mut probe = match IpcClient::open(path).await {
+/// On the daemon's socket the new connection uses `node`, never attaching it.
+async fn still_answering(path: &Path, node: Option<&crate::node::paths::NodeName>) -> Result<()> {
+    let opened = match node {
+        Some(node) => {
+            IpcClient::open_at(&NodeSocket::one_shot(path.to_owned(), node.clone())).await
+        }
+        None => IpcClient::open(path).await,
+    };
+    let mut probe = match opened {
         Ok(c) => c,
         Err(Error::Ipc(IpcHandshake::Silent { secs })) => {
             return Err(Error::Ipc(IpcHandshake::StoppedAnswering { secs }))
@@ -2638,7 +2646,7 @@ async fn serve_client(mut stream: UnixStream, handle: NodeHandle) {
     )
     .await;
     if greeted.is_ok() {
-        let _ = serve_requests(stream, &handle, &mut held, None).await;
+        let _ = serve_requests(stream, &handle, &mut held, None, None).await;
     }
     held.release(&handle).await;
 }
@@ -2668,6 +2676,7 @@ async fn serve_requests(
         crate::node::paths::NodeName,
         tokio::sync::watch::Receiver<bool>,
     )>,
+    extension: Option<std::sync::Arc<dyn Extension>>,
 ) -> Result<()> {
     let (node, mut watch) = match detached.take() {
         Some((node, rx)) => (Some(node), Some(rx)),
@@ -2698,6 +2707,15 @@ async fn serve_requests(
         // a join is the end of the join — it was still there when the lock reported done.
         // Measured through the shipped binary both times: one copy of a join's room passphrase.
         let body = zeroize::Zeroizing::new(body);
+        // ADR-026 S-5: a request the daemon serves itself takes the connection for good.
+        if let Some(ext) = extension.as_ref().filter(|e| e.claims(&body)) {
+            let serving = ext.serve(body.to_vec(), stream, handle.clone());
+            tokio::select! {
+                () = serving => {}
+                () = node_detached(&mut watch) => {}
+            }
+            return Ok(());
+        }
         // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
         if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
             let served = tokio::select! {
@@ -2804,6 +2822,23 @@ pub struct Lease {
     /// What the connection holds of the node (L-3, L-7): dropped when the connection ends, after
     /// what it opened is withdrawn, which may detach a node attached implicitly.
     pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// A request the daemon serves itself, beyond the node's vocabulary, if it has one.
+    pub extension: Option<std::sync::Arc<dyn Extension>>,
+}
+
+/// A request the daemon's own build serves on a node's connection, beyond what this crate knows:
+/// `vox lan up`, whose device comes from a root helper the daemon asks as its user (ADR-026 S-5).
+/// It takes the connection for the rest of its life, as an app request does.
+pub trait Extension: Send + Sync + 'static {
+    /// Whether `body`, a frame the client sent, is this extension's request.
+    fn claims(&self, body: &[u8]) -> bool;
+    /// Serve the request in `body` on `stream` as the node `handle`, until the client goes.
+    fn serve(
+        &self,
+        body: Vec<u8>,
+        stream: UnixStream,
+        handle: NodeHandle,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 }
 
 /// What the account socket asks of the daemon: implemented by its router.
@@ -2952,6 +2987,7 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
         handle,
         detached,
         hold,
+        extension,
     } = lease;
     let using = crate::node::daemonipc::DaemonFrame::Using {
         node: node.clone(),
@@ -2960,7 +2996,14 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
     let mut held = Held::default();
     if wrote.is_ok() {
-        let _ = serve_requests(stream, &handle, &mut held, Some((node, detached.clone()))).await;
+        let _ = serve_requests(
+            stream,
+            &handle,
+            &mut held,
+            Some((node, detached.clone())),
+            extension,
+        )
+        .await;
     }
     // A detached node has nothing left to withdraw from: its actor has stopped.
     if !*detached.borrow() {
@@ -3873,6 +3916,82 @@ pub struct IpcClient {
     me: Option<Digest32>,
     /// Where the node listens, so a request that waits can check it is still answering.
     path: PathBuf,
+    /// The node this connection acts as on the daemon's socket (ADR-026 C-2), which a check on a
+    /// waiting request names in its own `Use`; `None` for a node's own socket.
+    node: Option<crate::node::paths::NodeName>,
+}
+
+/// Where a client of the daemon reaches its node (ADR-026 C-2): the account's one socket, and the
+/// `Use` every connection to it opens with. A CLI process acts as one node, so every connection it
+/// makes carries the same `Use`.
+#[derive(Clone)]
+pub struct NodeSocket {
+    /// `<data root>/.daemon/vox.sock`.
+    pub path: PathBuf,
+    /// What each connection opens with.
+    pub using: crate::node::daemonipc::UseNode,
+}
+
+impl std::fmt::Debug for NodeSocket {
+    // Not derived: the `Use` may carry a passphrase.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeSocket")
+            .field("path", &self.path)
+            .field("node", &self.using.node)
+            .field("attach", &self.using.attach)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeSocket {
+    /// A one-shot verb's socket: the node must be attached already (ADR-026 L-2).
+    #[must_use]
+    pub fn one_shot(path: PathBuf, node: crate::node::paths::NodeName) -> Self {
+        Self {
+            path,
+            using: crate::node::daemonipc::UseNode {
+                node,
+                attach: crate::node::daemonipc::AttachMode::No,
+                passphrase: None,
+                anchors: Vec::new(),
+            },
+        }
+    }
+
+    /// The same node, for a connection that must not attach it: what a check on a waiting request
+    /// opens, and every connection after the first of a held verb, whose first holds it.
+    #[must_use]
+    pub fn attached_only(&self) -> Self {
+        Self::one_shot(self.path.clone(), self.using.node.clone())
+    }
+}
+
+/// Open a connection to the daemon at `at.path` acting as `at.using.node`: read the daemon's hello,
+/// send the `Use`, and read `Using`. Returns the connection, ready for node-level requests, and the
+/// node's fingerprint.
+///
+/// # Errors
+/// As [`crate::node::daemonipc::DaemonClient::open`]; [`IpcHandshake::Refused`], in the daemon's
+/// words, when it refuses the `Use`; [`IpcHandshake::NotHello`] for any other answer.
+pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> {
+    use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
+    let DaemonClient { mut stream, .. } = DaemonClient::open(&at.path).await?;
+    // Wiped once sent: it may carry the identity passphrase (C-6).
+    let opening = zeroize::Zeroizing::new(Opening::Use(at.using.clone()).to_bytes());
+    if let Err(e) = write_frame(&mut stream, &opening).await {
+        return Err(named(&at.path, e).await);
+    }
+    drop(opening);
+    let Some(answer) = read_frame(&mut stream).await? else {
+        return Err(hung_up(&at.path).await);
+    };
+    match DaemonFrame::from_bytes(&answer)? {
+        DaemonFrame::Using { me, .. } => Ok((stream, me)),
+        DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
+            reason: r.to_string(),
+        })),
+        _ => Err(Error::Ipc(IpcHandshake::NotHello)),
+    }
 }
 
 /// Connect to the control socket at `path` only if it is this user's own (V210-72).
@@ -3972,10 +4091,11 @@ impl IpcClient {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         match DaemonFrame::from_bytes(&answer)? {
-            DaemonFrame::Using { me, .. } => Ok(Ok(Self {
+            DaemonFrame::Using { me, node } => Ok(Ok(Self {
                 stream,
                 me,
                 path: path.to_owned(),
+                node: Some(node),
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
@@ -4025,6 +4145,21 @@ impl IpcClient {
             stream,
             me,
             path: path.to_owned(),
+            node: None,
+        })
+    }
+
+    /// Connect to the daemon at `at` acting as its node ([`open_as`]).
+    ///
+    /// # Errors
+    /// As [`open_as`].
+    pub async fn open_at(at: &NodeSocket) -> Result<Self> {
+        let (stream, me) = open_as(at).await?;
+        Ok(Self {
+            stream,
+            me,
+            path: at.path.clone(),
+            node: Some(at.using.node.clone()),
         })
     }
 
@@ -4041,7 +4176,9 @@ impl IpcClient {
     /// whether it is still greeting and its actor still taking commands ([`ACTOR_WITHIN`]), and
     /// the request fails, naming which, once it is not.
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
-        let Self { stream, path, .. } = self;
+        let Self {
+            stream, path, node, ..
+        } = self;
         let exchange = async {
             // Wiped once sent: it may carry a passphrase (V210-94).
             if let Err(e) = write_frame(stream, &zeroize::Zeroizing::new(req.to_bytes())).await {
@@ -4052,7 +4189,7 @@ impl IpcClient {
             };
             Frame::from_bytes(&body)
         };
-        while_answering(path, exchange).await
+        while_answering(path, node.as_ref(), exchange).await
     }
 
     /// Every row after `since`, however many replies that takes — as one
