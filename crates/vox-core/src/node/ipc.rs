@@ -4204,6 +4204,9 @@ mod account_socket_tests {
         assert!(super::admitted(Some(501), 501));
         assert!(!super::admitted(Some(502), 501));
         assert!(!super::admitted(None, 501));
-        assert!(!super::admitted(Some(0), 0));
+        assert!(
+            !super::admitted(Some(0), 0),
+            "PRODUCT: the account socket admitted uid 0"
+        );
     }
 }
