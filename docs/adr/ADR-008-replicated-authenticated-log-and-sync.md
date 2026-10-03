@@ -1,459 +1,378 @@
 # ADR-008: Replicated Authenticated Log and Sync
 
-**Status**: implemented (M5, `crates/vox-core/src/log/`)
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: Accepted. Built on integrate/v0.3.0 (`crates/vox-core/src/log/`,
+`crates/vox-core/src/node/syncstream.rs`, `crates/vox-core/src/wire.rs`), except where a
+requirement says otherwise. Not built: range reconciliation over the network (LS-27), the personal
+self-channel's runtime (LS-43), and recording a fork proof as a room entry (LS-35). The golden-vector
+obligation (LS-20) is unmet.
 **Date**: 2026-06-19
-**Updated**: 2026-09-19 — Implementation notes (M5) added; acceptance order fixed so equivocation is classified only after admission + authenticator verification; self-channel KDF errors propagate. 2026-09-20 — struct tag `0x0012` (member-bundle-record, ADR-016 M14.1) appended to the registry; the golden-vector range is now `0x0001–0x0012`; sync runs over QUIC with a real `kind_for` and a documented author-admission precondition (M14.6). 2026-09-24 — PRD-001 R5: a node answers a sync session for a room only from that room's members and anchors (§"Who is served"). 2026-09-24 — PRD-001 R1/R3: the per-author quota is **removed** (wire code `0x06` reserved). See §"Abuse resistance" and the 2026-09-24 Implementation note. 2026-09-24 — PRD-001 D2/R4: a `WANT` is served clamped to what is held, merged, and bounded per session (see the 2026-09-24 Implementation note). 2026-09-24 — ADR-023 M23.2: the skeleton gains `claimed_ms` and `seen`, and the room has one order (§"Cross-author edges and the one order"). 2026-09-25 — ADR-023 M23.6: checkpoints and shed signatures (authenticator type `0`, struct tag `0x0016`; `0x0015` is v0.2.10's presence statement).
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, merkle-dag, crdt, sync, anti-entropy, render-gating
 
 ## Context
 
-Vox needs both asynchronous and interactive messaging with a replicated, authenticated message
-store (ADR-001). The store must: replicate ciphertext a node cannot decrypt and simply not render
-it (the data-side of per-sender consent, ADR-007); preserve integrity and causal ordering; support
-both signed (attributable) and MAC-based (deniable) entries (ADR-009); honor admin TTL (ADR-010);
-and carry consent + certificate state consistently under partition. The author described it as
-"blockchain-like" but explicitly wants the *right* primitive, not a consensus blockchain.
+Vox carries asynchronous and interactive messaging over one replicated, authenticated message store
+(ADR-001). The store has to replicate ciphertext a node cannot decrypt without rendering it, keep
+integrity and causal order, let retention drop bodies (ADR-010, ADR-023), and carry governance state
+consistently under partition. The decider asked for something "blockchain-like", but for the right
+primitive, not a consensus blockchain. Messaging needs per-feed integrity and a causal merge, which a
+CRDT-style DAG gives with strong eventual consistency and availability under partition, with no
+consensus (shown for the Matrix Event Graph, arXiv 2011.06488). That result assumes
+honest-but-unreliable replicas. Resistance to adversarial authors (equivocation, Sybil, withholding)
+comes from per-author signatures, membership (ADR-007) and the fork handling below, not from the DAG.
 
-## Decision
+## Requirements
 
-**Per-author hash-linked logs merged into a Merkle-DAG.** Each identity owns a single-writer,
-append-only, hash-linked log (Secure Scuttlebutt / Hypercore style); logs merge across authors
-into a causally-ordered Merkle-DAG (a CRDT for causal histories). This gives tamper-evidence and
-*causal* (not total) ordering with Strong Eventual Consistency and availability under partition.
+### Decision: per-author logs merged into a Merkle-DAG
 
-**Explicitly NOT a consensus blockchain.** A blockchain exists to impose a single global total
-order among mutually-untrusting writers (PoW/PoS cost; BFT only n>3f). Messaging needs only
-per-feed integrity + causal merge, which a CRDT-style DAG delivers with Strong Eventual Consistency
-and availability under partition, with no consensus (proven for the Matrix Event Graph, arXiv
-2011.06488). No mining, no global order. This convergence result assumes honest-but-unreliable
-replicas; resistance to *adversarial* authors — equivocation, Sybil, withholding — comes from
-per-author signatures, membership/consent (ADR-007), and the fork handling below, **not** from the
-DAG alone (so no unqualified "n>f Byzantine" claim is made).
+- **LS-1.** Each identity MUST own, per room, a single-writer, append-only, hash-linked log (Secure
+  Scuttlebutt / Hypercore style). The logs of a room's authors MUST merge into a causally ordered
+  Merkle-DAG.
+- **LS-2.** Vox MUST NOT use a consensus blockchain: no mining, no proof of work or stake for
+  ordering, no agreed global order. The room's order (LS-11) is computed from the entry set, never
+  agreed.
+- **LS-3. Render-gating = replicate-all, decrypt-what-you-can.** Ciphertext MUST replicate to every
+  member that syncs the room, whoever can read it. A node MUST attempt decryption and render an entry
+  only when decryption succeeds. Trust decides which keys a node holds (ADR-006, ADR-007); the log
+  replicates everything.
 
-**Render-gating = replicate-all, decrypt-what-you-can.** Ciphertext replicates to all interested
-members regardless of who can read it; a node attempts decryption and renders only on success.
-This is exactly how per-sender consent (ADR-007) manifests in storage: consent decides which keys
-you hold; the log replicates everything.
+### Entry format
 
-**Concrete entry format (Bamboo-derived, no external log dependency).** A Vox log entry is a signed
-struct:
-`{ author_id, seq (per-author, strictly monotonic from 1), prev_hash, lipmaa_backlink, channelID,
-epoch, algo_ids, payload_hash, payload_len, end_of_feed_flag, claimed_ms, seen }`, authenticated **per entry type**
-(see "Per-entry-type authentication" below): governance/control entries are *always* composite
-Ed25519+ML-DSA root-signed (in every channel); message-content entries are composite-signed in
-attributable channels and authenticated by the ADR-009 deniable authenticator in deniable channels.
-The authenticator is computed over all preceding fields. Because the signature commits to the *payload hash*,
-not the bytes, a peer can delete old payload bodies (honoring admin TTL, ADR-010) while the signed,
-hash-linked skeleton stays fully verifiable; **lipmaa skip-links** give logarithmic-length
-verification certificates for partial replication. This is the Bamboo design adapted to Vox's
-composite-PQ signatures and `(channelID, epoch)` binding — specified directly here, not pulled from
-an external library (Bamboo/Reed/Hypercore inform it but are not a runtime dependency).
+- **LS-4.** A log entry's signed skeleton MUST be the 12-element array `[author_id, seq, prev_hash,
+  lipmaa_backlink, channelID, epoch, algo_ids, payload_hash, payload_len, end_of_feed_flag,
+  claimed_ms, seen]`. `seq` MUST start at 1 and rise strictly per author. An entry in the earlier
+  10-field shape MUST be refused at decode.
+- **LS-5.** The authenticator MUST commit to `payload_hash`, not to the payload bytes, so that a
+  node MAY drop a payload body (retention, ADR-010) while the signed, hash-linked skeleton stays
+  verifiable.
+- **LS-6.** `lipmaa_backlink` for `seq = n` MUST target the standard Bamboo `lipmaa(n)`. Every entry
+  MUST carry both `prev_hash` (the `seq − 1` link) and the `lipmaa_backlink` hash. The format is
+  specified here; Bamboo, Reed and Hypercore MUST NOT be runtime dependencies.
+- **LS-7.** The signed body and the wire frame MUST share one encoder and one decoder of the
+  skeleton's fields (`EntrySkeleton::encode_fields` / `decode_fields`).
 
-**Cross-author edges and the one order (amended 2026-09-24 by ADR-023 decision 1, PRD-001 R13).**
-`seen` is the list of the heads of **other** authors' feeds the author had applied when it wrote the
-entry: at most 16 32-byte entry hashes, strictly ascending (one encoding per set; a decoder refuses an
-unsorted, duplicated or longer list before reading it). A head the author already named, or an older
-entry of that feed, is left out — its own previous entry already follows it — and when more than 16
-feeds moved the most recent by the order are named and the rest wait for the next entry. With `seen`
-the log is a causal DAG *across* authors, not parallel chains. `claimed_ms` is the author's clock in
-milliseconds (the same value its content envelope carries). Both sit in the signed skeleton rather than
-the encrypted payload because a node must place entries it cannot read — an author whose key it lacks,
-a skeleton whose body was pruned — or every entry after them lands somewhere else than on a node that
-can read them. The cost is that anyone holding skeletons sees the claimed send time, as they already
-see arrival time.
+### Per-entry-type authentication
 
-The **room's order** is a hybrid logical clock over that DAG: `clock(e) = max(min(claimed_ms(e),
-latest(e) + MAX_LEAD_MS), latest(e) + 1)`, where `latest(e)` is the highest clock of the held parents
-(the author's own seq−1 and `seen`), or the room's genesis time for an entry with none, and
-`MAX_LEAD_MS` is ten minutes. Entries sort ascending by `(clock, entry_hash)`. The cap is relative to
-the parents, never to the receiving node's clock (which would differ per node and break the one
-order). It stops one member pinning the room's clocks forward: a post claiming tomorrow moves them
-ten minutes, not a day (ADR-023 decision 1). A parent's clock is below its child's, so this is a
-topological order; ties between concurrent entries fall to the claimed milliseconds and then the hash.
-It is a function of the entry set alone, so every node holding the same entries shows the same
-sequence: a total order **derived** from the causal DAG, with no consensus and no coordination —
-the "no global order" above means none is *agreed*, not that none can be computed. An author's clock
-can move its entry only among its concurrent peers: an entry stamped an hour early is still lifted to
-just after the newest thing it saw. **A `seen` hash a node does not hold never blocks acceptance**
-(entries arrive out of order); it contributes nothing until it arrives, and then the clocks of what
-named it, and their descendants, are raised to what the full set requires — the same result as if
-everything had arrived in causal order. `Dag::happened_before(a, b)` is the causal relation itself
-(ancestor through feeds and `seen`), the seam claims (ADR-020/021, R17) are to be built on.
+- **LS-8.** Every entry, governance and content alike, MUST be root-composite-signed
+  (Ed25519 + ML-DSA, ADR-003). Governance entries (genesis, admin delegations, consent grants and
+  revocations, policy updates) MUST also keep their payloads.
+- **LS-9.** The entry wire's authenticator type MUST be `1` (composite) or `0` ("dropped under a
+  checkpoint", an empty byte string, LS-38). Every other value MUST be refused. Type `2`, the ADR-009
+  deniable authenticator, is removed with deniable mode (PRD-001 R43, ADR-009 withdrawn) and MUST be
+  refused.
 
-**Canonical serialization (normative, series-wide — the one encoding every ADR signs over).** Every
-signed/authenticated structure in Vox — log entries (here), SKDMs (ADR-006), certificates and consent
-grants (ADR-007), rendezvous records (ADR-012), the transport identity extension (ADR-011) — is encoded
-as **deterministic CBOR** (RFC 8949 §4.2.1: definite-length items, shortest-form integers, map keys
-sorted bytewise), prefixed with a **2-byte struct-type tag** + **1-byte format version**. Each signed
-struct is a **definite-length CBOR array** whose element order is exactly the field order listed for that
-struct (COSE-style, RFC 9052) — arrays are unambiguously deterministic with no key-ordering question and
-are smaller; the "map keys sorted bytewise" rule therefore applies only to a CBOR *map* nested inside a
-payload, not to the signed skeleton. Every struct's field order is **normative** and pinned by golden
-vectors. A conforming decoder is **strict**: it rejects any non-canonical encoding (non-shortest integer,
-indefinite length, reserved additional-info, unsorted/duplicate map keys, trailing bytes), since a
-malleable encoding would let two distinct byte strings verify under one signature. Integer
-fields (`seq`, `iteration`, `epoch`, `payload_len`) are CBOR unsigned integers (no fixed width). The
-authenticator is computed over `domain_sep ‖ canonical_bytes`, where `domain_sep` is a per-struct ASCII
-label (e.g. `"vox/log-entry/v1"`). All hashes (`prev_hash`, `payload_hash`, CID = ADR-010) are
-**SHA-256** (ADR-003 registry) over those canonical bytes. Two correct implementations therefore
-produce **byte-identical** signed input — the precondition for signature verification, CID dedup, and
-the byte-equality fork-proof below. The **`lipmaa_backlink`** for entry `seq = n` targets the standard
-Bamboo `lipmaa(n)` (the largest certificate-pool predecessor of the form `(3^k − 1)/2`); every entry
-carries both `prev_hash` (the seq−1 link) and the `lipmaa_backlink` hash.
+### Cross-author edges and the one order
 
-**Struct-type tag registry (normative).** The 2-byte leading tag identifies the structure so the same
-canonical bytes are never cross-interpreted (the serialization analogue of ADR-003's algorithm prefixes):
+Amended 2026-09-24 by ADR-023 decision 1 (PRD-001 R13).
 
-| Tag | Struct | Tag | Struct |
-|---|---|---|---|
-| `0x0001` | log-entry | `0x000A` | chunk-manifest (ADR-014) |
-| `0x0002` | SKDM (ADR-006) | `0x000B` | dgka-setup (ADR-009) |
-| `0x0003` | admin/governance cert (ADR-007) | `0x000C` | self-channel-entry |
-| `0x0004` | consent-grant (ADR-007) | `0x000D` | genesis-record (ADR-007) |
-| `0x0005` | consent-revocation (ADR-007) | `0x000E` | admin-delegation-revocation (ADR-007) |
-| `0x0006` | policy/passphrase-rotation (ADR-007) | `0x000F` | service-advertisement (ADR-013) |
-| `0x0007` | rendezvous-record (ADR-012) | `0x0010` | esk-publication (ADR-009) |
-| `0x0008` | pre-join-record (ADR-012) | `0x0011` | session-establishment (ADR-011) |
-| `0x0009` | tls-identity-extension (ADR-011) | `0x0012` | member-bundle-record (ADR-016) |
+- **LS-10. `seen` and `claimed_ms`.**
+  - `seen` MUST list the heads of *other* authors' feeds that the author had applied when it wrote
+    the entry: at most `MAX_SEEN` (16) 32-byte entry hashes, strictly ascending. A decoder MUST
+    refuse an unsorted, duplicated or longer list before reading it.
+  - A head the author already named, or an older entry of that feed, MUST be left out. When more
+    than 16 feeds moved, the most recent by the order MUST be named and the rest wait for the next
+    entry (`Dag::seen_for`).
+  - `claimed_ms` MUST be the author's clock in milliseconds, the same value its content envelope
+    carries.
+  - Both MUST sit in the signed skeleton, so that a node places entries it cannot read (an author
+    whose key it lacks, a pruned body). Anyone holding skeletons therefore sees the claimed send
+    time, as they already see arrival time.
+- **LS-11. The room's order.** Every node MUST order a room's entries by a hybrid logical clock
+  over the DAG:
+  `clock(e) = max(min(claimed_ms(e), latest(e) + MAX_LEAD_MS), latest(e) + 1)`,
+  where `latest(e)` is the highest clock of the held parents (the author's own `seq − 1` and `seen`),
+  or the room's genesis time for an entry with none, and `MAX_LEAD_MS` is ten minutes. Entries MUST
+  sort ascending by `(clock, entry_hash)`.
+  - The cap MUST be relative to the parents, never to the receiving node's clock.
+  - The order MUST be a function of the entry set alone, so every node holding the same entries
+    shows the same sequence.
+- **LS-12.** A `seen` hash a node does not hold MUST NOT block acceptance. When it arrives, the
+  clocks of what named it, and of their descendants, MUST be raised to what the full set requires,
+  giving the same result as if everything had arrived in causal order.
+- **LS-13.** `Dag::happened_before(a, b)` MUST be the causal relation (ancestor through feeds and
+  `seen`). Claims stay in Vox: agent comms tracks who does what (ADR-020). A claim's order MAY use
+  this relation. On this tree nothing consumes it. Vox MUST NOT lock a claim or enforce a takeover
+  (PRD-001 R17).
 
-Each tag has an **explicit, normative** domain-separation label (the prefix of its signing input,
-`domain_sep ‖ canonical_bytes`). The labels are pinned exactly — they are not mechanically derived from
-the struct name, so two implementations cannot disagree on the bytes that get signed:
+### Canonical serialization
 
-| Tag | Label | Tag | Label |
-|---|---|---|---|
-| `0x0001` | `vox/log-entry/v1` | `0x000A` | `vox/chunk-manifest/v1` |
-| `0x0002` | `vox/skdm/v1` | `0x000B` | `vox/dgka-setup/v1` |
-| `0x0003` | `vox/admin-cert/v1` | `0x000C` | `vox/self-channel-entry/v1` |
-| `0x0004` | `vox/consent-grant/v1` | `0x000D` | `vox/genesis/v1` |
-| `0x0005` | `vox/consent-revocation/v1` | `0x000E` | `vox/admin-delegation-revocation/v1` |
-| `0x0006` | `vox/policy-rotation/v1` | `0x000F` | `vox/service-advertisement/v1` |
-| `0x0007` | `vox/rendezvous-record/v1` | `0x0010` | `vox/esk-publication/v1` |
-| `0x0008` | `vox/pre-join-record/v1` | `0x0011` | `vox/session-establishment/v1` |
-| `0x0009` | `vox/tls-identity-extension/v1` | `0x0012` | `vox/member-bundle-record/v1` |
+Normative for every ADR that signs a structure: log entries, SKDMs (ADR-006), certificates and
+consent grants (ADR-007), rendezvous records (ADR-012), the transport identity extension (ADR-011).
 
-New struct types are appended here (versioned), preserving the single canonical encoding. (Note: this struct-tag space is **disjoint from**
-the ADR-003 ciphersuite-ID space — `0x0001` here = `log-entry`, `0x0001` there = `vox-suite-1`; they
-never co-occur on the wire, so the numeric overlap is not a collision.)
+- **LS-14.** Every signed or authenticated structure MUST be deterministic CBOR (RFC 8949 §4.2.1:
+  definite lengths, shortest-form integers, map keys sorted bytewise), prefixed with a 2-byte
+  struct-type tag and a 1-byte format version.
+- **LS-15.** Each signed struct MUST be a definite-length CBOR array whose element order is exactly
+  the field order listed for it (COSE-style, RFC 9052). Bytewise map-key sorting applies only to a
+  CBOR map nested inside a payload.
+- **LS-16.** A decoder MUST be strict. It MUST reject a non-shortest integer, an indefinite length,
+  a reserved additional-info value, unsorted or duplicate map keys, and trailing bytes.
+- **LS-17.** Integer fields (`seq`, `iteration`, `epoch`, `payload_len`) MUST be CBOR unsigned
+  integers with no fixed width.
+- **LS-18.** The authenticator MUST be computed over `domain_sep ‖ canonical_bytes`, where
+  `domain_sep` is the struct's label (LS-21).
+- **LS-19.** Every hash (`prev_hash`, `payload_hash`, CID per ADR-010) MUST be SHA-256 (ADR-003)
+  over those canonical bytes.
+- **LS-20. Golden vectors.** Every struct's field order MUST be pinned by golden vectors, and the
+  frontier and Negentropy exchanges by interop bytes against a reference. *Status:* unmet. No golden
+  vector exists on this tree, and the obligation awaits the decider.
 
-**Sync = anti-entropy (concrete frames).** All sync frames are canonical-CBOR (above), each prefixed by
-a **1-byte frame ID**. Mode is negotiated by the opening `HELLO` frame's **mode bitmap** (bit 0 =
-frontier, bit 1 = range-reconciliation); both peers use the highest bit both set.
-- Frame IDs: `0x01 HELLO {mode_bitmap}`, `0x02 HAVE {feeds: [(author_id, max_seq, head_hash)]}`,
+### Struct-type tag registry
+
+- **LS-21.** The 2-byte tag MUST identify the structure, so that the same canonical bytes are never
+  read as another structure. Each tag MUST have exactly the label below as its `domain_sep`
+  (`StructTag::domain_sep`); labels are pinned, not derived from struct names.
+
+  | Tag | Struct | Label | Owner |
+  |---|---|---|---|
+  | `0x0001` | log-entry | `vox/log-entry/v1` | ADR-008 |
+  | `0x0002` | SKDM | `vox/skdm/v1` | ADR-006 |
+  | `0x0003` | admin/governance cert | `vox/admin-cert/v1` | ADR-007 |
+  | `0x0004` | consent-grant | `vox/consent-grant/v1` | ADR-007 |
+  | `0x0005` | consent-revocation | `vox/consent-revocation/v1` | ADR-007 |
+  | `0x0006` | policy/passphrase-rotation | `vox/policy-rotation/v1` | ADR-007 |
+  | `0x0007` | rendezvous-record | `vox/rendezvous-record/v1` | ADR-012 |
+  | `0x0008` | pre-join-record | `vox/pre-join-record/v1` | ADR-012 |
+  | `0x0009` | tls-identity-extension | `vox/tls-identity-extension/v1` | ADR-011 |
+  | `0x000A` | chunk-manifest | `vox/chunk-manifest/v1` | ADR-014 |
+  | `0x000B` | dgka-setup (removed) | `vox/dgka-setup/v1` | ADR-009 |
+  | `0x000C` | self-channel-entry | `vox/self-channel-entry/v1` | ADR-008 |
+  | `0x000D` | genesis-record | `vox/genesis/v1` | ADR-007 |
+  | `0x000E` | admin-delegation-revocation | `vox/admin-delegation-revocation/v1` | ADR-007 |
+  | `0x000F` | service-advertisement | `vox/service-advertisement/v1` | ADR-013 |
+  | `0x0010` | esk-publication (removed) | `vox/esk-publication/v1` | ADR-009 |
+  | `0x0011` | session-establishment | `vox/session-establishment/v1` | ADR-011 |
+  | `0x0012` | member-bundle-record | `vox/member-bundle-record/v1` | ADR-016 |
+  | `0x0013` | service-grant-exclusion | `vox/service-grant-exclusion/v1` | ADR-007, ADR-017 |
+  | `0x0014` | join-witness | `vox/join-witness/v1` | ADR-016 M17.6 |
+  | `0x0015` | presence | `vox/presence/v1` | V210-164 (`governance/presence.rs`) |
+  | `0x0016` | checkpoint | `vox/checkpoint/v1` | ADR-023 decision 3 (`log/checkpoint.rs`) |
+  | `0x0017` | key-package | `vox/key-package/v1` | ADR-023 decision 4 (`node/keypackage.rs`) |
+
+- **LS-22.** New struct types MUST be appended, versioned, and a tag MUST NOT be reused. `0x000B`
+  and `0x0010` belong to removed deniable mode: they stay registered and MUST NOT be produced.
+  `0x0006` carries only a room's retention; policy updates beyond retention and passphrase rotation
+  are removed (V030-32, #380; the code's removal is pending under that item).
+- **LS-23.** This tag space is disjoint from the ADR-003 ciphersuite-ID space. The two never
+  co-occur on the wire, so a numeric overlap (`0x0001` here and there) is not a collision.
+
+### Sync = anti-entropy
+
+- **LS-24. Frames.** Every sync frame MUST be canonical CBOR prefixed by a 1-byte frame ID:
+  `0x01 HELLO {mode_bitmap}`, `0x02 HAVE {feeds: [(author_id, max_seq, head_hash)]}`,
   `0x03 WANT {ranges: [(author_id, from_seq, to_seq)]}`, `0x04 ENTRY {entry, payload?}`,
-  `0x05 NEG {negentropy_msg}` (range-reconciliation payload).
-- **Frontier mode (default; required of every peer).** `HAVE` lists the feeds a peer holds; the receiver
-  replies `WANT` with the missing `(author_id, from_seq..to_seq)` ranges; the holder streams `ENTRY`
-  frames (skeleton + any retained payloads) over a reliable QUIC stream (ADR-011). A `WANT` is the
-  peer's to write, so the holder trusts nothing in it for size: each author's ranges are merged and each
-  merged range walks only the entries actually held, and one session serves at most `MAX_SERVE_ENTRIES`
-  (1,024) entries / `MAX_SERVE_BYTES` (64 MiB) within `SERVE_BUDGET` (30 s). That bounds one session,
-  never a history: a requester that applied entries syncs again at once and asks for the rest.
-- **Who is served (normative, PRD-001 R5).** A node serves a room's log only to that room's
-  **admitted authors** and to **that room's anchors**. The stream-kind gate (ADR-016) only decides
-  whether a peer may open a `sync` stream at all; the room is named afterwards, in the stream's
-  preamble, and must be checked against the peer. Built for sessions the node **answers** (V29-03) and
-  for sessions it **starts** (V29-04): a fresh connection is pushed only the rooms the peer belongs to.
-- **Range-reconciliation mode (used when both peers set bit 1; the default *above ~100 active authors*,
-  where `HAVE` size dominates).** `NEG` frames carry Negentropy range-based set reconciliation over entry
-  hashes (logarithmic rounds). The `NEG` body is **Negentropy v1** keyed by the **full 32-byte SHA-256
-  entry hash** (no truncation), wrapped in the Vox `NEG` frame so the Vox wire contract is fully
-  self-described here. Frontier is mandatory; range-reconciliation is an additional required capability
-  for scale.
+  `0x05 NEG {negentropy_msg}`. An unknown frame ID MUST be rejected (`decode_frame`).
+- **LS-25. The stream names its room.** A sync stream (ADR-016) MUST open with a preamble naming
+  `(channelID, epoch)` before the first ADR-008 frame.
+- **LS-26. Mode.** `HELLO`'s mode bitmap MUST use bit 0 for frontier and bit 1 for range
+  reconciliation. Both peers MUST use the highest bit both set. Frontier mode MUST be supported by
+  every peer.
+- **LS-27. Range reconciliation.** Above about 100 active authors (`RANGE_MODE_AUTHOR_THRESHOLD`),
+  where `HAVE` size dominates, peers that both set bit 1 MUST use range reconciliation. `NEG` MUST
+  carry Negentropy v1 keyed by the full 32-byte SHA-256 entry hash, with no truncation. *Status:*
+  planned. `range_reconcile_exchange` exists and nothing calls it; `should_use_range_mode` is never
+  called; every session offers frontier only.
+- **LS-28. Frontier mode.** `HAVE` MUST list the feeds a peer holds. The receiver MUST reply `WANT`
+  with the missing ranges, asking from its own head (not past it) so that the peer's entry at that
+  position is compared with its own (V210-63). The holder MUST stream `ENTRY` frames (skeleton and
+  any retained payload) over a reliable QUIC stream (ADR-011).
+- **LS-29. A `WANT` is bounded by what is held (PRD-001 R4).** The holder MUST trust nothing in a
+  `WANT` for size: each author's ranges MUST be sorted and merged, and each merged range MUST walk
+  only the entries actually held. One session MUST serve at most `MAX_SERVE_ENTRIES` (1,024) entries
+  and `MAX_SERVE_BYTES` (64 MiB) within `SERVE_BUDGET` (30 s), and always at least one entry. A
+  requester that applied entries MUST sync again at once for the rest. That bounds one session,
+  never a history. Proof: `crates/vox-tui/tests/one_want_cannot_stop_a_room_proof.rs`.
+- **LS-30. The drain phase.** The whole drain phase MUST be bounded by `DRAIN_BUDGET` (30 s), not
+  only per frame. A non-entry frame during the drain MUST fail the session. **Known limit:** the
+  deadline is checked when a frame arrives, so the real bound is 30 s plus one frame timeout.
+- **LS-31. No lock across I/O.** A session MUST NOT hold the room's lock across a network wait. It
+  MUST lock the room per protocol step and apply what it drained a batch at a time
+  (`frontier_session_room`).
+- **LS-32. Partial progress is kept.** Entries a session applied before it failed MUST stay stored.
+- **LS-33. Bodies owed, not expired (V030-10, the decider 2026-10-01).** A skeleton whose signature
+  verifies MUST be taken whether or not its body came with it. Whether a missing body is expired
+  MUST be the receiver's own computation, from the entry's signed `claimed_ms` and the room's signed
+  retention (or the receiver's shorter one, ADR-023 decision 2); nothing a peer says or omits makes
+  a body expired. Otherwise the body is owed: the entry MUST be shown as "not received yet" and the
+  body MUST be asked of every peer until one supplies it. A node MUST NOT ship a body it no longer
+  holds; a peer asking for one gets the skeleton. *Status:* built (`ChannelState::shown_timeline`);
+  V030-10 (#276) awaits acceptance.
 
-**Abort / error signalling (normative).** Every hard-fail in the wire ADRs (floor-violation, ADR-003;
-unknown struct tag or algo ID; sync mode mismatch; signature/authenticator failure) is
-surfaced — never silently downgraded — by **closing the QUIC stream (or connection) with a Vox
-application error code**: `0x01` protocol-version-unsupported, `0x02` suite-below-floor (ADR-003),
-`0x03` unknown-struct-tag, `0x04` unknown-algo-id, `0x05` authenticator-invalid, `0x06` **reserved**
-(was quota-exceeded; the quota was removed 2026-09-24 and the code is never reused), `0x07` sync-mode-unsupported, `0x08` epoch-mismatch, `0x09` transport-failed (the peer went away or the
-stream reset — nothing about the protocol was wrong; added 2026-09-20, see Implementation notes), `0x0A`
-unresponsive (this end closed a connection whose peer stopped answering — an unanswered liveness probe
-or `SILENCE_IS_DEATH`, ADR-012 #40; nothing about the peer's identity or frames was wrong, which is why it
-is not `0x05`). The peer logs the coded reason and surfaces it
-(ADR-014). This is the single wire-error contract referenced by ADR-003/ADR-011.
+### Who is served
 
-**Per-entry-type authentication (binding — resolves the deniable/governance split).** Authentication
-is chosen by entry TYPE, not merely by channel mode:
-- **Governance/control entries are ALWAYS root-composite-signed (Ed25519+ML-DSA), even in deniable
-  channels:** genesis, admin delegations, consent grants, consent revocations,
-  policy/passphrase-rotation updates, and the deniable-mode **DGKA/DSKE setup** entries (ADR-009 —
-  participation is attributable; only message content is deniable). They must stay attributable — membership is attributable by design (ADR-001/ADR-009),
-  and ADR-007's single-writer consent guarantee requires that a consent grant be unforgeably authored
-  by its issuer. Non-negotiable in both modes.
-- **Message-content entries:** attributable channels → root-composite-signed; deniable channels →
-  authenticated by the ADR-009 deniable construction (content authorship forgeable by any member).
-The hash-chain provides ordering and tamper-evidence regardless of the authenticator. Because
-governance entries are always signed, the governance plane — and its fork-attribution — stays intact
-even in deniable channels; only message-content authorship is deniable. The exact deniable
-content authenticator and how it preserves per-author single-writer ordering are specified in ADR-009.
+PRD-001 R5.
 
-**Consent + governance state lives here.** Admin/policy certificates, consent grants, and consent
-revocations are log entries, so they replicate and converge causally across the overlay (ADR-007).
-(Membership is emergent from join + consent — there is no membership-roster cert; ADR-007.)
+- **LS-34.** A node MUST serve a room's log only to that room's admitted authors and to that room's
+  anchors, for sessions it answers (V29-03) and sessions it starts (V29-04). The stream-kind gate
+  (ADR-016) decides only whether a peer may open a `sync` stream. The room named in the preamble
+  MUST then be checked against the peer, after the node admits authors from its own board's bundle
+  records. A refusal MUST be the same coded reset as a stream kind the peer may not open. An anchor
+  keeps no copy of a room it is not a member of and refuses every session for it (ADR-023
+  decision 6). Proof: `crates/vox-tui/tests/a_member_of_one_room_is_not_served_another_proof.rs`.
 
-**Personal self-channel (multi-device state, including received consent).** A user's own shared-root
-devices (ADR-002) share state through a **single-author self-log**: a log authored by the user's
-identity, keyed by a **dedicated random `self_seed`** (256-bit, generated at identity creation, stored
-in the identity vault and included in the encrypted identity backup, ADR-002; synced to a new device at
-enrollment alongside the root). Both the encryption key and the rendezvous derive from this **private**
-seed — never from a signature over a public constant (which a signing oracle could reproduce) and never
-from the *public* identity key (which would make the rendezvous locatable by anyone who knows it):
-`K_self = HKDF-SHA-256(self_seed, info="vox/self-channel/v1")` and
-`rendezvous_self = HKDF-SHA-256(self_seed, info="vox/self-rzv/v1")` (the ADR-005 rendezvous construction,
-seeded by the private `self_seed`). Replicated **only among that identity's own devices**; a device
-proves possession via the ADR-005 PoP to peer. It carries: local
-nicknames + verification state, and — load-bearing — **the SKDMs the identity has been consent-granted**
-(ADR-006) and per-channel join material. Because consent binds to an *identity* (ADR-006), syncing
-received SKDMs over the self-channel lets every shared-root device read what was consented to the
-identity, so **adding or restoring a shared-root device needs no re-consent**. First-device→second-device
-bootstrap: a new device is enrolled by presenting the identity key (out-of-band root sync, ADR-002),
-then discovers siblings at `rendezvous_self`. Per-device-key users have no shared root, so they hold no
-self-channel and their state is device-local (no special case). This is the sole spec of the
-self-channel; ADR-014 only surfaces its results.
+### Fork / equivocation handling
 
-**Fork / equivocation handling.** A single-writer log must not fork; two distinct entries by the
-same author at the same `seq` are an equivocation. Handling differs by authentication type (above),
-because automated punishment is only safe when the conflicting entries are *attributable*:
+- **LS-35.** Two validly signed entries at the same `(author_id, seq)` with different hashes are a
+  self-authenticating fork proof. Because every entry is signed (LS-8), a fork proof always
+  incriminates its author. On a fork proof a node MUST:
+  - freeze that author and refuse its later entries;
+  - keep the proof durably, and re-verify it when the room opens (`SEG_FORKS`,
+    `Dag::restore_fork`);
+  - surface it in `vox status --json` (`equivocations`), in `vox room read`, and in the TUI's notice
+    line, in the decider's wording: "<name> signed two different messages at the same place in this
+    room (their message <seq>). Their later messages are held back."
+  - record the proof as a room entry. *Status:* planned; no entry type exists.
 
-- **Attributable entries (all governance entries always; all entries in attributable channels)** are
-  root-composite-signed, so two validly-signed entries at the same `(author_id, seq)` with different
-  hashes are a **self-authenticating fork proof** that genuinely incriminates that author. Anti-entropy
-  gossips **signed log heads** `(author_id, seq, hash)`; on a fork proof clients **freeze that author**,
-  record the proof as a channel entry, surface it in the UI (ADR-014), and members revoke consent /
-  rotate to exclude the equivocator (ADR-007). Because governance is always attributable, the
-  membership/admin plane always gets this strong remedy.
-- **Deniable message-content entries** use a forgeable authenticator (ADR-009), so a "fork proof" does
-  **NOT** incriminate a specific author — any member could mint a second entry at a victim's
-  `(author_id, seq)`. Automated freeze/eviction is therefore **disabled** for deniable content forks
-  (it would be a framing/DoS primitive). Instead a deniable-content fork raises a **non-attributable
-  fork *alarm*** surfaced for manual, out-of-band resolution; the per-author ordering/anti-equivocation
-  guarantee that still holds in deniable mode (without enabling framing) is specified in ADR-009.
-- Honest partition limit: during a partition an equivocator can present different heads to disjoint
-  partitions; this cannot be *prevented* without consensus, but for attributable entries it is
-  **permanently detectable and attributable on heal** (the fork proof is durable). Partition-time
-  authority actions (admin grant/revoke) are treated as *provisional* until their causal neighborhood
-  reconciles (ADR-007).
+  Members exclude an equivocator by withdrawing trust (ADR-007).
+- **LS-36.** A fork MUST be detected wherever two histories part, not only at equal heads: when the
+  peer's history is shorter, its head MUST be compared with this node's entry at that `seq` (V210-63).
+  Proof: `crates/vox-tui/tests/an_equivocation_is_detected_and_said_proof.rs`.
+- **LS-37. Acceptance order (`Dag::accept`).** Frozen-author refusal → duplicate → admission →
+  authenticator and structure verification → equivocation → feed link. Equivocation MUST be
+  classified only for an entry that is admitted and verifies, so that a peer holding no valid key
+  cannot raise a fork proof. An entry at or below its author's checkpoint that is not already held
+  MUST be refused as `Rejected::PreCheckpoint`, never as a fork, and a session MUST continue past it.
+- **Partition limit.** During a partition an equivocator can present different heads to disjoint
+  partitions. This cannot be prevented without consensus, but it is permanently detectable and
+  attributable on heal. Admin grants and revocations made during a partition MUST be treated as
+  provisional until their causal neighbourhood reconciles (ADR-007).
 
-**Abuse resistance.** There is no membership roster or admission gate (ADR-007); the log
-acceptance predicate is instead **identity- and signature-bound**: an entry is accepted only if (a) it
-is authored by an identity that completed the authenticated channel join (CPace, ADR-005) for the
-current `(channelID, epoch)`, (b) it carries a valid per-author authenticator for its entry type
-(governance → root composite signature; content → composite or ADR-009 deniable), and (c) it links
-into that author's feed (seq, `prev_hash`, skip-link, no fork). Unauthenticated or wrong-epoch floods
-therefore cannot enter.
+### Checkpoints and shed signatures
 
-**There is no rate or volume limit on an admitted author** (PRD-001 R1/R3, decided 2026-09-24). An
-earlier revision bounded replication by per-author quotas — ≤ 1000 entries/hour and ≤ 50 MiB/epoch —
-and that is withdrawn: invitees are trusted, agents in a room must not be throttled, and the quota as
-built was also *wrong*, because it charged every stored entry again when a room was reopened, so a room
-could not be opened at all once one author had written a thousand entries (PRD-001 D1). The
-consequence is stated plainly: the **render-gating amplification** vector is not bounded by this ADR —
-every ciphertext replicates to all members (§"Render-gating"), so an admitted member can make every
-member store as much as it writes. The remedy for a member who abuses that is membership, not a quota:
-revoke consent and rotate (ADR-007). Agent loop control is out of scope for now (PRD-001 R3).
-Pruning is *authenticated*: a payload may be dropped per TTL, but its signed
-skeleton entry remains, so pruning can never silently rewrite history.
+ADR-023 decision 3 (M23.6).
+
+- **LS-38.** Authenticator type `0` ("dropped under a checkpoint") MUST carry an empty byte string.
+- **LS-39.** Struct tag `0x0016` is an author's checkpoint on its own feed, `[seq, entry_hash]`,
+  carried as the payload of an ordinary signed entry of that feed.
+- **LS-40. What `Dag::accept` does with them.**
+  - An unsigned entry MUST be taken only body-less and only provisionally. It becomes authentic when
+    a signed entry of the same feed chains to it. `Dag::discard_unverified` MUST take back whatever
+    never does, at the end of every sync session and of every reload. A reload that finds one MUST
+    refuse the store.
+  - A checkpoint that names a position its own feed does not hold, with that hash, MUST be refused.
+- **LS-41. Shedding.** A node MUST shed signatures only as ADR-023 decision 3 allows
+  (`Dag::drop_checkpointed_signatures`, `drop_signature_if_checkpointed`).
+  `Feed::verify_all_signatures` MUST accept an unsigned run only when a signed entry follows it.
+
+### Abuse resistance
+
+- **LS-42.** There is no membership roster or admission gate (ADR-007). An entry MUST be accepted
+  only if:
+  - (a) its author completed the authenticated room join (CPace, ADR-005) for the current
+    `(channelID, epoch)` and is admitted on that evidence;
+  - (b) it carries a valid composite signature (LS-8);
+  - (c) it links into its author's feed (`seq`, `prev_hash`, skip link, no fork).
+
+  An entry from an author this node has not admitted MUST NOT be stored; in a node's session it is
+  counted and skipped, and the session goes on (`EntryClass::Unadmitted`). A member SHOULD admit the
+  room's current members from the board (ADR-012) before it syncs.
+- **No rate or volume limit (PRD-001 R1/R3, decided 2026-09-24).** A node MUST NOT limit the rate
+  or volume of an admitted author's entries. The per-author quota (1,000 entries/hour, 50 MiB/epoch)
+  is removed, and wire code `0x06` stays reserved (LS-45). Proof:
+  `crates/vox-tui/tests/a_long_room_reopens_proof.rs`.
+- **Known limit, render-gating amplification.** Every ciphertext replicates to every member (LS-3),
+  so an admitted member can make every member store as much as it writes. This ADR does not bound
+  it. The remedy for a member who abuses it is membership: withdraw trust (ADR-007). Agent loop
+  control is out of scope (PRD-001 R3).
+- Pruning is authenticated: a body MAY be dropped by retention, but its signed skeleton MUST remain,
+  so pruning cannot silently rewrite history.
+
+### Consent and governance state
+
+- Admin and policy certificates, consent grants and consent revocations MUST be log entries, so
+  they replicate and converge causally (ADR-007). Membership is emergent from join and consent;
+  there MUST NOT be a membership-roster certificate.
+
+### Personal self-channel
+
+- **LS-43.** A user's shared-root devices (ADR-002) share state through a single-author self-log,
+  keyed by a dedicated random 256-bit `self_seed` generated at identity creation, kept in the
+  identity vault and the encrypted backup:
+  - `K_self = HKDF-SHA-256(self_seed, info = "vox/self-channel/v1")`;
+  - `rendezvous_self = HKDF-SHA-256(self_seed, info = "vox/self-rzv/v1")` (the ADR-005
+    construction, seeded by the private `self_seed`).
+
+  Both MUST derive from the private seed, never from a signature over a public constant and never
+  from the public identity key. The self-log MUST be replicated only among that identity's own
+  devices, each proving possession by the ADR-005 PoP. It carries nicknames and verification state,
+  the SKDMs consent-granted to the identity (ADR-006), and per-room join material, so that adding or
+  restoring a shared-root device needs no re-consent. Per-device-key users hold no self-channel.
+  *Status:* planned. The KDFs, `self_channel_id` (`vox/self-channel-id/v1`, not named above) and the
+  self-log type exist in `log/selfchannel.rs`; nothing in the node calls them, and `K_self` is never
+  applied.
+
+### Abort / error signalling
+
+- **LS-44.** Every hard failure in the wire ADRs (a floor violation, ADR-003; an unknown struct tag
+  or algorithm ID; a sync-mode mismatch; an authenticator failure) MUST be surfaced, never silently
+  downgraded, by closing the QUIC stream or connection with a Vox application error code. The peer
+  MUST log the coded reason and surface it (ADR-014). This is the single wire-error contract that
+  ADR-003 and ADR-011 cite.
+- **LS-45.** The codes (`WireError`):
+
+  | Code | Meaning |
+  |---|---|
+  | `0x01` | protocol version unsupported (a frame that decodes to an unsupported version) |
+  | `0x02` | suite below floor (ADR-003) |
+  | `0x03` | unknown struct tag |
+  | `0x04` | unknown algorithm ID |
+  | `0x05` | authenticator invalid |
+  | `0x06` | reserved: was quota exceeded; MUST NOT be reused |
+  | `0x07` | sync mode unsupported |
+  | `0x08` | epoch mismatch |
+  | `0x09` | transport failed: a failed send or receive, or end of stream where a frame was due |
+  | `0x0A` | unresponsive: an unanswered liveness probe or `SILENCE_IS_DEATH` (ADR-012) |
+  | `0x0B` | session busy (ADR-025) |
+  | `0x0C` | not yet a member, sent only to a pending joiner (#217) |
+  | `0x0D` | shutting down (V210-93) |
+  | `0x0E` | superseded duplicate connection (V210-93) |
+
+## Known gaps
+
+- Range reconciliation is not wired to the network (LS-27).
+- A fork proof is kept in the node's own store, not recorded as a room entry (LS-35).
+- The self-channel has no runtime (LS-43).
+- No golden vectors or interop bytes exist (LS-20).
+- The drain bound is 30 s plus one frame timeout (LS-30).
+
+Fixed since the old text, with evidence:
+- A fork below the remote's head surfaced only as a `prev_hash` failure: b38b2502 (V210-63, #252),
+  proof `an_equivocation_is_detected_and_said_proof`.
+- Fork proofs lived only in memory: kept in `SEG_FORKS` and restored on open (b38b2502).
+- Every transport failure was reported as `0x01`: `0x09` (58d95706, M15.2c).
+- A session held the room's lock across network waits: 3f95b576.
+- The first entry from an unadmitted author killed the session: it is counted and skipped
+  (d635846e, ADR-025).
+- Governance entries received by sync got the content fork remedy (`kind_for` defaulted to
+  `Content`): closed in M14.6 by `ChannelAuthors`; since deniable mode was removed (b0f82185, R43)
+  every entry gets the attributable remedy.
+- The authenticator type sat outside the signed skeleton and `algo_ids[0]` was pinned to the
+  composite ID even for deniable entries: deniable mode is removed (b0f82185), and type `2` is
+  refused.
 
 ## Consequences
 
-### Positive
-- Async + interactive both fall out of one replicated structure; offline nodes self-heal on reconnect.
-- Render-gating makes consent and storage compose with zero friction.
-- Payload-hash signing reconciles append-only integrity with TTL pruning and large PQ signatures (ADR-003).
+- Asynchronous and interactive messaging come from one replicated structure; an offline node heals
+  on reconnect.
+- Render-gating makes trust and storage compose with no extra mechanism; the cost is that a node
+  stores and carries ciphertext it cannot read.
+- Payload-hash signing reconciles append-only integrity with retention pruning and large post-quantum
+  signatures (ADR-003).
+- Every node shows one order, derived from the causal DAG with no coordination; concurrent entries
+  are ordered by a tie-break, not by agreement.
+- DAG convergence is proven for non-adversarial replicas; Sybil and withholding resistance comes from
+  signatures and membership (ADR-002, ADR-007).
+- Vox sits alongside SSB, Hypercore, Berty and the Matrix event DAG; its difference is the trust and
+  cryptography layered on top.
 
-### Negative
-- Causal (not total) order means no global "one true sequence"; application must tolerate concurrency.
-- DAG convergence is proven for non-adversarial replicas; Sybil/withholding resistance must come
-  from signatures + membership (ADR-002, ADR-007), not the DAG alone.
-- Ciphertext a node cannot read still consumes its storage/bandwidth (the cost of render-gating).
-- **Build coupling with ADR-009:** the deniable-content fork branch here checks the authenticator that
-  ADR-009 supplies, so 008's deniable path and ADR-009 are co-built (not 008-complete-then-009). The
-  dependency graph stays acyclic (009 → 008); only the *build order* is coupled.
+## Related ADRs
 
-### Neutral
-- Positions Vox alongside SSB / Hypercore / Berty / Matrix-event-DAG; differentiator remains the
-  consent + crypto layered on top.
-
-## Implementation notes (M5)
-
-These record the concrete decisions made building this ADR (`crates/vox-core/src/log/`), so the spec and code stay in lockstep:
-
-- **Acceptance order (`Dag::accept_with_deniable`).** governance-must-be-attributable → frozen-author
-  refusal → duplicate → **admission → authenticator/structure verification → equivocation** → feed link.
-  (The trailing quota step was removed 2026-09-24.) Equivocation is classified only for an entry that is admitted *and* authenticates, so an
-  attributable fork proof is self-authenticating by construction (both entries verified under the
-  author's root) and a deniable-content alarm is raised only by an entry the ADR-009 epoch verifier
-  accepts. A conflicting entry from an unadmitted author, one whose composite signature does not verify,
-  or a deniable one the verifier rejects (or with no verifier available) is rejected as
-  `NotAdmitted` / `Verification` and never surfaces as a fork. *(2026-09-19 review, HIGH: classifying
-  before verification let a peer holding no valid key raise fork proofs and alarms — a framing /
-  attention-DoS primitive.)* `sync::apply_entry` still reports a genuine fork as the non-fatal
-  `ApplyOutcome::Fork`; the forged case now closes the stream with wire error `0x05` like any other
-  authenticator failure.
-- **Self-channel KDFs have no zero-fill fallback.** `derive_k_self`, `derive_rendezvous_self` and
-  `self_channel_id` return `Result`; the shared HKDF-Expand helper propagates the ceiling error
-  (output > 255·32 bytes) and leaves the caller's buffer untouched instead of zero-filling it. The
-  three fixed 32-byte outputs can never hit it, but the helper's contract is general and a test pins
-  the oversize case. *(2026-09-19 review.)*
-- **Known gaps (recorded 2026-09-19).** (1) Negentropy range reconciliation is implemented and tested
-  in memory (`range_reconcile_exchange`) but never runs over a `Transport`: `frontier_session*` offer
-  frontier mode only — the ~100-author range mode this ADR calls required at scale is unwired. (2) Only
-  an equal-`max_seq` divergent head is pulled and proven as a fork; a fork below the remote's head
-  surfaces as a `prev_hash` failure (wire error `0x05`), so "permanently detectable on heal" holds only
-  for equal-length forks. (3) Fork proofs live in the in-memory `frozen` map; the ADR's "record the
-  proof as a channel entry" has no entry type yet. (4) `AuthorResolver::kind_for` defaults to
-  `Content` and nothing overrides it, so governance entries received via **sync** still get the content
-  fork remedy — but the discriminator now exists: `node::channel::classify_payload` (2026-09-20, ADR-016
-  M14.5) types an entry from its payload, which is self-describing and disjoint (a governance payload is a
-  struct-tagged frame, a sender-key message is domain-prefixed `vox/group-msg/v1`, anything else is
-  refused), and every entry the node accepts or reloads is classified that way. **Closed for sync
-  (2026-09-20, M14.6):** `node::channel::ChannelAuthors` is the resolver a channel hands to a session, and
-  its `kind_for` uses that discriminator, so a governance entry received via sync is classified as
-  governance rather than given the content fork remedy. Only a *pruned* payload still falls back to
-  `Content`, and governance entries must retain their payload, so that case is not governance.
-- **Sync presupposes that every author has been admitted (recorded 2026-09-20, M14.6).** `apply_entry`
-  turns an author the resolver cannot resolve into `WireError::AuthenticatorInvalid`, which is a **hard**
-  failure that closes the session — correctly, since an unverifiable entry must not be stored. The
-  operational consequence is worth stating plainly: a member must admit the channel's current members
-  (whose full composite keys are on the ADR-012 board) *before* it can sync, or the first entry from an
-  unadmitted author kills the session. A test pins this exact behaviour rather than papering over it, and
-  `ChannelState::sync_over` persists everything that arrived **before** surfacing the coded failure, so a
-  partial session still makes durable progress instead of leaving entries only in the in-memory DAG. (5) `K_self` is derived but never applied (the self-log test stores plaintext);
-  `self_channel_id` (`vox/self-channel-id/v1`) is an addition not in the Decision. (6) Transport I/O
-  errors map to `0x01`, which the M0 table defines as "version". (7) The authenticator type sits outside
-  the signed skeleton and `algo_ids[0]` is pinned to the composite id even for deniable entries.
-  Test-vector obligation: only the log-entry skeleton is byte-pinned; there is no golden canonical-CBOR
-  suite for tags `0x0001–0x0012` and no frontier/Negentropy interop bytes against a reference.
-
-- **A secret-free peer is a real peer (2026-09-20, ADR-016 M15.2b).** The engine's independence from
-  plaintext is load-bearing, not incidental: an **anchor** that holds no key for a channel runs
-  `frontier_session_peer` over that channel's log as either side, because the session verifies authorship
-  and ordering and nothing else. `node::anchor::AnchorState` is that peer — genesis, vouched authors,
-  entries — and it is what lets two members who are never online together converge.
-- **A transport failure is not a protocol failure (2026-09-20, ADR-016 M15.2c).** Observed while gating
-  the anchor: every transport failure inside a session was reported as
-  `WireError::ProtocolVersionUnsupported`, because the engine mapped all send and receive errors onto that
-  code — so a peer that simply closed its laptop was diagnosed as speaking the wrong version. The registry
-  gains `0x09 TransportFailed` and the engine uses it for a failed send, a failed receive, and a clean
-  end-of-stream where a frame was due (the peer hung up mid-session). Genuine version mismatches — a frame
-  that decodes to an unsupported version — still map to `0x01`, which is what that code is for. The
-  behaviour is unchanged (the session still hard-fails and the next pass succeeds); what changes is that
-  the reason no longer lies, which matters because the ADR's own words are that a peer "logs the coded
-  reason and surfaces it".
-
-- **The drain phase is bounded in total, not only per frame (2026-09-23).** A session holds the
-  room's lock for its whole length, so a peer sending one frame just inside the per-frame timeout,
-  for ever, held that lock for ever — every other operation on the room stopped by one member at no
-  cost to it. `DRAIN_BUDGET` bounds the whole phase at thirty seconds. The honest bound is thirty
-  seconds *plus* one frame timeout, because the deadline is only checked when a frame arrives; the
-  engine is synchronous over channel state and cannot be wrapped in a timeout from outside. The
-  references separate the two for the same reason: go-libp2p's relay sets a per-stream timeout *and*
-  an absolute `Duration` cap, and Tor reclaims a circuit on total idle.
-- **A non-entry frame in the drain phase is now a protocol violation, not something to ignore
-  (2026-09-23).** This phase is defined as entries only, and tolerating anything else is what made
-  the hold above free: a non-entry frame costs the sender nothing, never reaches `apply_entry`, and
-  so never touches the quota that then bounded the exchange (since removed). This is a **wire-visible behaviour
-  change**, recorded as such: a sender that emits a non-entry frame mid-drain now has the session
-  failed rather than the frame skipped. Unknown frame *ids* are still rejected separately by
-  `decode_frame`, so this is not the RFC 9000 §12.4 "ignore what you do not know" case.
-- **The root cause both of these bound rather than fix (2026-09-23).** A sync runs with the channel's
-  lock held, so every network wait inside it is a wait the rest of the node serves behind. A naive
-  three-second bound on the *publish* path was written and **withdrawn before landing** for exactly
-  this reason: publishing also takes that lock, so a budget shorter than a sync's lock-hold would
-  have dropped records systematically whenever a sync was in flight — trading a visible stall for a
-  silent loss. The fix is for the exchange not to hold the lock across network waits, which is a
-  change to this ADR's implementation and not to a constant.
-
-- **An answered sync is bound to the room (2026-09-24, PRD-001 D5/R5).** `run_sync_session`
-  received the peer's identity and discarded it, so any member of any room this node held could name
-  another room's channel id in the preamble and be served its log. It now refuses — with the same coded
-  reset as a stream kind the peer may not open — unless the peer is an admitted author of *that* room
-  or in *that* room's anchor set (`ChannelState::anchors`: the node's configured anchors and those the
-  room's link named); for a room the node only anchors, an author its board knows. Before refusing, the
-  node admits from its own board's bundle records (the M17.6 evidence, as everywhere), so a member who
-  joined through somebody else is not refused for being new. The check is one early return below the
-  in-flight (`syncing`) refusal.
-  **Gate** (`crates/vox-tui/tests/a_member_of_one_room_is_not_served_another_proof.rs`, release, `--ignored`, since V29-17/RP-29 driving the **shipped `vox daemon`** as the victim; v0.2.8 leaks 25 of bravo's entries to it, `f5a1fe8` none):
-  the victim holds rooms A and B; a member of A only, using its own identity over a real connection, is
-  served all 5 of A's entries (the control) and asks for B five times — 0 sessions answered, 0 entries;
-  a member of B still holds all 5 of B's. On 0844943 it is red: 25 of B's entries over 5 answered
-  sessions; with the check removed, the same.
-  **The outbound direction is closed too (V29-04):** a session this node *starts* pushes a room only
-  to that room's members (admitted from the board first, as above) and to this node's own anchors,
-  and an anchor forwards a kept room only to its authors. Before, a fresh connection was pushed every
-  open room. Gate: the same file, step 4 — the victim's own push, answered by a member of A only:
-  1 session and 5 of B's entries before; 0 and 0 after, with A's 5 still pushed (the control).
-- **The per-author quota is removed (2026-09-24, PRD-001 D1/R1/R3).** `log/quota.rs` is deleted, both
-  its limits with it: the 1,000-entries-per-hour rate *and* the 50 MiB-per-epoch byte total, because the
-  byte total was a cumulative per-author cap on history within an epoch — a lifetime limit, which R1
-  forbids. `Dag::accept` no longer takes a clock. `WireError::QuotaExceeded` is gone and `0x06` is
-  reserved: `from_code(0x06)` is `None`, like any unknown code. The defect it closes was worse than
-  throttling: replaying a room's stored log on open charged every entry to the quota in one burst, so a
-  room with more than a thousand entries from one author failed to open, and the 1,001st post was
-  refused outright.
-  **Gates** (release, `--ignored`): `crates/vox-tui/tests/a_long_room_reopens_proof.rs` drives the
-  shipped `vox` binary — 1,500 `vox room post`s from one author all succeed, the daemon is killed and
-  restarted and the room opens with all 1,500 rows readable, and a newcomer who joins with `vox room
-  join` holds every entry alice's log does (1,502: the posts and two consents, counted off both stores).
-  On v0.2.8 (0844943) it is red at post 1,001; with the quota restored on the reopen path only it is red
-  at the reopen (`[closed]`). `crates/vox-core/tests/a_room_has_no_history_limit.rs` was the same claim
-  on in-process nodes; it was deleted in V29-17 because `a_long_room_reopens_proof` proves it through
-  the shipped binary.
-  **Observed alongside, not fixed or diagnosed here:** through the CLI the newcomer rendered none of
-  the pre-join history, and — the part that matters for R1 — did not render alice's *next* post within
-  180 s once the history was 1,500 long, where with 5 posts it did. A likely cause, **not verified**, is
-  that the key a newcomer receives sits at the chain's origin and the sender-key chain refuses a gap
-  over `MAX_SKIP` (1,000). That belongs to ADR-006 and R12 (per-grant history); the gate above counts
-  the newcomer's log for this reason rather than what it renders.
-- **A `WANT` is bounded by what is held (2026-09-24, PRD-001 D2/R4).** `entries_for_wants` looped
-  `from_seq..=to_seq` — one lookup per *number* — collecting into memory with the room's lock held, so
-  `WANT (author, 1, u64::MAX)` from any member spun for ever and nothing else could touch the room. Now
-  each author's ranges are sorted and merged (duplicates and overlaps cost nothing and serve nothing
-  twice), each merged range walks `Feed::range` over the entries actually held, and a session serves at
-  most `MAX_SERVE_ENTRIES` / `MAX_SERVE_BYTES` within `SERVE_BUDGET`, always at least one entry. The
-  continuation is the existing one: a sync that applied entries marks a push, so the requester comes
-  straight back for the rest.
-  **Gate** (`crates/vox-core/tests/a_want_cannot_wedge_a_room.rs`, release, `--ignored`): a real
-  member's identity, over a real connection, sends `WANT` with 1,000 copies of `(victim, 1, u64::MAX)`
-  plus an unheld feed and an inverted range; an ordinary post into the room on the victim completes
-  (6.6, 10.8 and 6.7 ms over three runs) and the attacker receives each of the 50 held entries exactly
-  once. On v0.2.8 (3cac220) the post gets no answer in 5 s in three runs of three; with the old loop
-  restored, the same; with ranges not merged, 1,024 entries are served for 50 held.
-
-- **`seen`, `claimed_ms` and the one order (2026-09-24, ADR-023 M23.2, PRD-001 R13).** The skeleton
-  is a 12-element array, and `EntrySkeleton::encode_fields` / `decode_fields` are now the only
-  encoder and decoder of its fields: the signed body and the wire frame both call them, where there
-  used to be four hand-kept copies. `Dag` keeps a clock per entry and an ordered index, so
-  `causal_order` iterates rather than sorts. It also keeps `seen_by` (hash → entries naming it, held
-  or not), which is how a late parent finds what it must lift, and `reorder_generation`, which a
-  timeline compares to know a re-sort is due. `Dag::seen_for(author)` picks what the next entry
-  names. `Dag::happened_before` walks parents with clock pruning. No backwards compatibility: an
-  entry in the 10-field shape is refused at decode. Gates: ADR-023 M23.2.
-
-- **Checkpoints and shed signatures (2026-09-25, ADR-023 M23.6).**
-  - **Wire:** the entry wire gains authenticator type `0`, "dropped under a checkpoint", which
-    carries an empty byte string. Type `2`, the removed deniable authenticator, stays refused.
-  - **Struct tag `0x0016`** (`vox/checkpoint/v1`) is an author's checkpoint on its own feed,
-    `[seq, entry_hash]`, carried as the payload of an ordinary signed entry of that feed.
-  - **What `Dag::accept` does with them:**
-    - An unsigned entry is taken only body-less and only provisionally. It becomes authentic when
-      a signed entry of the same feed chains to it. `Dag::discard_unverified` takes back whatever
-      never is, at the end of every sync session and of every reload. A reload that finds one
-      refuses the store.
-    - An entry for a position at or below its author's checkpoint that is not already held is
-      `Rejected::PreCheckpoint`, never a fork. `apply_entry` reports it as
-      `ApplyOutcome::PreCheckpoint` and the session continues.
-    - A checkpoint that names a position its own feed does not hold, with that hash, is refused.
-  - **Shedding:** `Dag::drop_checkpointed_signatures` walks each checkpoint's new range once, and
-    `drop_signature_if_checkpointed` handles an entry pruned afterwards.
-  - **Checking a whole feed:** `Feed::verify_all_signatures` accepts an unsigned run only if a
-    signed entry follows it.
-
-## Links
-**Depends on**: ADR-002, ADR-006.
-- Depended on by: ADR-007, ADR-009, ADR-010, ADR-011.
+Depends on ADR-002 (identity) and ADR-006 (sender keys). Used by ADR-007 (governance), ADR-010
+(at-rest storage and retention), ADR-011 (transport), ADR-012 (rendezvous records), ADR-016 (sync
+scheduling), ADR-020 (agent comms), ADR-023 (one order, checkpoints, key packages) and ADR-025 (sync
+ports). ADR-009 (deniability) is withdrawn.
 
 ## Engineering Mantra
 
