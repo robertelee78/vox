@@ -151,7 +151,9 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
         })
         .expect("CANNOT MEASURE (staging): C found no free dual-stack port in 5 tries");
     let id = c
-        .line_within(world::LINE_TIMEOUT, |l| l.starts_with("vox daemon: identity "))
+        .line_within(world::LINE_TIMEOUT, |l| {
+            l.starts_with("vox daemon: identity ")
+        })
         .unwrap_or_else(|| panic!("PRODUCT (staging): C's daemon never said its identity"));
     assert_eq!(
         id.split_whitespace().last(),

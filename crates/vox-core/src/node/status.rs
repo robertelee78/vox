@@ -109,6 +109,10 @@ pub struct RoomStatus {
     /// R14: one, unless a full-history grant is still owed). `None` when the room was
     /// mid-session and could not be read without waiting.
     pub key_generations: Option<usize>,
+    /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
+    /// receiving side: a generation read to the end is deleted). `None` when the room was
+    /// mid-session and could not be read without waiting.
+    pub received_key_generations: Option<usize>,
     /// Authors this node froze here for signing two entries at one position (ADR-008). `None`
     /// when the room was mid-session and could not be read without waiting.
     pub frozen: Option<Vec<Digest32>>,
@@ -278,13 +282,14 @@ impl StatusReport {
                 )
             });
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"frozen\":{},\"refused_below_checkpoint\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":{},\"refused_below_checkpoint\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
                 opt(r.last_sync),
                 opt(r.retention),
                 opt(r.key_generations.map(|n| n as u64)),
+                opt(r.received_key_generations.map(|n| n as u64)),
                 r.frozen.as_ref().map_or("null".into(), |f| format!(
                     "[{}]",
                     list(f.iter().map(|d| q(&b32_encode(d))))
