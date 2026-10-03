@@ -20,6 +20,14 @@
 //!    member's own words and who shared it.
 //! 5. a second share under a taken name is refused, naming it; the first still answers.
 //! 6. `vox serve` with a bare port is refused, saying how to name the share.
+//! 7. `vox forward` takes the address and nothing else (decider, 2026-10-03: "address only"):
+//!    `vox forward nas-ssh.nas-box.fam.vox` carries bob to alice's ssh service, and the form that
+//!    names a room, a member and a service is refused.
+//! 8. An address naming no share in a room bob has synced is refused at once, saying so: within
+//!    [`IMMEDIATE`], PRD-001 R23's bound (#69), with no wait for a share that is not coming.
+//! 9. The same for UDP: alice also shares `nas-dns` over UDP. `vox forward nas-dns.nas-box.fam.vox`
+//!    carries bob's datagrams to it and back, and an address naming no UDP share (`dns.…`) is
+//!    refused at once, saying so, rather than bound and its datagrams dropped.
 //!
 //! **A red names its side.** A `vox` command that fails while the scene is set is PRODUCT
 //! (staging); what this proof claims is PRODUCT, quoting what vox said; the proof's own files,
@@ -40,6 +48,9 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use world::{after_label, args, VoxProc, IDENTITY, VOX};
+
+/// PRD-001 R23's bound for a refusal (#69's `tunnel_honesty_proof`): it fails at once.
+const IMMEDIATE: Duration = Duration::from_secs(2);
 
 /// How long setting the scene may take at each step.
 const SETUP: Duration = Duration::from_secs(90);
@@ -169,6 +180,44 @@ fn echo(owner: &'static str) -> SocketAddr {
     at
 }
 
+/// A UDP service that answers each datagram with `<owner>:<datagram>`.
+fn udp_echo(owner: &'static str) -> SocketAddr {
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: a UDP echo socket");
+    let at = sock
+        .local_addr()
+        .expect("APPARATUS: the UDP echo's address");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            let mut out = format!("{owner}:").into_bytes();
+            out.extend_from_slice(&buf[..n]);
+            let _ = sock.send_to(&out, from);
+        }
+    });
+    at
+}
+
+/// `vox forward <address>` on `dir`, expected to be refused: whether it exited refused within
+/// 30 s, how long it took, and what it said.
+fn forward_refused(dir: &Path, who: &str, address: &str) -> (bool, Duration, String) {
+    let t = Instant::now();
+    let mut p = VoxProc::spawn(who, dir, &args(&["forward", address, "127.0.0.1:0"]));
+    let status = loop {
+        match p.child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if t.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => break None,
+            Err(e) => panic!("APPARATUS: wait for {who}: {e}"),
+        }
+    };
+    let took = t.elapsed();
+    std::thread::sleep(Duration::from_millis(200));
+    let said = p.transcript();
+    (status.is_some_and(|st| !st.success()), took, said)
+}
+
 /// A CONNECT through the proxy to `host`; the stream, or the SOCKS reply code.
 fn socks(proxy: SocketAddr, host: &str) -> Result<TcpStream, u8> {
     let mut s = TcpStream::connect(proxy).expect("PRODUCT: `vox up`'s proxy refused a connection");
@@ -261,7 +310,7 @@ fn listed(dir: &Path, room: &str, want: &[String]) -> (bool, String) {
 fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
-    let (ssh_at, nfs_at) = (echo("ssh"), echo("nfs"));
+    let (ssh_at, nfs_at, dns_at) = (echo("ssh"), echo("nfs"), udp_echo("dns"));
 
     let anchor_dir = tmp.path().join("anchor");
     std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: the anchor's directory");
@@ -307,6 +356,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
             "serve",
             &format!("nas-ssh={}", ssh_at.port()),
             &format!("nas-nfs={}", nfs_at.port()),
+            &format!("nas-dns={}/udp", dns_at.port()),
             "--anchor",
             &spec,
             "--listen",
@@ -484,9 +534,161 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         Ok("ssh"),
         "PRODUCT: after the refused second nas-ssh, nas-ssh must still reach the first"
     );
+    // (7) `vox forward` by the address, through bob's daemon; and the three-word form refused.
+    let mut fwd = VoxProc::spawn(
+        "bob forward",
+        &bob_dir,
+        &args(&["forward", "nas-ssh.nas-box.fam.vox", "127.0.0.1:0"]),
+    );
+    let bound_line = fwd.expect_line("PRODUCT: `vox forward <address>` binds", |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let bound: SocketAddr = bound_line
+        .split_whitespace()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("PRODUCT: vox forward said {bound_line:?}"));
+    let forwarded = {
+        let mut s = TcpStream::connect(bound)
+            .unwrap_or_else(|e| panic!("PRODUCT: the forward at {bound} refused: {e}"));
+        s.set_read_timeout(Some(vox_core::node::up::HOST_PATIENCE))
+            .expect("APPARATUS: set a read timeout");
+        s.write_all(b"hello\n")
+            .unwrap_or_else(|e| panic!("PRODUCT: the forward closed before a line: {e}"));
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line)
+            .unwrap_or_else(|e| panic!("PRODUCT: nothing came back through the forward: {e}"));
+        line
+    };
+    // Spawned, not waited for: a form that is accepted forwards until stopped, so it is judged by
+    // whether it exits refused within a bound, and by what it said.
+    let mut three = VoxProc::spawn(
+        "bob three-word forward",
+        &bob_dir,
+        &args(&["forward", &room, &alice_fp, "nas-ssh", "127.0.0.1:0"]),
+    );
+    let three_deadline = Instant::now() + Duration::from_secs(15);
+    let three_status = loop {
+        match three.child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() < three_deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => break None,
+            Err(e) => panic!("APPARATUS: wait for the three-word forward: {e}"),
+        }
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let three_said = three.transcript();
+    let three_ok = three_status.is_none_or(|st| st.success())
+        || three_said.contains("vox: forwarding")
+        || three_said.contains('→');
+    let (three_out, three_err) = (three_said, String::new());
+    drop(three);
+    eprintln!(
+        "forward by address: {bound_line:?} answered {forwarded:?}\nthree-word forward: \
+         ok={three_ok} {three_out}{three_err}"
+    );
+    assert!(
+        forwarded.starts_with("ssh:"),
+        "PRODUCT: `vox forward nas-ssh.nas-box.fam.vox` did not carry bob to alice's ssh service: \
+         {forwarded:?}"
+    );
+    assert!(
+        !three_ok,
+        "PRODUCT: `vox forward <room> <member> <service>` must be refused — the address is the only \
+         form: {three_out}{three_err}"
+    );
+    drop(fwd);
+
+    // (9) UDP: the share by its address carries datagrams; a name no UDP share carries is refused.
+    let mut dns_fwd = VoxProc::spawn(
+        "bob forward nas-dns",
+        &bob_dir,
+        &args(&["forward", "nas-dns.nas-box.fam.vox", "127.0.0.1:0"]),
+    );
+    let dns_line = dns_fwd.expect_line("PRODUCT: `vox forward` of a UDP share binds", |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let dns_bound: SocketAddr = dns_line
+        .split_whitespace()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("PRODUCT: vox forward said {dns_line:?}"));
+    let dns_answer = {
+        let c = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: a UDP client");
+        c.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("APPARATUS: a UDP read timeout");
+        let mut buf = [0u8; 1500];
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let _ = c.send_to(b"query", dns_bound);
+            if let Ok((n, _)) = c.recv_from(&mut buf) {
+                break Some(String::from_utf8_lossy(&buf[..n]).into_owned());
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+        }
+    };
+    drop(dns_fwd);
+    let (dns_refused, dns_took, dns_said) =
+        forward_refused(&bob_dir, "bob forward dns", "dns.nas-box.fam.vox");
+    eprintln!(
+        "forward nas-dns: {dns_line:?} answered {dns_answer:?}\nforward dns (no such share): \
+         refused={dns_refused} after {dns_took:?}: {dns_said}"
+    );
+    assert!(
+        dns_line.contains("udp/nas-dns") && dns_answer.as_deref() == Some("dns:query"),
+        "PRODUCT: `vox forward nas-dns.nas-box.fam.vox` must carry datagrams to alice's UDP share \
+         and back: {dns_line:?} answered {dns_answer:?}"
+    );
+    assert!(
+        dns_refused && dns_said.contains("shares no service called `dns`"),
+        "PRODUCT: a forward to an address naming no UDP share must be refused, saying so, not \
+         bound with its datagrams dropped: {dns_said}"
+    );
+    assert!(
+        dns_took <= IMMEDIATE,
+        "PRODUCT: a forward to an address naming no UDP share took {dns_took:?} to be refused; R23 \
+         bounds a refusal at {IMMEDIATE:?}"
+    );
+    // (8) No share of that name, in a room bob has synced: refused at once, through his daemon.
+    let t_absent = Instant::now();
+    let mut absent = VoxProc::spawn(
+        "bob forward nas-ftp",
+        &bob_dir,
+        &args(&["forward", "nas-ftp.nas-box.fam.vox", "127.0.0.1:0"]),
+    );
+    let absent_status = loop {
+        match absent.child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if t_absent.elapsed() < Duration::from_secs(30) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => break None,
+            Err(e) => panic!("APPARATUS: wait for the forward to nas-ftp: {e}"),
+        }
+    };
+    let absent_took = t_absent.elapsed();
+    std::thread::sleep(Duration::from_millis(200));
+    let absent_said = absent.transcript();
+    drop(absent);
+    eprintln!("forward to nas-ftp: {absent_status:?} after {absent_took:?}: {absent_said}");
+    assert!(
+        absent_status.is_some_and(|st| !st.success())
+            && absent_said.contains("shares no service called `nas-ftp`"),
+        "PRODUCT: a forward to an address naming no share must be refused, saying so: \
+         {absent_status:?} {absent_said}"
+    );
+    assert!(
+        absent_took <= IMMEDIATE,
+        "PRODUCT: a forward to an address naming no share in a synced room took {absent_took:?} to \
+         be refused; R23 bounds a refusal at {IMMEDIATE:?}"
+    );
     eprintln!(
         "[proof] 2 services reached by 6 addresses through 2 members' own words; 4 shorter names \
-         resolved to nothing; a duplicate name and a bare port refused"
+         resolved to nothing; a duplicate name and a bare port refused; forward by address only; absent TCP and UDP shares refused at once"
     );
     let _ = (
         bob_daemon.transcript(),

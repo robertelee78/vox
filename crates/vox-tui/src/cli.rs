@@ -1715,16 +1715,22 @@ pub struct TrustRemoveArgs {
 #[derive(Args, Debug, Clone)]
 pub struct ForwardArgs {
     #[command(flatten)]
-    pub room: RoomArgs,
-    /// The member sharing the service (its fingerprint, or a unique prefix). When the room
-    /// is given as a service's address, `<service>.<node>.<room>.vox`, the local port or
-    /// address to listen on instead.
-    pub host: Option<String>,
-    /// The service to reach, by the name its sharer gave it. Not given with an address.
-    pub tag: Option<String>,
-    /// Where to listen locally; port 0 picks one.
+    pub profile: ProfileArgs,
+    /// The service's address, `<service>.<node>.<room>.vox`: the name its sharer gave it, then
+    /// your alias for the sharer (or its fingerprint) and for the room (or its id). A service
+    /// is reached this way and no other (V030-25).
+    pub address: String,
+    /// Where to listen locally: a port on loopback, or an address. `127.0.0.1:0` picks a port.
     #[arg(default_value = "127.0.0.1:0")]
-    pub local: SocketAddr,
+    pub local: String,
+    /// **Refused**, as for every verb: a command line is readable by every process on the
+    /// machine while it runs. Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`,
+    /// or let it prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox serve`
@@ -1960,8 +1966,8 @@ enum Cmd {
     /// most other tools take `ALL_PROXY=socks5h://…`. Runs until stopped: SIGINT (Ctrl-C),
     /// SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Up(UpArgs),
-    /// Forward a local port to a member's service over the overlay — `ssh` over Vox
-    /// (ADR-013). Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
+    /// Forward a local port to a shared service, named by its address
+    /// `<service>.<node>.<room>.vox` — `ssh` over Vox (ADR-013, V030-25). Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
     /// cleanly.
     Forward(ForwardArgs),
     /// Put this machine on a room's **family LAN** (PRD-001 R28): a network interface on
@@ -2984,45 +2990,57 @@ pub fn run() -> ExitCode {
             })
         }
         Cmd::Forward(args) => {
-            // Two shapes. `vox forward <room> <host> <service> [local]`, and a service's address,
-            // `vox forward <service>.<node>.<room>.vox [<local>]` (V030-25), resolved by the node
-            // already holding the profile, which carries the forward.
-            let room = args.room.clone();
-            let name = room.room.trim().to_ascii_lowercase();
-            if name.ends_with(".vox") {
-                let paths = match room.profile.paths() {
+            // One form only (decider, 2026-10-03: "address only"): the service's address,
+            // resolved by the node holding the profile — the running daemon if there is one, else
+            // a node this verb unlocks, which reopens the rooms the profile holds open.
+            let name = args.address.trim().to_ascii_lowercase();
+            if !name.ends_with(".vox") {
+                eprintln!(
+                    "vox: {:?} is not a service's address: vox forward \
+                     <service>.<node>.<room>.vox [<local>] (`vox service list <room>` shows them)",
+                    args.address
+                );
+                return ExitCode::FAILURE;
+            }
+            let local = match args.local.parse::<u16>() {
+                Ok(port) => format!("127.0.0.1:{port}"),
+                Err(_) => args.local.clone(),
+            };
+            if node_answers(&args.profile) {
+                let paths = match args.profile.paths() {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("vox: {e}");
                         return ExitCode::FAILURE;
                     }
                 };
-                if args.tag.is_some() {
-                    eprintln!(
-                        "vox: a service's address names the service already: \
-                         vox forward <service>.<node>.<room>.vox [<local>]"
-                    );
-                    return ExitCode::FAILURE;
-                }
-                let local = args
-                    .host
-                    .clone()
-                    .unwrap_or_else(|| "127.0.0.1:0".to_owned());
                 return run_attached(async move {
                     crate::tunnel_cli::forward_named(&paths, &name, &local).await
                 });
             }
-            let (Some(host), Some(tag)) = (args.host.clone(), args.tag.clone()) else {
+            let Ok(local) = local.parse::<SocketAddr>() else {
                 eprintln!(
-                    "vox: name the member and the service: vox forward <room> <member> <service> \
-                     [<local>], or vox forward <service>.<node>.<room>.vox [<local>]"
+                    "vox: {:?} is not a local port or address to listen on",
+                    args.local
                 );
                 return ExitCode::FAILURE;
             };
-            let local = args.local;
-            run_tunnel_verb(room, true, move |node, cid| async move {
-                crate::tunnel_cli::forward(&node, cid, &host, &tag, local).await
-            })
+            let Some(socket) = socket_of(&args.profile) else {
+                return ExitCode::FAILURE;
+            };
+            run_new_room_verb_with(
+                args.profile.clone(),
+                args.identity_passphrase.clone(),
+                args.identity_passphrase_file.clone(),
+                None,
+                || Ok(()),
+                move |node, _anchors, ()| async move {
+                    // A running forward answers for its profile, as a daemon does: `vox status`
+                    // lists its tunnels, and `vox tunnel close` closes them.
+                    let _control = crate::tunnel_cli::serve_control_socket(&node, socket);
+                    crate::tunnel_cli::forward_address(&node, &name, local).await
+                },
+            )
         }
         Cmd::Lan(LanCmd::Helper(a)) => match crate::lan_cli::run_helper(&a.socket) {
             Ok(()) => ExitCode::SUCCESS,

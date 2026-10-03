@@ -289,6 +289,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
         shares: ch.shares(),
+        synced: ch.is_settled(),
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
@@ -13119,8 +13120,9 @@ impl Node {
         let view = self.view_tx.borrow().clone();
         for room in &view.open_channels {
             names.add_room(room.channel_id, &room.local_name, &room.members);
+            names.set_synced(room.channel_id, room.synced);
             for share in &room.shares {
-                names.add_share(room.channel_id, share.host, &share.name);
+                names.add_share(room.channel_id, share.host, &share.name, share.udp);
             }
         }
         for (fp, petname) in self.trust.iter() {

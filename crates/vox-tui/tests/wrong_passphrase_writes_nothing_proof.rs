@@ -123,18 +123,17 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
         .expect("APPARATUS: a non-UTF-8 temp path");
     // A syntactically whole address, so `connect` gets as far as opening the profile.
     let link = format!("vox://{fp}?a={fp}&b=/ip4/127.0.0.1/udp/1");
+    // The forward's address names a room the profile does not hold: the identity passphrase is
+    // refused before any name is resolved.
+    let forward_to = format!("22.{fp}.aaaa.vox");
     let verbs: [(&str, Vec<&str>); 5] = [
         ("serve", vec!["serve", "9=9", "--listen", "127.0.0.1:0"]),
         (
             "forward",
             vec![
                 "forward",
-                "aaaa",
-                &fp,
-                "22",
+                &forward_to,
                 "127.0.0.1:0",
-                "--passphrase-file",
-                room_pass,
                 "--listen",
                 "127.0.0.1:0",
             ],

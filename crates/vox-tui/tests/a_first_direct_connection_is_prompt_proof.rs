@@ -483,7 +483,7 @@ fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, Str
 #[test]
 #[ignore = "production Argon2id + a real PoW, a third member staged; run in release"]
 fn a_node_reads_the_board_before_bridging() {
-    use world::{args, room_pass_file, VoxProc};
+    use world::{args, VoxProc};
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(true);
@@ -494,12 +494,8 @@ fn a_node_reads_the_board_before_bridging() {
         &dave,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &w.hostname(),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &room_pass_file(&dave, &w.passphrase),
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",
@@ -573,18 +569,14 @@ fn without_entry_of(address: &str, who: &str) -> String {
 /// Start the guest's `vox forward` to the host's service, wait until it says it reached the host,
 /// read how many circuits it asked for to the host while it still runs, and stop it (by its PID).
 fn forward_once(w: &ForwardedWorld) -> (String, u64, Vec<String>) {
-    use world::{args, room_pass_file, VoxProc};
+    use world::{args, VoxProc};
     let mut fwd = VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &w.hostname(),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &room_pass_file(&w.guest_dir, &w.passphrase),
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",

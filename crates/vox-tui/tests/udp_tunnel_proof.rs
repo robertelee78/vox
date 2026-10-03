@@ -385,7 +385,7 @@ fn serves_udp(path: PathKind) {
     assert_eq!(
         answer.as_deref(),
         Some("10.53.0.1"),
-        "PRODUCT: dig through `vox forward <room> <host> {dns}/udp` must get the responder's answer"
+        "PRODUCT: dig through `vox forward {dns}.<host>.<room>.vox` (UDP) must get the responder's answer"
     );
     // And every later query is answered first time: the flow is up.
     let answered = (0..5).filter(|_| dig(at).is_some()).count();

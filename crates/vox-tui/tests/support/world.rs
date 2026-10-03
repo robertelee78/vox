@@ -907,26 +907,18 @@ impl World {
         format!("{}.{}.{}.vox", self.service_port, self.host_fp, self.room)
     }
 
-    /// `vox forward <room> <host> <service> 127.0.0.1:0` from `dir`, where `service` is a tag (`22`) or a
-    /// port spec (`53/udp` is the service `udp/53`) — returning it and the address it bound.
-    /// (The `vox forward <room>.vox <service> <local>` shape this used is withdrawn (V030-25);
-    /// `vox forward <service>.<node>.<room>.vox` needs a node already holding the profile.)
+    /// `vox forward <service>.<host fp>.<room>.vox 127.0.0.1:0` from `dir`, where `spec` names the
+    /// service as this world serves it: `P` or `P/udp` (served as `P=P/udp`, the name `P`) —
+    /// returning it and the address it bound. The address is the only form (V030-25).
     pub fn forward_service(&self, name: &str, dir: &Path, spec: &str) -> (VoxProc, SocketAddr) {
-        // From a file, never argv (V210-72: a room passphrase on the command line is refused).
-        let pass_file = dir.join(format!("{name}.room.pass"));
-        std::fs::write(&pass_file, &self.passphrase)
-            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
+        let service = spec.trim_end_matches("/udp").trim_end_matches("/tcp");
         let mut fwd = VoxProc::spawn(
             name,
             dir,
             &args(&[
                 "forward",
-                &self.room,
-                &self.host_fp,
-                spec,
+                &format!("{service}.{}.{}.vox", self.host_fp, self.room),
                 "127.0.0.1:0",
-                "--passphrase-file",
-                &utf8(&pass_file),
                 "--anchor",
                 &self.guest_anchor,
                 "--listen",
@@ -936,12 +928,7 @@ impl World {
         let line = fwd.expect_line("the forward's bound address", |l| {
             l.starts_with("vox: 127.0.0.1:") && l.contains('→')
         });
-        let bound: SocketAddr = line
-            .split_whitespace()
-            .nth(1)
-            .expect("an address")
-            .parse()
-            .expect("a socket address");
+        let bound = address_in(&mut fwd, &line, 1);
         (fwd, bound)
     }
 
@@ -968,24 +955,21 @@ impl World {
         (up, bound)
     }
 
-    /// `vox forward <room> <host> <port>` from `dir`; returns it and the address it bound.
+    /// `vox forward <port>.<host fp>.<room>.vox` from `dir`; returns it and the address it bound.
     pub fn forward(&self, name: &str, dir: &Path) -> (VoxProc, SocketAddr) {
         self.forward_port(name, dir, self.service_port)
     }
 
-    /// [`World::forward`] to `port` on the host, which need not be a port it offers.
+    /// [`World::forward`] to the service named `port` on the host, which need not be one it
+    /// shares.
     pub fn forward_port(&self, name: &str, dir: &Path, port: u16) -> (VoxProc, SocketAddr) {
         let mut fwd = VoxProc::spawn(
             name,
             dir,
             &args(&[
                 "forward",
-                &self.room,
-                &self.host_fp,
-                &port.to_string(),
+                &format!("{port}.{}.{}.vox", self.host_fp, self.room),
                 "127.0.0.1:0",
-                "--passphrase-file",
-                &self.passphrase_file(),
                 "--anchor",
                 &self.guest_anchor,
                 "--listen",

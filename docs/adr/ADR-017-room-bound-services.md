@@ -274,8 +274,13 @@ is what a person offers. A tunnel is how bytes reach it.
   the node and room places.
 - **12.11** A service MUST be named only by its address: `vox forward` MUST take a
   `service.node.room.vox` address and MUST NOT take a room, a member and a service as separate
-  arguments (decider, 2026-10-03). *Decided, not built:* the separate-argument form
-  `vox forward <room> <member> <service>` is still on this tree and is to be removed.
+  arguments (decider, 2026-10-03). Any other first argument MUST be refused. The address is
+  resolved by the node holding the profile: the running daemon, else a node the verb unlocks, which
+  reopens the rooms the profile holds open.
+- **12.12** A forward MUST NOT wait for a share it can see is absent (PRD-001 R23). While the named
+  room has not completed its first sync, the share's statement may still be on its way, and the
+  forward MAY wait for it. Once the room has synced and its log carries no share of that name by
+  that node, the forward MUST be refused at once, saying so.
 
 Built (#339): `node::resolver`, `governance::share`, `ChannelState::{say_share, shares}`,
 `vox serve <name>=<port>`, `vox service list`, `vox forward <service>.<node>.<room>.vox [<local>]`.

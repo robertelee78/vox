@@ -444,8 +444,8 @@ impl RelayWorld {
         (ok, t0.elapsed(), out, err)
     }
 
-    /// Start the guest's `vox forward` to the host's service, on `[::1]`; returns the local
-    /// address it bound.
+    /// Start the guest's `vox forward <service>.<host fp>.<room>.vox` to the host's service, on
+    /// `[::1]`; returns the local address it bound.
     pub fn forward(&mut self) -> SocketAddr {
         self.forward_with_anchors(&[])
     }
@@ -464,15 +464,11 @@ impl RelayWorld {
 
     fn spawn_forward(&mut self, spec: &str, extra: &[&str]) -> SocketAddr {
         let listen = self.guest_net().0;
-        let passphrase_file = self.passphrase_file();
+        let address = format!("{}.{}.{}.vox", self.service, self.host_fp, self.room);
         let mut list = vec![
             "forward",
-            &self.room,
-            &self.host_fp,
-            &self.service,
+            &address,
             "127.0.0.1:0",
-            "--passphrase-file",
-            &passphrase_file,
             "--anchor",
             spec,
             "--listen",
@@ -526,9 +522,10 @@ impl RelayWorld {
         (bound, ready)
     }
 
-    /// The room's name for the host's service, as a SOCKS5 client asks `vox up` for it.
+    /// The host's service's address, as a SOCKS5 client asks `vox up` for it:
+    /// `<service>.<node>.<room>.vox`, the only form that resolves (V030-25).
     pub fn hostname(&self) -> String {
-        format!("{}.vox", self.room)
+        format!("{}.{}.{}.vox", self.service, self.host_fp, self.room)
     }
 
     /// **The path is a relay, said by the guest.** The forward's upgrade tries a direct dial and

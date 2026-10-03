@@ -95,6 +95,7 @@ fn free_udp_port() -> u16 {
 /// A `vox forward` of the guest's identity on UDP `port`, with its millisecond clock skewed if asked.
 fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
     let listen = format!("127.0.0.1:{port}");
+    let address = format!("{}.{}.{}.vox", w.service, w.host_fp, w.room);
     let env: Vec<(&str, &str)> = skew
         // A whole clock step, both clocks (V210-64): `VOX_TEST_CLOCK_SKEW_MS` moves the
         // millisecond clock only, and would prove half the cure.
@@ -105,12 +106,8 @@ fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service,
+            &address,
             "127.0.0.1:0",
-            "--passphrase-file",
-            &w.passphrase_file(),
             "--anchor",
             &w.anchor.v4_spec,
             "--listen",

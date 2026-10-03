@@ -17,6 +17,7 @@ use vox_core::node::actor::{Bind, EventStreamItem, Node, NodeConfig, NodeHandle}
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome, Secret};
 use vox_core::node::link::{b32_decode, b32_encode};
 use vox_core::node::paths::Paths;
+use vox_core::node::resolver::{ServiceRoom, ShareState};
 
 use crate::app::AppError;
 
@@ -589,21 +590,85 @@ pub fn print_services(
     }
 }
 
+/// How long a node this verb unlocked waits for the rooms it holds open to reopen before a
+/// name that matches none of them is final: they reopen off the actor, one at a time (#208).
+const REOPEN_PATIENCE: Duration = Duration::from_secs(20);
+
+/// `vox forward <service>.<node>.<room>.vox [<local>]` on a node this verb unlocked: the name is
+/// resolved against the rooms the profile holds open (reopened at unlock) and its keyring, then
+/// forwarded as the daemon would (V030-25).
+///
+/// # Errors
+/// If the name leads nowhere — with the resolver's reason — or the forward fails.
+pub async fn forward_address(
+    node: &NodeHandle,
+    name: &str,
+    local: SocketAddr,
+) -> Result<(), AppError> {
+    let deadline = Instant::now() + REOPEN_PATIENCE;
+    let mut room = loop {
+        match node.resolve_name(name).await {
+            Ok(room) => break room,
+            // A room still reopening may be the one named: wait while any is closed.
+            Err(why)
+                if Instant::now() < deadline && node.view().channels.iter().any(|c| !c.open) =>
+            {
+                let _ = why;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(why) => return Err(AppError::Usage(format!("{name}: {why}"))),
+        }
+    };
+    // **Which share the name names is the room's log's to say** (V030-25): its transport, and
+    // whether there is one at all. A room this node joined and has not yet synced may not hold the
+    // statement yet — it arrives with the first sync, which starts as soon as the room is open —
+    // so only that case waits. A synced room whose log carries no such share is refused at once,
+    // with the reason (PRD-001 R23: a refusal is immediate, and said here).
+    let share_deadline = Instant::now() + SHARE_PATIENCE;
+    while room.share == ShareState::NotYetKnown && Instant::now() < share_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(again) = node.resolve_name(name).await {
+            room = again;
+        }
+    }
+    if let Some(refused) = share_refusal(name, &room) {
+        return Err(refused);
+    }
+    forward(node, room.channel_id, room.host, &room.service, local).await
+}
+
+/// The refusal for an address whose share the room's log does not carry, or `None` when it does
+/// (V030-25, PRD-001 R23: said at once, on this side).
+fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
+    match room.share {
+        ShareState::Stated => None,
+        ShareState::Absent => Some(AppError::Usage(format!(
+            "{name}: {} shares no service called `{}` in that room \
+             (`vox service list {}` shows what is shared there)",
+            crate::ident::author_id(&room.host),
+            vox_core::node::channel::service_name(&room.service),
+            short(&room.channel_id)
+        ))),
+        ShareState::NotYetKnown => Some(AppError::Usage(format!(
+            "{name}: that room has not synced with its members since this node joined it, so what \
+             is shared there is not known here yet\n       try again once a member is reachable"
+        ))),
+    }
+}
+
+/// How long a node this verb unlocked waits, in a room it has not yet synced, for the share a
+/// name names to arrive on the room's log: see [`forward_address`]. The same patience a forward has for reaching its host: the first sync is with the room's
+/// members, so it can take as long as reaching one (a relayed path took 18 s).
+const SHARE_PATIENCE: Duration = vox_core::node::up::HOST_PATIENCE;
+
 /// `vox forward` — serves until interrupted.
 pub async fn forward(
     node: &NodeHandle,
     channel_id: Digest32,
-    host_prefix: &str,
+    host: Digest32,
     service: &str,
     local: SocketAddr,
 ) -> Result<(), AppError> {
-    let view = node.view();
-    let detail = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == channel_id);
-    let members: Vec<Digest32> = detail.map(|d| d.members.clone()).unwrap_or_default();
-    let host = resolve_prefix(host_prefix, &members)?;
     // `53/udp` is the service `udp/53`; anything that is not a port spec is a tag as is.
     let label = vox_core::tunnel::udp::service_label(service).unwrap_or_else(|| service.to_owned());
     let tag = label.as_str();
@@ -1706,9 +1771,27 @@ pub async fn up_all(paths: &Paths, bind: SocketAddr) -> Result<(), AppError> {
 /// already holding this profile, until ^C (V030-25).
 pub async fn forward_named(paths: &Paths, name: &str, local: &str) -> Result<(), AppError> {
     let sock = paths.socket_file();
-    let (channel_id, host, service) = vox_core::node::nameipc::resolve(&sock, name)
-        .await
-        .map_err(|e| AppError::Usage(format!("{name}: {e}")))?;
+    let resolve = || async {
+        vox_core::node::nameipc::resolve(&sock, name)
+            .await
+            .map_err(|e| AppError::Usage(format!("{name}: {e}")))
+    };
+    let mut room = resolve().await?;
+    // As [`forward_address`]: wait only while the room has not synced since it was joined.
+    let share_deadline = Instant::now() + SHARE_PATIENCE;
+    while room.share == ShareState::NotYetKnown && Instant::now() < share_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        room = resolve().await?;
+    }
+    if let Some(refused) = share_refusal(name, &room) {
+        return Err(refused);
+    }
+    let ServiceRoom {
+        channel_id,
+        host,
+        service,
+        ..
+    } = room;
     // A bare port means loopback; `127.0.0.1:0` picks one.
     let local = match local.parse::<u16>() {
         Ok(port) => format!("127.0.0.1:{port}"),
