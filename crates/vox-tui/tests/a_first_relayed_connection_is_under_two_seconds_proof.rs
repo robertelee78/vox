@@ -59,9 +59,13 @@ use world::round_trip;
 const R42: Duration = Duration::from_secs(2);
 /// Cold first connections measured; the bound is asserted on every one.
 const SAMPLES: usize = 5;
-/// A restart (samples 1 on) connects this fast: under the 250 ms a probe of the dead predecessor
-/// cost, with margin for a loaded box. Sample 0 took 6–30 ms.
-const RESTART_WITHIN: Duration = Duration::from_millis(150);
+/// A restart (samples 1 on) connects this fast: a relayed reach's direct head start (V210-122,
+/// 250 ms, which every sample pays: the guest has no direct candidate) plus 150 ms, under the head
+/// start plus the 250 ms a probe of the dead predecessor cost. Before the head start, sample 0 took
+/// 6–30 ms and the bound was 150 ms; after it, every sample took 261–281 ms (2026-10-02), and a
+/// fixed 150 ms read every restart as a wait on its predecessor.
+const RESTART_WITHIN: Duration =
+    vox_core::node::network::DIRECT_HEAD_START.saturating_add(Duration::from_millis(150));
 /// What the anchor says when a newcomer supersedes another process of its identity.
 const SUPERSEDED: &str = "a new connection is from a new process of this identity";
 
