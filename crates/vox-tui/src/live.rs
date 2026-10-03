@@ -51,6 +51,11 @@ use crate::viewmodel::{
 /// tunnels and their last moved byte change without a room event.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
 
+/// How the TUI takes its node (ADR-026 L-2, S-4; the decider's ruling of 2026-10-03): it holds it
+/// implicitly, so quitting or SIGHUP drops only its hold, and a node it was the last holder of
+/// detaches. A node attached by hand or with `--keep` stays attached.
+const HOW_THE_TUI_ATTACHES: AttachMode = AttachMode::Hold;
+
 /// What the event tasks tell the UI thread.
 enum Ev {
     /// A node event of the node this TUI acts as.
@@ -274,7 +279,7 @@ impl DaemonCore {
         let socket = self.account.socket();
         let using = |passphrase| UseNode {
             node: self.node.clone(),
-            attach: AttachMode::Hold,
+            attach: HOW_THE_TUI_ATTACHES,
             passphrase,
             anchors: self.anchors.clone(),
         };
