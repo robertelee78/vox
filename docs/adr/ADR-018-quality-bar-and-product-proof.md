@@ -10,11 +10,10 @@ v0.3.0**.
 
 ## Context
 
-On 2026-09-21 the repository had 877 passing tests, and every gate was green. The first real run of
-`vox serve` → `vox connect` → `vox up` → `ssh` failed on three defects. Each one sat in a handoff
-between two commands, and none of the 877 tests could see it. Test volume and green intermediate
-artifacts did not answer the only question that matters: does `vox` work for the person using it?
-This ADR makes real use of the shipped binary the only evidence a release accepts.
+A large suite of passing tests and green gates can coexist with a product that fails its first real
+use, because the defects that matter sit in the handoffs between commands, which unit and in-process
+tests do not exercise. The only question that matters is whether `vox` works for the person using
+it. This ADR makes real use of the shipped binary the only evidence a release accepts.
 
 ## Requirements
 
@@ -238,9 +237,9 @@ MUST be reproduced by the harness when its fix is reverted.
 | §10.2 and §10.6 on integrate/v0.3.0: R40/R41 block in `transport-gates`, R41's WAN arm is report-only on macOS, and `scripts/release-gate.sh` requires the live-model proofs | built on integrate/v0.2.10 (#301); reaches v0.3.0 with #226 |
 | CI still accepts the `opencode` gap (§3) | the live-model proofs need OpenCode and a model account CI lacks |
 | The watchdog's Linux stack dump (§6.3) has not been run | open, V210-145 |
-| `cross_process_join_proof` saw one fast red (`Unreachable` straight after an invite, 1 in 3 on 005b801) whose cause was never named; it has not recurred (12/12, 15/15) and the next red names its side (#192) | open, V210-146 |
+| `cross_process_join_proof` has one red (`Unreachable` straight after an invite) whose cause is not named | open, V210-146 |
 | UPnP port mapping has no real-router validation (ADR-012) | open |
-| Claims left unmeasured by the 2026-09-26 test deletion | proved since: `no_consent_without_a_ring_entry_proof`, `revocation_rotates_the_key_proof`, `the_path_mtu_follows_the_socket_buffer_proof`; the rest are tracked by #204 |
+| Claims left unmeasured by the deletion of the unit tests | tracked by #204 |
 
 ## Related ADRs
 

@@ -68,7 +68,7 @@ the client presents it.
 ### 3. Channel create, join and navigation
 
 3.1. The create screen MUST start on these policy defaults, and the creator MUST be able to change
-     them (ADR-007): authorship attributable (ADR-009); history full, with forward-only as an
+     them (ADR-007): authorship attributable (every entry composite-signed, ADR-008 LS-8); history full, with forward-only as an
      opt-in; retention never expires (ADR-010). *Planned.* Deniable authorship is not offered:
      deniable mode is removed (PRD-001 R43).
 3.2. An invite MUST be one scannable QR and copyable code carrying only the channel ID (ADR-005). The
@@ -209,7 +209,7 @@ the client presents it.
 
 ## Related ADRs
 
-ADR-001, ADR-002, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009, ADR-010, ADR-012, ADR-013, ADR-015
+ADR-001, ADR-002, ADR-005, ADR-006, ADR-007, ADR-008, ADR-009 (withdrawn: no deniable mode), ADR-010, ADR-012, ADR-013, ADR-015
 (peer client; requirement 4.2's derivation), ADR-017 (room-bound services and the entry point),
 ADR-022 (app API).
 

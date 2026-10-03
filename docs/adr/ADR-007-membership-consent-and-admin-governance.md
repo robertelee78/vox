@@ -45,8 +45,8 @@ only room governance is who sets the room's retention. This builds on identity (
   certificate MUST carry `policy` only, never `admin` (#319). The creator or an admin MAY end the room
   for everyone (`vox room end`, a room-lifecycle fact `0x0019`); every member's node then deletes it
   (ADR-023 RL-8.2).
-- **G-6.** The only governance act MUST be setting the room's retention (the policy-update `ttl`), and
-  only the creator or an admin it delegated MAY do it. The capabilities are `admin` and `policy`; every
+- **G-6.** The only governance acts MUST be setting the room's retention (the policy-update `ttl`) and
+  ending the room (G-5), and only the creator or an admin it delegated MAY do either. The capabilities are `admin` and `policy`; every
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be
   refused as unknown. Policy updates beyond retention, passphrase rotation, invite modes and the
   capability lattice are removed (#380; `bind:`/`dial:` under #94, see Status).
@@ -106,6 +106,9 @@ only room governance is who sets the room's retention. This builds on identity (
      empty plaintext, so the responder gains a sending chain and receives no key and no grant.
   3. Each member `A` decides whether `N` reads `A`, by trusting `N`. Until `A` does, `A`'s messages stay
      unreadable to `N`. `N`'s view fills in monotonically, per sender.
+- **G-15a. Release at admission.** When a joiner is already in a member's trust keyring, that member
+  MUST release its sender key to the joiner when it admits the join, not on a later tick: the room is
+  forward-only, so anything sealed before the release would stay unreadable to the joiner for good.
 - **G-16.** A grant MUST record what it released (`history_mode_at_grant`): the granting owner's choice
   per grant (ADR-006 S-18), never another member's history.
 - **G-17.** Log authorship and read authority MUST stay separate: `admit_author` records a verified key
@@ -174,12 +177,6 @@ only room governance is who sets the room's retention. This builds on identity (
   suite at all (G-10).
 - Role-tag ABAC is not evaluated, `Invite` has no wire encoding, and any `delegate`-holder may revoke any
   delegation: each goes with the capabilities #380 removes; only the creator removes an admin under #319.
-
-Fixed since:
-- Joining released the joiner's sender key to the member that answered (M17.6).
-- `NodeCommand::Consent` released a key without a keyring entry: removed; a key goes only to a trusted
-  member, checked in the core (V210-148, `bb1481b1`; proof `no_consent_without_a_ring_entry_proof.rs`).
-- `Untrust` was forward-looking only and did not change the lock (M17.14, `8894b2b2`).
 
 ## Consequences
 

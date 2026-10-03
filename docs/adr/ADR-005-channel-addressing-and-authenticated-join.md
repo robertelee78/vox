@@ -27,8 +27,9 @@ readable: who reads whom is decided by trust (ADR-007).
   creates the room; `vox room invite` prints the room's link; the link and the passphrase are sent
   separately; the other runs `vox room join` with them; each then runs `vox trust add` for the other
   (ADR-007).
-- **J-2.** A room passphrase is OPTIONAL. The core MUST NOT refuse an empty room passphrase. (The
-  identity passphrase is ADR-002's and follows the same rule.)
+- **J-2.** A room passphrase is OPTIONAL. The core MUST NOT refuse an empty room passphrase. An identity
+  passphrase is OPTIONAL by the same rule: the core MUST NOT refuse an empty identity passphrase
+  (ADR-010 AR-5).
 - **J-3.** A join naming a room this node already holds MUST update the room's stored address to the
   new link's addresses, not refuse (V210-167): the members the link names are dialled there, and those
   that answer, with the anchors it names, are kept as the room's address. An address at which no member
@@ -117,8 +118,7 @@ readable: who reads whom is decided by trust (ADR-007).
   (`Difficulty::expected_solves`). The responder's base MUST be `DEFAULT_INVITE` = 1 bit (low but non-zero,
   so a leaked channelID still costs a full solve per attempt); `DEFAULT_OPEN` = 2 bits; `ZERO` MAY be used
   only for an explicit LAN or closed deployment. A joiner MUST refuse a challenge above `MAX` = 8 bits
-  before grinding. The target base solve SHOULD be ≈ 1–2 s on a mobile CPU (measured 1.1 s and 245 MB on
-  a desktop-class core, 2026-09-19, `examples/spike_pow.rs`).
+  before grinding. The target base solve SHOULD be ≈ 1–2 s on a mobile CPU.
 - **J-25.** The responder MUST adapt difficulty to its live count of joins in flight with
   `Difficulty::adapted_for_load`: one bit per doubling of the queue at or above `ADAPT_THRESHOLD` = 4,
   saturating at `MAX`, falling back as the queue drains.

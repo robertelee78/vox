@@ -14,8 +14,7 @@ Not built:
 - the consent-retry keying in D9 (Planned);
 - the proofs for P3, P4, P5 and P7.
 
-The P1 and P10 proofs were deleted with the decider's approval in V210-106 (#301, `233a870a`). P6
-asserts what P1 asserted about refusals.
+P1 and P10 have no proof on this tree (#301). P6 asserts what P1 asserted about refusals.
 
 On this tree D3's class set has three more classes from later items: `BodyArrived` (V030-10), and
 `Unlinked` and `Refused` (V210-74).
@@ -25,8 +24,8 @@ On this tree D3's class set has three more classes from later items: `BodyArrive
 
 ## Context
 
-The decider: *"it kind of reminds me of a networking hub vs. a switch — is there something that we can
-do that's more intelligent to make it more like a switch instead of a hub, with slots and queues"*.
+Sync is to be scheduled like a network switch, not a hub: with slots and queues, so one busy peer
+does not hold up the others.
 
 A sync session reconciles one room's log between two nodes over one QUIC bi-stream. Either end may
 open it, and both ends run the same steps:
@@ -277,17 +276,6 @@ feature, whose behaviour is chosen with `VOX_MUTANT_SENDER_MODE`. No shipped bui
 - A burst past the slot cap waits in a queue instead of waiting for the 30 s tick.
 - A faulty peer cannot get unrequested entries stored, and cannot drive a tight retry loop.
 - One stalled set of peers can still delay a live one by up to a session timeout (D6.3).
-
-### Fixed since
-
-- The bilateral serve-before-drain deadlock (V210-39, #212) is fixed: serve and drain run
-  concurrently (`d700d0a1`, `cf42f553`, merged `39c38841`). Proof: `two_backlogs_meet_proof`.
-- The defects in this ADR's scope are fixed by V210-34 (#209):
-  - a session skipped at the slot cap (P2);
-  - a truncated serve counted as done (D3, the `partial` counter);
-  - a failed partial apply that did not wake the room's other peers (D6a);
-  - a receiver storing entries it did not ask for (P9);
-  - an honest pair retrying zero-progress sessions without pacing (D3/D5).
 
 ## Related ADRs
 

@@ -189,9 +189,8 @@ connection, bound to the TLS session by its exporter.
     - `PROVE = [tag_prove, version, target_composite_pubkey, instance, sig]`;
     - `CLAIM = [tag_claim, version, dialler_composite_pubkey, instance, sig]`.
 
-    The three tags MUST be the next free tags in `wire.rs` when this is built. The highest on the
-    land tree is `0x0018`, and the governance work (V030-32) is adding `0x0019` onward, so the
-    numbers are assigned at build time against `wire.rs`, not here. `version` is 2. A frame longer
+    The tags are `0x001C` (`ASK`), `0x001D` (`PROVE`) and `0x001E` (`CLAIM`) in `wire.rs`'s
+    registry (ADR-008 LS-21), after the room-lifecycle tags `0x0019`–`0x001B` (ADR-023 RL-8). `version` is 2. A frame longer
     than 16 KiB MUST NOT be read past the cap, and MUST be refused as a malformed flight
     (requirement 32).
 29. **The responder proves first.** The dialler MUST NOT send `CLAIM` until `PROVE` has verified
@@ -270,10 +269,6 @@ connection, bound to the TLS session by its exporter.
 
 - **The interop matrix** (requirement 14) is an open release gate, awaiting the decider (V030-29
   decider question 32).
-
-Fixed since the old text: macOS black-holing at 1452 bytes with a 256 KiB receive buffer was
-quinn-proto 0.11.14 reading overflow loss as a black hole. quinn-proto 0.11.18 (7c14ec60, #206) fixed
-it; re-measured through `vox forward`, 0 of 10 runs black-holed (#381, V210-158, closed).
 
 ## Consequences
 
