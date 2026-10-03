@@ -1960,8 +1960,9 @@ pub fn run() -> ExitCode {
             }
             "codex" => {
                 println!(
-                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{ \
-                     \"command\": \"vox agent hook\", \"async\": false }}\n    ]\n  \
+                    "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
+                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
+                     \"vox agent hook\", \"async\": false }}\n        ]\n      }}\n    ]\n  \
                      }}\n}}"
                 );
                 eprintln!(

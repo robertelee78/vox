@@ -33,8 +33,9 @@
 //! proof's processes are sealed.)
 //!
 //! **Which side a red is on.** What vox said or did, read back through Codex's own API, is
-//! `PRODUCT:`. Codex not answering, not listing an entry this proof wrote, or not seeing a
-//! staged change is `CANNOT MEASURE:` (Codex is the instrument here). A fault of this proof's own
+//! `PRODUCT:`, and so is Codex not listing an entry this proof wrote: every entry has the shape
+//! `vox agent plugin codex` prints. Codex not answering, or not seeing a staged change, is
+//! `CANNOT MEASURE:` (Codex is the instrument here). A fault of this proof's own
 //! (a file, a symlink, a leaked variable) is `APPARATUS:`.
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -72,14 +73,34 @@ fn codex_present(home: &Path) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// One `UserPromptSubmit` entry in exactly the shape `vox agent plugin codex` prints, with its
+/// command replaced. The shape is the product's, not this file's: a hand-written shape is how a
+/// flat entry Codex ignores shipped while this proof stayed green (V210-133, #352).
+fn plugin_entry(command: &str) -> serde_json::Value {
+    let out = Command::new(VOX)
+        .args(["agent", "plugin", "codex"])
+        .output()
+        .expect("APPARATUS: cannot run vox agent plugin codex");
+    assert!(
+        out.status.success(),
+        "PRODUCT: `vox agent plugin codex` failed"
+    );
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("PRODUCT: `vox agent plugin codex` printed no JSON: {e}"));
+    let mut entry = printed["hooks"]["UserPromptSubmit"][0].clone();
+    let slot = entry.pointer_mut("/hooks/0/command").unwrap_or_else(|| {
+        panic!("PRODUCT: `vox agent plugin codex` printed no nested hook command: {printed}")
+    });
+    *slot = serde_json::Value::from(command);
+    entry
+}
+
 fn write_hooks(home: &Path, commands: &[&str]) {
     let mut entries = vec![serde_json::json!({"hooks": [
         {"type": "command", "command": "echo another-tool", "async": false}
     ]})];
     for c in commands {
-        entries.push(serde_json::json!({"hooks": [
-            {"type": "command", "command": c, "async": false}
-        ]}));
+        entries.push(plugin_entry(c));
     }
     let body = serde_json::json!({"hooks": {"UserPromptSubmit": entries}});
     std::fs::write(home.join("hooks.json"), body.to_string())
@@ -167,7 +188,13 @@ fn status_of(home: &Path, command: &str) -> String {
         .find(|(c, _)| c == command)
         .map(|(_, s)| s)
         .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: Codex does not list the hook {command:?} this proof wrote")
+            // Every entry this proof writes has the shape `vox agent plugin codex` prints
+            // (`plugin_entry`), so Codex not listing one is exactly #352's failure: a user who
+            // installs what Vox prints gets no hook.
+            panic!(
+                "PRODUCT: Codex does not list the hook {command:?}, written in the shape \
+                 `vox agent plugin codex` prints"
+            )
         })
 }
 
