@@ -198,7 +198,8 @@ them, and the threat model is cooperating workers that may be buggy, never adver
 
 An adapter is a process on a node's host, with its own identity, on the workers' Vox version,
 trusted like any worker. It sees what its node can decrypt. All its surfaces compose `Read`,
-`Subscribe` and `Post` on the existing control socket.
+`Subscribe` and `Post` on the existing control socket. *Decided, not built (ADR-026):* that is the
+account's one daemon socket, and an adapter's requests name the node it acts as (ADR-026 C-3).
 
 - **7.1 (M21.5, F5, F6, F13).** `vox room tail ROOM --since CURSOR --json` MUST deliver every row
   after `CURSOR`, then every row as it lands, with no gap across a lag or a restart: subscribe, then
