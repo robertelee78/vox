@@ -94,10 +94,10 @@ fn render(v: &Value) -> String {
             ago(now, &r["last_sync"]),
             r.get("key_generations")
                 .and_then(Value::as_u64)
-                .map_or_else(|| "(busy)".to_owned(), |n| n.to_string()),
+                .unwrap_or(0),
             r.get("received_key_generations")
                 .and_then(Value::as_u64)
-                .map_or_else(|| "(busy)".to_owned(), |n| n.to_string())
+                .unwrap_or(0)
         );
         // A fork is a member caught signing two different entries at one position: loud,
         // because everything that member posts here is refused from then on.

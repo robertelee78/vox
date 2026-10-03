@@ -458,6 +458,20 @@ pub struct ChannelDetail {
     /// Who this identity consents to reading it here (ADR-007), in fingerprint order. Read off
     /// the log, so a revocation takes one out; what a client shows as consent (V210-82).
     pub consented: Vec<Digest32>,
+    /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
+    /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
+    /// so a reader never has to take the room's lock, which a sync session holds while it runs.
+    pub retention: u64,
+    /// How many generations of this node's own sender key it still holds here (PRD-001 R14).
+    pub key_generations: usize,
+    /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
+    /// receiving side).
+    pub received_key_generations: usize,
+    /// Authors this node froze here for signing two entries at one position (ADR-008).
+    pub frozen: Vec<Digest32>,
+    /// Entries this node refused here as at or below their author's checkpoint since it opened
+    /// the room (ADR-023 decision 3).
+    pub refused_below_checkpoint: u64,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -950,8 +964,6 @@ impl Fault {
     /// What this fault means to a person, and what to do about it, in the house style: one
     /// short line saying what happened, then indented lines saying what to do.
     ///
-    // `Fault::KeyringFull`'s explanation names the cap in words; this holds them together.
-    const _KEYRING_CAP_NAMED: () = assert!(crate::node::trust::MAX_TRUSTED == 1024);
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
     // `Fault::PassphraseNeeded`'s explanation names the window in words.
@@ -982,8 +994,16 @@ impl Fault {
                 "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
             }
             Fault::TooLong => "that is longer than this field allows",
+            // The cap in force, read once (#85): a test build's lowered cap is never called 1,024.
             Fault::KeyringFull => {
-                "your trust keyring is full (1,024 identities)\n       remove one with `vox trust remove <fingerprint>`, then add again"
+                static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                TEXT.get_or_init(|| {
+                    format!(
+                        "your trust keyring is full ({} identities)\n       remove one with \
+                         `vox trust remove <fingerprint>`, then add again",
+                        crate::node::trust::trust_cap_words()
+                    )
+                })
             }
             Fault::Storage => {
                 "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
