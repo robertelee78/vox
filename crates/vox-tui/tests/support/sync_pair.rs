@@ -24,6 +24,10 @@ use std::time::{Duration, Instant};
 
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 
+#[path = "layout.rs"]
+mod layout;
+pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
+
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const ID_PASS: &str = "an identity passphrase";
 pub const ROOM_PASS: &str = "the room passphrase";
@@ -213,6 +217,14 @@ pub struct Member {
     pub dir: PathBuf,
     pub pass: PathBuf,
     pub fp: String,
+}
+
+impl Drop for Member {
+    /// The safety net: a daemon still holding this member's data root is stopped by its pid
+    /// ([`reap_daemon`]).
+    fn drop(&mut self) {
+        reap_daemon(&self.dir);
+    }
 }
 
 impl Member {

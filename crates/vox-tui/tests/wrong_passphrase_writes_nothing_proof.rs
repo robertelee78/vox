@@ -25,6 +25,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -108,7 +111,7 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
         52,
         "PRODUCT (staging): `vox id`'s first line is not a fingerprint: {said}"
     );
-    let store = dir.join("default").join("store.redb");
+    let store = layout::node_dir(&dir, layout::DEFAULT_NODE).join("store.redb");
     assert!(
         store.is_file(),
         "PRODUCT (staging): `vox id` left no {} to watch: {said}",

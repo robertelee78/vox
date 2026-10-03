@@ -73,7 +73,7 @@ use vox_core::atrest::vault::IdentityVault;
 use vox_core::hash::Digest32;
 
 use previous_release::{previous_release, PREVIOUS};
-use world::{args, VoxProc, IDENTITY, VOX};
+use world::{args, node_dir, VoxProc, DEFAULT_NODE, IDENTITY, VOX};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
 /// Copies unlocked twice at once in the natural arm (fewer in a debug build, whose Argon2id
@@ -218,8 +218,16 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
 
 // ---- the profile on disk ---------------------------------------------------------------------
 
+/// The default node's directory as this build keeps it, `<data>/nodes/default/` (ADR-026 §7).
 fn profile_dir(data: &Path) -> PathBuf {
-    data.join("default")
+    node_dir(data, DEFAULT_NODE)
+}
+
+/// The default profile's directory as v0.2.9 left it, `<data>/default/`, which this build's first
+/// run moves to [`profile_dir`] (ADR-026 F-3): what v0.2.9 wrote is read here, what a trial left
+/// there — read here, a trial's profile would be missing, not clean.
+fn old_profile_dir(data: &Path) -> PathBuf {
+    data.join(DEFAULT_NODE)
 }
 
 /// Copy a stopped profile's data directory (its files; a daemon's leftover socket is not one).
@@ -246,11 +254,11 @@ const SEGMENTS: TableDefinition<SegmentKey, &[u8]> = TableDefinition::new("segme
 const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wraps");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
-/// Every row key in a stopped profile's store, named by table. Read from a copy, so a store that
-/// redb would repair on open is not changed by reading it.
-fn row_keys(data: &Path) -> BTreeSet<String> {
+/// Every row key in the store of the stopped profile at `profile` under data root `data`, named by
+/// table. Read from a copy, so a store that redb would repair on open is not changed by reading it.
+fn row_keys(data: &Path, profile: &Path) -> BTreeSet<String> {
     let copy = data.with_extension("rows.redb");
-    std::fs::copy(profile_dir(data).join("store.redb"), &copy)
+    std::fs::copy(profile.join("store.redb"), &copy)
         .expect("PRODUCT (staging): the profile has no store.redb to read");
     let db = redb::Database::open(&copy).expect("APPARATUS: open a copy of the stopped store");
     let r = db
@@ -289,8 +297,8 @@ fn row_keys(data: &Path) -> BTreeSet<String> {
     keys
 }
 
-fn vault_version(data: &Path) -> u64 {
-    let bytes = std::fs::read(profile_dir(data).join("vault.cbor"))
+fn vault_version(profile: &Path) -> u64 {
+    let bytes = std::fs::read(profile.join("vault.cbor"))
         .expect("PRODUCT (staging): the profile has no vault.cbor");
     IdentityVault::from_canonical_slice(&bytes)
         .expect("PRODUCT: the vault vox wrote does not parse")
@@ -419,11 +427,11 @@ impl Tally {
         if !names.contains("dave") {
             self.dave_gone += 1;
         }
-        let now = row_keys(data);
+        let now = row_keys(data, &profile_dir(data));
         for k in template.difference(&now) {
             self.lost_rows.push(format!("{label}: {k}"));
         }
-        if oks > 0 && vault_version(data) != 2 {
+        if oks > 0 && vault_version(&profile_dir(data)) != 2 {
             self.not_v2 += 1;
         }
         for f in leftovers(data) {
@@ -439,7 +447,7 @@ impl Tally {
             runs.len(),
             template.intersection(&now).count(),
             template.len(),
-            vault_version(data)
+            vault_version(&profile_dir(data))
         );
     }
 }
@@ -493,12 +501,12 @@ fn two_unlocks_of_one_v1_profile_lose_no_rows() {
     // it, repairs it, and closes it cleanly, so the trials start from the ordinary case.
     ok(&old, &carol, &["trust", "list"], None);
     assert_eq!(
-        vault_version(&carol),
+        vault_version(&old_profile_dir(&carol)),
         1,
         "APPARATUS, CANNOT MEASURE: the previous release {PREVIOUS} did not write a version-1 \
          vault"
     );
-    let template = row_keys(&carol);
+    let template = row_keys(&carol, &old_profile_dir(&carol));
     let room_rows = template
         .iter()
         .filter(|k| k.starts_with("segments/") || k.starts_with("sek_wraps/"))

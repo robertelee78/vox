@@ -81,7 +81,7 @@ fn an_unknown_control_request_says_so() {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let socket = data.join("default").join("node.sock");
+    let socket = world::node_dir(&data, world::DEFAULT_NODE).join("node.sock");
     assert!(
         socket.exists(),
         "PRODUCT (staging): no control socket at {} (a long path is hashed elsewhere)",

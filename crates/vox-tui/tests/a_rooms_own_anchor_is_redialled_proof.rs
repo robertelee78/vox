@@ -193,11 +193,12 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
     // Its board is held in memory, so the restart alone loses it; its identity file stays, so it
     // is the same anchor. An anchor keeps no store at all (ADR-023 decision 6, PRD-001 R34), so
     // there is nothing on disk that could put the board back.
-    let store = anchor_dir.join("default").join("store.redb");
+    // Anywhere under its data root, so a store kept in an unexpected place is caught too.
+    let stores = world::find_named(&anchor_dir, "store.redb");
     assert!(
-        !store.exists(),
-        "PRODUCT: an anchor that is no member of any room must keep no store, yet {} exists",
-        store.display()
+        stores.is_empty(),
+        "PRODUCT: an anchor that is no member of any room must keep no store, yet {stores:?} \
+         exist"
     );
     std::thread::sleep(DOWN);
     w.anchor.restart(&anchor_dir);

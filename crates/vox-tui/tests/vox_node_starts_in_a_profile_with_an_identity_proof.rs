@@ -214,7 +214,7 @@ fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
 
     let locked = hostile::profile_dir(tmp.path(), "locked");
     hostile::fingerprint(&locked);
-    let store = locked.join("default").join("store.redb");
+    let store = world::node_dir(&locked, world::DEFAULT_NODE).join("store.redb");
     assert!(
         store.is_file(),
         "APPARATUS, CANNOT MEASURE (the proof's premise): `vox id` made no store at {}, the file \

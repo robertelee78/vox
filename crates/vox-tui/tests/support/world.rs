@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "layout.rs"]
+mod layout;
+pub use layout::{daemon_lock, find_named, node_dir, reap_daemon, DEFAULT_NODE};
+
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const IDENTITY: &str = "identity passphrase";
 /// Generous: production Argon2id derivations and a real PoW happen inside it.
@@ -671,6 +675,16 @@ pub struct World {
     pub address: String,
     pub passphrase: String,
     pub service_port: u16,
+}
+
+impl Drop for World {
+    /// The safety net: a daemon any of the world's data roots still holds is stopped by its pid
+    /// ([`reap_daemon`]) before the processes and the temp dir go.
+    fn drop(&mut self) {
+        for d in [&self.host_dir, &self.guest_dir, &self.tmp.path().join("anchor")] {
+            reap_daemon(d);
+        }
+    }
 }
 
 impl World {
