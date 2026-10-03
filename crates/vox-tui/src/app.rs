@@ -571,6 +571,12 @@ pub fn run_node(
     let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
     let fp = vox_core::node::link::b32_encode(&fingerprint);
     println!("vox node: identity {fp}");
+    // An anchor binds as it spawns, before the loop below listens, so a moved port is said here.
+    while let Some(ev) = node.try_next_event() {
+        if let vox_core::node::api::NodeEvent::NodeNote { note } = ev {
+            eprintln!("vox node: {note}");
+        }
+    }
     rt.block_on(async {
         // Addresses are discovered on a task after start-up (a route probe and a
         // gateway request); print the anchor specs once they are known, then serve.
@@ -800,6 +806,9 @@ pub fn run_node(
                                         "vox node: connection to {} — {note}",
                                         crate::ident::author_id(&peer)
                                     );
+                                }
+                                vox_core::node::api::NodeEvent::NodeNote { note } => {
+                                    eprintln!("vox node: {note}");
                                 }
                                 vox_core::node::api::NodeEvent::Synced {
                                     channel_id,
