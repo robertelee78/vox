@@ -3,39 +3,45 @@
 //! complete in under 2 s").
 //!
 //! It replaces `crates/vox-core/tests/perf_r42_first_connect_relay_gate.rs`, an in-process gate on
-//! a NAT simulator that is already deleted (V29-17). That gate's runs took 635–1328 s (#167's
-//! "915 s"), and none of it was the connection: each of its twenty samples restarted a node,
-//! paid two production Argon2id steps and waited ~6.5 s for the peer to notice, while the timed
-//! window itself — first request to a path — stayed under 2 s. So this proof times what R42
-//! bounds, and the product now says it: `vox forward` prints `reached <host> in <N> ms (<k>
-//! attempts)`, counted from its first attempt (after unlocking and opening the room, the two
-//! steps a person waits for at the prompt) to the attempt that got through.
+//! a NAT simulator that is already deleted (V29-17).
+//!
+//! **Timed from outside, by this test's own clock** (#91, attempt 1). The clock starts when the
+//! test reads the guest's `vox up on <address>` line — the moment a person sees the proxy is up
+//! and asks it for the host's service — and stops when the **first echoed byte** of that request
+//! comes back through the proxy. Everything the person waits for in between is on it: the SOCKS5
+//! exchange, the node's wait for its anchor, the reach (direct head start, circuit, any retry), the
+//! host's side and the echo. The two production-Argon2id unlocks `vox up` does before it can take
+//! a request are outside it, as for R42's direct and punched arms: a person waits for them at the
+//! prompt. The proof used to read `vox forward`'s own "reached … in N ms", which counts from the
+//! forward's first attempt: a wait before that attempt was never on the clock.
 //!
 //! **Relayed, and asserted.** The host listens on IPv4 and the guest on IPv6 (`support/relay.rs`,
 //! `Split::Families`), so the only path is a circuit through the anchor (ADR-012 rung 4); the
 //! guest's own "still relayed" line and the anchor's circuit count are asserted, never assumed.
+//! Either missing is `CANNOT MEASURE`: nothing staged a relayed path.
 //!
-//! **Cold.** Each of [`SAMPLES`] is a new `vox forward`: a new process, a new node, a new port, no
-//! connection kept from the sample before. An echo crosses each one, so "reached" means carried.
+//! **Cold.** Each of [`SAMPLES`] is a new `vox up`: a new process, a new node, a new port, no
+//! connection kept from the sample before (the previous one is killed by its PID first).
 //!
 //! **A restart is as quick as a first start** (V210-57, #243). Samples 1 on are each a new process
 //! of an identity whose previous process was just killed, and the anchor still held that
 //! predecessor's connection. It used to probe it for `probe_patience`'s 250 ms floor on every
-//! restart (samples 1–4 at 250–258 ms against sample 0's 6–30 ms, both trees), and could keep it:
-//! CI run 36418572653 had a sample at 30065 ms after the anchor closed the restarted process's
-//! connection. The anchor now supersedes another process's connections outright, so every restart
-//! sample reached on its first attempt is asserted under [`RESTART_WITHIN`], and the anchor must
-//! say it superseded the previous process on each restart and never put the restarted guest to a
-//! tie-break. A sample whose first attempt found no anchor connected yet ("no peer is connected to
-//! carry a circuit") waited on its own start-up, not on its predecessor, and `vox forward` retries
-//! it 500 ms later: it is held to R42 and not to the restart bound (seen at 861 ms, 2 attempts, on
-//! 2026-10-02). A run with no restart reached on its first attempt is CANNOT MEASURE.
+//! restart, and could keep it: CI run 36418572653 had a sample at 30065 ms. The anchor now
+//! supersedes another process's connections outright, so every restart sample is asserted under
+//! [`RESTART_WITHIN`] on the same outside clock (a sample whose proxy first found no anchor
+//! connected yet, "no peer is connected to carry a circuit", waited on its own start-up and is held
+//! to R42 only), and the anchor must say it superseded the previous
+//! process on each restart and never put the restarted guest to a tie-break.
 //!
-//! Mutations: make the ladder's circuit rung wait (or remove it) and every sample either exceeds
-//! [`R42`] or never connects; stop superseding another process's connections and the anchor says
-//! no supersede and weighs the restarts in tie-breaks (run 2026-10-02: "superseded the guest's
-//! previous process 0 time(s) in 4 restarts", 2 tie-breaks; the restarts themselves took
-//! 261–292 ms, inside [`RESTART_WITHIN`]).
+//! **Every red is labelled**: `PRODUCT` when the product did the wrong thing, `CANNOT MEASURE` when
+//! the staging did not happen or the harness could not see, `APPARATUS` when the test's own
+//! machinery failed.
+//!
+//! Mutations: a 2.5 s sleep in `vox up`'s request path before it reaches for the host (the wait
+//! the old clock could not see) makes every sample exceed [`R42`]: red, as PRODUCT. A circuit that
+//! waits out the direct head start with no direct dial under way makes every restart exceed
+//! [`RESTART_WITHIN`]; so does an anchor that stops superseding another process's connections,
+//! which also says no supersede.
 
 // Optional (decider, 2026-10-01): it blocks nothing and CI only compiles it. Without
 // `--features optional-proofs` a stand-in takes its place and says it was not run
@@ -56,41 +62,66 @@ mod world;
 #[path = "support/relay.rs"]
 mod relay;
 
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 
 use relay::{RelayWorld, Split};
-use world::round_trip;
+use world::socks5_connect;
 
 /// PRD-001 R42.
 const R42: Duration = Duration::from_secs(2);
 /// Cold first connections measured; the bound is asserted on every one.
-const SAMPLES: usize = 5;
-/// A restart (samples 1 on) connects this fast: a relayed reach's direct head start (V210-122,
-/// 250 ms, which every sample pays: the guest has no direct candidate) plus 150 ms, under the head
-/// start plus the 250 ms a probe of the dead predecessor cost. Before the head start, sample 0 took
-/// 6–30 ms and the bound was 150 ms; after it, every sample took 261–281 ms (2026-10-02), and a
-/// fixed 150 ms read every restart as a wait on its predecessor.
+const SAMPLES: usize = 10;
+/// A restart (samples 1 on) connects this fast: a relayed reach's direct head start (V210-122)
+/// plus 150 ms, under the head start plus the 250 ms a probe of the dead predecessor cost.
 const RESTART_WITHIN: Duration =
     vox_core::node::network::DIRECT_HEAD_START.saturating_add(Duration::from_millis(150));
-/// What `vox forward` says of an attempt made before its node had any anchor connected.
+/// What the proxy says of an attempt made before its node had any anchor connected.
 const NO_HELPER_YET: &str = "no peer is connected to carry a circuit";
 /// What the anchor says when a newcomer supersedes another process of its identity.
 const SUPERSEDED: &str = "a new connection is from a new process of this identity";
+/// How long one request may wait for its first echoed byte before it counts as never answered.
+const GIVE_UP: Duration = Duration::from_secs(60);
 
-/// `vox: reached <host> in <N> ms (<k> attempts)` → (N, the line).
-fn reached(transcript: &str) -> Option<(u64, String)> {
-    transcript.lines().find_map(|l| {
-        let rest = l.split("vox: reached ").nth(1)?;
-        let ms = rest
-            .split(" in ")
-            .nth(1)?
-            .split(" ms")
-            .next()?
-            .trim()
-            .parse()
-            .ok()?;
-        Some((ms, l.to_owned()))
-    })
+/// One request through the proxy at `proxy`: CONNECT to the host's service, send `payload`, and
+/// return when its first byte came back, after reading the whole echo.
+fn request(w: &mut RelayWorld, proxy: std::net::SocketAddr, payload: &[u8], n: usize) -> Instant {
+    let port: u16 = w
+        .service
+        .parse()
+        .unwrap_or_else(|_| panic!("APPARATUS: the echo service {:?} is not a port", w.service));
+    let (reply, mut s) = socks5_connect(proxy, &w.hostname(), port);
+    let mut said = || {
+        w.fwd
+            .as_mut()
+            .map(world::VoxProc::transcript)
+            .unwrap_or_default()
+    };
+    if reply != 0 {
+        let said = said();
+        panic!("PRODUCT (sample {n}): the proxy refused CONNECT to the host's service (reply {reply}).\n{said}");
+    }
+    s.set_read_timeout(Some(GIVE_UP))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not set a read timeout: {e}"));
+    s.write_all(payload).unwrap_or_else(|e| {
+        let said = said();
+        panic!("PRODUCT (sample {n}): the proxy took the CONNECT, then refused the request's bytes ({e}).\n{said}")
+    });
+    let mut back = vec![0u8; payload.len()];
+    s.read_exact(&mut back[..1]).unwrap_or_else(|e| {
+        let said = said();
+        panic!("PRODUCT (sample {n}): no echo came back through the proxy within {GIVE_UP:?} ({e}).\n{said}")
+    });
+    let first = Instant::now();
+    s.read_exact(&mut back[1..]).unwrap_or_else(|e| {
+        let said = said();
+        panic!("PRODUCT (sample {n}): the echo stopped after its first byte ({e}).\n{said}")
+    });
+    assert!(
+        back == payload,
+        "PRODUCT (sample {n}): the echo came back changed: sent {payload:?}, got {back:?}"
+    );
+    first
 }
 
 #[cfg(feature = "optional-proofs")]
@@ -105,67 +136,54 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         "PRODUCT: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
 
-    let guest_fp = {
-        let (ok, out, err) = world::vox_once(&w.guest_dir, &world::args(&["id"]));
-        assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
-        out.trim().chars().take(26).collect::<String>()
-    };
-    // Only what the anchor says from the first forward on counts for the restart claims.
+    let guest_fp = world::fingerprint(&w.guest_dir, "guest")
+        .chars()
+        .take(26)
+        .collect::<String>();
+    // Only what the anchor says from the first proxy on counts for the restart claims.
     let mark = w.anchor.proc.transcript().lines().count();
-    let mut samples: Vec<(u64, String)> = Vec::new();
-    // Per sample: an attempt before the one that got through found no anchor connected yet.
+    let mut samples: Vec<Duration> = Vec::new();
+    // Per sample: the proxy found no anchor connected yet on an attempt (a wait on its start-up).
     let mut before_its_anchor: Vec<bool> = Vec::new();
     for n in 0..SAMPLES {
-        // A fresh `vox forward` each time: the previous one's process is killed by its PID first.
+        // A fresh `vox up` each time: the previous one's process is killed by its PID first.
         drop(w.fwd.take());
-        let at = w.forward();
+        let (proxy, ready) = w.up();
         let payload = format!("sample {n}");
-        let back =
-            round_trip(at, payload.as_bytes(), Duration::from_secs(120)).unwrap_or_else(|e| {
-                panic!(
-                    "PRODUCT (sample {n}): no echo through the forward ({e}).\n{}",
-                    w.fwd
-                        .as_mut()
-                        .map(world::VoxProc::transcript)
-                        .unwrap_or_default()
-                )
-            });
-        assert_eq!(
-            back,
-            payload.as_bytes(),
-            "PRODUCT: sample {n}: the echo came back changed"
+        let first = request(&mut w, proxy, payload.as_bytes(), n);
+        let waited = first - ready;
+        eprintln!(
+            "[proof] sample {n}: first echoed byte {} ms after `vox up` said it was up",
+            waited.as_millis()
         );
         w.expect_still_relayed();
-        let said = w
-            .fwd
-            .as_mut()
-            .map(world::VoxProc::transcript)
-            .unwrap_or_default();
-        let sample = reached(&said).unwrap_or_else(|| {
-            panic!("PRODUCT: sample {n}: the forward never said how long reaching the host took:\n{said}")
-        });
         before_its_anchor.push(
-            said.lines()
-                .take_while(|l| !l.contains("vox: reached "))
+            w.fwd
+                .as_mut()
+                .map(world::VoxProc::transcript)
+                .unwrap_or_default()
+                .lines()
                 .any(|l| l.contains(NO_HELPER_YET)),
         );
-        samples.push(sample);
+        samples.push(waited);
     }
     w.assert_relayed("after the samples");
 
-    let mut ms: Vec<u64> = samples.iter().map(|(m, _)| *m).collect();
+    let mut ms: Vec<u128> = samples.iter().map(Duration::as_millis).collect();
     ms.sort_unstable();
     eprintln!(
-        "[proof] {SAMPLES} cold first connections over the relay: {} ms (min {} / median {} / max {})",
-        samples.iter().map(|(m, _)| m.to_string()).collect::<Vec<_>>().join(", "),
+        "[proof] {SAMPLES} cold first connections over the relay, outside clock: {} ms (min {} / median {} / max {})",
+        samples.iter().map(|d| d.as_millis().to_string()).collect::<Vec<_>>().join(", "),
         ms[0],
         ms[ms.len() / 2],
         ms[ms.len() - 1]
     );
-    if samples
-        .iter()
-        .any(|(m, _)| Duration::from_millis(*m) >= R42)
-    {
+    let guest_said = w
+        .fwd
+        .as_mut()
+        .map(world::VoxProc::transcript)
+        .unwrap_or_default();
+    if samples.iter().any(|d| *d >= R42) {
         // A red names its cause from the other ends too: the anchor carrying the circuits and the
         // host behind them, whose connection notes say what they did with each new process (#229).
         eprintln!("---- the anchor said ----\n{}", w.anchor.proc.transcript());
@@ -173,10 +191,12 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
             eprintln!("---- the host said ----\n{}", host.transcript());
         }
     }
-    for (m, line) in &samples {
+    for (n, d) in samples.iter().enumerate() {
         assert!(
-            Duration::from_millis(*m) < R42,
-            "PRODUCT: a first relayed connection took {m} ms, over PRD-001 R42's {R42:?}: {line}"
+            *d < R42,
+            "PRODUCT: sample {n}'s first relayed connection took {} ms from `vox up` saying it was up \
+             to the first echoed byte, over PRD-001 R42's {R42:?}.\nthe last proxy said:\n{guest_said}",
+            d.as_millis()
         );
     }
     // ---- a restart is as quick as a first start, and the anchor supersedes, never weighs ----
@@ -204,19 +224,22 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
         weighed.len()
     );
     let mut judged = 0;
-    for (n, (m, line)) in samples.iter().enumerate().skip(1) {
+    for (n, d) in samples.iter().enumerate().skip(1) {
         if before_its_anchor[n] {
             eprintln!(
-                "[proof] restart {n}: {m} ms, not held to {RESTART_WITHIN:?}: an attempt before it \
-                 found no anchor connected yet ({NO_HELPER_YET:?}), a wait on its own start-up"
+                "[proof] restart {n}: {} ms, not held to {RESTART_WITHIN:?}: its proxy found no \
+                 anchor connected yet ({NO_HELPER_YET:?}), a wait on its own start-up",
+                d.as_millis()
             );
             continue;
         }
         judged += 1;
         assert!(
-            Duration::from_millis(*m) < RESTART_WITHIN,
-            "PRODUCT: restart {n} took {m} ms, over {RESTART_WITHIN:?} — a restarted process waited on its \
-             dead predecessor: {line}\nthe anchor said:\n{}",
+            *d < RESTART_WITHIN,
+            "PRODUCT: restart {n} took {} ms to its first echoed byte, over {RESTART_WITHIN:?} — a \
+             restarted process waited on something before its circuit.\nthe last proxy said:\n\
+             {guest_said}\nthe anchor said:\n{}",
+            d.as_millis(),
             anchor_said.join("\n")
         );
     }

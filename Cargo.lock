@@ -3185,6 +3185,7 @@ dependencies = [
  "reqwest",
  "rustix 1.1.4",
  "rustls",
+ "rustls-post-quantum",
  "secrecy",
  "semver",
  "serde",

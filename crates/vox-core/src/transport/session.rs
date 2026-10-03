@@ -9,36 +9,22 @@
 //! wire; this record makes the fact auditable at the application/log layer too
 //! (e.g. a peer can later prove which group a session used).
 //!
-//! **What `negotiated_group` is, exactly.** It is a compile-time constant, written
-//! unconditionally by [`SessionEstablishment::new`]. Nothing downstream of our own
-//! configuration is consulted, so the field would read `X25519MLKEM768` just as
-//! confidently if a handshake had used something else. It records **the group this
-//! build offers**, and the module heading's "prove which group a session used"
-//! overstated it.
-//!
-//! This is a defect in the evidence, not in the cryptography, and the distinction
-//! matters because the record's whole job is to be independent evidence. The
-//! guarantee itself holds without this field: the provider offers exactly one
-//! `kx_group` so there is no downgrade target,
-//! `provider::assert_pq_only` enforces that at every config
-//! boundary, and TLS 1.3 binds the negotiated parameters into the Finished MAC, so a
-//! mismatch breaks the handshake rather than passing quietly. Nobody's traffic is at
-//! risk; the audit record is simply restating our intent under a name that reads like
-//! an observation.
-//!
-//! Making it an observation needs the value rustls already holds: quinn 0.11 gates
-//! `negotiated_key_exchange_group` behind a test-only cfg, so it is not reachable
-//! from a `Connection` today. Until it is, this field MUST NOT be cited as evidence
-//! of what a session negotiated.
+//! **What `negotiated_group` is, exactly** (V030-33). The key-exchange group rustls negotiated
+//! for this session, read from the handshake through quinn's handshake data — an observation,
+//! not the configuration restated. [`SessionEstablishment::observed`] is the only constructor,
+//! and it refuses a session under any group but X25519MLKEM768: a node never holds a session
+//! whose record would name a classical group. Beneath it the provider offers exactly one
+//! `kx_group` (`provider::assert_pq_only` at every config boundary) and TLS 1.3 binds the
+//! negotiated parameters into the Finished MAC; this is the check that would catch either of
+//! those being widened.
 //!
 //! Body field order (fixed, canonical-CBOR array): `[peer_id, suite_id,
 //! negotiated_group, ts]`:
 //! - `peer_id` — the authenticated peer's 32-byte composite-identity fingerprint;
 //! - `suite_id` — the ADR-003 ciphersuite id in force (`vox-suite-1` = `0x0001`);
 //! - `negotiated_group` — the TLS named-group code point (X25519MLKEM768 =
-//!   `0x11EC`). **This build writes the group it offers, not a group it observed.**
-//!   See the note below; a record whose group is anything else is rejected on parse,
-//!   which bites for a record from elsewhere and can never fire for one of ours;
+//!   `0x11EC`), as observed in the handshake; a record whose group is anything else is
+//!   refused when built and rejected on parse;
 //! - `ts` — unix seconds the session was established.
 
 use crate::cbor::{Decoder, Encoder};
@@ -55,31 +41,33 @@ pub struct SessionEstablishment {
     pub peer_id: Digest32,
     /// The ADR-003 ciphersuite id in force for the session.
     pub suite_id: u16,
-    /// The TLS named-group code point this build **offers** (X25519MLKEM768).
-    ///
-    /// Not an observation of the handshake — see the module docs. The name is the
-    /// wire field's, which is why it has not been changed; the documentation is where
-    /// the correction belongs.
+    /// The TLS key-exchange group the handshake negotiated (always X25519MLKEM768: any
+    /// other is refused by [`Self::observed`]).
     pub negotiated_group: u16,
     /// Unix seconds at which the session was established.
     pub ts: u64,
 }
 
 impl SessionEstablishment {
-    /// Build a record for a session negotiated with the Vox default suite
-    /// (`vox-suite-1`) over the X25519MLKEM768 group.
+    /// The record of a session the handshake negotiated under `group` (the TLS named-group code
+    /// point rustls reports), with the Vox default suite (`vox-suite-1`).
     ///
-    /// `negotiated_group` is filled from the constant, unconditionally: this
-    /// constructor has no access to what the handshake actually chose. See the module
-    /// docs before citing the field as evidence.
-    #[must_use]
-    pub fn new(peer_id: Digest32, ts: u64) -> Self {
-        Self {
+    /// # Errors
+    /// [`Error::SuiteBelowFloor`] when `group` is not X25519MLKEM768: a session under a classical
+    /// group is refused, never recorded.
+    pub fn observed(peer_id: Digest32, group: u16, ts: u64) -> Result<Self> {
+        if group != X25519MLKEM768_CODE_POINT {
+            return Err(Error::SuiteBelowFloor {
+                observed: group,
+                floor: X25519MLKEM768_CODE_POINT,
+            });
+        }
+        Ok(Self {
             peer_id,
             suite_id: VOX_SUITE_1.id,
-            negotiated_group: X25519MLKEM768_CODE_POINT,
+            negotiated_group: group,
             ts,
-        }
+        })
     }
 
     /// Encode to the ADR-008-framed canonical wire bytes

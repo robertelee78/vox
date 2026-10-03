@@ -54,9 +54,9 @@
 //!   datagram primitives and the connection AEAD
 //!   ([`quic::VoxConnection::open_stream`] / `bind_flow` / `quinn`); the tunnel
 //!   service that uses them is M11.
-//! - **The IANA PEN** for the identity-extension OID is pending; M9 uses the
-//!   documented provisional arc ([`identity_cert::VOX_IDENTITY_EXT_OID`]) which the
-//!   interop matrix pins as a release gate.
+//! - **The identity-extension OID** is `2.25.<UUID>.1.1`, under a UUID arc Vox made once
+//!   ([`identity_cert::VOX_IDENTITY_EXT_OID_DOTTED`], V030-33): no registration is needed, and
+//!   no other organisation's arc is used.
 
 pub mod congestion;
 pub mod datagram;
