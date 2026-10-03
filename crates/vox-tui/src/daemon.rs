@@ -201,6 +201,13 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 return Ok(());
             }
         }
+        None if !args.as_detached && account.nodes_on_disk().is_empty() => {
+            eprintln!(
+                "vox daemon: no node here yet, so it runs with none; nodes attach to it as they \
+                 are made and used"
+            );
+            println!("vox daemon: control socket {}", account.socket().display());
+        }
         None if !args.as_detached => {
             let nodes = account.nodes_on_disk();
             eprintln!(
@@ -258,15 +265,15 @@ fn named_node(args: &DaemonArgs) -> Result<Option<NodeName>, AppError> {
         .transpose()
 }
 
-/// The foreground node (C-3): the named one, else the only node on disk, else `default` when
-/// there is none (its attach then says to make an identity), else none.
+/// The foreground node (C-3): the named one, else the only node on disk, else none. **A daemon
+/// runs with zero nodes** (ADR-026 D-2): an empty data root, or several nodes and none named,
+/// starts it with none, and nothing is asked for; a passphrase is read only for a node it attaches.
 fn resolve(account: &Account, named: Option<NodeName>) -> Option<NodeName> {
     if named.is_some() {
         return named;
     }
     let mut on_disk = account.nodes_on_disk();
     match on_disk.len() {
-        0 => NodeName::parse(DEFAULT_PROFILE).ok(),
         1 => on_disk.pop(),
         _ => None,
     }
@@ -323,6 +330,14 @@ fn attach_foreground(
     router: &Router,
     node: &NodeName,
 ) -> Result<Option<crate::app::StopSignal>, AppError> {
+    // Named and not here: refused before any passphrase is asked for.
+    if !account.nodes_on_disk().contains(node) {
+        return Err(AppError::Usage(format!(
+            "there is no node {node} here, so there is nothing to attach.\n\
+             \x20      Make one:  vox id --profile {node}\n\
+             \x20      Then start the daemon again."
+        )));
+    }
     let interactive = args.passphrase_file.is_none()
         && daemon_env_passphrase().is_none()
         && io::IsTerminal::is_terminal(&io::stdin());

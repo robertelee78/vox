@@ -442,3 +442,54 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
         a.log()
     );
 }
+
+/// ADR-026 D-2: a daemon runs with zero nodes. On an empty data root, `vox daemon` with stdin
+/// closed and no passphrase anywhere starts, asks for nothing, and answers on the account socket.
+#[test]
+#[ignore = "real binaries; run in release"]
+fn a_daemon_on_an_empty_root_starts_with_no_node() {
+    watchdog::arm();
+    let a = Account::new();
+    let out = a.data.with_extension("empty.out");
+    let f = std::fs::File::create(&out).unwrap();
+    let mut child = a
+        .cmd(&["daemon"])
+        .env_remove("VOX_IDENTITY_PASSPHRASE")
+        .stdin(Stdio::null())
+        .stdout(f.try_clone().unwrap())
+        .stderr(f)
+        .spawn()
+        .unwrap();
+    let said = || std::fs::read_to_string(&out).unwrap_or_default();
+    let up = wait_until(Duration::from_secs(20), || {
+        said().contains("vox daemon: control socket")
+    });
+    let exited = child.try_wait().ok().flatten();
+    assert!(
+        up && exited.is_none(),
+        "PRODUCT: on an empty data root `vox daemon` must start with no node (ADR-026 D-2); it \
+         exited {exited:?} saying:\n{}",
+        said()
+    );
+    // A client finds it answering on the account socket: `--detach` starts nothing when one
+    // answers.
+    let (ok, stdout, stderr) = a.run(&["daemon", "--detach"], "");
+    assert!(
+        ok && stdout.contains("already running"),
+        "PRODUCT: the daemon with no node does not answer on the account socket: \
+         {stdout}{stderr}\ndaemon:\n{}",
+        said()
+    );
+    assert!(
+        child.try_wait().ok().flatten().is_none(),
+        "PRODUCT: the daemon with no node stopped on its own:\n{}",
+        said()
+    );
+    stop_pid(child.id());
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "PRODUCT: the daemon with no node did not stop cleanly on SIGTERM ({status}):\n{}",
+        said()
+    );
+}
