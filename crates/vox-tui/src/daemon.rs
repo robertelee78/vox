@@ -334,7 +334,7 @@ fn attach_foreground(
     if !account.nodes_on_disk().contains(node) {
         return Err(AppError::Usage(format!(
             "there is no node {node} here, so there is nothing to attach.\n\
-             \x20      Make one:  vox id --profile {node}\n\
+             \x20      Make one:  vox node create {node}\n\
              \x20      Then start the daemon again."
         )));
     }

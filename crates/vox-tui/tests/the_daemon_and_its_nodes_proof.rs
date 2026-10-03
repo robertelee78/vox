@@ -546,7 +546,7 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
                 &[
                     "room",
                     "create",
-                    "--profile",
+                    "--node",
                     "agent",
                     "--passphrase-file",
                     "-",
