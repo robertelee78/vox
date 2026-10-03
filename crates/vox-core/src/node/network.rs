@@ -485,6 +485,13 @@ impl NodeNet {
         self.service.on_admitted(hook);
     }
 
+    /// Be told when a signed withdraw takes records off this node's board (V030-14). Set before
+    /// this is shared, like [`Self::on_board_growth`]; see
+    /// [`crate::nat::service::RendezvousService::on_withdrawn`].
+    pub fn on_board_withdraw(&mut self, hook: crate::nat::service::AdmittedHook) {
+        self.service.on_withdrawn(hook);
+    }
+
     /// Which rooms this node keeps a board for when a peer brings their genesis — an anchor's
     /// job, and no other node's. Set before this is shared, like [`Self::on_board_growth`];
     /// see [`crate::nat::service::RendezvousService::serve_rooms`].
@@ -1892,6 +1899,26 @@ impl NodeNet {
                 .map(RendezvousRecord::to_wire),
         );
         out
+    }
+
+    /// Take a member that left off **this node's own** board (V030-14): its records go, and any
+    /// stamped no later than `at` are refused. This node's board is its own, so no signature is
+    /// needed — the leave on the room's log is the reason, and this node holds it.
+    pub fn forget_member_on_board(&self, channel_id: &Digest32, author: &Digest32, at: u64) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .withdraw_member(channel_id, author, at);
+    }
+
+    /// Take a room that ended off **this node's own** board (V030-14), for good.
+    pub fn forget_room_on_board(&self, channel_id: &Digest32) {
+        let store = self.service.store();
+        store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .withdraw_room(channel_id, None);
     }
 
     /// Put a framed record on **this node's own** board, without a network round

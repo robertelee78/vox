@@ -1247,11 +1247,11 @@ async fn drain(
         Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    let rooms: Vec<(Digest32, String, bool)> = match room_arg {
+    let rooms: Vec<(Digest32, String, bool, String)> = match room_arg {
         Some(arg) => {
-            let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
             let id = resolve_prefix(arg, &ids)?;
-            rooms.into_iter().filter(|(r, _, _)| *r == id).collect()
+            rooms.into_iter().filter(|(r, _, _, _)| *r == id).collect()
         }
         None => rooms,
     };
@@ -1266,7 +1266,7 @@ async fn drain(
     // **One room that cannot be read does not silence the others** (V210-163): it is named,
     // in one line, and its cursor stays where it was.
     let mut unread: Vec<String> = Vec::new();
-    for (channel_id, name, open) in rooms {
+    for (channel_id, name, open, _) in rooms {
         // A closed room cannot be read; it is heard again once it is open.
         if !open {
             continue;

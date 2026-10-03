@@ -17,14 +17,13 @@
 //!   identical channelID by construction.
 //!
 //! ## The capability model (SPKI/SDSI/UCAN attenuation)
-//! - [`capability`] — the closed capability vocabulary (`admin` ⊇ `delegate`,
-//!   `invite`, `policy`, `passphrase-rotate`, and role-tag attributes `#tag`) and the
-//!   attenuation lattice ("a delegation grants only capabilities at or below its
-//!   own"). Unknown capability = verification failure (closed domain). The ADR-013
-//!   tunnel tokens `bind:<svc>` / `dial:<svc>` still **parse**, because rooms made by
-//!   v0.1.0–v0.2.x carry them in certificates and geneses, but they confer nothing:
-//!   tunnel reach is the host's own decision, never a capability (ADR-017 M17.7,
-//!   PRD-001 R44).
+//! - [`capability`] — the closed capability vocabulary: `admin` ⊇ `policy`. Unknown
+//!   capability = verification failure (closed domain). **Governance is only "the
+//!   creator or an admin sets the room's retention"** (V030-32, the decider,
+//!   2026-10-02): the `delegate`, `invite` and `passphrase-rotate` capabilities and
+//!   `#role` attributes, which no command ever issued, are removed, and so are the
+//!   `bind:`/`dial:` tunnel capabilities (PRD-001 R44: reach is the host's own
+//!   decision); their tokens are refused as unknown.
 //!
 //! ## The governance entry bodies (pinned canonical CBOR)
 //! All composite-signed, `(channelID, epoch)`-bound, and ride the causal log
@@ -32,9 +31,9 @@
 //! - [`cert`] — admin-delegation cert (`0x0003`) + admin-delegation revocation
 //!   (`0x000E`).
 //! - [`consent`] — consent grant (`0x0004`) + consent revocation (`0x0005`).
-//! - [`policy`] — policy-update (`0x0006`, kind = policy-update): history mode and TTL.
-//! - [`rotation`] — passphrase-rotation / epoch bump (`0x0006`, kind = rotation):
-//!   the only admin-side (bulk) removal.
+//! - [`policy`] — policy-update (`0x0006`, kind = policy-update): the room's retention
+//!   (TTL) only. The rotation kind under the same tag, a passphrase-rotation / epoch
+//!   bump no command ever wrote, is reserved and refused (V030-32).
 //!
 //! ## The deterministic evaluator (the release-gated core)
 //! - [`entry`] — the evaluator-ready [`entry::GovEntry`]: a decoded body plus its
@@ -52,12 +51,10 @@
 //!   (no roster), monotonic per-sender visibility, and the consent-grant /
 //!   revocation issuing seam (which carries only `skdm_ref`; the SKDM travels over
 //!   M4's pairwise session).
-//! - [`visibility`] — the inbound visibility opt-out ("whom do I read?"):
-//!   receiver-side only, **no** log entry, reversible, orthogonal to outbound
-//!   consent.
-//! - [`invite`] — identity-bound invites (high-trust default, under the `invite`
-//!   capability) and open passphrase joins (unverified until a member verifies).
-//!   The passphrase gates the swarm; consent gates reading.
+//!
+//! The inbound visibility opt-out and identity-bound invite modes were removed
+//! (V030-32): nothing read or issued them. A room is joined with its passphrase
+//! (ADR-005) and read by consent.
 //!
 //! ## Golden vectors (release gate)
 //! The mandatory evaluator golden-vector suite (the test-only `vectors` module)
@@ -72,14 +69,8 @@
 //! a false claim that already-readable traffic became unreadable.
 //!
 //! ## Scope boundaries (documented, not stubbed — ADR mantra)
-//! - **Tunnel capability *use*** (ABAC over `bind`/`dial`/role-tags) → M11/ADR-013:
-//!   M6 defines the caps in the lattice and the evaluator evaluates them; ADR-013
-//!   adds no parallel engine.
 //! - **SKDM *delivery*** → M4/ADR-006: a consent-grant carries only `skdm_ref`; the
 //!   SKDM travels in the pairwise session.
-//! - **CPace passphrase re-key on rotation** → M3/M5: M6 authors the rotation entry
-//!   and bumps the epoch; the actual re-key + sender-key re-bind is M3/M6's join +
-//!   M4's rotation.
 //! - **TTL / at-rest erasure** → M8/ADR-010: M6 carries the TTL policy value; M8
 //!   enforces it.
 //!
@@ -93,13 +84,10 @@ pub mod consent;
 pub mod entry;
 pub mod evaluator;
 pub mod genesis;
-pub mod invite;
+pub mod lifecycle;
 pub mod membership;
 pub mod policy;
-pub mod presence;
-pub mod rotation;
 pub mod share;
-pub mod visibility;
 
 pub use capability::{Capability, CapabilitySet};
 pub use cert::{AdminCert, AdminRevocation, RevocationReason};
@@ -107,8 +95,6 @@ pub use consent::{ConsentGrant, ConsentRevocation};
 pub use entry::{GovBody, GovEntry};
 pub use evaluator::{DenyReason, Evaluator, Verdict};
 pub use genesis::{ChannelPolicy, Genesis, HistoryMode};
-pub use invite::{Invite, InviteMode};
+pub use lifecycle::{LifecycleKind, RoomLifecycle};
 pub use membership::MembershipView;
 pub use policy::PolicyUpdate;
-pub use rotation::PassphraseRotation;
-pub use visibility::VisibilitySet;

@@ -1,38 +1,31 @@
 //! The closed capability vocabulary and attenuation lattice (ADR-007
-//! §"Capability vocabulary").
+//! §"Capability vocabulary"), as trimmed by V030-32.
 //!
-//! Authorization in Vox is an SPKI/SDSI/UCAN-style *capability* model: the
-//! genesis creator holds the top capability ([`Capability::Admin`]), and every
-//! delegation may grant **only capabilities at or below the issuer's own**
-//! (monotonic attenuation — a delegation can never escalate). The evaluator
-//! ([`crate::governance::evaluator`]) recognizes **exactly** the capabilities
-//! defined here and nothing else: an unknown capability type is a verification
-//! failure, never silently ignored, so the evaluator's domain is closed and the
-//! golden-vector equality gate is well defined.
+//! **A room's governance is only "the creator or an admin sets the room's retention"** (the
+//! decider, 2026-10-02). The genesis creator holds [`Capability::Admin`]; the creator may name
+//! admins (#319), whose certificates carry `admin`; and `admin` implies [`Capability::Policy`],
+//! the one capability a governance entry needs (a retention update). The evaluator recognizes
+//! **exactly** the capabilities defined here: an unknown capability is a verification failure,
+//! never silently ignored, so the evaluator's domain is closed.
 //!
 //! ## The lattice
 //! ```text
-//!                         admin                (implies every capability below)
-//!         ┌────────┬────────┼─────────┐
-//!     delegate   invite   policy  passphrase-rotate
+//!            admin           (implies policy)
+//!              │
+//!            policy
 //! ```
-//! `admin` *implies* (is ≥) every other capability. The four named capabilities are
-//! otherwise mutually incomparable: holding `invite` says nothing about `policy`. The
-//! "≤" relation is therefore: `x ≤ y` iff `y == admin`, or `x == y`.
+//! `x ≤ y` iff `y == admin`, or `x == y`.
 //!
-//! ## No tunnel capabilities
-//! The `bind:<svc>` / `dial:<svc>` tunnel capabilities and `#role` attributes were the
-//! capability model ADR-017 M17.7 withdrew, and are removed from the vocabulary
-//! (PRD-001 R44): who reaches a service is the host's own decision (its trust keyring
-//! and the room's current authors), never a token in the log. A cert or genesis
-//! carrying one is refused like any unknown capability.
+//! **Removed, tokens reserved** (V030-32): `delegate`, `invite`, `passphrase-rotate` and `#role`
+//! attributes. No command ever issued them, and nothing read them but the evaluator. A token of
+//! theirs is refused as [`Error::UnknownCapability`], like any other word outside the vocabulary.
+//! So are the `bind:<svc>` / `dial:<svc>` tunnel capabilities (PRD-001 R44): who reaches a
+//! service is the host's own decision, never a token in the log.
 //!
 //! ## Wire encoding
 //! A capability is a CBOR text string in a capability-set array (the cert body,
-//! [`crate::governance::cert`]), one fixed ASCII token per capability. The
-//! set is canonicalized (sorted, deduplicated) so two implementations encode the
-//! identical bytes for the identical logical set — a precondition for the
-//! golden-vector gate.
+//! [`crate::governance::cert`]), one fixed ASCII token per capability. The set is canonicalized (sorted,
+//! deduplicated) so two implementations encode identical bytes for the identical logical set.
 
 use std::collections::BTreeSet;
 
@@ -40,14 +33,8 @@ use crate::error::{Error, Result};
 
 /// The ASCII token for [`Capability::Admin`].
 pub const TOKEN_ADMIN: &str = "admin";
-/// The ASCII token for [`Capability::Delegate`].
-pub const TOKEN_DELEGATE: &str = "delegate";
-/// The ASCII token for [`Capability::Invite`].
-pub const TOKEN_INVITE: &str = "invite";
 /// The ASCII token for [`Capability::Policy`].
 pub const TOKEN_POLICY: &str = "policy";
-/// The ASCII token for [`Capability::PassphraseRotate`].
-pub const TOKEN_PASSPHRASE_ROTATE: &str = "passphrase-rotate";
 
 /// The longest capability token text string accepted on decode: rejects a hostile
 /// multi-megabyte "capability" before it is looked at (anti-abuse, ADR-008).
@@ -60,14 +47,8 @@ pub enum Capability {
     /// `admin` — full governance; implies every capability below. Held by the
     /// root admin from genesis (ADR-007).
     Admin,
-    /// `delegate` — may issue admin-delegation certs (attenuable).
-    Delegate,
-    /// `invite` — may issue identity-bound invites (ADR-005).
-    Invite,
-    /// `policy` — may author policy-update entries (history / TTL).
+    /// `policy` — may author policy-update entries: the room's retention.
     Policy,
-    /// `passphrase-rotate` — may author passphrase-rotation (epoch) entries.
-    PassphraseRotate,
 }
 
 impl Capability {
@@ -77,17 +58,15 @@ impl Capability {
     pub fn to_token(&self) -> String {
         match self {
             Capability::Admin => TOKEN_ADMIN.to_owned(),
-            Capability::Delegate => TOKEN_DELEGATE.to_owned(),
-            Capability::Invite => TOKEN_INVITE.to_owned(),
             Capability::Policy => TOKEN_POLICY.to_owned(),
-            Capability::PassphraseRotate => TOKEN_PASSPHRASE_ROTATE.to_owned(),
         }
     }
 
     /// Parse a capability from its canonical token.
     ///
-    /// An unrecognized token — including the withdrawn `bind:`/`dial:`/`#role` forms,
-    /// or any string not in the vocabulary — is
+    /// An unrecognized token — including the removed `delegate`, `invite`,
+    /// `passphrase-rotate`, `bind:`/`dial:` and `#role` tokens, or any
+    /// string not in the vocabulary — is
     /// [`Error::UnknownCapability`]: the closed vocabulary admits nothing else,
     /// so the evaluator can never see a capability it does not understand.
     pub fn from_token(token: &str) -> Result<Self> {
@@ -96,10 +75,7 @@ impl Capability {
         }
         match token {
             TOKEN_ADMIN => Ok(Capability::Admin),
-            TOKEN_DELEGATE => Ok(Capability::Delegate),
-            TOKEN_INVITE => Ok(Capability::Invite),
             TOKEN_POLICY => Ok(Capability::Policy),
-            TOKEN_PASSPHRASE_ROTATE => Ok(Capability::PassphraseRotate),
             _ => Err(Error::UnknownCapability),
         }
     }

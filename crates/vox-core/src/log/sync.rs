@@ -1353,6 +1353,8 @@ pub mod mutant {
         AuthorUnclassifiable,
         OldRowIds,
         AuthorMisbound,
+        WithdrawUnentitled,
+        AdminUnentitled,
         RefuseSessions,
     }
 
@@ -1368,6 +1370,8 @@ pub mod mutant {
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
                 "old-row-ids" => Mode::OldRowIds,
                 "author-misbound" => Mode::AuthorMisbound,
+                "withdraw-unentitled" => Mode::WithdrawUnentitled,
+                "admin-unentitled" => Mode::AdminUnentitled,
                 "refuse-sessions" => Mode::RefuseSessions,
                 _ => Mode::Correct,
             };
@@ -1376,6 +1380,20 @@ pub mod mutant {
             );
             mode
         })
+    }
+
+    /// Whether this build takes a room off boards even where its node may not end it (V030-14): the
+    /// faulty peer a board must not obey — an admin whose admin was taken back.
+    #[must_use]
+    pub fn withdraws_unentitled() -> bool {
+        mode() == Mode::WithdrawUnentitled
+    }
+
+    /// Whether this build names admins though its identity is not the room's creator (#319): the
+    /// admin with a modified client whose certificate no node may honour.
+    #[must_use]
+    pub fn admins_unentitled() -> bool {
+        mode() == Mode::AdminUnentitled
     }
 
     /// The `HAVE` to send, and the entries to serve unasked.
@@ -1434,6 +1452,8 @@ pub mod mutant {
             | Mode::AuthorUnclassifiable
             | Mode::OldRowIds
             | Mode::AuthorMisbound
+            | Mode::WithdrawUnentitled
+            | Mode::AdminUnentitled
             | Mode::RefuseSessions => asked,
             Mode::ServeNothing => Vec::new(),
             Mode::ServeUnasked => asked.into_iter().chain(unasked).collect(),
