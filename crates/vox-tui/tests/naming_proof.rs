@@ -289,22 +289,12 @@ impl Member {
         );
     }
 
-    /// `vox service list <room>`: whether it succeeded, and what it said. With the room
-    /// passphrase from a file, as the one-shot form needs it once no daemon holds the room.
-    fn list(&self, room: &str, pass: &str) -> (bool, String) {
-        let pass_file = self.dir.join("room.pass");
-        std::fs::write(&pass_file, pass).expect("APPARATUS: write the room passphrase file");
+    /// `vox service list <room>`: whether it succeeded, and what it said. Listing opens no room,
+    /// so it takes no room passphrase (V210-149).
+    fn list(&self, room: &str) -> (bool, String) {
         let (ok, out, err) = vox(
             &self.dir,
-            &[
-                "service",
-                "list",
-                room,
-                "--passphrase-file",
-                pass_file.to_str().unwrap(),
-                "--listen",
-                "127.0.0.1:0",
-            ],
+            &["service", "list", room, "--listen", "127.0.0.1:0"],
             None,
         );
         (ok, format!("{out}{err}"))
@@ -466,7 +456,7 @@ fn a_local_name_reaches_the_node_it_names() {
     carol.serve(&family, family_pass, laptop_echo);
     carol.serve(&work, work_pass, laptop_work_echo);
     // (6) Listed while the daemon runs: `vox service list` asks it.
-    let (ok, listed) = carol.list(&work, work_pass);
+    let (ok, listed) = carol.list(&work);
     let offered = format!("22  →  {laptop_work_echo}");
     assert!(
         ok && listed.contains(&offered),
@@ -646,7 +636,7 @@ fn a_local_name_reaches_the_node_it_names() {
     // (6) The daemon stopped, the one-shot `vox service list` still shows carol's service: it
     // was kept, not only offered for the daemon's run.
     drop(carol.daemon.take());
-    let (ok, listed) = carol.list(&work, work_pass);
+    let (ok, listed) = carol.list(&work);
     assert!(
         ok && listed.contains(&offered),
         "PRODUCT: after carol's daemon stopped, `vox service list` does not show the service she \

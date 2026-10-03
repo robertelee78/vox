@@ -2416,6 +2416,29 @@ impl ChannelState {
         Ok(())
     }
 
+    /// State every share this node offers here that the log does not yet say it shares, and
+    /// return whether anything was written. A share made in a room joined and not yet synced is
+    /// offered at once but can be said only once the room settles (V210-164); this says it then.
+    pub fn say_unsaid_shares(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+        let me = profile.signer()?.fingerprint();
+        let said: BTreeSet<String> = self
+            .shares()
+            .into_iter()
+            .filter(|s| s.host == me)
+            .map(|s| s.name)
+            .collect();
+        let unsaid: Vec<String> = self
+            .services
+            .keys()
+            .filter(|tag| !self.transient.contains(*tag) && !said.contains(service_name(tag)))
+            .cloned()
+            .collect();
+        for tag in &unsaid {
+            self.say_share(profile, tag, true, now_secs)?;
+        }
+        Ok(!unsaid.is_empty())
+    }
+
     /// Whether `service_tag` is offered and persisted: a share, not a transient offer.
     #[must_use]
     pub fn is_shared(&self, service_tag: &str) -> bool {

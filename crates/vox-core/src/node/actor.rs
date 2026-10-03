@@ -12264,6 +12264,12 @@ impl Node {
             }
             ch.catch_up_generation(profile, now)
                 .and_then(|_| ch.say_presence(profile, true, now))
+                .map(|back| {
+                    // Shares made while the room was unsettled are said now (V030-25). A share
+                    // left unsaid is offered but unlisted, which is not worth failing the room.
+                    let said = ch.say_unsaid_shares(profile, now).unwrap_or(false);
+                    back || said
+                })
         };
         match back {
             Ok(true) => self.note_local_append(channel_id),
@@ -12387,11 +12393,16 @@ impl Node {
                     if !persist {
                         return Ok(());
                     }
-                    channel
-                        .say_share(profile, service_tag, true, now)
-                        .inspect_err(|_| {
+                    // A room joined and not yet synced cannot be written to (V210-164): the share
+                    // is offered now and said when the room settles (`say_unsaid_shares`).
+                    match channel.say_share(profile, service_tag, true, now) {
+                        Err(crate::error::Error::RoomNotSynced) => Ok(()),
+                        Err(e) => {
                             let _ = channel.remove_service(profile.store(), service_tag);
-                        })
+                            Err(e)
+                        }
+                        Ok(()) => Ok(()),
+                    }
                 })
         };
         match outcome {
