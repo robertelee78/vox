@@ -15,8 +15,12 @@
 //! `HOME` explicitly passes either a directory of its own or `std::env::var("HOME")`, which is
 //! now this one.
 //!
-//! The real HOME is kept only for [`real_home`] (and XDG_DATA_HOME for [`real_xdg_data_home`]): the live-model sandbox reads its OpenCode
-//! credentials from there and plants its canary there. Nothing hands it to a child.
+//! The real HOME is kept only for [`real_home`] (and XDG_DATA_HOME for [`real_xdg_data_home`]):
+//! the live-model sandbox reads its OpenCode credentials from there and plants its canary there.
+//! Two tools a proof starts need the operator's own setup, and get only that, never HOME:
+//! [`real_toolchain`] gives `cargo` the operator's rustup and cargo homes (else the rustup proxy
+//! finds no toolchain and downloads one), and [`real_gh`] gives `gh` the operator's gh config
+//! directory (else it has no login).
 //!
 //! [`check`] proves it once per proof process: a child reports its HOME and writes
 //! `$HOME/.vox-proof-sentinel`, and the sentinel must land in the temporary HOME and never in
@@ -32,6 +36,9 @@ static REAL_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// The operator's XDG_DATA_HOME, before it was replaced: where OpenCode keeps credentials.
 static REAL_XDG_DATA_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The operator's XDG_CONFIG_HOME, before it was replaced: where gh keeps its login.
+static REAL_XDG_CONFIG_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// The temporary HOME every child of this process inherits.
 static TEMP_HOME: OnceLock<PathBuf> = OnceLock::new();
@@ -69,6 +76,9 @@ extern "C" fn init() {
     let real_data = std::env::var_os("XDG_DATA_HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from);
+    let real_config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -96,6 +106,7 @@ extern "C" fn init() {
     }
     let _ = REAL_HOME.set(real);
     let _ = REAL_XDG_DATA_HOME.set(real_data);
+    let _ = REAL_XDG_CONFIG_HOME.set(real_config);
     let _ = TEMP_HOME.set(home);
     // SAFETY: `atexit` is the C library's, which every Rust program on these platforms links;
     // `remove` takes no arguments, never unwinds, and touches only the directory made above.
@@ -135,6 +146,38 @@ pub fn real_home() -> Option<&'static Path> {
 #[allow(dead_code)]
 pub fn real_xdg_data_home() -> Option<&'static Path> {
     REAL_XDG_DATA_HOME.get().and_then(|h| h.as_deref())
+}
+
+/// Give `cmd` (a `cargo`) the operator's rustup and cargo homes, unless this process already
+/// names them (as `cargo test` does). Only those two directories, never HOME: without them the
+/// rustup proxy under the temporary HOME finds no toolchain and downloads a whole one.
+#[allow(dead_code)]
+pub fn real_toolchain(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for (var, sub) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+        if std::env::var_os(var).is_none_or(|v| v.is_empty()) {
+            if let Some(real) = real_home() {
+                cmd.env(var, real.join(sub));
+            }
+        }
+    }
+    cmd
+}
+
+/// Give `cmd` (a `gh`) the operator's gh config directory, where its login is. Only that
+/// directory, never HOME: without it gh under the temporary HOME has no login.
+#[allow(dead_code)]
+pub fn real_gh(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    if std::env::var_os("GH_CONFIG_DIR").is_none_or(|v| v.is_empty()) {
+        let dir = REAL_XDG_CONFIG_HOME
+            .get()
+            .and_then(|c| c.as_deref())
+            .map(|c| c.join("gh"))
+            .or_else(|| real_home().map(|h| h.join(".config/gh")));
+        if let Some(dir) = dir {
+            cmd.env("GH_CONFIG_DIR", dir);
+        }
+    }
+    cmd
 }
 
 /// A child reports its HOME and XDG_CONFIG_HOME and writes `$HOME/.vox-proof-sentinel`: both must
