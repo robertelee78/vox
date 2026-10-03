@@ -49,12 +49,15 @@ fn vox(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run vox");
+        .expect("APPARATUS: run vox");
     if let Some(text) = stdin {
-        let mut pipe = child.stdin.take().expect("stdin");
-        pipe.write_all(text.as_bytes()).unwrap();
+        let mut pipe = child.stdin.take().expect("APPARATUS: vox's piped stdin");
+        pipe.write_all(text.as_bytes())
+            .expect("APPARATUS: write vox's stdin");
     }
-    let out = child.wait_with_output().expect("vox finished");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: collect vox's output");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -72,11 +75,15 @@ struct Member {
 
 fn member(tmp: &Path, name: &'static str) -> Member {
     let dir = tmp.join(name);
-    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: make the profile dir");
     let (ok, out, err) = vox(&dir, &["id", "--listen", "127.0.0.1:0"], None);
-    assert!(ok, "vox id ({name}): {err}");
+    assert!(ok, "PRODUCT (staging): vox id ({name}): {err}");
     let fp = out.trim().to_owned();
-    assert_eq!(fp.len(), 52, "{name}'s fingerprint: {out:?}");
+    assert_eq!(
+        fp.len(),
+        52,
+        "PRODUCT (staging): {name}'s fingerprint: {out:?}"
+    );
     Member {
         name,
         dir,
@@ -102,7 +109,7 @@ impl Member {
         );
         assert!(
             ok,
-            "{} trusts {} as {as_name}: {out}{err}",
+            "PRODUCT (staging): {} trusts {} as {as_name}: {out}{err}",
             self.name, peer.name
         );
     }
@@ -111,7 +118,8 @@ impl Member {
     /// `vox room list`.
     fn start(&mut self, anchor: &str) {
         let pass_file = self.dir.join("passphrases");
-        std::fs::write(&pass_file, format!("{IDENTITY}\n")).unwrap();
+        std::fs::write(&pass_file, format!("{IDENTITY}\n"))
+            .expect("APPARATUS: write the passphrase file");
         let mut p = VoxProc::spawn(
             self.name,
             &self.dir,
@@ -122,14 +130,14 @@ impl Member {
                 "--anchor",
                 anchor,
                 "--passphrase-file",
-                pass_file.to_str().unwrap(),
+                pass_file.to_str().expect("APPARATUS: a UTF-8 path"),
             ]),
         );
         let deadline = Instant::now() + SETUP;
         while !vox(&self.dir, &["room", "list"], None).0 {
             if Instant::now() >= deadline {
                 panic!(
-                    "{}'s daemon never answered `vox room list`. It said:\n{}",
+                    "PRODUCT (staging): {}'s daemon never answered `vox room list`. It said:\n{}",
                     self.name,
                     p.transcript()
                 );
@@ -154,7 +162,7 @@ impl Member {
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        panic!("{what} never reached {}", self.name);
+        panic!("PRODUCT: {what} never reached {}", self.name);
     }
 
     /// A `vox up` with no room, carried by this member's daemon, and where it listens.
@@ -165,7 +173,11 @@ impl Member {
             &args(&["up", "--bind", "127.0.0.1:0"]),
         );
         let line = p.expect_within(TIMEOUT, "vox up's address", |l| l.starts_with("vox up on "));
-        let addr = line.split_whitespace().nth(3).unwrap().parse().unwrap();
+        let addr = line
+            .split_whitespace()
+            .nth(3)
+            .and_then(|a| a.parse().ok())
+            .unwrap_or_else(|| panic!("PRODUCT (staging): no address in {line:?}"));
         (p, addr)
     }
 }
@@ -410,15 +422,15 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
 #[ignore = "an anchor, two vox daemons and real child processes; CI runs it in release"]
 fn the_last_fetch_is_delivered_before_the_share_ends() {
     watchdog::arm();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let payload: Vec<u8> = (0..24_000_000u32)
         .map(|i| (i.wrapping_mul(131) >> 5) as u8)
         .collect();
     let file = tmp.path().join("big.bin");
-    std::fs::write(&file, &payload).unwrap();
+    std::fs::write(&file, &payload).expect("APPARATUS: write the shared file");
 
     let anchor_dir = tmp.path().join("anchor");
-    std::fs::create_dir_all(anchor_dir.join("cfg")).unwrap();
+    std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: the anchor's dir");
     let mut anchor = VoxProc::spawn(
         "anchor",
         &anchor_dir,
@@ -439,30 +451,51 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
     }
     let (ok, out, err) = vox(
         &alice.dir,
-        &["room", "create", "--name", "files"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "files",
+        ],
         Some(&format!("{ROOM_PASS}\n")),
     );
-    assert!(ok, "vox room create: {out}{err}");
+    assert!(ok, "PRODUCT (staging): vox room create: {out}{err}");
     let (_, list, _) = vox(&alice.dir, &["room", "list"], None);
     let room = list
         .lines()
         .find(|l| l.split_whitespace().nth(1) == Some("files"))
         .and_then(|l| l.split_whitespace().next())
-        .unwrap_or_else(|| panic!("files is not listed: {list}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): files is not listed: {list}"))
         .to_owned();
     let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, out, err) = vox(
         &bob.dir,
-        &["room", "join", link.trim(), "--name", "files"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "files",
+        ],
         Some(&format!("{ROOM_PASS}\n")),
     );
-    assert!(ok, "bob joins files: {out}{err}");
+    assert!(ok, "PRODUCT (staging): bob joins files: {out}{err}");
 
     let mut share = VoxProc::spawn(
         "alice share",
         &alice.dir,
-        &args(&["share", &room, file.to_str().unwrap(), "--count", "1"]),
+        &args(&[
+            "share",
+            &room,
+            file.to_str().expect("APPARATUS: a UTF-8 path"),
+            "--count",
+            "1",
+        ]),
     );
     let line = share.expect_within(TIMEOUT, "the share's port", |l| {
         l.starts_with("vox: sharing ")
@@ -471,7 +504,7 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
         .split("on port ")
         .nth(1)
         .and_then(|p| p.trim().parse().ok())
-        .unwrap_or_else(|| panic!("no port in {line:?}"));
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no port in {line:?}"));
     let (_bob_up, bob_proxy) = bob.up();
     let out = Command::new("curl")
         .args([
@@ -486,7 +519,7 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
             &format!("http://alice.files.vox:{port}/big.bin"),
         ])
         .output()
-        .unwrap();
+        .expect("APPARATUS: run curl");
     let until = Instant::now() + Duration::from_secs(20);
     let mut ended = None;
     while Instant::now() < until {
@@ -509,11 +542,11 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
     );
     assert!(
         out.status.success() && sha(&out.stdout) == sha(&payload),
-        "the last fetch must arrive whole before the share ends"
+        "PRODUCT: the last fetch must arrive whole before the share ends"
     );
     assert!(
         ended.is_some_and(|s| s.success()) && share_said.contains("fetched 1 time(s)"),
-        "the share must still stop by itself after --count 1"
+        "PRODUCT: the share must still stop by itself after --count 1"
     );
     drop((share, alice, bob, anchor));
 }
