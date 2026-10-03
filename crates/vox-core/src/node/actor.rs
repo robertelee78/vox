@@ -264,6 +264,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
+        consenting: ch.consenting().into_iter().collect(),
         retention: ch.effective_retention(),
         key_generations: ch.key_generations(),
         received_key_generations: ch.received_key_generations(),
