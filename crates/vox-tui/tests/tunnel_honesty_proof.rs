@@ -773,8 +773,10 @@ fn a_refusal_tells_the_refused_side_nothing_new() {
     }
     let mut codes = Vec::new();
     let (_up, proxy) = w.up("stranger-up", &guest_dir);
-    let hostname = format!("{}.vox", w.room);
+    // The service is its address's first part (V030-25): the offered one by its name, the
+    // unoffered one by a name the host never shared.
     for (label, port) in [("offered", w.service_port), ("unoffered", unoffered)] {
+        let hostname = format!("{port}.{}.{}.vox", w.host_fp, w.room);
         let (code, _s) = socks5_connect(proxy, &hostname, port);
         eprintln!("[test] {label} port {port}: SOCKS reply code {code}");
         codes.push((label, code));
@@ -826,7 +828,7 @@ fn a_local_refusal_sends_the_host_nothing() {
     // The control: a CONNECT the host refuses is one the host logs. Without it, the host's
     // silence below would prove nothing.
     let t0 = Instant::now();
-    let (code, _s) = socks5_connect(proxy, &format!("{room}.vox"), w.service_port);
+    let (code, _s) = socks5_connect(proxy, &w.service_host(), w.service_port);
     let mut logged = Vec::new();
     while logged.is_empty() && t0.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(100));
@@ -842,7 +844,10 @@ fn a_local_refusal_sends_the_host_nothing() {
     eprintln!("[test] control: vox up said: {host_line}");
 
     // Each refusal this node makes on its own: the name, what it is, and the reason it says.
-    let stranger = format!("stranger.{room}.vox");
+    // Each name is a service's address but the shorter ones (V030-25), which resolve to nothing.
+    let stranger = format!("{}.stranger.{room}.vox", w.service_port);
+    let room_only = format!("{room}.vox");
+    let node_only = format!("{}.{room}.vox", w.host_fp);
     let cases = [
         (
             "printer.example.com",
@@ -850,12 +855,17 @@ fn a_local_refusal_sends_the_host_nothing() {
             "is not a .vox name",
         ),
         (
-            "nosuchroom.vox",
-            "a room this machine does not have",
-            "neither a room id nor a node",
+            room_only.as_str(),
+            "a room alone, which is no address",
+            "resolves to nothing",
         ),
         (
-            "nas.nosuchroom.vox",
+            node_only.as_str(),
+            "a node in a room, which is no address",
+            "resolves to nothing",
+        ),
+        (
+            "ssh.nas.nosuchroom.vox",
             "a room name this machine does not have",
             "no room on this machine is called",
         ),

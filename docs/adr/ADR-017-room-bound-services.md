@@ -268,7 +268,7 @@ is what a person offers. A tunnel is how bytes reach it.
 - **12.10** `vox serve` MUST print each share's address with the service name and the fingerprints in
   the node and room places.
 
-Built on this branch (#339): `node::resolver`, `governance::share`, `ChannelState::{say_share, shares}`,
+Built (#339): `node::resolver`, `governance::share`, `ChannelState::{say_share, shares}`,
 `vox serve <name>=<port>`, `vox service list`, `vox forward <service>.<node>.<room>.vox [<local>]`.
 Proved by `crates/vox-tui/tests/a_service_is_reached_only_by_its_address_proof.rs`.
 
