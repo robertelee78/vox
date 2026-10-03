@@ -74,7 +74,7 @@ planned. This is the roll-up.
 | 008 | accepted; built (`log/`); range reconciliation over the network and the self-channel are planned; golden vectors are open |
 | 009 | **withdrawn** (R43); the deniable code is removed (b0f82185) |
 | 010 | accepted; built (`atrest/`, `node/`) except where marked planned |
-| 011 | built (`transport/`); the PEN, the observed group (#382) and the interop matrix are not |
+| 011 | built (`transport/`), including the OID's UUID arc and the observed group (#382); the interop matrix is not; the identity exchange (req 27–40) is decided, not built (#397) |
 | 012 | accepted; all four rungs built, a relay-only pair taking its circuit at once |
 | 013 | accepted; built except where marked |
 | 014 | proposed; only the embedded node over FFI (`crates/vox-ffi`) is built |
@@ -97,7 +97,7 @@ These obligations come from the ADRs named. None is a release gate: tests are re
 shipped binary, run on demand (ADR-018). Whether each is kept as a real-binary check or dropped is
 open with the decider (V030-29 questions 12, 19, 30 and 32).
 
-- **Canonical serialization (ADR-008):** golden vectors for every struct tag `0x0001`–`0x0017`. No
+- **Canonical serialization (ADR-008):** golden vectors for every struct tag `0x0001`–`0x001E` (reserved tags excepted). No
   per-tag fixture exists.
 - **Identity (ADR-002):** composite public key and signature layout, and the ML-DSA binding statement.
   No pinned known-answer bytes exist.
