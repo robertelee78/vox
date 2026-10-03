@@ -154,6 +154,9 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   | `0x0019` | room-lifecycle | `vox/room-lifecycle/v1` | ADR-023 RL-8 (`governance/lifecycle.rs`) |
   | `0x001A` | board-withdraw | `vox/board-withdraw/v1` | ADR-023 RL-8 (`nat/withdraw.rs`) |
   | `0x001B` | admin-roster | `vox/admin-roster/v1` | ADR-023 RL-8 (`nat/withdraw.rs`) |
+  | `0x001C` | identity ask | — (never signed) | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
+  | `0x001D` | identity prove | `vox-id/v2/resp` | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
+  | `0x001E` | identity claim | `vox-id/v2/init` | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
 
 - **LS-22.** New struct types MUST be appended, versioned, and a tag MUST NOT be reused. `0x000B`
   and `0x0010` belong to removed deniable mode: they stay registered and MUST NOT be produced.
