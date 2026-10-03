@@ -299,6 +299,11 @@ pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 1024;
 
 /// The transport parameters every Vox connection runs with, in both directions.
 fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
+    Arc::new(base_transport(mtu_ceiling))
+}
+
+/// [`transport_config`]'s parameters, unshared, for a variant to change.
+fn base_transport(mtu_ceiling: u16) -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
     cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_BIDI_STREAMS));
@@ -321,6 +326,24 @@ fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     // Cubic, restarted after the connection idles: a tunnel's transfer must not inherit the
     // congestion history of an older one on the same long-lived connection (PRD-001 R41).
     cfg.congestion_controller_factory(Arc::new(crate::transport::congestion::IdleRestartConfig));
+    cfg
+}
+
+/// The transport parameters of a connection **before its identity exchange** (ADR-011
+/// requirement 33): [`transport_config`] with QUIC's own limits holding the connection to the
+/// exchange — at most [`identity::PRE_IDENTITY_BIDI`](crate::transport::identity::PRE_IDENTITY_BIDI)
+/// client-opened bidirectional streams, no unidirectional stream, and a
+/// [`identity::PRE_IDENTITY_WINDOW`](crate::transport::identity::PRE_IDENTITY_WINDOW) connection
+/// window. A third stream is QUIC's STREAM_LIMIT_ERROR, not something Vox has to police.
+/// [`identity::open_post_identity`](crate::transport::identity::open_post_identity) raises them
+/// once the exchange is done.
+#[must_use]
+pub fn pre_identity_transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
+    use crate::transport::identity::{PRE_IDENTITY_BIDI, PRE_IDENTITY_UNI, PRE_IDENTITY_WINDOW};
+    let mut cfg = base_transport(mtu_ceiling);
+    cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(PRE_IDENTITY_BIDI));
+    cfg.max_concurrent_uni_streams(quinn::VarInt::from_u32(PRE_IDENTITY_UNI));
+    cfg.receive_window(quinn::VarInt::from_u32(PRE_IDENTITY_WINDOW));
     Arc::new(cfg)
 }
 

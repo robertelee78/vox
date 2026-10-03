@@ -156,7 +156,8 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
             WireError::TransportFailed
             | WireError::Unresponsive
             | WireError::ShuttingDown
-            | WireError::Superseded => BackoffKind::Unreachable,
+            | WireError::Superseded
+            | WireError::NotAvailable => BackoffKind::Unreachable,
             WireError::EpochMismatch | WireError::AuthenticatorInvalid => BackoffKind::Policy,
             WireError::ProtocolVersionUnsupported
             | WireError::SuiteBelowFloor
@@ -168,7 +169,8 @@ pub fn backoff_kind(fail: &SyncFailure) -> Option<BackoffKind> {
             WireError::TransportFailed
             | WireError::Unresponsive
             | WireError::ShuttingDown
-            | WireError::Superseded => BackoffKind::Unreachable,
+            | WireError::Superseded
+            | WireError::NotAvailable => BackoffKind::Unreachable,
             WireError::SessionBusy | WireError::NotYetMember => BackoffKind::Busy,
             WireError::EpochMismatch => BackoffKind::Policy,
             WireError::ProtocolVersionUnsupported

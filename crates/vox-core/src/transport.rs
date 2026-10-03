@@ -61,6 +61,7 @@
 pub mod congestion;
 pub mod datagram;
 pub mod framing;
+pub mod identity;
 pub mod identity_cert;
 pub mod mux;
 pub mod provider;
