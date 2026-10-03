@@ -493,6 +493,10 @@ pub enum Error {
     #[error("{0}")]
     AppRefused(String),
 
+    /// No node could be chosen for a verb (ADR-026 C-3): what there is, and how to name one.
+    #[error("{0}")]
+    NoNodeChosen(String),
+
     /// Attaching to a node's control socket failed before any request: the connect, or
     /// the node's greeting. Said in a person's words, because each one needs a different
     /// remedy and they used to share one sentence (#191).

@@ -69,9 +69,14 @@ impl Root {
         p
     }
 
+    /// `vox args`; a leading `--node <name>` is given after the verb, where it is a flag.
     fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(VOX);
-        cmd.args(args)
+        match args {
+            ["--node", node, rest @ ..] => cmd.args(rest).args(["--node", node]),
+            _ => cmd.args(args),
+        };
+        cmd
             .env("VOX_DATA_DIR", &self.dir)
             .env("VOX_CONFIG_DIR", self.dir.join("cfg"))
             .env_remove("VOX_NODE")
@@ -388,6 +393,7 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
             "b",
             "room",
             "create",
+            "--name",
             "bx",
             "--passphrase-file",
             room_pf.to_str().unwrap(),
@@ -449,6 +455,7 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
             "room",
             "join",
             &b_link,
+            "--name",
             "bx",
             "--passphrase-file",
             b_room_pf.to_str().unwrap(),

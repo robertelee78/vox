@@ -189,23 +189,17 @@ pub fn resolve_node(
     match on_disk.as_slice() {
         [only] => Ok(only.clone()),
         [] if creates => NodeName::parse(DEFAULT_PROFILE),
-        [] => Err(Error::Path {
-            op: "choose a node",
-            detail: format!(
-                "there is no node in {} yet; make one: vox node create <name>",
-                account.data_root.display()
-            ),
-        }),
-        many => Err(Error::Path {
-            op: "choose a node",
-            detail: format!(
-                "this data root holds several nodes ({}); name one: --node <name> or VOX_NODE",
-                many.iter()
-                    .map(NodeName::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }),
+        [] => Err(Error::NoNodeChosen(format!(
+            "there is no node in {} yet; make one: vox node create <name>",
+            account.data_root.display()
+        ))),
+        many => Err(Error::NoNodeChosen(format!(
+            "this data root holds several nodes ({}); name one: --node <name> or VOX_NODE",
+            many.iter()
+                .map(NodeName::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 
