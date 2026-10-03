@@ -38,6 +38,7 @@ pub mod ipc;
 pub mod joinslots;
 pub mod joinstream;
 pub mod keypackage;
+pub mod layout;
 pub mod link;
 pub mod nameipc;
 pub mod nearby;

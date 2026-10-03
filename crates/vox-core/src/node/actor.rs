@@ -5024,10 +5024,16 @@ impl Node {
             return Ok((VoxEndpoint::bind(signer, addr)?, None));
         }
         let file = self.paths.port_file();
-        let kept = std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|t| t.trim().parse::<u16>().ok())
-            .filter(|p| *p != 0);
+        let read_port = |f: &std::path::Path| {
+            std::fs::read_to_string(f)
+                .ok()
+                .and_then(|t| t.trim().parse::<u16>().ok())
+                .filter(|p| *p != 0)
+        };
+        // The node's own port, else the data root's (ADR-026 D-3): a node moved from the layout
+        // before v0.3.0 had its `port` file removed, and the migration kept its port in
+        // `.daemon/port`, so it binds where members last saw it.
+        let kept = read_port(&file).or_else(|| read_port(&self.paths.account_port_file()));
         let Some(port) = kept else {
             let endpoint = VoxEndpoint::bind(signer, addr)?;
             if let Ok(at) = endpoint.local_addr() {
@@ -13599,13 +13605,15 @@ impl Node {
             // The room's own value is "follow the room": the member's line is cleared, so a later
             // change to the room's retention reaches this node too.
             let own = (ttl != room).then_some(ttl);
-            if crate::node::retention::RetentionConfig::write_room(
-                &self.paths.retention_file(),
-                channel_id,
-                own,
-            )
-            .is_err()
-            {
+            // Written to the node's own file (ADR-026 F-2), seeded from the account's when the
+            // node has none, so the other rooms' lines it was reading are kept.
+            let written = self
+                .paths
+                .own_config_path(crate::node::paths::RETENTION_FILE)
+                .and_then(|file| {
+                    crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
+                });
+            if written.is_err() {
                 return Outcome::Failed(Fault::Storage);
             }
             self.retention_read_at = 0;
