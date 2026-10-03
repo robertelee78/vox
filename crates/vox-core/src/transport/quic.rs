@@ -447,18 +447,41 @@ fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<()
     let Ok(probe) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
         return Ok(()); // no test is possible; never refuse a bind for that
     };
+    // **A control for each address: an IPv4 socket of this test's own.** A machine can drop what
+    // it sends to its own routable address (a VPN that blocks the local network does): measured
+    // 2026-10-03, every datagram to the LAN address was lost, to an IPv4-only socket as much as
+    // to a dual-stack one, and the node refused every port it was given as "held by another
+    // program". So an address whose control datagram does not arrive tests nothing, and is left
+    // out of the verdict rather than read as a collision.
+    let Ok(control) = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) else {
+        return Ok(());
+    };
+    let Ok(control_port) = control.local_addr().map(|a| a.port()) else {
+        return Ok(());
+    };
+    let nonce = |what: &[u8]| -> Option<Vec<u8>> {
+        let mut n = [0u8; 16];
+        getrandom::fill(&mut n).ok()?;
+        let mut text = what.to_vec();
+        text.extend_from_slice(&n);
+        Some(text)
+    };
     let mut owed: Vec<(std::net::Ipv4Addr, Vec<u8>)> = Vec::new();
+    let mut controls: Vec<(std::net::Ipv4Addr, Vec<u8>)> = Vec::new();
     for target in targets {
-        let mut nonce = [0u8; 16];
-        if getrandom::fill(&mut nonce).is_err() {
+        let (Some(text), Some(check)) = (
+            nonce(b"vox dual-stack self-test "),
+            nonce(b"vox dual-stack control "),
+        ) else {
             return Ok(());
-        }
-        let mut text = b"vox dual-stack self-test ".to_vec();
-        text.extend_from_slice(&nonce);
-        if probe.send_to(&text, (target, port)).is_err() {
+        };
+        if probe.send_to(&text, (target, port)).is_err()
+            || probe.send_to(&check, (target, control_port)).is_err()
+        {
             return Ok(());
         }
         owed.push((target, text));
+        controls.push((target, check));
     }
     let deadline = std::time::Instant::now() + DUAL_STACK_SELF_TEST;
     let mut buf = [0u8; 64];
@@ -483,6 +506,16 @@ fn hears_ipv4(socket: &std::net::UdpSocket, port: u16) -> std::result::Result<()
         let _ = socket.set_nonblocking(false);
     }
     let _ = socket.set_read_timeout(None);
+    if owed.is_empty() {
+        return Ok(());
+    }
+    // The controls of the addresses still owed: each had the whole wait to arrive.
+    if control.set_nonblocking(true).is_ok() {
+        while let Ok((n, _)) = control.recv_from(&mut buf) {
+            controls.retain(|(_, t)| buf[..n] != t[..]);
+        }
+    }
+    owed.retain(|(at, _)| !controls.iter().any(|(c, _)| c == at));
     if owed.is_empty() {
         return Ok(());
     }

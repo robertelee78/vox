@@ -1061,8 +1061,11 @@ fn tend(
             }
             crate::wake::Tended::Send => {
                 said_held.remove(&session.session);
+                // The reader's own name for each sender, and "you" for another session of this
+                // node (V210-162): its own fingerprint read as "not in keyring".
+                let me = view.identity.as_ref().map(|i| i.fingerprint);
                 let name = |r: &&vox_core::node::api::MessageRow| {
-                    crate::ident::member_name(&view.trusted, &r.author)
+                    crate::ident::author_for(&view.trusted, me.as_ref(), &r.author)
                 };
                 let owed: Vec<crate::agent_hook::Owed> = rooms
                     .iter()
