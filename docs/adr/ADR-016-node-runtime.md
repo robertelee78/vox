@@ -48,8 +48,9 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 ### App-lock and signals
 
 - **NR-13.** `Lock` MUST drop every SEK, the signer, the prekey ring and the pairwise and sender state, and close the network. *Decided, not built (ADR-026 D-5):* a lock closes only that node's connections; the daemon's endpoint and the other nodes stay up. A lock MUST be answered once it has settled (V210-94). The actor MUST keep answering other commands while it settles.
+  *Decided 2026-10-03, not built (ADR-026 N-2):* there is no `Lock` or `Unlock`. A node gets its passphrase once when it attaches and runs in full while attached; after the keyring window only keyring changes ask again. Detaching does what NR-13 says `Lock` does, for that node only, and is the only way a node stops. NR-13a, NR-13b and NR-14 go with it, and NR-23a's "after every `Unlock`" becomes "on every attach".
 - **NR-13a.** Dropping the last `NodeHandle` MUST lock the node exactly as `Lock` does, then end the actor.
-- **NR-13b.** The TUI MUST lock after `IDLE_LOCK_SECS` (5 minutes) without input (ADR-015).
+- **NR-13b.** The TUI MUST lock after `IDLE_LOCK_SECS` (5 minutes) without input (ADR-015). *Removed by ADR-026 N-2 when built.*
 - **NR-14 (M15.2c).** A headless node MUST refuse `Lock`.
 - **NR-15.** `vox daemon`, `vox node` and every long-running verb MUST stop cleanly on SIGINT, SIGTERM, SIGHUP and SIGQUIT (V210-108). *Decided, not built (ADR-026 S-1, L-7):* the daemon stops every node cleanly on those signals, and a foreground client whose daemon stops exits non-zero, saying so.
 
@@ -213,7 +214,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 ### Gates
 
 - **NR-49.** Each milestone MUST be proven through the shipped binary, as a person uses it (ADR-018):
-  - **M13:** a profile, a room, messages, lock, unlock and a restart;
+  - **M13:** a profile, a room, messages, lock, unlock and a restart (under ADR-026: attach, detach and a restart);
   - **M14:** create, invite, join with the passphrase, consent, both ways, and an unconsented member reading nothing (`a_room_admits_the_passphrase_and_authors_decide_readers`), across processes (`cross_process_join_proof`);
   - **M15:** two members never online together converge through an anchor; a hole punch through the anchor's `coord` stream; `ssh` over Vox through `vox forward` (`service_rehearsal_proof`);
   - **M18.1:** a revoked member reads nothing after the rotation.

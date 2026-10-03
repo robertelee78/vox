@@ -56,7 +56,7 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
 ### App-lock and memory hygiene
 
-- **AR-15.** A SEK MUST be held only in memory, and only while the identity is unlocked. A lock (manual, idle timeout, or on sleep; ADR-015 maps sleep to its triggers) MUST zeroize every SEK and the derived material.
+- **AR-15.** A SEK MUST be held only in memory, and only while the identity is unlocked. A lock (manual, idle timeout, or on sleep; ADR-015 maps sleep to its triggers) MUST zeroize every SEK and the derived material. *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* there is no node lock; a node's SEKs and derived material are zeroized when it detaches, which is the only way it stops.
 - **AR-16.** Secret memory MUST be zeroized when it is freed. The SEK MUST be `mlock`ed where the platform allows (best effort). **Not built:** derived factors, the KEK, the vault key and opened plaintext are zeroizing but not `mlock`ed.
 - **AR-17.** An opened segment's plaintext MUST be returned zeroizing (`store::open_segment` returns `Zeroizing<Vec<u8>>`). `Sek` MUST NOT implement `Clone`.
 - **AR-18.** Plaintext caches MUST live inside the SEK-sealed store and MUST NOT be written unencrypted.
@@ -77,7 +77,7 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 
   These blobs MUST NOT be sealed under the Ed25519 `id_proof`, which a quantum adversary with the public key could compute.
 - **AR-23.** A version-1 vault's blobs, sealed under the identity factor (`vox/prekey-ring-sek/v1`, `vox/trust-keyring-sek/v1`), MAY be read only by the one-time migration (`node::seal_migration`).
-- **AR-24.** The prekey ring MUST be held only while the identity is unlocked and dropped on lock. A ring sealed to another identity, or tampered with, MUST fail as `AtRestUnlockFailed` and MUST NOT be silently regenerated.
+- **AR-24.** The prekey ring MUST be held only while the identity is unlocked and dropped on lock (under ADR-026, while the node is attached, and dropped on detach). A ring sealed to another identity, or tampered with, MUST fail as `AtRestUnlockFailed` and MUST NOT be silently regenerated.
 
 ### Remembered open rooms
 

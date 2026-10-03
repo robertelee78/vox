@@ -141,7 +141,7 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 9.1. The TUI MUST embed the node while running, or sync with a user-run node as a ciphertext-only
      peer (1.2). The TUI MUST NOT make either compulsory. It MUST show per-room reachability and sync
      state. *Built.* *Decided, not built (ADR-026):* the TUI shows the daemon's attached nodes, live
-     through attach, detach, lock and unlock events, and acts as the node the person picks (ADR-026
+     through attach and detach events, and acts as the node the person picks (ADR-026
      C-3); it MUST NOT embed a node.
 9.2. New decryptable entries MUST show in the app (unread markers on the room list, a status line).
      *Built.*
@@ -173,9 +173,12 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 11.2. Lock MUST zeroize the room SEKs, the in-memory identity root (generate path) and the decrypted
       view models, and MUST require the identity vault and each room's passphrase again. For a
       `gpg-agent` key, Vox MUST clear only its own derived material. *Built for the generate path.*
+      *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* 11.2–11.4 are removed: the TUI is a daemon client with no node
+      lock. A node's secrets are wiped when it detaches (ADR-026 L-3).
 11.3. The TUI MUST lock after 5 minutes idle (the default) and on `SIGHUP` or a dropped connection. The
       lock MUST be configurable, including off, with a direct warning. *The 5-minute idle lock, `:lock`
-      and `SIGHUP` are built; configuring them is planned.*
+      and `SIGHUP` are built; configuring them is planned.* *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* the idle lock, `:lock` and the
+      `SIGHUP` lock go; `SIGHUP` stops the TUI cleanly and leaves its node attached.
 11.4. The node MUST track every task it hands a signer handle to and abort them all when it locks,
       before it drops the prekey ring, so no task outlives the lock holding the identity. *Built
       (`Profile::signer_arc`).*
@@ -238,7 +241,7 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 16.4. Every passphrase source (file, environment variable, prompt) MUST be resolved in the client;
       the daemon MUST NOT read a passphrase from its own environment (ADR-026 C-6). *Decided, not
       built.*
-16.5. A passphrase sent to the daemon (attach, unlock) MUST travel in a zeroizing buffer end to end
+16.5. A passphrase sent to the daemon (attach, a keyring change) MUST travel in a zeroizing buffer end to end
       (ADR-026 C-6). *Decided, not built.*
 16.6. A client that finds no daemon MUST start one (ADR-026 S-2) before sending its request.
       *Decided, not built.*

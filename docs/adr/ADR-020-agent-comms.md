@@ -216,7 +216,7 @@ they are not a defence against one that lies.
   messaging socket MAY be used for the wake only. Codex's `thread/inject_items` MUST NOT be used.
   MCP MUST NOT be relied on for delivery.
 - **6.5** `vox agent hook` MUST drain every room its node holds, each message labelled with its
-  room. When it cannot drain (no node running, node locked), the injected context MUST say so in
+  room. When it cannot drain (no node running, node locked; under ADR-026, node not attached), the injected context MUST say so in
   one line (V210-163). The hook MUST exit 0 whatever happens.
 - **6.6** What the drain injects MUST be attributed and bounded (PRD-001 R19):
   - each message is one row, `[<entry> from <author> to <recipients>] …`, whose author and
@@ -294,7 +294,7 @@ they are not a defence against one that lies.
 - **7.5** A cursor belongs to the reader of the log (§4, ADR-021 §7), not to the event transport.
 - **7.6** The protocol MUST be versioned (`PROTOCOL_VERSION`, now 8) and grow by additive requests.
   *Decided, not built (ADR-026 C-4):* version 9 adds the node to every request, daemon requests and
-  daemon events (attach, detach, lock, unlock).
+  daemon events (attach, detach). There is no lock or unlock (ADR-026 N-2).
   The app API (`AppListen`, `AppAccept`, `AppOpen`; ADR-022 M22.5) rides the same socket.
 - **7.7 (PRD-001 R35, R38).** The socket MUST answer a status request (tag 2301) with the node's
   report as JSON: rooms with each member's last-seen and last-sync time and the room's last

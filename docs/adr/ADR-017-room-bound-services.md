@@ -215,7 +215,8 @@ is what a person offers. A tunnel is how bytes reach it.
   It MUST be recomputed when the keyring or a room's author set changes, and on each accept. Serving
   tasks MUST be woken only when the set really changes (`publish_reachers`). A locked node MUST NOT
   recompute it, because the keyring is cleared while locked and an empty set would read as everyone
-  withdrawn.
+  withdrawn. *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* there is no locked node; a detaching node's serving
+  tasks stop before its keyring is cleared.
 - **10.6** A refused dial MUST tell the peer nothing beyond its SOCKS reply. The dialing node prints
   the reason locally (ADR-013 T-19).
 - **10.7** Restoring trust MUST restore reach in the same act. There is no separate service state.
