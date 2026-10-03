@@ -328,7 +328,7 @@ fn logs(root: &Path, members: &[Member]) -> String {
 }
 
 #[test]
-#[ignore = "a real anchor and two real daemons with production Argon2id; CI runs it in release"]
+#[ignore = "a real anchor and two real daemons with production Argon2id; run by hand, on demand, in release"]
 fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
     watchdog::arm();
     let tmp = harness(tempfile::tempdir(), "a temp dir");
@@ -365,7 +365,7 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
 }
 
 #[test]
-#[ignore = "a real anchor and two real daemons with production Argon2id; CI runs it in release"]
+#[ignore = "a real anchor and two real daemons with production Argon2id; run by hand, on demand, in release"]
 fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust_step() {
     watchdog::arm();
     let tmp = harness(tempfile::tempdir(), "a temp dir");
