@@ -429,7 +429,7 @@ fn r6_a_room_with_no_retention_keeps_every_message_however_old() {
 fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_holds() {
     watchdog::arm();
     let t = tempfile::tempdir().expect("APPARATUS: a temporary directory");
-    let (alice, _) = identity(t.path(), "alice");
+    let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
     let (carol, carol_fp) = identity(t.path(), "carol");
     let _a = daemon(
@@ -457,6 +457,9 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
     join(&alice, &carol, &room);
     trust(&alice, &bob_fp, "bob");
     trust(&alice, &carol_fp, "carol");
+    // A node reads only members it trusted (V210-118): bob and carol read alice once they trust her.
+    trust(&bob, &alice_fp, "alice");
+    trust(&carol, &alice_fp, "alice");
     until_readable(&alice, &[&bob, &carol], &room);
     let members = [(&alice, "alice"), (&bob, "bob"), (&carol, "carol")];
 
@@ -821,6 +824,9 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     join(&alice, &carol, &room);
     trust(&alice, &bob_fp, "bob");
     trust(&alice, &carol_fp, "carol");
+    // A node reads only members it trusted (V210-118): bob and carol read alice once they trust her.
+    trust(&bob, &alice_fp, "alice");
+    trust(&carol, &alice_fp, "alice");
     until_readable(&alice, &[&bob, &carol], &room);
     let (ok, said) = set_retention(&alice, &room, "20");
     assert!(ok, "PRODUCT (staging): the admin sets 20 s: {said}");
