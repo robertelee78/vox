@@ -688,7 +688,18 @@ async fn a_datagram_before_prove_closes_the_connection() {
     );
     c.send_datagram(bytes::Bytes::from_static(b"too early"))
         .expect("APPARATUS: send a datagram");
-    let (_send, _recv) = raw_ask(&c, target.id()).await;
+    // The listener may close before these leave: the datagram alone is enough.
+    if let Ok((mut send, _recv)) = c.open_bi().await {
+        let _ = write_frame(&mut send, &StreamKind::Identity.frame()).await;
+        let _ = write_frame(
+            &mut send,
+            &Ask {
+                target: target.id(),
+            }
+            .encode(),
+        )
+        .await;
+    }
     assert_eq!(
         listened(h).await.err(),
         Some(Refused::Datagram),

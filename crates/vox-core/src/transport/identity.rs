@@ -619,13 +619,22 @@ async fn listener_exchange(
         let (prove, hosted, e) = answer?;
         Ok((send, recv, prove, hosted, e))
     };
+    // A datagram already waiting wins over an answer ready in the same poll; and one last look
+    // just before PROVE leaves, so none received before it slips through.
     let (mut send, mut recv, prove, hosted, e) = tokio::select! {
         biased;
-        r = before_prove => r?,
         d = conn.read_datagram() => {
             return Err(if d.is_ok() { Refused::Datagram } else { Refused::Closed });
         }
+        r = before_prove => r?,
     };
+    tokio::select! {
+        biased;
+        d = conn.read_datagram() => {
+            return Err(if d.is_ok() { Refused::Datagram } else { Refused::Closed });
+        }
+        () = std::future::ready(()) => {}
+    }
     write_frame(&mut send, &prove)
         .await
         .map_err(|_| Refused::Closed)?;
