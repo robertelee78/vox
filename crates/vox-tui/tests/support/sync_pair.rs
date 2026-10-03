@@ -366,7 +366,10 @@ impl Member {
 
     /// Create a room and return its id as `vox room list` prints it.
     pub fn create(&self, name: &str) -> String {
-        let (ok, out, err) = self.vox(&["room", "create", "--name", name], Some(ROOM_PASS));
+        let (ok, out, err) = self.vox(
+            &["room", "create", "--passphrase-file", "-", "--name", name],
+            Some(ROOM_PASS),
+        );
         assert!(
             ok,
             "PRODUCT: {}'s `vox room create` of {name} failed.\nstdout:\n{out}\nstderr:\n{err}",
@@ -399,7 +402,18 @@ impl Member {
     /// a retry would pass a join that does not work the first time a person asks.
     pub fn join(&self, link: &str, name: &str) {
         let t0 = Instant::now();
-        let (ok, out, err) = self.vox(&["room", "join", link, "--name", name], Some(ROOM_PASS));
+        let (ok, out, err) = self.vox(
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link,
+                "--name",
+                name,
+            ],
+            Some(ROOM_PASS),
+        );
         assert!(
             ok,
             "PRODUCT: {} could not join {name}: `vox room join` was refused after {:?}.\n\

@@ -236,7 +236,10 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
     });
     assert!(
         alice
-            .vox(&["room", "create", "--name", "slow"], Some(ROOM_PASS))
+            .vox(
+                &["room", "create", "--passphrase-file", "-", "--name", "slow"],
+                Some(ROOM_PASS)
+            )
             .0,
         "CANNOT MEASURE: room create failed"
     );
@@ -273,7 +276,15 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
 
     let t = Instant::now();
     let (ok, out, err) = s.bob.vox(
-        &["room", "join", &s.link, "--name", "slow"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &s.link,
+            "--name",
+            "slow",
+        ],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();
@@ -322,7 +333,15 @@ fn a_joiner_slower_than_the_patience_is_told_why() {
 
     let t = Instant::now();
     let (ok, out, err) = s.bob.vox(
-        &["room", "join", &s.link, "--name", "slow"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &s.link,
+            "--name",
+            "slow",
+        ],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();

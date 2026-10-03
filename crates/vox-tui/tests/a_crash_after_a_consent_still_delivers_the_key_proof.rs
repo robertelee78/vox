@@ -252,7 +252,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         .collect();
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "CANNOT MEASURE: vox room create: {err}");
@@ -300,7 +300,15 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         attached(&bob, "bob");
         let (ok, _, err) = vox(
             &bob,
-            &["room", "join", &link, "--name", "r"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "r",
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "CANNOT MEASURE: bob{k} could not join: {err}");

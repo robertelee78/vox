@@ -172,7 +172,7 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
         .collect();
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "r"],
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "CANNOT MEASURE: vox room create: {err}");
@@ -211,12 +211,23 @@ fn a_join_in_flight_when_the_node_locks_does_not_complete() {
 
     // ---- a join that cannot finish yet, and a lock while it runs --------------------------
     signal(alice_pid, "-STOP");
-    let mut join = command(&bob, &["room", "join", &link, "--name", "r"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn vox room join");
+    let mut join = command(
+        &bob,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "r",
+        ],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("spawn vox room join");
     {
         let mut pipe = join.stdin.take().expect("join stdin");
         pipe.write_all(format!("{ROOMPASS}\n").as_bytes()).unwrap();

@@ -370,7 +370,11 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    let (ok, _, out, err) = vox(&data, &["room", "create", "--name", "long"], ROOM_PASS);
+    let (ok, _, out, err) = vox(
+        &data,
+        &["room", "create", "--passphrase-file", "-", "--name", "long"],
+        ROOM_PASS,
+    );
     assert!(
         ok,
         "APPARATUS (precondition not met): room create: {out}\n{err}"
@@ -538,7 +542,18 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         );
         std::thread::sleep(Duration::from_millis(250));
     }
-    let (ok, _, out, err) = vox(&data, &["room", "create", "--name", "short"], ROOM_PASS);
+    let (ok, _, out, err) = vox(
+        &data,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "short",
+        ],
+        ROOM_PASS,
+    );
     assert!(
         ok,
         "APPARATUS (precondition not met): room create: {out}\n{err}"

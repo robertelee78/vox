@@ -240,7 +240,14 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     let mut alice = daemon("alice", &alice_dir, &spec, &idpass, &[]);
     let (ok, out, err) = vox_in(
         &alice_dir,
-        &["room", "create", "--name", "family"],
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "family",
+        ],
         &format!("{ROOM_PASS}\n"),
     );
     assert!(
@@ -287,7 +294,15 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
             );
             let (ok, out, err) = vox_in(
                 d,
-                &["room", "join", link.trim(), "--name", "family"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    link.trim(),
+                    "--name",
+                    "family",
+                ],
                 &format!("{ROOM_PASS}\n"),
             );
             assert!(ok, "PRODUCT: {name}'s `vox room join` failed: {out}{err}");

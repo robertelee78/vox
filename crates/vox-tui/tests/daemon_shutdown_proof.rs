@@ -239,7 +239,15 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     daemon.expect_out("its control socket", |l| l.contains("control socket"));
     let (ok, said) = vox(
         &joiner_dir,
-        &["room", "join", &address, "--name", "svc"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &address,
+            "--name",
+            "svc",
+        ],
         &format!("{passphrase}\n"),
     );
     assert!(ok, "CANNOT MEASURE: the join failed: {said}");

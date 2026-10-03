@@ -332,7 +332,17 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         ]);
         assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
-    let (ok, _, err) = alice.vox_with(&["room", "create", "--name", "mission"], ROOM_PASS);
+    let (ok, _, err) = alice.vox_with(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+    );
     assert!(ok, "PRODUCT (staging): vox room create: {err}");
     let label = alice
         .vox(&["room", "list"])
@@ -351,7 +361,18 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         .to_owned();
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.
-    let (ok, out, err) = bob.vox_with(&["room", "join", &link, "--name", "mission"], ROOM_PASS);
+    let (ok, out, err) = bob.vox_with(
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "mission",
+        ],
+        ROOM_PASS,
+    );
     assert!(
         ok,
         "PRODUCT: `vox room join` failed for bob.\nstdout: {out}\nstderr: {err}"

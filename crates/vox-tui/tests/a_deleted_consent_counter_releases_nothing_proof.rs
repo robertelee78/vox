@@ -251,7 +251,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     assert!(ok, "alice trusts carol: {err}");
     let (ok, _, err) = vox(
         &alice,
-        &["room", "create", "--name", "c"],
+        &["room", "create", "--passphrase-file", "-", "--name", "c"],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room create: {err}");
@@ -352,7 +352,15 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     assert!(ok, "vox room invite: {err}");
     let (ok, _, err) = vox(
         &bob,
-        &["room", "join", link.trim(), "--name", "c"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "c",
+        ],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "CANNOT MEASURE: vox room join: {err}");

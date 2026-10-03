@@ -500,7 +500,14 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
     first
         .vox_in(
             None,
-            &["room", "create", "--name", "mission"],
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "mission",
+            ],
             Some(ROOM_PASS),
         )
         .expect_ok("`vox room create`");
@@ -526,7 +533,15 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         let t = Instant::now();
         let o = w.vox_in(
             None,
-            &["room", "join", &link, "--name", "mission"],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                &link,
+                "--name",
+                "mission",
+            ],
             Some(ROOM_PASS),
         );
         assert!(

@@ -235,7 +235,15 @@ fn connected_notes(err: &Path, anchor: &str) -> usize {
 fn join(dir: &Path, link: &str, name: &str) -> (bool, String) {
     let (ok, out, err) = vox(
         dir,
-        &["room", "join", link, "--name", name],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link,
+            "--name",
+            name,
+        ],
         Some(ROOM_PASS),
     );
     (ok, format!("{}{}", out.trim(), err.trim()))
@@ -308,7 +316,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     for name in ["one", "two"] {
         let (ok, _, err) = vox(
             &alice_dir,
-            &["room", "create", "--name", name],
+            &["room", "create", "--passphrase-file", "-", "--name", name],
             Some(ROOM_PASS),
         );
         assert!(ok, "PRODUCT (staging): alice's room create: {err}");

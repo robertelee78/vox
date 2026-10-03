@@ -265,7 +265,15 @@ fn posts_until_read(
 fn join(m: &Member, link: &str, name: &str) {
     let joined = (1..=6).any(|attempt| {
         let (ok, o, e) = m.vox(
-            &["room", "join", link, "--name", name],
+            &[
+                "room",
+                "join",
+                "--passphrase-file",
+                "-",
+                link,
+                "--name",
+                name,
+            ],
             Some(&format!("{ROOM_PASS}\n")),
         );
         if !ok {
@@ -295,7 +303,7 @@ fn until(what: &str, within: Duration, ok: impl Fn() -> bool) -> bool {
 /// Alice's room, by the name she gave it, and the link she mints for it (which pins her).
 fn make_room(alice: &Member, name: &str) -> (String, String) {
     let (ok, _, e) = alice.vox(
-        &["room", "create", "--name", name],
+        &["room", "create", "--passphrase-file", "-", "--name", name],
         Some(&format!("{ROOM_PASS}\n")),
     );
     assert!(ok, "room create {name}: {e}");

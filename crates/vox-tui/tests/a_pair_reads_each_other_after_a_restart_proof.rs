@@ -279,7 +279,7 @@ fn restarted_responder() -> World {
     // ---- alice creates the room; bob joins through her, then carol ---------------------
     let (ok, _, err) = vox(
         &alice.dir,
-        &["room", "create", "--name", "pair"],
+        &["room", "create", "--passphrase-file", "-", "--name", "pair"],
         Some(ROOMPASS),
     );
     assert!(ok, "room create: {err}");
@@ -297,7 +297,15 @@ fn restarted_responder() -> World {
         let joined = (1..=6).any(|attempt| {
             let (ok, _, err) = vox(
                 &m.dir,
-                &["room", "join", link.trim(), "--name", "pair"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    link.trim(),
+                    "--name",
+                    "pair",
+                ],
                 Some(ROOMPASS),
             );
             if !ok {

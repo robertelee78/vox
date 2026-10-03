@@ -208,7 +208,17 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
         .collect();
     let [alice, bob] = &members;
 
-    let (ok, _, err) = alice.vox(&["room", "create", "--name", "mission"], Some(ROOM_PASS));
+    let (ok, _, err) = alice.vox(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "mission",
+        ],
+        Some(ROOM_PASS),
+    );
     assert!(ok, "create: {err}");
     let room = alice
         .vox(&["room", "list"], None)
@@ -226,7 +236,15 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
     for attempt in 1..=6 {
         if bob
             .vox(
-                &["room", "join", &link, "--name", "mission"],
+                &[
+                    "room",
+                    "join",
+                    "--passphrase-file",
+                    "-",
+                    &link,
+                    "--name",
+                    "mission",
+                ],
                 Some(ROOM_PASS),
             )
             .0

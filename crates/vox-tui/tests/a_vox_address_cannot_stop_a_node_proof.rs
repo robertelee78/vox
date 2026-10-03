@@ -260,7 +260,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
     let _victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
     let (ok, out, err) = vox_in(
         &victim_dir,
-        &["room", "create", "--name", "team"],
+        &["room", "create", "--passphrase-file", "-", "--name", "team"],
         ROOM_PASS,
     );
     assert!(ok, "PRODUCT (staging): room create: {out}\n{err}");

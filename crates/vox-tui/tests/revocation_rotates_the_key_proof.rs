@@ -274,7 +274,15 @@ fn join(m: &Member, link: &str, name: &str) {
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.
     let (ok, o, e) = m.vox(
-        &["room", "join", link, "--name", name],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link,
+            "--name",
+            name,
+        ],
         Some(&format!("{ROOM_PASS}\n")),
     );
     assert!(
@@ -340,7 +348,7 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
     let mut rooms = Vec::new();
     for name in ROOMS {
         let (ok, _, e) = alice.vox(
-            &["room", "create", "--name", name],
+            &["room", "create", "--passphrase-file", "-", "--name", name],
             Some(&format!("{ROOM_PASS}\n")),
         );
         assert!(ok, "PRODUCT (staging): vox room create {name} failed: {e}");

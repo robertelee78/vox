@@ -224,7 +224,7 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
 
     let (ok, _, err) = vox(
         &alice_dir,
-        &["room", "create", "--name", "chat"],
+        &["room", "create", "--passphrase-file", "-", "--name", "chat"],
         Some("room passphrase\n"),
     );
     assert!(ok, "room create: {err}");
@@ -240,7 +240,15 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     assert!(ok, "invite: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
-        &["room", "join", link.trim(), "--name", "chat"],
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            link.trim(),
+            "--name",
+            "chat",
+        ],
         Some("room passphrase\n"),
     );
     assert!(
