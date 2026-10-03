@@ -70,7 +70,7 @@ serde_json.workspace = true
 semver.workspace = true
 # The LAN helper passes its utun descriptor over a socket: `net`. `vox daemon` asks for its
 # passphrase with echo off and the terminal otherwise as it was (V210-153): `termios`.
-rustix = { workspace = true, features = ["net", "termios"] }
+rustix = { workspace = true, features = ["net", "termios", "process"] }
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 

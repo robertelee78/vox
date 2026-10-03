@@ -947,6 +947,22 @@ pub struct DaemonArgs {
     /// counters name every peer and room this node talks to.
     #[arg(long)]
     pub metrics: Option<SocketAddr>,
+    /// The node to attach in the foreground (ADR-026 C-3). Without it: the only node on disk,
+    /// else `default` when there is none, else no node (the daemon runs with none).
+    #[arg(long, env = "VOX_NODE")]
+    pub node: Option<String>,
+    /// Start the daemon in the background and return once it answers; its output goes to
+    /// `<data root>/.daemon/log`. It exits once it has no attached node and no client.
+    #[arg(long, conflicts_with_all = ["keep", "passphrase_file"])]
+    pub detach: bool,
+    /// Keep the foreground node attached across daemon restarts (`.daemon/attach`, ADR-026 L-4).
+    /// Its passphrase comes from `--passphrase-file` then, or it has none.
+    #[arg(long)]
+    pub keep: bool,
+    /// How a client starts the daemon (ADR-026 S-2): its own session, no foreground node, and an
+    /// exit once nothing is attached and no client is connected.
+    #[arg(long = "as-detached", hide = true)]
+    pub as_detached: bool,
 }
 
 /// `vox tunnel …` (V030-11).
@@ -2561,39 +2577,16 @@ pub fn run() -> ExitCode {
             // Always success: a hook that fails must not break the turn.
             ExitCode::SUCCESS
         }
-        Cmd::Daemon(args) => {
-            let paths = match args.profile.paths() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let anchors = match args.profile.anchor_set() {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match crate::app::run_daemon(
-                paths,
-                args.profile.listen,
-                anchors,
-                args.profile.anchors.clone(),
-                args.passphrase_file.clone(),
-                args.metrics,
-            ) {
-                Ok(()) => ExitCode::SUCCESS,
-                // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a
-                // write that fails there must not turn the reason into a panic.
-                Err(e) => {
-                    use std::io::Write as _;
-                    let _ = writeln!(io::stderr(), "vox: {e}");
-                    e.exit_code()
-                }
+        Cmd::Daemon(args) => match crate::daemon::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            // Not `eprintln!`: after a hangup stderr can be a terminal that is gone, and a
+            // write that fails there must not turn the reason into a panic.
+            Err(e) => {
+                use std::io::Write as _;
+                let _ = writeln!(io::stderr(), "vox: {e}");
+                e.exit_code()
             }
-        }
+        },
         Cmd::Agent(AgentCmd::Doctor(args)) => {
             let paths = match args.profile.paths() {
                 Ok(p) => p,

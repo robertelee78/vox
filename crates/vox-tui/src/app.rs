@@ -817,7 +817,7 @@ pub fn run_node(
 /// It must stay longer than the node's own worst-case stop
 /// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, the sum of the stop's budget), so a stop
 /// that waits every one of them out still closes its connections before the daemon leaves.
-const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 const _: () = assert!(
     vox_core::node::actor::STOP_WORST_CASE.as_millis() + 500 <= SHUTDOWN_PATIENCE.as_millis(),
     "the daemon gives a stop that waits out every bound at least 0.5 s more"
@@ -833,7 +833,7 @@ const TEST_SHUTDOWN_PATIENCE_ENV: &str = "VOX_TEST_SHUTDOWN_PATIENCE_MS";
 /// node's stop is budgeted to fit the real patience, so no real scene runs past it; a proof stages
 /// a stop that gives up, and what the daemon then says and how it exits, with a shorter one. It
 /// only ever shortens it; unset, empty or unparsable is the real patience.
-fn shutdown_patience() -> std::time::Duration {
+pub(crate) fn shutdown_patience() -> std::time::Duration {
     #[cfg(feature = "test-knobs")]
     if let Some(ms) = std::env::var(TEST_SHUTDOWN_PATIENCE_ENV)
         .ok()
@@ -865,10 +865,10 @@ pub(crate) fn say(line: std::fmt::Arguments<'_>) {
 }
 
 /// The identity passphrase `vox daemon` unlocks with, and the room lines that follow it.
-type DaemonPassphrases = (zeroize::Zeroizing<String>, Vec<String>);
+pub(crate) type DaemonPassphrases = (zeroize::Zeroizing<String>, Vec<String>);
 
 /// What a start-up wait of `vox daemon` ended with: what it waited for, or a stop.
-enum Asked<T> {
+pub(crate) enum Asked<T> {
     Got(T),
     Stopped(StopSignal),
 }
@@ -876,7 +876,7 @@ enum Asked<T> {
 /// `VOX_IDENTITY_PASSPHRASE`, when set: how an agent's harness gives a daemon its identity
 /// passphrase (V210-159, decider 2026-10-02, option A). Set to nothing, it gives none on purpose
 /// (V030-36).
-fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
+pub(crate) fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
     std::env::var("VOX_IDENTITY_PASSPHRASE")
         .ok()
         .map(zeroize::Zeroizing::new)
@@ -886,7 +886,7 @@ fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
 /// `VOX_IDENTITY_PASSPHRASE` (the identity alone), the terminal (asked for without echo, and
 /// **without waiting for end of input**: one line is the passphrase, V210-153), or stdin that is
 /// not a terminal, read to its end. A stop ends any wait for them.
-fn daemon_passphrases(
+pub(crate) fn daemon_passphrases(
     rt: &tokio::runtime::Runtime,
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
     passphrase_file: Option<std::path::PathBuf>,
@@ -1030,7 +1030,7 @@ const HANGUP_GRACE: Duration = Duration::from_secs(1);
 
 /// One line typed at the terminal, without echo, racing `stop`; `None` when its input ended with
 /// none. A stop leaves the terminal as it was: echo comes back whichever ends the wait.
-fn ask_without_echo(
+pub(crate) fn ask_without_echo(
     rt: &tokio::runtime::Runtime,
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
     prompt: &str,
@@ -1068,25 +1068,6 @@ fn ask_without_echo(
         let _ = writeln!(io::stderr());
     }
     asked
-}
-
-/// A daemon stopped before it served: its node, if it had one, is shut down, and it says which
-/// signal, exiting 0 as any stop of a server does (V210-153). The runtime is not waited for: a
-/// thread of it may still be reading the terminal.
-fn stopped_while_starting(
-    rt: tokio::runtime::Runtime,
-    node: Option<&vox_core::node::actor::NodeHandle>,
-    signal: StopSignal,
-) -> Result<(), AppError> {
-    if let Some(node) = node {
-        let _ = rt.block_on(tokio::time::timeout(
-            shutdown_patience(),
-            node.apply(NodeCommand::Shutdown),
-        ));
-    }
-    rt.shutdown_background();
-    say(format_args!("vox daemon: stopped by {}", signal.name()));
-    Ok(())
 }
 
 /// Reading a line at the terminal without echo, and without crossterm's raw mode: the terminal
@@ -1277,329 +1258,6 @@ pub(crate) async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle,
             })
             .await;
     }
-}
-
-/// Run this profile's node **without a terminal**, so agent sessions can attach
-/// (ADR-020 §12).
-///
-/// This exists because neither of the other two ways to run a node can serve an
-/// unattended host:
-///
-/// - [`run_live`] is the TUI. It is the only other caller of `node::ipc::bind`, it
-///   needs a TTY to prompt for the passphrase, and per ADR-015 it **locks the node
-///   on SIGHUP** — so detaching it from a terminal defeats it by design.
-/// - [`run_node`] is an anchor. It serves the board and carries circuits, but it is
-///   headless in the other sense: no identity is unlocked, it holds no room and it
-///   can read nothing.
-///
-/// So an agent on a server had no node to attach to, which contradicted this ADR's
-/// own premise that sessions may be on "n-count remote hosts".
-///
-/// ## Passphrases
-///
-/// From `--passphrase-file`, else `VOX_IDENTITY_PASSPHRASE` (the identity's alone: how an agent's
-/// harness starts one, decider 2026-10-02), else asked for at the terminal without echo, else
-/// read from stdin to its end. Never from argv, which every process on the machine can read.
-///
-/// The format of a file or of stdin is one passphrase per line, because a room needs **two** keys, not
-/// one — ADR-010's double lock means unlocking the identity does not open a room:
-///
-/// ```text
-/// <identity passphrase>
-/// <room id or unique prefix> <that room's passphrase>
-/// <room id or unique prefix> <that room's passphrase>
-/// ```
-///
-/// A room line splits at its **first space**, so a room passphrase may contain
-/// spaces — which the generated ones do. With no room lines the daemon unlocks the
-/// identity and holds no open room, which is enough to serve `vox room list` and
-/// nothing else.
-///
-/// `--passphrase-file` reads the same format from a file, for a service manager
-/// that prefers one.
-///
-/// # Errors
-/// If the runtime cannot start, the node cannot spawn, the passphrase is unreadable
-/// or wrong, a named room is unknown or its passphrase is refused, or the control
-/// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
-/// because serving that socket is this command's entire purpose.
-/// How long `vox daemon` keeps retrying a profile another vox is in the middle of closing.
-const PROFILE_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
-
-pub fn run_daemon(
-    paths: Paths,
-    listen: std::net::SocketAddr,
-    anchors: vox_core::nat::bootstrap::BootstrapSet,
-    anchor_specs: Vec<String>,
-    passphrase_file: Option<std::path::PathBuf>,
-    metrics: Option<std::net::SocketAddr>,
-) -> Result<(), AppError> {
-    // Refused before anything is read or unlocked: a metrics endpoint the network can
-    // reach names every peer and room this node talks to (PRD-001 R38).
-    if let Some(addr) = metrics {
-        if !addr.ip().is_loopback() {
-            return Err(AppError::Usage(format!(
-                "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or \
-                 ::1); it names every peer and room this node talks to"
-            )));
-        }
-    }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
-    // **Every stop signal is a clean stop, taken from the start** (V210-108, V210-153): SIGINT,
-    // SIGTERM, SIGHUP and SIGQUIT. Taken first, before the passphrase is read: the read came
-    // first, so a daemon closed with its terminal while it waited there died on the default
-    // action. A stop while the daemon waits for a passphrase ends it at once; one sent during a
-    // later start-up step is acted on once that step has finished.
-    let mut stop = Box::pin({
-        // Registering needs the runtime's signal driver, not a task.
-        let _in_runtime = rt.enter();
-        stop_requested("vox daemon")
-    });
-    let interactive = passphrase_file.is_none()
-        && daemon_env_passphrase().is_none()
-        && io::IsTerminal::is_terminal(&io::stdin());
-    let (identity, rooms) = match daemon_passphrases(&rt, &mut stop, passphrase_file)? {
-        Asked::Got(got) => got,
-        Asked::Stopped(signal) => return stopped_while_starting(rt, None, signal),
-    };
-    let identity = identity.as_str();
-    // **Wait briefly for a profile that is being closed.** redb allows one process per
-    // store, and a daemon started the moment another vox finished with the profile could
-    // still find the file open: it failed at once with "another vox already has this
-    // profile open" and never retried. Measured in `remote_interrupt_proof`, which hands a
-    // profile from an in-process node to `vox daemon`: once handshakes became concurrent
-    // (v0.2.8) it lost that race in most runs — even in a run where the old node's `Store`
-    // had already been dropped before the daemon was spawned. What held the file those last
-    // milliseconds is not identified; this does not claim to know. It makes the daemon
-    // tolerant of the window. A few seconds of retrying costs a person nothing, and a vox
-    // that genuinely holds the profile still gets the same message after the wait.
-    let started = std::time::Instant::now();
-    let (node, actor) = loop {
-        let cfg = vox_core::node::actor::NodeConfig::new()
-            .bind(vox_core::node::actor::Bind::Addr(listen))
-            .anchors(anchors.clone())
-            .on_profile_wait(crate::tunnel_cli::say_waiting);
-        match rt.block_on(async { Node::spawn_supervised(paths.clone(), cfg) }) {
-            Err(vox_core::error::Error::ProfileBusy)
-                if started.elapsed() < PROFILE_RELEASE_PATIENCE =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            other => break other?,
-        }
-    };
-
-    rt.block_on(async {
-        let outcome = crate::tunnel_cli::apply_saying_waits(
-            &node,
-            NodeCommand::Unlock {
-                passphrase: Secret::new(identity.as_bytes().to_vec()),
-            },
-        )
-        .await;
-        if !outcome.is_done() {
-            // **Say what to do, not which enum variant lost.** A new person is sent here
-            // by `vox room list`'s "start one: vox daemon", and this is the second thing
-            // they see; `Failed(NoIdentity)` names nothing they can act on and does not
-            // mention that `vox id` is what creates an identity. The two failures a
-            // person actually hits are distinguished, because the remedies are opposite:
-            // one means make an identity, the other means you typed the wrong thing.
-            use vox_core::node::api::{Fault, Outcome};
-            return Err(AppError::Usage(match outcome {
-                Outcome::Failed(Fault::NoIdentity) => format!(
-                    "this profile has no identity yet, so there is nothing to unlock.\n\
-                     \x20      Make one:  vox id\n\
-                     \x20      Then start the daemon again. Profile: {}",
-                    paths.profile_dir.display()
-                ),
-                Outcome::Failed(Fault::WrongPassphrase) => {
-                    "that identity passphrase is wrong.\n       The first line piped to \
-                     `vox daemon` is the identity passphrase; lines after it open rooms."
-                        .to_owned()
-                }
-                // Unlocking also brings the node onto the network, so a `--listen` address
-                // that cannot be bound fails here. It said `Failed(Internal)` — a bug report for
-                // an occupied port (PRD-001 R36) — and then "something else already holds that
-                // UDP port" for every cause, an address this machine does not have included
-                // (V210-134). Now it names the cause and quotes the operating system.
-                Outcome::Failed(fault) if fault.is_bind() => format!(
-                    "cannot listen on {listen}: {}",
-                    crate::tunnel_cli::bind_failure(listen, crate::tunnel_cli::Socket::Udp, fault)
-                        .unwrap_or_default()
-                ),
-                other => format!("could not unlock this profile's identity: {other}"),
-            }));
-        }
-        // Then the second lock. `vox room post|read|board` all need the room OPEN,
-        // not merely known — a daemon that unlocked the identity and stopped there
-        // would answer `room list` and refuse everything else, which is the defect
-        // this proof found the first time it ran.
-        for line in &rooms {
-            open_rooms_by_line(&node, line).await;
-        }
-        Ok(())
-    })?;
-    // **At a terminal, the rooms still closed are asked for** (V210-153), one passphrase at a
-    // time, as a piped line would give them; an empty one starts the daemon without them.
-    if interactive {
-        loop {
-            let shut = node.view().channels.iter().filter(|c| !c.open).count();
-            if shut == 0 {
-                break;
-            }
-            let prompt = format!(
-                "passphrase for a closed room ({shut} closed; Enter to start without them)"
-            );
-            let line = match ask_without_echo(&rt, &mut stop, &prompt) {
-                // End of input starts it without them, as Enter does.
-                Asked::Got(line) => line?.unwrap_or_default(),
-                Asked::Stopped(signal) => {
-                    return stopped_while_starting(rt, Some(&node), signal);
-                }
-            };
-            if line.is_empty() {
-                break;
-            }
-            rt.block_on(open_rooms_by_line(&node, &line));
-        }
-    }
-    // Say what is actually held, by id, because the names cannot be shown for the
-    // rooms that stayed closed and a silent daemon is how this went unnoticed.
-    let view = node.view();
-    let (open, shut) = (
-        view.channels.iter().filter(|c| c.open).count(),
-        view.channels.iter().filter(|c| !c.open).count(),
-    );
-    if shut > 0 {
-        eprintln!(
-            "vox daemon: {open} room(s) open, {shut} still closed — a closed room \
-             answers nothing but `room list`"
-        );
-    }
-
-    // The node's name, as its metrics are labelled (ADR-026 P-1): its profile directory's.
-    let node_name = paths
-        .profile_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let daemon_metrics = std::sync::Arc::new(vox_core::node::status::DaemonMetrics::default());
-    daemon_metrics
-        .nodes_attached
-        .store(1, std::sync::atomic::Ordering::Relaxed);
-    // **A node's panic is said, never silent** (ADR-026 L-6): its actor is watched, and a panic
-    // is reported on stderr and counted in the metrics. Every request to it fails from then on,
-    // as before; the router (ADR-026 §3) detaches it.
-    {
-        let (name, daemon_metrics) = (node_name.clone(), std::sync::Arc::clone(&daemon_metrics));
-        rt.spawn(async move {
-            if let vox_core::node::actor::ActorEnd::Panicked(message) =
-                vox_core::node::actor::ActorEnd::of(actor).await
-            {
-                daemon_metrics
-                    .node_panics
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                daemon_metrics
-                    .nodes_attached
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("vox daemon: node {name} stopped: its actor panicked: {message}");
-            }
-        });
-    }
-
-    if let Some(addr) = metrics {
-        let listener = rt
-            .block_on(vox_core::node::status::bind_metrics(addr))
-            .map_err(|e| AppError::Usage(e.to_string()))?;
-        let bound = listener.local_addr().map_err(AppError::Io)?;
-        let (name, handle) = (node_name.clone(), node.clone());
-        rt.spawn(vox_core::node::status::serve_metrics_for(
-            listener,
-            Some(std::sync::Arc::clone(&daemon_metrics)),
-            move || vec![(name.clone(), handle.clone())],
-        ));
-        println!("vox daemon: metrics http://{bound}/metrics");
-    }
-
-    // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
-    let _ipc = rt
-        .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
-        .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
-
-    let fp = node
-        .view()
-        .identity
-        .map(|i| vox_core::node::link::b32_encode(&i.fingerprint))
-        .unwrap_or_default();
-    println!("vox daemon: identity {fp}");
-    println!(
-        "vox daemon: control socket {}",
-        paths.socket_file().display()
-    );
-    for room in node.view().open_channels {
-        println!(
-            "vox daemon: holding room {} open",
-            vox_core::node::link::b32_encode(&room.channel_id)
-        );
-    }
-
-    let tasks = crate::node_tasks::NodeTasks::start(rt.handle(), &node, &paths, anchor_specs);
-
-    let stopped = rt.block_on(async {
-        // **SIGHUP stops it too** (V210-108). It used to be ignored, on the reading that a daemon
-        // has no terminal to lose and a service manager sends SIGHUP to ask for a reload. But this
-        // daemon has nothing to reload, and people start it from tmux and ssh sessions, whose
-        // closing sends SIGHUP: an ignored hangup left a daemon nobody could see still holding the
-        // profile. Each of the four stops it the same way.
-        // A server's stop is its normal end: once its node has stopped it says which signal and
-        // exits 0, as a service manager expects of a service it stopped. A stop that did not
-        // finish says so and exits non-zero (below).
-        let signal = stop.await;
-        say(format_args!(
-            "vox daemon: shutting down on {}",
-            signal.name()
-        ));
-        // The node's own tasks first, so none of them acts on a node that is stopping.
-        tasks.stop().await;
-        // **Bounded.** The node handles one thing at a time, so `Shutdown` waits behind whatever
-        // it is doing — and it can be doing a network round trip to a peer that has vanished.
-        // Measured: a daemon that had joined a room through an anchor, with the anchor gone,
-        // printed this line and then sat for 59.6 s (the connection's idle timeout) while the
-        // node finished publishing to a board nobody was reading. A service manager's SIGTERM
-        // has to mean stop. Whatever the node was mid-way through is lost either way; its
-        // state on disk is committed per step, so nothing half-written is left by leaving.
-        let patience = shutdown_patience();
-        let finished = tokio::time::timeout(patience, node.apply(NodeCommand::Shutdown))
-            .await
-            .is_ok();
-        (signal, patience, finished)
-    });
-    // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
-    // session runs on one.
-    rt.shutdown_timeout(SHUTDOWN_PATIENCE);
-    let (signal, patience, finished) = stopped;
-    if !finished {
-        // **A stop that gave up is not a stop** (decider, V210-93). The daemon leaves, as it must,
-        // but its node's ordered stop was cut short: the closes it had not yet sent never left,
-        // and those peers learn it went only by their own timeouts. That is a failure, said as
-        // one, with an error status, never "stopped by …" and 0.
-        return Err(AppError::Refused {
-            code: 1,
-            message: format!(
-                "the daemon did not finish stopping on {} within {}s: its node was mid-way \
-                 through a network exchange with a peer that is not answering. It left anyway, so \
-                 a peer it had not yet said goodbye to learns it went only when its connection \
-                 times out",
-                signal.name(),
-                patience.as_secs_f64()
-            ),
-        });
-    }
-    say(format_args!("vox daemon: stopped by {}", signal.name()));
-    Ok(())
 }
 
 /// Write this anchor's own specs into the profile's anchors file (ADR-017 decision 7, M17.4),
