@@ -707,9 +707,9 @@ pub fn run_node(
                                 format!(
                                     "{} holds {} back: {}",
                                     crate::tunnel_cli::short_id_of(&a.channel_id),
-                                    crate::ident::author_id(author),
+                                    crate::ident::member_name(&view.trusted, author),
                                     crate::ident::equivocation_notice(
-                                        &crate::ident::author_id(author),
+                                        &crate::ident::member_name(&view.trusted, author),
                                         *seq
                                     )
                                 )
@@ -921,7 +921,6 @@ async fn judge(
         );
         return;
     }
-    let author = crate::ident::member_name(&view.trusted, &row.author);
     let room_name = view
         .channels
         .iter()
@@ -937,6 +936,7 @@ async fn judge(
     if !envelope.may_interrupt(&vox_core::node::link::b32_encode(&me)) {
         return;
     }
+    let author = crate::ident::author_for(&view.trusted, Some(&me), &row.author);
     let to = crate::agent_hook::addressed(&row.text, Some(&me), &view.trusted);
     for session in crate::wake::registered(paths) {
         if row.author == me && envelope.from == session.session {

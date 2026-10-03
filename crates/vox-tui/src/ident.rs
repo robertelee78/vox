@@ -56,11 +56,21 @@ pub fn member_name(trusted: &[(Digest32, String)], fp: &Digest32) -> String {
 /// This process's copy of the node's names for its members: `(fingerprint, name)`.
 static NAMES: OnceLock<Vec<(Digest32, String)>> = OnceLock::new();
 
+/// This node's own fingerprint, as the node reported it, for [`name_of`].
+static ME: OnceLock<Digest32> = OnceLock::new();
+
+/// How every surface names the reader's own node: as the TUI does, and as a message addressed
+/// to it says "to you".
+pub const YOU: &str = "you";
+
 /// Read the node's names for its members once, for [`name_of`] (V210-162).
 ///
 /// Best effort: a node that does not answer leaves every member shown by fingerprint, as every
 /// surface showed them before.
 pub async fn load_names(client: &mut IpcClient) {
+    if let Some(me) = client.me() {
+        let _ = ME.set(me);
+    }
     if NAMES.get().is_some() {
         return;
     }
@@ -75,11 +85,23 @@ pub fn names() -> &'static [(Digest32, String)] {
     NAMES.get().map_or(&[], Vec::as_slice)
 }
 
-/// A member as the reader knows it (V210-162): the name this node gave it, on one line, or its
-/// fingerprint at [`AUTHOR_CHARS`] when it gave none.
+/// A member as the reader knows it (V210-162): [`YOU`] for this node itself, the name this node
+/// gave it, on one line, or its fingerprint at [`AUTHOR_CHARS`] when it gave none.
 #[must_use]
 pub fn name_of(fp: &Digest32) -> String {
+    if ME.get() == Some(fp) {
+        return YOU.to_owned();
+    }
     name_in(names(), fp)
+}
+
+/// [`member_name`], but [`YOU`] for `me`: how the daemon names an author to its own agents.
+#[must_use]
+pub fn author_for(trusted: &[(Digest32, String)], me: Option<&Digest32>, fp: &Digest32) -> String {
+    if me == Some(fp) {
+        return YOU.to_owned();
+    }
+    member_name(trusted, fp)
 }
 
 /// [`name_of`] against `trusted`.
@@ -172,19 +194,30 @@ pub fn resolve_member(
     }
 }
 
+/// The node one entry of an envelope's `to` names: a whole fingerprint, written exactly as
+/// [`b32_encode`] writes it.
+///
+/// **Only that form** (V210-161): the wake and `vox room post`'s unread list compare `to` with
+/// this node's fingerprint as written, so an address in any other spelling (upper case, padded)
+/// would read as "to you" here and wake no one there. Such an entry names no node.
+#[must_use]
+pub fn recipient(t: &str) -> Option<Digest32> {
+    vox_core::node::link::b32_decode(t, "recipient")
+        .ok()
+        .filter(|fp| b32_encode(fp) == t)
+}
+
 /// Who a message is addressed to, as the reader knows them (V210-161): each recipient by
 /// [`name_in`], the reader itself as `you`. A recipient that is not a fingerprint (an older
 /// build addressed sessions by name) is shown as written, on one line.
 #[must_use]
 pub fn recipients(to: &[String], me: Option<&Digest32>, trusted: &[(Digest32, String)]) -> String {
     to.iter()
-        .map(
-            |t| match vox_core::node::link::b32_decode(t.trim(), "recipient") {
-                Ok(fp) if Some(&fp) == me => "you".to_owned(),
-                Ok(fp) => name_in(trusted, &fp),
-                Err(_) => vox_agentcomms::envelope::shown(t, vox_agentcomms::envelope::SHOWN_NAME),
-            },
-        )
+        .map(|t| match recipient(t) {
+            Some(fp) if Some(&fp) == me => YOU.to_owned(),
+            Some(fp) => name_in(trusted, &fp),
+            None => vox_agentcomms::envelope::shown(t, vox_agentcomms::envelope::SHOWN_NAME),
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

@@ -369,14 +369,15 @@ pub async fn post_cmd(
             if !env.to.is_empty() {
                 let (mut client, cid, _) = open_room(paths, room).await?;
                 let members = members_of(&mut client, cid).await?;
-                if let Some(bad) = env.to.iter().find(|t| {
-                    vox_core::node::link::b32_decode(t.trim(), "recipient")
-                        .map_or(true, |fp| !members.contains(&fp))
-                }) {
+                if let Some(bad) = env
+                    .to
+                    .iter()
+                    .find(|t| !crate::ident::recipient(t).is_some_and(|fp| members.contains(&fp)))
+                {
                     return Err(AppError::Usage(format!(
                         "refusing to post it: `to` names {:?}, which is not a member's whole \
-                         fingerprint. Use --to, which takes your name for a member or its \
-                         fingerprint",
+                         fingerprint as `vox room roster` prints it. Use --to, which takes your \
+                         name for a member or its fingerprint",
                         vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
                     )));
                 }
