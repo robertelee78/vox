@@ -3457,6 +3457,9 @@ pub struct Node {
     /// is refused once [`keyring_window`] has passed since (V210-159). Shared, because a check
     /// passes on a blocking thread.
     passphrase_entered_at: Arc<std::sync::atomic::AtomicU64>,
+    /// Set while a [`NodeCommand::Proved`] keyring change is applied: its passphrase was just
+    /// checked, so the keyring window does not apply to it (V210-159).
+    keyring_change_proved: bool,
     /// The join exchanges running right now, both sides of them, the room creations sealing
     /// their key (V210-76), and the identity-passphrase checks (V210-94).
     ///
@@ -3971,6 +3974,7 @@ impl Node {
             join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             passphrase_entered_at: Arc::default(),
+            keyring_change_proved: false,
             join_tasks: tokio::task::JoinSet::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
@@ -4461,6 +4465,28 @@ impl Node {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
             }
+            // A change whose passphrase was just checked: made, and the window starts again. Not
+            // through the window: with the window restarted by the check, a change could still
+            // find it passed — another check's restart having won, or the clock having moved on
+            // between the check and the change — and refuse the passphrase it had just been given.
+            NodeCommand::Proved { change } => {
+                if !matches!(
+                    *change,
+                    NodeCommand::Trust { .. }
+                        | NodeCommand::TrustWith { .. }
+                        | NodeCommand::Rename { .. }
+                        | NodeCommand::Untrust { .. }
+                ) {
+                    return Outcome::Failed(Fault::Internal);
+                }
+                if self.profile.as_ref().is_some_and(Profile::is_unlocked) {
+                    self.note_passphrase_entered();
+                }
+                self.keyring_change_proved = true;
+                let outcome = self.handle(*change).await;
+                self.keyring_change_proved = false;
+                outcome
+            }
             // Only an unlocked node asks for the passphrase again. One with no identity or a
             // locked one falls through, and says that: a passphrase would not make the change.
             NodeCommand::Trust { .. }
@@ -4468,6 +4494,7 @@ impl Node {
             | NodeCommand::Rename { .. }
             | NodeCommand::Untrust { .. }
                 if self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                    && !self.keyring_change_proved
                     && !self.passphrase_entered_recently() =>
             {
                 Outcome::Failed(Fault::PassphraseNeeded)
@@ -11663,12 +11690,16 @@ impl Node {
                 let _slot = slot;
                 match verifier.verify(&passphrase) {
                     Ok(()) => {
+                        // Restarted unless a lock zeroed it meanwhile, and never moved back: of
+                        // several checks passing at once, each leaves it at least at its own
+                        // time, whichever wrote first (a compare-exchange against the value at
+                        // the start lost to the first, and left the window where it was).
                         if entered_before != 0 {
-                            let _ = entered_at.compare_exchange(
-                                entered_before,
-                                clock().max(1),
+                            let now = clock().max(1);
+                            let _ = entered_at.fetch_update(
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
+                                |at| (at != 0).then_some(at.max(now)),
                             );
                         }
                         Outcome::Done

@@ -585,6 +585,16 @@ pub enum NodeCommand {
         /// The identity passphrase to check.
         passphrase: Secret,
     },
+    /// A keyring change (`Trust`, `TrustWith`, `Rename`, `Untrust`) whose caller has just
+    /// proved the identity passphrase: [`NodeCommand::VerifyPassphrase`] answered `Done` for it.
+    /// It is made whatever the keyring window says, and the window starts again (V210-159). The
+    /// window is for a change made **without** the passphrase; one made with it is never asked
+    /// for it again, however several checks passing at once raced to restart the window. The
+    /// daemon builds it only after the check; nothing on the control socket names it.
+    Proved {
+        /// The keyring change. Anything else is refused as an internal fault.
+        change: Box<NodeCommand>,
+    },
     /// Merge more anchors into the configured set, and dial any not yet connected.
     ///
     /// The set is resolved when configuration is read, so a long-running node holds the
