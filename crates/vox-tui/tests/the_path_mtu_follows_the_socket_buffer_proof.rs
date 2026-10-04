@@ -241,7 +241,18 @@ fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
             log.display()
         )
     });
-    let clamped = syscalls::parse(&text).iter().any(|e| {
+    let events = syscalls::parse(&text);
+    let clamping: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e.call {
+            syscalls::Call::RcvBuf { asked, set } => Some(format!(
+                "pid {} asked {asked} set {set} ret {}",
+                e.pid, e.ret
+            )),
+            _ => None,
+        })
+        .collect();
+    let clamped = events.iter().any(|e| {
         e.pid == pid
             && e.ret == 0
             && matches!(e.call, syscalls::Call::RcvBuf { asked, set }
@@ -250,7 +261,8 @@ fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
     assert!(
         clamped,
         "APPARATUS, CANNOT MEASURE: {name} (pid {pid}) recorded no SO_RCVBUF request \
-         clamped to {CAP} bytes, so the interposer did not stage its short grant"
+         clamped to {CAP} bytes, so the interposer did not stage its short grant (pids that \
+         recorded one: {clamping:?})"
     );
 }
 

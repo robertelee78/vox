@@ -184,6 +184,19 @@ fn log_fd() -> c_int {
     }
 }
 
+/// `close`, which forgets the log's descriptor when the process closes it. A `vox daemon` started by a
+/// client closes every descriptor it inherited or opened before its own start (ADR-026 S-2), the
+/// log's among them; the number is then reused by a file of the daemon's, and a line written to
+/// it would land in that file, never in the log. Forgotten here, the log is opened again at the
+/// next line.
+#[no_mangle]
+pub unsafe extern "C" fn vti_close(fd: c_int) -> c_int {
+    if fd >= 0 {
+        let _ = LOG_FD.compare_exchange(fd, -1, Ordering::AcqRel, Ordering::Acquire);
+    }
+    close(fd)
+}
+
 /// Append one line, keeping the caller's `errno` as it was.
 fn record(fields: &[&str]) {
     // SAFETY: __error returns this thread's errno location.
@@ -700,4 +713,5 @@ interpose! {
     I_FCLONEFILEAT: vti_fclonefileat => fclonefileat;
     I_COPYFILE: vti_copyfile => copyfile;
     I_FCOPYFILE: vti_fcopyfile => fcopyfile;
+    I_CLOSE: vti_close => close;
 }
