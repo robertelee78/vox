@@ -695,6 +695,11 @@ impl<'a> Resolver<'a> {
     /// author holds `policy` in the update's STRICT past, over the canonical order,
     /// taking the latest retention (`ttl`). A policy update carries nothing else
     /// (V030-32): history mode and the suite floor stay as the genesis set them.
+    ///
+    /// **Removal wins over an update made meanwhile** (ADR-007 G-23, G-25, #380), as over an end
+    /// ([`Resolver::resolve_lifecycle`]): a delegated admin, cut off while the creator takes its
+    /// admin back, sets the room's retention on its own node, which rightly took it; an
+    /// authorized revocation of that admin concurrent with the update voids it once the logs meet.
     fn resolve_policy(&mut self, genesis: &Genesis) -> Result<ChannelPolicy> {
         let mut policy = genesis.body.policy;
         let order: Vec<&GovEntry> = self.causality.order.clone();
@@ -710,6 +715,7 @@ impl<'a> Resolver<'a> {
                 .authority
                 .get(&e.author_id)
                 .is_some_and(|c| c.grants(&Capability::Policy))
+                || self.revoked_meanwhile(&e.author_id, &e.entry_hash)?
             {
                 continue;
             }
@@ -758,8 +764,18 @@ impl<'a> Resolver<'a> {
 
     /// Fold the room-lifecycle facts (V030-08). Each counts only from its signer (`issuer_id` is
     /// the signer, and the signer is the entry's author). An end counts from the root admin, or
-    /// from an admin the creator delegated, as of the end's strict causal past; an idle end only
-    /// from the root admin. The last idle end wins.
+    /// from an admin the creator delegated, as of the end's strict causal past — **unless an
+    /// authorized revocation of that admin is concurrent with the end** (ADR-007 G-23, G-25,
+    /// #380); an idle end only from the root admin. The last idle end wins.
+    ///
+    /// **Removal wins over an end made meanwhile.** An admin cut off while the creator takes its
+    /// admin back, who ends the room before it hears of that, writes an end its own node rightly
+    /// took: it held no revocation. Authority read from the end's strict past alone let that end
+    /// stand everywhere once the logs met, so anyone whose admin was being taken back could end the
+    /// room by going offline first. An authority action made during a partition is provisional
+    /// until its causal neighbourhood reconciles (G-23): a revocation concurrent with the end kills
+    /// it, as a revocation concurrent with a delegation kills the delegation. A revocation causally
+    /// after the end does not: whoever revoked had seen the room end.
     fn resolve_lifecycle(&mut self) -> Result<Lifecycle> {
         use crate::governance::lifecycle::LifecycleKind;
         let mut out = Lifecycle::default();
@@ -774,11 +790,12 @@ impl<'a> Resolver<'a> {
             match l.body.kind {
                 LifecycleKind::End => {
                     let admin = l.body.issuer_id == self.root_admin
-                        || self
+                        || (self
                             .strict_before(&e.entry_hash)?
                             .authority
                             .get(&l.body.issuer_id)
-                            .is_some_and(|c| !c.is_empty());
+                            .is_some_and(|c| !c.is_empty())
+                            && !self.revoked_meanwhile(&l.body.issuer_id, &e.entry_hash)?);
                     if admin {
                         out.ended_by.get_or_insert(e.entry_hash);
                     }
@@ -790,6 +807,39 @@ impl<'a> Resolver<'a> {
             }
         }
         Ok(out)
+    }
+}
+
+impl Resolver<'_> {
+    /// Whether an authorized revocation of `delegate`'s admin is **concurrent** with the entry `x`:
+    /// neither causally before it nor after it (ADR-007 G-25's removal-wins, for an action the
+    /// delegate took). Each revocation is authorized from its own strict past, as in
+    /// [`Resolver::resolve_scope`].
+    fn revoked_meanwhile(&mut self, delegate: &Digest32, x: &Digest32) -> Result<bool> {
+        let order: Vec<&GovEntry> = self.causality.order.clone();
+        for r in order {
+            let GovBody::AdminRevocation(rb) = &r.body else {
+                continue;
+            };
+            let names_delegate = self.causality.order.iter().any(|o| {
+                o.entry_hash == rb.body.revoked_delegation_hash
+                    && matches!(&o.body, GovBody::AdminCert(c) if c.body.delegate_id() == *delegate)
+            });
+            if !names_delegate || !self.in_effect(r)? {
+                continue;
+            }
+            let authorized = self
+                .strict_before(&r.entry_hash)?
+                .authority
+                .get(&rb.body.issuer_id)
+                .is_some_and(|c| c.grants(&Capability::Admin));
+            let concurrent = !self.causality.happens_after(x, &r.entry_hash)
+                && !self.causality.happens_after(&r.entry_hash, x);
+            if authorized && concurrent {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
