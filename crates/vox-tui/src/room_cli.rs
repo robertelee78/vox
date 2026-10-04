@@ -1626,6 +1626,31 @@ fn outcome_json(o: Option<&Outcome>) -> serde_json::Value {
     }
 }
 
+/// What a claim-protocol post did, as a sentence: never the outcome's debug form (R36).
+fn outcome_words(o: Option<&Outcome>) -> String {
+    match o {
+        None => "this node has not folded the post yet, so what it did is not known".into(),
+        Some(Outcome::Applied) => "it was applied".into(),
+        Some(Outcome::Lost) => {
+            "another session holds the resource, or it is reserved for someone else".into()
+        }
+        Some(Outcome::NoEffect(why)) => (*why).to_owned(),
+        Some(Outcome::Invalid(why)) => format!("the post was not valid: {why}"),
+        Some(Outcome::OtherVersion(s)) => format!(
+            "the post is stamped {}, a claim-protocol version this vox does not fold",
+            s.token()
+        ),
+        Some(Outcome::Duplicate { of }) => format!(
+            "it repeats post {}, which was already applied",
+            claim::b32(of)
+        ),
+        Some(Outcome::Conflict { group }) => format!(
+            "{} posts share its operation id and disagree, so none of them has any effect",
+            group.len()
+        ),
+    }
+}
+
 /// Report a coordinating verb: JSON for a program, a sentence for a person, and the
 /// exit status that is the machine-readable half of whether it did what was asked.
 fn report(
@@ -2100,7 +2125,13 @@ pub async fn release_resource(
     let (ok, said) = match &done.outcome {
         Some(Outcome::Applied) => (true, format!("released {resource}")),
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not released: {why}")),
-        other => (false, format!("{resource} was not released: {other:?}")),
+        other => (
+            false,
+            format!(
+                "{resource} was not released: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(&done, claim::RELEASE, resource, opts, ok, &said)
 }
@@ -2275,7 +2306,10 @@ pub async fn handoff_resource(
         ),
         (Some(Outcome::Applied), _) => (true, format!("{resource} was handed off and has since moved on")),
         (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not handed off: {why}")),
-        (other, _) => (false, format!("{resource} was not handed off: {other:?}")),
+        (other, _) => (
+            false,
+            format!("{resource} was not handed off: {}", outcome_words(other.as_ref())),
+        ),
     };
     report(&done, claim::HANDOFF, resource, opts, ok, &said)
 }
@@ -2305,7 +2339,13 @@ pub async fn decline_resource(
     let (ok, said) = match &done.outcome {
         Some(Outcome::Applied) => (true, format!("declined {resource}; it is free")),
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not declined: {why}")),
-        other => (false, format!("{resource} was not declined: {other:?}")),
+        other => (
+            false,
+            format!(
+                "{resource} was not declined: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(
         &done,
@@ -2378,7 +2418,13 @@ pub async fn renew_resource(
             format!("renewed {resource} until {}", millis_as_time(*e)),
         ),
         (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not renewed: {why}")),
-        (other, _) => (false, format!("{resource} was not renewed: {other:?}")),
+        (other, _) => (
+            false,
+            format!(
+                "{resource} was not renewed: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(&done, claim::RENEW, resource, opts, ok, &said)
 }
