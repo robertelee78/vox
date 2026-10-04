@@ -22,15 +22,13 @@
 //! starts; A is resumed with SIGCONT. Five arms:
 //! 1. **CLI, create**: two `vox id`s on a fresh profile. B is refused, naming the concurrent
 //!    creation; A made the identity.
-//! 2. **CLI, migration**: two `vox trust add`s on a profile the **released v0.2.9 binary** wrote.
-//!    **A exits 0, then B exits 0** (B after A), and `vox trust list` names both.
+//! 2. (withdrawn: **CLI, migration** — since ADR-026 a one-shot verb opens no node, and the move
+//!    of an old layout runs under the account lock; `every_verb_migrates_an_old_layout_first_proof`
+//!    proves it.)
 //! 3. **TUI, create** (`tests/pty/tui_lock_wait.py`): `vox id` holds the lock, `vox tui` is given a
 //!    passphrase at its first-run prompt; read through `pyte`.
-//! 4. **TUI, migration**: `vox trust add` holds the lock migrating a v0.2.9 profile. `vox tui`
-//!    waits when it opens the profile, before it takes the screen, and says so on the terminal as
-//!    a CLI verb does; once A is done the TUI starts, its screen clean, and is given the passphrase
-//!    at its unlock prompt. A exits 0; the TUI then unlocks.
-//! 5. **CLI, past the patience**: two `vox trust add`s on a profile this build made; A stays
+//! 4. (withdrawn with arm 2: **TUI, migration** — the TUI is a client, ADR-026 S-4.)
+//! 5. **CLI, past the patience**: two `vox id`s on a fresh profile; A stays
 //!    stopped until B gives up. B is refused saying another vox is still using the profile, not
 //!    "Stop that node", and `lsof` on the directory it names lists A's PID. A, resumed, exits 0.
 //!
@@ -62,18 +60,14 @@ mod pty_driver;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[path = "support/previous_release.rs"]
-mod previous_release;
-
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-use previous_release::previous_release;
-use world::{args, vox_once, VoxProc, IDENTITY, VOX};
+use world::{args, VoxProc, IDENTITY, VOX};
 
 /// B must say it is waiting within this of starting (its own start-up, then the one-second
 /// patience).
@@ -184,8 +178,6 @@ fn exits(a: &mut VoxProc, b: &mut VoxProc) -> [Option<(ExitStatus, Instant)>; 2]
 enum Then {
     /// A made the identity; B is refused, naming the concurrent creation.
     ARefusesB,
-    /// A exits 0, then B exits 0.
-    AThenB,
 }
 
 /// A CLI arm: A holds the lock and is stopped, B waits; then A is resumed.
@@ -243,7 +235,7 @@ fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Th
             "PRODUCT: {label}: B exited while A was stopped, instead of waiting: {b_said}"
         ));
     }
-    let (Some((sa, ta)), Some((sb, tb))) = (ea, eb) else {
+    let (Some((sa, _)), Some((sb, _))) = (ea, eb) else {
         red.push(format!(
             "PRODUCT: {label}: not both finished {FINISHES_WITHIN:?} after SIGCONT: A {:?}, B {:?}",
             at(&ea),
@@ -262,19 +254,6 @@ fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Th
                 red.push(format!(
                     "PRODUCT: {label}: B did not refuse naming the concurrent creation ({sb}): \
                      {b_said}"
-                ));
-            }
-        }
-        Then::AThenB => {
-            if !sb.success() {
-                red.push(format!(
-                    "PRODUCT: {label}: B failed after A finished ({sb}): {b_said}"
-                ));
-            } else if tb < ta {
-                red.push(format!(
-                    "PRODUCT: {label}: B finished before A, which held the lock first ({:.2}s \
-                     earlier)",
-                    ta.duration_since(tb).as_secs_f64()
                 ));
             }
         }
@@ -467,30 +446,6 @@ fn a_vox_waiting_for_the_profile_says_so() {
         std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
-    let old = previous_release();
-    let run_old = |data: &Path, argv: &[&str]| {
-        let out = Command::new(&old)
-            .args(argv)
-            .env("VOX_DATA_DIR", data)
-            .env("VOX_CONFIG_DIR", data.join("cfg"))
-            .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-            .output()
-            .expect("APPARATUS: run a process");
-        assert!(
-            out.status.success(),
-            "APPARATUS, CANNOT MEASURE: the v0.2.9 release this proof stages with failed \
-             `vox {argv:?}`: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    };
-    // A profile v0.2.9 wrote, so this build's first unlock of it migrates.
-    let v029 = |name: &str| -> PathBuf {
-        let d = dir(name);
-        run_old(&d, &["id"]);
-        d
-    };
-    let (x_fp, y_fp) = (run_old(&dir("x"), &["id"]), run_old(&dir("y"), &["id"]));
     let mut red = Vec::new();
 
     // ---- 1. CLI, create ---------------------------------------------------------------------
@@ -502,38 +457,6 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &Then::ARefusesB,
     ));
 
-    // ---- 2. CLI, migration: A's `trust add` succeeds, then B's -------------------------------
-    let carol = v029("carol");
-    red.extend(cli_arm(
-        "cli-migration",
-        &carol,
-        &["trust", "add", &x_fp, "--name", "x"],
-        &["trust", "add", &y_fp, "--name", "y"],
-        &Then::AThenB,
-    ));
-    let (ok, listed, err) = vox_once(&carol, &args(&["trust", "list"]));
-    println!(
-        "[proof] cli-migration: `vox trust list` afterwards: {}",
-        listed.trim()
-    );
-    assert!(
-        ok,
-        "PRODUCT: cli-migration: `vox trust list` afterwards failed: {listed}{err}"
-    );
-    if red.iter().all(|r| !r.contains("cli-migration")) {
-        for name in ["x", "y"] {
-            if !listed
-                .lines()
-                .any(|l| l.trim_end().ends_with(&format!("  {name}")))
-            {
-                red.push(format!(
-                    "PRODUCT: cli-migration: both `trust add`s exited 0, and `trust list` does \
-                     not name {name}: {listed}"
-                ));
-            }
-        }
-    }
-
     // ---- 3. TUI, create ---------------------------------------------------------------------
     red.extend(tui_arm(
         "tui-create",
@@ -543,27 +466,15 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &[CONCURRENT],
     ));
 
-    // ---- 4. TUI, migration ------------------------------------------------------------------
-    red.extend(tui_arm(
-        "tui-migration",
-        &v029("dave"),
-        "startup",
-        &["trust", "add", &x_fp, "--name", "x"],
-        &["unlocked", "done"],
-    ));
-
     // ---- 5. CLI, past the patience: A never lets go while B waits ---------------------------
-    let erin = dir("erin");
-    let (ok, made, err) = vox_once(&erin, &args(&["id"]));
-    assert!(
-        ok,
-        "PRODUCT (staging): `vox id` could not make the profile for arm 5: {made}{err}"
-    );
+    // Two `vox id`s on a fresh profile: since ADR-026 creating an identity is what still takes
+    // the node's lock from a client (a one-shot verb opens nothing; moving an old layout is the
+    // account lock's, `every_verb_migrates_an_old_layout_first_proof`).
     red.extend(past_patience_arm(
         "cli-past-patience",
-        &erin,
-        &["trust", "add", &x_fp, "--name", "x"],
-        &["trust", "add", &y_fp, "--name", "y"],
+        &dir("erin"),
+        &["id"],
+        &["id"],
     ));
 
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
