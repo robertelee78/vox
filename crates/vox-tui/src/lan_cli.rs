@@ -932,7 +932,17 @@ impl vox_core::node::ipc::Extension for LanUp {
                 return;
             };
             let said = tx.clone();
+            // **The daemon says it too** (R36): what a LAN said goes to its `vox lan up`, and to
+            // the daemon's own log, so a LAN whose client is gone still left a trace of how far it
+            // got (#75: a root run's `vox lan up` exited saying nothing, its LAN's interface made).
+            let who = handle
+                .view()
+                .identity
+                .map(|i| vox_core::node::link::b32_encode(&i.fingerprint)[..12].to_owned())
+                .unwrap_or_default();
+            let tag = who.clone();
             let say = move |line: String| {
+                eprintln!("vox daemon: {tag}: {line}");
                 let _ = said.send(line_frame(T_LAN_SAID, &line));
             };
             // The LAN lives exactly as long as the client's connection.
@@ -950,8 +960,14 @@ impl vox_core::node::ipc::Extension for LanUp {
                 stop,
             )
             .await;
-            if let Err(e) = out {
-                let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+            match out {
+                Ok(()) => eprintln!(
+                    "vox daemon: {who}: a LAN stopped: its `vox lan up` closed its connection"
+                ),
+                Err(e) => {
+                    eprintln!("vox daemon: {who}: a LAN could not run: {e}");
+                    let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+                }
             }
             drop(say);
             drop(tx);
