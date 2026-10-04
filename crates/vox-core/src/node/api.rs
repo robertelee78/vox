@@ -533,6 +533,10 @@ pub struct NodeView {
     /// Those peers, in fingerprint order: which of a room's members this node reaches now
     /// (V210-82).
     pub connected_peers: Vec<Digest32>,
+    /// The anchors and room hosts' boards this node holds a connection to now, each with the note
+    /// said when it was made ("connected to this anchor"): what a client that subscribes after the
+    /// connection was made is told first, since it missed the note itself.
+    pub boards_connected: Vec<(Digest32, String)>,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of
