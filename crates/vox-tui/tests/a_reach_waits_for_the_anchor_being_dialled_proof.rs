@@ -36,7 +36,9 @@
 //! **The mutations that must turn it red, as PRODUCT:** delete the wait for a dial under way in
 //! `NodeNet::reach_ladder` — the first attempt fails with nobody to carry it, and the forward reaches
 //! the host on its second; or make a circuit with no direct rung sit out the head start
-//! (`direct_failed` starting `false`) — the circuit is asked about 500 ms into the reach.
+//! (`direct_failed` starting `false`) — the circuit is asked about 500 ms into the reach; or ask
+//! the coordinator for this node's observed address inline, before the dial-back and the circuit
+//! are started (V030-22 as first written) — the circuit is asked one anchor round trip late.
 
 #![cfg(unix)]
 
@@ -204,8 +206,11 @@ fn a_forward_whose_anchor_is_still_being_dialled_reaches_on_its_first_attempt() 
     );
     assert!(
         asked.0 <= ASK_WITHIN,
-        "PRODUCT: with no direct rung, the reach sat out the direct head start before asking the \
-         anchor for its circuit ({} ms, over {ASK_WITHIN} ms): {}\nforward:\n{said}",
+        "PRODUCT: the reach asked the anchor for its circuit late, {} ms into the reach (over \
+         {ASK_WITHIN} ms): with no direct rung and its helper connected, the ask must come at once, \
+         not after anything the reach waits for first (the direct head start, or a round trip \
+         to the anchor such as the dial-back's ask for this node's observed address): {}\n\
+         forward:\n{said}",
         asked.0,
         asked.1
     );
