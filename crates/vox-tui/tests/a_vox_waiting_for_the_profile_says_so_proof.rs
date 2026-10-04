@@ -424,23 +424,28 @@ fn tui_arm(label: &str, data: &Path, mode: &str, a_args: &[&str], answer: &[&str
     } else {
         "APPARATUS"
     };
-    assert!(
-        !out.has_verdict(label) && out.code == Some(0) && line("AFTER:").is_some(),
-        "{side}: the {label} arm's TUI driver did not run to the end (exit {:?}, stage {:?}): \
-         {said}",
-        out.code,
-        out.stage
-    );
     let notice = line("NOTICE ").unwrap_or_default();
+    let mut red = Vec::new();
+    // **The claim first** (V210-100): whether the TUI said it was waiting is read before anything
+    // that needs the rest of its run, so a TUI that waited in silence is a PRODUCT red that names
+    // the missing notice, whatever happened after.
+    if !notice.starts_with("after") {
+        red.push(format!(
+            "PRODUCT: {label}: the TUI never said it was waiting: {notice}"
+        ));
+    }
+    // Collected, not panicked: the other arms' claims are reported too.
+    if out.has_verdict(label) || out.code != Some(0) || line("AFTER:").is_none() {
+        red.push(format!(
+            "{side}: the {label} arm's TUI driver did not run to the end (exit {:?}, stage {:?}): \
+             {said}",
+            out.code, out.stage
+        ));
+        return red;
+    }
     let stray = line("STRAY: ").unwrap_or_default();
     let frame = line("FRAME: ").unwrap_or_default();
     let after = line("AFTER: ").unwrap_or_default();
-    let mut red = Vec::new();
-    if !notice.starts_with("after") {
-        red.push(format!(
-            "PRODUCT: {label}: the TUI's status line never said it was waiting: {notice}"
-        ));
-    }
     if stray.trim() != "no" {
         red.push(format!(
             "PRODUCT: {label}: CLI text was written into the TUI's screen: {stray}"
