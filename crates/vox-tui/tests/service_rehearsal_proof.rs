@@ -343,8 +343,10 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     //    as revised — joining grants nothing, so without this step the guest reaches
     //    nothing, which the control at the end of this proof asserts.
     //
-    //    It happens before `vox serve` starts because redb is single-writer: a one-shot
-    //    verb cannot open a profile a running `vox serve` holds.
+    //    Since ADR-026 the host makes its node first (C-3: a verb acts as a node that
+    //    exists), and the trust is made with that node attached (L-2).
+    let (ok, _, err) = vox_once(&host_dir, &["id".into()]);
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let (ok, guest_id, err) = vox_once(&guest_dir, &["id".into()]);
     assert!(
         ok,
