@@ -41,7 +41,8 @@ async fn room(c: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
             resolve_prefix(prefix, &ids)
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        other => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
@@ -50,7 +51,8 @@ async fn member(c: &mut IpcClient, room: Digest32, prefix: &str) -> Result<Diges
     match c.request(&Request::Roster { channel_id: room }).await {
         Ok(Frame::Members { members }) => resolve_prefix(prefix, &members),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        other => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
