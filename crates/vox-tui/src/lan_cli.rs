@@ -101,6 +101,30 @@ impl DeviceRequest {
         })
     }
 
+    /// An address on the room's IPv4 LAN other than this node's, for the helper to look up
+    /// the route it added: the LAN's `.1`, or `.2` when this node is `.1`.
+    #[cfg(target_os = "macos")]
+    fn other_v4(&self) -> Option<Ipv4Addr> {
+        self.v4.map(|a| {
+            let o = a.octets();
+            Ipv4Addr::new(o[0], o[1], o[2], if o[3] == 1 { 2 } else { 1 })
+        })
+    }
+
+    /// [`Self::other_v4`] for the room's IPv6 prefix: `::1` in it, or `::2`.
+    #[cfg(target_os = "macos")]
+    fn other_v6(&self) -> Ipv6Addr {
+        let mut o = self.v6.octets();
+        let last = if o[8..15].iter().all(|b| *b == 0) && o[15] == 1 {
+            2
+        } else {
+            1
+        };
+        o[8..].fill(0);
+        o[15] = last;
+        Ipv6Addr::from(o)
+    }
+
     /// Only the macOS helper configures an interface from it.
     #[cfg(target_os = "macos")]
     fn prefix_v6(&self) -> String {
@@ -110,10 +134,78 @@ impl DeviceRequest {
     }
 }
 
-/// Whether a helper is answering on `socket`.
-#[must_use]
-pub fn helper_reachable(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+/// What `vox lan up` sends to ask whether a helper is there, before the node does any work.
+pub const HELLO: &str = "hello";
+
+/// The first words of a helper's answer to [`HELLO`]; its protocol version follows.
+pub const HELPER_SAYS: &str = "vox lan helper";
+
+/// The protocol this helper speaks: [`HELPER_SAYS`] `1`.
+pub const HELPER_PROTOCOL: u32 = 1;
+
+/// How long a helper has to answer [`HELLO`]: it answers at once, so a socket that says nothing
+/// in this time is not one.
+const HELLO_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a helper is answering on `socket`: it must answer [`HELLO`] as a helper. `Err` says
+/// what to do: [`no_helper`] when nothing listens there, and the socket named when something that
+/// is not a helper does.
+///
+/// A connection alone was the check, so anything listening on that path passed it, and `vox lan
+/// up` then waited 30 s for a device that never came (#75's review). Asking for the helper's own
+/// words refuses a wrong socket at once.
+///
+/// # Errors
+/// As above.
+pub fn helper_answers(socket: &Path) -> Result<(), String> {
+    use std::io::{BufRead as _, Write as _};
+    let Ok(mut s) = std::os::unix::net::UnixStream::connect(socket) else {
+        return Err(no_helper(socket));
+    };
+    let not_one = |why: String| {
+        format!(
+            "{} answers, but not as a vox LAN helper ({why}). Is another program using that \
+             path? Start the helper on a path of its own with\n\n    sudo vox lan helper \
+             --socket <path>\n\nand give `vox lan up` the same --helper-socket.",
+            socket.display()
+        )
+    };
+    let _ = s.set_read_timeout(Some(HELLO_WITHIN));
+    let _ = s.set_write_timeout(Some(HELLO_WITHIN));
+    if let Err(e) = s.write_all(format!("{HELLO}\n").as_bytes()) {
+        return Err(not_one(format!("it would not take a line: {e}")));
+    }
+    let mut line = String::new();
+    match std::io::BufReader::new(&s).read_line(&mut line) {
+        Ok(_) if line.starts_with(HELPER_SAYS) => {
+            let version = line[HELPER_SAYS.len()..].trim();
+            if version == HELPER_PROTOCOL.to_string() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the LAN helper on {} speaks protocol {version:?}, and this vox speaks \
+                     {HELPER_PROTOCOL}: start the helper from this vox (sudo {} lan helper)",
+                    socket.display(),
+                    std::env::current_exe()
+                        .map_or_else(|_| "vox".to_owned(), |p| p.display().to_string())
+                ))
+            }
+        }
+        Ok(0) => Err(not_one("it closed without a word".into())),
+        Ok(_) => Err(not_one(format!("it said {:?}", line.trim()))),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(not_one(format!(
+                "it said nothing within {} s",
+                HELLO_WITHIN.as_secs()
+            )))
+        }
+        Err(e) => Err(not_one(format!("reading its answer: {e}"))),
+    }
 }
 
 /// What `vox lan up` says when there is no helper to ask: how to start one.
@@ -233,31 +325,97 @@ mod mac {
         }
     }
 
-    /// Route `net` to `name`, or — if another interface already has the route, which on
-    /// one machine means another LAN of the same room — scope the route to this interface,
-    /// so a socket bound to it still reaches the LAN.
-    fn route(family: &str, net: &str, name: &str) -> Result<String, String> {
-        match run(
-            "/sbin/route",
-            &["-q", "-n", "add", family, net, "-interface", name],
-        ) {
-            Ok(s) => Ok(s),
-            Err(e) if e.contains("File exists") => run(
-                "/sbin/route",
-                &[
-                    "-q",
-                    "-n",
-                    "add",
-                    family,
-                    net,
-                    "-interface",
-                    name,
-                    "-ifscope",
-                    name,
-                ],
-            ),
-            Err(e) => Err(e),
+    /// Run `/sbin/route` with `args`, returning it as typed and what it printed. macOS's `route
+    /// add` can exit 0 having added nothing (it prints `File exists` and carries on), so its
+    /// exit status alone says little: callers look up what they added ([`routed`]).
+    fn route_cmd(args: &[&str]) -> Result<(String, String), String> {
+        let shown = format!("/sbin/route {}", args.join(" "));
+        let out = Command::new("/sbin/route")
+            .args(args)
+            .output()
+            .map_err(|e| format!("{shown}: {e}"))?;
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+        .trim()
+        .to_owned();
+        if out.status.success() || said.contains("File exists") {
+            Ok((shown, said))
+        } else {
+            Err(format!("{shown}: {said}"))
         }
+    }
+
+    /// Whether `addr`, looked up scoped to `name`, goes out of `name` by the route to `net`
+    /// itself: `Err` with what the lookup said when not. The destination is checked too: an
+    /// interface can carry a scoped default route (macOS gives its own `utun`s one for IPv6),
+    /// which would answer for any address.
+    fn routed(family: &str, addr: &str, net: &str, name: &str) -> Result<(), String> {
+        let base = net.split('/').next().unwrap_or(net);
+        let out = Command::new("/sbin/route")
+            .args(["-n", "get", family, "-ifscope", name, addr])
+            .output()
+            .map_err(|e| format!("/sbin/route -n get: {e}"))?;
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let field = |k: &str| {
+            said.lines()
+                .find_map(|l| l.trim().strip_prefix(k).map(|v| v.trim().to_owned()))
+        };
+        if field("interface:").as_deref() == Some(name)
+            && field("destination:").as_deref() == Some(base)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "/sbin/route -n get {family} -ifscope {name} {addr} said: {}",
+                said.split_whitespace().collect::<Vec<_>>().join(" ")
+            ))
+        }
+    }
+
+    /// Route the room's `net` to `name`, and say what was done; an error if `name` cannot reach
+    /// `other` (an address on that LAN) afterwards.
+    ///
+    /// **Scoped to the interface, always.** Two nodes on one machine each run their own LAN of
+    /// the same room, each on its own `utun`, all with the same subnet. Only one unscoped route
+    /// to a subnet can exist, so every interface after the first had none: a socket bound to it
+    /// (`ping -b`, `IP_BOUND_IF`) was told "No route to host" (#75, the decider's run). A route
+    /// scoped with `-ifscope` exists per interface, and a bound socket finds its own.
+    ///
+    /// **And unscoped when none is there yet**, so an application that binds nothing (a media
+    /// player finding a server) reaches the LAN; with two LANs of one room on one machine that
+    /// route is the first one's. A route add that fails is an error the helper reports, never
+    /// silence: `route` is run without `-q`, and the scoped route is looked up after.
+    fn route(family: &str, net: &str, other: &str, name: &str) -> Result<String, String> {
+        let (shown, said) = route_cmd(&["-n", "add", family, net, "-interface", name])?;
+        let unscoped = if said.contains("File exists") {
+            format!("{shown}: another interface has it")
+        } else {
+            shown
+        };
+        let (scoped, _) = route_cmd(&[
+            "-n",
+            "add",
+            family,
+            net,
+            "-interface",
+            name,
+            "-ifscope",
+            name,
+        ])?;
+        routed(family, other, net, name).map_err(|why| {
+            format!(
+                "{scoped}: {name} has no route to {net} afterwards, so nothing bound to it would \
+                 reach the LAN ({why})"
+            )
+        })?;
+        Ok(format!("{unscoped}; {scoped}"))
     }
 
     fn configure(name: &str, req: &DeviceRequest) -> Result<Vec<String>, String> {
@@ -267,32 +425,58 @@ mod mac {
             let host = format!("{v4}/24");
             let v4s = v4.to_string();
             done.push(run("/sbin/ifconfig", &[name, "inet", &host, &v4s, "up"])?);
-            done.push(route("-inet", &net, name)?);
+            let other = req.other_v4().map(|a| a.to_string()).unwrap_or_default();
+            done.push(route("-inet", &net, &other, name)?);
         }
         let v6 = format!("{}/64", req.v6);
         done.push(run("/sbin/ifconfig", &[name, "inet6", &v6, "alias"])?);
         done.push(run("/sbin/ifconfig", &[name, "mtu", &mtu, "up"])?);
-        done.push(route("-inet6", &req.prefix_v6(), name)?);
+        done.push(route(
+            "-inet6",
+            &req.prefix_v6(),
+            &req.other_v6().to_string(),
+            name,
+        )?);
         Ok(done)
     }
 
+    /// Serve one connection: `Ok(None)` for one that asked for no device.
+    ///
+    /// **`hello` is answered, and not logged.** `vox lan up` first asks whether a helper is
+    /// there ([`super::helper_answers`]), before the node does any work; the helper answers
+    /// with its name and protocol, and that is all. **A connection that closes unasked** is
+    /// served silently too: by the time the helper takes it the client has gone, and macOS
+    /// refuses `setsockopt` on such a socket with `EINVAL`, which the helper once logged as
+    /// `refused: Invalid argument (os error 22)` (#75, the decider's run).
     fn serve_one(
         stream: &std::os::unix::net::UnixStream,
         owner: nix::unistd::Uid,
-    ) -> Result<String, String> {
+    ) -> Result<Option<String>, String> {
         let (uid, _) = nix::unistd::getpeereid(stream).map_err(|e| format!("getpeereid: {e}"))?;
         if uid != owner {
             return Err(format!(
                 "uid {uid} asked, and this helper serves only uid {owner}, who started it"
             ));
         }
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| e.to_string())?;
+        match stream.set_read_timeout(Some(Duration::from_secs(5))) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(nix::libc::EINVAL) => return Ok(None),
+            Err(e) => return Err(format!("setting the request's read timeout: {e}")),
+        }
         let mut line = String::new();
-        std::io::BufReader::new(stream)
+        let got = std::io::BufReader::new(stream)
             .read_line(&mut line)
             .map_err(|e| format!("reading the request: {e}"))?;
+        if got == 0 {
+            return Ok(None);
+        }
+        if line.trim() == super::HELLO {
+            let _ = std::io::Write::write_all(
+                &mut &*stream,
+                format!("{} {}\n", super::HELPER_SAYS, super::HELPER_PROTOCOL).as_bytes(),
+            );
+            return Ok(None);
+        }
         let req = DeviceRequest::parse(&line)?;
         let (fd, name) = create_utun().map_err(|e| format!("creating a utun: {e}"))?;
         // On any failure from here, dropping `fd` destroys the half-made interface.
@@ -319,10 +503,10 @@ mod mac {
         // sends into it while still able to deliver out of it.
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("waiting for {name} to be taken: {e}"))?;
         let _ = std::io::Read::read(&mut &*stream, &mut [0u8; 1]);
         drop(fd);
-        Ok(format!("{name} for uid {uid}: {}", done.join("; ")))
+        Ok(Some(format!("{name} for uid {uid}: {}", done.join("; "))))
     }
 
     /// `sudo vox lan helper`: serve interface requests from the person who ran `sudo`
@@ -395,7 +579,8 @@ mod mac {
                         .await
                         .map_err(io::Error::other)?;
                         match said {
-                            Ok(s) => println!("vox lan helper: {s}"),
+                            Ok(Some(s)) => println!("vox lan helper: {s}"),
+                            Ok(None) => {}
                             Err(e) => println!("vox lan helper: refused: {e}"),
                         }
                     }
@@ -747,7 +932,17 @@ impl vox_core::node::ipc::Extension for LanUp {
                 return;
             };
             let said = tx.clone();
+            // **The daemon says it too** (R36): what a LAN said goes to its `vox lan up`, and to
+            // the daemon's own log, so a LAN whose client is gone still left a trace of how far it
+            // got (#75: a root run's `vox lan up` exited saying nothing, its LAN's interface made).
+            let who = handle
+                .view()
+                .identity
+                .map(|i| vox_core::node::link::b32_encode(&i.fingerprint)[..12].to_owned())
+                .unwrap_or_default();
+            let tag = who.clone();
             let say = move |line: String| {
+                eprintln!("vox daemon: {tag}: {line}");
                 let _ = said.send(line_frame(T_LAN_SAID, &line));
             };
             // The LAN lives exactly as long as the client's connection.
@@ -765,8 +960,14 @@ impl vox_core::node::ipc::Extension for LanUp {
                 stop,
             )
             .await;
-            if let Err(e) = out {
-                let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+            match out {
+                Ok(()) => eprintln!(
+                    "vox daemon: {who}: a LAN stopped: its `vox lan up` closed its connection"
+                ),
+                Err(e) => {
+                    eprintln!("vox daemon: {who}: a LAN could not run: {e}");
+                    let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+                }
             }
             drop(say);
             drop(tx);

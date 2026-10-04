@@ -6,7 +6,7 @@
 //! when it is stopped, or non-zero when the daemon or the node goes from under it.
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use vox_core::hash::Digest32;
 use vox_core::node::actor::NodeHandle;
@@ -343,6 +343,10 @@ pub struct Waiting {
     /// A server's verb (`vox serve`): being stopped is how it ends, so a stop is a clean exit, not
     /// an error (V210-108).
     serves: bool,
+    /// A held client verb (`vox up`, `vox forward`, `vox lan up`): it runs until stopped too, but
+    /// it is a client, so a stop says `stopped by <SIGNAL>` and exits 128 + the signal's number
+    /// (V210-108).
+    held: bool,
 }
 
 impl Waiting {
@@ -356,7 +360,28 @@ impl Waiting {
             outcome,
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
             serves: false,
+            held: false,
         })
+    }
+
+    /// [`Waiting::new`] for a held client verb (`vox up`, `vox forward`, `vox lan up`): see
+    /// [`Waiting::held`].
+    #[must_use]
+    pub fn client() -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome: "it was running",
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: false,
+            held: true,
+        })
+    }
+
+    /// Whether this is a held client verb, whose stop is `stopped by <SIGNAL>`, 128 + n.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.held
     }
 
     /// [`Waiting::new`] for a server's verb, which runs until it is stopped: a stop is its normal
@@ -369,6 +394,7 @@ impl Waiting {
             outcome: "it was serving",
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
             serves: true,
+            held: false,
         })
     }
 
@@ -788,6 +814,20 @@ pub fn room_passphrase_for(
     Ok(encouraged(prompt_passphrase("room passphrase")?, "room"))
 }
 
+/// Refuse the room passphrase sources that disclose it (V210-72): `--passphrase` and
+/// `VOX_ROOM_PASSPHRASE`, for a verb that takes one only from a file or not at all. Said before
+/// anything else, so a person relying on either learns it was never read.
+///
+/// # Errors
+/// Either is given.
+pub fn refuse_disclosed_room_passphrase(given: Option<&String>) -> Result<(), AppError> {
+    if given.is_some() || std::env::var_os("VOX_ROOM_PASSPHRASE").is_some() {
+        // The same words as every verb that reads one.
+        room_passphrase_for(given, None)?;
+    }
+    Ok(())
+}
+
 /// `passphrase`, after one line on stderr encouraging one when it is empty (V030-36).
 ///
 /// **An empty passphrase is accepted, not refused** (decider 2026-10-02: "passphrase is a good
@@ -1063,6 +1103,7 @@ pub async fn connect(
     // waits for, once, rather than sitting silent for up to half a minute.
     let mut said_waiting = std::collections::HashSet::new();
     let mut following = true;
+    let mut said_steps = false;
     let reply = loop {
         tokio::select! {
             reply = &mut join => break reply,
@@ -1072,6 +1113,11 @@ pub async fn connect(
                         eprintln!("vox: {step}");
                     }
                     waiting.on(step);
+                }
+                // Its steps, said once it got in or did not (#192), and what explains a wait.
+                Ok(Some(Frame::Event(ev))) => {
+                    say_if_it_explains_a_failure(&ev);
+                    said_steps |= matches!(ev, NodeEvent::JoinSteps { .. });
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => following = false,
@@ -1099,6 +1145,20 @@ pub async fn connect(
         }
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
+    }
+    // **What the join did, said** (#192): the node raises its steps before it answers, so they
+    // are in the subscription already; said as `join got in — <steps>`, with anything else that
+    // explains a wait.
+    if following && !said_steps {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, steps.next()).await {
+            if let Frame::Event(ev) = frame {
+                say_if_it_explains_a_failure(&ev);
+                if matches!(ev, NodeEvent::JoinSteps { .. }) {
+                    break;
+                }
+            }
+        }
     }
     let channel_id = vox_core::node::link::InviteLink::parse(url)
         .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?
@@ -1158,14 +1218,30 @@ pub async fn up(
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
     waiting.on("the vox daemon to stop");
+    // **What the node says about its reaches is said here too** (PRD-001 R23, R36): a path that
+    // stays relayed, a peer that cannot be reached, a refusal's reason. The proxy's own notes say
+    // which name matched nothing; the node's events say what happened to the connection it made.
+    let mut events = crate::client::events(&held.at).await.ok();
     let closed = crate::client::hold_until_closed(&mut held.client);
     tokio::pin!(closed);
     loop {
+        let event = async {
+            match events.as_mut() {
+                Some(e) => e.next().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             why = &mut closed => return Err(why),
             note = up.next_note() => match note {
                 Some(note) => eprintln!("vox: {note}"),
                 None => return Err((&mut closed).await),
+            },
+            ev = event => match ev {
+                Ok(Some(Frame::Event(ev))) => say_if_it_explains_a_failure(&ev),
+                Ok(Some(_)) => {}
+                // The subscription ends with the node; the holding connection says why.
+                Ok(None) | Err(_) => events = None,
             },
         }
     }
@@ -1217,6 +1293,29 @@ pub(crate) async fn open_named_room(
     Ok(channel_id)
 }
 
+/// Whether `host` shares `service` in `channel_id` over UDP: each UDP share the room lists is
+/// resolved as this node writes it, and compared.
+async fn shared_udp(
+    held: &mut crate::client::Held,
+    channel_id: Digest32,
+    host: Digest32,
+    service: &str,
+) -> bool {
+    let Ok(Frame::Services { shared, .. }) =
+        held.client.request(&Request::Services { channel_id }).await
+    else {
+        return false;
+    };
+    for (address, _, _) in shared.iter().filter(|s| s.2) {
+        if let Ok(found) = vox_core::node::nameipc::resolve(&held.at, address).await {
+            if found == (channel_id, host, service.to_owned()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// `vox forward <service>.<node>.<room>.vox [<local>]`: resolved and carried by the daemon for
 /// this node, until stopped (V030-25, ADR-026 L-7).
 ///
@@ -1236,6 +1335,13 @@ pub async fn forward_named(
     let (channel_id, host, service) = vox_core::node::nameipc::resolve(&held.at, name)
         .await
         .map_err(|e| AppError::Usage(format!("{name}: {e}")))?;
+    // **A UDP service is forwarded as one** (ADR-022 decision 6): its address names it as any
+    // other, and the room says which shares are UDP. One that is, is asked for as `udp/<name>`.
+    let service = if shared_udp(&mut held, channel_id, host, &service).await {
+        format!("udp/{service}")
+    } else {
+        service
+    };
     // A bare port means loopback; `127.0.0.1:0` picks one.
     let local = match local.parse::<u16>() {
         Ok(port) => format!("127.0.0.1:{port}"),
@@ -1267,7 +1373,13 @@ pub async fn forward_named(
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    eprintln!("vox: bound in {} ms", first_attempt.elapsed().as_millis());
+    // The daemon binds the forward only once it has reached the host (#215), so this is how long
+    // reaching it took: said as it always was, with the host and the one request it took.
+    eprintln!(
+        "vox: reached {} in {} ms (1 attempt)",
+        short(&host),
+        first_attempt.elapsed().as_millis()
+    );
     println!(
         "vox: forwarding {bound} to {service} on {name} ({})",
         short(&host)

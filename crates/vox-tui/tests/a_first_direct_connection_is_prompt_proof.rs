@@ -484,7 +484,7 @@ fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, Str
 #[test]
 #[ignore = "production Argon2id + a real PoW, a third member staged; run in release"]
 fn a_node_reads_the_board_before_bridging() {
-    use world::{args, room_pass_file, VoxProc};
+    use world::{args, VoxProc};
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(true);
@@ -495,12 +495,8 @@ fn a_node_reads_the_board_before_bridging() {
         &dave,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &w.hostname(),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &room_pass_file(&dave, &w.passphrase),
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",
@@ -574,18 +570,14 @@ fn without_entry_of(address: &str, who: &str) -> String {
 /// Start the guest's `vox forward` to the host's service, wait until it says it reached the host,
 /// read how many circuits it asked for to the host while it still runs, and stop it (by its PID).
 fn forward_once(w: &ForwardedWorld) -> (String, u64, Vec<String>) {
-    use world::{args, room_pass_file, VoxProc};
+    use world::{args, VoxProc};
     let mut fwd = VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &w.hostname(),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &room_pass_file(&w.guest_dir, &w.passphrase),
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",
@@ -796,6 +788,27 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
             },
             direct_at.map_or_else(|| "NEVER".to_owned(), |_| format!("{d:?}"))
         );
+        // **A slow sample says what each side noticed** (the guest's `vox up` and its daemon, the
+        // host), times from this sample's ready, so a red names its cause rather than a number.
+        if a >= TARGET || d >= TARGET {
+            for l in up.said_since(ready) {
+                eprintln!("[proof]   up-{i} said: {l}");
+            }
+            for l in w.host.said_since(ready) {
+                eprintln!("[proof]   the host said: {l}");
+            }
+            let log = std::fs::read_to_string(w.guest_dir.join(".daemon/log")).unwrap_or_default();
+            for l in log
+                .lines()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                eprintln!("[proof]   the guest's daemon log: {l}");
+            }
+        }
         any.push(a);
         direct.push(d);
         // The circuits this `vox up` asked a relay for, to the host it could reach directly.

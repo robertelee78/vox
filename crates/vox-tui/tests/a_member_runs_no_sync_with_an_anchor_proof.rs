@@ -94,7 +94,7 @@ impl Root {
             .env("VOX_DATA_DIR", &self.dir)
             .env("VOX_CONFIG_DIR", self.dir.join("cfg"))
             .env("VOX_NODE", self.node)
-            .env_remove("VOX_PROFILE")
+            .env_remove("VOX_NODE")
             .env_remove("VOX_IDENTITY_PASSPHRASE")
             .env_remove("VOX_ANCHORS")
             .env_remove("VOX_LISTEN");

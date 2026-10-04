@@ -495,7 +495,7 @@ impl Member {
             )
         });
         let client = rt
-            .block_on(IpcClient::open(&paths.socket_file()))
+            .block_on(attach::paths_client(&paths))
             .unwrap_or_else(|e| {
                 panic!(
                     "CANNOT MEASURE: the harness could not attach to {}'s control socket: {e}",

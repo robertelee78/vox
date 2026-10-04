@@ -92,10 +92,25 @@ pub async fn connect<S: vox_core::identity::composite::RootSigner + Send + Sync 
             .expect("APPARATUS: a socket address the proof wrote"),
     )
     .expect("APPARATUS: bind the stand-in peer's endpoint");
-    let conn = endpoint
-        .connect(addr, id, now())
-        .await
-        .unwrap_or_else(|e| panic!("CANNOT MEASURE: a valid identity was not admitted: {e:?}"));
+    // **Paced to the listener's per-source rate** (ADR-011 requirement 34: 8 `ASK`s a second
+    // from one source, past a burst of 16): every stand-in here dials from 127.0.0.1, one source,
+    // and a refusal over the rate is the generic one, indistinguishable from any other. So a
+    // refused dial is tried again, spread out, for as long as a source within its rate needs; one
+    // still refused after that was not refused for its rate.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut wait = std::time::Duration::from_millis(150);
+    let conn = loop {
+        match endpoint.connect(addr, id, now()).await {
+            Ok(conn) => break conn,
+            Err(vox_core::error::Error::HandshakeAuth(_))
+                if std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(e) => panic!("CANNOT MEASURE: a valid identity was not admitted: {e:?}"),
+        }
+    };
     (endpoint, Arc::new(conn))
 }
 

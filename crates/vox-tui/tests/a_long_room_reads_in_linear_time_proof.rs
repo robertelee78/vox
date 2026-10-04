@@ -555,12 +555,22 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
         "PRODUCT: in a room of {POSTS} messages the TUI took {sent:?} to show {TUI_POSTS} messages \
          sent from its own composer (bound {TUI_ALL:?}): each frame costs the room's history"
     );
-    let _restarted = VoxProc::spawn("alice", &data, &daemon_args);
+    // The TUI was a client: the daemon it started holds the data root until it goes idle, and the
+    // TUI driver may have killed it by its pid. Stopped by the pid in its lock, so the daemon
+    // started here takes the lock and is the one that runs.
+    world::reap_daemon(&data);
+    let mut restarted = VoxProc::spawn("alice", &data, &daemon_args);
     let deadline = Instant::now() + SETUP;
-    while !vox(&data, &["room", "list"], "").0 {
+    loop {
+        let (ok, _, out, err) = vox(&data, &["room", "list"], "");
+        if ok {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): `vox daemon`, started again after the TUI, never answered `vox room list`"
+            "PRODUCT (staging): `vox daemon`, started again after the TUI, never answered \
+             `vox room list`; the last answer: {out}{err}\n--- the daemon said:\n{}",
+            restarted.transcript()
         );
         std::thread::sleep(Duration::from_millis(250));
     }

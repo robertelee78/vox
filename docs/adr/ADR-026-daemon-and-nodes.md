@@ -5,7 +5,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status**: Accepted by the decider, 2026-10-03 (#397, V030-35). **Built** (v0.3.0,
 `crates/vox-core/src/node/`, `crates/vox-core/src/transport/`, `crates/vox-tui/src/`), except: N-2
 (the TUI still locks its node), S-4 and C-7 (the TUI still embeds its node), and what is marked
-*Deferred*. N-1a and L-7 are built and not yet proved by real use. §10 names the proof of each claim.
+*Deferred*. §10 names the proof of each claim.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: daemon, node, identity, control-plane, lifecycle, layout
 
@@ -64,8 +64,10 @@ network presence from the start: there is no interim design with one socket per 
   node MUST receive its passphrase once, when it attaches, and MUST run in full while attached: it
   dials, accepts, syncs, serves, relays and publishes. After the keyring window (30 minutes,
   V210-159), only keyring changes (trust add, remove, rename) MUST ask for the passphrase again.
-  Detaching is the only way a node stops. *Not built: the TUI still locks its node (ADR-015
-  11.2–11.3).*
+  Detaching is the only way a node stops. *Built (#409): there is no `Lock` command and no
+  `Locked` or `Unlocked` event; the vault is opened once, by the daemon's attach, and a detach wipes
+  the node's secrets once work holding one has finished
+  (`a_detach_leaves_no_secret_in_memory_proof`).*
 - **N-3.** All attached nodes MUST run concurrently: each syncs, receives, serves and wakes its agents
   independently. Selecting a node for a request MUST NOT idle, pause or deprioritise any other node.
 - **N-4.** There MUST NOT be an "active node". A node is named only to say which node an action is
@@ -144,9 +146,13 @@ network presence from the start: there is no interim design with one socket per 
   attach it.
 - **C-6.** Passphrases MAY travel over the socket (attach, keyring changes): the OS account is the
   boundary (ADR-001). They MUST be carried in zeroizing buffers end to end. A passphrase taken from
-  an environment variable MUST be resolved in the client, never by the daemon.
+  an environment variable MUST be resolved in the client, never by the daemon. A foreground
+  `vox daemon` attaching its own foreground node is that node's client: it MAY read
+  `VOX_IDENTITY_PASSPHRASE` for that node only, never for a node another client asks it to attach.
 - **C-7.** The socket MUST offer what the TUI needs as a client: open and close of a closed room,
-  per-node status, attach and detach. *Not built (with S-4).*
+  per-node status, attach and detach. *Built (#409): `OpenRoom`/`CloseRoom`, the node snapshot
+  (`node::snapshot`), status and tunnel close on the node's connection, and the daemon's attach,
+  detach and events; the TUI uses only these (`the_tui_shows_the_room_truthfully_proof`, `tui_member_names_proof`, `tui_unread_backfill_proof`).*
 
 ### 5. Starting the daemon and the clients
 
@@ -160,9 +166,12 @@ network presence from the start: there is no interim design with one socket per 
 - **S-3.** No verb MUST host its own node: `serve`, `connect`, `up`, `forward`, `service`, `trust` and
   every other verb MUST be clients of the daemon.
 - **S-4. Clients.** The TUI and the macOS app MUST be clients of the daemon (ADR-014, ADR-015); they
-  MUST NOT embed a node. A client has no node lock: SIGHUP MUST stop the client cleanly and leave its
-  node attached. The one exception is the iOS app (v0.4.0), which hosts its own node because iOS runs
-  no background daemon. *Not built: the TUI still embeds its node.*
+  MUST NOT embed a node. A client has no node lock: SIGHUP MUST stop the client cleanly, the same as
+  quitting, and the client MUST only drop its hold, so a node it attached implicitly detaches if that
+  was its last holder (L-3) and one attached by hand or with `--keep` stays attached. The one
+  exception is the iOS app (v0.4.0), which hosts its own node because iOS runs no background daemon.
+  *Built for the TUI (#409): `the_tui_shows_the_room_truthfully_proof`, `tui_member_names_proof`, `tui_unread_backfill_proof`, `a_detach_leaves_no_secret_in_memory_proof` (SIGHUP
+  mid-attach). Not built for the macOS app (ADR-014).*
 - **S-5. `vox lan up`.** The user-side `vox lan up` MUST be a daemon client holding a session (L-7).
   The daemon, as the same uid, MUST ask the root helper (`sudo vox lan helper`) for the device and
   run the LAN itself. The helper MUST serve its interface over its own socket owned by `SUDO_UID`;
@@ -246,10 +255,10 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 1. two nodes on one daemon post, read and serve concurrently, and a remote daemon reaches both at one
    ip:port, each as itself (`two_nodes_are_clients_of_one_daemon_proof`,
    `two_nodes_answer_at_one_address_proof`);
-2. node to node within one daemon, including loss and redial (I-4). *Not proved by real use*
-   (in process: `self_dial_on_one_endpoint`, `node::presence` tests);
-3. detaching one node keeps the other's live tunnel and sync (mutant: endpoint closed on detach).
-   *Not proved by real use* (in process: `vox-core/tests/two_nodes_on_one_presence_proof.rs`);
+2. node to node within one daemon, including loss and redial (I-4)
+   (`the_nodes_of_one_daemon_proof`);
+3. detaching one node keeps the other's live tunnel and sync (mutant: endpoint closed on detach)
+   (`the_nodes_of_one_daemon_proof`);
 4. tunnels, counters, status and metrics are per node; node A cannot list or close B's tunnel
    (`two_nodes_are_clients_of_one_daemon_proof`);
 5. a panic in one node's actor leaves the daemon and the other nodes serving
@@ -260,19 +269,19 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
    `a_detach_mid_request_is_said_in_words_proof`);
 7. a `--keep` node and its rooms and services return after a daemon restart
    (`the_daemon_and_its_nodes_proof`); a foreground `vox serve` exits non-zero when the daemon
-   stops (*not proved*);
+   stops (`the_nodes_of_one_daemon_proof`);
 8. two clients with no daemon running end with exactly one daemon, and an auto-started daemon exits
    when its last node detaches (`the_daemon_and_its_nodes_proof`);
 9. a hook acts only as its `--node`, and refuses without it
    (`an_agents_wiring_acts_only_as_its_node_proof`); a one-shot verb refuses an unattached node
-   (*not proved*);
+   (`the_nodes_of_one_daemon_proof`); node names follow N-1a (`the_nodes_of_one_daemon_proof`);
 10. migration moves profiles (a vault node, a headless anchor, and a directory holding both) with
     identity, rooms and config (`profiles_of_the_previous_release_become_nodes_proof`);
 11. a node keeps running in full past the keyring window, and only a keyring change asks for the
     passphrase again (`a_keyring_change_needs_a_recent_passphrase_proof`);
-12. R40 and R42 are re-measured (R42 punch: `a_first_punched_connection_is_prompt_proof`; R40 and
-    R42's direct path *not re-measured*: `a_first_direct_connection_is_prompt_proof` does not yet
-    run on the daemon's verbs);
+12. R40 and R42 are re-measured (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
+    `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`,
+    `a_first_relayed_connection_is_under_two_seconds_proof`);
 13. the process-wide-state enumeration (P-1) (`every_process_wide_state_is_listed`).
 
 ADR-011's identity-exchange proofs are listed there.

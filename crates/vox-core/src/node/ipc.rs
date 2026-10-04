@@ -161,8 +161,7 @@ const _: () = assert!(crate::node::content::MAX_TEXT_LEN + ROW_OVERHEAD <= ROWS_
 const T_HELLO: u64 = 1;
 const T_LAGGED: u64 = 2;
 const T_NEW_ENTRY: u64 = 10;
-const T_UNLOCKED: u64 = 11;
-const T_LOCKED: u64 = 12;
+// 11 and 12 were `Unlocked` and `Locked`: there is no lock (ADR-026 N-2). Never reuse them.
 const T_CHANNEL_OPENED: u64 = 13;
 const T_CHANNEL_CLOSED: u64 = 14;
 const T_PEER_JOINED: u64 = 15;
@@ -1552,14 +1551,8 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .uint(row.arrival)
                 .uint(u64::from(row.late));
         }
-        NodeEvent::Unlocked => {
-            e.array(1).uint(T_UNLOCKED);
-        }
         NodeEvent::WaitingForProfile => {
             e.array(1).uint(T_WAITING_FOR_PROFILE);
-        }
-        NodeEvent::Locked => {
-            e.array(1).uint(T_LOCKED);
         }
         NodeEvent::Shutdown => {
             e.array(1).uint(T_SHUTDOWN);
@@ -2048,9 +2041,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 },
             }
         }
-        (T_UNLOCKED, 1) => NodeEvent::Unlocked,
         (T_WAITING_FOR_PROFILE, 1) => NodeEvent::WaitingForProfile,
-        (T_LOCKED, 1) => NodeEvent::Locked,
         (T_SHUTDOWN, 1) => NodeEvent::Shutdown,
         (T_CHANNEL_OPENED, 2) => NodeEvent::ChannelOpened {
             channel_id: digest(d)?,
@@ -2380,10 +2371,19 @@ pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10
 /// The error for a node that closed the connection before replying (V210-101): never "malformed",
 /// since nothing arrived to be malformed. A fresh connection, bounded, tells a node that is gone
 /// from one that ended this request itself.
+///
+/// **Running means greeting, not accepting**: a process being killed closes its connections and
+/// its listening socket in whatever order the kernel takes, and a connect in between lands in the
+/// backlog of a listener about to close. Measured: a daemon SIGKILLed mid-request was reported
+/// "still running". Only a hello read back counts.
 pub async fn hung_up(path: &Path) -> Error {
     let still_running = matches!(
-        tokio::time::timeout(ANSWER_WITHIN, connect_own(path)).await,
-        Ok(Ok(_))
+        tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut s = connect_own(path).await?;
+            read_frame(&mut s).await
+        })
+        .await,
+        Ok(Ok(Some(_)))
     );
     Error::Ipc(IpcHandshake::HungUp { still_running })
 }
@@ -2732,6 +2732,12 @@ async fn serve_requests(
             crate::node::status::serve(&mut stream, handle).await?;
             continue;
         }
+        // ADR-026 C-7: what a client that draws the node's rooms needs, the TUI first. Answered,
+        // and the connection serves on.
+        if crate::node::snapshot::is_request(&body) {
+            write_frame(&mut stream, &crate::node::snapshot::answer(handle)).await?;
+            continue;
+        }
         // V030-11: `vox tunnel close`. The live tunnels are kept in this process, so it is
         // answered here, and the connection serves on.
         if let Some(which) = crate::node::status::close_request(&body) {
@@ -2796,6 +2802,13 @@ async fn serve_requests(
         let intent = Held::intent(&request);
         let reply = tokio::select! {
             reply = serve_request(handle, request) => reply,
+            // **A client that hangs up mid-request is noticed then, not when the request ends**
+            // (ADR-026 L-3): a `vox connect` stopped during its join kept its connection — and the
+            // hold it carries on its node — until the join finished, so an implicit node's detach,
+            // and the goodbye its connections owe their peers, waited on a join nobody wanted.
+            // The request is abandoned; what it started in the node goes on, or stops with the
+            // node.
+            () = subscriber_gone(&stream) => return Ok(()),
             () = node_detached(&mut watch) => {
                 if let Some(b) = gone(&node) {
                     let _ = write_frame(&mut stream, &b).await;
@@ -2824,6 +2837,10 @@ pub struct Lease {
     pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
     /// A request the daemon serves itself, beyond the node's vocabulary, if it has one.
     pub extension: Option<std::sync::Arc<dyn Extension>>,
+    /// What attaching the node said, when this `Use` attached it ([`DaemonFrame::Using`]).
+    ///
+    /// [`DaemonFrame::Using`]: crate::node::daemonipc::DaemonFrame::Using
+    pub notes: Vec<String>,
 }
 
 /// A request the daemon's own build serves on a node's connection, beyond what this crate knows:
@@ -2891,9 +2908,14 @@ impl Drop for Counted {
 /// # Errors
 /// If the socket cannot be placed.
 pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
-    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet.
+    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet. **Not
+    // the shared fallback** (`<tmp>/vox-<uid>`, for a data root whose socket path is too long):
+    // `create_private_dir` follows a symlink and changes the mode of whatever it points at, and
+    // anyone can plant one there. `place_socket` creates or refuses that one itself, by lstat.
     if let Some(dir) = path.parent() {
-        crate::node::paths::create_private_dir(dir)?;
+        if !crate::node::paths::is_socket_fallback_dir(dir) {
+            crate::node::paths::create_private_dir(dir)?;
+        }
     }
     let listener = place_socket(&path)?;
     let me = crate::node::paths::my_uid();
@@ -2993,10 +3015,12 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
         detached,
         hold,
         extension,
+        notes,
     } = lease;
     let using = crate::node::daemonipc::DaemonFrame::Using {
         node: node.clone(),
         me: handle.view().identity.map(|i| i.fingerprint),
+        notes,
     };
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
     let mut held = Held::default();
@@ -3064,12 +3088,43 @@ async fn verify_operator(
 /// one is checked too, and a match counts as the passphrase entered, opening the window; a
 /// mismatch is "none given", not a wrong passphrase. Without that, an identity with no
 /// passphrase could never change its keyring once the window had passed.
-async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
+///
+/// Answers whether the passphrase was proved: a proved change is made as
+/// [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved), which the window does not
+/// refuse.
+async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<bool, Frame> {
     if passphrase.is_empty() {
-        let _ = verify_operator(handle, passphrase).await;
-        return Ok(());
+        return Ok(verify_operator(handle, passphrase).await.is_ok());
     }
-    verify_operator(handle, passphrase).await
+    verify_operator(handle, passphrase).await.map(|()| true)
+}
+
+/// **For proofs only.** When set, a keyring change whose passphrase was just proved waits this
+/// many milliseconds between the check and the change, which stands for a daemon too busy to
+/// make it at once, past the keyring window. Nothing a person runs sets it; unset, nothing
+/// changes. Not compiled in without the `test-knobs` feature.
+#[cfg(feature = "test-knobs")]
+pub const TEST_PROVED_CHANGE_DELAY_ENV: &str = "VOX_TEST_PROVED_CHANGE_DELAY_MS";
+
+/// `change`, as [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved) when its
+/// passphrase was just proved.
+async fn proved_if(
+    proved: bool,
+    change: crate::node::api::NodeCommand,
+) -> crate::node::api::NodeCommand {
+    if !proved {
+        return change;
+    }
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_PROVED_CHANGE_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    crate::node::api::NodeCommand::Proved {
+        change: Box::new(change),
+    }
 }
 
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
@@ -3139,16 +3194,22 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             full_history,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::TrustWith {
-                    fingerprint: target,
-                    petname,
-                    history: if full_history {
-                        crate::node::trust::HistoryGrant::Full
-                    } else {
-                        crate::node::trust::HistoryGrant::Now
-                    },
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::TrustWith {
+                            fingerprint: target,
+                            petname,
+                            history: if full_history {
+                                crate::node::trust::HistoryGrant::Full
+                            } else {
+                                crate::node::trust::HistoryGrant::Now
+                            },
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3181,10 +3242,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Untrust {
-                    fingerprint: target,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Untrust {
+                            fingerprint: target,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3199,11 +3266,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Rename {
-                    fingerprint: target,
-                    petname,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Rename {
+                            fingerprint: target,
+                            petname,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3681,7 +3754,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         crate::node::api::Outcome::Failed(fault) => {
                             format!("Failed({})", fault.name())
                         }
-                        other => format!("{other:?}"),
+                        other => other.to_string(),
                     };
                     let (mut steps, mut said) = (None, None);
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -3951,6 +4024,8 @@ pub struct IpcClient {
     /// The node this connection acts as on the daemon's socket (ADR-026 C-2), which a check on a
     /// waiting request names in its own `Use`; `None` for a node's own socket.
     node: Option<crate::node::paths::NodeName>,
+    /// What attaching the node said, when this connection's `Use` attached it.
+    notes: Vec<String>,
 }
 
 /// Where a client of the daemon reaches its node (ADR-026 C-2): the account's one socket, and the
@@ -3962,6 +4037,10 @@ pub struct NodeSocket {
     pub path: PathBuf,
     /// What each connection opens with.
     pub using: crate::node::daemonipc::UseNode,
+    /// Called once if the daemon has not greeted within a second
+    /// ([`crate::node::daemonipc::DaemonClient::open_noting`]); the caller says the wait where its
+    /// user sees it.
+    pub waiting: Option<fn()>,
 }
 
 impl std::fmt::Debug for NodeSocket {
@@ -3987,6 +4066,7 @@ impl NodeSocket {
                 passphrase: None,
                 anchors: Vec::new(),
             },
+            waiting: None,
         }
     }
 
@@ -3994,7 +4074,10 @@ impl NodeSocket {
     /// opens, and every connection after the first of a held verb, whose first holds it.
     #[must_use]
     pub fn attached_only(&self) -> Self {
-        Self::one_shot(self.path.clone(), self.using.node.clone())
+        Self {
+            waiting: self.waiting,
+            ..Self::one_shot(self.path.clone(), self.using.node.clone())
+        }
     }
 }
 
@@ -4006,8 +4089,18 @@ impl NodeSocket {
 /// As [`crate::node::daemonipc::DaemonClient::open`]; [`IpcHandshake::Refused`], in the daemon's
 /// words, when it refuses the `Use`; [`IpcHandshake::NotHello`] for any other answer.
 pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> {
+    open_as_noting(at).await.map(|(s, me, _)| (s, me))
+}
+
+/// [`open_as`], with what attaching the node said when this `Use` attached it.
+///
+/// # Errors
+/// As [`open_as`].
+pub async fn open_as_noting(
+    at: &NodeSocket,
+) -> Result<(UnixStream, Option<Digest32>, Vec<String>)> {
     use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
-    let DaemonClient { mut stream, .. } = DaemonClient::open(&at.path).await?;
+    let DaemonClient { mut stream, .. } = DaemonClient::open_noting(&at.path, at.waiting).await?;
     // Wiped once sent: it may carry the identity passphrase (C-6).
     let opening = zeroize::Zeroizing::new(Opening::Use(at.using.clone()).to_bytes());
     if let Err(e) = write_frame(&mut stream, &opening).await {
@@ -4018,7 +4111,7 @@ pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> 
         return Err(hung_up(&at.path).await);
     };
     match DaemonFrame::from_bytes(&answer)? {
-        DaemonFrame::Using { me, .. } => Ok((stream, me)),
+        DaemonFrame::Using { me, notes, .. } => Ok((stream, me, notes)),
         DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
             reason: r.to_string(),
         })),
@@ -4123,11 +4216,12 @@ impl IpcClient {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         match DaemonFrame::from_bytes(&answer)? {
-            DaemonFrame::Using { me, node } => Ok(Ok(Self {
+            DaemonFrame::Using { me, node, notes } => Ok(Ok(Self {
                 stream,
                 me,
                 path: path.to_owned(),
                 node: Some(node),
+                notes,
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
@@ -4178,6 +4272,7 @@ impl IpcClient {
             me,
             path: path.to_owned(),
             node: None,
+            notes: Vec::new(),
         })
     }
 
@@ -4186,13 +4281,21 @@ impl IpcClient {
     /// # Errors
     /// As [`open_as`].
     pub async fn open_at(at: &NodeSocket) -> Result<Self> {
-        let (stream, me) = open_as(at).await?;
+        let (stream, me, notes) = open_as_noting(at).await?;
         Ok(Self {
             stream,
             me,
             path: at.path.clone(),
             node: Some(at.using.node.clone()),
+            notes,
         })
+    }
+
+    /// What attaching the node said, when this connection's `Use` attached it: for a verb that
+    /// holds a session to print in the person's own terminal (PRD-001 R23, R36).
+    #[must_use]
+    pub fn attach_notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// Send one request and read its answer.
@@ -4220,6 +4323,28 @@ impl IpcClient {
                 return Err(hung_up(path).await);
             };
             Frame::from_bytes(&body)
+        };
+        while_answering(path, node.as_ref(), exchange).await
+    }
+
+    /// Send one request body this module has no [`Request`] for — a status, a tunnel close, a
+    /// snapshot ([`crate::node::snapshot`]) — and return the one reply body, bounded as
+    /// [`IpcClient::request`] is.
+    ///
+    /// # Errors
+    /// If the node cannot be reached, or hangs up before it answers.
+    pub async fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+        let Self {
+            stream, path, node, ..
+        } = self;
+        let exchange = async {
+            if let Err(e) = write_frame(stream, body).await {
+                return Err(named(path, e).await);
+            }
+            match read_frame(stream).await? {
+                Some(reply) => Ok(reply),
+                None => Err(hung_up(path).await),
+            }
         };
         while_answering(path, node.as_ref(), exchange).await
     }

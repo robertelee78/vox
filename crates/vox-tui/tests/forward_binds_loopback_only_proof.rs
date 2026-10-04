@@ -63,12 +63,8 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
             &exposed,
-            "--passphrase-file",
-            &w.passphrase_file(),
             "--anchor",
             &w.guest_anchor,
             "--listen",
@@ -86,7 +82,7 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
         match fwd.lines.recv_timeout(left.min(Duration::from_secs(1))) {
             Ok(line) => {
                 eprintln!("[exposed-forward] {line}");
-                let bound = line.starts_with("vox: ") && line.contains('→');
+                let bound = line.starts_with("vox: forwarding ");
                 fwd.seen.push(line.clone());
                 if bound {
                     bound_line = Some(line);

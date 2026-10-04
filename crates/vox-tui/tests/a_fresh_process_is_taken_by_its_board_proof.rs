@@ -93,7 +93,38 @@ fn free_udp_port() -> u16 {
 }
 
 /// A `vox forward` of the guest's identity on UDP `port`, with its millisecond clock skewed if asked.
+/// Stop the guest's daemon, by the pid it writes in its lock, and wait for it to go: the next
+/// `vox forward` then starts the guest's **fresh process** itself, on its `--listen` and with its
+/// clock (ADR-026 S-2). A forward is a client; the daemon is the process the board must take.
+fn stop_guest_daemon(w: &RelayWorld) {
+    let lock = w.guest_dir.join(".daemon").join("lock");
+    let Some(pid) = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while alive() {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): the guest's daemon (pid {pid}) did not stop on SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
+    stop_guest_daemon(w);
     let listen = format!("127.0.0.1:{port}");
     let env: Vec<(&str, &str)> = skew
         // A whole clock step, both clocks (V210-64): `VOX_TEST_CLOCK_SKEW_MS` moves the
@@ -105,12 +136,8 @@ fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service,
+            &format!("{}.{}.{}.vox", w.service, w.host_fp, w.room),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &w.passphrase_file(),
             "--anchor",
             &w.anchor.v4_spec,
             "--listen",
@@ -154,9 +181,7 @@ fn a_fresh_process_is_taken_by_its_board() {
         let a_port = free_udp_port();
         let a_spawned = Instant::now();
         let mut a = spawn_forward(&w, a_port, None);
-        a.expect_line("A's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
-        });
+        a.expect_line("A's bound address", |l| l.starts_with("vox: forwarding "));
         let a_start = a_spawned.elapsed();
         let a_tag = format!("/udp/{a_port}");
         let deadline = Instant::now() + CURED_WITHIN;
@@ -182,7 +207,7 @@ fn a_fresh_process_is_taken_by_its_board() {
         let port = free_udp_port();
         let mut fwd = spawn_forward(&w, port, Some(&skew.to_string()));
         fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+            l.starts_with("vox: forwarding ")
         });
         let bound = Instant::now();
         let port_tag = format!("/udp/{port}");

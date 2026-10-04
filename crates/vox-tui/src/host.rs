@@ -76,6 +76,9 @@ struct Inner {
     rt: Handle,
     defaults: Defaults,
     slots: Mutex<BTreeMap<NodeName, Slot>>,
+    /// For a headless node in the anchor role, the creators whose rooms it serves; absent, any
+    /// room (`vox node --serve`, ADR-026 N-5).
+    serve_only: Mutex<BTreeMap<NodeName, BTreeSet<Digest32>>>,
     events: broadcast::Sender<DaemonEvent>,
     metrics: Arc<DaemonMetrics>,
     stopping: AtomicBool,
@@ -114,6 +117,9 @@ struct Attached {
     tasks: Option<NodeTasks>,
     /// Turned `true` when it detaches: every connection acting as it answers "node detached".
     detached: watch::Sender<bool>,
+    /// What attaching it said (a skipped anchors line, a node carrying on with no anchor): logged
+    /// by the daemon, and handed to the `Use` that attached it, for its client to print.
+    notes: Vec<String>,
     /// Turned `true` when its actor has ended, however.
     ended: watch::Receiver<bool>,
     fingerprint: Option<Digest32>,
@@ -137,6 +143,8 @@ struct Granted {
     handle: NodeHandle,
     detached: watch::Receiver<bool>,
     hold: Option<HolderGuard>,
+    /// What attaching the node said, when this request attached it; empty when it was attached.
+    notes: Vec<String>,
 }
 
 /// A held connection's hold on its node (L-3): released when dropped, and the release that leaves
@@ -221,6 +229,7 @@ impl Router {
                 stopping: AtomicBool::new(false),
                 next_generation: AtomicU64::new(1),
                 stop_asked: tokio::sync::Notify::new(),
+                serve_only: Mutex::default(),
                 unfinished_stop: AtomicBool::new(false),
                 connections: Arc::default(),
             }),
@@ -236,6 +245,12 @@ impl Router {
     /// Wait until a client asks the daemon to stop ([`DaemonRequest::Stop`]).
     pub async fn stop_asked(&self) {
         self.inner.stop_asked.notified().await;
+    }
+
+    /// Serve only rooms made by `creators` from headless node `node`, the next time it attaches
+    /// in the anchor role (`vox node --serve trusted`).
+    pub fn serve_only(&self, node: &NodeName, creators: BTreeSet<Digest32>) {
+        lock(&self.inner.serve_only).insert(node.clone(), creators);
     }
 
     /// The attached nodes and their handles, for the metrics endpoint.
@@ -287,11 +302,28 @@ impl Router {
         rooms: Vec<Zeroizing<String>>,
         anchors: Vec<String>,
     ) -> Result<NodeInfo, Refusal> {
+        self.attach_noting(node, passphrase, keep, rooms, anchors)
+            .await
+            .map(|(info, _)| info)
+    }
+
+    /// [`Self::attach`], with what attaching the node said when this call attached it.
+    ///
+    /// # Errors
+    /// As [`Self::attach`].
+    pub async fn attach_noting(
+        &self,
+        node: &NodeName,
+        passphrase: Option<Zeroizing<String>>,
+        keep: Option<KeepSource>,
+        rooms: Vec<Zeroizing<String>>,
+        anchors: Vec<String>,
+    ) -> Result<(NodeInfo, Vec<String>), Refusal> {
         let g = self
             .want(node, Want::Explicit(keep), passphrase, rooms, anchors)
             .await?;
         self.write_attach_file(None);
-        Ok(g.info)
+        Ok((g.info, g.notes))
     }
 
     /// Grant a connection's `Use` (C-2), attaching the node implicitly when the `Use` holds it.
@@ -315,6 +347,7 @@ impl Router {
                 .map(|h| Box::new(h) as Box<dyn std::any::Any + Send + Sync>),
             // `vox lan up`: the daemon asks the root helper for the device itself (S-5).
             extension: Some(std::sync::Arc::new(crate::lan_cli::LanUp)),
+            notes: g.notes,
         })
     }
 
@@ -531,8 +564,18 @@ impl Router {
                 Step::WaitAttach(mut rx) => {
                     let _ = rx.wait_for(Option::is_some).await;
                 }
+                // **Bounded** (#408): a detach waits for the node's secret work however long it
+                // takes (L-3), and a hook asking for its node sits inside a model's turn. Past
+                // the bound the request is refused, saying the node is still detaching.
                 Step::WaitDetach(mut rx) => {
-                    let _ = rx.wait_for(|d| *d).await;
+                    let waited = tokio::time::timeout(
+                        vox_core::node::daemonipc::DETACHING_PATIENCE,
+                        rx.wait_for(|d| *d),
+                    )
+                    .await;
+                    if waited.is_err() {
+                        return Err(Refusal::StillDetaching { node: node.clone() });
+                    }
                 }
                 Step::NotAttached => return Err(Refusal::NotAttached { node: node.clone() }),
                 Step::Mine(tx) => {
@@ -544,7 +587,9 @@ impl Router {
                     return match started {
                         Ok(mut a) => {
                             a.implicit = !matches!(w, Want::Explicit(_));
-                            let granted = self.grant(node, &mut a, w);
+                            let mut granted = self.grant(node, &mut a, w);
+                            // This request attached it: what that said goes back to its client.
+                            granted.notes = a.notes.clone();
                             let fingerprint = a.fingerprint;
                             slots.insert(node.clone(), Slot::Attached(a));
                             drop(slots);
@@ -609,6 +654,7 @@ impl Router {
             handle: a.handle.clone(),
             detached: a.detached.subscribe(),
             hold,
+            notes: Vec::new(),
         }
     }
 
@@ -634,10 +680,40 @@ impl Router {
             .node_paths(node)
             .map_err(|e| failed(e.to_string()))?;
         // The daemon's anchors, the node's own anchors file, and what this attach names.
+        //
+        // **What the file could not give is said, here** (V210-107, under ADR-026): each skipped
+        // line, and that a file naming no usable anchor leaves the node with none, which it
+        // carries on without — or, for an anchor node (`vox node`), runs with none of its own. The
+        // daemon is the one vox that reads the file now; dropping what it skipped left a person
+        // whose file named a host that no longer resolves with nothing said anywhere (#410: the
+        // wholly-bad anchors file proof). It is logged, and kept as the attach's notes, which go
+        // back to the verb that attached the node, to print in its person's own terminal (R23).
         let mut set = self.inner.defaults.anchors.clone();
-        let _ = vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file());
+        let file = paths.anchors_file();
+        let mut notes = vox_core::node::link::merge_anchors_file(&mut set, &file)
+            .unwrap_or_else(|e| vec![e.to_string()]);
+        let skipped = notes.len();
         for spec in anchors {
             let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+        }
+        if set.is_empty() && skipped > 0 {
+            let is_anchor = !paths.vault_file().is_file()
+                && vox_core::node::headless::identity_file(&paths).is_file();
+            notes.push(format!(
+                "node {node}: {}; {}",
+                vox_core::error::Error::AnchorsFileUnusable {
+                    path: file.display().to_string(),
+                    skipped,
+                },
+                if is_anchor {
+                    "running with no anchor of its own"
+                } else {
+                    "carrying on with no anchor"
+                }
+            ));
+        }
+        for line in &notes {
+            eprintln!("vox daemon: {line}");
         }
         let started = std::time::Instant::now();
         let bind = (self.inner.defaults.bind)(node);
@@ -645,12 +721,36 @@ impl Router {
             Some(Bind::Addr(a)) => Some(*a),
             _ => None,
         };
+        // **A node with a headless key and no vault is an anchor** (ADR-026 N-5, ADR-016): it
+        // runs as that key from spawn, with no passphrase, serving its board for the rooms
+        // published to it.
+        let anchor_key = || {
+            vox_core::node::headless::load_or_create_identity(&paths)
+                .map_err(|e| failed(e.to_string()))
+        };
+        // Its fingerprint: the key is read again for each spawn, which takes it.
+        let anchor: Option<Digest32> = if !paths.vault_file().is_file()
+            && vox_core::node::headless::identity_file(&paths).is_file()
+        {
+            Some(vox_core::identity::composite::RootSigner::fingerprint(
+                &anchor_key()?,
+            ))
+        } else {
+            None
+        };
+        let serve_only = lock(&self.inner.serve_only).get(node).cloned();
         let (handle, actor) = loop {
             let mut cfg = NodeConfig::new()
                 .anchors(set.clone())
                 .on_profile_wait(crate::tunnel_cli::say_waiting);
             if let Some(bind) = &bind {
                 cfg = cfg.bind(bind.clone());
+            }
+            if anchor.is_some() {
+                cfg = cfg.headless(anchor_key()?).anchor_boards(true);
+                if let Some(creators) = &serve_only {
+                    cfg = cfg.serve_only(creators.clone());
+                }
             }
             let p = paths.clone();
             let spawned = tokio::task::spawn_blocking(move || Node::spawn_supervised(p, cfg))
@@ -691,13 +791,18 @@ impl Router {
         }
         let empty = Zeroizing::new(String::new());
         let pass = passphrase.unwrap_or(&empty);
-        let outcome = crate::tunnel_cli::apply_saying_waits(
-            &handle,
-            NodeCommand::Unlock {
-                passphrase: Secret::new(pass.as_bytes().to_vec()),
-            },
-        )
-        .await;
+        // An anchor has nothing to unlock: it is networked from spawn.
+        let outcome = if anchor.is_some() {
+            Outcome::Done
+        } else {
+            crate::tunnel_cli::apply_saying_waits(
+                &handle,
+                NodeCommand::Unlock {
+                    passphrase: Secret::new(pass.as_bytes().to_vec()),
+                },
+            )
+            .await
+        };
         if !outcome.is_done() {
             let outcome_text = outcome.to_string();
             let refusal = match outcome {
@@ -730,13 +835,16 @@ impl Router {
         if *ended.borrow() {
             return Err(failed("its actor stopped while it attached".into()));
         }
-        let tasks = NodeTasks::start(
-            &self.inner.rt,
-            &handle,
-            &paths,
-            self.inner.defaults.anchor_specs.clone(),
-        );
-        let fingerprint = handle.view().identity.map(|i| i.fingerprint);
+        // An anchor wakes no agent, notifies nobody and follows no anchor of its own: it is one.
+        let tasks = anchor.is_none().then(|| {
+            NodeTasks::start(
+                &self.inner.rt,
+                &handle,
+                &paths,
+                self.inner.defaults.anchor_specs.clone(),
+            )
+        });
+        let fingerprint = anchor.or_else(|| handle.view().identity.map(|i| i.fingerprint));
         Ok(Box::new(Attached {
             handle,
             paths,
@@ -745,8 +853,9 @@ impl Router {
             keep: None,
             holders: 0,
             sessions: BTreeSet::new(),
-            tasks: Some(tasks),
+            tasks,
             detached: watch::channel(false).0,
+            notes,
             ended,
             fingerprint,
         }))
@@ -1006,8 +1115,11 @@ impl Dispatch for Router {
                 keep,
                 rooms,
                 anchors,
-            } => match self.attach(&node, passphrase, keep, rooms, anchors).await {
-                Ok(info) => DaemonFrame::Attached(info),
+            } => match self
+                .attach_noting(&node, passphrase, keep, rooms, anchors)
+                .await
+            {
+                Ok((info, notes)) => DaemonFrame::Attached(info, notes),
                 Err(r) => refused(r),
             },
             DaemonRequest::Detach { node } => {
@@ -1037,7 +1149,7 @@ impl Dispatch for Router {
                     .session_register(&node, record, passphrase, anchors)
                     .await
                 {
-                    Ok(info) => DaemonFrame::Attached(info),
+                    Ok(info) => DaemonFrame::Attached(info, Vec::new()),
                     Err(r) => refused(r),
                 }
             }

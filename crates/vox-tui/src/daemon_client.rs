@@ -42,8 +42,15 @@ pub async fn ensure_daemon(
     anchors: &[String],
 ) -> Result<Daemon, AppError> {
     let socket = account.socket();
-    if DaemonClient::open(&socket).await.is_ok() {
-        return Ok(Daemon::Running);
+    match DaemonClient::open_noting(&socket, Some(crate::client::say_daemon_waiting)).await {
+        Ok(_) => return Ok(Daemon::Running),
+        // **A daemon that took the connection and has not greeted is running**: busy, or stopped
+        // (Ctrl-Z). Starting another would only meet its lock (D-1) and wait out the start bound
+        // silently; this says what it is, and how to go on.
+        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Silent { .. })) => {
+            return Err(AppError::Usage(format!("{e}")))
+        }
+        Err(_) => {}
     }
     let log_path = account.log_file();
     vox_core::node::paths::create_private_dir(&account.daemon_dir())
@@ -69,30 +76,59 @@ pub async fn ensure_daemon(
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    // Where this start's lines begin: a daemon that fails is reported in its own words, not in
+    // an earlier start's.
+    let from = std::fs::metadata(&log_path).map_or(0, |m| m.len());
     let mut child = cmd.spawn().map_err(|e| {
         AppError::Usage(format!(
             "could not start the daemon: {e}; its log is {}",
             log_path.display()
         ))
     })?;
-    // Reaped on its own thread: the daemon outlives most clients, and one that ends first (the
-    // second of two started at once) must not stay a zombie for the client's life.
+    let t0 = Instant::now();
+    let outcome = loop {
+        if DaemonClient::open(&socket).await.is_ok() {
+            break Ok(Daemon::Started);
+        }
+        // **A daemon that ended is not waited for** (S-2): it said why in its log, and the
+        // client says it at once. One that ended because another took the lock first left
+        // that one answering.
+        if let Ok(Some(_)) = child.try_wait() {
+            if DaemonClient::open(&socket).await.is_ok() {
+                break Ok(Daemon::Running);
+            }
+            break Err(AppError::Usage(format!(
+                "the daemon stopped as it started; it said (its log is {}):\n{}",
+                log_path.display(),
+                since(&log_path, from)
+            )));
+        }
+        if t0.elapsed() >= START_WITHIN {
+            break Err(AppError::Usage(format!(
+                "the daemon did not start within {} s. Its log, {}, ends:\n{}",
+                START_WITHIN.as_secs(),
+                log_path.display(),
+                tail(&log_path, 20)
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // Reaped on its own thread: the daemon outlives most clients, and one that ends first must
+    // not stay a zombie for the client's life.
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    let t0 = Instant::now();
-    while t0.elapsed() < START_WITHIN {
-        if DaemonClient::open(&socket).await.is_ok() {
-            return Ok(Daemon::Started);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    outcome
+}
+
+/// What `path` holds past byte `from`: this start's lines.
+fn since(path: &Path, from: u64) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(bytes.get(from as usize..).unwrap_or_default())
+            .trim_end()
+            .to_owned(),
+        Err(e) => format!("(it could not be read: {e})"),
     }
-    Err(AppError::Usage(format!(
-        "the daemon did not start within {} s. Its log, {}, ends:\n{}",
-        START_WITHIN.as_secs(),
-        log_path.display(),
-        tail(&log_path, 20)
-    )))
 }
 
 /// The daemon's log, appended to, `0600`.

@@ -70,7 +70,16 @@ impl NodeArgs {
     /// # Errors
     /// If neither a flag, the env vars nor `HOME` names a directory.
     pub fn account(&self) -> vox_core::error::Result<Account> {
-        Account::of(self.data_dir.as_deref(), self.config_dir.as_deref())
+        let account = Account::of(self.data_dir.as_deref(), self.config_dir.as_deref())?;
+        // **An old layout moves before any node is resolved** (ADR-026 F-3): every client entry
+        // point comes through here, so a data root of the layout before v0.3.0 is found as nodes
+        // by whichever verb a person runs first. A no-op once it has moved.
+        let named = self
+            .node
+            .as_deref()
+            .and_then(|n| vox_core::node::paths::NodeName::parse(n).ok());
+        vox_core::node::layout::migrate(&account, named.as_ref())?;
+        Ok(account)
     }
 
     /// Resolve the node (C-3) for a verb that does not create an identity, and its paths.
@@ -194,10 +203,14 @@ pub fn resolve_node(
     if let Some(name) = named.map(str::trim).filter(|n| !n.is_empty()) {
         return NodeName::parse(name);
     }
-    if let [only] = attached_now(account).as_slice() {
+    // An anchor's headless node is no person's or agent's: it holds no room and reads nothing, so
+    // a verb acting as a node never picks it unnamed (ADR-026 N-5).
+    let person = |n: &NodeName| !is_headless(account, n);
+    let attached: Vec<NodeName> = attached_now(account).into_iter().filter(person).collect();
+    if let [only] = attached.as_slice() {
         return Ok(only.clone());
     }
-    let on_disk = account.nodes_on_disk();
+    let on_disk: Vec<NodeName> = account.nodes_on_disk().into_iter().filter(person).collect();
     match on_disk.as_slice() {
         [only] => Ok(only.clone()),
         [] if creates => NodeName::parse(DEFAULT_PROFILE),
@@ -213,6 +226,39 @@ pub fn resolve_node(
                 .join(", ")
         ))),
     }
+}
+
+/// Whether `node` is headless: a key file and no vault, an anchor's.
+fn is_headless(account: &Account, node: &NodeName) -> bool {
+    let dir = account.node_dir(node);
+    !dir.join(vox_core::node::paths::VAULT_FILE).is_file()
+        && dir.join(vox_core::node::headless::IDENTITY_FILE).is_file()
+}
+
+/// The node `vox node` runs as an anchor (ADR-026 N-5, C-3 for an anchor): the one named; else the
+/// only headless node on disk, the one an earlier `vox node` made; else the only node on disk
+/// (whose anchor key is then `<name>-anchor`, beside a vault); else `default` on an empty data
+/// root, made here; else a refusal listing them.
+///
+/// # Errors
+/// As [`resolve_node`], or the node's paths cannot be made.
+pub fn anchor_paths_of(args: &NodeArgs) -> vox_core::error::Result<Paths> {
+    let account = args.account()?;
+    let headless: Vec<NodeName> = account
+        .nodes_on_disk()
+        .into_iter()
+        .filter(|n| is_headless(&account, n))
+        .collect();
+    let name = match (args.node.as_deref().map(str::trim), headless.as_slice()) {
+        (Some(n), _) if !n.is_empty() => NodeName::parse(n)?,
+        (_, [only]) => only.clone(),
+        _ => resolve_node(None, &account, true)?,
+    };
+    Paths::resolve(
+        name.as_str(),
+        args.data_dir.as_deref(),
+        args.config_dir.as_deref(),
+    )
 }
 
 /// The nodes the account's daemon has attached, from its hello; none when no daemon answers.
@@ -238,10 +284,20 @@ pub fn name_of(paths: &Paths) -> Result<NodeName, AppError> {
 /// # Errors
 /// As [`name_of`].
 pub fn one_shot(paths: &Paths) -> Result<NodeSocket, AppError> {
-    Ok(NodeSocket::one_shot(
-        paths.account().socket(),
-        name_of(paths)?,
-    ))
+    Ok(NodeSocket {
+        waiting: Some(say_daemon_waiting),
+        ..NodeSocket::one_shot(paths.account().socket(), name_of(paths)?)
+    })
+}
+
+/// What a verb says on stderr, once, when the daemon has not greeted it within a second.
+pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
+     be busy (moving or attaching a node) or stopped (Ctrl-Z, which goes on once resumed); this \
+     waits up to 10 s";
+
+/// Say [`DAEMON_WAITING`]: a verb waiting on the daemon is never silent (V210-100).
+pub fn say_daemon_waiting() {
+    eprintln!("{DAEMON_WAITING}");
 }
 
 /// A connection to `at` as its node, with each way it can fail said for a person: no daemon, a
@@ -258,10 +314,11 @@ pub fn said(at: &NodeSocket, e: Error) -> AppError {
     let node = &at.using.node;
     let path = at.path.display();
     AppError::Usage(match e {
-        Error::Ipc(IpcHandshake::Unreachable { .. }) => format!(
+        // The cause stays named (#191): the OS's reason the connect failed, beside the socket.
+        Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
             "no vox daemon is running for this data root, so node {node} is not attached.\n\
              \x20      Start one:  vox daemon      (or `vox node attach {node}`)\n\
-             \x20      Socket: {path}"
+             \x20      Socket: {path} ({reason})"
         ),
         Error::Ipc(IpcHandshake::Refused { reason }) => reason,
         Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {
@@ -352,6 +409,10 @@ pub async fn hold(
         w.on("the vox daemon to answer");
     }
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+    // **Held open until the node is attached**: a daemon this started exits once it has no node
+    // and no client (L-8), and making an identity or asking for a passphrase takes longer than
+    // its linger. This connection is a client.
+    let _alive = DaemonClient::open(&account.socket()).await;
     warn_if_listening_elsewhere(&account, args.listen).await;
     let attached = DaemonClient::open(&account.socket())
         .await
@@ -380,8 +441,15 @@ pub async fn hold(
             passphrase,
             anchors: args.anchor_specs(),
         },
+        waiting: Some(say_daemon_waiting),
     };
     let client = open(&at).await?;
+    // What attaching the node said (a skipped anchors line, carrying on with no anchor), in the
+    // person's own terminal as well as the daemon's log (R23, R36): the daemon this verb started
+    // writes only to `<data root>/.daemon/log`.
+    for note in client.attach_notes() {
+        eprintln!("vox: {note}");
+    }
     let me = client.me();
     Ok(Held {
         client,
@@ -421,8 +489,7 @@ async fn identity_for_attach(
 }
 
 /// The passphrase an existing node is attached with: given (`--identity-passphrase-file`,
-/// `VOX_IDENTITY_PASSPHRASE`), else asked at a terminal, else none — the empty passphrase a node
-/// made without one opens with (V030-36); for any other the daemon's refusal says it was wrong.
+/// `VOX_IDENTITY_PASSPHRASE`), else asked at a terminal, else refused, saying how to give one.
 ///
 /// # Errors
 /// The refused flag, or a file that cannot be read.
@@ -433,10 +500,9 @@ pub fn attach_passphrase(
     if let Some(p) = crate::tunnel_cli::identity_passphrase_given(flag, file)? {
         return Ok(Zeroizing::new(p));
     }
-    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return crate::tunnel_cli::ask_identity_passphrase().map(Zeroizing::new);
-    }
-    Ok(Zeroizing::new(String::new()))
+    // Asked at a terminal; with none, refused at once saying how to give it (V210-165). An
+    // identity made with no passphrase is given one as an empty file or an empty variable.
+    crate::tunnel_cli::ask_identity_passphrase().map(Zeroizing::new)
 }
 
 /// Create a node's identity in its directory (C-5): the vault and the store, sealed under
@@ -448,8 +514,27 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    match vox_core::node::profile::Profile::create(paths.clone(), passphrase.as_bytes(), now) {
+    // **A wait is said, once, after a second** (V210-100): another vox making this node's identity
+    // holds its directory, and one stopped (Ctrl-Z) holds it until resumed; this one waiting with
+    // nothing on the screen looked hung.
+    match vox_core::node::profile::Profile::create_noting(
+        paths.clone(),
+        passphrase.as_bytes(),
+        now,
+        vox_core::atrest::sek::Argon2Profile::default(),
+        &crate::tunnel_cli::say_waiting,
+    ) {
         Ok(p) => Ok(p.fingerprint()),
+        // Waited the whole patience and the holder is still not done: say what holds it and how to
+        // find it, never to stop a node — the holder may only be slow, or stopped.
+        Err(Error::ProfileBusy) => Err(AppError::Usage(format!(
+            "another vox is still using this node's directory, and only one at a time may hold \
+             it.\n\x20      It is a command that has not finished (a slow one, or one stopped, \
+             e.g. with Ctrl-Z, which goes on once resumed), or the vox daemon, which holds an \
+             attached node until it detaches.\n\x20      To see which process it is: lsof {}\n\
+             \x20      Run this command again once it is done.",
+            paths.profile_dir.display()
+        ))),
         Err(Error::Profile(why)) if why.contains("already exists") => Err(AppError::Usage(
             "another vox created this node's identity at the same time; nothing was created \
              here.\n\x20      Run `vox id` again to see the identity it made."
@@ -536,7 +621,8 @@ pub async fn events(at: &NodeSocket) -> Result<IpcClient, AppError> {
 
 // ---- vox node create | attach | detach | list ---------------------------------------------------
 
-/// `vox node create <name>`: write the node's files here (C-5), sending nothing over the socket.
+/// `vox node create <name> [--headless]`: write the node's files here (C-5), sending nothing over
+/// the socket.
 /// Its passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the terminal
 /// (asked twice); an empty one is allowed (V030-36).
 ///
@@ -546,6 +632,7 @@ pub fn node_create(
     args: &NodeArgs,
     name: &str,
     passphrase_file: Option<PathBuf>,
+    headless: bool,
 ) -> Result<(), AppError> {
     let name = NodeName::parse(name)?;
     let account = args.account()?;
@@ -559,6 +646,23 @@ pub fn node_create(
         args.data_dir.as_deref(),
         args.config_dir.as_deref(),
     )?;
+    // **A headless node is an anchor's** (ADR-026 N-5, ADR-016): a key file and no vault, so it
+    // runs with nobody at a keyboard; it holds no room and can read nothing.
+    if headless {
+        if passphrase_file.is_some() {
+            return Err(AppError::Usage(
+                "a headless node has no passphrase: its key is a file only you can read".into(),
+            ));
+        }
+        let fp = vox_core::identity::composite::RootSigner::fingerprint(
+            &vox_core::node::headless::load_or_create_identity(&paths)?,
+        );
+        println!(
+            "vox: created headless node {name}; `vox node --node {name}` runs it as an anchor"
+        );
+        println!("{}", vox_core::node::link::b32_encode(&fp));
+        return Ok(());
+    }
     let passphrase = Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
         &paths,
         None,
@@ -594,6 +698,9 @@ pub async fn node_attach(
         args.config_dir.as_deref(),
     )?;
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+    // Held open while the passphrase is read: the daemon this started would otherwise exit as
+    // idle before the attach reaches it (L-8).
+    let mut d = daemon(&account).await?;
     let file = passphrase_file.clone();
     let _ = paths;
     let passphrase = tokio::task::spawn_blocking(move || attach_passphrase(None, file))
@@ -603,7 +710,6 @@ pub async fn node_attach(
         Some(f) => KeepSource::File(absolute(&f)),
         None => KeepSource::None,
     });
-    let mut d = daemon(&account).await?;
     match d
         .request(DaemonRequest::Attach {
             node: name.clone(),
@@ -614,7 +720,12 @@ pub async fn node_attach(
         })
         .await
     {
-        Ok(DaemonFrame::Attached(info)) => {
+        Ok(DaemonFrame::Attached(info, notes)) => {
+            // What attaching it said, in this terminal: the daemon `vox node attach` started
+            // writes only to its log (R23, R36).
+            for note in &notes {
+                eprintln!("vox: {note}");
+            }
             println!("vox: node {} attached{}", info.name, kept(&info));
             Ok(())
         }

@@ -46,6 +46,9 @@ mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -80,13 +83,26 @@ impl Daemon {
         matches!(self.0.try_wait(), Ok(Some(_)))
     }
 
-    /// Send it a signal by its PID (`-STOP` freezes it, `-CONT` thaws it).
+    /// Send it a signal by its PID (`-STOP` freezes it, `-CONT` thaws it), from this process.
+    ///
+    /// **Sent directly, not by running `kill`**: the freeze has to land between the post's answer
+    /// and the daemon's push, which leaves at once, and starting a `kill` process took longer than
+    /// that every time (5 of 5 attempts in each of two tests, 2026-10-03).
     fn signal(&self, sig: &str) {
-        let ok = Command::new("kill")
-            .args([sig, &self.0.id().to_string()])
-            .status()
-            .is_ok_and(|s| s.success());
-        assert!(ok, "APPARATUS: kill {sig} {} failed", self.0.id());
+        use rustix::process::{kill_process, Pid, Signal};
+        let signal = match sig {
+            "-STOP" => Signal::STOP,
+            "-CONT" => Signal::CONT,
+            other => panic!("APPARATUS: no signal {other}"),
+        };
+        let pid = Pid::from_raw(i32::try_from(self.0.id()).unwrap_or(0))
+            .unwrap_or_else(|| panic!("APPARATUS: the daemon has no pid"));
+        let sent = kill_process(pid, signal);
+        assert!(
+            sent.is_ok(),
+            "APPARATUS: kill {sig} {} failed: {sent:?}",
+            self.0.id()
+        );
     }
 
     /// Kill it by its PID and report whether it is gone (reaped): the check that nothing
@@ -146,7 +162,19 @@ fn claimed_times(dir: &Path, question: &str, answer: &str) -> (u64, u64) {
     (find(question), find(answer))
 }
 
-fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
+fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let verb: Vec<&str> = args.to_vec();
+    match attach::needs(dir, &verb) {
+        Some(node) => {
+            attach::Root::at(dir, IDENTITY).attached(&node, || vox_plain(dir, args, stdin))
+        }
+        None => vox_plain(dir, args, stdin),
+    }
+}
+
+fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)

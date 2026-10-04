@@ -37,6 +37,15 @@ T0 = time.time()
 STAGE = ["start"]
 
 
+def is_attached(text):
+    """Whether the TUI's status bar says its node is attached and the TUI acts as it (ADR-026 S-4):
+    `node <name>  ·  attached: …`, where a node not attached reads `node <name> (not attached)`.
+    There is no locked state any more (N-2): this is what "unlocked" was."""
+    import re
+    # Any run of spaces: a driver may read the status bar with its spacing collapsed.
+    return re.search(r"node [a-z0-9._-]+\s+·\s+attached: ", text) is not None
+
+
 class Hung(Exception):
     """The driver ran past its budget, or was told to stop."""
 

@@ -12,12 +12,18 @@
 //! anchors file of two lines that cannot be used (a host that does not resolve, and a malformed
 //! fingerprint). No `--anchor`, no `vox node` running, both on `127.0.0.1`. Then, each a real `vox`:
 //! - `vox id` prints alice's fingerprint and exits 0; `vox trust add` (each trusts the other) exits
-//!   0. Each says the file and both lines were skipped and that it carries on.
+//!   0. **The daemon says it** (ADR-026): it is the one vox that reads the anchors file, when it
+//!   attaches a node, so the node's attach — by hand, by a verb, or for a one-shot verb run by
+//!   `vox node attach` — writes the file, both lines and that it carries on into what the daemon
+//!   says (its own stderr, or `<data root>/.daemon/log` for one a verb started). `vox id` reads
+//!   no anchor and says nothing of one.
 //! - with alice's anchors file replaced by bytes that are not text, `vox id` still prints her
-//!   fingerprint and exits 0, saying the file is skipped whole, why, and that it carries on.
+//!   fingerprint and exits 0, and the daemon that attaches her says the file is skipped whole,
+//!   why, and that it carries on.
 //! - alice's `vox daemon` **starts** (answers `vox room list`) and says it carries on; she
 //!   `vox room create`s a room, posts in it, and `vox room invite`s.
-//! - bob **`vox connect`s** with that address and the room passphrase, and exits 0.
+//! - bob **`vox connect`s** with that address and the room passphrase, and exits 0, saying in his
+//!   own terminal what the attach of his node said (the daemon it started logs it too).
 //! - bob's `vox daemon` starts, and bob **reads alice's post** with `vox room read` — the room
 //!   reached him directly, with no anchor anywhere.
 //! - bob's **`vox tui`** unlocks, opens the room and closes it (`tests/pty/tui_close_room.py`).
@@ -38,9 +44,12 @@
 //! to read back, the TUI driver's own apparatus: pyte missing, its staging, its own error) is
 //! `APPARATUS`.
 //!
-//! **The mutation that must turn it red:** `ProfileArgs::anchor_set` returns the
-//! `AnchorsFileUnusable` error again instead of saying it and carrying on (the V210-75 refusal).
-//! `vox id` exits 1 and prints no fingerprint: red, on the product, at the first arm. And for the
+//! **The mutation that must turn it red:** the daemon's attach (`host.rs`) dropping what the
+//! anchors file skipped again, as it did from the daemon re-architecture until #410: the trust
+//! arm turns red as PRODUCT, nothing having said the file. And `client::hold` no longer printing
+//! the attach's notes: bob's `vox connect` arm turns red as PRODUCT, his terminal told nothing.
+//! And `vox node attach` no longer printing the notes its answer carries: the node-attach arm turns
+//! red as PRODUCT. And for the
 //! "waits on" half: `vox tui` sleeping before it draws when its anchors file names no usable
 //! anchor must turn the TUI arm red as PRODUCT, not CANNOT MEASURE. And for the last arm: the
 //! `BoardUnreachable` advice saying "the anchor could not be reached … check `vox node`" again
@@ -174,6 +183,18 @@ fn carries_on(said: &str, path: &str) -> bool {
         && said.contains("carrying on with no anchor")
 }
 
+/// What the daemons of the data root at `dir` started by a verb have said (`.daemon/log`), from
+/// byte `from` on: the part a step added.
+fn daemon_log(dir: &Path, from: usize) -> String {
+    let all = std::fs::read(dir.join(".daemon").join("log")).unwrap_or_default();
+    String::from_utf8_lossy(all.get(from..).unwrap_or_default()).into_owned()
+}
+
+/// How long `dir`'s `.daemon/log` is now, to read what the next step adds.
+fn log_len(dir: &Path) -> usize {
+    std::fs::metadata(dir.join(".daemon").join("log")).map_or(0, |m| m.len() as usize)
+}
+
 /// `vox daemon` on the profile at `dir`, once it answers `vox room list`; a red naming the
 /// product if it exits first.
 fn daemon(dir: &Path, pass: &str, tag: &str) -> Proc {
@@ -261,27 +282,75 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     // ---- vox id and vox trust: said, skipped, done ---------------------------------------------
     let (ok, out, err) = vox_once(&alice, &args(&["id"]));
     println!(
-        "[proof] vox id: exit ok {ok}; printed the fingerprint: {}; said it carries on: {}",
-        out.trim() == alice_fp,
-        carries_on(&err, &alice_file)
+        "[proof] vox id: exit ok {ok}; printed the fingerprint: {}",
+        out.trim() == alice_fp
     );
     assert!(
-        ok && out.trim() == alice_fp && carries_on(&err, &alice_file),
+        ok && out.trim() == alice_fp,
         "PRODUCT: `vox id` with an anchors file that names no usable anchor must print its \
-         fingerprint ({alice_fp}), exit 0, and name the file, both lines and that it carries on; \
-         it exited ok={ok}, printed {out:?} and said:\n{err}"
+         fingerprint ({alice_fp}) and exit 0; it exited ok={ok}, printed {out:?} and said:\n{err}"
     );
     for (dir, file, fp, name) in [
         (&alice, &alice_file, &bob_fp, "bob"),
         (&bob, &bob_file, &alice_fp, "alice"),
     ] {
+        let at = log_len(dir);
         let (ok, out, err) = vox_once(dir, &args(&["trust", "add", fp, "--name", name]));
-        println!("[proof] vox trust add {name}: exit ok {ok}");
-        assert!(
-            ok && carries_on(&err, file),
-            "PRODUCT: `vox trust add {name}` with an anchors file that names no usable anchor \
-             must work and say it carries on; it exited ok={ok} and said:\n{out}{err}"
+        let said = daemon_log(dir, at);
+        println!(
+            "[proof] vox trust add {name}: exit ok {ok}; its node's attach said it carries on: {}",
+            carries_on(&said, file)
         );
+        assert!(
+            ok && carries_on(&said, file),
+            "PRODUCT: `vox trust add {name}` with an anchors file that names no usable anchor \
+             must work, and the daemon attaching its node must name the file, both lines and that \
+             it carries on; it exited ok={ok} and said:\n{out}{err}\nthe daemon said:\n{said}"
+        );
+    }
+
+    // ---- `vox node attach` says it in the person's terminal ----------------------------------
+    // The daemon it starts writes only to its log, so the attach's notes come back in its answer
+    // and `vox node attach` prints them (R23, R36).
+    let (ok, out, err) = world::vox_once_plain(
+        &alice,
+        &args(&["node", "attach", "default", "--passphrase-file", &pass]),
+    );
+    let said = format!("{out}{err}");
+    println!(
+        "[proof] vox node attach: exit ok {ok}; said it carries on in the terminal: {}",
+        carries_on(&said, &alice_file)
+    );
+    assert!(
+        ok && carries_on(&said, &alice_file),
+        "PRODUCT: `vox node attach` with an anchors file that names no usable anchor must attach \
+         the node and say, in the terminal, the file, both lines and that it carries on; it \
+         exited ok={ok} and said:\n{said}"
+    );
+    let (ok, out, err) = world::vox_once_plain(&alice, &args(&["node", "detach", "default"]));
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox node detach default`: {out}{err}"
+    );
+    // The daemon that attach started exits once it holds no node (ADR-026 L-8); the steps below
+    // start their own, so wait for it to go.
+    let gone = Instant::now() + Duration::from_secs(15);
+    while std::fs::read_to_string(alice.join(".daemon").join("lock"))
+        .ok()
+        .and_then(|p| p.trim().parse::<u32>().ok())
+        .is_some_and(|pid| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    {
+        assert!(
+            Instant::now() < gone,
+            "PRODUCT (staging): the daemon `vox node attach` started did not exit once its node \
+             was detached"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     // ---- an anchors file that cannot be read as text stops nothing either -----------------------
@@ -290,19 +359,30 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     std::fs::write(alice.join("cfg").join("anchors"), b"\xff\xfe\x00bad\n")
         .expect("APPARATUS: cannot write a staging file");
     let (ok, out, err) = vox_once(&alice, &args(&["id"]));
-    let named = err.contains(&format!("{alice_file} is skipped whole: it is not text"))
-        && err.contains("names no usable anchor")
-        && err.contains("carrying on with no anchor");
     println!(
-        "[proof] vox id, anchors file not text: exit ok {ok}; printed the fingerprint: {}; named \
-         the file and carried on: {named}",
+        "[proof] vox id, anchors file not text: exit ok {ok}; printed the fingerprint: {}",
         out.trim() == alice_fp
     );
     assert!(
-        ok && out.trim() == alice_fp && named,
+        ok && out.trim() == alice_fp,
         "PRODUCT: `vox id` with an anchors file that is not text must print its fingerprint \
-         ({alice_fp}), exit 0, and say the file is skipped, why, and that it carries on; it exited \
-         ok={ok}, printed {out:?} and said:\n{err}"
+         ({alice_fp}) and exit 0; it exited ok={ok}, printed {out:?} and said:\n{err}"
+    );
+    let at = log_len(&alice);
+    let (ok, out, err) = vox_once(&alice, &args(&["trust", "list"]));
+    let said = daemon_log(&alice, at);
+    let named = said.contains(&format!("{alice_file} is skipped whole: it is not text"))
+        && said.contains("names no usable anchor")
+        && said.contains("carrying on with no anchor");
+    println!(
+        "[proof] vox trust list, anchors file not text: exit ok {ok}; its node's attach named the \
+         file and carried on: {named}"
+    );
+    assert!(
+        ok && named,
+        "PRODUCT: with an anchors file that is not text, `vox trust list` must work and the daemon \
+         attaching its node must say the file is skipped, why, and that it carries on; it exited \
+         ok={ok} and said:\n{out}{err}\nthe daemon said:\n{said}"
     );
     std::fs::write(alice.join("cfg").join("anchors"), &bad)
         .expect("APPARATUS: cannot write a staging file");
@@ -355,6 +435,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
 
     // ---- bob connects, with no anchor anywhere ---------------------------------------------------
     let t0 = Instant::now();
+    let at = log_len(&bob);
     let mut connect = Proc::spawn(
         &bob,
         &[
@@ -368,17 +449,23 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         "bob-connect",
     );
     let status = connect.exited_within(CONNECT_WITHIN);
+    // **In bob's own terminal** (R23, R36): the daemon `vox connect` started writes only to its
+    // log, so the verb that attached the node prints what the attach said.
     let said = connect.said();
+    let logged = daemon_log(&bob, at);
     println!(
-        "[proof] bob's vox connect: exited {status:?} after {:?}; said it carries on: {}",
+        "[proof] bob's vox connect: exited {status:?} after {:?}; said it carries on in his \
+         terminal: {}; the daemon it started logged it: {}",
         t0.elapsed(),
-        carries_on(&said, &bob_file)
+        carries_on(&said, &bob_file),
+        carries_on(&logged, &bob_file)
     );
     assert!(
         status.is_some_and(|s| s.success()) && carries_on(&said, &bob_file),
         "PRODUCT: bob's `vox connect` to alice, who is directly reachable, with an anchors file \
-         that names no usable anchor, must join (exit 0) and say it carries on; it exited \
-         {status:?} within {CONNECT_WITHIN:?} and said:\n{said}"
+         that names no usable anchor, must join (exit 0) and say in his terminal that it carries \
+         on; it exited {status:?} within {CONNECT_WITHIN:?} and said:\n{said}\nthe daemon it \
+         started logged:\n{logged}"
     );
     drop(connect);
 

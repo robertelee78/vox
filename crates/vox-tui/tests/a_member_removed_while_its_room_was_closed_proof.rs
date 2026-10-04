@@ -48,6 +48,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 
@@ -204,7 +207,9 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         fps.push(out.trim().to_owned());
     }
     let trust = |who: &Path, whom: usize, name: &str| {
-        let (ok, _, err) = vox(who, &["trust", "add", &fps[whom], "--name", name], None);
+        let (ok, _, err) = attach::Root::at(who, IDENTITY).ensure("default", || {
+            vox(who, &["trust", "add", &fps[whom], "--name", name], None)
+        });
         assert!(
             ok,
             "PRODUCT (staging): `vox trust add` of {name} failed: {err}"
@@ -324,7 +329,8 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         line.lines().any(|l| l.contains("[closed]")),
         "PRODUCT (staging): room C, closed in the TUI, is open again when bob's daemon restarts: {line}"
     );
-    let (ok, o, e) = vox(&bob, &["trust", "remove", &fps[0]], None);
+    let (ok, o, e) = attach::Root::at(&bob, IDENTITY)
+        .ensure("default", || vox(&bob, &["trust", "remove", &fps[0]], None));
     assert!(
         ok,
         "PRODUCT (staging): bob's `vox trust remove` of alice failed: {o}{e}"
@@ -357,7 +363,9 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     println!("[proof] (b) after the reopen alice renders {b} of bob's 3 posts, carol {b_carol}");
 
     // ---- (c) bob trusts alice again and reads her again --------------------------------------
-    let (ok, _, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
+    let (ok, _, err) = attach::Root::at(&bob, IDENTITY).ensure("default", || {
+        vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None)
+    });
     assert!(
         ok,
         "PRODUCT (staging): bob's `vox trust add` of alice failed: {err}"
@@ -378,7 +386,9 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         t0.elapsed()
     );
     // And carol, once bob trusts her: the positive control for (b).
-    let (ok, _, err) = vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None);
+    let (ok, _, err) = attach::Root::at(&bob, IDENTITY).ensure("default", || {
+        vox(&bob, &["trust", "add", &fps[2], "--name", "carol"], None)
+    });
     assert!(
         ok,
         "PRODUCT (staging): bob's `vox trust add` of carol failed: {err}"

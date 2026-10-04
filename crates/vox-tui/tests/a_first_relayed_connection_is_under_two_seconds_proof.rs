@@ -124,6 +124,35 @@ fn request(w: &mut RelayWorld, proxy: std::net::SocketAddr, payload: &[u8], n: u
     first
 }
 
+/// SIGKILL to the daemon of the data root `dir` (a process this proof's verbs started), by the PID
+/// its lock names, then wait up to 15 s for it to go.
+fn kill_daemon(dir: &std::path::Path) {
+    let Some(pid) = std::fs::read_to_string(dir.join(".daemon/lock"))
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !alive(),
+        "APPARATUS: the guest's daemon (pid {pid}) did not stop within 15 s"
+    );
+}
+
 #[cfg(feature = "optional-proofs")]
 #[test]
 #[ignore = "real binaries, production Argon2id and a PoW; optional, run it in release"]
@@ -146,7 +175,13 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     // Per sample: the proxy found no anchor connected yet on an attempt (a wait on its start-up).
     let mut before_its_anchor: Vec<bool> = Vec::new();
     for n in 0..SAMPLES {
-        // A fresh `vox up` each time: the previous one's process is killed by its PID first.
+        // A fresh `vox up` each time, on a fresh node process. **The guest's daemon is killed
+        // first**, by the PID in its lock, while the last `vox up` still holds its node: the node
+        // goes as a crash goes, with its connections live and no goodbye — what the anchor's
+        // supersession is for. Killing the `vox up` first would let the node detach cleanly (its
+        // last holder gone), say goodbye and close its connections, and leave the anchor nothing
+        // to supersede. Then the `vox up` goes, and this one starts the next daemon.
+        kill_daemon(&w.guest_dir);
         drop(w.fwd.take());
         let (proxy, ready) = w.up();
         let payload = format!("sample {n}");

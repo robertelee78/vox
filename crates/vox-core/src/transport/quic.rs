@@ -380,10 +380,24 @@ const GRANTED_WHEN_FULL: usize = 2 * UDP_SOCKET_BUFFER;
 #[cfg(not(target_os = "linux"))]
 const GRANTED_WHEN_FULL: usize = UDP_SOCKET_BUFFER;
 
-/// The endpoint parameters every Vox endpoint runs with.
+/// How many bytes over the path-MTU ceiling a datagram this endpoint receives may run.
+///
+/// quinn sizes each receive buffer at the endpoint's `max_udp_payload_size`, and a datagram
+/// longer than its buffer is cut by the kernel, fails decryption and is dropped without a word.
+/// quinn-proto (0.11.18, and 0.11.19 and main as of 2026-10-03) fills a CONNECTION_CLOSE with
+/// a long reason to the packet's size counting its error code as one byte: a peer closing with a
+/// code of 2 to 8 bytes and a reason that fills the packet sends up to 7 bytes more than its
+/// path MTU. At the ceiling, the close was lost, the next packet met the peer's stateless reset,
+/// and the connection ended "reset by peer", its cause gone (#191: an anchor's close, code
+/// 0x7e57, 8194 bytes on an 8192-byte path). Path-MTU discovery is still bounded by the ceiling
+/// ([`base_transport`]), so nothing this endpoint sends grows.
+const RECEIVE_HEADROOM: u16 = 64;
+
+/// The endpoint parameters every Vox endpoint runs with: datagrams up to the path-MTU ceiling,
+/// and [`RECEIVE_HEADROOM`] over it received whole.
 fn endpoint_config(mtu_ceiling: u16) -> quinn::EndpointConfig {
     let mut cfg = quinn::EndpointConfig::default();
-    let _ = cfg.max_udp_payload_size(mtu_ceiling);
+    let _ = cfg.max_udp_payload_size(mtu_ceiling.saturating_add(RECEIVE_HEADROOM));
     cfg
 }
 

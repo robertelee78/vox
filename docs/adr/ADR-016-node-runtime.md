@@ -27,7 +27,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - network tasks hand it parsed, verified wire structures, and the actor makes every admission, acceptance and consent decision.
 
   `NodeView`, `NodeEvent` and `Outcome`/`Fault` MUST carry no keys, SKDMs, SEKs or `self_seed`. `Outcome` and `Fault` MUST be closed `Copy` types with no free text. A passphrase MUST enter as a zeroizing `Secret`.
-- **NR-3.** The client MUST embed the node in its own process: the TUI runs it in-process (ADR-015), and the macOS client is to (ADR-014). Under ADR-026 (S-3, S-4) no client or verb hosts a node; nodes run in the account's one daemon, and the TUI and CLI are its clients: built for the CLI verbs (`two_nodes_are_clients_of_one_daemon_proof`), *not built* for the TUI, which still embeds its node. (The macOS app's embedding is ADR-014's question.)
+- **NR-3.** The client MUST embed the node in its own process: the TUI runs it in-process (ADR-015), and the macOS client is to (ADR-014). Under ADR-026 (S-3, S-4) no client or verb hosts a node; nodes run in the account's one daemon, and the TUI and CLI are its clients: built for the CLI verbs (`two_nodes_are_clients_of_one_daemon_proof`) and for the TUI (#409, `the_tui_shows_the_room_truthfully_proof`). (The macOS app's embedding is ADR-014's question.)
 - **NR-4.** `vox node`, the headless node, MUST be constructed without a vault (`NodeConfig::headless`). It has a transport identity in a `0600` file of two seeds, rebuilt identically at every start so peers keep pinning it, and no profile, SEK, sender keys or pairwise sessions. The absence MUST be structural: the secret-bearing fields are `Option`s the headless constructor leaves `None`. A headless node MUST NOT be able to decrypt (ADR-015 requirement 1.2). Under ADR-026 (N-5, F-3) the headless node is attached to a daemon in the anchor role, its key lives in `nodes/<name>/node-identity.key`, and no TLS leaf carries its identity (ADR-011 requirement 27).
 - **NR-5.** Commands MUST be processed in order, each answered on its own `oneshot`.
 - **NR-5a.** The actor MUST tick once a second (`TICK`). "Within one tick" in this ADR means within that second.
@@ -48,11 +48,11 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 ### App-lock and signals
 
 - **NR-13.** `Lock` MUST drop every SEK, the signer, the prekey ring and the pairwise and sender state, and close the network. A node's detach closes only its own connections; the daemon's endpoint and the other nodes stay up (ADR-026 D-5). A lock MUST be answered once it has settled (V210-94). The actor MUST keep answering other commands while it settles.
-  *Not built (ADR-026 N-2):* there is no `Lock` or `Unlock`. A node gets its passphrase once when it attaches and runs in full while attached; after the keyring window only keyring changes ask again. Detaching does what NR-13 says `Lock` does, for that node only, and is the only way a node stops. NR-13a, NR-13b and NR-14 go with it, and NR-23a's "after every `Unlock`" becomes "on every attach".
+  *Built (ADR-026 N-2, #409):* there is no `Lock` command and no lock or unlock event; the vault is opened once, by the daemon's attach (`a_detach_leaves_no_secret_in_memory_proof`). A node gets its passphrase once when it attaches and runs in full while attached; after the keyring window only keyring changes ask again. Detaching does what NR-13 says `Lock` does, for that node only, and is the only way a node stops. NR-13a, NR-13b and NR-14 go with it, and NR-23a's "after every `Unlock`" becomes "on every attach".
 - **NR-13a.** Dropping the last `NodeHandle` MUST lock the node exactly as `Lock` does, then end the actor.
-- **NR-13b.** The TUI MUST lock after `IDLE_LOCK_SECS` (5 minutes) without input (ADR-015). *Removed by ADR-026 N-2 when built.*
-- **NR-14 (M15.2c).** A headless node MUST refuse `Lock`.
-- **NR-15.** `vox daemon`, `vox node` and every long-running verb MUST stop cleanly on SIGINT, SIGTERM, SIGHUP and SIGQUIT (V210-108). The daemon stops every node cleanly on those signals (`an_anchor_stops_on_ctrl_c_proof`), and a foreground client whose daemon stops exits non-zero, saying so (built, not yet proved).
+- **NR-13b.** The TUI MUST lock after `IDLE_LOCK_SECS` (5 minutes) without input (ADR-015). *Removed by ADR-026 N-2 (#409): the TUI has no lock.*
+- **NR-14 (M15.2c).** A headless node MUST refuse `Lock`. *Removed by ADR-026 N-2 (#409): there is no `Lock`.*
+- **NR-15.** `vox daemon`, `vox node` and every long-running verb MUST stop cleanly on SIGINT, SIGTERM, SIGHUP and SIGQUIT (V210-108). The daemon stops every node cleanly on those signals (`an_anchor_stops_on_ctrl_c_proof`), and a foreground client whose daemon stops exits non-zero, saying so (`the_nodes_of_one_daemon_proof`).
 
 ### Channel lifecycle
 

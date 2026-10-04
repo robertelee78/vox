@@ -26,7 +26,7 @@ import errno, os, sys
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import STAGE, Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import STAGE, Hung, Tui, arm, disarm, pyte, stage, is_attached  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, TAG, VERB, HOLD = sys.argv[1:9]
 HOLD = int(HOLD)
@@ -46,9 +46,10 @@ REFUSALS = (
     "this room has ended",
     "you left this room",
     "joined a moment ago",
-    "channel is not open",
+    "this room is not open",
     "internal error",
-    "could not save",
+    "could not write this node's files",
+    "could not be written",
     "not connected",
     "locked — :unlock",
 )
@@ -108,7 +109,7 @@ try:
         give(1, f"RED: vox tui exited before it asked to unlock:\n{tui.text()}")
     key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds. Unlocked, the rooms list names the room.
-    unlocked = tui.until(lambda: tui.closed or "unlocked" in status(), 90)
+    unlocked = tui.until(lambda: tui.closed or is_attached(status()), 90)
     gone_check()
     if not unlocked:
         give(1, f"RED: the TUI never unlocked, with the right passphrase typed:\n{tui.text()}")

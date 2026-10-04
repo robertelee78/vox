@@ -105,29 +105,24 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
         "PRODUCT (staging): the guest has an anchors file ({}), so its anchor would be configured",
         anchors_file.display()
     );
-    let pass_file = w.passphrase_file();
     let started = Instant::now();
     let mut fwd = VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service,
+            &format!("{}.{}.{}.vox", w.service, w.host_fp, w.room),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &pass_file,
             "--listen",
             Split::Families.guest_listen(),
         ]),
     );
     let line = fwd.expect_line("the forward's bound address", |l| {
-        l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+        l.starts_with("vox: forwarding ")
     });
     let at: std::net::SocketAddr = line
         .split_whitespace()
-        .nth(1)
+        .nth(2)
         .and_then(|a| a.parse().ok())
         .unwrap_or_else(|| {
             panic!("PRODUCT: the forward's address line names no address: {line:?}")

@@ -145,12 +145,36 @@ fn a_leave_and_an_end_take_their_records_off_the_anchor() {
         &carol_err,
     );
     let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
+    // **Carol's own node holds her admin's revocation before she is asked to end the room.** A
+    // node decides who may end a room from the log it holds (ADR-007); until alice's revocation
+    // has synced to carol, carol's node still lists her as an admin and rightly writes the end — an
+    // end every node holding the revocation refuses (removal wins). Asked before the sync, this arm
+    // measured the sync's timing, not the refusal: red 2 runs in 4 under load, carol's node then
+    // listing three admins.
+    let carol_fp = carol.b32();
+    let synced = Instant::now() + WITHIN;
+    loop {
+        let admins = carol.vox(None, &["room", "admin", "list", id]);
+        if admins.ok && !admins.stdout.contains(&carol_fp) {
+            break;
+        }
+        assert!(
+            Instant::now() < synced,
+            "PRODUCT (staging): carol's node never held alice's revocation of her admin within \
+             {WITHIN:?}: it lists {admins:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
     let deadline = Instant::now() + WITHIN;
     let put_to = loop {
+        // Who carol's own node holds as the room's admins as it is asked to end it: what its
+        // refusal, or not, rests on.
+        let admins = carol.vox(None, &["room", "admin", "list", id]);
         let o = carol.vox(None, &["room", "end", id]);
         assert!(
             !o.ok,
-            "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}"
+            "PRODUCT: carol, whose admin was taken back, was not refused `vox room end`: {o:?}\n\
+             carol's node holds as the room's admins: {admins:?}"
         );
         let said = std::fs::read_to_string(&carol_err).unwrap_or_default();
         let put_to = said

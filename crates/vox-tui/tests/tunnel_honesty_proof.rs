@@ -293,18 +293,13 @@ const PATH_CHANGED_WITHIN: Duration = Duration::from_secs(75);
 fn a_forward_keeps_carrying_when_its_path_changes_from_relayed_to_direct() {
     watchdog::arm();
     let mut w = port_forward::ForwardedWorld::new(false);
-    let pass = world::room_pass_file(&w.guest_dir, &w.passphrase);
     let mut fwd = world::VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &pass,
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",
@@ -312,9 +307,9 @@ fn a_forward_keeps_carrying_when_its_path_changes_from_relayed_to_direct() {
         ]),
     );
     let line = fwd.expect_line("the forward's bound address", |l| {
-        l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+        l.starts_with("vox: forwarding ")
     });
-    let at = world::address_in(&mut fwd, &line, 1);
+    let at = world::address_in(&mut fwd, &line, 2);
     let payload: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
 
     // Staging: relayed, observed. The connection rides the anchor's circuit, and none of its
@@ -1414,7 +1409,7 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
     )
     .expect("APPARATUS: resolve the guest's paths");
     let mut client = rt
-        .block_on(vox_core::node::ipc::IpcClient::open(&paths.socket_file()))
+        .block_on(world::attach::paths_client(&paths))
         .unwrap_or_else(|e| panic!("PRODUCT: the guest's TUI serves no control socket: {e}"));
     let room = match rt.block_on(client.rooms()) {
         Ok(vox_core::node::ipc::Frame::Rooms { rooms }) => rooms
@@ -1961,14 +1956,14 @@ enum Back {
     SamePort,
 }
 
-/// The UDP port the host's process listens on, read from the system (`lsof` on its PID).
+/// The UDP port the host's daemon listens on, read from the system (`lsof` on its PID). `vox
+/// serve` is a client (ADR-026 S-3): the socket is its daemon's, whose pid is in the daemon's lock.
 fn host_udp_port(w: &World) -> u16 {
-    let pid = w
-        .host
-        .as_ref()
-        .expect("APPARATUS: a running host")
-        .child
-        .id();
+    let lock = world::daemon_lock(&w.host_dir);
+    let pid: u32 = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|t| t.split_whitespace().next()?.parse().ok())
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: {} names no daemon pid", lock.display()));
     let out = std::process::Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-iUDP", "-Fn", "-P", "-n"])
         .output()
@@ -1990,6 +1985,8 @@ fn restart_host(w: &mut World, back: Back) {
         Back::SamePort => {
             let port = host_udp_port(w);
             drop(w.host.take());
+            // The host's daemon goes too: it holds the port, and the node.
+            world::reap_daemon(&w.host_dir);
             let pass_file = w.tmp.path().join("daemon-passphrases");
             std::fs::write(
                 &pass_file,

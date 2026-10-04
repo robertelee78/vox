@@ -1118,6 +1118,11 @@ pub async fn run(
     Ok(())
 }
 
+/// The longest a hook waits for the daemon to register its session (#408). ADR-020 states no hook
+/// latency, so this is about 10 s: more than the daemon's own bound on a detaching node
+/// ([`vox_core::node::daemonipc::DETACHING_PATIENCE`]), so that refusal arrives first and says why.
+const REGISTER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The daemon a hook speaks to, and the node it acts as (ADR-020 6.10, ADR-026 L-2, L-3).
 pub struct Daemon {
     /// The account whose daemon it is.
@@ -1148,18 +1153,34 @@ impl Daemon {
         let passphrase = std::env::var("VOX_IDENTITY_PASSPHRASE")
             .ok()
             .map(zeroize::Zeroizing::new);
-        match d
-            .request(DaemonRequest::SessionRegister {
+        // **Never without a bound** (#408): the hook runs inside a model's turn, and a wait with
+        // no end hangs the harness. The daemon refuses a node still detaching after
+        // DETACHING_PATIENCE; this bounds everything else the registration can wait on.
+        let asked = tokio::time::timeout(
+            REGISTER_WITHIN,
+            d.request(DaemonRequest::SessionRegister {
                 node: self.node.clone(),
                 session: input.session_id.clone(),
                 record,
                 passphrase,
                 anchors: self.anchors.clone(),
-            })
-            .await
-            .map_err(|e| AppError::Usage(e.to_string()))?
-        {
-            DaemonFrame::Attached(_) => Ok(()),
+            }),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Usage(format!(
+                "the daemon did not register this session within {} s; this turn reads nothing",
+                REGISTER_WITHIN.as_secs()
+            ))
+        })?
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+        match asked {
+            DaemonFrame::Attached(..) => Ok(()),
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
+                Err(AppError::Usage(format!(
+                    "node {node} is still detaching; this turn reads nothing"
+                )))
+            }
             DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string())),
             other => Err(crate::client::unexpected_daemon(&other)),
         }

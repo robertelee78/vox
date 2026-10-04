@@ -33,8 +33,8 @@
 //! are APPARATUS.
 //!
 //! Mutations (each run, each red): a non-zero default retention (R6); the admin check skipped,
-//! and a change that reaches only new entries (R7); the fork check skipped for a pruned position
-//! (R10).
+//! and a change that reaches only new entries (R7); a member's own retention that cannot be saved
+//! reported as the store (R7, R36); the fork check skipped for a pruned position (R10).
 
 #![cfg(unix)]
 
@@ -509,6 +509,29 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
             "PRODUCT: {who}: a refused change must change nothing"
         );
     }
+
+    // ---- a member's own retention that cannot be saved names the file that failed -----------
+    // A directory where the retention file's temporary copy must go: the write cannot happen.
+    let node = bob.join("nodes").join("default");
+    assert!(
+        node.is_dir(),
+        "APPARATUS: bob's node is not at {}",
+        node.display()
+    );
+    let blocker = node.join("config").join("retention.tmp");
+    std::fs::create_dir_all(blocker.join("keep"))
+        .expect("APPARATUS: create the blocking directory");
+    let (ok, said) = set_retention(&bob, &room, "30");
+    println!(
+        "R7: bob's own retention with its file unwritable: ok={ok} — {}",
+        said.trim()
+    );
+    assert!(
+        !ok && said.contains("retention file") && !said.contains("store could not be read"),
+        "PRODUCT: a member's own retention that could not be saved must say its retention file \
+         could not be written, not the store: ok={ok}, {said}"
+    );
+    std::fs::remove_dir_all(&blocker).expect("APPARATUS: remove the blocking directory");
 
     // ---- ...but may keep less, on their own node only -------------------------------------
     let (ok, said) = set_retention(&bob, &room, "30");

@@ -585,6 +585,16 @@ pub enum NodeCommand {
         /// The identity passphrase to check.
         passphrase: Secret,
     },
+    /// A keyring change (`Trust`, `TrustWith`, `Rename`, `Untrust`) whose caller has just
+    /// proved the identity passphrase: [`NodeCommand::VerifyPassphrase`] answered `Done` for it.
+    /// It is made whatever the keyring window says, and the window starts again (V210-159). The
+    /// window is for a change made **without** the passphrase; one made with it is never asked
+    /// for it again, however several checks passing at once raced to restart the window. The
+    /// daemon builds it only after the check; nothing on the control socket names it.
+    Proved {
+        /// The keyring change. Anything else is refused as an internal fault.
+        change: Box<NodeCommand>,
+    },
     /// Merge more anchors into the configured set, and dial any not yet connected.
     ///
     /// The set is resolved when configuration is read, so a long-running node holds the
@@ -601,8 +611,6 @@ pub enum NodeCommand {
         /// The identity passphrase.
         passphrase: Secret,
     },
-    /// App-lock: drop the identity signer and every open channel's SEK.
-    Lock,
     /// Create a channel (needs the unlocked identity).
     CreateChannel {
         /// The local (device-only) name.
@@ -880,6 +888,14 @@ pub enum Fault {
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
+    /// Unlocking an identity of an older vox, its file (`vault.cbor`) could not be rewritten in
+    /// this build's format; the old file is kept, unchanged. Not [`Fault::Storage`], which named
+    /// the store, nor [`Fault::IdentityFileUnwritable`], which says no identity was made.
+    IdentityFileNotRewritten,
+    /// A member's own retention for a room could not be saved: its file (`retention`, in the
+    /// node's configuration directory) could not be written. Not [`Fault::Storage`], which named
+    /// the store.
+    RetentionFileUnwritable,
     /// The identity passphrase was right, but something this identity sealed (its trust
     /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
     /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
@@ -1068,6 +1084,12 @@ impl Fault {
             Fault::ProfileBusy => {
                 "another vox holds this profile open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
             }
+            Fault::RetentionFileUnwritable => {
+                "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
+            }
+            Fault::IdentityFileNotRewritten => {
+                "the profile's identity file (vault.cbor) could not be written in this vox's format, so the old one was kept\n       check free disk space, and that the data directory is writable; then run it again"
+            }
             Fault::IdentityFileUnwritable => {
                 "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
             }
@@ -1183,6 +1205,27 @@ impl Fault {
     }
 }
 
+impl Fault {
+    /// The fault whose [`Fault::explain`] is `text`, or that `text` names as `Failed(<name>)` (the
+    /// join's answer, V210-114), if there is one: how a client of the daemon gets back the typed
+    /// fault a request failed with.
+    #[must_use]
+    pub fn from_explanation(text: &str) -> Option<Self> {
+        let first = text.lines().next().unwrap_or_default();
+        if let Some(name) = first
+            .strip_prefix("Failed(")
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            return Self::from_name(name);
+        }
+        // A fault's explanation may run to a second line of advice; its first line names it.
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|f| f.explain().lines().next() == Some(first))
+    }
+}
+
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.explain())
@@ -1207,6 +1250,10 @@ macro_rules! fault_names {
                     $(Fault::$fault => stringify!($fault),)*
                 }
             }
+
+            /// Every fault, so a client given only a fault's explanation over the control socket
+            /// can tell which it was ([`Fault::from_explanation`]).
+            pub const ALL: &'static [Fault] = &[$(Fault::$fault,)*];
 
             /// The fault named `name` (as [`Fault::name`] gives it), if there is one.
             #[must_use]
@@ -1233,6 +1280,8 @@ fault_names!(
     Storage,
     ProfileBusy,
     IdentityFileUnwritable,
+    IdentityFileNotRewritten,
+    RetentionFileUnwritable,
     SealedUnreadable,
     ShuttingDown,
     NotNetworked,
@@ -1363,10 +1412,6 @@ pub enum NodeEvent {
         /// The rendered entry.
         row: MessageRow,
     },
-    /// The identity was unlocked.
-    Unlocked,
-    /// The identity (and every open channel) was locked.
-    Locked,
     /// A channel was opened.
     ChannelOpened {
         /// The channel.
@@ -1720,4 +1765,178 @@ pub enum NodeEvent {
     },
     /// The actor has stopped.
     Shutdown,
+}
+
+impl NodeEvent {
+    /// The event as a sentence a person can read, for a front end that shows events as text (the
+    /// macOS app's notices): never the event's debug form, which is a struct dump (R36). Room and
+    /// member ids are given as their first 12 characters, as the CLI shows them.
+    #[must_use]
+    pub fn words(&self) -> String {
+        fn short(d: &Digest32) -> String {
+            crate::node::link::b32_encode(d).chars().take(12).collect()
+        }
+        match self {
+            NodeEvent::WaitingForProfile => {
+                "waiting for another vox that is using this identity's files".into()
+            }
+            NodeEvent::NewEntry { channel_id, .. } => {
+                format!("a new message in room {}", short(channel_id))
+            }
+            NodeEvent::ChannelOpened { channel_id } => {
+                format!("room {} is open", short(channel_id))
+            }
+            NodeEvent::ChannelClosed { channel_id } => {
+                format!("room {} is closed", short(channel_id))
+            }
+            NodeEvent::RoomEnded {
+                channel_id,
+                handed,
+                members,
+            } => format!(
+                "room {} ended; {handed} of its {members} members were told directly, the rest \
+                 learn it from them",
+                short(channel_id)
+            ),
+            NodeEvent::RoomRemoved { channel_id } => {
+                format!("room {} was removed from this device", short(channel_id))
+            }
+            NodeEvent::PeerJoined { channel_id, peer } => format!(
+                "{} joined room {}; they read nothing until you trust them",
+                short(peer),
+                short(channel_id)
+            ),
+            NodeEvent::KeyNotTaken {
+                channel_id,
+                peer,
+                why,
+            } => format!(
+                "{} did not take your key for room {} — {why}; it is sent again",
+                short(peer),
+                short(channel_id)
+            ),
+            NodeEvent::SenderKeyReceived {
+                channel_id, peer, ..
+            } => format!(
+                "{}'s messages in room {} can be read now",
+                short(peer),
+                short(channel_id)
+            ),
+            NodeEvent::ReachWithdrawn { channel_id, port } => format!(
+                "the host withdrew your reach to port {port} in room {}, so the tunnel was cut",
+                short(channel_id)
+            ),
+            NodeEvent::SyncFailed {
+                channel_id,
+                peer,
+                reason,
+            } => format!(
+                "sync of room {} with {} did not complete — {reason}",
+                short(channel_id),
+                short(peer)
+            ),
+            NodeEvent::RoomNotRemembered { channel_id, why } => format!(
+                "room {} is open, but will not reopen by itself after a restart — {why}",
+                short(channel_id)
+            ),
+            NodeEvent::Stalled { what, millis } => {
+                format!("busy {millis} ms — {what} — nobody could be answered")
+            }
+            NodeEvent::PublishRefused {
+                channel_id,
+                what,
+                why,
+            } => format!(
+                "a board would not take {what} for room {} — {why}",
+                short(channel_id)
+            ),
+            NodeEvent::PublishCured { channel_id, what } => format!(
+                "{what} for room {} was taken on a republish",
+                short(channel_id)
+            ),
+            NodeEvent::RetentionAboveRoom {
+                channel_id,
+                node,
+                room,
+            } => format!(
+                "this device asks to keep room {}'s messages for {node} s, but the room keeps \
+                 them for {room} s, which is what applies",
+                short(channel_id)
+            ),
+            NodeEvent::ConnectionNote { peer, note } => {
+                format!("connection to {} — {note}", short(peer))
+            }
+            NodeEvent::NodeNote { note } => note.clone(),
+            NodeEvent::HandshakesQueued {
+                waited, refused, ..
+            } => format!(
+                "a burst of connections: {waited} waited for a handshake slot and {refused} were \
+                 turned away"
+            ),
+            NodeEvent::JoinFailed { reason } => format!("a join did not complete — {reason}"),
+            NodeEvent::JoinSteps { joined, steps } => {
+                if *joined {
+                    format!("the join got in — {steps}")
+                } else {
+                    format!("the join did not get in — {steps}")
+                }
+            }
+            NodeEvent::JoinStep { step } => format!("joining: {step}"),
+            NodeEvent::StillRelayed { peer, reason } => {
+                format!("still relayed to {} — {reason}", short(peer))
+            }
+            NodeEvent::ProxyRefused { reason } => format!("tunnel refused or cut — {reason}"),
+            NodeEvent::TunnelClosed { reason } => format!("tunnel closed — {reason}"),
+            NodeEvent::PeerUnreachable { peer, why } => {
+                format!("could not reach {} — {why}", short(peer))
+            }
+            NodeEvent::Forwarding {
+                host,
+                service_tag,
+                local,
+                ..
+            } => format!("forwarding {local} to {service_tag} on {}", short(host)),
+            NodeEvent::AddressWithheld { reason, .. } => {
+                format!("the address was not handed out — {reason}")
+            }
+            NodeEvent::AddressNote { note, .. } => note.clone(),
+            NodeEvent::InviteLink { channel_id, url } => {
+                format!("invite link for room {}: {url}", short(channel_id))
+            }
+            NodeEvent::Joined {
+                channel_id,
+                responder,
+            } => format!(
+                "joined room {}, let in by {}",
+                short(channel_id),
+                short(responder)
+            ),
+            NodeEvent::Consented { channel_id, target } => format!(
+                "{} can now read your messages in room {}",
+                short(target),
+                short(channel_id)
+            ),
+            NodeEvent::Revoked {
+                channel_id, target, ..
+            } => format!(
+                "{} can no longer read your new messages in room {}",
+                short(target),
+                short(channel_id)
+            ),
+            NodeEvent::TunnelServed {
+                client,
+                service_tag,
+                ..
+            } => format!("{} reached {service_tag}", short(client)),
+            NodeEvent::ProxyUp { hostname, bind, .. } => {
+                format!("{hostname} is reachable through {bind}")
+            }
+            NodeEvent::Synced {
+                channel_id,
+                applied,
+                ..
+            } => format!("room {} synced: {applied} new entries", short(channel_id)),
+            NodeEvent::Shutdown => "the node stopped".into(),
+        }
+    }
 }
