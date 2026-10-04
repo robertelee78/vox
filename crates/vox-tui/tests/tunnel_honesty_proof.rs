@@ -1956,14 +1956,14 @@ enum Back {
     SamePort,
 }
 
-/// The UDP port the host's process listens on, read from the system (`lsof` on its PID).
+/// The UDP port the host's daemon listens on, read from the system (`lsof` on its PID). `vox
+/// serve` is a client (ADR-026 S-3): the socket is its daemon's, whose pid is in the daemon's lock.
 fn host_udp_port(w: &World) -> u16 {
-    let pid = w
-        .host
-        .as_ref()
-        .expect("APPARATUS: a running host")
-        .child
-        .id();
+    let lock = world::daemon_lock(&w.host_dir);
+    let pid: u32 = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|t| t.split_whitespace().next()?.parse().ok())
+        .unwrap_or_else(|| panic!("CANNOT MEASURE: {} names no daemon pid", lock.display()));
     let out = std::process::Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-iUDP", "-Fn", "-P", "-n"])
         .output()
@@ -1985,6 +1985,8 @@ fn restart_host(w: &mut World, back: Back) {
         Back::SamePort => {
             let port = host_udp_port(w);
             drop(w.host.take());
+            // The host's daemon goes too: it holds the port, and the node.
+            world::reap_daemon(&w.host_dir);
             let pass_file = w.tmp.path().join("daemon-passphrases");
             std::fs::write(
                 &pass_file,
