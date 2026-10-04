@@ -6088,6 +6088,15 @@ impl Node {
                 let peer = conn.peer_id();
                 self.sync_dials.remove(&peer);
                 self.adopt_connection(Arc::clone(&conn));
+                // **And every connection the dial left retired** (#335): a reach files each
+                // connection its rungs made, and one it filed first can have been displaced by a
+                // later one. The peer may have filed it first too, and sent on it, so it is read
+                // until its grace ends, as a retired connection the peer dialled is.
+                if let Some(net) = self.net.as_ref().map(Arc::clone) {
+                    for retired in net.manager().retiring_to(&peer) {
+                        self.adopt_connection(retired);
+                    }
+                }
                 if let Some(net) = self.net.as_ref().map(Arc::clone) {
                     if crate::node::net::path_class(net.manager().endpoint(), &conn)
                         == crate::node::net::PathClass::Relayed

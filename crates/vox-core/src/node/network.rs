@@ -1361,7 +1361,31 @@ impl NodeNet {
         let mut why: Vec<String> = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((_, Ok(conn))) => return Ok(self.manager.adopt(conn).await),
+                Ok((_, Ok(conn))) => {
+                    #[cfg(feature = "test-knobs")]
+                    if let Some(ms) = test_ladder_settle_ms() {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    let won = self.manager.adopt(conn).await;
+                    // **Every connection a rung made is filed, not only the first** (#335). Two
+                    // circuits through two helpers connect within milliseconds of each other, and
+                    // the far end accepts both and keeps the one with the lower `tie_key`. Dropped
+                    // here, the second was neither weighed nor closed — the circuit's driver held
+                    // it open — so the far end could keep, and send its keys on, a connection this
+                    // end never read: bob read carol at 540 ms, and carol never read bob. Filed,
+                    // both ends weigh the same connections and keep the same one; a loser is
+                    // closed, and its close crosses. Closing every late one instead lost both
+                    // ends' connections when each had kept the other's late one. The caller
+                    // serves the one kept and every one retired (`NetEvent::Dialed`). Rungs still
+                    // dialling are given up, as before.
+                    set.abort_all();
+                    while let Some(late) = set.join_next().await {
+                        if let Ok((_, Ok(conn))) = late {
+                            self.manager.adopt(conn).await;
+                        }
+                    }
+                    return Ok(self.manager.existing(&peer).unwrap_or(won));
+                }
                 Ok((rung, Err(e))) => why.push(format!("{rung}: {e}")),
                 Err(_) => why.push("a rung was cancelled".to_owned()),
             }
@@ -2144,6 +2168,23 @@ fn join_addrs(addrs: &[std::net::SocketAddr]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// **For proofs only.** When set, a reach whose first rung connected waits this many milliseconds
+/// before it files that connection, which stands for a ladder whose filing is slow (a probe of a
+/// held connection, a busy machine): the other rungs finish meanwhile. A proof uses it to make a
+/// member's two circuits through two relays both connect before either is filed, every run (#335).
+/// Nothing a person runs sets it; unset, nothing changes. Not compiled in without the `test-knobs`
+/// feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_LADDER_SETTLE_ENV: &str = "VOX_TEST_LADDER_SETTLE_MS";
+
+/// [`TEST_LADDER_SETTLE_ENV`]'s milliseconds, if set.
+#[cfg(feature = "test-knobs")]
+fn test_ladder_settle_ms() -> Option<u64> {
+    std::env::var(TEST_LADDER_SETTLE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// A peer id shortened to the first four bytes, which is enough to tell two helpers apart

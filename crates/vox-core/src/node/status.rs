@@ -1240,22 +1240,25 @@ impl SyncBook {
         stuck_after: std::time::Duration,
     ) -> String {
         // Read before the book is held: the manager takes a lock of its own.
-        let held: BTreeMap<Digest32, (String, crate::node::net::PathClass)> = {
-            let manager = book
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .connections
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            manager
-                .map(|m| {
-                    m.held_connections()
-                        .into_iter()
-                        .map(|(peer, tag, path)| (peer, (tag, path)))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        let manager = book
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .connections
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let held: BTreeMap<Digest32, (String, crate::node::net::PathClass)> = manager
+            .as_ref()
+            .map(|m| {
+                m.held_connections()
+                    .into_iter()
+                    .map(|(peer, tag, path)| (peer, (tag, path)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut retired: BTreeMap<Digest32, Vec<String>> = BTreeMap::new();
+        for (peer, tag) in manager.map(|m| m.retired_connections()).unwrap_or_default() {
+            retired.entry(peer).or_default().push(q(&tag));
+        }
         let b = book.lock().unwrap_or_else(PoisonError::into_inner);
         let mut s = String::from("\"sync\":[");
         for (i, ((room, peer), c)) in b.ports.iter().enumerate() {
@@ -1312,6 +1315,7 @@ impl SyncBook {
             .chain(circuits.keys())
             .chain(dial_backs.keys())
             .chain(held.keys())
+            .chain(retired.keys())
             .collect();
         for (i, peer) in peers.into_iter().enumerate() {
             if i > 0 {
@@ -1330,10 +1334,13 @@ impl SyncBook {
                     (q(tag), q(path))
                 },
             );
+            // And the ones displaced but still open, read until their grace ends (#335).
+            let retired = retired.get(peer).map(|t| t.join(",")).unwrap_or_default();
             let _ = write!(
                 s,
                 "{{\"peer\":\"{}\",\"ladders\":{},\"circuits\":{},\"dial_backs\":{asked},\
-                 \"dial_backs_answered\":{answered},\"connection\":{connection},\"path\":{path}}}",
+                 \"dial_backs_answered\":{answered},\"connection\":{connection},\"path\":{path},\
+                 \"retired\":[{retired}]}}",
                 b32_encode(peer),
                 b.ladders.get(peer).copied().unwrap_or(0),
                 circuits.get(peer).copied().unwrap_or(0)

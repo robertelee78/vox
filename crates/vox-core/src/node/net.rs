@@ -684,6 +684,20 @@ impl ConnectionManager {
         &self.endpoint
     }
 
+    /// The connections a newcomer displaced that are still open, by peer and tag, as `vox status
+    /// --json` reports them beside the one held (#335): what this end still reads from the peer,
+    /// which is what the peer's end must still be able to send on.
+    #[must_use]
+    pub fn retired_connections(&self) -> Vec<(Digest32, String)> {
+        let mut retired: Vec<(Digest32, String)> = lock(&self.retiring)
+            .iter()
+            .filter(|(c, _)| is_live(c))
+            .map(|(c, _)| (c.peer_id(), conn_tag(c)))
+            .collect();
+        retired.sort();
+        retired
+    }
+
     /// The connection this node holds for each peer, as `vox status --json` reports it: the
     /// peer, the connection's tag (the first bytes of its TLS exporter, the same at both ends, as
     /// the connection notes name it) and its path. Only connections not yet closed.
