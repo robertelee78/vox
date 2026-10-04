@@ -5,8 +5,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status**: implemented in part, `crates/vox-tui` on integrate/v0.3.0. The `vox` binary, its live TUI over
 the embedded node, the network verbs and install/update are built. Each requirement below is marked
 *Built* or *Planned*, or says which part is built. Under ADR-026 every verb is a client of the
-account's one daemon (built); the TUI still embeds and locks its node (1.2, 11.2–11.3 and 9.1 are
-not built for it).
+account's one daemon (built), the TUI included (#409): it embeds no node and has no lock (1.2, 9.1,
+11.2–11.4).
 **Date**: 2026-06-20
 **Deciders**: Robert E. Lee
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui, distribution
@@ -28,9 +28,10 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 1.2. A user-run headless node MUST be only a ciphertext-only sync peer of the TUI's embedded node
      (ADR-008 over ADR-011). It MUST NOT hold this user's secrets or plaintext, and the TUI MUST NOT
      remote-control it. The TUI MUST hold the secrets and decrypt locally. A remote-core thin client
-     is out of scope and needs its own ADR. *Built.* *Decided, not built (ADR-026 S-4):* the TUI is a
+     is out of scope and needs its own ADR. *Superseded and built (ADR-026 S-4, #409):* the TUI is a
      client of the account's daemon over its control socket, which holds the node's secrets in the
-     same OS account; a headless node elsewhere stays a ciphertext-only peer.
+     same OS account; a headless node elsewhere stays a ciphertext-only peer
+     (`the_tui_shows_the_room_truthfully_proof`, `a_detach_leaves_no_secret_in_memory_proof`).
 1.3. The runtime MUST be multi-threaded tokio. The main task MUST own the terminal and the render
      loop, a dedicated blocking task MUST read `crossterm` events, and shutdown MUST be cooperative
      through a `CancellationToken`. Rendering MUST NOT block on the core. *Built.*
@@ -140,9 +141,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 
 9.1. The TUI MUST embed the node while running, or sync with a user-run node as a ciphertext-only
      peer (1.2). The TUI MUST NOT make either compulsory. It MUST show per-room reachability and sync
-     state. *Built.* *Decided, not built (ADR-026):* the TUI shows the daemon's attached nodes, live
-     through attach and detach events, and acts as the node the person picks (ADR-026
-     C-3); it MUST NOT embed a node.
+     state. *Built.* *Superseded and built (ADR-026, #409):* the TUI shows the daemon's attached
+     nodes, live through attach and detach events, and acts as the node the person picks (ADR-026
+     C-3; `--node`, `:node <name>`); it MUST NOT embed a node (`the_tui_shows_the_room_truthfully_proof`, `tui_member_names_proof`, `tui_unread_backfill_proof`).
 9.2. New decryptable entries MUST show in the app (unread markers on the room list, a status line).
      *Built.*
 9.3. On a desktop session the TUI MUST also raise an OS notification, and over SSH it MUST fall back to
@@ -173,15 +174,17 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 11.2. Lock MUST zeroize the room SEKs, the in-memory identity root (generate path) and the decrypted
       view models, and MUST require the identity vault and each room's passphrase again. For a
       `gpg-agent` key, Vox MUST clear only its own derived material. *Built for the generate path.*
-      *Not built (ADR-026 N-2):* 11.2–11.4 are removed: the TUI is a daemon client with no node
-      lock. A node's secrets are wiped when it detaches (ADR-026 L-3).
+      *Removed (ADR-026 N-2, #409):* 11.2–11.4 are removed: the TUI is a daemon client with no node
+      lock. A node's secrets are wiped when it detaches (ADR-026 L-3), and the TUI holds no copy of
+      the passphrase it attached with (`a_detach_leaves_no_secret_in_memory_proof`).
 11.3. The TUI MUST lock after 5 minutes idle (the default) and on `SIGHUP` or a dropped connection. The
       lock MUST be configurable, including off, with a direct warning. *The 5-minute idle lock, `:lock`
-      and `SIGHUP` are built; configuring them is planned.* *Not built (ADR-026 N-2):* the idle lock, `:lock` and the
-      `SIGHUP` lock go; `SIGHUP` stops the TUI cleanly and leaves its node attached.
+      and `SIGHUP` are built; configuring them is planned.* *Built (ADR-026 N-2, ruling of 2026-10-03, #409):* the idle lock, `:lock` and the
+      `SIGHUP` lock go; `SIGHUP` stops the TUI cleanly, the same as quitting, and the TUI only drops its
+      hold on its node, which detaches if the TUI was its last holder (ADR-026 S-4, L-3).
 11.4. The node MUST track every task it hands a signer handle to and abort them all when it locks,
       before it drops the prekey ring, so no task outlives the lock holding the identity. *Built
-      (`Profile::signer_arc`).*
+      (`Profile::signer_arc`); it holds of a detach, which is the node's only stop (ADR-026 N-2).*
 11.5. Inside a detected terminal multiplexer the TUI MUST show a one-time warning that capture there
       is outside Vox's control. *Planned.*
 11.6. Secrets MUST be `zeroize`/`secrecy` types and MUST be memory-locked. Where locking is

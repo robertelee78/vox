@@ -38,7 +38,7 @@ mod watchdog;
 
 use world::{vox_once, IDENTITY, VOX};
 
-const NAMED: &str = "another vox created this profile's identity at the same time";
+const NAMED: &str = "another vox created this node's identity at the same time";
 const NOTHING_HERE: &str = "nothing was created here";
 
 #[test]
