@@ -320,8 +320,37 @@ pub fn vox_once_attached(data: &Path, args: &[String]) -> (bool, String, String)
     attach::Root::at(data, IDENTITY).attached(DEFAULT_NODE, || vox_once(data, args))
 }
 
-/// Run a one-shot `vox` verb to completion.
+/// The verbs that refuse a node no daemon holds (ADR-026 L-2, ruled): a person attaches the node
+/// first.
+const NEEDS_ATTACHED: &[&str] = &[
+    "room", "trust", "status", "service", "share", "app", "tunnel", "doctor",
+];
+
+/// Run a one-shot `vox` verb to completion — **as a person runs it since ADR-026 L-2**: a verb
+/// that needs its node attached, run while no daemon holds this data root, runs with the node
+/// attached by `vox node attach` and let go after (`attach::Root::attached`), so a daemon the
+/// proof starts next is the one that runs. With a daemon holding the root it runs as it is.
 pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
+    let needs = args
+        .first()
+        .is_some_and(|v| NEEDS_ATTACHED.contains(&v.as_str()));
+    let root = attach::Root::at(data, IDENTITY);
+    if needs && !root.daemon_running() && !layout::node_dir(data, DEFAULT_NODE).exists() {
+        // No node to attach: the verb says so itself.
+        return vox_once_plain(data, args);
+    }
+    if needs && !root.daemon_running() {
+        let node = args
+            .windows(2)
+            .find(|w| w[0] == "--node")
+            .map_or(DEFAULT_NODE.to_owned(), |w| w[1].clone());
+        return root.attached(&node, || vox_once_plain(data, args));
+    }
+    vox_once_plain(data, args)
+}
+
+/// [`vox_once`] exactly as given, attaching nothing.
+pub fn vox_once_plain(data: &Path, args: &[String]) -> (bool, String, String) {
     let out = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", data)
