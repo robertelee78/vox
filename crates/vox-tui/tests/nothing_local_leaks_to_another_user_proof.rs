@@ -1012,6 +1012,8 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         ok,
         "PRODUCT (staging): vox node attach after the stop: {err}"
     );
+    // That attach started a daemon of its own: stopped by its lock's pid however this ends.
+    let _reaper = layout::Reaper(vec![alice.data.clone()]);
     let room_pass = tmp.path().join("room.pass");
     std::fs::write(&room_pass, ROOM_PASS).expect("APPARATUS: the room passphrase file");
     let list = |what: &str| {
