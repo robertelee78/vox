@@ -37,7 +37,8 @@
 //!
 //! **Both arms run on a Mac.** Its grant is full (`kern.ipc.maxsockbuf` 8 MiB by default; a
 //! short one is CANNOT MEASURE), so the no-notice arm is measured first. Then the short arm is
-//! staged without root: every `vox` runs with the test-only DYLD interposer
+//! staged without root: every `vox` — the daemons the clients start included — runs with the
+//! test-only DYLD interposer
 //! (`crates/vox-test-interpose`) and `VOX_INTERPOSE_RCVBUF_CAP` = [`CAP`], which makes each
 //! `setsockopt(SO_RCVBUF, 4 MiB)` ask for 1 MiB instead. The kernel really grants 1 MiB and the
 //! product reads it back, exactly as on a host whose `maxsockbuf` is small; the binary is
@@ -163,17 +164,35 @@ fn run_arm(granted: usize, short: bool, staged: Option<&std::path::Path>) {
     );
     eprintln!("[proof] echoed {} bytes through the forward", back.len());
 
-    let host = w
-        .host
-        .take()
-        .expect("APPARATUS: the world has no host process");
-    // Moved out (the temp dir stays with `w`) so it is killed last, after everything that
-    // reaches through it.
+    // Since ADR-026 (D-3) the UDP socket is each data root's daemon's: `vox forward` and
+    // `vox serve` are clients, so the endpoints measured are the guest's and the host's daemons
+    // (their pid from `.daemon/lock`, what they said from `.daemon/log`), and the anchor.
+    let daemon_of = |name: &str, dir: &std::path::Path| -> (String, u32, Vec<String>) {
+        let pid: u32 = std::fs::read_to_string(dir.join(".daemon").join("lock"))
+            .ok()
+            .and_then(|t| t.split_whitespace().next()?.parse().ok())
+            .unwrap_or_else(|| panic!("PRODUCT (staging): no daemon holds {}", dir.display()));
+        let log = std::fs::read_to_string(dir.join(".daemon").join("log")).unwrap_or_default();
+        // The log holds every daemon this data root has run (one started for an attach before
+        // this one, say): only the running daemon's lines, after the last one's "stopped".
+        let lines: Vec<String> = log.lines().map(str::to_owned).collect();
+        let from = lines
+            .iter()
+            .rposition(|l| l.starts_with("vox daemon: stopped"))
+            .map_or(0, |i| i + 1);
+        (name.to_owned(), pid, lines[from..].to_vec())
+    };
+    let guest_daemon = daemon_of("the guest's daemon", &w.guest_dir);
+    let host_daemon = daemon_of("the host's daemon", &w.host_dir);
+    drop(forward);
+    drop(w.host.take());
     let anchor = w.anchor;
-    for proc in [forward, host, anchor] {
-        let name = proc.name.clone();
-        let pid = proc.child.id();
-        let said = everything_said(proc);
+    let anchor_said = (
+        anchor.name.clone(),
+        anchor.child.id(),
+        everything_said(anchor),
+    );
+    for (name, pid, said) in [guest_daemon, host_daemon, anchor_said] {
         if let Some(log) = staged {
             staged_for(log, pid, &name);
         }
@@ -222,7 +241,18 @@ fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
             log.display()
         )
     });
-    let clamped = syscalls::parse(&text).iter().any(|e| {
+    let events = syscalls::parse(&text);
+    let clamping: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e.call {
+            syscalls::Call::RcvBuf { asked, set } => Some(format!(
+                "pid {} asked {asked} set {set} ret {}",
+                e.pid, e.ret
+            )),
+            _ => None,
+        })
+        .collect();
+    let clamped = events.iter().any(|e| {
         e.pid == pid
             && e.ret == 0
             && matches!(e.call, syscalls::Call::RcvBuf { asked, set }
@@ -231,7 +261,8 @@ fn staged_for(log: &std::path::Path, pid: u32, name: &str) {
     assert!(
         clamped,
         "APPARATUS, CANNOT MEASURE: {name} (pid {pid}) recorded no SO_RCVBUF request \
-         clamped to {CAP} bytes, so the interposer did not stage its short grant"
+         clamped to {CAP} bytes, so the interposer did not stage its short grant (pids that \
+         recorded one: {clamping:?})"
     );
 }
 

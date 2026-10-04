@@ -493,6 +493,10 @@ pub enum Error {
     #[error("{0}")]
     AppRefused(String),
 
+    /// No node could be chosen for a verb (ADR-026 C-3): what there is, and how to name one.
+    #[error("{0}")]
+    NoNodeChosen(String),
+
     /// Attaching to a node's control socket failed before any request: the connect, or
     /// the node's greeting. Said in a person's words, because each one needs a different
     /// remedy and they used to share one sentence (#191).
@@ -615,6 +619,14 @@ pub enum IpcHandshake {
     Stuck {
         /// How long the ping was given.
         secs: u64,
+    },
+    /// The daemon answered the connection's `Use` with a refusal (ADR-026 C-2): the node is not
+    /// attached for a one-shot verb, there is no such node, a wrong passphrase. Its words say what
+    /// to do.
+    #[error("{reason}")]
+    Refused {
+        /// The daemon's refusal, for a person.
+        reason: String,
     },
 }
 

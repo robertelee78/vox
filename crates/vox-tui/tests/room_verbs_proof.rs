@@ -153,8 +153,9 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         !ok,
         "PRODUCT: `vox room list` succeeded with no node running; stderr: {err}"
     );
+    // Since ADR-026 (C-3): no node exists yet, said with how to make one.
     assert!(
-        err.contains("no node is running"),
+        err.contains("there is no node") && err.contains("vox node create"),
         "PRODUCT: the no-node error must say so plainly, got: {err}"
     );
 

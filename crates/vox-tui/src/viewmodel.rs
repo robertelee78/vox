@@ -149,10 +149,14 @@ pub struct ViewModel {
     pub active: Option<ChannelView>,
     /// Overall sync status.
     pub sync: SyncStatus,
-    /// Whether the app is locked (SEK/identity zeroized, re-auth required).
-    pub locked: bool,
-    /// Whether a lock is under way and waiting for work that holds a secret (V210-94).
-    pub locking: bool,
+    /// Whether the node this TUI acts as is attached to the daemon and this TUI uses it. There is
+    /// no locked state (ADR-026 N-2): a node not attached waits for its passphrase to attach it.
+    pub attached: bool,
+    /// The node this TUI acts as: whose rooms are on screen (ADR-026 S-4).
+    pub node: String,
+    /// The nodes attached to the daemon now, by name, kept from its attach and detach events
+    /// (ADR-015 9.1).
+    pub nodes: Vec<String>,
     /// Whether `mlock` is in effect; `false` surfaces the documented zeroize-only
     /// degradation warning (ADR-015 memory-protection honesty).
     pub mlock_active: bool,
@@ -174,7 +178,7 @@ pub struct ViewModel {
 /// an error can never carry plaintext, a key, or a passphrase into the UI/logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiError {
-    /// Wrong channel passphrase on join.
+    /// Wrong room passphrase on join.
     WrongPassphrase,
     /// The identity opened, but what it sealed in the store would not (V210-40).
     SealedUnreadable,
@@ -209,15 +213,16 @@ pub enum UiError {
     IdentityMadeElsewhere,
     /// Another vox holds this profile open for writing.
     ProfileBusy,
-    /// The app is locked (`:unlock`).
-    Locked,
+    /// The node this TUI acts as is not attached: give its passphrase (`:attach`).
+    NotAttached,
     /// The channel is not open (select it and enter its passphrase).
     ChannelNotOpen,
     /// An input exceeded its bound (name or message length).
     TooLong,
     /// The trust keyring holds its maximum number of identities.
     KeyringFull,
-    /// Persisting to the store failed; reopen the channel.
+    /// A write to this node's files failed for a reason the TUI has no fault for. A fault that
+    /// names its file is shown in its own words instead (`live::failed`).
     Storage,
     /// The tunnel to close is no longer open (V030-11).
     NoSuchTunnel,
@@ -229,7 +234,7 @@ pub enum UiError {
     NotConsented,
     /// A consent named a member this node has not admitted to the room yet.
     NotAdmitted,
-    /// This client is not networked, or is locked, so it cannot reach anyone.
+    /// The node is not networked, so it cannot reach anyone.
     NotNetworked,
     /// A local address the node needs (its listen port) is held by another program.
     AddressInUse,
@@ -289,20 +294,20 @@ impl UiError {
             }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
-            UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
+            UiError::EpochMismatch => "the room's passphrase was changed — re-syncing",
             UiError::MissingConsent => "you'll see this member once they consent to you",
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",
             UiError::NoIdentity => "no identity yet — :init to create one",
             UiError::IdentityExists => "an identity already exists in this profile",
             UiError::IdentityMadeElsewhere => {
-                "another vox created this profile's identity at the same time; nothing was created here — restart vox tui to unlock it"
+                "another vox created this node's identity at the same time; nothing was created here — :attach with its passphrase"
             }
             UiError::ProfileBusy => {
-                "another vox holds this profile open — try again once it is done"
+                "another vox is still running as this node — stop it, then try again"
             }
-            UiError::Locked => "locked — :unlock",
-            UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
+            UiError::NotAttached => "this node is not attached — :attach and give its passphrase",
+            UiError::ChannelNotOpen => "this room is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
             // The cap in force (#85), as `Fault::KeyringFull` names it.
             UiError::KeyringFull => {
@@ -314,12 +319,12 @@ impl UiError {
                     )
                 })
             }
-            UiError::Storage => "could not save — reopen the channel",
+            UiError::Storage => "could not write this node's files — check free disk space, and that the data directory is writable",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NoSuchTunnel => "that tunnel is no longer open",
-            UiError::Refused => "refused — check the channel passphrase",
-            UiError::NotNetworked => "not connected (unlock first)",
+            UiError::Refused => "refused — check the room passphrase",
+            UiError::NotNetworked => "this node is not on the network",
             UiError::AddressInUse => {
                 "a local port it needs is held by another program — pick another --listen"
             }
@@ -352,12 +357,10 @@ impl std::fmt::Display for UiError {
 /// status, not a free string, so a core implementation cannot surface arbitrary
 /// plaintext/secret detail through the status channel (the same redaction guarantee
 /// as [`UiError`]). Each variant maps to a fixed human string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandStatus {
     /// The command succeeded.
     Done,
-    /// The app was locked.
-    Locked,
     /// The action needs a running node that is not attached.
     NeedsNode,
     /// Not connected; the action could not be performed.
@@ -366,19 +369,23 @@ pub enum CommandStatus {
     Queued,
     /// A typed error occurred.
     Failed(UiError),
+    /// The daemon's own sentence for a person, where its answer names no fault the UI knows: a
+    /// refusal naming a node, a daemon that stopped. Never plaintext or key material: the daemon
+    /// and the node word these for a person, from fixed texts and public facts.
+    Said(String),
 }
 
 impl CommandStatus {
     /// The fixed, redaction-safe human string for this status.
     #[must_use]
-    pub fn message(self) -> String {
+    pub fn message(&self) -> String {
         match self {
             CommandStatus::Done => "done".to_owned(),
-            CommandStatus::Locked => "locked".to_owned(),
             CommandStatus::NeedsNode => "needs a running node (attach one to proceed)".to_owned(),
             CommandStatus::NotConnected => "not connected: action not performed".to_owned(),
             CommandStatus::Queued => "queued".to_owned(),
             CommandStatus::Failed(e) => e.message().to_owned(),
+            CommandStatus::Said(s) => s.clone(),
         }
     }
 }
@@ -393,10 +400,16 @@ pub enum Command {
         /// The identity passphrase (redacted/zeroized).
         passphrase: SecretString,
     },
-    /// Unlock the identity (masked prompt).
-    Unlock {
+    /// Attach the node this TUI acts as, with its identity passphrase (masked prompt): the one
+    /// time a node takes it (ADR-026 N-2).
+    Attach {
         /// The identity passphrase (redacted/zeroized).
         passphrase: SecretString,
+    },
+    /// Act as another node of this account from now on (ADR-015 9.1, `:node <name>`).
+    UseNode {
+        /// Its name.
+        name: String,
     },
     /// Open a closed channel: its passphrase is the second lock factor.
     OpenChannel {
@@ -462,6 +475,4 @@ pub enum Command {
         /// The plaintext to send (becomes ciphertext in the core).
         text: String,
     },
-    /// Lock the app now (zeroize SEK + identity root, require re-auth).
-    Lock,
 }

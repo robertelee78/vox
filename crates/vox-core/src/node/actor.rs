@@ -465,7 +465,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReachFailed { .. } => "filing a failed dial",
         NetEvent::UpgradeFailed { .. } => "filing a path upgrade that failed",
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
-        NetEvent::AddressesDiscovered { .. } => "publishing every room at a new address",
+        NetEvent::AddressesDiscovered => "publishing every room at a new address",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
@@ -534,31 +534,6 @@ async fn announce(conn: &VoxConnection, prejoin_wire: &[u8]) -> crate::error::Re
     res
 }
 
-/// When granted mappings must be re-requested: half the shortest granted lifetime
-/// (the renewal interval RFC 6887 §11.2.1 recommends), or `None` when no gateway
-/// granted anything and so there is nothing to keep alive.
-///
-/// Half the *shortest* lifetime, not the requested one: a gateway may grant less than
-/// asked, and the mapping that expires first is the one that governs. A lifetime of
-/// zero is a **permanent** grant (UPnP routers that refuse timed leases) and never
-/// needs renewing — it is deleted when the network stops instead.
-fn renew_at(now: u64, mappings: &[crate::nat::portmap::PortMapping]) -> Option<u64> {
-    mappings
-        .iter()
-        .map(|m| m.lifetime_secs)
-        .filter(|l| *l > 0)
-        .min()
-        // `max(2)` keeps the interval at one second or more: a zero would re-request
-        // on every tick.
-        .map(|l| now + u64::from(l.max(2) / 2))
-}
-
-/// Whether a mapping is the IPv6 pinhole (`true`) rather than the IPv4 mapping: the two address
-/// families are renewed, retried and expired independently (V210-75).
-fn mapping_is_v6(m: &crate::nat::portmap::PortMapping) -> bool {
-    m.method == crate::nat::portmap::Method::PcpV6Pinhole
-}
-
 /// Where a node's endpoint binds.
 #[derive(Clone)]
 pub enum Bind {
@@ -566,8 +541,12 @@ pub enum Bind {
     /// comes from the ADR-012 ladder, not from here).
     Addr(std::net::SocketAddr),
     /// A caller-supplied datagram socket — a simulated network with NAT devices, or
-    /// any other substrate (`VoxEndpoint::bind_abstract`).
+    /// any other substrate (`SharedEndpoint::bind_abstract`).
     Socket(Arc<dyn quinn::AsyncUdpSocket>),
+    /// **The daemon's presence, shared with every node it hosts** (ADR-026 D-3): the node attaches
+    /// to it instead of binding, and its detach closes only its own connections (D-5). The
+    /// presence's socket, port, mapping and nearby group are the daemon's.
+    Shared(Arc<crate::node::presence::NetPresence>),
 }
 
 impl std::fmt::Debug for Bind {
@@ -575,6 +554,7 @@ impl std::fmt::Debug for Bind {
         match self {
             Bind::Addr(a) => write!(f, "Bind::Addr({a})"),
             Bind::Socket(s) => write!(f, "Bind::Socket({s:?})"),
+            Bind::Shared(p) => write!(f, "Bind::Shared({:?})", p.shared().local_addr().ok()),
         }
     }
 }
@@ -788,14 +768,6 @@ const ANCHOR_DIAL_CANDIDATES: usize = 4 * crate::nat::multiaddr::MAX_ENDPOINTS;
 /// [`ANCHOR_REDIAL_SECS`].
 const ANCHOR_FLAP_SECS: u64 = 10;
 
-/// The first wait before a port-mapping renewal that got nothing back is tried again (V210-75),
-/// doubling to [`MAPPING_RETRY_MAX_SECS`]. A gateway that is restarting, or a request lost on
-/// the way, must not end renewal for the life of the node.
-const MAPPING_RETRY_SECS: u64 = 15;
-
-/// The longest wait between retries of a failed port-mapping renewal.
-const MAPPING_RETRY_MAX_SECS: u64 = 600;
-
 /// How long an anchor connection may hear nothing before every tick probes it (V210-93).
 const ANCHOR_PROBE_AFTER: Duration = Duration::from_secs(3);
 
@@ -919,12 +891,9 @@ enum NetEvent {
         /// The members it named, and their ports.
         entries: Vec<crate::node::nearby::Entry>,
     },
-    /// The ladder's publish side finished: this node now knows what to advertise, and
-    /// which mappings a gateway granted (each of which will need renewing).
-    AddressesDiscovered {
-        /// Every granted mapping or pinhole, possibly none.
-        mappings: Vec<crate::nat::portmap::PortMapping>,
-    },
+    /// The presence's publish side composed what its nodes advertise (ADR-026 D-3): this node's
+    /// records are published again with it.
+    AddressesDiscovered,
     /// A configured anchor answered its dial (ADR-016 M15.1): it gets the ordinary
     /// bookkeeping, the `Anchor` class, and every open channel's records.
     AnchorConnected {
@@ -1919,138 +1888,60 @@ struct PairwiseIn {
     recv: quinn::RecvStream,
 }
 
-/// Accept connections and their streams forever, forwarding to the actor the ones
-/// that need channel state. The board is served inside `accept_stream`.
+/// **Take this node's inbound connections from its presence** (ADR-026 D-3) and serve them, for
+/// as long as the node is attached: each is filed and its streams served on a task of its own,
+/// so one slow connection holds up no other. The handshakes and identity exchanges themselves
+/// run in the presence's gate (`node::presence`), which hands over only connections already
+/// proved to be for this node.
 ///
-/// **Each connection's handshake runs on its own task, bounded, and the accept loop
-/// never waits for one.** Phase two (`finish_incoming`: the TLS handshake and admission,
-/// itself bounded at `HANDSHAKE_TIMEOUT`) is spawned per attempt, which is quinn's own
-/// documented shape — `finish_incoming` says "Spawn this; do not await it in an accept
-/// loop".
-///
-/// # What awaiting it inline cost
-/// Until v0.2.8 this loop awaited phase two, so it handled one handshake at a time. Two
-/// consequences, both measured:
-///
-/// - **A pre-authentication denial of service.** One peer that opened a connection and
-///   stalled its handshake blocked every other inbound connection for up to 30s, with no
-///   credential of any kind. Worst against an anchor, the node most likely to be public.
-/// - **The same stall with no attacker at all.** `vox connect` exits the moment it has
-///   joined, which leaves the host mid-handshake, so a second person joining right after
-///   the first was locked out for 30s. `order4.sh` (a host and two back-to-back joiners)
-///   locked the second joiner out 5 of 5 on a quiet box, and the stranger's join in
-///   `service_rehearsal_proof` failed the same way.
-///
-/// # Why it stayed inline so long
-/// ADR-017 recorded the split as tried and reverted: `m15_two_clients_behind_symmetric_
-/// nats…` timed out at 247s with it and passed serialised. That 247s was **not** the split.
-/// It was sync starvation — a room's in-flight mark let a failing anchor session take the
-/// room first every round, so the direct member session never ran — and it hit the
-/// serialised loop too, in 9 of ~15 CI runs on `main`. The evidence against the split was
-/// a different defect with the same signature.
-///
-/// With that fixed (the owed-room change in the old `run_due_syncs`, now ADR-025's ports) the split exposed one real
-/// dependency on the serial order, and it was not in this loop: `ConnectionManager`'s
-/// duplicate tie-break was "the held connection wins", which the two ends of a pair only
-/// agree on if they file the pair in the same order. Concurrent handshakes broke that, and a
-/// node could be left holding a connection its peer had closed (see `tie_key` in
-/// `node::net`). Measured with both ends logging each connection's exporter tag: 2 of 5
-/// duplicate pairs disagreed before the tie-break became order-independent, 0 of 28 after.
-///
-/// # The bound, and what a flood costs
-/// At most [`HANDSHAKES_IN_FLIGHT`] handshakes run at once. An attempt past the cap never waits
-/// in this loop — that would put the wait back into it:
-///
-/// - an attempt whose source address is **not yet validated** gets `retry()`, a QUIC Retry
-///   packet that makes the client prove it can receive at the address it claims before
-///   anything is allocated. A spoofed flood cannot answer one; a real peer pays one round
-///   trip. Before this, one spoofed packet cost an attacker a packet and cost the node a
-///   handshake slot.
-/// - an attempt that **is** validated waits for a slot on a task of its own, up to
-///   [`HANDSHAKE_WAIT`], with at most [`HANDSHAKES_WAITING`] waiting at once; past either it
-///   gets `refuse()`. It used to be refused at once (V210-86, #278): a peer that has proven
-///   itself was told "not now", which its dialler cannot tell from a failed dial and backs off
-///   like one — 1, 2, 4… seconds, doubling to half a minute. After an anchor restart every
-///   member redials within the same second, so every one past the 64th was sent away:
-///   measured against the shipped `vox node`, 300 identities dialling at once got 107–188 in,
-///   and all 511 failures were `CONNECTION_REFUSED`. A short wait costs a slot nothing, and
-///   those members are in within the burst instead of on a backoff.
-///
-/// Waiting holds a pending attempt (its first packets, which quinn bounds), not a handshake.
-/// When a burst has waited or been refused, the node says how it went
-/// ([`NodeEvent::HandshakesQueued`]).
-///
-/// **Residual, stated rather than implied:** 64 *validated* handshakes that stall still
-/// deny service for up to `HANDSHAKE_TIMEOUT` each. Bounded, and far better than a single
-/// slot, but not nothing.
-///
-/// [`NodeEvent::HandshakesQueued`]: crate::node::api::NodeEvent::HandshakesQueued
-fn spawn_accept_loop(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>) {
+/// Ends when the node's queue closes (it detached: its registration and the queue's sender went
+/// with it) or the presence's endpoint closes, and says so (`NetEvent::Stopped`). Also says each
+/// burst of attempts the gate made wait or refused (`NodeEvent::HandshakesQueued`).
+fn spawn_inbound_pump(
+    net: Arc<NodeNet>,
+    mut inbound: mpsc::Receiver<crate::transport::quic::VoxConnection>,
+    bursts: tokio::sync::broadcast::Receiver<crate::node::presence::HandshakeBurst>,
+    mut closed: watch::Receiver<bool>,
+    tx: mpsc::Sender<NetEvent>,
+) {
     let gone = Arc::downgrade(&net);
     tokio::spawn(async move {
-        let gate = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_IN_FLIGHT));
-        let queue = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES_WAITING));
-        let burst = Arc::new(std::sync::Mutex::new(Burst::default()));
+        let mut bursts = Some(bursts);
         loop {
-            let Some(incoming) = net.manager().accept_incoming().await else {
-                break;
-            };
-            if let Ok(permit) = Arc::clone(&gate).try_acquire_owned() {
-                lock_burst(&burst).ran(&gate);
-                spawn_handshake(Arc::clone(&net), tx.clone(), permit, incoming);
-                continue;
-            }
-            if !incoming.remote_address_validated() {
-                // `Err` means this attempt is already a retried one; retrying it again
-                // would loop, so it is simply dropped.
-                let _ = incoming.retry();
-                continue;
-            }
-            let Ok(place) = Arc::clone(&queue).try_acquire_owned() else {
-                let over = {
-                    let mut b = lock_burst(&burst);
-                    b.refused += 1;
-                    b.over()
-                };
-                incoming.refuse();
-                // Without waiting: this loop never waits (see above), and a report lost to a full
-                // queue costs nothing but the report.
-                if let Some(over) = over {
-                    let _ = tx.try_send(over);
+            let burst = async {
+                match bursts.as_mut() {
+                    Some(b) => b.recv().await,
+                    None => std::future::pending().await,
                 }
-                continue;
             };
-            lock_burst(&burst).enter(&gate);
-            let (net, tx, gate, burst) = (
-                Arc::clone(&net),
-                tx.clone(),
-                Arc::clone(&gate),
-                Arc::clone(&burst),
-            );
-            tokio::spawn(async move {
-                let since = std::time::Instant::now();
-                let slot = tokio::time::timeout(HANDSHAKE_WAIT, Arc::clone(&gate).acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
-                drop(place);
-                let over = {
-                    let mut b = lock_burst(&burst);
-                    if slot.is_some() {
-                        b.ran(&gate);
-                    } else {
-                        b.refused += 1;
+            tokio::select! {
+                conn = inbound.recv() => {
+                    let Some(conn) = conn else { break };
+                    let (net, tx) = (Arc::clone(&net), tx.clone());
+                    tokio::spawn(async move {
+                        let filed = net.manager().take_inbound(conn).await;
+                        let _ = serve_filed(&net, &tx, filed).await;
+                    });
+                }
+                b = burst => match b {
+                    Ok(b) => {
+                        // Without waiting: a report lost to a full queue costs only the report.
+                        let _ = tx.try_send(NetEvent::HandshakesQueued {
+                            waited: b.waited,
+                            most_waiting: b.most_waiting,
+                            most_running: b.most_running,
+                            refused: b.refused,
+                            longest: b.longest,
+                        });
                     }
-                    b.leave(since.elapsed())
-                };
-                match slot {
-                    Some(permit) => spawn_handshake(Arc::clone(&net), tx.clone(), permit, incoming),
-                    None => incoming.refuse(),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => bursts = None,
+                },
+                r = closed.wait_for(|c| *c) => {
+                    let _ = r;
+                    break;
                 }
-                if let Some(over) = over {
-                    let _ = tx.send(over).await;
-                }
-            });
+            }
         }
         #[cfg(feature = "test-knobs")]
         if let Some(ms) = test_stopped_delay_ms() {
@@ -2106,11 +1997,12 @@ fn test_stopped_delay_ms() -> Option<u64> {
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_ADDRESS_ENV: &str = "VOX_TEST_HOLD_ADDRESS_MS";
 
-/// Whether [`TEST_HOLD_ADDRESS_ENV`] still keeps this node's address record for `channel_id` off
-/// the boards: its time counts from the first call for that room.
+/// Whether [`TEST_HOLD_ADDRESS_ENV`] still keeps the node `me`'s address record for `channel_id`
+/// off the boards: its time counts from that node's first call for that room, kept per (node,
+/// room) because a process may host several nodes (ADR-026 P-1).
 #[cfg(feature = "test-knobs")]
-fn test_hold_address(channel_id: &Digest32) -> bool {
-    static FIRST: std::sync::Mutex<BTreeMap<Digest32, std::time::Instant>> =
+fn test_hold_address(me: &Digest32, channel_id: &Digest32) -> bool {
+    static FIRST: std::sync::Mutex<BTreeMap<(Digest32, Digest32), std::time::Instant>> =
         std::sync::Mutex::new(BTreeMap::new());
     let Some(ms) = std::env::var(TEST_HOLD_ADDRESS_ENV)
         .ok()
@@ -2122,7 +2014,7 @@ fn test_hold_address(channel_id: &Digest32) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let since = *first
-        .entry(*channel_id)
+        .entry((*me, *channel_id))
         .or_insert_with(std::time::Instant::now);
     since.elapsed() < Duration::from_millis(ms)
 }
@@ -2137,11 +2029,11 @@ fn test_hold_address(channel_id: &Digest32) -> bool {
 #[cfg(feature = "test-knobs")]
 pub const TEST_HOLD_ROOM_FROM_ANCHORS_ENV: &str = "VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS";
 
-/// Whether [`TEST_HOLD_ROOM_FROM_ANCHORS_ENV`] still keeps `channel_id` off this node's anchors:
-/// its time counts from the first call for that room.
+/// Whether [`TEST_HOLD_ROOM_FROM_ANCHORS_ENV`] still keeps `channel_id` off the node `me`'s
+/// anchors: its time counts from that node's first call for that room (ADR-026 P-1).
 #[cfg(feature = "test-knobs")]
-fn test_hold_room_from_anchors(channel_id: &Digest32) -> bool {
-    static FIRST: std::sync::Mutex<BTreeMap<Digest32, std::time::Instant>> =
+fn test_hold_room_from_anchors(me: &Digest32, channel_id: &Digest32) -> bool {
+    static FIRST: std::sync::Mutex<BTreeMap<(Digest32, Digest32), std::time::Instant>> =
         std::sync::Mutex::new(BTreeMap::new());
     let Some(ms) = std::env::var(TEST_HOLD_ROOM_FROM_ANCHORS_ENV)
         .ok()
@@ -2153,7 +2045,7 @@ fn test_hold_room_from_anchors(channel_id: &Digest32) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let since = *first
-        .entry(*channel_id)
+        .entry((*me, *channel_id))
         .or_insert_with(std::time::Instant::now);
     since.elapsed() < Duration::from_millis(ms)
 }
@@ -2230,21 +2122,6 @@ async fn seal_off_actor(
     Ok((sek, wrap))
 }
 
-/// Run one inbound handshake on its own task, holding `permit` for as long as it runs.
-fn spawn_handshake(
-    net: Arc<NodeNet>,
-    tx: mpsc::Sender<NetEvent>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-    incoming: quinn::Incoming,
-) {
-    tokio::spawn(async move {
-        let _permit = permit;
-        if let Some(filed) = finish_one(&net, incoming).await {
-            let _ = serve_filed(&net, &tx, filed).await;
-        }
-    });
-}
-
 /// **For proofs only.** When set to `N`, the node loses the first `N` pairwise streams that
 /// carry a hello: it resets them unread, as a stream lost with its connection is, so the sender
 /// learns only that its key was not taken. The simultaneous-session proof uses it to force what a
@@ -2254,120 +2131,29 @@ fn spawn_handshake(
 #[cfg(feature = "test-knobs")]
 pub const TEST_LOSE_HELLOS_ENV: &str = "VOX_TEST_LOSE_HELLOS";
 
-/// Whether this inbound hello is one [`TEST_LOSE_HELLOS_ENV`] says to lose.
+/// Whether this inbound hello, to the node `me` in `room`, is one [`TEST_LOSE_HELLOS_ENV`] says
+/// to lose: the first `N` of each (node, room), since a process may host several nodes (ADR-026
+/// P-1).
 #[cfg(feature = "test-knobs")]
-fn test_lose_hello() -> bool {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
-    LEFT.get_or_init(|| {
-        AtomicU64::new(
-            std::env::var(TEST_LOSE_HELLOS_ENV)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-        )
-    })
-    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-    .is_ok()
-}
-
-/// How many inbound handshakes may run at once.
-///
-/// Inline, the ceiling was one, which was the defect. This is the same bound in spirit as
-/// [`JOINS_IN_FLIGHT`]: enough that ordinary use never reaches it, small enough that an
-/// attacker cannot make a node hold unbounded state.
-const HANDSHAKES_IN_FLIGHT: usize = 64;
-
-/// How many validated attempts may wait for a handshake slot at once; past it, one is refused.
-/// Twice the members of a large room (PRD-001), so a whole room redialling a restarted anchor
-/// waits rather than being turned away, and still a bound on what a flood can make a node hold.
-const HANDSHAKES_WAITING: usize = 1024;
-
-/// How long a validated attempt may wait for a handshake slot before it is refused: half of what
-/// a dialler gives one attempt (`nat::reachability::PER_ATTEMPT_TIMEOUT`, 10 s), so an attempt
-/// given a slot still has a dialler waiting for it.
-const HANDSHAKE_WAIT: Duration = Duration::from_secs(5);
-
-/// One burst of inbound attempts that had to wait for a handshake slot, from the first that
-/// waited until none is waiting.
-#[derive(Default)]
-struct Burst {
-    /// Attempts waiting now.
-    waiting: usize,
-    /// The most that waited at once.
-    most_waiting: usize,
-    /// How many waited in all.
-    waited: usize,
-    /// The most handshakes seen running at once.
-    most_running: usize,
-    /// How many were refused: no place to wait, or no slot within [`HANDSHAKE_WAIT`].
-    refused: usize,
-    /// The longest any waited.
-    longest: Duration,
-}
-
-impl Burst {
-    /// A handshake took a slot of `gate`.
-    fn ran(&mut self, gate: &tokio::sync::Semaphore) {
-        if self.waiting > 0 {
-            self.most_running = self
-                .most_running
-                .max(HANDSHAKES_IN_FLIGHT - gate.available_permits());
-        }
-    }
-
-    /// An attempt starts waiting for a slot of `gate`.
-    fn enter(&mut self, gate: &tokio::sync::Semaphore) {
-        self.most_running = self
-            .most_running
-            .max(HANDSHAKES_IN_FLIGHT - gate.available_permits());
-        self.waiting += 1;
-        self.waited += 1;
-        self.most_waiting = self.most_waiting.max(self.waiting);
-    }
-
-    /// An attempt stops waiting after `waited`. When it was the last, the burst is over and
-    /// what it came to is returned, to be said.
-    fn leave(&mut self, waited: Duration) -> Option<NetEvent> {
-        self.waiting -= 1;
-        self.longest = self.longest.max(waited);
-        self.over()
-    }
-
-    /// When nothing is left waiting, the burst is over: what it came to, to be said. A refusal
-    /// with nothing waiting is a burst of its own, so no refusal goes unsaid.
-    fn over(&mut self) -> Option<NetEvent> {
-        (self.waiting == 0).then(|| {
-            let b = std::mem::take(self);
-            NetEvent::HandshakesQueued {
-                waited: b.waited,
-                most_waiting: b.most_waiting,
-                most_running: b.most_running,
-                refused: b.refused,
-                longest: b.longest,
-            }
-        })
-    }
-}
-
-fn lock_burst(burst: &std::sync::Mutex<Burst>) -> std::sync::MutexGuard<'_, Burst> {
-    burst
+fn test_lose_hello(me: &Digest32, room: &Digest32) -> bool {
+    static LEFT: std::sync::Mutex<BTreeMap<(Digest32, Digest32), u64>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    let mut left = LEFT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Phase two for one connection: complete the handshake and admission, or drop it.
-async fn finish_one(
-    net: &Arc<NodeNet>,
-    incoming: quinn::Incoming,
-) -> Option<crate::node::net::Filed> {
-    net.manager()
-        .finish_incoming(
-            incoming,
-            crate::transport::quic::Admission::AcceptAnyAuthenticated,
-        )
-        .await
-        .ok()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = left.entry((*me, *room)).or_insert_with(|| {
+        std::env::var(TEST_LOSE_HELLOS_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    match n.checked_sub(1) {
+        Some(rest) => {
+            *n = rest;
+            true
+        }
+        None => false,
+    }
 }
 
 /// Serve a filed connection and announce it. `false` when the actor has gone away.
@@ -3535,6 +3321,9 @@ pub struct Node {
     /// endpoint needs the identity's signer, so a locked node has no network
     /// identity to present and serves nothing (M14.7d).
     net: Option<Arc<NodeNet>>,
+    /// The presence the network runs on, and whether this node made it for itself (a solo
+    /// presence, closed with the node) rather than attached to the daemon's.
+    presence: Option<(Arc<crate::node::presence::NetPresence>, bool)>,
     /// Sender the actor keeps so the network queue never closes under it.
     net_tx: mpsc::Sender<NetEvent>,
     /// Where the endpoint binds, if this node networks at all.
@@ -3578,9 +3367,8 @@ pub struct Node {
     /// Each entry keeps its connection weakly, so entries for connections that are gone are
     /// dropped and the map is as small as the set of live ones.
     stream_loops: std::collections::BTreeMap<u64, std::sync::Weak<VoxConnection>>,
-    /// The gateway port mapping in force, if one was granted. Held so it can be
-    /// renewed before its lifetime elapses (RFC 6886/6887 put renewal on the client).
-    port_mappings: Vec<crate::nat::portmap::PortMapping>,
+    /// The task telling this node each new composition of its presence's addresses.
+    addresses_task: Option<tokio::task::AbortHandle>,
     /// Per anchor that failed to connect: when it may be dialled again (unix seconds), and the
     /// wait that set it, doubling to [`ANCHOR_REDIAL_SECS`] (V210-57). No entry: dial when
     /// needed.
@@ -3605,23 +3393,9 @@ pub struct Node {
     anchor_unreached_since: BTreeMap<Digest32, u64>,
     /// Peers a room's sync is dialling right now (`reach_for_sync`), so one is not dialled twice.
     sync_dials: BTreeSet<Digest32>,
-    /// When the granted mappings must be renewed (unix seconds), or `None` when there
-    /// is nothing to renew. A mapping a gateway grants for two hours outlives no
-    /// long-running node by itself: it is re-requested at half its lifetime, the
-    /// interval RFC 6887 §11.2.1 recommends.
-    renew_mappings_at: Option<u64>,
     /// When each open room's own records are next renewed on this node's board and its anchors
     /// (V210-68, #258): half their lifetime after the last round that signed them.
     records_renew_at: BTreeMap<Digest32, u64>,
-    /// Per address family (`true` for the IPv6 pinhole, `false` for the IPv4 mapping), when the
-    /// timed lease held for it runs out (unix seconds). Until then its mapped address is still
-    /// advertised, even while its renewal is failing (V210-75).
-    mapping_expires: BTreeMap<bool, u64>,
-    /// Per address family, the wait set after the last renewal that got nothing back for it:
-    /// doubles from [`MAPPING_RETRY_SECS`] to [`MAPPING_RETRY_MAX_SECS`], and is gone once that
-    /// family is granted again (V210-75). One family's lost renewal is retried on its own clock,
-    /// not at the other's half-lifetime.
-    mapping_retry: BTreeMap<bool, u64>,
     /// ADR-025's sync ports, one per `(room, peer)`: see `node::ports`.
     ports: BTreeMap<(Digest32, Digest32), crate::node::ports::Port>,
     /// Ports waiting for an outbound slot (ADR-025 D6).
@@ -3684,6 +3458,9 @@ pub struct Node {
     /// is refused once [`keyring_window`] has passed since (V210-159). Shared, because a check
     /// passes on a blocking thread.
     passphrase_entered_at: Arc<std::sync::atomic::AtomicU64>,
+    /// Set while a [`NodeCommand::Proved`] keyring change is applied: its passphrase was just
+    /// checked, so the keyring window does not apply to it (V210-159).
+    keyring_change_proved: bool,
     /// The join exchanges running right now, both sides of them, the room creations sealing
     /// their key (V210-76), and the identity-passphrase checks (V210-94).
     ///
@@ -3712,10 +3489,6 @@ pub struct Node {
     /// back yet (`NetEvent::LockSettled`, V210-94). While any is, the node is *locking*: the
     /// identity is already locked and refuses new work, but not every secret is gone yet.
     locking: usize,
-    /// Lock replies held until the node has settled locked.
-    lock_waiters: Vec<oneshot::Sender<Outcome>>,
-    /// Whether a lock now settling found the node unlocked, so settling says `Locked`.
-    lock_was_unlocked: bool,
     /// Unlocks asked for while locking, run once it has settled: an unlock in between would
     /// start new work beside threads still holding the old secrets.
     unlock_after_lock: Vec<(Secret, oneshot::Sender<Outcome>)>,
@@ -3874,6 +3647,11 @@ pub struct Node {
     millis_clock: crate::time::MillisClock,
     /// See [`NodeConfig::checkpoint_idle_secs`].
     checkpoint_idle_secs: u64,
+    /// How long this node gives a tunnel whose bytes wait before closing it as stuck (V030-11),
+    /// from its `tunnel-stuck-after` file: set on its endpoint's [`LocalNode`] at each start.
+    ///
+    /// [`LocalNode`]: crate::transport::quic::LocalNode
+    stuck_after: Duration,
     argon2: Argon2Profile,
     view_tx: watch::Sender<NodeView>,
     event_tx: broadcast::Sender<NodeEvent>,
@@ -4011,6 +3789,38 @@ fn forget_consent_key(
     Ok(())
 }
 
+/// How a node's actor task ended (ADR-026 L-6), read from the handle
+/// [`Node::spawn_supervised`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActorEnd {
+    /// It stopped on its own: `Shutdown`, or every handle to it dropped.
+    Stopped,
+    /// It panicked; the panic's message, when it carried one.
+    Panicked(String),
+    /// Its task was cancelled: the runtime is shutting down.
+    Cancelled,
+}
+
+impl ActorEnd {
+    /// Wait for `actor` to end, and say how.
+    pub async fn of(actor: tokio::task::JoinHandle<()>) -> Self {
+        match actor.await {
+            Ok(()) => Self::Stopped,
+            Err(e) if e.is_panic() => {
+                let payload = e.into_panic();
+                Self::Panicked(
+                    payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                        .unwrap_or_else(|| "(no message)".to_owned()),
+                )
+            }
+            Err(_) => Self::Cancelled,
+        }
+    }
+}
+
 impl Node {
     /// Spawn the node for `paths` on the current tokio runtime with the system
     /// clock and the production Argon2id profile. An existing identity is
@@ -4065,8 +3875,23 @@ impl Node {
     }
 
     /// Spawn the node with a full [`NodeConfig`]: the one constructor every other
-    /// one is a shorthand for.
+    /// one is a shorthand for. The actor's task is not watched; a host that must notice its
+    /// node's end uses [`Node::spawn_supervised`].
     pub fn spawn_config(paths: Paths, cfg: NodeConfig) -> crate::error::Result<NodeHandle> {
+        Self::spawn_supervised(paths, cfg).map(|(handle, _actor)| handle)
+    }
+
+    /// [`Node::spawn_config`], also returning the actor's task (ADR-026 L-6).
+    ///
+    /// **A node's panic must not vanish.** The actor runs as its own task; tokio catches a panic
+    /// in it and, with the handle dropped, nobody hears of it: every later request fails with the
+    /// node's queue closed and nothing says why. The host awaits this handle, and a
+    /// `JoinError::is_panic` there is that node's end, to report and detach. The task ends with
+    /// `Ok(())` when the actor stops on its own (`Shutdown`, or every handle dropped).
+    pub fn spawn_supervised(
+        paths: Paths,
+        cfg: NodeConfig,
+    ) -> crate::error::Result<(NodeHandle, tokio::task::JoinHandle<()>)> {
         let NodeConfig {
             clock,
             millis_clock,
@@ -4094,12 +3919,12 @@ impl Node {
         } else {
             None
         };
-        // How long a stuck tunnel is given (V030-11), from the profile's config.
-        crate::tunnel::session::set_stuck_after(
-            paths
-                .tunnel_stuck_after()
-                .unwrap_or(crate::tunnel::session::STUCK_AFTER),
-        );
+        // How long a stuck tunnel is given (V030-11), from the profile's config: the node's own,
+        // kept for its endpoint (ADR-026 P-1).
+        let stuck_after = paths
+            .tunnel_stuck_after()
+            .unwrap_or(crate::tunnel::session::STUCK_AFTER)
+            .max(Duration::from_secs(1));
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_QUEUE);
         let (event_tx, event_rx) = broadcast::channel(EVENT_QUEUE);
         // The handle keeps the sender so any number of clients may subscribe
@@ -4111,7 +3936,9 @@ impl Node {
             profile,
             millis_clock,
             checkpoint_idle_secs,
+            stuck_after,
             net: None,
+            presence: None,
             net_tx,
             bind,
             anchor_ids: anchors.nodes().iter().map(|n| n.id).collect(),
@@ -4123,7 +3950,7 @@ impl Node {
             forwards: BTreeMap::new(),
             pow_params,
             stream_loops: std::collections::BTreeMap::new(),
-            port_mappings: Vec::new(),
+            addresses_task: None,
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             anchor_window: BTreeMap::new(),
@@ -4131,10 +3958,7 @@ impl Node {
             anchors_up: BTreeMap::new(),
             anchor_unreached_since: BTreeMap::new(),
             sync_dials: BTreeSet::new(),
-            renew_mappings_at: None,
             records_renew_at: BTreeMap::new(),
-            mapping_expires: BTreeMap::new(),
-            mapping_retry: BTreeMap::new(),
             ports: BTreeMap::new(),
             port_queue: crate::node::ports::Queue::default(),
             slots: Arc::new(std::sync::Mutex::new(crate::node::ports::Slots::default())),
@@ -4151,6 +3975,7 @@ impl Node {
             join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             passphrase_entered_at: Arc::default(),
+            keyring_change_proved: false,
             join_tasks: tokio::task::JoinSet::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
@@ -4158,8 +3983,6 @@ impl Node {
             reopen_task: None,
             unlock_waiters: Vec::new(),
             locking: 0,
-            lock_waiters: Vec::new(),
-            lock_was_unlocked: false,
             unlock_after_lock: Vec::new(),
             view_stale: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
@@ -4288,8 +4111,8 @@ impl Node {
             node.start_network()?;
         }
         node.publish_initial();
-        tokio::spawn(node.run(cmd_rx, net_rx));
-        Ok(NodeHandle {
+        let actor = tokio::spawn(node.run(cmd_rx, net_rx));
+        let handle = NodeHandle {
             cmd_tx,
             view_rx,
             event_tx: handle_event_tx,
@@ -4298,7 +4121,8 @@ impl Node {
             status_tx,
             net_tx: handle_net_tx,
             sync_book,
-        })
+        };
+        Ok((handle, actor))
     }
 
     async fn run(
@@ -4467,26 +4291,6 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
-                    // **A lock is answered once it has settled, and the actor does not wait for
-                    // that** (V210-94, and V210-71's rule that nothing slow stalls the actor). The
-                    // lock itself — the identity, the rooms, the tasks, the network — happens now;
-                    // waiting for work still holding a secret happens on a task of its own, which
-                    // reports `NetEvent::LockSettled`. Meanwhile the node answers everyone else and
-                    // says it is locking.
-                    if matches!(command, NodeCommand::Lock) && self.headless.is_none() {
-                        drop(self.lock_all().await);
-                        self.lock_waiters.push(reply);
-                        // What work finished just before the lock and queued for the actor — a
-                        // sealed room key and its passphrase, a joined room, a reopened room — is
-                        // handled now, not on a later turn: each is refused while locked and its
-                        // secrets dropped, and until then they sat in this queue after the lock.
-                        while let Ok(event) = net_rx.try_recv() {
-                            self.handle_net(event).await;
-                        }
-                        self.note_if_stalled(name, started);
-                        self.publish().await;
-                        continue;
-                    }
                     let outcome = self.handle(command).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
@@ -4516,7 +4320,6 @@ impl Node {
                     self.note_peers_seen();
                     self.retry_upgrades_if_due().await;
                     self.maintain_prekeys();
-                    self.renew_mappings_if_due();
                     self.renew_records_if_due().await;
                     if self.view_stale.load(std::sync::atomic::Ordering::Relaxed) {
                         self.refresh_network_view().await;
@@ -4598,18 +4401,6 @@ impl Node {
         match command {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
-            NodeCommand::Lock => {
-                // A headless node has no vault, so there is nothing to lock and no
-                // passphrase to unlock it with: locking it would take the anchor off
-                // the network permanently, until somebody noticed and restarted it.
-                // Refused rather than obeyed (ADR-016 M15.2c).
-                if self.headless.is_some() {
-                    return Outcome::Failed(Fault::NoIdentity);
-                }
-                // Not reached for a node with an identity: `run` answers its lock once it settles.
-                drop(self.lock_all().await);
-                Outcome::Done
-            }
             NodeCommand::AddAnchors { anchors } => {
                 // `merge` keeps the first entry per identity, so it would discard exactly
                 // the thing a refresh carries: the same anchor at its new address.
@@ -4662,7 +4453,11 @@ impl Node {
                 channel_id,
                 idle_secs,
             } => self.choose_idle_end(&channel_id, idle_secs).await,
-            NodeCommand::SendText { channel_id, text } => self.send_text(&channel_id, &text).await,
+            NodeCommand::SendText { channel_id, text } => {
+                #[cfg(feature = "test-knobs")]
+                test_panic_on_text(&text);
+                self.send_text(&channel_id, &text).await
+            }
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
             // Answered through `begin_join_channel`, which the run loop calls instead of this; a
             // join reaching here would have to be answered inline, which is the stall that
@@ -4671,6 +4466,28 @@ impl Node {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
             }
+            // A change whose passphrase was just checked: made, and the window starts again. Not
+            // through the window: with the window restarted by the check, a change could still
+            // find it passed — another check's restart having won, or the clock having moved on
+            // between the check and the change — and refuse the passphrase it had just been given.
+            NodeCommand::Proved { change } => {
+                if !matches!(
+                    *change,
+                    NodeCommand::Trust { .. }
+                        | NodeCommand::TrustWith { .. }
+                        | NodeCommand::Rename { .. }
+                        | NodeCommand::Untrust { .. }
+                ) {
+                    return Outcome::Failed(Fault::Internal);
+                }
+                if self.profile.as_ref().is_some_and(Profile::is_unlocked) {
+                    self.note_passphrase_entered();
+                }
+                self.keyring_change_proved = true;
+                let outcome = self.handle(*change).await;
+                self.keyring_change_proved = false;
+                outcome
+            }
             // Only an unlocked node asks for the passphrase again. One with no identity or a
             // locked one falls through, and says that: a passphrase would not make the change.
             NodeCommand::Trust { .. }
@@ -4678,6 +4495,7 @@ impl Node {
             | NodeCommand::Rename { .. }
             | NodeCommand::Untrust { .. }
                 if self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                    && !self.keyring_change_proved
                     && !self.passphrase_entered_recently() =>
             {
                 Outcome::Failed(Fault::PassphraseNeeded)
@@ -4850,7 +4668,6 @@ impl Node {
                     return Outcome::Failed(fault_of(&e));
                 }
                 self.note_passphrase_entered();
-                let _ = self.event_tx.send(NodeEvent::Unlocked);
                 self.reopen_remembered().await;
                 Outcome::Done
             }
@@ -4869,15 +4686,31 @@ impl Node {
             return Ok(());
         }
         // The identity to network as: the unlocked vault's, or the headless one.
-        let (endpoint, moved) = match (self.headless.as_ref(), self.profile.as_ref()) {
-            (Some(signer), _) => self.bind_endpoint(&**signer, bind)?,
-            (None, Some(profile)) => self.bind_endpoint(profile.signer()?, bind)?,
-            (None, None) => {
-                return Err(crate::error::Error::Profile("no identity in this profile"))
+        let signer: Arc<dyn crate::identity::composite::RootSigner + Send + Sync> =
+            match (self.headless.as_ref(), self.profile.as_ref()) {
+                (Some(signer), _) => Arc::clone(signer) as _,
+                (None, Some(profile)) => profile.signer_arc()? as _,
+                (None, None) => {
+                    return Err(crate::error::Error::Profile("no identity in this profile"))
+                }
+            };
+        // The daemon's presence, or one of this node's own.
+        let (presence, owned, moved) = match bind {
+            Bind::Shared(presence) => (Arc::clone(presence), false, None),
+            other => {
+                let (shared, moved) = self.bind_endpoint(other)?;
+                (
+                    crate::node::presence::NetPresence::start(shared),
+                    true,
+                    moved,
+                )
             }
         };
-        let endpoint = Arc::new(endpoint);
-        let mut net = NodeNet::new(endpoint, Arc::clone(&self.clock));
+        let link = presence.attach(signer)?;
+        let endpoint = link.endpoint;
+        // How long a stuck tunnel is given (V030-11): this node's setting, on this node.
+        endpoint.local().set_stuck_after(self.stuck_after);
+        let mut net = NodeNet::new(endpoint, Arc::clone(&presence), Arc::clone(&self.clock));
         // Only an anchor keeps a board for a room it does not hold, and `--serve trusted`
         // narrows that to rooms its operator's trust list created (V210-70).
         net.serve_rooms(match (self.anchor_boards, self.serve_only.as_ref()) {
@@ -4950,25 +4783,56 @@ impl Node {
         // publish yet. The *address* discovery does run, on its own task, because it
         // talks to the network (a route probe and a gateway request) and must not hold
         // up the unlock.
-        let discover = Arc::clone(&net);
-        let tx = self.net_tx.clone();
-        tokio::spawn(async move {
-            let mappings = discover.refresh_advertised(&[]).await;
-            let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
-        });
-        spawn_accept_loop(net, self.net_tx.clone());
+        // The presence discovers, maps and renews once for every node on it (ADR-026 D-3): this
+        // node is told each composition, the one already made included.
+        {
+            let mut addresses = presence.advertised();
+            if addresses.borrow().is_some() {
+                addresses.mark_changed();
+            }
+            let tx = self.net_tx.clone();
+            let task = tokio::spawn(async move {
+                while addresses.changed().await.is_ok() {
+                    if tx.send(NetEvent::AddressesDiscovered).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            if let Some(old) = self.addresses_task.replace(task.abort_handle()) {
+                old.abort();
+            }
+        }
+        spawn_inbound_pump(
+            net,
+            link.inbound,
+            presence.bursts(),
+            presence.shared().closed(),
+            self.net_tx.clone(),
+        );
+        self.presence = Some((presence, owned));
         // Members on this computer or the local network are found by what they say there, an
         // anchor holds no room and has nobody to find. Without the group, a node is found only
         // where its records say, as before.
-        if self.headless.is_none() {
-            if let Ok(nearby) = crate::node::nearby::Nearby::open() {
-                let nearby = Arc::new(nearby);
-                let (hear, tx) = (Arc::clone(&nearby), self.net_tx.clone());
+        // On the daemon's presence the group is the daemon's (ADR-026 D-3, ADR-012 N-44).
+        let nearby = if self.headless.is_none() {
+            self.presence.as_ref().and_then(|(p, _)| p.nearby())
+        } else {
+            None
+        };
+        {
+            if let Some((nearby, mut heard)) = nearby {
+                let tx = self.net_tx.clone();
                 let task = tokio::spawn(async move {
-                    while let Ok((from, entries)) = hear.hear().await {
-                        // Dropped when the actor is behind: the next one is said within
-                        // `NEARBY_EVERY_SECS`.
-                        let _ = tx.try_send(NetEvent::Heard { from, entries });
+                    loop {
+                        match heard.recv().await {
+                            // Dropped when the actor is behind: the next one is said within
+                            // `NEARBY_EVERY_SECS`.
+                            Ok((from, entries)) => {
+                                let _ = tx.try_send(NetEvent::Heard { from, entries });
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
                     }
                 });
                 self.nearby = Some(nearby);
@@ -4994,7 +4858,7 @@ impl Node {
         Ok(())
     }
 
-    /// Bind the endpoint as `signer`.
+    /// Bind this node's own presence's endpoint (a solo presence; the daemon's is bound once).
     ///
     /// **A node keeps its port** (V210-167). Asked for port 0, it bound a new random port on every
     /// start, and a member finds another only at the address its board record last gave: with no
@@ -5006,57 +4870,26 @@ impl Node {
     /// recorded.
     ///
     /// [`PORT_FILE`]: crate::node::paths::PORT_FILE
-    fn bind_endpoint<S: crate::identity::composite::RootSigner>(
+    fn bind_endpoint(
         &self,
-        signer: &S,
         bind: &Bind,
-    ) -> crate::error::Result<(crate::transport::quic::VoxEndpoint, Option<String>)> {
-        use crate::transport::quic::VoxEndpoint;
+    ) -> crate::error::Result<(Arc<crate::transport::quic::SharedEndpoint>, Option<String>)> {
+        use crate::transport::quic::SharedEndpoint as VoxEndpoint;
         let addr = match bind {
             Bind::Addr(addr) => *addr,
             Bind::Socket(socket) => {
-                return Ok((
-                    VoxEndpoint::bind_abstract(signer, Arc::clone(socket))?,
-                    None,
-                ))
+                return Ok((VoxEndpoint::bind_abstract(Arc::clone(socket))?, None))
             }
+            Bind::Shared(presence) => return Ok((Arc::clone(presence.shared()), None)),
         };
-        if addr.port() != 0 {
-            return Ok((VoxEndpoint::bind(signer, addr)?, None));
-        }
-        let file = self.paths.port_file();
-        let kept = std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|t| t.trim().parse::<u16>().ok())
-            .filter(|p| *p != 0);
-        let Some(port) = kept else {
-            let endpoint = VoxEndpoint::bind(signer, addr)?;
-            if let Ok(at) = endpoint.local_addr() {
-                let _ = crate::node::paths::write_private_file(
-                    &file,
-                    format!("{}\n", at.port()).as_bytes(),
-                );
-            }
-            return Ok((endpoint, None));
-        };
-        let why = match VoxEndpoint::bind(signer, std::net::SocketAddr::new(addr.ip(), port)) {
-            Ok(endpoint) => return Ok((endpoint, None)),
-            Err(crate::error::Error::LocalBind {
-                cause: crate::error::BindCause::InUse,
-                ..
-            }) => "another program holds it".to_owned(),
-            Err(e) => e.to_string(),
-        };
-        let endpoint = VoxEndpoint::bind(signer, addr)?;
-        let now = endpoint
-            .local_addr()
-            .map_or_else(|_| "another".to_owned(), |a| a.port().to_string());
-        Ok((
-            endpoint,
-            Some(format!(
-                "this node's port {port} is not free ({why}), so it listens on port {now} this run"
-            )),
-        ))
+        // The node's own port, else the data root's (ADR-026 D-3): a node moved from the layout
+        // before v0.3.0 had its `port` file removed, and the migration kept its port in
+        // `.daemon/port`, so it binds where members last saw it.
+        crate::node::presence::NetPresence::bind_kept(
+            addr,
+            &self.paths.port_file(),
+            Some(&self.paths.account_port_file()),
+        )
     }
 
     /// Tear the network down: close every connection and the endpoint, so a locked
@@ -5065,12 +4898,19 @@ impl Node {
         if let Some(task) = self.nearby_task.take() {
             task.abort();
         }
+        if let Some(task) = self.addresses_task.take() {
+            task.abort();
+        }
         self.nearby = None;
         if let Some(net) = self.net.take() {
             // **A finished tunnel's last bytes first.** A close drops what the peer has not yet
             // acknowledged, so a node stopped right after a reply was finished cut it short at
             // the far end (V210-81).
-            crate::tunnel::session::all_acknowledged(STOP_ACK_BOUND).await;
+            crate::tunnel::session::all_acknowledged(
+                &net.manager().endpoint().local_id(),
+                STOP_ACK_BOUND,
+            )
+            .await;
             // **Relayed connections first**, while the circuits their closes travel in still run,
             // then everything else. Closing them all at once closed each circuit's carrier in the
             // same instant, so a relayed peer never received the CONNECTION_CLOSE. It learned this
@@ -5088,31 +4928,20 @@ impl Node {
                 tokio::time::sleep(RELAYED_CLOSE_LEAD).await;
             }
             net.manager().close_all();
-            net.manager().endpoint().close();
-            // **The closes leave before the node goes on** (V210-93). `close` only queues each
-            // CONNECTION_CLOSE for the endpoint's driver; a process that exits straight after can
-            // take them with it, and its peers then learn it went only by inference. Bounded: a
-            // close that cannot leave is not worth a stuck shutdown.
-            let _ = tokio::time::timeout(CLOSE_FLUSH, net.manager().endpoint().wait_idle()).await;
+            // Off the exchange: nothing more is answered as this node.
+            net.manager().endpoint().unregister();
         }
-        self.stream_loops.clear();
-        // A UPnP mapping the router granted only *permanently* (lifetime 0) would
-        // outlive this node; it is deleted, best-effort, on its own task. Timed
-        // mappings of every kind expire by themselves.
-        for m in self.port_mappings.drain(..) {
-            if m.method == crate::nat::portmap::Method::UpnpIgd && m.lifetime_secs == 0 {
-                tokio::spawn(async move {
-                    let _ = crate::nat::portmap::unmap_port_upnp(
-                        crate::nat::portmap::Protocol::Udp,
-                        m.internal_port,
-                    )
-                    .await;
-                });
+        // **Only this node's** (ADR-026 D-5): on the daemon's presence the endpoint and every
+        // other node's connections stay as they are. A presence this node made for itself goes
+        // with it, and the closes leave before the node goes on (V210-93): `close` only queues
+        // each CONNECTION_CLOSE, and a process that exits straight after can take them with it.
+        // Bounded inside: a close that cannot leave is not worth a stuck shutdown.
+        if let Some((presence, owned)) = self.presence.take() {
+            if owned {
+                presence.close().await;
             }
         }
-        self.renew_mappings_at = None;
-        self.mapping_expires.clear();
-        self.mapping_retry.clear();
+        self.stream_loops.clear();
         // Every session stops with the network (ADR-025 D1a: the node shuts down).
         self.retire_all_ports();
     }
@@ -5184,7 +5013,7 @@ impl Node {
             ("our address", address.to_wire()),
         ];
         #[cfg(feature = "test-knobs")]
-        if test_hold_address(channel_id) {
+        if test_hold_address(&conn.local_id(), channel_id) {
             own.pop();
         }
         let mirrored = net.board_records(channel_id, epoch);
@@ -5210,7 +5039,7 @@ impl Node {
         }
         crate::node::status::SyncBook::note_publish_round(&self.sync_book, cause);
         #[cfg(feature = "test-knobs")]
-        let held = test_hold_room_from_anchors(channel_id);
+        let held = test_hold_room_from_anchors(&conn.local_id(), channel_id);
         let conn = Arc::clone(conn);
         let tx = self.net_tx.clone();
         let cid = *channel_id;
@@ -5890,7 +5719,7 @@ impl Node {
             admission,
         ) {
             #[cfg(feature = "test-knobs")]
-            let held = test_hold_address(channel_id);
+            let held = test_hold_address(&net.manager().endpoint().local_id(), channel_id);
             #[cfg(not(feature = "test-knobs"))]
             let held = false;
             if !held {
@@ -6369,10 +6198,9 @@ impl Node {
                 self.run_sync_session(conn, peer, channel_id, epoch, send, recv)
                     .await;
             }
-            NetEvent::AddressesDiscovered { mappings } => {
+            NetEvent::AddressesDiscovered => {
                 // Re-publish every open channel's records: the addresses in them were
                 // composed before discovery and may name only loopback.
-                self.take_mappings(&mappings);
                 let channels: Vec<Digest32> = self.channels.keys().copied().collect();
                 for channel_id in channels {
                     self.publish_channel_locally(&channel_id).await;
@@ -7742,7 +7570,10 @@ impl Node {
             let kind = if ip.is_loopback() {
                 "this machine"
             } else if self
-                .port_mappings
+                .presence
+                .as_ref()
+                .map(|(p, _)| p.port_mappings())
+                .unwrap_or_default()
                 .iter()
                 .any(|m| m.external_ip == Some(ip) && m.external_port == sa.port())
             {
@@ -9288,71 +9119,6 @@ impl Node {
         self.note_local_append(channel_id);
     }
 
-    /// Take what a discovery or a renewal was granted, **per address family** (V210-75).
-    ///
-    /// A family granted again is held anew and renewed at half its lease. A family that was held,
-    /// or was already being retried, and got nothing back this time is retried after a backoff
-    /// of its own ([`MAPPING_RETRY_SECS`] doubling to [`MAPPING_RETRY_MAX_SECS`]), and its mapping
-    /// is kept, and still advertised, until its lease runs out: the gateway most likely still
-    /// holds it, and a lost reply is not a withdrawn mapping. The next try is never later than
-    /// that lease's end, so an expired mapping stops being advertised then. A permanent grant
-    /// (lifetime zero) is never re-requested; it is deleted when the network stops.
-    ///
-    /// Both families used to come back in one list, and only an empty list was retried: one
-    /// family's lost renewal was dropped, and asked again only at the other's half-lifetime,
-    /// about when it expired.
-    fn take_mappings(&mut self, fresh: &[crate::nat::portmap::PortMapping]) {
-        let now = self.now();
-        let mut held = Vec::new();
-        let mut due: Option<u64> = None;
-        let mut sooner = |at: u64| due = Some(due.map_or(at, |d| d.min(at)));
-        for v6 in [false, true] {
-            let granted = fresh.iter().find(|m| mapping_is_v6(m) == v6).copied();
-            let had = self
-                .port_mappings
-                .iter()
-                .find(|m| mapping_is_v6(m) == v6)
-                .copied();
-            if let Some(m) = granted {
-                held.push(m);
-                self.mapping_retry.remove(&v6);
-                if m.lifetime_secs > 0 {
-                    self.mapping_expires
-                        .insert(v6, now + u64::from(m.lifetime_secs));
-                    if let Some(at) = renew_at(now, &[m]) {
-                        sooner(at);
-                    }
-                } else {
-                    self.mapping_expires.remove(&v6);
-                }
-                continue;
-            }
-            if let Some(m) = had.filter(|m| m.lifetime_secs == 0) {
-                held.push(m);
-                continue;
-            }
-            if had.is_none() && !self.mapping_retry.contains_key(&v6) {
-                continue; // never granted: no gateway for this family, nothing to keep alive
-            }
-            let wait = (self.mapping_retry.get(&v6).copied().unwrap_or(0) * 2)
-                .clamp(MAPPING_RETRY_SECS, MAPPING_RETRY_MAX_SECS);
-            self.mapping_retry.insert(v6, wait);
-            let mut at = now + wait;
-            match (had, self.mapping_expires.get(&v6).copied()) {
-                (Some(m), Some(expires)) if now < expires => {
-                    held.push(m);
-                    at = at.min(expires);
-                }
-                _ => {
-                    self.mapping_expires.remove(&v6);
-                }
-            }
-            sooner(at);
-        }
-        self.port_mappings = held;
-        self.renew_mappings_at = due;
-    }
-
     /// Renew each open room's own records when half their lifetime has passed (V210-68, #258).
     ///
     /// A node's address record lives two hours on a board ([`crate::nat::store::MAX_TTL_SECS`]),
@@ -9391,49 +9157,6 @@ impl Node {
         let half = crate::nat::store::own_record_ttl_secs() / 2;
         self.records_renew_at
             .insert(*room, self.now().saturating_add(half.max(1)));
-    }
-
-    /// Re-run the ladder's publish side when the granted mappings are halfway through
-    /// their lifetime, so a node that outlives a two-hour mapping stays dialable.
-    ///
-    /// Nothing happens while the network is down: the renewal instant is left in place
-    /// so the next unlock's discovery supersedes it.
-    ///
-    /// The re-request runs on its own task (it talks to a gateway) and lands back as
-    /// [`NetEvent::AddressesDiscovered`], which republishes the address records too —
-    /// a renewal that came back with a *different* external port must be advertised.
-    fn renew_mappings_if_due(&mut self) {
-        let Some(due) = self.renew_mappings_at else {
-            return;
-        };
-        if self.now() < due {
-            return;
-        }
-        let Some(net) = self.net.as_ref().map(Arc::clone) else {
-            return;
-        };
-        // Cleared now, not when the refresh returns: one renewal in flight at a time.
-        self.renew_mappings_at = None;
-        // The mappings whose lease has not run out, so a family whose renewal fails this time
-        // is still advertised at its mapped address until the lease ends (V210-75).
-        let now = self.now();
-        let leased: Vec<crate::nat::portmap::PortMapping> = self
-            .port_mappings
-            .iter()
-            .filter(|m| {
-                m.lifetime_secs == 0
-                    || self
-                        .mapping_expires
-                        .get(&mapping_is_v6(m))
-                        .is_some_and(|at| now < *at)
-            })
-            .copied()
-            .collect();
-        let tx = self.net_tx.clone();
-        tokio::spawn(async move {
-            let mappings = net.refresh_advertised(&leased).await;
-            let _ = tx.send(NetEvent::AddressesDiscovered { mappings }).await;
-        });
     }
 
     /// ADR-025: a local append bumped the room's generation (inside the room's own write), so the
@@ -10482,19 +10205,6 @@ impl Node {
         self.start_inbound(channel_id, peer, conn, transport);
     }
 
-    /// Whether `peer` may reconcile `channel_id`'s log with this node.
-    ///
-    /// - An **admitted author** of that room. If it is not one yet, this node's own board is
-    ///   consulted first — local, so cheap — because a member that joined through somebody
-    ///   else is on the board before it is in this node's author table, and refusing it for
-    ///   that would be the "precondition behind its own check" defect `shares_room` documents.
-    ///   Admission there takes the same M17.6 evidence as everywhere else.
-    /// - An **anchor of that room** — in the room's own anchor set, which holds this node's
-    ///   configured anchors and those the room's link named. It keeps the room's ciphertext by
-    ///   design (ADR-016 M15.2b) for members who are away. An anchor named only by *another*
-    ///   room's link is not an anchor of this one.
-    ///
-    /// For a room this node only anchors, the peer must be an author the board knows.
     /// Whether a refusal may tell `peer` **why** (#202): it is this room's session partner, or it
     /// has a member record for the room on the board. Decided without the room's lock, because
     /// the refusals that ask run before it. Anyone else is refused with the uninformative code,
@@ -10518,6 +10228,19 @@ impl Node {
             })
     }
 
+    /// Whether `peer` may reconcile `channel_id`'s log with this node: an **admitted author** of
+    /// that room. If it is not one yet, this node's own board is consulted first — local, so
+    /// cheap — because a member that joined through somebody else is on the board before it is
+    /// in this node's author table, and refusing it for that would be the "precondition behind
+    /// its own check" defect `shares_room` documents. Admission there takes the same M17.6
+    /// evidence as everywhere else.
+    ///
+    /// **Not an anchor for being one.** An anchor that is not a member holds nothing for the
+    /// room and runs no sync session (ADR-023 RL-6.1, RL-6.2), so it refuses every one. Counting
+    /// the room's anchors here, a leftover of the anchor log M23.5 deleted, gave every member a
+    /// port to each anchor: a session opened on every connection and tick, refused "epoch
+    /// mismatch", and printed as a sync that did not complete. An anchor that is a member
+    /// syncs as a member.
     async fn may_sync(&mut self, channel_id: &Digest32, peer: &Digest32, epoch: u64) -> bool {
         if let Some(shared) = self.channels.get(channel_id).map(Arc::clone) {
             {
@@ -10526,9 +10249,7 @@ impl Node {
                 if channel.has_left(peer) {
                     return false;
                 }
-                if channel.is_member(peer)
-                    || channel.anchors().nodes().iter().any(|a| a.id == *peer)
-                {
+                if channel.is_member(peer) {
                     return true;
                 }
             }
@@ -11486,7 +11207,16 @@ impl Node {
             return;
         }
         #[cfg(feature = "test-knobs")]
-        if matches!(stream.first, PairwiseFrame::Hello { .. }) && test_lose_hello() {
+        if matches!(stream.first, PairwiseFrame::Hello { .. })
+            && test_lose_hello(
+                &self
+                    .net
+                    .as_ref()
+                    .map(|n| n.manager().endpoint().local_id())
+                    .unwrap_or_default(),
+                &room,
+            )
+        {
             eprintln!("vox: {TEST_LOSE_HELLOS_ENV}: an inbound hello was lost, unread");
             let PairwiseIn {
                 mut send, mut recv, ..
@@ -11748,7 +11478,6 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
-        let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
         self.passphrase_entered_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
         for (_, shared) in std::mem::take(&mut self.channels) {
@@ -11816,13 +11545,17 @@ impl Node {
         // for the closes to leave — up to a couple of seconds for a peer that does not answer —
         // and none of that needs a secret, since a connection's keys are its own. A lock wipes
         // every secret at once; it does not hold the identity while the network winds down.
+        // Off the exchange first (ADR-011 requirement 34, ADR-026 L-3): the endpoint holds the
+        // signer to sign each PROVE, so it lets go of it before the keys are wiped.
+        if let Some(net) = &self.net {
+            net.manager().endpoint().unregister();
+        }
         if let Some(p) = self.profile.as_mut() {
             p.lock();
         }
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
         self.stop_network().await;
-        self.lock_was_unlocked |= was_unlocked;
         self.locking += 1;
         let (settled, on_settled) = oneshot::channel();
         let secret_work = Arc::clone(&self.secret_work);
@@ -11855,12 +11588,6 @@ impl Node {
         }
         // The view first: whoever is told the lock is done reads a locked view.
         self.publish().await;
-        for reply in std::mem::take(&mut self.lock_waiters) {
-            let _ = reply.send(Outcome::Done);
-        }
-        if std::mem::take(&mut self.lock_was_unlocked) {
-            let _ = self.event_tx.send(NodeEvent::Locked);
-        }
         for (passphrase, reply) in std::mem::take(&mut self.unlock_after_lock) {
             self.unlock_and_answer(&passphrase, reply).await;
         }
@@ -11964,12 +11691,16 @@ impl Node {
                 let _slot = slot;
                 match verifier.verify(&passphrase) {
                     Ok(()) => {
+                        // Restarted unless a lock zeroed it meanwhile, and never moved back: of
+                        // several checks passing at once, each leaves it at least at its own
+                        // time, whichever wrote first (a compare-exchange against the value at
+                        // the start lost to the first, and left the window where it was).
                         if entered_before != 0 {
-                            let _ = entered_at.compare_exchange(
-                                entered_before,
-                                clock().max(1),
+                            let now = clock().max(1);
+                            let _ = entered_at.fetch_update(
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
+                                |at| (at != 0).then_some(at.max(now)),
                             );
                         }
                         Outcome::Done
@@ -13431,6 +13162,7 @@ impl Node {
             relaying: view.relaying,
             app: self.app.stats(),
             udp_flows: self.udp_flows.snapshot(),
+            tunnel_stuck_after: self.stuck_after,
             ..StatusReport::default()
         };
         for room in &view.open_channels {
@@ -13601,14 +13333,16 @@ impl Node {
             // The room's own value is "follow the room": the member's line is cleared, so a later
             // change to the room's retention reaches this node too.
             let own = (ttl != room).then_some(ttl);
-            if crate::node::retention::RetentionConfig::write_room(
-                &self.paths.retention_file(),
-                channel_id,
-                own,
-            )
-            .is_err()
-            {
-                return Outcome::Failed(Fault::Storage);
+            // Written to the node's own file (ADR-026 F-2), seeded from the account's when the
+            // node has none, so the other rooms' lines it was reading are kept.
+            let written = self
+                .paths
+                .own_config_path(crate::node::paths::RETENTION_FILE)
+                .and_then(|file| {
+                    crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
+                });
+            if written.is_err() {
+                return Outcome::Failed(Fault::RetentionFileUnwritable);
             }
             self.retention_read_at = 0;
             self.refresh_node_retention(now);
@@ -14197,6 +13931,27 @@ fn note_event(note: crate::node::tunnel::TunnelNote) -> NodeEvent {
     }
 }
 
+/// **For proofs only.** A marker: a message posted through this node whose text contains it
+/// makes the node's actor panic as it takes the post, which stands for a bug in one node
+/// (ADR-026 L-6). The panic-isolation proof uses it to show the host hears of the panic and every
+/// other node keeps running. Nothing a person runs sets it; unset or empty, nothing changes. Not
+/// compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_PANIC_ON_TEXT_ENV: &str = "VOX_TEST_PANIC_ON_TEXT";
+
+#[cfg(feature = "test-knobs")]
+fn test_panic_on_text(text: &str) {
+    if let Some(marker) = std::env::var(TEST_PANIC_ON_TEXT_ENV)
+        .ok()
+        .filter(|m| !m.is_empty())
+    {
+        assert!(
+            !text.contains(&marker),
+            "{TEST_PANIC_ON_TEXT_ENV}: the posted text holds the marker {marker:?}"
+        );
+    }
+}
+
 /// **Test-only**: set, this node fails every joiner's admission after the exchange, as a node
 /// locked or closing mid-join does (V210-128), so a proof can see what the joiner is told. Not
 /// compiled in without the `test-knobs` feature (V210-105).
@@ -14419,7 +14174,10 @@ async fn agree_round(
     }
 }
 
-fn fault_of(e: &Error) -> Fault {
+/// The [`Fault`] a person is told for `e`: one mapping, shared by the actor and by a client verb
+/// that does the same work itself (`vox id` making an identity, ADR-026 C-5).
+#[must_use]
+pub fn fault_of(e: &Error) -> Fault {
     match e {
         // A ladder that tried every rung and got nowhere is unreachable, not an internal
         // fault: falling through to `Internal` made the join walk stop after one responder.
@@ -14452,6 +14210,10 @@ fn fault_of(e: &Error) -> Fault {
             op: crate::node::profile::VAULT_WRITE,
             ..
         } => Fault::IdentityFileUnwritable,
+        Error::Path {
+            op: crate::node::profile::VAULT_REWRITE,
+            ..
+        } => Fault::IdentityFileNotRewritten,
         // Retention is the admin's to set; anyone else is refused, and told why. It was mapped to
         // `Refused`, which reads "the other side refused" — for a check this node made itself,
         // about its own identity, with nobody on any other side (found by the R7 gate).

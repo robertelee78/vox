@@ -318,12 +318,14 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             .expect("APPARATUS: cannot build the client runtime"),
     ));
     let _enter = rt.enter();
-    let stranger = SoftwareRootSigner::from_component_seeds(&[0xA7; 32], &[0x5C; 32])
-        .expect("APPARATUS: the stranger's identity");
+    let stranger = Arc::new(
+        SoftwareRootSigner::from_component_seeds(&[0xA7; 32], &[0x5C; 32])
+            .expect("APPARATUS: the stranger's identity"),
+    );
     let (_endpoint, conn) = rt.block_on(async {
         let t = now();
         let endpoint = VoxEndpoint::bind(
-            &stranger,
+            Arc::clone(&stranger) as Arc<_>,
             "127.0.0.1:0"
                 .parse()
                 .expect("APPARATUS: a loopback address"),

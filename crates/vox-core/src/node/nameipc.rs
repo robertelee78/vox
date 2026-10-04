@@ -10,7 +10,6 @@
 //!   ^C stops it.
 
 use std::net::SocketAddr;
-use std::path::Path;
 
 use tokio::net::UnixStream;
 
@@ -18,7 +17,7 @@ use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
-use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
+use crate::node::ipc::{read_frame, write_frame, Frame, NodeSocket};
 use crate::node::resolver::{ServiceRoom, ShareState};
 
 const T_RESOLVE: u64 = 2401;
@@ -148,18 +147,9 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle, req: NameReques
     }
 }
 
-async fn connect(path: &Path) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(path).await.map_err(|e| Error::Path {
-        op: "connect control socket",
-        detail: format!("{}: {e}", path.display()),
-    })?;
-    let Some(hello) = read_frame(&mut stream).await? else {
-        return Err(Error::MalformedBundle("ipc closed before hello"));
-    };
-    match Frame::from_bytes(&hello)? {
-        Frame::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => Ok(stream),
-        _ => Err(Error::MalformedBundle("ipc protocol version")),
-    }
+/// A connection to the daemon acting as the node `at` names (ADR-026 C-2).
+async fn connect(at: &NodeSocket) -> Result<UnixStream> {
+    Ok(crate::node::ipc::open_as(at).await?.0)
 }
 
 fn reason(body: &[u8]) -> Error {
@@ -169,13 +159,13 @@ fn reason(body: &[u8]) -> Error {
     }
 }
 
-/// Resolve `name` with the node at `path`: the room, the member, the service's tag, and what the
-/// room's log says of the share.
+/// Resolve `name` with the node `at` names: the room, the member, the service's tag, and what
+/// the room's log says of the share.
 ///
 /// # Errors
 /// If no node answers, or the name leads nowhere — with the node's reason.
-pub async fn resolve(path: &Path, name: &str) -> Result<ServiceRoom> {
-    let mut stream = connect(path).await?;
+pub async fn resolve(at: &NodeSocket, name: &str) -> Result<ServiceRoom> {
+    let mut stream = connect(at).await?;
     write_frame(
         &mut stream,
         &NameRequest::Resolve(name.to_owned()).to_bytes(),
@@ -234,12 +224,12 @@ impl RemoteUp {
     }
 }
 
-/// Bring the proxy up inside the node at `path`, across every room it holds.
+/// Bring the proxy up inside the node `at` names, across every room it holds.
 ///
 /// # Errors
 /// If no node answers, or it could not bind.
-pub async fn up(path: &Path, bind: SocketAddr) -> Result<RemoteUp> {
-    let mut stream = connect(path).await?;
+pub async fn up(at: &NodeSocket, bind: SocketAddr) -> Result<RemoteUp> {
+    let mut stream = connect(at).await?;
     write_frame(&mut stream, &NameRequest::Up(bind.to_string()).to_bytes()).await?;
     let body = read_frame(&mut stream)
         .await?

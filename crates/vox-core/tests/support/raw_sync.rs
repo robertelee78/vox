@@ -99,7 +99,7 @@ pub async fn endpoint_as_member(paths: &Paths, passphrase: &[u8]) -> VoxEndpoint
         .unlock(passphrase)
         .expect("the member's identity unlocks");
     let signer = profile.signer_arc().expect("the member's signer");
-    VoxEndpoint::bind(&*signer, "127.0.0.1:0".parse().unwrap()).expect("bind as the member")
+    VoxEndpoint::bind(signer, "127.0.0.1:0".parse().unwrap()).expect("bind as the member")
 }
 
 /// Run one session over an already-open sync transport. Blocking: call from

@@ -2,13 +2,10 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: built (M9, `crates/vox-core/src/transport/`), except where a requirement says
-otherwise: the interop matrix (requirement 14) is not built. The OID's UUID arc (requirement 6)
-and the observed group (requirement 12) are built (V030-33, #382). A TCP fallback
-(requirement 2) does not exist.
-**Decided 2026-10-03, not built (#397, ADR-026):** the identity exchange (requirements 27–40)
-replaces identity in the TLS handshake (requirements 5–8) and ALPN `vox/1`. Until it is built, the
-code does what requirements 5–8 say, and requirements 27–40 are planned.
+**Status**: built (`crates/vox-core/src/transport/`), except where a requirement says otherwise: the
+interop matrix (requirement 14) and a TCP fallback (requirement 2) are not built. The identity
+exchange (requirements 27–39, 38a) is built and replaces requirements 5–8, which are not in the
+code; of requirement 40's proofs, path privacy is proved by real use and the rest in process only.
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: transport, quic, tls, post-quantum, multiplexing, datagrams
@@ -37,8 +34,7 @@ design, grounded in the libp2p TLS specification, IETF `draft-ietf-tls-ecdhe-mlk
 
 ### Transport security (concrete)
 
-Requirements 5–8 describe the built identity-in-the-handshake design. They are **superseded** by
-requirements 27–40 and MUST be removed from the code when those are built.
+Requirements 5–8 are **superseded** by requirements 27–40 and are not in the code.
 
 4. **PQ-hybrid key exchange.** The QUIC TLS 1.3 handshake MUST use the hybrid group X25519MLKEM768
    (code point `0x11EC`), whose key-schedule secret is `concat(ML-KEM-768 secret, X25519 secret)`.
@@ -82,18 +78,16 @@ requirements 27–40 and MUST be removed from the code when those are built.
     `__rustls-post-quantum-test` feature, which only adds that field), never a constant;
     `SessionEstablishment::observed` MUST refuse a session under any group but X25519MLKEM768.
     `vox status --json` names each peer's group (`tls_group`).
-    *Decided, not built (#397):* the ALPN becomes `vox/2` (requirement 27), and the record is
-    written only after the identity exchange completes (requirement 33).
+    The record MUST be written only after the identity exchange completes (requirement 33).
 13. **Hard failure.** A peer or library that cannot negotiate the required hybrid group MUST fail to
     connect with a clear, surfaced error and MUST NOT silently downgrade. A failure of
     authentication is reported as `SignatureInvalid`; any other handshake failure (refused, timed
     out, closed) is reported by its own cause (`quic::handshake_failed`).
 14. **Interop is a release gate.** The supported provider set (quinn + rustls with the
     X25519MLKEM768 provider, version-pinned) and a cross-version interop matrix (each supported
-    client and library pair completes the handshake and identity proof of possession, with the OID
-    and the raw-key binding pinned) MUST be release gates. Once requirements 27–40 are built, the
-    matrix pins the exchange's flights, signature labels and exporter label instead of the OID. The required-suite floor is versioned
-    (ADR-003). *Not built:* there is no second implementation, matrix or CI job.
+    client and library pair completes the handshake and the identity exchange, with the exchange's
+    flights, signature labels and exporter label pinned) MUST be release gates. The required-suite
+    floor is versioned (ADR-003). *Not built:* there is no second implementation, matrix or CI job.
 
 ### Datagram flows (ADR-022 M22.1)
 
@@ -242,18 +236,24 @@ connection, bound to the TLS session by its exporter.
     record's observed group (requirement 12) stays in force.
 38. **Latency.** The exchange adds one round trip before the dialler may send and about 1.5 round
     trips to the listener's admission. R40 (under 1 s) and R42 (under 2 s), and the hole punch's
-    attempt timeout (ADR-012 `PUNCH_ATTEMPT_TIMEOUT`), MUST be re-measured with it.
+    attempt timeout (ADR-012 `PUNCH_ATTEMPT_TIMEOUT`), MUST be re-measured with it. They are re-measured
+    (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
+    `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`,
+    `a_first_relayed_connection_is_under_two_seconds_proof`).
 38a. **Diagnostics.** A dialler whose expected node does not answer MUST say "nothing at `<address>`
-    answers as `<expected node>`", and MUST NOT name anyone else (ADR-026 G-1).
+    answers as `<expected node>`", and MUST NOT name anyone else (ADR-026 G-1)
+    (`a_dial_that_reaches_another_node_names_no_one_proof`).
 39. **Accepted cost (ADR-026).** A party that knows a node's fingerprint can test, by naming it,
     whether that node is attached at an address. The generic refusal (requirement 32)
     keeps it from learning anything more.
 40. **Proofs**, by real use of the shipped binary (ADR-018), each with its mutant:
     - path privacy: a UDP proxy records every datagram of setup and no fingerprint appears (mutant:
-      SNI = fingerprint);
+      SNI = fingerprint) (`a_tap_on_the_handshake_learns_no_node_proof`);
     - exporter binding: a `CLAIM` replayed onto another connection is refused, and a second `ASK` on
       one connection closes it (mutants: no exporter in the signature; no one-exchange rule);
-    - reflection: a `PROVE` fed back as a `CLAIM` is refused (mutant: one shared label);
+    - reflection: a `PROVE` fed back as a `CLAIM` is refused (mutant: one shared label **and**
+      `dialler_fp` dropped from what `CLAIM` signs; either alone leaves the two signed inputs
+      different, so the label is defence in depth beside the flights' shapes);
     - responder first: a fake listener at a node's address, without its key, never receives the
       dialler's `CLAIM` (mutant: `CLAIM` sent before `PROVE` is checked);
     - no further oracle: unknown and detached targets and a rate-limited source get byte-identical
@@ -264,6 +264,9 @@ connection, bound to the TLS session by its exporter.
       raised before `CLAIM` verifies);
     - re-attach: a node that detaches and re-attaches is seen by its peers as a new process (mutant:
       the instance left out of the process identity).
+
+    Every proof but path privacy is *proved in process only* (`transport::identity` and
+    `node::presence` tests); its real-binary form is not built.
 
 ## Known limits
 

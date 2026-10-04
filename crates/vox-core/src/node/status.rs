@@ -47,18 +47,17 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::cbor::{Decoder, Encoder};
-use crate::error::{Error, IpcHandshake, Result};
+use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
 use crate::node::app::AppStats;
-use crate::node::ipc::{read_frame, write_frame, Frame, PROTOCOL_VERSION};
+use crate::node::ipc::{read_frame, write_frame, Frame};
 use crate::node::link::b32_encode;
 use crate::transport::router::DatagramStats;
 
@@ -198,6 +197,10 @@ pub struct StatusReport {
     pub anchors: Vec<AnchorStatus>,
     /// What needs looking at.
     pub unhealthy: Vec<Unhealthy>,
+    /// How long this node gives a tunnel whose bytes wait before closing it as stuck (V030-11):
+    /// its own setting, not the process's (ADR-026 P-1). Said in the JSON's
+    /// `tunnel_stuck_after`, by [`SyncBook::sections_json`].
+    pub tunnel_stuck_after: std::time::Duration,
 }
 
 /// One anchor this node keeps: configured, or named by an open room.
@@ -427,15 +430,24 @@ impl StatusReport {
         j
     }
 
-    /// The report as Prometheus text exposition (what `vox daemon --metrics` serves).
+    /// The report as Prometheus text exposition for the node named `node`, alone (see
+    /// [`StatusReport::to_prometheus_rows`]).
     #[must_use]
-    pub fn to_prometheus(&self) -> String {
-        let mut m = String::new();
-        let mut gauge = |name: &str, help: &str, rows: Vec<(String, u64)>| {
-            let _ = writeln!(m, "# HELP {name} {help}");
-            let _ = writeln!(m, "# TYPE {name} gauge");
+    pub fn to_prometheus(&self, node: &str) -> String {
+        let mut out = Families::default();
+        self.to_prometheus_rows(node, &mut out);
+        out.render()
+    }
+
+    /// Add this report's samples, each labelled `node="<node>"` (ADR-026 P-1), to `out`, which
+    /// may already hold other nodes' samples of the same families: a scrape of a daemon is one
+    /// exposition with each family's `HELP` and `TYPE` once, and every node's samples under it.
+    pub fn to_prometheus_rows(&self, node: &str, out: &mut Families) {
+        let me = node_label(node);
+        let mut gauge = |name: &'static str, help: &'static str, rows: Vec<(String, u64)>| {
+            out.family(name, help, Kind::Gauge);
             for (labels, v) in rows {
-                let _ = writeln!(m, "{name}{labels} {v}");
+                out.sample(name, &me, &labels, v);
             }
         };
         gauge(
@@ -509,7 +521,11 @@ impl StatusReport {
             "Circuits carried for other peers.",
             vec![(String::new(), self.relaying as u64)],
         );
-        let live = crate::transport::quic::live_tunnels();
+        // Only this node's: a process may host several (ADR-026 P-1).
+        let live = self
+            .identity
+            .map(|me| crate::transport::quic::live_tunnels(&me))
+            .unwrap_or_default();
         gauge(
             "vox_tunnels_served",
             "Tunnels being served now.",
@@ -577,10 +593,9 @@ impl StatusReport {
             vec![(String::new(), self.unhealthy.len() as u64)],
         );
         let d = &self.datagrams;
-        let mut counter = |name: &str, help: &str, v: u64| {
-            let _ = writeln!(m, "# HELP {name} {help}");
-            let _ = writeln!(m, "# TYPE {name} counter");
-            let _ = writeln!(m, "{name} {v}");
+        let mut counter = |name: &'static str, help: &'static str, v: u64| {
+            out.family(name, help, Kind::Counter);
+            out.sample(name, &me, "", v);
         };
         counter(
             "vox_datagrams_sent_total",
@@ -634,7 +649,144 @@ impl StatusReport {
                 + a.refused_unaccepted
                 + a.refused_locally,
         );
+    }
+}
+
+/// A metric family's type, as its `# TYPE` line says it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A value that goes up and down.
+    Gauge,
+    /// A value that only goes up.
+    Counter,
+}
+
+/// A Prometheus exposition being built from several nodes' reports and the daemon's own gauges:
+/// each family's `HELP` and `TYPE` lines once, then every sample of it, in the order the
+/// families were first named. Two `TYPE` lines for one family make a scraper refuse the whole
+/// exposition, which is why a daemon's nodes cannot each render their own text and be joined.
+#[derive(Debug, Default)]
+pub struct Families {
+    order: Vec<&'static str>,
+    families: BTreeMap<&'static str, Family>,
+}
+
+#[derive(Debug)]
+struct Family {
+    help: &'static str,
+    kind: Kind,
+    samples: Vec<String>,
+}
+
+impl Families {
+    /// Name the family `name`, so its `HELP` and `TYPE` are written even when no sample follows.
+    /// A family named again keeps what it was first named with.
+    pub fn family(&mut self, name: &'static str, help: &'static str, kind: Kind) {
+        if !self.families.contains_key(name) {
+            self.order.push(name);
+            self.families.insert(
+                name,
+                Family {
+                    help,
+                    kind,
+                    samples: Vec::new(),
+                },
+            );
+        }
+    }
+
+    /// One sample of the family `name` (named first with [`Families::family`]): `node` is the
+    /// node's own label (`node="…"`, or empty for a daemon-wide value) and comes first; `labels`
+    /// is the rest, either `{a="…",b="…"}` or empty.
+    pub fn sample(&mut self, name: &'static str, node: &str, labels: &str, value: u64) {
+        let rest = labels
+            .strip_prefix('{')
+            .and_then(|l| l.strip_suffix('}'))
+            .unwrap_or(labels);
+        let set = match (node.is_empty(), rest.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("{{{node}}}"),
+            (true, false) => format!("{{{rest}}}"),
+            (false, false) => format!("{{{node},{rest}}}"),
+        };
+        if let Some(f) = self.families.get_mut(name) {
+            f.samples.push(format!("{name}{set} {value}"));
+        }
+    }
+
+    /// The exposition text.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut m = String::new();
+        for name in &self.order {
+            let Some(f) = self.families.get(name) else {
+                continue;
+            };
+            let kind = match f.kind {
+                Kind::Gauge => "gauge",
+                Kind::Counter => "counter",
+            };
+            let _ = writeln!(m, "# HELP {name} {}", f.help);
+            let _ = writeln!(m, "# TYPE {name} {kind}");
+            for line in &f.samples {
+                let _ = writeln!(m, "{line}");
+            }
+        }
         m
+    }
+}
+
+/// `node="<name>"`, with the value escaped as the exposition format asks (backslash, quote and
+/// newline), since a profile's name is the person's.
+fn node_label(node: &str) -> String {
+    let mut v = String::with_capacity(node.len());
+    for c in node.chars() {
+        match c {
+            '\\' => v.push_str("\\\\"),
+            '"' => v.push_str("\\\""),
+            '\n' => v.push_str("\\n"),
+            c => v.push(c),
+        }
+    }
+    format!("node=\"{v}\"")
+}
+
+/// What a daemon counts of itself, beside its nodes' reports (ADR-026 P-1): how many nodes are
+/// attached, and how many of their actors have panicked since it started (L-6).
+#[derive(Debug, Default)]
+pub struct DaemonMetrics {
+    /// Nodes attached now.
+    pub nodes_attached: std::sync::atomic::AtomicU64,
+    /// Node actors that panicked since the daemon started.
+    pub node_panics: std::sync::atomic::AtomicU64,
+}
+
+impl DaemonMetrics {
+    /// Add the daemon's own families to `out`, unlabelled.
+    pub fn to_prometheus_rows(&self, out: &mut Families) {
+        use std::sync::atomic::Ordering::Relaxed;
+        out.family(
+            "vox_daemon_nodes_attached",
+            "Nodes attached to this daemon.",
+            Kind::Gauge,
+        );
+        out.sample(
+            "vox_daemon_nodes_attached",
+            "",
+            "",
+            self.nodes_attached.load(Relaxed),
+        );
+        out.family(
+            "vox_daemon_node_panics_total",
+            "Node actors that panicked since the daemon started; each one detached its node.",
+            Kind::Counter,
+        );
+        out.sample(
+            "vox_daemon_node_panics_total",
+            "",
+            "",
+            self.node_panics.load(Relaxed),
+        );
     }
 }
 
@@ -1078,11 +1230,14 @@ impl SyncBook {
     /// The counters as `vox status --json` carries them: its `"sync"`, `"reach"`,
     /// `"equivocations"`, `"publish"`, `"prekeys"` and `"set_aside"` members, without the enclosing braces, for [`serve`] to add beside
     /// [`StatusReport::to_json`]'s. `equivocations` is each `(room, author, position)` the node
-    /// holds back (V210-63).
+    /// holds back (V210-63). `me` is the node whose tunnels and counts are said, and
+    /// `stuck_after` that node's stuck-tunnel setting (ADR-026 P-1).
     #[must_use]
     pub fn sections_json(
         book: &SharedSyncBook,
         equivocations: &[(Digest32, Digest32, u64)],
+        me: &Digest32,
+        stuck_after: std::time::Duration,
     ) -> String {
         // Read before the book is held: the manager takes a lock of its own.
         let held: BTreeMap<Digest32, (String, crate::node::net::PathClass)> = {
@@ -1149,8 +1304,8 @@ impl SyncBook {
         // Ladders from this book; circuits counted where every outbound circuit is asked for
         // (`circuitstream::connect_through`). Every peer either names, in one row.
         // Dial-backs (V030-22) counted where each is asked for, in the ladder.
-        let circuits = crate::node::circuitstream::outbound_circuits();
-        let dial_backs = crate::node::coordstream::dial_backs();
+        let circuits = crate::node::circuitstream::outbound_circuits(me);
+        let dial_backs = crate::node::coordstream::dial_backs(me);
         let peers: std::collections::BTreeSet<&Digest32> = b
             .ladders
             .keys()
@@ -1251,7 +1406,8 @@ impl SyncBook {
         // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and
         // when it was opened and last moved a byte (Unix seconds), so a stale one is visible.
         s.push_str("],\"tunnels\":[");
-        for (i, t) in crate::transport::quic::live_tunnels().iter().enumerate() {
+        // Only this node's tunnels: a process may host several (ADR-026 P-1).
+        for (i, t) in crate::transport::quic::live_tunnels(me).iter().enumerate() {
             if i > 0 {
                 s.push(',');
             }
@@ -1270,7 +1426,10 @@ impl SyncBook {
         // **Tunnels that ended for a reason a person should see** (V030-11): closed here, closed
         // at the other end, or closed as stuck, with why; and how long a stuck tunnel is given.
         s.push_str("],\"closed_tunnels\":[");
-        for (i, t) in crate::transport::quic::closed_tunnels().iter().enumerate() {
+        for (i, t) in crate::transport::quic::closed_tunnels(me)
+            .iter()
+            .enumerate()
+        {
             if i > 0 {
                 s.push(',');
             }
@@ -1287,11 +1446,7 @@ impl SyncBook {
                 q(&t.why)
             );
         }
-        let _ = write!(
-            s,
-            "],\"tunnel_stuck_after\":{}",
-            crate::tunnel::session::stuck_after().as_secs()
-        );
+        let _ = write!(s, "],\"tunnel_stuck_after\":{}", stuck_after.as_secs());
         s
     }
 }
@@ -1344,39 +1499,67 @@ pub fn close_request(body: &[u8]) -> Option<crate::transport::quic::TunnelSelect
 /// If the reply cannot be written.
 pub async fn serve_close(
     stream: &mut UnixStream,
+    owner: &Digest32,
     which: &crate::transport::quic::TunnelSelector,
 ) -> Result<()> {
     // Nothing closed and a reason: the selector named more than one member.
-    let (n, said) =
-        match crate::transport::quic::close_tunnels(which, "closed by a person on this side") {
-            Ok(closed) => (closed.len() as u64, closed_said(&closed)),
-            Err(refused) => (0, refused),
-        };
+    let (n, said) = match crate::transport::quic::close_tunnels(
+        owner,
+        which,
+        "closed by a person on this side",
+    ) {
+        Ok(closed) => (closed.len() as u64, closed_said(&closed)),
+        Err(refused) => (0, refused),
+    };
     let mut e = Encoder::new();
     e.array(3).uint(T_TUNNEL_CLOSED).uint(n).text(&said);
     write_frame(stream, &e.finish()).await
 }
 
-/// Ask the node listening on `path` to close the tunnels `which` names: how many it closed,
+/// Ask the node `at` names to close the tunnels `which` names: how many it closed,
 /// and each as `vox status` lists it — or none, and why not, when `which` named more than one
 /// member.
 ///
 /// # Errors
 /// If the node cannot be reached, does not answer in time, or answers something else.
 pub async fn request_close(
-    path: &Path,
+    at: &crate::node::ipc::NodeSocket,
     which: &crate::transport::quic::TunnelSelector,
 ) -> Result<(u64, String)> {
+    let body = tokio::time::timeout(
+        crate::node::ipc::ANSWER_WITHIN,
+        exchange(at, close_body(which)),
+    )
+    .await
+    .map_err(|_| crate::node::ipc::silent())??;
+    close_reply(&body)
+}
+
+/// [`request_close`] on a connection already acting as a node on the daemon's account socket
+/// (ADR-026 C-2): what a client of the daemon, the TUI first, closes a tunnel with.
+///
+/// # Errors
+/// If the node cannot be reached or answers something else.
+pub async fn request_close_on(
+    client: &mut crate::node::ipc::IpcClient,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<(u64, String)> {
+    let body = client.exchange(&close_body(which)).await?;
+    close_reply(&body)
+}
+
+fn close_body(which: &crate::transport::quic::TunnelSelector) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(4)
         .uint(T_TUNNEL_CLOSE)
         .text(&which.id.map(|i| i.to_string()).unwrap_or_default())
         .text(which.member.as_deref().unwrap_or_default())
         .text(which.service.as_deref().unwrap_or_default());
-    let body = tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, exchange(path, e.finish()))
-        .await
-        .map_err(|_| crate::node::ipc::silent())??;
-    let mut d = Decoder::new(&body);
+    e.finish()
+}
+
+fn close_reply(body: &[u8]) -> Result<(u64, String)> {
+    let mut d = Decoder::new(body);
     if let (Ok(3), Ok(T_TUNNEL_CLOSED)) = (d.array(), d.uint()) {
         let n = d
             .uint()
@@ -1418,7 +1601,13 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
             let mut json = report.to_json();
             json.pop();
             json.push(',');
-            json.push_str(&SyncBook::sections_json(handle.sync_book(), &equivocations));
+            let me = report.identity.unwrap_or_default();
+            json.push_str(&SyncBook::sections_json(
+                handle.sync_book(),
+                &equivocations,
+                &me,
+                report.tunnel_stuck_after,
+            ));
             json.push('}');
             let mut e = Encoder::new();
             e.array(2).uint(T_STATUS_REPORT).text(&json);
@@ -1432,23 +1621,23 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle) -> Result<()> {
     write_frame(stream, &body).await
 }
 
-/// Ask the node at `path` for its status, as JSON.
+/// Ask the node `at` names for its status, as JSON.
 ///
 /// **Bounded by [`ANSWER_WITHIN`](crate::node::ipc::ANSWER_WITHIN)** (V210-83): a suspended node's
 /// socket still accepts, and `vox status` against one waited for ever.
 ///
 /// # Errors
 /// If the node cannot be reached, does not answer in time, or answers something else.
-pub async fn request(path: &Path) -> Result<String> {
-    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, ask(path))
+pub async fn request(at: &crate::node::ipc::NodeSocket) -> Result<String> {
+    tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, ask(at))
         .await
         .map_err(|_| crate::node::ipc::silent())?
 }
 
-async fn ask(path: &Path) -> Result<String> {
+async fn ask(at: &crate::node::ipc::NodeSocket) -> Result<String> {
     let mut e = Encoder::new();
     e.array(1).uint(T_STATUS);
-    let body = exchange(path, e.finish()).await?;
+    let body = exchange(at, e.finish()).await?;
     let mut d = Decoder::new(&body);
     if let (Ok(2), Ok(T_STATUS_REPORT)) = (d.array(), d.uint()) {
         return d
@@ -1465,29 +1654,17 @@ async fn ask(path: &Path) -> Result<String> {
     }
 }
 
-/// Greet the node listening on `path`, send it `request`, and return its one reply.
-async fn exchange(path: &Path, request: Vec<u8>) -> Result<Vec<u8>> {
-    let mut stream = crate::node::ipc::connect_own(path).await?;
+/// Greet the daemon as the node `at` names (ADR-026 C-2), send it `request`, and return its one
+/// reply.
+async fn exchange(at: &crate::node::ipc::NodeSocket, request: Vec<u8>) -> Result<Vec<u8>> {
+    let (mut stream, _) = crate::node::ipc::open_as(at).await?;
     // A connection that ends is named as such, never as a malformed message (V210-101); and none
     // of this is an identity bundle, which `MalformedBundle` said.
-    let Some(hello) = read_frame(&mut stream).await? else {
-        return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
-    };
-    match Frame::from_bytes(&hello)? {
-        Frame::Hello { protocol, .. } if protocol == PROTOCOL_VERSION => {}
-        Frame::Hello { protocol, .. } => {
-            return Err(Error::Ipc(IpcHandshake::Protocol {
-                mine: PROTOCOL_VERSION,
-                theirs: protocol,
-            }))
-        }
-        _ => return Err(Error::Ipc(IpcHandshake::NotHello)),
-    }
     if let Err(e) = write_frame(&mut stream, &request).await {
-        return Err(crate::node::ipc::named(path, e).await);
+        return Err(crate::node::ipc::named(&at.path, e).await);
     }
     let Some(body) = read_frame(&mut stream).await? else {
-        return Err(crate::node::ipc::hung_up(path).await);
+        return Err(crate::node::ipc::hung_up(&at.path).await);
     };
     Ok(body)
 }
@@ -1557,10 +1734,25 @@ async fn drain_after_answer(sock: &mut tokio::net::TcpStream, within: std::time:
     }
 }
 
-/// Serve Prometheus text on every connection to `listener`, until it is dropped.
-pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle) {
+/// Serve Prometheus text for the one node `handle`, named `node`, on every connection to
+/// `listener`, until it is dropped: a process that hosts one node and no daemon (`vox lan up`).
+pub async fn serve_metrics(listener: tokio::net::TcpListener, node: String, handle: NodeHandle) {
+    serve_metrics_for(listener, None, move || vec![(node.clone(), handle.clone())]).await;
+}
+
+/// Serve Prometheus text on every connection to `listener`, until it is dropped: the daemon's own
+/// families from `daemon`, then those of every node `nodes` lists at the time of the scrape, each
+/// sample labelled with its node's name. A node that does not answer is `vox_up 0` for that node.
+pub async fn serve_metrics_for<F>(
+    listener: tokio::net::TcpListener,
+    daemon: Option<std::sync::Arc<DaemonMetrics>>,
+    nodes: F,
+) where
+    F: Fn() -> Vec<(String, NodeHandle)> + Send + Sync + 'static,
+{
+    let nodes = std::sync::Arc::new(nodes);
     while let Ok((mut sock, _)) = listener.accept().await {
-        let handle = handle.clone();
+        let (daemon, nodes) = (daemon.clone(), std::sync::Arc::clone(&nodes));
         tokio::spawn(async move {
             // The request itself is not interpreted: every path answers the metrics. But it is
             // **read to its end** first, the blank line after its headers, within the same 2 s
@@ -1568,10 +1760,20 @@ pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle
             // pieces, and closing with the rest unread made the OS reset the connection, so the
             // scraper lost the answer (`Connection reset by peer`).
             read_request_head(&mut sock, std::time::Duration::from_secs(2)).await;
-            let body = match handle.status().await {
-                Ok(r) => r.to_prometheus(),
-                Err(_) => "vox_up 0\n".to_owned(),
-            };
+            let mut out = Families::default();
+            if let Some(d) = &daemon {
+                d.to_prometheus_rows(&mut out);
+            }
+            for (name, handle) in nodes() {
+                match handle.status().await {
+                    Ok(r) => r.to_prometheus_rows(&name, &mut out),
+                    Err(_) => {
+                        out.family("vox_up", "1 while the node answers.", Kind::Gauge);
+                        out.sample("vox_up", &node_label(&name), "", 0);
+                    }
+                }
+            }
+            let body = out.render();
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -1583,5 +1785,63 @@ pub async fn serve_metrics(listener: tokio::net::TcpListener, handle: NodeHandle
             let _ = sock.shutdown().await;
             drain_after_answer(&mut sock, DRAIN_AFTER_ANSWER).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two nodes' reports in one exposition: each family's `HELP` and `TYPE` once, every sample
+    /// labelled with its node first, and the daemon's own families unlabelled (ADR-026 P-1).
+    #[test]
+    fn two_nodes_share_one_help_and_type_per_family() {
+        let mut out = Families::default();
+        let daemon = DaemonMetrics::default();
+        daemon
+            .nodes_attached
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        daemon.to_prometheus_rows(&mut out);
+        let a = StatusReport {
+            networked: true,
+            ..StatusReport::default()
+        };
+        a.to_prometheus_rows("alice", &mut out);
+        StatusReport::default().to_prometheus_rows("bob", &mut out);
+        let text = out.render();
+        for family in ["vox_up", "vox_networked", "vox_datagrams_sent_total"] {
+            assert_eq!(
+                text.matches(&format!("# TYPE {family} ")).count(),
+                1,
+                "{family}:\n{text}"
+            );
+        }
+        assert!(text.contains("vox_networked{node=\"alice\"} 1\n"), "{text}");
+        assert!(text.contains("vox_networked{node=\"bob\"} 0\n"), "{text}");
+        assert!(
+            text.contains("vox_datagrams_sent_total{node=\"bob\"} 0\n"),
+            "{text}"
+        );
+        assert!(text.contains("vox_daemon_nodes_attached 2\n"), "{text}");
+        assert!(text.contains("vox_daemon_node_panics_total 0\n"), "{text}");
+        // No sample of a node's family goes unlabelled.
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            assert!(
+                line.starts_with("vox_daemon_") || line.contains("{node=\""),
+                "unlabelled: {line}"
+            );
+        }
+    }
+
+    /// A sample with labels of its own keeps them after the node's.
+    #[test]
+    fn a_labelled_sample_puts_the_node_first() {
+        let mut out = Families::default();
+        out.family("vox_x", "x", Kind::Gauge);
+        out.sample("vox_x", &node_label("a\"b"), "{peer=\"P\"}", 3);
+        assert_eq!(
+            out.render(),
+            "# HELP vox_x x\n# TYPE vox_x gauge\nvox_x{node=\"a\\\"b\",peer=\"P\"} 3\n"
+        );
     }
 }

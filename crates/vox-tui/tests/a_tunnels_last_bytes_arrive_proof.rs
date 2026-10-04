@@ -298,11 +298,11 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         &[],
     );
     let line = fwd.expect_line("the forward's bound address", |l| {
-        l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+        l.starts_with("vox: forwarding ")
     });
     let at: SocketAddr = line
         .split_whitespace()
-        .nth(1)
+        .nth(2)
         .and_then(|a| a.parse().ok())
         .unwrap_or_else(|| {
             panic!("PRODUCT: `vox forward`'s bound-address line names no socket address: {line:?}")

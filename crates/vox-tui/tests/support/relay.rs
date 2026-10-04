@@ -27,8 +27,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::world::{
-    address_in, after_label, args, echo_service, fingerprint, mkdir, room_pass_file, tempdir, utf8,
-    vox_once, VoxProc, IDENTITY,
+    address_in, after_label, args, echo_service, fingerprint, mkdir, reap_daemon, room_pass_file,
+    tempdir, utf8, vox_once, vox_once_attached, VoxProc, IDENTITY,
 };
 
 /// Whether host and guest are split by address family.
@@ -313,6 +313,20 @@ pub struct RelayWorld {
     pub service: String,
 }
 
+impl Drop for RelayWorld {
+    /// The safety net: a daemon any of the world's data roots still holds is stopped by its pid
+    /// ([`reap_daemon`]) before the processes and the temp dir go.
+    fn drop(&mut self) {
+        for d in [
+            &self.host_dir,
+            &self.guest_dir,
+            &self.tmp.path().join("anchor"),
+        ] {
+            reap_daemon(d);
+        }
+    }
+}
+
 impl RelayWorld {
     /// The host as an `--anchor` spec (`<fingerprint>@<address>`), from the address its room link
     /// gives for it.
@@ -372,7 +386,7 @@ impl RelayWorld {
 
         let guest_fp = fingerprint(&guest_dir, "guest");
         let host_fp = fingerprint(&host_dir, "host");
-        let (ok, out, err) = vox_once(
+        let (ok, out, err) = vox_once_attached(
             &host_dir,
             &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
         );
@@ -464,10 +478,10 @@ impl RelayWorld {
 
     fn spawn_forward(&mut self, spec: &str, extra: &[&str]) -> SocketAddr {
         let listen = self.guest_net().0;
-        let address = format!("{}.{}.{}.vox", self.service, self.host_fp, self.room);
+        let name = self.hostname();
         let mut list = vec![
             "forward",
-            &address,
+            &name,
             "127.0.0.1:0",
             "--anchor",
             spec,
@@ -480,9 +494,9 @@ impl RelayWorld {
         }
         let mut fwd = VoxProc::spawn("forward", &self.guest_dir, &args(&list));
         let line = fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+            l.starts_with("vox: forwarding 127.0.0.1:")
         });
-        let at = address_in(&mut fwd, &line, 1);
+        let at = address_in(&mut fwd, &line, 2);
         self.fwd = Some(fwd);
         at
     }
@@ -522,8 +536,8 @@ impl RelayWorld {
         (bound, ready)
     }
 
-    /// The host's service's address, as a SOCKS5 client asks `vox up` for it:
-    /// `<service>.<node>.<room>.vox`, the only form that resolves (V030-25).
+    /// The host's service by its address, `<service>.<node>.<room>.vox`: the only `.vox` form that
+    /// resolves (V030-25; the decider, 2026-10-02). The service is named for its port.
     pub fn hostname(&self) -> String {
         format!("{}.{}.{}.vox", self.service, self.host_fp, self.room)
     }
@@ -552,8 +566,11 @@ impl RelayWorld {
             .expect("APPARATUS: the proof crashed a host it had not started");
         let pid = host.child.id();
         drop(host);
+        // `vox serve` is a client (ADR-026 S-3): the host's node runs in its daemon, which is
+        // what crashes — SIGKILL by the pid in its lock.
+        let daemon = crate::world::kill_daemon(&self.host_dir);
         let crashed = Instant::now();
-        eprintln!("[test] host pid {pid} killed and reaped");
+        eprintln!("[test] host pid {pid} killed and reaped; its daemon {daemon:?} killed");
         let pass_file = self.tmp.path().join("daemon-passphrases");
         std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase))
             .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));

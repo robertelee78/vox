@@ -1,9 +1,9 @@
-//! ADR-020 §8 — `vox room`: the agent-facing verbs, over a **running** node.
+//! ADR-020 §8 — `vox room`: the agent-facing verbs, over an **attached** node.
 //!
-//! Every other `vox` verb spawns a node of its own. These do not, and that is the
-//! point: agent comms puts several agent sessions on one harness node (ADR-020
-//! §2, one identity per `(host, harness)`), so these connect to the control
-//! socket of a node that is already running and already unlocked.
+//! These are one-shot clients of the vox daemon (ADR-026 L-2): they never attach a node, and
+//! ask as one that is already attached. That is the point: agent comms puts several agent
+//! sessions on one harness node (ADR-020 §2, one identity per `(host, harness)`), so these
+//! reach the daemon's socket as that node, already running and already unlocked.
 //!
 //! Two consequences fall out of that, both intended:
 //!
@@ -21,7 +21,6 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 
-use vox_core::error::{Error, IpcHandshake};
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode, B32_DIGEST_LEN};
@@ -30,50 +29,15 @@ use vox_core::node::paths::Paths;
 use crate::app::AppError;
 use crate::tunnel_cli::resolve_prefix;
 
-/// Connect to the running node's control socket for this profile.
+/// Connect to the daemon as this node, which must be attached already (ADR-026 L-2: a one-shot
+/// verb never attaches).
 ///
-/// The failure an operator will actually hit is "no node is running", so it says
-/// that rather than surfacing a connect error — **and names the thing that would
-/// actually fix it.** It used to say "Start one with `vox node`", which is the first
-/// error a new person meets and it sent them in a circle: `vox node` is an anchor, it
-/// holds no room and serves no control socket, so following the advice produced this
-/// same message again, verbatim. `vox daemon` is what holds a profile's rooms and
-/// serves this socket.
+/// Each way it fails needs a different remedy, so each gets its own sentence (#191): no daemon
+/// running, the node not attached (the daemon's refusal says how to attach it), a socket that is
+/// not this user's.
 pub(crate) async fn attach(paths: &Paths) -> Result<IpcClient, AppError> {
-    let sock = paths.socket_file();
-    if !sock.exists() {
-        return Err(AppError::Usage(format!(
-            "no node is running for this profile, so there is nothing to ask.\n\
-             \x20      Start one:  vox daemon        (holds this profile's rooms, no \
-             terminal needed)\n\
-             \x20             or:  vox tui           (the interactive client)\n\
-             \x20      `vox node` will NOT do: it is an anchor, it holds no room and \
-             serves no socket.\n\
-             \x20      Socket: {}",
-            paths.socket_file().display()
-        )));
-    }
-    // Each way an attach fails needs a different remedy, so each gets its own sentence
-    // (#191): they were one, "nothing answered — the node may have stopped", which is true
-    // only of a stale socket, and the actual error was thrown away.
-    let mut client = IpcClient::open(&sock).await.map_err(|e| {
-        let at = sock.display();
-        AppError::Usage(match e {
-            Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
-                "a control socket exists at {at} but nothing is listening on it ({reason}) — \
-                 the node may have stopped without cleaning up. Starting a node again replaces it."
-            ),
-            Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => format!(
-                "a control socket exists at {at}, but {h}: it may be shutting down. Try again, \
-                 or start one with `vox daemon`."
-            ),
-            Error::Ipc(h) => format!("{h}. Socket: {at}"),
-            other => format!(
-                "a control socket exists at {at} but nothing answered ({other}) — the node may \
-                 have stopped without cleaning up. Starting a node again replaces it."
-            ),
-        })
-    })?;
+    let at = crate::client::one_shot(paths)?;
+    let mut client = crate::client::open(&at).await?;
     // Every author this command prints is named as this node names it (V210-162).
     crate::ident::load_names(&mut client).await;
     Ok(client)
@@ -86,7 +50,7 @@ async fn rooms_of(
     match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -271,7 +235,7 @@ pub(crate) async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Resul
     {
         Ok(Frame::Ok) => Ok(()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -323,7 +287,7 @@ async fn members_of(
     match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => Ok(members),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -637,7 +601,7 @@ pub async fn post_cmd(
         {
             Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         // When each last posted as an agent: the room's structured posts, by author.
@@ -1143,7 +1107,10 @@ pub async fn read(
 /// The services of the tunnels open to or from `member`, each with its count (`22 ×2`), from
 /// `vox status`. Empty when the node does not say.
 async fn tunnels_to(paths: &Paths, member: &Digest32) -> Vec<String> {
-    let Ok(json) = vox_core::node::status::request(&paths.socket_file()).await else {
+    let Ok(at) = crate::client::one_shot(paths) else {
+        return Vec::new();
+    };
+    let Ok(json) = vox_core::node::status::request(&at).await else {
         return Vec::new();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -1170,7 +1137,10 @@ async fn tunnels_to(paths: &Paths, member: &Digest32) -> Vec<String> {
 /// The members the node holds back for equivocating in `room` (V210-63), from `vox status`.
 /// Empty when the node does not say: the rows are still worth printing.
 async fn equivocations_in(paths: &Paths, room: &Digest32) -> Vec<(Digest32, u64)> {
-    let Ok(json) = vox_core::node::status::request(&paths.socket_file()).await else {
+    let Ok(at) = crate::client::one_shot(paths) else {
+        return Vec::new();
+    };
+    let Ok(json) = vox_core::node::status::request(&at).await else {
         return Vec::new();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
@@ -1210,7 +1180,7 @@ pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -1230,7 +1200,7 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -1407,7 +1377,7 @@ pub async fn tail(
                 Frame::Error { .. } if read_to.is_some() => {
                     coord::read_all(&mut lookup, channel_id, None).await?
                 }
-                other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+                other => return Err(crate::client::unexpected(&other)),
             };
             if let Some(r) = rows.last() {
                 read_to = Some(r.entry_hash);
@@ -1653,6 +1623,31 @@ fn outcome_json(o: Option<&Outcome>) -> serde_json::Value {
         Some(Outcome::Conflict { group }) => {
             serde_json::json!({"conflict": group.iter().map(claim::b32).collect::<Vec<_>>()})
         }
+    }
+}
+
+/// What a claim-protocol post did, as a sentence: never the outcome's debug form (R36).
+fn outcome_words(o: Option<&Outcome>) -> String {
+    match o {
+        None => "this node has not folded the post yet, so what it did is not known".into(),
+        Some(Outcome::Applied) => "it was applied".into(),
+        Some(Outcome::Lost) => {
+            "another session holds the resource, or it is reserved for someone else".into()
+        }
+        Some(Outcome::NoEffect(why)) => (*why).to_owned(),
+        Some(Outcome::Invalid(why)) => format!("the post was not valid: {why}"),
+        Some(Outcome::OtherVersion(s)) => format!(
+            "the post is stamped {}, a claim-protocol version this vox does not fold",
+            s.token()
+        ),
+        Some(Outcome::Duplicate { of }) => format!(
+            "it repeats post {}, which was already applied",
+            claim::b32(of)
+        ),
+        Some(Outcome::Conflict { group }) => format!(
+            "{} posts share its operation id and disagree, so none of them has any effect",
+            group.len()
+        ),
     }
 }
 
@@ -2034,7 +2029,7 @@ async fn agreement(
         {
             Ok(Frame::Agreement { report }) => report,
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         // The node compared its posts as they were when it answered; these must be the same ones.
@@ -2130,7 +2125,13 @@ pub async fn release_resource(
     let (ok, said) = match &done.outcome {
         Some(Outcome::Applied) => (true, format!("released {resource}")),
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not released: {why}")),
-        other => (false, format!("{resource} was not released: {other:?}")),
+        other => (
+            false,
+            format!(
+                "{resource} was not released: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(&done, claim::RELEASE, resource, opts, ok, &said)
 }
@@ -2175,7 +2176,7 @@ pub async fn service_add(
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -2207,7 +2208,7 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot remove {tag:?}: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -2236,7 +2237,7 @@ pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
             "cannot list that room's services: {reason}"
         ))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -2305,7 +2306,10 @@ pub async fn handoff_resource(
         ),
         (Some(Outcome::Applied), _) => (true, format!("{resource} was handed off and has since moved on")),
         (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not handed off: {why}")),
-        (other, _) => (false, format!("{resource} was not handed off: {other:?}")),
+        (other, _) => (
+            false,
+            format!("{resource} was not handed off: {}", outcome_words(other.as_ref())),
+        ),
     };
     report(&done, claim::HANDOFF, resource, opts, ok, &said)
 }
@@ -2335,7 +2339,13 @@ pub async fn decline_resource(
     let (ok, said) = match &done.outcome {
         Some(Outcome::Applied) => (true, format!("declined {resource}; it is free")),
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not declined: {why}")),
-        other => (false, format!("{resource} was not declined: {other:?}")),
+        other => (
+            false,
+            format!(
+                "{resource} was not declined: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(
         &done,
@@ -2408,7 +2418,13 @@ pub async fn renew_resource(
             format!("renewed {resource} until {}", millis_as_time(*e)),
         ),
         (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not renewed: {why}")),
-        (other, _) => (false, format!("{resource} was not renewed: {other:?}")),
+        (other, _) => (
+            false,
+            format!(
+                "{resource} was not renewed: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(&done, claim::RENEW, resource, opts, ok, &said)
 }
@@ -2442,7 +2458,7 @@ pub async fn board(
         {
             vox_core::node::ipc::Frame::Count { n, last } => (n, last),
             vox_core::node::ipc::Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            other => return Err(crate::client::unexpected(&other)),
         }
     } else {
         (0, None)
@@ -2691,7 +2707,7 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
             // The message named a permission nobody can hold and an admin nobody has.
             return Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")));
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     }
 
@@ -2861,7 +2877,7 @@ pub async fn get_file(
     let rows = match client.read_rows(channel_id, None).await {
         Ok(Frame::Rows { rows }) => rows,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
@@ -3111,7 +3127,7 @@ async fn collect_offer(
                  may not have trusted this identity"
             )))
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
@@ -3508,7 +3524,7 @@ pub async fn join(
                 "this node already holds {name}; nothing was changed{}",
                 crate::tunnel_cli::join_detail(&reason)
             ))),
-            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => Err(crate::client::unexpected(&other)),
             Err(e) => Err(AppError::Usage(e.to_string())),
         };
     }
@@ -3538,7 +3554,7 @@ pub async fn join(
                 None => format!("cannot join: {reason}"),
             },
         )),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3612,9 +3628,7 @@ pub async fn create(
                             "the room was created, but its idle end was not set: {reason}"
                         )))
                     }
-                    Ok(other) => {
-                        return Err(AppError::Usage(format!("unexpected reply: {other:?}")))
-                    }
+                    Ok(other) => return Err(crate::client::unexpected(&other)),
                     Err(e) => return Err(AppError::Usage(e.to_string())),
                 }
             }
@@ -3622,7 +3636,7 @@ pub async fn create(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3708,7 +3722,7 @@ pub async fn retention(
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot set retention: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3736,22 +3750,12 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
 // ---------------------------------------------------------------- the trust keyring
-
-/// Whether a node is already serving this profile's control socket.
-///
-/// Used to decide whether a verb should ask the running node or start its own. It is a
-/// probe, not a guarantee: the node may stop between this answering and the request being
-/// made, and the caller handles that the same way it handles any other socket failure.
-pub async fn node_is_running(paths: &Paths) -> bool {
-    let sock = paths.socket_file();
-    sock.exists() && IpcClient::open(&sock).await.is_ok()
-}
 
 /// Send a keyring change, giving the identity passphrase only when the node says it needs it
 /// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
@@ -3817,7 +3821,7 @@ pub async fn trust_add(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(e),
     }
 }
@@ -3836,7 +3840,7 @@ pub async fn trust_rename(
     let entries = match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => entries,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let ids: Vec<Digest32> = entries.iter().map(|(id, _)| *id).collect();
@@ -3864,7 +3868,7 @@ pub async fn trust_rename(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(e),
     }
 }
@@ -3891,7 +3895,7 @@ pub async fn trust_remove(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(e),
     }
 }
@@ -3912,31 +3916,51 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
-/// `vox id`, asked of the running node.
+/// `vox id`: this node's fingerprint, from the daemon when the node is attached, else from its
+/// files; a node with no identity has one made first (ADR-026 C-5).
 ///
-/// Printing your own fingerprint is the most ordinary thing a person does — it is what
-/// they send to somebody who will type it into `vox trust add` — and it needs no secret
-/// and changes nothing. It nevertheless failed outright whenever a daemon held the
-/// profile, because it went through a node of its own.
+/// Printing your own fingerprint is the most ordinary thing a person does — it is what they send
+/// to somebody who will type it into `vox trust add` — and it needs no secret and changes nothing,
+/// so it starts no daemon and attaches nothing.
 ///
-/// The socket's hello already carries it (protocol 2's `me`), so this costs no new
-/// request and no passphrase: a fingerprint is public.
-pub async fn print_identity(paths: &Paths) -> Result<(), AppError> {
-    let client = attach(paths).await?;
-    let Some(me) = client.me() else {
-        return Err(AppError::Usage(
-            "the running node has no identity yet. Make one:  vox id  (with the daemon \
-             stopped)"
-                .into(),
-        ));
+/// # Errors
+/// The node's files cannot be read, or a new identity's passphrase cannot be had.
+pub fn print_identity(
+    paths: &Paths,
+    flag: Option<String>,
+    file: Option<std::path::PathBuf>,
+) -> Result<(), AppError> {
+    let fingerprint = if vox_core::node::profile::Profile::exists(paths) {
+        let attached = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+            .and_then(|rt| {
+                rt.block_on(async {
+                    let at = crate::client::one_shot(paths).ok()?;
+                    IpcClient::open_at(&at).await.ok()?.me()
+                })
+            });
+        match attached {
+            Some(me) => me,
+            // Not attached: the node's files say it, in the clear (a fingerprint is public).
+            None => vox_core::node::profile::Profile::open(paths.clone())?.fingerprint(),
+        }
+    } else {
+        // **A node with no identity has one made here** (ADR-026 C-5), with a passphrase asked
+        // twice at a terminal or given, never by a daemon.
+        let passphrase = zeroize::Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
+            paths, flag, file,
+        )?);
+        crate::client::create_identity(paths, &passphrase)?
     };
     // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
-    println!("{}", vox_core::node::link::b32_encode(&me));
+    println!("{}", vox_core::node::link::b32_encode(&fingerprint));
     Ok(())
 }
 
@@ -3974,7 +3998,7 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("{which} was not left: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3997,7 +4021,7 @@ pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot end: {reason}"))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -4024,7 +4048,7 @@ pub async fn admin(
                 Ok(())
             }
             Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => Err(crate::client::unexpected(&other)),
             Err(e) => Err(AppError::Usage(e.to_string())),
         };
     }
@@ -4045,7 +4069,7 @@ pub async fn admin(
     let members = match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => members,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let member = resolve_prefix(member, &members)?;
@@ -4069,7 +4093,7 @@ pub async fn admin(
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
             "cannot {action} the admin: {reason}"
         ))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }

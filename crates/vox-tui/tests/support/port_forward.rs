@@ -50,6 +50,9 @@ struct State {
     dropped: AtomicU64,
     /// When the first datagram from each guest source arrived, open or not.
     first_seen: Mutex<HashMap<SocketAddr, Instant>>,
+    /// When each datagram from a guest arrived, open or not, with its source: a node keeps its
+    /// port across runs (ADR-026 D-3), so a new process is not told apart by a new source.
+    arrivals: Mutex<Vec<(Instant, SocketAddr)>>,
     /// How long each datagram guest → host is held before it is sent on, in microseconds; 0 sends
     /// at once. A path with latency, as a real one has (V210-122).
     delay_us: AtomicU64,
@@ -129,6 +132,10 @@ impl PortForward {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .entry(from)
                     .or_insert(at);
+                st.arrivals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((at, from));
                 if !st.open.load(Ordering::SeqCst) {
                     st.dropped.fetch_add(1, Ordering::SeqCst);
                     continue;
@@ -256,6 +263,17 @@ impl PortForward {
     }
 
     /// Every guest source seen so far, with when its first datagram arrived.
+    /// The first datagram from any guest that arrived at or after `since`, with its source.
+    pub fn first_since(&self, since: Instant) -> Option<(Instant, SocketAddr)> {
+        self.state
+            .arrivals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(at, _)| *at >= since)
+            .copied()
+    }
+
     pub fn sources(&self) -> HashMap<SocketAddr, Instant> {
         self.state
             .first_seen
@@ -347,7 +365,8 @@ impl ForwardedWorld {
     /// used, and the world is not the one its proofs measure (V210-105).
     pub fn new(forward_open: bool) -> Self {
         use crate::world::{
-            after_label, args, echo_service, fingerprint, mkdir, vox_once, VoxProc,
+            after_label, args, echo_service, fingerprint, mkdir, vox_once, vox_once_attached,
+            VoxProc,
         };
         crate::test_knobs::require(&["VOX_TEST_ADVERTISE"]);
         let tmp = crate::world::tempdir();
@@ -363,7 +382,7 @@ impl ForwardedWorld {
 
         let guest_fp = fingerprint(&guest_dir, "guest");
         let host_fp = fingerprint(&host_dir, "host");
-        let (ok, out, err) = vox_once(
+        let (ok, out, err) = vox_once_attached(
             &host_dir,
             &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
         );

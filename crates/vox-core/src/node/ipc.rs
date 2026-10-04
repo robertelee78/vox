@@ -69,7 +69,12 @@ use crate::node::api::{MessageRow, NodeEvent};
 /// (`SyncFailed`, `RoomNotRemembered`) are additive tags.
 ///
 /// 8: a row says whether its body is **not received yet** (V030-10, [`MessageRow::owed`]).
-pub const PROTOCOL_VERSION: u64 = 8;
+///
+/// 9: one daemon serves every node of a data root on one socket (ADR-026 §4). A connection opens
+/// with the daemon's hello and the client's `Use` or daemon request
+/// ([`crate::node::daemonipc`]); a request in flight when its node detaches is answered
+/// [`Frame::NodeDetached`].
+pub const PROTOCOL_VERSION: u64 = 9;
 
 /// Largest frame accepted in either direction.
 ///
@@ -156,8 +161,7 @@ const _: () = assert!(crate::node::content::MAX_TEXT_LEN + ROW_OVERHEAD <= ROWS_
 const T_HELLO: u64 = 1;
 const T_LAGGED: u64 = 2;
 const T_NEW_ENTRY: u64 = 10;
-const T_UNLOCKED: u64 = 11;
-const T_LOCKED: u64 = 12;
+// 11 and 12 were `Unlocked` and `Locked`: there is no lock (ADR-026 N-2). Never reuse them.
 const T_CHANNEL_OPENED: u64 = 13;
 const T_CHANNEL_CLOSED: u64 = 14;
 const T_PEER_JOINED: u64 = 15;
@@ -305,6 +309,9 @@ const T_COUNT_REQ: u64 = 122;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
 // far from the others, like V210-120's.
 const T_LEAVE: u64 = 164;
+/// ADR-026 C-7: open and close a room over the socket (protocol 9).
+const T_OPEN_ROOM: u64 = 4400;
+const T_CLOSE_ROOM: u64 = 4401;
 /// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
 const T_COUNT: u64 = 1200;
 // The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
@@ -455,6 +462,19 @@ pub enum Request {
     /// credential: it names the room and where to look, carries no passphrase, and
     /// since M17.6 joining with it grants nothing at all.
     Invite {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Open a closed room with its passphrase (ADR-026 C-7): what the TUI, as a client of the
+    /// daemon, does when a person types a room's passphrase.
+    OpenRoom {
+        /// The room.
+        channel_id: Digest32,
+        /// The room's passphrase.
+        passphrase: String,
+    },
+    /// Close an open room, wiping its key (ADR-026 C-7).
+    CloseRoom {
         /// The room.
         channel_id: Digest32,
     },
@@ -744,6 +764,18 @@ impl Request {
             }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
+            }
+            Request::OpenRoom {
+                channel_id,
+                passphrase,
+            } => {
+                e.array(3)
+                    .uint(T_OPEN_ROOM)
+                    .bytes(channel_id)
+                    .text(passphrase);
+            }
+            Request::CloseRoom { channel_id } => {
+                e.array(2).uint(T_CLOSE_ROOM).bytes(channel_id);
             }
             Request::Leave { channel_id } => {
                 e.array(2).uint(T_LEAVE).bytes(channel_id);
@@ -1137,6 +1169,22 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Invite { channel_id })
             }
+            (T_OPEN_ROOM, 3) => {
+                let channel_id = digest(&mut d)?;
+                let mut passphrase = secret_text(&mut d, "ipc open room passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::OpenRoom {
+                    channel_id,
+                    passphrase: std::mem::take(&mut *passphrase),
+                })
+            }
+            (T_CLOSE_ROOM, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::CloseRoom { channel_id })
+            }
             (T_LEAVE | T_END, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -1211,6 +1259,13 @@ pub enum Frame {
     },
     /// A node event.
     Event(NodeEvent),
+    /// The node this connection acts as detached while a request was in flight, or before it was
+    /// made (ADR-026 L-3). Distinct from [`Frame::Error`]: it says the request was not done
+    /// because the node is gone, and a client MUST NOT attach the node again to retry it.
+    NodeDetached {
+        /// The node.
+        node: crate::node::daemonipc::NodeName,
+    },
     /// A request succeeded and carries nothing further.
     Ok,
     /// A request failed. The reason is for a person to read, not to branch on.
@@ -1320,6 +1375,11 @@ impl Frame {
                 e.array(2).uint(T_LAGGED).uint(*missed);
             }
             Frame::Event(ev) => encode_event(&mut e, ev),
+            Frame::NodeDetached { node } => {
+                e.array(2)
+                    .uint(crate::node::daemonipc::T_NODE_DETACHED)
+                    .text(node.as_str());
+            }
             Frame::Ok => {
                 e.array(1).uint(T_OK);
             }
@@ -1491,14 +1551,8 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .uint(row.arrival)
                 .uint(u64::from(row.late));
         }
-        NodeEvent::Unlocked => {
-            e.array(1).uint(T_UNLOCKED);
-        }
         NodeEvent::WaitingForProfile => {
             e.array(1).uint(T_WAITING_FOR_PROFILE);
-        }
-        NodeEvent::Locked => {
-            e.array(1).uint(T_LOCKED);
         }
         NodeEvent::Shutdown => {
             e.array(1).uint(T_SHUTDOWN);
@@ -1752,6 +1806,15 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             };
             return Ok(Frame::Hello { protocol, me });
         }
+        (crate::node::daemonipc::T_NODE_DETACHED, 2) => {
+            let node = d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc node detached"))?;
+            return Ok(Frame::NodeDetached {
+                node: crate::node::daemonipc::NodeName::parse(node)
+                    .map_err(|_| Error::MalformedIpc("ipc node detached name"))?,
+            });
+        }
         (T_LAGGED, 2) => {
             return Ok(Frame::Lagged {
                 missed: d.uint().map_err(|_| Error::MalformedIpc("ipc lagged"))?,
@@ -1978,9 +2041,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 },
             }
         }
-        (T_UNLOCKED, 1) => NodeEvent::Unlocked,
         (T_WAITING_FOR_PROFILE, 1) => NodeEvent::WaitingForProfile,
-        (T_LOCKED, 1) => NodeEvent::Locked,
         (T_SHUTDOWN, 1) => NodeEvent::Shutdown,
         (T_CHANNEL_OPENED, 2) => NodeEvent::ChannelOpened {
             channel_id: digest(d)?,
@@ -2310,10 +2371,19 @@ pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10
 /// The error for a node that closed the connection before replying (V210-101): never "malformed",
 /// since nothing arrived to be malformed. A fresh connection, bounded, tells a node that is gone
 /// from one that ended this request itself.
+///
+/// **Running means greeting, not accepting**: a process being killed closes its connections and
+/// its listening socket in whatever order the kernel takes, and a connect in between lands in the
+/// backlog of a listener about to close. Measured: a daemon SIGKILLed mid-request was reported
+/// "still running". Only a hello read back counts.
 pub async fn hung_up(path: &Path) -> Error {
     let still_running = matches!(
-        tokio::time::timeout(ANSWER_WITHIN, connect_own(path)).await,
-        Ok(Ok(_))
+        tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut s = connect_own(path).await?;
+            read_frame(&mut s).await
+        })
+        .await,
+        Ok(Ok(Some(_)))
     );
     Error::Ipc(IpcHandshake::HungUp { still_running })
 }
@@ -2342,6 +2412,7 @@ pub const ACTOR_WITHIN: std::time::Duration = std::time::Duration::from_secs(60)
 /// (V210-83). A node that is merely slow at this request answers both, and is waited for.
 async fn while_answering<T>(
     path: &Path,
+    node: Option<&crate::node::paths::NodeName>,
     exchange: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::pin!(exchange);
@@ -2352,15 +2423,22 @@ async fn while_answering<T>(
             out = &mut exchange => return out,
             alive = async {
                 tokio::time::sleep(ANSWER_WITHIN).await;
-                still_answering(path).await
+                still_answering(path, node).await
             } => alive?,
         }
     }
 }
 
 /// Whether the node at `path` greets a new connection and its actor answers a ping, or why not.
-async fn still_answering(path: &Path) -> Result<()> {
-    let mut probe = match IpcClient::open(path).await {
+/// On the daemon's socket the new connection uses `node`, never attaching it.
+async fn still_answering(path: &Path, node: Option<&crate::node::paths::NodeName>) -> Result<()> {
+    let opened = match node {
+        Some(node) => {
+            IpcClient::open_at(&NodeSocket::one_shot(path.to_owned(), node.clone())).await
+        }
+        None => IpcClient::open(path).await,
+    };
+    let mut probe = match opened {
         Ok(c) => c,
         Err(Error::Ipc(IpcHandshake::Silent { secs })) => {
             return Err(Error::Ipc(IpcHandshake::StoppedAnswering { secs }))
@@ -2400,40 +2478,7 @@ async fn still_answering(path: &Path) -> Result<()> {
 ///
 /// [`prepare_socket_dir`]: crate::node::paths::prepare_socket_dir
 pub fn bind_at(handle: NodeHandle, path: PathBuf) -> Result<IpcServer> {
-    crate::node::paths::prepare_socket_dir(&path)?;
-    // Never longer than `path`, so it fits wherever `path` does.
-    let staging = path.with_extension("new");
-    for stale in [&staging, &path] {
-        if std::fs::symlink_metadata(stale).is_ok() {
-            std::fs::remove_file(stale).map_err(|e| Error::Path {
-                op: "unlink stale control socket",
-                detail: format!("{}: {e}", stale.display()),
-            })?;
-        }
-    }
-    let listener = UnixListener::bind(&staging).map_err(|e| Error::Path {
-        op: "bind control socket",
-        detail: format!("{}: {e}", staging.display()),
-    })?;
-    let placed = {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::Path {
-                op: "chmod control socket",
-                detail: format!("{}: {e}", staging.display()),
-            })
-            .and_then(|()| {
-                std::fs::rename(&staging, &path).map_err(|e| Error::Path {
-                    op: "place control socket",
-                    detail: format!("{}: {e}", path.display()),
-                })
-            })
-    };
-    if let Err(e) = placed {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e);
-    }
-
+    let listener = place_socket(&path)?;
     let me = crate::node::paths::my_uid();
     let task = tokio::spawn(async move {
         loop {
@@ -2466,6 +2511,45 @@ pub fn bind_at(handle: NodeHandle, path: PathBuf) -> Result<IpcServer> {
     });
 
     Ok(IpcServer { path, task })
+}
+
+/// Place a listening socket at `path`, `0600`, by binding a staging name and renaming it into
+/// place, so no client ever finds the socket with a wider mode.
+fn place_socket(path: &Path) -> Result<UnixListener> {
+    crate::node::paths::prepare_socket_dir(path)?;
+    // Never longer than `path`, so it fits wherever `path` does.
+    let staging = path.with_extension("new");
+    for stale in [staging.as_path(), path] {
+        if std::fs::symlink_metadata(stale).is_ok() {
+            std::fs::remove_file(stale).map_err(|e| Error::Path {
+                op: "unlink stale control socket",
+                detail: format!("{}: {e}", stale.display()),
+            })?;
+        }
+    }
+    let listener = UnixListener::bind(&staging).map_err(|e| Error::Path {
+        op: "bind control socket",
+        detail: format!("{}: {e}", staging.display()),
+    })?;
+    let placed = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::Path {
+                op: "chmod control socket",
+                detail: format!("{}: {e}", staging.display()),
+            })
+            .and_then(|()| {
+                std::fs::rename(&staging, path).map_err(|e| Error::Path {
+                    op: "place control socket",
+                    detail: format!("{}: {e}", path.display()),
+                })
+            })
+    };
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    Ok(listener)
 }
 
 /// Bind the control socket at this profile's conventional path.
@@ -2550,19 +2634,9 @@ enum Intent {
 }
 
 /// One client, until it goes, and then whatever it left open is withdrawn.
-async fn serve_client(stream: UnixStream, handle: NodeHandle) {
+async fn serve_client(mut stream: UnixStream, handle: NodeHandle) {
     let mut held = Held::default();
-    let _ = serve_requests(stream, &handle, &mut held).await;
-    held.release(&handle).await;
-}
-
-/// Greet, serve requests, and stream once subscribed, until either side stops.
-async fn serve_requests(
-    mut stream: UnixStream,
-    handle: &NodeHandle,
-    held: &mut Held,
-) -> Result<()> {
-    write_frame(
+    let greeted = write_frame(
         &mut stream,
         &Frame::Hello {
             protocol: PROTOCOL_VERSION,
@@ -2570,12 +2644,61 @@ async fn serve_requests(
         }
         .to_bytes(),
     )
-    .await?;
+    .await;
+    if greeted.is_ok() {
+        let _ = serve_requests(stream, &handle, &mut held, None, None).await;
+    }
+    held.release(&handle).await;
+}
 
+/// Wait until `detached` says the node detached (ADR-026 L-3); for ever when there is none to
+/// watch, or its sender is gone without saying so.
+async fn node_detached(detached: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match detached {
+        Some(rx) => {
+            if rx.wait_for(|d| *d).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Serve requests, and stream once subscribed, until either side stops — or until the node
+/// detaches (`detached`, ADR-026 L-3): a request in flight then, or the next one, is answered
+/// [`Frame::NodeDetached`] and the connection ends, so a client holding a session sees its node
+/// go and is never left on a dead one (L-7).
+async fn serve_requests(
+    mut stream: UnixStream,
+    handle: &NodeHandle,
+    held: &mut Held,
+    mut detached: Option<(
+        crate::node::paths::NodeName,
+        tokio::sync::watch::Receiver<bool>,
+    )>,
+    extension: Option<std::sync::Arc<dyn Extension>>,
+) -> Result<()> {
+    let (node, mut watch) = match detached.take() {
+        Some((node, rx)) => (Some(node), Some(rx)),
+        None => (None, None),
+    };
+    let gone = |node: &Option<crate::node::paths::NodeName>| {
+        node.clone()
+            .map(|node| Frame::NodeDetached { node }.to_bytes())
+    };
     // Serve requests until the client hangs up, or until it subscribes — which is
     // terminal, because from then on the connection is a one-way stream.
     loop {
-        let Some(body) = read_frame(&mut stream).await? else {
+        let next = tokio::select! {
+            next = read_frame(&mut stream) => next?,
+            () = node_detached(&mut watch) => {
+                if let Some(b) = gone(&node) {
+                    let _ = write_frame(&mut stream, &b).await;
+                }
+                return Ok(());
+            }
+        };
+        let Some(body) = next else {
             return Ok(());
         };
         // **Wiped as soon as it is decoded** (V210-94): a request can carry a room or identity
@@ -2584,9 +2707,22 @@ async fn serve_requests(
         // a join is the end of the join — it was still there when the lock reported done.
         // Measured through the shipped binary both times: one copy of a join's room passphrase.
         let body = zeroize::Zeroizing::new(body);
+        // ADR-026 S-5: a request the daemon serves itself takes the connection for good.
+        if let Some(ext) = extension.as_ref().filter(|e| e.claims(&body)) {
+            let serving = ext.serve(body.to_vec(), stream, handle.clone());
+            tokio::select! {
+                () = serving => {}
+                () = node_detached(&mut watch) => {}
+            }
+            return Ok(());
+        }
         // PRD-001 R20: resolving a `.vox` name serves on; `vox up` holds the connection.
         if let Some(req) = crate::node::nameipc::NameRequest::parse(&body) {
-            if crate::node::nameipc::serve(&mut stream, handle, req).await? {
+            let served = tokio::select! {
+                served = crate::node::nameipc::serve(&mut stream, handle, req) => served?,
+                () = node_detached(&mut watch) => false,
+            };
+            if served {
                 continue;
             }
             return Ok(());
@@ -2596,17 +2732,32 @@ async fn serve_requests(
             crate::node::status::serve(&mut stream, handle).await?;
             continue;
         }
-        // V030-11: `vox tunnel close`. The live tunnels are this process's, so it is answered
-        // here, and the connection serves on.
+        // ADR-026 C-7: what a client that draws the node's rooms needs, the TUI first. Answered,
+        // and the connection serves on.
+        if crate::node::snapshot::is_request(&body) {
+            write_frame(&mut stream, &crate::node::snapshot::answer(handle)).await?;
+            continue;
+        }
+        // V030-11: `vox tunnel close`. The live tunnels are kept in this process, so it is
+        // answered here, and the connection serves on.
         if let Some(which) = crate::node::status::close_request(&body) {
-            crate::node::status::serve_close(&mut stream, &which).await?;
+            // Only this node's own tunnels: a process may host several (ADR-026 P-1).
+            let me = handle
+                .view()
+                .identity
+                .map(|i| i.fingerprint)
+                .unwrap_or_default();
+            crate::node::status::serve_close(&mut stream, &me, &which).await?;
             continue;
         }
         // Protocol 6: an app request turns the connection into an app connection for
         // the rest of its life (ADR-022 decision 7, `node::appipc`).
         if let Some(app) = crate::node::appipc::AppRequest::parse(&body) {
             return match app {
-                Ok(app) => crate::node::appipc::serve(stream, handle.clone(), app).await,
+                Ok(app) => tokio::select! {
+                    r = crate::node::appipc::serve(stream, handle.clone(), app) => r,
+                    () = node_detached(&mut watch) => Ok(()),
+                },
                 Err(e) => {
                     write_frame(
                         &mut stream,
@@ -2643,13 +2794,252 @@ async fn serve_requests(
             // request and the first read is missed.
             let events = handle.subscribe();
             write_frame(&mut stream, &Frame::Ok.to_bytes()).await?;
-            return pump(stream, events).await;
+            return tokio::select! {
+                r = pump(stream, events) => r,
+                () = node_detached(&mut watch) => Ok(()),
+            };
         }
         let intent = Held::intent(&request);
-        let reply = serve_request(handle, request).await;
+        let reply = tokio::select! {
+            reply = serve_request(handle, request) => reply,
+            // **A client that hangs up mid-request is noticed then, not when the request ends**
+            // (ADR-026 L-3): a `vox connect` stopped during its join kept its connection — and the
+            // hold it carries on its node — until the join finished, so an implicit node's detach,
+            // and the goodbye its connections owe their peers, waited on a join nobody wanted.
+            // The request is abandoned; what it started in the node goes on, or stops with the
+            // node.
+            () = subscriber_gone(&stream) => return Ok(()),
+            () = node_detached(&mut watch) => {
+                if let Some(b) = gone(&node) {
+                    let _ = write_frame(&mut stream, &b).await;
+                }
+                return Ok(());
+            }
+        };
         held.note(intent, &reply);
         write_frame(&mut stream, &reply.to_bytes()).await?;
     }
+}
+
+// ---- the account socket (ADR-026 §4) ---------------------------------------------------------
+
+/// A connection's right to act as one attached node, as the daemon's router grants it for a
+/// `Use` (ADR-026 C-2).
+pub struct Lease {
+    /// The node.
+    pub node: crate::node::paths::NodeName,
+    /// Its handle.
+    pub handle: NodeHandle,
+    /// Turns `true` when the node detaches (L-3).
+    pub detached: tokio::sync::watch::Receiver<bool>,
+    /// What the connection holds of the node (L-3, L-7): dropped when the connection ends, after
+    /// what it opened is withdrawn, which may detach a node attached implicitly.
+    pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// A request the daemon serves itself, beyond the node's vocabulary, if it has one.
+    pub extension: Option<std::sync::Arc<dyn Extension>>,
+    /// What attaching the node said, when this `Use` attached it ([`DaemonFrame::Using`]).
+    ///
+    /// [`DaemonFrame::Using`]: crate::node::daemonipc::DaemonFrame::Using
+    pub notes: Vec<String>,
+}
+
+/// A request the daemon's own build serves on a node's connection, beyond what this crate knows:
+/// `vox lan up`, whose device comes from a root helper the daemon asks as its user (ADR-026 S-5).
+/// It takes the connection for the rest of its life, as an app request does.
+pub trait Extension: Send + Sync + 'static {
+    /// Whether `body`, a frame the client sent, is this extension's request.
+    fn claims(&self, body: &[u8]) -> bool;
+    /// Serve the request in `body` on `stream` as the node `handle`, until the client goes.
+    fn serve(
+        &self,
+        body: Vec<u8>,
+        stream: UnixStream,
+        handle: NodeHandle,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+}
+
+/// What the account socket asks of the daemon: implemented by its router.
+pub trait Dispatch: Send + Sync + 'static {
+    /// The hello every connection is greeted with ([`crate::node::daemonipc::DaemonFrame::Hello`]).
+    fn hello(&self) -> crate::node::daemonipc::DaemonFrame;
+    /// Grant a `Use`, or refuse it.
+    fn use_node(
+        &self,
+        using: crate::node::daemonipc::UseNode,
+    ) -> impl std::future::Future<Output = std::result::Result<Lease, crate::node::daemonipc::Refusal>>
+           + Send;
+    /// Answer a daemon request (not `Subscribe`, which the socket serves from [`Dispatch::events`]).
+    fn daemon(
+        &self,
+        request: crate::node::daemonipc::DaemonRequest,
+    ) -> impl std::future::Future<Output = crate::node::daemonipc::DaemonFrame> + Send;
+    /// A new subscription to the daemon's events.
+    fn events(&self) -> tokio::sync::broadcast::Receiver<crate::node::daemonipc::DaemonEvent>;
+    /// Where the socket counts its open connections, if the daemon wants them counted (an
+    /// auto-started daemon exits once it has no node and no connection, ADR-026 L-8).
+    fn connections(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        None
+    }
+}
+
+/// One counted connection: counted while it lives.
+struct Counted(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
+
+impl Counted {
+    fn new(n: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>) -> Self {
+        if let Some(n) = &n {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self(n)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        if let Some(n) = &self.0 {
+            n.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Bind the account's one control socket at `path` (ADR-026 C-1): mode `0600`, every peer checked
+/// as this user and never uid 0, each connection served by `dispatch`.
+///
+/// # Errors
+/// If the socket cannot be placed.
+pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
+    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet. **Not
+    // the shared fallback** (`<tmp>/vox-<uid>`, for a data root whose socket path is too long):
+    // `create_private_dir` follows a symlink and changes the mode of whatever it points at, and
+    // anyone can plant one there. `place_socket` creates or refuses that one itself, by lstat.
+    if let Some(dir) = path.parent() {
+        if !crate::node::paths::is_socket_fallback_dir(dir) {
+            crate::node::paths::create_private_dir(dir)?;
+        }
+    }
+    let listener = place_socket(&path)?;
+    let me = crate::node::paths::my_uid();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                // Transient, as in [`bind_at`].
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
+            if !admitted(stream.peer_cred().ok().map(|c| c.uid()), me) {
+                continue;
+            }
+            let dispatch = std::sync::Arc::clone(&dispatch);
+            let counted = Counted::new(dispatch.connections());
+            tokio::spawn(async move {
+                let _ = serve_account(stream, dispatch).await;
+                drop(counted);
+            });
+        }
+    });
+    Ok(IpcServer { path, task })
+}
+
+/// Whether a peer of uid `peer` may use the account socket of a daemon running as `me`: only the
+/// same user, and **never root** (ADR-026 C-1, S-5), even a daemon run as root.
+fn admitted(peer: Option<u32>, me: u32) -> bool {
+    peer.is_some_and(|p| p == me && p != 0)
+}
+
+/// One connection to the account socket: the daemon's hello, the client's opening, then the
+/// node's requests or the daemon's answer.
+async fn serve_account<D: Dispatch>(
+    mut stream: UnixStream,
+    dispatch: std::sync::Arc<D>,
+) -> Result<()> {
+    use crate::node::daemonipc::{DaemonFrame, DaemonRequest, Opening};
+    write_frame(&mut stream, &dispatch.hello().to_bytes()).await?;
+    let Some(body) = read_frame(&mut stream).await? else {
+        return Ok(());
+    };
+    // Wiped once decoded: an opening can carry passphrases (C-6).
+    let body = zeroize::Zeroizing::new(body);
+    let opening = Opening::from_bytes(&body);
+    drop(body);
+    match opening {
+        Err(e) => {
+            write_frame(
+                &mut stream,
+                &Frame::Error {
+                    reason: e.to_string(),
+                }
+                .to_bytes(),
+            )
+            .await
+        }
+        Ok(Opening::Use(using)) => match dispatch.use_node(using).await {
+            Err(refusal) => {
+                write_frame(&mut stream, &DaemonFrame::Refused(refusal).to_bytes()).await
+            }
+            Ok(lease) => serve_node(stream, lease).await,
+        },
+        Ok(Opening::Daemon(DaemonRequest::Subscribe)) => {
+            let mut events = dispatch.events();
+            write_frame(&mut stream, &DaemonFrame::Ok.to_bytes()).await?;
+            loop {
+                // Noticed even with no event to send (see `pump`).
+                let next = tokio::select! {
+                    next = events.recv() => next,
+                    () = subscriber_gone(&stream) => return Ok(()),
+                };
+                match next {
+                    Ok(ev) => {
+                        write_frame(&mut stream, &DaemonFrame::Event(ev).to_bytes()).await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+        }
+        Ok(Opening::Daemon(request)) => {
+            let answer = dispatch.daemon(request).await;
+            write_frame(&mut stream, &answer.to_bytes()).await
+        }
+    }
+}
+
+/// Serve a granted `Use`: say `Using`, then the node's requests until the client goes or the node
+/// detaches; then withdraw what the connection opened and let go of the node.
+///
+/// # Errors
+/// If the `Using` cannot be written.
+pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
+    let Lease {
+        node,
+        handle,
+        detached,
+        hold,
+        extension,
+        notes,
+    } = lease;
+    let using = crate::node::daemonipc::DaemonFrame::Using {
+        node: node.clone(),
+        me: handle.view().identity.map(|i| i.fingerprint),
+        notes,
+    };
+    let wrote = write_frame(&mut stream, &using.to_bytes()).await;
+    let mut held = Held::default();
+    if wrote.is_ok() {
+        let _ = serve_requests(
+            stream,
+            &handle,
+            &mut held,
+            Some((node, detached.clone())),
+            extension,
+        )
+        .await;
+    }
+    // A detached node has nothing left to withdraw from: its actor has stopped.
+    if !*detached.borrow() {
+        held.release(&handle).await;
+    }
+    drop(hold);
+    wrote
 }
 
 /// Apply `command` and answer `Ok`, or the outcome as an error.
@@ -2698,12 +3088,43 @@ async fn verify_operator(
 /// one is checked too, and a match counts as the passphrase entered, opening the window; a
 /// mismatch is "none given", not a wrong passphrase. Without that, an identity with no
 /// passphrase could never change its keyring once the window had passed.
-async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
+///
+/// Answers whether the passphrase was proved: a proved change is made as
+/// [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved), which the window does not
+/// refuse.
+async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<bool, Frame> {
     if passphrase.is_empty() {
-        let _ = verify_operator(handle, passphrase).await;
-        return Ok(());
+        return Ok(verify_operator(handle, passphrase).await.is_ok());
     }
-    verify_operator(handle, passphrase).await
+    verify_operator(handle, passphrase).await.map(|()| true)
+}
+
+/// **For proofs only.** When set, a keyring change whose passphrase was just proved waits this
+/// many milliseconds between the check and the change, which stands for a daemon too busy to
+/// make it at once, past the keyring window. Nothing a person runs sets it; unset, nothing
+/// changes. Not compiled in without the `test-knobs` feature.
+#[cfg(feature = "test-knobs")]
+pub const TEST_PROVED_CHANGE_DELAY_ENV: &str = "VOX_TEST_PROVED_CHANGE_DELAY_MS";
+
+/// `change`, as [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved) when its
+/// passphrase was just proved.
+async fn proved_if(
+    proved: bool,
+    change: crate::node::api::NodeCommand,
+) -> crate::node::api::NodeCommand {
+    if !proved {
+        return change;
+    }
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_PROVED_CHANGE_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    crate::node::api::NodeCommand::Proved {
+        change: Box::new(change),
+    }
 }
 
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
@@ -2773,16 +3194,22 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             full_history,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::TrustWith {
-                    fingerprint: target,
-                    petname,
-                    history: if full_history {
-                        crate::node::trust::HistoryGrant::Full
-                    } else {
-                        crate::node::trust::HistoryGrant::Now
-                    },
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::TrustWith {
+                            fingerprint: target,
+                            petname,
+                            history: if full_history {
+                                crate::node::trust::HistoryGrant::Full
+                            } else {
+                                crate::node::trust::HistoryGrant::Now
+                            },
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -2815,10 +3242,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Untrust {
-                    fingerprint: target,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Untrust {
+                            fingerprint: target,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -2833,11 +3266,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Rename {
-                    fingerprint: target,
-                    petname,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Rename {
+                            fingerprint: target,
+                            petname,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3315,7 +3754,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         crate::node::api::Outcome::Failed(fault) => {
                             format!("Failed({})", fault.name())
                         }
-                        other => format!("{other:?}"),
+                        other => other.to_string(),
                     };
                     let (mut steps, mut said) = (None, None);
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -3356,6 +3795,26 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
+        Request::OpenRoom {
+            channel_id,
+            passphrase,
+        } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::OpenChannel {
+                    channel_id,
+                    passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                },
+            )
+            .await
+        }
+        Request::CloseRoom { channel_id } => {
+            plain(
+                handle,
+                crate::node::api::NodeCommand::CloseChannel { channel_id },
+            )
+            .await
+        }
         Request::Leave { channel_id } => {
             plain(
                 handle,
@@ -3514,7 +3973,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
 /// stops. Any write failure ends **this** connection and nothing else — a client
 /// that died mid-stream shows up as `BrokenPipe` here (measured).
 async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
-    while let Some(item) = events.next().await {
+    loop {
+        // **A subscriber that hangs up is noticed on a quiet node too**: waiting only on events
+        // left its connection — and the hold it carries on its node (ADR-026 L-3) — open until
+        // the node next said something, which on a quiet node is never, so an auto-started daemon
+        // never reached its idle exit (L-8).
+        let item = tokio::select! {
+            item = events.next() => item,
+            () = subscriber_gone(&stream) => return Ok(()),
+        };
+        let Some(item) = item else {
+            return Ok(());
+        };
         let frame = match item {
             EventStreamItem::Event(ev) => Frame::Event(ev),
             EventStreamItem::Lagged(missed) => Frame::Lagged { missed },
@@ -3523,7 +3993,23 @@ async fn pump(mut stream: UnixStream, mut events: EventStream) -> Result<()> {
             return Ok(());
         }
     }
-    Ok(())
+}
+
+/// Resolves once the client of a subscription has gone: its end of `stream` is closed or failed.
+/// A subscriber sends nothing after subscribing; anything it does send is read and dropped.
+pub(crate) async fn subscriber_gone(stream: &UnixStream) {
+    let mut buf = [0u8; 256];
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        match stream.try_read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return,
+        }
+    }
 }
 
 // ---- client ----------------------------------------------------------------
@@ -3535,6 +4021,102 @@ pub struct IpcClient {
     me: Option<Digest32>,
     /// Where the node listens, so a request that waits can check it is still answering.
     path: PathBuf,
+    /// The node this connection acts as on the daemon's socket (ADR-026 C-2), which a check on a
+    /// waiting request names in its own `Use`; `None` for a node's own socket.
+    node: Option<crate::node::paths::NodeName>,
+    /// What attaching the node said, when this connection's `Use` attached it.
+    notes: Vec<String>,
+}
+
+/// Where a client of the daemon reaches its node (ADR-026 C-2): the account's one socket, and the
+/// `Use` every connection to it opens with. A CLI process acts as one node, so every connection it
+/// makes carries the same `Use`.
+#[derive(Clone)]
+pub struct NodeSocket {
+    /// `<data root>/.daemon/vox.sock`.
+    pub path: PathBuf,
+    /// What each connection opens with.
+    pub using: crate::node::daemonipc::UseNode,
+    /// Called once if the daemon has not greeted within a second
+    /// ([`crate::node::daemonipc::DaemonClient::open_noting`]); the caller says the wait where its
+    /// user sees it.
+    pub waiting: Option<fn()>,
+}
+
+impl std::fmt::Debug for NodeSocket {
+    // Not derived: the `Use` may carry a passphrase.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeSocket")
+            .field("path", &self.path)
+            .field("node", &self.using.node)
+            .field("attach", &self.using.attach)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeSocket {
+    /// A one-shot verb's socket: the node must be attached already (ADR-026 L-2).
+    #[must_use]
+    pub fn one_shot(path: PathBuf, node: crate::node::paths::NodeName) -> Self {
+        Self {
+            path,
+            using: crate::node::daemonipc::UseNode {
+                node,
+                attach: crate::node::daemonipc::AttachMode::No,
+                passphrase: None,
+                anchors: Vec::new(),
+            },
+            waiting: None,
+        }
+    }
+
+    /// The same node, for a connection that must not attach it: what a check on a waiting request
+    /// opens, and every connection after the first of a held verb, whose first holds it.
+    #[must_use]
+    pub fn attached_only(&self) -> Self {
+        Self {
+            waiting: self.waiting,
+            ..Self::one_shot(self.path.clone(), self.using.node.clone())
+        }
+    }
+}
+
+/// Open a connection to the daemon at `at.path` acting as `at.using.node`: read the daemon's hello,
+/// send the `Use`, and read `Using`. Returns the connection, ready for node-level requests, and the
+/// node's fingerprint.
+///
+/// # Errors
+/// As [`crate::node::daemonipc::DaemonClient::open`]; [`IpcHandshake::Refused`], in the daemon's
+/// words, when it refuses the `Use`; [`IpcHandshake::NotHello`] for any other answer.
+pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> {
+    open_as_noting(at).await.map(|(s, me, _)| (s, me))
+}
+
+/// [`open_as`], with what attaching the node said when this `Use` attached it.
+///
+/// # Errors
+/// As [`open_as`].
+pub async fn open_as_noting(
+    at: &NodeSocket,
+) -> Result<(UnixStream, Option<Digest32>, Vec<String>)> {
+    use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
+    let DaemonClient { mut stream, .. } = DaemonClient::open_noting(&at.path, at.waiting).await?;
+    // Wiped once sent: it may carry the identity passphrase (C-6).
+    let opening = zeroize::Zeroizing::new(Opening::Use(at.using.clone()).to_bytes());
+    if let Err(e) = write_frame(&mut stream, &opening).await {
+        return Err(named(&at.path, e).await);
+    }
+    drop(opening);
+    let Some(answer) = read_frame(&mut stream).await? else {
+        return Err(hung_up(&at.path).await);
+    };
+    match DaemonFrame::from_bytes(&answer)? {
+        DaemonFrame::Using { me, notes, .. } => Ok((stream, me, notes)),
+        DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
+            reason: r.to_string(),
+        })),
+        _ => Err(Error::Ipc(IpcHandshake::NotHello)),
+    }
 }
 
 /// Connect to the control socket at `path` only if it is this user's own (V210-72).
@@ -3615,6 +4197,47 @@ impl IpcClient {
         self.me
     }
 
+    /// Connect to the daemon's socket at `path` and act as the node `using.node` (ADR-026 C-2):
+    /// read the daemon's hello, send the `Use`, and read its answer. `Ok(Err(refusal))` is the
+    /// daemon's answer, not a failure to reach it: a node not attached for a one-shot verb, a
+    /// wrong passphrase.
+    ///
+    /// # Errors
+    /// As [`crate::node::daemonipc::DaemonClient::open`], or if the daemon answers the `Use`
+    /// with anything but `Using` or `Refused`.
+    pub async fn open_node(
+        path: &Path,
+        using: crate::node::daemonipc::UseNode,
+    ) -> Result<std::result::Result<Self, crate::node::daemonipc::Refusal>> {
+        use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
+        let DaemonClient { mut stream, .. } = DaemonClient::open(path).await?;
+        write_frame(&mut stream, &Opening::Use(using).to_bytes()).await?;
+        let Some(answer) = read_frame(&mut stream).await? else {
+            return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
+        };
+        match DaemonFrame::from_bytes(&answer)? {
+            DaemonFrame::Using { me, node, notes } => Ok(Ok(Self {
+                stream,
+                me,
+                path: path.to_owned(),
+                node: Some(node),
+                notes,
+            })),
+            DaemonFrame::Refused(r) => Ok(Err(r)),
+            _ => Err(Error::Ipc(IpcHandshake::NotHello)),
+        }
+    }
+
+    /// Wait until the daemon ends this connection: it closed it, or said the node detached
+    /// (ADR-026 L-7). Only for a connection held without requests in flight.
+    pub async fn closed(&mut self) {
+        while let Ok(Some(body)) = read_frame(&mut self.stream).await {
+            if matches!(Frame::from_bytes(&body), Ok(Frame::NodeDetached { .. })) {
+                return;
+            }
+        }
+    }
+
     /// Connect and check the protocol version, without subscribing.
     ///
     /// Use this for a client that issues requests. [`IpcClient::subscribe`] turns
@@ -3648,7 +4271,31 @@ impl IpcClient {
             stream,
             me,
             path: path.to_owned(),
+            node: None,
+            notes: Vec::new(),
         })
+    }
+
+    /// Connect to the daemon at `at` acting as its node ([`open_as`]).
+    ///
+    /// # Errors
+    /// As [`open_as`].
+    pub async fn open_at(at: &NodeSocket) -> Result<Self> {
+        let (stream, me, notes) = open_as_noting(at).await?;
+        Ok(Self {
+            stream,
+            me,
+            path: at.path.clone(),
+            node: Some(at.using.node.clone()),
+            notes,
+        })
+    }
+
+    /// What attaching the node said, when this connection's `Use` attached it: for a verb that
+    /// holds a session to print in the person's own terminal (PRD-001 R23, R36).
+    #[must_use]
+    pub fn attach_notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// Send one request and read its answer.
@@ -3664,7 +4311,9 @@ impl IpcClient {
     /// whether it is still greeting and its actor still taking commands ([`ACTOR_WITHIN`]), and
     /// the request fails, naming which, once it is not.
     pub async fn request(&mut self, req: &Request) -> Result<Frame> {
-        let Self { stream, path, .. } = self;
+        let Self {
+            stream, path, node, ..
+        } = self;
         let exchange = async {
             // Wiped once sent: it may carry a passphrase (V210-94).
             if let Err(e) = write_frame(stream, &zeroize::Zeroizing::new(req.to_bytes())).await {
@@ -3675,7 +4324,29 @@ impl IpcClient {
             };
             Frame::from_bytes(&body)
         };
-        while_answering(path, exchange).await
+        while_answering(path, node.as_ref(), exchange).await
+    }
+
+    /// Send one request body this module has no [`Request`] for — a status, a tunnel close, a
+    /// snapshot ([`crate::node::snapshot`]) — and return the one reply body, bounded as
+    /// [`IpcClient::request`] is.
+    ///
+    /// # Errors
+    /// If the node cannot be reached, or hangs up before it answers.
+    pub async fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+        let Self {
+            stream, path, node, ..
+        } = self;
+        let exchange = async {
+            if let Err(e) = write_frame(stream, body).await {
+                return Err(named(path, e).await);
+            }
+            match read_frame(stream).await? {
+                Some(reply) => Ok(reply),
+                None => Err(hung_up(path).await),
+            }
+        };
+        while_answering(path, node.as_ref(), exchange).await
     }
 
     /// Every row after `since`, however many replies that takes — as one
@@ -3852,5 +4523,21 @@ impl IpcClient {
             Some(body) => Ok(Some(Frame::from_bytes(&body)?)),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod account_socket_tests {
+    /// The account socket admits its own user only, and never root, even a daemon run as root
+    /// (ADR-026 C-1, S-5).
+    #[test]
+    fn only_the_same_user_and_never_root() {
+        assert!(super::admitted(Some(501), 501));
+        assert!(!super::admitted(Some(502), 501));
+        assert!(!super::admitted(None, 501));
+        assert!(
+            !super::admitted(Some(0), 0),
+            "PRODUCT: the account socket admitted uid 0"
+        );
     }
 }

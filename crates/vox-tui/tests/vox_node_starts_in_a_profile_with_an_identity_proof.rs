@@ -24,14 +24,20 @@
 //!    file under the profile's data or config directory, and the passphrase is not on its
 //!    command line.
 //!
-//! **Mutation that must turn it red.** In `node::actor`'s `spawn_config`, open the profile's
-//! vault for a headless node again (`Profile::exists` without the `headless.is_none()` guard).
-//! The start fails with "another vox already has this profile open".
+//! Everything runs as the shipped binary: the trusted member is another profile made with
+//! `vox id`, and its 32 bytes are only the printed fingerprint decoded, to search files for.
+//!
+//! **Mutations that must turn it red.** `vox node --serve trusted` writing the fingerprints it
+//! serves into its node directory in the clear: red on (2), naming the file.
+//!
+//! The one this proof was written for — `spawn_config` opening the vault for a headless node (no
+//! `headless.is_none()` guard) — **no longer turns it red** (measured 2026-10-03): since ADR-026
+//! a headless key and a vault are two nodes, and `vox node` runs as `nodes/default-anchor/`, which
+//! holds no vault, so there is nothing for that guard to keep it from opening. Assertion (1) still
+//! holds the start to its words.
 
 #![cfg(unix)]
 
-#[path = "support/hostile.rs"]
-mod hostile;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -82,11 +88,12 @@ fn start(data: &Path, extra: &[&str]) -> VoxProc {
 fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let data = hostile::profile_dir(tmp.path(), "anchor");
-    hostile::fingerprint(&data);
-    let trusted = hostile::stranger(0x71);
-    let trusted_fp = vox_core::identity::composite::RootSigner::fingerprint(&trusted);
-    let trusted_b32 = vox_core::node::link::b32_encode(&trusted_fp);
+    let data = profile_dir(tmp.path(), "anchor");
+    world::fingerprint(&data, "the anchor");
+    // The trusted member: another person's `vox id`.
+    let trusted_b32 = world::fingerprint(&profile_dir(tmp.path(), "friend"), "the friend");
+    let trusted_fp = vox_core::node::link::b32_decode(&trusted_b32, "fingerprint")
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): `vox id` printed {trusted_b32:?}: {e:?}"));
     let (ok, out, err) = vox_once(
         &data,
         &args(&["trust", "add", &trusted_b32, "--name", "friend"]),
@@ -200,7 +207,7 @@ fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
         )
     };
 
-    let bare = hostile::profile_dir(tmp.path(), "bare");
+    let bare = profile_dir(tmp.path(), "bare");
     let (ok, said) = run(&bare);
     println!(
         "[proof] --serve trusted, no identity: ok={ok}: {}",
@@ -212,9 +219,9 @@ fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
          ok={ok}: {said}"
     );
 
-    let locked = hostile::profile_dir(tmp.path(), "locked");
-    hostile::fingerprint(&locked);
-    let store = locked.join("default").join("store.redb");
+    let locked = profile_dir(tmp.path(), "locked");
+    world::fingerprint(&locked, "the locked profile");
+    let store = world::node_dir(&locked, world::DEFAULT_NODE).join("store.redb");
     assert!(
         store.is_file(),
         "APPARATUS, CANNOT MEASURE (the proof's premise): `vox id` made no store at {}, the file \
@@ -235,4 +242,11 @@ fn vox_node_serve_trusted_names_what_is_wrong_with_its_trust_list() {
         "PRODUCT: `vox node --serve trusted` with an unreadable store must say the list exists but could \
          not be opened, and must not advise making one: ok={ok}: {said}"
     );
+}
+
+/// A data root `root/name` with its config directory, as a person's would be.
+fn profile_dir(root: &Path, name: &str) -> std::path::PathBuf {
+    let d = root.join(name);
+    world::mkdir(&d.join("cfg"));
+    d
 }

@@ -909,23 +909,11 @@ impl ConnectionManager {
         Ok(Some(self.file(conn).await))
     }
 
-    /// Phase one for an accept loop: the next inbound attempt, with no handshake.
-    /// `None` when the endpoint is closed.
-    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
-        self.endpoint.accept_incoming().await
-    }
-
-    /// Phase two: complete one attempt's handshake and admission, then file it. Spawn this.
-    pub async fn finish_incoming(
-        &self,
-        incoming: quinn::Incoming,
-        admission: Admission,
-    ) -> Result<Filed> {
-        let conn = self
-            .endpoint
-            .finish_incoming(incoming, (self.clock)(), admission)
-            .await?;
-        Ok(self.file_reporting(conn).await)
+    /// File a connection the presence accepted for this node (after its identity exchange),
+    /// handing back a duplicate it retired so the caller keeps serving it (see
+    /// [`Self::file_reporting`]).
+    pub async fn take_inbound(&self, conn: VoxConnection) -> Filed {
+        self.file_reporting(conn).await
     }
 
     /// Take ownership of a connection this manager did not dial — one a hole punch

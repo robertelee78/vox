@@ -44,14 +44,14 @@ use quinn::{Connection, Endpoint, RecvStream, Runtime, SendStream};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
-use crate::transport::identity_cert::build_leaf_certificate;
+use crate::transport::identity;
+use crate::transport::identity_cert::build_neutral_leaf;
 use crate::transport::mux::{CircuitPort, MuxSocket};
-use crate::transport::provider::{client_config, server_config};
+use crate::transport::provider::{neutral_client_config, neutral_server_config};
 use crate::transport::router::{
     DatagramFlow, DatagramRouter, DatagramStats, FlowMode, MAX_PACKET_HEADER,
 };
 use crate::transport::session::SessionEstablishment;
-use crate::transport::verifier::{VerifiedPeer, VoxClientCertVerifier, VoxServerCertVerifier};
 use crate::wire::WireError;
 
 /// The maximum length of a single length-delimited M5 frame on a reliable stream.
@@ -67,27 +67,127 @@ pub fn close_code(err: WireError) -> quinn::VarInt {
     quinn::VarInt::from_u32(u32::from(err.code()))
 }
 
-/// A Vox QUIC endpoint: it owns the local UDP socket and the authenticated TLS
-/// configuration, and can both dial peers and accept inbound connections.
+/// **The daemon's one QUIC endpoint** (ADR-026 D-3, ADR-012 N-41): one socket, one multiplexer,
+/// one neutral TLS leaf for the whole run, serving every node registered on it.
 ///
-/// The endpoint holds the local identity (via its leaf certificate) and the shared
-/// supported-signature-algorithms set the verifiers need.
-pub struct VoxEndpoint {
+/// The TLS handshake authenticates only this endpoint (ADR-011 requirement 27); which node a
+/// connection is to is proved afterwards by the identity exchange ([`identity`]), signed by the
+/// registered node's own key. A dial runs [`identity::dial`] as the dialling node; an accepted
+/// connection runs [`identity::listen`] against the registry, so a connection reaches only the
+/// node it asked for, and an unknown or unregistered one gets the one refusal.
+///
+/// A node's view of it is a [`VoxEndpoint`] ([`SharedEndpoint::register`]).
+pub struct SharedEndpoint {
     endpoint: Endpoint,
-    /// The socket the endpoint runs on: the real one plus relay circuits (ADR-012
-    /// rung 4). Held so circuits can be attached after binding.
+    /// The socket the endpoint runs on: the real one plus relay circuits (ADR-012 rung 4).
     mux: Arc<MuxSocket>,
-    /// The local leaf cert chain + key, re-offered on each dial for mutual auth.
-    leaf_chain: Vec<rustls_pki_types::CertificateDer<'static>>,
-    leaf_key: rustls_pki_types::PrivateKeyDer<'static>,
-    /// The provider's signature-verification algorithms, shared with verifiers.
-    supported: rustls::crypto::WebPkiSupportedAlgorithms,
-    /// This endpoint's own identity fingerprint.
-    local_id: Digest32,
+    /// The client side of every dial: the neutral leaf, pre-identity limits.
+    client: quinn::ClientConfig,
     /// The largest UDP payload this endpoint advertises and path-MTU discovery searches up to:
     /// [`MAX_UDP_PAYLOAD`] when the socket's receive buffer can take its bursts, else quinn's
     /// Ethernet default. See [`mtu_ceiling_for`].
     mtu_ceiling: u16,
+    /// The nodes this endpoint answers for, by fingerprint.
+    registry: Mutex<std::collections::HashMap<Digest32, Registered>>,
+    /// The per-source rate limit on `ASK`s (ADR-011 requirement 34): one per endpoint, run
+    /// before any node is looked up.
+    limiter: identity::AskLimiter,
+    /// Set once [`SharedEndpoint::close`] has run.
+    closed: tokio::sync::watch::Sender<bool>,
+    /// Each node's connections, by node, so a node gone without detaching can still have its own
+    /// closed ([`SharedEndpoint::evict`]). Closed ones are dropped as new ones are added.
+    by_node: Mutex<std::collections::HashMap<Digest32, Vec<Connection>>>,
+}
+
+/// One node on a [`SharedEndpoint`].
+struct Registered {
+    local: Arc<LocalNode>,
+    signer: Arc<dyn RootSigner + Send + Sync>,
+    /// Where the node's accepted connections go, when something routes them by node
+    /// ([`SharedEndpoint::route`]).
+    inbound: Option<tokio::sync::mpsc::Sender<VoxConnection>>,
+}
+
+/// **A node's view of the shared endpoint** (ADR-026 D-3): it dials as this node, its circuits
+/// are this node's, and what it accepts is this node's. Dropping or closing it unregisters the
+/// node — its signer leaves the exchange, so it answers nothing more — and closes the endpoint
+/// itself only when the node had it to itself (a solo endpoint, [`VoxEndpoint::bind`]).
+pub struct VoxEndpoint {
+    shared: Arc<SharedEndpoint>,
+    /// This node's own fingerprint.
+    local_id: Digest32,
+    /// The node this view is, with the state the process keeps per node (ADR-026 P-1).
+    local: Arc<LocalNode>,
+    /// The node's long-term key: it signs this node's `CLAIM`s. Taken out when the node is
+    /// unregistered, so a view outliving its node's attach holds no key (ADR-026 L-3).
+    signer: Mutex<Option<Arc<dyn RootSigner + Send + Sync>>>,
+    /// Whether the endpoint was bound for this node alone, and so goes with it.
+    solo: bool,
+}
+
+/// **One node this process hosts, and what the process keeps for it alone** (ADR-026 P-1).
+///
+/// A process may host several nodes, so nothing a node configures or a peer could learn from may
+/// sit in a process-wide value: each tunnel, count and setting is filed under the node it is
+/// for, and every reader asks by node. This is the per-node half that is not a registry entry:
+/// how long the node gives a stuck tunnel, the secret its relay keys origin tags with, and the
+/// per-attach `instance` its identity exchange signs (ADR-011), so a node that comes back is seen
+/// as a new process of itself.
+#[derive(Debug)]
+pub struct LocalNode {
+    id: Digest32,
+    instance: [u8; 16],
+    stuck_after_secs: AtomicU64,
+    origin_key: [u8; 32],
+}
+
+impl LocalNode {
+    /// A node with a fresh `instance` and origin key, giving stuck tunnels the default
+    /// ([`crate::tunnel::session::STUCK_AFTER`]).
+    ///
+    /// # Errors
+    /// If the OS CSPRNG is unavailable: the origin key and the instance are drawn from it, and a
+    /// guessable origin key would let a target work a relayed asker's address back out.
+    pub fn new(id: Digest32) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            id,
+            instance: crate::identity::rng::random_array()?,
+            stuck_after_secs: AtomicU64::new(crate::tunnel::session::STUCK_AFTER.as_secs()),
+            origin_key: crate::identity::rng::random_array()?,
+        }))
+    }
+
+    /// The node's identity fingerprint.
+    #[must_use]
+    pub fn id(&self) -> Digest32 {
+        self.id
+    }
+
+    /// This attach of the node: new each time it is made (ADR-011).
+    #[must_use]
+    pub fn instance(&self) -> [u8; 16] {
+        self.instance
+    }
+
+    /// Give this node's tunnels `after` before one whose bytes wait is closed as stuck
+    /// (V030-11): the node's `tunnel-stuck-after` setting. At least a second.
+    pub fn set_stuck_after(&self, after: std::time::Duration) {
+        self.stuck_after_secs
+            .store(after.as_secs().max(1), Ordering::Relaxed);
+    }
+
+    /// How long this node's tunnels' bytes may wait before the tunnel is closed as stuck.
+    #[must_use]
+    pub fn stuck_after(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.stuck_after_secs.load(Ordering::Relaxed))
+    }
+
+    /// The secret this node, as a relay, keys the origin tags it tells a target with
+    /// (`circuitstream::origin_tags`). Never sent.
+    #[must_use]
+    pub fn origin_key(&self) -> &[u8; 32] {
+        &self.origin_key
+    }
 }
 
 /// Transport-layer admission for an *inbound* connection, evaluated **after** the
@@ -280,10 +380,24 @@ const GRANTED_WHEN_FULL: usize = 2 * UDP_SOCKET_BUFFER;
 #[cfg(not(target_os = "linux"))]
 const GRANTED_WHEN_FULL: usize = UDP_SOCKET_BUFFER;
 
-/// The endpoint parameters every Vox endpoint runs with.
+/// How many bytes over the path-MTU ceiling a datagram this endpoint receives may run.
+///
+/// quinn sizes each receive buffer at the endpoint's `max_udp_payload_size`, and a datagram
+/// longer than its buffer is cut by the kernel, fails decryption and is dropped without a word.
+/// quinn-proto (0.11.18, and 0.11.19 and main as of 2026-10-03) fills a CONNECTION_CLOSE with
+/// a long reason to the packet's size counting its error code as one byte: a peer closing with a
+/// code of 2 to 8 bytes and a reason that fills the packet sends up to 7 bytes more than its
+/// path MTU. At the ceiling, the close was lost, the next packet met the peer's stateless reset,
+/// and the connection ended "reset by peer", its cause gone (#191: an anchor's close, code
+/// 0x7e57, 8194 bytes on an 8192-byte path). Path-MTU discovery is still bounded by the ceiling
+/// ([`base_transport`]), so nothing this endpoint sends grows.
+const RECEIVE_HEADROOM: u16 = 64;
+
+/// The endpoint parameters every Vox endpoint runs with: datagrams up to the path-MTU ceiling,
+/// and [`RECEIVE_HEADROOM`] over it received whole.
 fn endpoint_config(mtu_ceiling: u16) -> quinn::EndpointConfig {
     let mut cfg = quinn::EndpointConfig::default();
-    let _ = cfg.max_udp_payload_size(mtu_ceiling);
+    let _ = cfg.max_udp_payload_size(mtu_ceiling.saturating_add(RECEIVE_HEADROOM));
     cfg
 }
 
@@ -297,8 +411,9 @@ fn endpoint_config(mtu_ceiling: u16) -> quinn::EndpointConfig {
 /// few; this is the headroom that keeps the node's own streams opening while they are.
 pub const MAX_CONCURRENT_BIDI_STREAMS: u32 = 1024;
 
-/// The transport parameters every Vox connection runs with, in both directions.
-fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
+/// The transport parameters every Vox connection runs with, in both directions, once its
+/// identity exchange is done; [`pre_identity_transport_config`] holds it to the exchange first.
+fn base_transport(mtu_ceiling: u16) -> quinn::TransportConfig {
     let mut cfg = quinn::TransportConfig::default();
     cfg.keep_alive_interval(Some(KEEP_ALIVE));
     cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(MAX_CONCURRENT_BIDI_STREAMS));
@@ -321,6 +436,24 @@ fn transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
     // Cubic, restarted after the connection idles: a tunnel's transfer must not inherit the
     // congestion history of an older one on the same long-lived connection (PRD-001 R41).
     cfg.congestion_controller_factory(Arc::new(crate::transport::congestion::IdleRestartConfig));
+    cfg
+}
+
+/// The transport parameters of a connection **before its identity exchange** (ADR-011
+/// requirement 33): the normal parameters with QUIC's own limits holding the connection to the
+/// exchange — at most [`identity::PRE_IDENTITY_BIDI`](crate::transport::identity::PRE_IDENTITY_BIDI)
+/// client-opened bidirectional streams, no unidirectional stream, and a
+/// [`identity::PRE_IDENTITY_WINDOW`](crate::transport::identity::PRE_IDENTITY_WINDOW) connection
+/// window. A third stream is QUIC's STREAM_LIMIT_ERROR, not something Vox has to police.
+/// [`identity::open_post_identity`](crate::transport::identity::open_post_identity) raises them
+/// once the exchange is done.
+#[must_use]
+pub fn pre_identity_transport_config(mtu_ceiling: u16) -> Arc<quinn::TransportConfig> {
+    use crate::transport::identity::{PRE_IDENTITY_BIDI, PRE_IDENTITY_UNI, PRE_IDENTITY_WINDOW};
+    let mut cfg = base_transport(mtu_ceiling);
+    cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(PRE_IDENTITY_BIDI));
+    cfg.max_concurrent_uni_streams(quinn::VarInt::from_u32(PRE_IDENTITY_UNI));
+    cfg.receive_window(quinn::VarInt::from_u32(PRE_IDENTITY_WINDOW));
     Arc::new(cfg)
 }
 
@@ -567,20 +700,13 @@ enum Missed {
     Routable(String),
 }
 
-impl VoxEndpoint {
-    /// Bind a Vox endpoint to `addr`, authenticating as `signer`'s identity.
+impl SharedEndpoint {
+    /// Bind the endpoint to `addr`: one UDP socket (dual-stack self-tested, [`bind_udp`]), the
+    /// multiplexer over it, and a neutral leaf made once for this endpoint's whole life.
     ///
-    /// The endpoint can immediately [`accept`](Self::accept) inbound connections
-    /// (open-swarm default: any *authenticated* Vox identity is admitted at the
-    /// transport layer and surfaced for upper-layer join/consent authorization —
-    /// see [`Admission`]) or [`accept_with_admission`](Self::accept_with_admission)
-    /// (to enforce a pinned set / callback), and [`connect`](Self::connect) to
-    /// peers (pinning the expected peer identity).
-    ///
-    /// Per-connection server configs are built lazily on each accept (each needs
-    /// its own verifier output slot), so `bind` itself only stores the local leaf
-    /// + the provider's supported-signature algorithms.
-    pub fn bind<S: RootSigner>(signer: &S, addr: SocketAddr) -> Result<Self> {
+    /// # Errors
+    /// [`Error::LocalBind`] if the address cannot be bound; a TLS setup error otherwise.
+    pub fn bind(addr: SocketAddr) -> Result<Arc<Self>> {
         let socket = bind_udp(addr)?;
         let effective = {
             let sock = socket2::SockRef::from(&socket);
@@ -604,48 +730,342 @@ impl VoxEndpoint {
         let wrapped = quinn::TokioRuntime
             .wrap_udp_socket(socket)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
-        Self::bind_abstract_with(signer, wrapped, mtu_ceiling)
+        Self::bind_abstract_with(wrapped, mtu_ceiling)
     }
 
-    /// Bind on a caller-supplied datagram socket instead of a real UDP socket.
+    /// Bind on a caller-supplied datagram socket instead of a real UDP socket: how a simulated
+    /// network with NAT devices is driven in tests (ADR-012 rungs 3 and 4).
     ///
-    /// Everything above the datagram — the ADR-011 handshake, the composite identity
-    /// pinning, the streams — is identical; only where the bytes go changes. This is
-    /// how a simulated network with NAT devices is driven in tests (ADR-012 rungs 3
-    /// and 4 cannot be demonstrated without a middlebox to traverse), and it is the
-    /// hook any other datagram substrate would use.
-    pub fn bind_abstract<S: RootSigner>(
-        signer: &S,
-        socket: Arc<dyn quinn::AsyncUdpSocket>,
-    ) -> Result<Self> {
+    /// # Errors
+    /// A TLS or endpoint setup error.
+    pub fn bind_abstract(socket: Arc<dyn quinn::AsyncUdpSocket>) -> Result<Arc<Self>> {
         // A caller-supplied socket has no kernel buffer to overflow.
-        Self::bind_abstract_with(signer, socket, MAX_UDP_PAYLOAD)
+        Self::bind_abstract_with(socket, MAX_UDP_PAYLOAD)
     }
 
-    fn bind_abstract_with<S: RootSigner>(
-        signer: &S,
+    fn bind_abstract_with(
         socket: Arc<dyn quinn::AsyncUdpSocket>,
         mtu_ceiling: u16,
-    ) -> Result<Self> {
-        // Every endpoint runs on the multiplexer, so a relay circuit can be attached
-        // to a real socket and a simulated one alike.
+    ) -> Result<Arc<Self>> {
+        // Every endpoint runs on the multiplexer, so a relay circuit can be attached to a real
+        // socket and a simulated one alike.
         let mux = MuxSocket::new(socket);
         let for_endpoint: Arc<dyn quinn::AsyncUdpSocket> =
             Arc::clone(&mux) as Arc<dyn quinn::AsyncUdpSocket>;
-        Self::bind_with(signer, mux, mtu_ceiling, |cfg| {
-            Endpoint::new_with_abstract_socket(
-                endpoint_config(mtu_ceiling),
-                Some(cfg),
-                for_endpoint,
-                Arc::new(quinn::TokioRuntime),
-            )
+        // One neutral leaf for every connection this endpoint makes or takes (ADR-011
+        // requirement 27): it names nobody, so sharing it shows nothing a path observer could
+        // not see from the address.
+        let leaf = build_neutral_leaf()?;
+        let quic_server =
+            quinn::crypto::rustls::QuicServerConfig::try_from(neutral_server_config(&leaf)?)
+                .map_err(|_| Error::MalformedBundle("quic server config"))?;
+        let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server.transport_config(pre_identity_transport_config(mtu_ceiling));
+        let quic_client =
+            quinn::crypto::rustls::QuicClientConfig::try_from(neutral_client_config(&leaf)?)
+                .map_err(|_| Error::MalformedBundle("quic client config"))?;
+        let mut client = quinn::ClientConfig::new(Arc::new(quic_client));
+        client.transport_config(pre_identity_transport_config(mtu_ceiling));
+        let endpoint = Endpoint::new_with_abstract_socket(
+            endpoint_config(mtu_ceiling),
+            Some(server),
+            for_endpoint,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
+        Ok(Arc::new(Self {
+            endpoint,
+            mux,
+            client,
+            mtu_ceiling,
+            registry: Mutex::new(std::collections::HashMap::new()),
+            limiter: identity::AskLimiter::standard(),
+            closed: tokio::sync::watch::channel(false).0,
+            by_node: Mutex::new(std::collections::HashMap::new()),
+        }))
+    }
+
+    /// **Register a node** on this endpoint, with a fresh per-attach instance (ADR-026 I-3):
+    /// from now on it dials as itself and is answered for. `inbound`, when given, is where
+    /// [`Self::route`] sends the connections accepted for it.
+    ///
+    /// # Errors
+    /// [`Error::Profile`] if the node is registered already; a CSPRNG failure.
+    pub fn register(
+        self: &Arc<Self>,
+        signer: Arc<dyn RootSigner + Send + Sync>,
+        inbound: Option<tokio::sync::mpsc::Sender<VoxConnection>>,
+    ) -> Result<VoxEndpoint> {
+        self.register_as(signer, inbound, false)
+    }
+
+    fn register_as(
+        self: &Arc<Self>,
+        signer: Arc<dyn RootSigner + Send + Sync>,
+        inbound: Option<tokio::sync::mpsc::Sender<VoxConnection>>,
+        solo: bool,
+    ) -> Result<VoxEndpoint> {
+        let id = signer.fingerprint();
+        let local = LocalNode::new(id)?;
+        {
+            let mut reg = lock(&self.registry);
+            if reg.contains_key(&id) {
+                return Err(Error::Profile("this node is attached already"));
+            }
+            reg.insert(
+                id,
+                Registered {
+                    local: Arc::clone(&local),
+                    signer: Arc::clone(&signer),
+                    inbound,
+                },
+            );
+        }
+        Ok(VoxEndpoint {
+            shared: Arc::clone(self),
+            local_id: id,
+            local,
+            signer: Mutex::new(Some(signer)),
+            solo,
         })
+    }
+
+    /// Take `local` off the endpoint, if it is still the registration of its node: its signer
+    /// leaves the exchange, so nothing more is answered as it (ADR-011 requirement 34).
+    fn unregister(&self, local: &Arc<LocalNode>) {
+        let mut reg = lock(&self.registry);
+        if reg
+            .get(&local.id())
+            .is_some_and(|r| Arc::ptr_eq(&r.local, local))
+        {
+            reg.remove(&local.id());
+        }
+    }
+
+    /// File `conn` under the node `local`, for [`Self::evict`].
+    fn track(&self, local: Digest32, conn: &Connection) {
+        let mut by = lock(&self.by_node);
+        let list = by.entry(local).or_default();
+        list.retain(|c| c.close_reason().is_none());
+        list.push(conn.clone());
+    }
+
+    /// **Evict a node** that went without detaching — its actor panicked (ADR-026 L-6): take it
+    /// off the exchange, and close every connection it had, as stopping. Every other node's
+    /// registration and connections are left as they are.
+    pub fn evict(&self, local: &Digest32) {
+        lock(&self.registry).remove(local);
+        let conns = lock(&self.by_node).remove(local).unwrap_or_default();
+        for c in conns {
+            c.close(
+                close_code(WireError::ShuttingDown),
+                WireError::ShuttingDown.to_string().as_bytes(),
+            );
+        }
+    }
+
+    /// The fingerprints of the nodes registered now.
+    #[must_use]
+    pub fn registered(&self) -> Vec<Digest32> {
+        lock(&self.registry).keys().copied().collect()
+    }
+
+    /// The bound local socket address.
+    ///
+    /// # Errors
+    /// If the socket has none.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint
+            .local_addr()
+            .map_err(|_| Error::MalformedBundle("quic local_addr"))
+    }
+
+    /// The largest UDP payload this endpoint advertises and searches up to.
+    #[must_use]
+    pub fn mtu_ceiling(&self) -> u16 {
+        self.mtu_ceiling
+    }
+
+    /// **Phase one of accepting:** the next inbound attempt, with no handshake. `None` when the
+    /// endpoint is closed. Run [`Self::finish_incoming`] for it on a task of its own.
+    pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
+        self.endpoint.accept().await
+    }
+
+    /// **Phase two:** the neutral handshake (bounded by [`HANDSHAKE_TIMEOUT`]) and then the
+    /// identity exchange as the listener (bounded by [`identity::EXCHANGE_TIMEOUT`]), answering
+    /// for whichever registered node the dialler asks for — on a relay circuit only the node the
+    /// circuit was attached for ([`MuxSocket::serves_on`]). The connection comes back filed
+    /// under that node ([`VoxConnection::local_id`]); nothing above the transport sees it before
+    /// `CLAIM` verified, and its session record is written only then (ADR-011 requirement 33).
+    ///
+    /// # Errors
+    /// A failed handshake, or a refused exchange (the connection already closed with the one
+    /// refusal).
+    pub async fn finish_incoming(
+        &self,
+        incoming: quinn::Incoming,
+        now_secs: u64,
+    ) -> Result<VoxConnection> {
+        let remote = incoming.remote_address();
+        // Read before this end answers anything: see [`VoxConnection::via_circuit`].
+        let via_circuit = self.mux.is_circuit(remote);
+        let circuit_origin = self.mux.origin_of(remote);
+        let carrier = self.mux.carrier_of(remote);
+        let connecting = incoming.accept().map_err(handshake_failed)?;
+        // Bounded: an unauthenticated peer must not be able to hold a task open for ever by
+        // beginning a handshake and never finishing it.
+        let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+            .await
+            .map_err(|_| {
+                Error::Handshake(format!(
+                    "the peer did not finish its handshake within {}s",
+                    HANDSHAKE_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(handshake_failed)?;
+        // A circuit's asks are limited by the relay carrying them: this end never sees the
+        // asker's address.
+        let source = match &carrier {
+            Some((relay, _)) if via_circuit => identity::SourceKey::Circuit(*relay),
+            _ => identity::SourceKey::of_addr(remote),
+        };
+        let answering = Answering {
+            shared: self,
+            remote,
+        };
+        let (hosted, proven) =
+            identity::listen(&connection, source, None, &answering, &self.limiter)
+                .await
+                .map_err(|why| Error::Handshake(format!("refused the identity exchange: {why}")))?;
+        // The node answered for, as it is registered now: one that went away during the exchange
+        // has nothing left to take the connection.
+        let local = lock(&self.registry)
+            .get(&hosted.id)
+            .filter(|r| r.local.instance() == hosted.instance)
+            .map(|r| Arc::clone(&r.local));
+        let Some(local) = local else {
+            identity::refuse(&connection);
+            return Err(Error::Handshake(
+                "the node asked for went away during the identity exchange".to_owned(),
+            ));
+        };
+        self.track(local.id(), &connection);
+        let mut conn = finish_connection(connection, local, &proven, now_secs, via_circuit)?;
+        conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
+        conn.carrier = carrier.filter(|_| via_circuit);
+        Ok(conn)
+    }
+
+    /// **Hand an accepted connection to the node it is for** ([`Self::register`]'s `inbound`).
+    /// A node with nowhere to put it, or a full queue, gets it closed as stopping: the node is
+    /// going, or too far behind to serve it.
+    pub fn route(&self, conn: VoxConnection) {
+        let sink = lock(&self.registry)
+            .get(&conn.local_id())
+            .and_then(|r| r.inbound.clone());
+        let Some(sink) = sink else {
+            conn.close(WireError::ShuttingDown);
+            return;
+        };
+        if let Err(e) = sink.try_send(conn) {
+            let conn = match e {
+                tokio::sync::mpsc::error::TrySendError::Full(c)
+                | tokio::sync::mpsc::error::TrySendError::Closed(c) => c,
+            };
+            conn.close(WireError::ShuttingDown);
+        }
+    }
+
+    /// Close the endpoint and every connection on it, for every node: the daemon stopping.
+    pub fn close(&self) {
+        // A stopping node's last word to every connection it still has (V210-93): "stopped",
+        // the same as `ConnectionManager::close_all` says, never a code that reads as a fault.
+        self.endpoint.close(
+            close_code(WireError::ShuttingDown),
+            WireError::ShuttingDown.to_string().as_bytes(),
+        );
+        self.closed.send_replace(true);
+    }
+
+    /// Whether the endpoint is closed, as a watch: `true` once [`Self::close`] has run.
+    #[must_use]
+    pub fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.closed.subscribe()
+    }
+
+    /// Wait until every connection of this endpoint has finished closing, which includes its
+    /// CONNECTION_CLOSE having left. Callers bound it.
+    pub async fn wait_idle(&self) {
+        self.endpoint.wait_idle().await;
+    }
+
+    /// How many connections the endpoint holds, in either role.
+    #[must_use]
+    pub fn open_connections(&self) -> usize {
+        self.endpoint.open_connections()
+    }
+}
+
+/// The nodes a connection from `remote` may reach: any registered node, except that a relay
+/// circuit is answered only by the node it was attached for (ADR-026 P-1).
+struct Answering<'a> {
+    shared: &'a SharedEndpoint,
+    remote: SocketAddr,
+}
+
+impl identity::Hosts for Answering<'_> {
+    fn host(&self, target: &Digest32) -> Option<identity::Hosted> {
+        if !self.shared.mux.serves_on(self.remote, target) {
+            return None;
+        }
+        lock(&self.shared.registry)
+            .get(target)
+            .map(|r| identity::Hosted {
+                id: *target,
+                instance: r.local.instance(),
+                signer: Arc::clone(&r.signer),
+            })
+    }
+}
+
+impl VoxEndpoint {
+    /// Bind an endpoint of its own to `addr` for `signer`'s node (a **solo** endpoint: today's
+    /// one node per process). Closing the view closes the endpoint.
+    ///
+    /// # Errors
+    /// As [`SharedEndpoint::bind`].
+    pub fn bind(signer: Arc<dyn RootSigner + Send + Sync>, addr: SocketAddr) -> Result<Self> {
+        SharedEndpoint::bind(addr)?.register_as(signer, None, true)
+    }
+
+    /// [`Self::bind`] on a caller-supplied datagram socket ([`SharedEndpoint::bind_abstract`]).
+    ///
+    /// # Errors
+    /// As [`SharedEndpoint::bind_abstract`].
+    pub fn bind_abstract(
+        signer: Arc<dyn RootSigner + Send + Sync>,
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+    ) -> Result<Self> {
+        SharedEndpoint::bind_abstract(socket)?.register_as(signer, None, true)
+    }
+
+    /// The shared endpoint this view is on.
+    #[must_use]
+    pub fn shared(&self) -> &Arc<SharedEndpoint> {
+        &self.shared
+    }
+
+    /// Whether this view's node had the endpoint to itself.
+    #[must_use]
+    pub fn is_solo(&self) -> bool {
+        self.solo
     }
 
     /// Attach a relay circuit to `peer` (ADR-012 rung 4): datagrams the endpoint
     /// sends to the port's own [`CircuitPort::addr`] come out of it, and datagrams
     /// its inlet is fed arrive from that address. Dialling that address then runs
-    /// the ordinary handshake, pinned to `peer`, over whatever carries the port.
+    /// the ordinary handshake and exchange, pinned to `peer`, over whatever carries the port.
     ///
     /// # Errors
     /// If the OS CSPRNG is unavailable, since the address is drawn from it.
@@ -654,7 +1074,7 @@ impl VoxEndpoint {
         peer: &Digest32,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach(peer, None, carrier)
+        self.shared.mux.attach(&self.local_id, peer, None, carrier)
     }
 
     /// Attach an **inbound** circuit from `peer`, carried by `relay`, as
@@ -670,7 +1090,9 @@ impl VoxEndpoint {
         origin: crate::transport::mux::CircuitOrigin,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach_via(peer, relay, Some(origin), carrier)
+        self.shared
+            .mux
+            .attach_via(&self.local_id, peer, relay, Some(origin), carrier)
     }
 
     /// [`VoxEndpoint::attach_circuit`], recording `relay` as the peer carrying it.
@@ -683,167 +1105,126 @@ impl VoxEndpoint {
         relay: &Digest32,
         carrier: Option<crate::transport::mux::CircuitCarrier>,
     ) -> Result<CircuitPort> {
-        self.mux.attach_via(peer, relay, None, carrier)
+        self.shared
+            .mux
+            .attach_via(&self.local_id, peer, relay, None, carrier)
     }
 
-    /// The relay carrying `peer`'s live circuit, if one is recorded.
+    /// The relay carrying this node's live circuit to `peer`, if one is recorded.
     #[must_use]
     pub fn circuit_relay_of(&self, peer: &Digest32) -> Option<Digest32> {
-        self.mux.circuit_relay_of(peer)
+        self.shared.mux.circuit_relay_of(&self.local_id, peer)
     }
 
     /// Whether `addr` is a **live circuit** on this endpoint's socket — answered from the
     /// mux's table, which is the only authority on it.
     #[must_use]
     pub fn is_circuit(&self, addr: std::net::SocketAddr) -> bool {
-        self.mux.is_circuit(addr)
+        self.shared.mux.is_circuit(addr)
     }
 
-    /// The address `peer`'s newest live circuit stands at, if it has one. Circuit addresses are
-    /// allocated, so this is the only way to get from a peer to its circuit.
+    /// The address this node's newest live circuit to `peer` stands at, if it has one.
     #[must_use]
     pub fn circuit_addr_of(&self, peer: &Digest32) -> Option<std::net::SocketAddr> {
-        self.mux.circuit_addr_of(peer)
+        self.shared.mux.circuit_addr_of(&self.local_id, peer)
     }
 
-    /// How many relay circuits are attached.
+    /// How many relay circuits are attached for this node.
     #[must_use]
     pub fn circuit_count(&self) -> usize {
-        self.mux.circuit_count()
-    }
-
-    /// The shared body of the constructors: build this node's leaf credentials and
-    /// hand the resulting server config to `make` to produce the endpoint.
-    fn bind_with<S: RootSigner>(
-        signer: &S,
-        mux: Arc<MuxSocket>,
-        mtu_ceiling: u16,
-        make: impl FnOnce(quinn::ServerConfig) -> std::io::Result<Endpoint>,
-    ) -> Result<Self> {
-        let leaf = build_leaf_certificate(signer)?;
-        let leaf_chain = leaf.cert_chain();
-        let leaf_key = leaf.private_key();
-        let supported =
-            crate::transport::provider::vox_crypto_provider().signature_verification_algorithms;
-
-        // A minimal server config to bind the listening socket. The authenticating
-        // verifier is installed per-connection in `accept` (each connection needs
-        // its own [`VerifiedPeer`] slot), so this initial config's verifier output
-        // is never read — it exists only so `Endpoint::server` has a crypto config.
-        let bootstrap_verifier =
-            VoxClientCertVerifier::any_identity(supported, VerifiedPeer::new());
-        let s_cfg = server_config(
-            Arc::new(bootstrap_verifier),
-            leaf_chain.clone(),
-            leaf.private_key(),
-        )?;
-        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
-            .map_err(|_| Error::MalformedBundle("quic server config"))?;
-        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-        server_cfg.transport_config(transport_config(mtu_ceiling));
-
-        let endpoint =
-            make(server_cfg).map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
-
-        Ok(Self {
-            endpoint,
-            mux,
-            leaf_chain,
-            leaf_key,
-            supported,
-            local_id: leaf.identity_fingerprint(),
-            mtu_ceiling,
-        })
+        self.shared.mux.circuit_count(&self.local_id)
     }
 
     /// The largest UDP payload this endpoint advertises and searches up to (see
     /// [`mtu_ceiling_for`]).
     #[must_use]
     pub fn mtu_ceiling(&self) -> u16 {
-        self.mtu_ceiling
+        self.shared.mtu_ceiling
     }
 
     /// The bound local socket address (useful when binding to port 0).
+    ///
+    /// # Errors
+    /// If the socket has none.
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.endpoint
-            .local_addr()
-            .map_err(|_| Error::MalformedBundle("quic local_addr"))
+        self.shared.local_addr()
     }
 
-    /// This endpoint's identity fingerprint.
+    /// This node's identity fingerprint.
     #[must_use]
     pub fn local_id(&self) -> Digest32 {
         self.local_id
     }
 
-    /// Dial `addr`, requiring the peer to authenticate as `expected_peer`.
+    /// The node this view is ([`LocalNode`]).
+    #[must_use]
+    pub fn local(&self) -> &Arc<LocalNode> {
+        &self.local
+    }
+
+    /// Dial `addr` as this node, requiring the node that answers to prove it is
+    /// `expected_peer`.
     ///
-    /// Fails (no silent fallback) if: the peer cannot negotiate X25519MLKEM768, the
-    /// peer's identity does not match `expected_peer`, or its composite PoP does not
-    /// verify. On success returns an authenticated [`VoxConnection`] plus the
-    /// session-establishment record.
+    /// The neutral TLS handshake (post-quantum group, no classical fallback), then the identity
+    /// exchange as the dialler ([`identity::dial`]): this node shows who it is only once the
+    /// other end has proved, on this TLS session, to be `expected_peer`. Anything else — a
+    /// refusal, a `PROVE` that does not verify, silence — says "nothing at `addr` answers as
+    /// `expected_peer`" and names nobody (ADR-011 38a).
+    ///
+    /// # Errors
+    /// As above, or a handshake failure by its own cause.
     pub async fn connect(
         &self,
         addr: SocketAddr,
         expected_peer: Digest32,
         now_secs: u64,
     ) -> Result<VoxConnection> {
-        let verified = VerifiedPeer::new();
-        let verifier =
-            VoxServerCertVerifier::pinned(self.supported, expected_peer, verified.clone());
-        let c_cfg = client_config(
-            Arc::new(verifier),
-            self.leaf_chain.clone(),
-            self.clone_key(),
-        )?;
-        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(c_cfg)
-            .map_err(|_| Error::MalformedBundle("quic client config"))?;
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
-        client_cfg.transport_config(transport_config(self.mtu_ceiling));
-
         // Read before the first packet leaves: see [`VoxConnection::via_circuit`].
-        let via_circuit = self.mux.is_circuit(addr);
-        let carrier = self.mux.carrier_of(addr);
-        // The SNI server name is unused for authentication (we authenticate by the
-        // Vox identity), but rustls requires a syntactically valid name.
+        let via_circuit = self.shared.mux.is_circuit(addr);
+        let carrier = self.shared.mux.carrier_of(addr);
+        // The SNI is a fixed placeholder: it carries no identity (ADR-011 requirement 27), and
+        // rustls requires a syntactically valid name.
         let connecting = self
+            .shared
             .endpoint
-            .connect_with(client_cfg, addr, "vox.invalid")
+            .connect_with(self.shared.client.clone(), addr, "vox.invalid")
             .map_err(|_| Error::MalformedBundle("quic connect"))?;
-        let connection = connecting
+        let signer = lock(&self.signer)
+            .clone()
+            .ok_or_else(|| Error::Handshake("this node is detached".to_owned()))?;
+        let connection = connecting.await.map_err(handshake_failed)?;
+        let proven = identity::dial(&connection, &*signer, self.local.instance(), expected_peer)
             .await
-            .map_err(|e| handshake_failed(e, &verified))?;
-        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
+            .map_err(|f| f.into_error(addr, &expected_peer))?;
+        self.shared.track(self.local_id, &connection);
+        let mut conn = finish_connection(
+            connection,
+            Arc::clone(&self.local),
+            &proven,
+            now_secs,
+            via_circuit,
+        )?;
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
     }
 
-    /// Accept the next inbound connection, admitting **any authenticated Vox
-    /// identity** (the open-swarm default — see [`Admission`]). Returns `Ok(None)`
-    /// if the endpoint is closed.
+    /// Accept the next inbound connection for this node, admitting **any proven Vox
+    /// identity** (the open-swarm default — see [`Admission`]). `Ok(None)` when the endpoint is
+    /// closed. For a solo endpoint; on a shared one the presence accepts and routes.
     ///
-    /// The peer is cryptographically authenticated during the handshake (composite
-    /// identity recovered + PoP verified); the recovered identity is recorded and
-    /// surfaced via [`VoxConnection::peer_id`] so the application can apply its
-    /// join/consent authorization (ADR-005/007). To reject an
-    /// authenticated-but-unwanted identity at the transport boundary (pinned /
-    /// private deployments), use [`accept_with_admission`](Self::accept_with_admission).
+    /// # Errors
+    /// A failed handshake or exchange.
     pub async fn accept(&self, now_secs: u64) -> Result<Option<VoxConnection>> {
         self.accept_with_admission(now_secs, Admission::AcceptAnyAuthenticated)
             .await
     }
 
-    /// Accept the next inbound connection, enforcing `admission` **after** the peer
-    /// is cryptographically authenticated. Returns `Ok(None)` if the endpoint is
-    /// closed.
+    /// Accept the next inbound connection, enforcing `admission` after the exchange proved who
+    /// dialled. A proven but not admitted peer is closed with
+    /// [`WireError::AuthenticatorInvalid`] and this returns `Err`.
     ///
-    /// The peer always proves a valid Vox identity first (handshake-level auth); a
-    /// peer that authenticates but is **not admitted** by `admission` has its
-    /// connection closed with [`WireError::AuthenticatorInvalid`] (`0x05`) and this
-    /// returns `Err` — the same coded rejection the dialer uses for an identity
-    /// mismatch, so an unwanted peer cannot tell "not authenticated" from "not
-    /// admitted". An admitted peer's identity is surfaced via
-    /// [`VoxConnection::peer_id`].
+    /// # Errors
+    /// As [`Self::finish_incoming`].
     pub async fn accept_with_admission(
         &self,
         now_secs: u64,
@@ -858,71 +1239,34 @@ impl VoxEndpoint {
     }
 
     /// **Phase one of accepting: wait for an inbound connection attempt and return
-    /// immediately, doing no handshake.**
-    ///
-    /// The handshake belongs in [`VoxEndpoint::finish_incoming`], on its own task. Doing
-    /// both in one call — which is what [`VoxEndpoint::accept_with_admission`] still does,
-    /// for callers that want one connection — means an accept *loop* performs every
-    /// handshake inline and therefore serialises on them: one peer that opens a connection
-    /// and then stalls its TLS handshake blocks **every** other inbound connection, with no
-    /// credential of any kind, because authentication has not happened yet. That is a
-    /// pre-authentication denial of service against an always-on node, which is exactly what
-    /// an anchor is.
+    /// immediately, doing no handshake.** See [`SharedEndpoint::accept_incoming`].
     ///
     /// `None` when the endpoint is closed.
     pub async fn accept_incoming(&self) -> Option<quinn::Incoming> {
-        self.endpoint.accept().await
+        self.shared.accept_incoming().await
     }
 
-    /// **Phase two: complete one connection's handshake and admission.**
+    /// **Phase two: complete one connection's handshake, exchange and admission** as this node
+    /// ([`SharedEndpoint::finish_incoming`]). A connection the exchange filed under another node
+    /// of the endpoint is closed: this view accepts only its own.
     ///
-    /// Bounded by a 30-second handshake timeout, so a peer that opens a connection and then says
-    /// nothing costs one task for that long and not for ever. Spawn this; do not await it in
-    /// an accept loop.
+    /// # Errors
+    /// A failed handshake or exchange, another node's connection, or a peer not admitted.
     pub async fn finish_incoming(
         &self,
         incoming: quinn::Incoming,
         now_secs: u64,
         mut admission: Admission,
     ) -> Result<VoxConnection> {
-        // Read before this end answers anything: see [`VoxConnection::via_circuit`].
-        let via_circuit = self.mux.is_circuit(incoming.remote_address());
-        let circuit_origin = self.mux.origin_of(incoming.remote_address());
-        let carrier = self.mux.carrier_of(incoming.remote_address());
-        // A fresh slot for THIS connection's verifier output. We install a
-        // per-connection server config so the verifier writes into our slot.
-        let verified = VerifiedPeer::new();
-        let client_verifier = VoxClientCertVerifier::any_identity(self.supported, verified.clone());
-        let s_cfg = server_config(
-            Arc::new(client_verifier),
-            self.leaf_chain.clone(),
-            self.clone_key(),
-        )?;
-        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(s_cfg)
-            .map_err(|_| Error::MalformedBundle("quic server config (accept)"))?;
-        let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-        server_cfg.transport_config(transport_config(self.mtu_ceiling));
-        // Bounded: an unauthenticated peer must not be able to hold a task open for ever by
-        // beginning a handshake and never finishing it.
-        let connecting = incoming
-            .accept_with(Arc::new(server_cfg))
-            .map_err(|e| handshake_failed(e, &verified))?;
-        let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
-            .await
-            .map_err(|_| {
-                Error::Handshake(format!(
-                    "the peer did not finish its handshake within {}s",
-                    HANDSHAKE_TIMEOUT.as_secs()
-                ))
-            })?
-            .map_err(|e| handshake_failed(e, &verified))?;
-        let mut conn = finish_connection(connection, &verified, now_secs, via_circuit)?;
-        conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
-        conn.carrier = carrier.filter(|_| via_circuit);
-
-        // Transport-layer admission, after authentication. A non-admitted peer is
-        // closed with the coded reason and rejected — indistinguishable on the wire
-        // from an authentication failure.
+        let conn = self.shared.finish_incoming(incoming, now_secs).await?;
+        if conn.local_id() != self.local_id {
+            conn.close(WireError::ShuttingDown);
+            return Err(Error::Handshake(
+                "a connection for another node of this endpoint".to_owned(),
+            ));
+        }
+        // Transport-layer admission, after the exchange. A non-admitted peer is
+        // closed with the coded reason and rejected.
         if !admission.admits(&conn.peer_id()) {
             conn.close(WireError::AuthenticatorInvalid);
             return Err(Error::SignatureInvalid);
@@ -930,25 +1274,36 @@ impl VoxEndpoint {
         Ok(conn)
     }
 
-    /// Gracefully close the endpoint (all connections).
+    /// **Take this node off the endpoint** (ADR-026 L-3, ADR-011 requirement 34): its signer
+    /// leaves the exchange, so nothing more is answered as it. Its connections stay as they are;
+    /// closing them is the caller's (D-5: only this node's, in their order).
+    pub fn unregister(&self) {
+        self.shared.unregister(&self.local);
+        lock(&self.signer).take();
+    }
+
+    /// Close this node's part: unregister it, and close the endpoint itself — every connection
+    /// on it — only when the node had it to itself. On a shared endpoint every other node's
+    /// connections are untouched (ADR-026 D-5).
     pub fn close(&self) {
-        // A stopping node's last word to every connection it still has (V210-93): "stopped",
-        // the same as `ConnectionManager::close_all` says, never a code that reads as a fault.
-        self.endpoint.close(
-            close_code(WireError::ShuttingDown),
-            WireError::ShuttingDown.to_string().as_bytes(),
-        );
+        self.unregister();
+        if self.solo {
+            self.shared.close();
+        }
     }
 
-    /// Wait until every connection of this endpoint has finished closing, which includes its
-    /// CONNECTION_CLOSE having left. Callers bound it.
+    /// Wait until every connection of the endpoint has finished closing. Meaningful for a solo
+    /// endpoint, after [`Self::close`]; callers bound it.
     pub async fn wait_idle(&self) {
-        self.endpoint.wait_idle().await;
+        self.shared.wait_idle().await;
     }
+}
 
-    /// Clone the private key (rustls `PrivateKeyDer` is clone-by-method).
-    fn clone_key(&self) -> rustls_pki_types::PrivateKeyDer<'static> {
-        self.leaf_key.clone_key()
+impl Drop for VoxEndpoint {
+    fn drop(&mut self) {
+        // A view that goes away takes its node off the exchange with it: no signer outlives the
+        // node's use of it.
+        self.unregister();
     }
 }
 
@@ -995,7 +1350,7 @@ pub fn closed_text(e: &quinn::ConnectionError) -> String {
 /// A refusal is a peer that is busy (V210-86, #278): a node past its cap on handshakes refuses
 /// what it cannot take in time, and its dialler is to say so and try again shortly, not report
 /// a fault.
-fn handshake_failed(e: quinn::ConnectionError, verified: &VerifiedPeer) -> Error {
+fn handshake_failed(e: quinn::ConnectionError) -> Error {
     use quinn::ConnectionError as C;
     let tls = |code: quinn::TransportErrorCode| (0x100..0x200).contains(&u64::from(code));
     // A QUIC crypto error is 0x100 plus the TLS alert.
@@ -1004,15 +1359,15 @@ fn handshake_failed(e: quinn::ConnectionError, verified: &VerifiedPeer) -> Error
         format!("TLS alert {n} ({:?})", rustls::AlertDescription::from(n))
     };
     match e {
-        // This end refused: its verifier says why, or quinn's reason does.
+        // This end refused the peer's TLS: not a Vox daemon's neutral leaf, or not the group.
         C::TransportError(t) if tls(t.code) => Error::HandshakeAuth(format!(
-            "this node refused the peer ({}): {}",
+            "this node refused the peer's TLS handshake ({}): {}",
             alert(t.code),
-            peer_text(&verified.rejection().unwrap_or(t.reason))
+            peer_text(&t.reason)
         )),
-        // The peer refused this node, and sent only its alert.
+        // The peer refused this node's TLS, and sent only its alert.
         C::ConnectionClosed(c) if tls(c.error_code) => Error::HandshakeAuth(format!(
-            "the peer refused this node ({}){}",
+            "the peer refused this node's TLS handshake ({}){}",
             alert(c.error_code),
             match String::from_utf8_lossy(&c.reason).trim() {
                 "" => String::new(),
@@ -1028,35 +1383,41 @@ fn handshake_failed(e: quinn::ConnectionError, verified: &VerifiedPeer) -> Error
     }
 }
 
-/// Confirm the negotiated group, record the session, and build the connection.
+/// Confirm the negotiated group, record the session, and build the connection — once the
+/// identity exchange has proved who the peer is (`proven`).
+///
+/// The session record is written only now (ADR-011 requirement 33), and the remote process is
+/// `sha256(the peer daemon's leaf ‖ the peer node's instance)` (requirement 35, ADR-026 I-3): the
+/// leaf is per daemon run and shared by its nodes, the instance per attach, so a node that
+/// re-attaches — or a daemon that restarts — is a new process to its peers. The datagram router
+/// starts here too, after the exchange, never before.
 fn finish_connection(
     connection: Connection,
-    verified: &VerifiedPeer,
+    local: Arc<LocalNode>,
+    proven: &identity::Proven,
     now_secs: u64,
     via_circuit: bool,
 ) -> Result<VoxConnection> {
-    // The verifier authenticated the peer during the handshake; its fingerprint is
-    // in the slot. Absence means the handshake completed without our verifier
-    // running, which must not happen — treat as an auth failure.
-    let peer_id = verified.fingerprint().ok_or(Error::SignatureInvalid)?;
-
+    let peer_id = proven.peer;
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
     // actually negotiated; a session under any group but the post-quantum hybrid is refused.
     let group = confirm_handshake(&connection)?;
     let session = SessionEstablishment::observed(peer_id, group, now_secs)?;
-    // The peer's leaf certificate is generated per endpoint — per process — and bound to the
-    // identity by a signature (`identity_cert`), so its digest says which *process* of the
-    // identity this connection is to (V210-57).
     let peer_process = connection
         .peer_identity()
         .and_then(|any| {
             any.downcast::<Vec<rustls_pki_types::CertificateDer<'static>>>()
                 .ok()
         })
-        .and_then(|chain| chain.first().map(|leaf| crate::hash::sha256(leaf.as_ref())))
+        .and_then(|chain| {
+            chain
+                .first()
+                .map(|leaf| identity::remote_process(leaf.as_ref(), &proven.instance))
+        })
         .ok_or(Error::SignatureInvalid)?;
     Ok(VoxConnection {
         serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
+        local,
         peer_id,
         peer_process,
         session,
@@ -1109,6 +1470,9 @@ pub struct VoxConnection {
     /// This connection's name in this process, never given to another (see [`Self::serial`]).
     serial: u64,
     connection: Connection,
+    /// The node this end is: whose tunnels this connection's are, in a process hosting several
+    /// nodes (ADR-026 P-1).
+    local: Arc<LocalNode>,
     peer_id: Digest32,
     /// Which process of `peer_id` this connection is to: the digest of its per-process leaf
     /// certificate (see [`Self::peer_process`]).
@@ -1176,10 +1540,14 @@ impl Drop for TunnelCredit {
         // stuck, closed at its other end — is kept on the closed list with that reason.
         if let Some(why) = lock(&self.watch.why).clone() {
             let mut closed = lock(&CLOSED);
-            if closed.len() == CLOSED_KEPT {
-                closed.pop_front();
+            // Kept per node: one node's busy day must not push another's history off the list.
+            if closed.iter().filter(|t| t.owner == live.owner).count() >= CLOSED_KEPT {
+                if let Some(oldest) = closed.iter().position(|t| t.owner == live.owner) {
+                    closed.remove(oldest);
+                }
             }
             closed.push_back(ClosedTunnel {
+                owner: live.owner,
                 id: self.id,
                 peer: live.peer,
                 service: live.service,
@@ -1199,15 +1567,34 @@ pub struct TunnelWatch {
     moved: Arc<AtomicU64>,
     close: Arc<tokio::sync::Notify>,
     why: Arc<Mutex<Option<String>>>,
+    /// The node this end of the tunnel is (ADR-026 P-1): whose stop waits for its last bytes.
+    owner: Digest32,
+    /// How long its owner gives it with bytes waiting before it is closed as stuck, as the
+    /// owner had it when the tunnel opened.
+    stuck_after: std::time::Duration,
 }
 
 impl TunnelWatch {
-    fn new(now: u64) -> Self {
+    fn new(now: u64, owner: Digest32, stuck_after: std::time::Duration) -> Self {
         Self {
             moved: Arc::new(AtomicU64::new(now)),
             close: Arc::new(tokio::sync::Notify::new()),
             why: Arc::new(Mutex::new(None)),
+            owner,
+            stuck_after,
         }
+    }
+
+    /// The node this end of the tunnel is.
+    #[must_use]
+    pub fn owner(&self) -> Digest32 {
+        self.owner
+    }
+
+    /// How long this tunnel's bytes may wait before it is closed as stuck: its node's setting.
+    #[must_use]
+    pub fn stuck_after(&self) -> std::time::Duration {
+        self.stuck_after
     }
 
     /// Mark that the tunnel moved a byte just now.
@@ -1241,6 +1628,8 @@ impl TunnelWatch {
 /// (V030-11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosedTunnel {
+    /// The node it was this end of (ADR-026 P-1).
+    pub owner: Digest32,
     /// Its number while it ran ([`LiveTunnel::id`]).
     pub id: u64,
     /// The member at the other end.
@@ -1257,17 +1646,21 @@ pub struct ClosedTunnel {
     pub why: String,
 }
 
-/// How many ended tunnels [`closed_tunnels`] keeps, newest last.
+/// How many ended tunnels [`closed_tunnels`] keeps for each node, newest last.
 const CLOSED_KEPT: usize = 32;
 
 /// The tunnels that ended for a reason, newest last ([`ClosedTunnel`]).
 static CLOSED: Mutex<std::collections::VecDeque<ClosedTunnel>> =
     Mutex::new(std::collections::VecDeque::new());
 
-/// The tunnels that ended for a reason a person should see, oldest first.
+/// The tunnels of the node `owner` that ended for a reason a person should see, oldest first.
 #[must_use]
-pub fn closed_tunnels() -> Vec<ClosedTunnel> {
-    lock(&CLOSED).iter().cloned().collect()
+pub fn closed_tunnels(owner: &Digest32) -> Vec<ClosedTunnel> {
+    lock(&CLOSED)
+        .iter()
+        .filter(|t| t.owner == *owner)
+        .cloned()
+        .collect()
 }
 
 /// Which live tunnels to close (V030-11): one by its number, or a member's — all of them, or
@@ -1312,14 +1705,19 @@ impl TunnelSelector {
 /// than one member's tunnels match: "a person closes one member's tunnels" (V030-11), and a
 /// short or mistyped prefix must not close several members' at once.
 pub fn close_tunnels(
+    owner: &Digest32,
     which: &TunnelSelector,
     why: &str,
 ) -> std::result::Result<Vec<LiveTunnel>, String> {
     let live = lock(&LIVE);
+    // Only the node's own: a process may host several (ADR-026 P-1), and one node closing
+    // another's tunnel by its number or its member is the leak this filter exists to stop.
+    let live: std::collections::BTreeMap<&u64, &Live> =
+        live.iter().filter(|(_, t)| t.owner == *owner).collect();
     if let Some(prefix) = &which.member {
         let members: std::collections::BTreeSet<String> = live
             .iter()
-            .filter(|(id, t)| which.matches(**id, t))
+            .filter(|(id, t)| which.matches(***id, t))
             .map(|(_, t)| crate::node::link::b32_encode(&t.peer))
             .collect();
         if members.len() > 1 {
@@ -1332,10 +1730,10 @@ pub fn close_tunnels(
     }
     Ok(live
         .iter()
-        .filter(|(id, t)| which.matches(**id, t))
+        .filter(|(id, t)| which.matches(***id, t))
         .map(|(id, t)| {
             t.watch.ask_to_close(why);
-            t.listed(*id)
+            t.listed(**id)
         })
         .collect())
 }
@@ -1360,6 +1758,8 @@ pub struct LiveTunnel {
 
 /// A live tunnel's entry in [`LIVE`].
 struct Live {
+    /// The node this end of the tunnel is (ADR-026 P-1).
+    owner: Digest32,
     peer: Digest32,
     service: String,
     outbound: bool,
@@ -1380,8 +1780,8 @@ impl Live {
     }
 }
 
-/// Every tunnel this process carries now, by a number of its own. A process runs one node, so
-/// this is the node's list.
+/// Every tunnel this process carries now, by a number of its own. A process may host several
+/// nodes (ADR-026 P-1), so each entry names its node, and every reader filters by it.
 static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
     Mutex::new(std::collections::BTreeMap::new());
 
@@ -1396,17 +1796,28 @@ pub fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Every tunnel this node carries now, oldest first.
+/// Every tunnel the node `owner` carries now, oldest first.
 #[must_use]
-pub fn live_tunnels() -> Vec<LiveTunnel> {
-    lock(&LIVE).iter().map(|(id, t)| t.listed(*id)).collect()
+pub fn live_tunnels(owner: &Digest32) -> Vec<LiveTunnel> {
+    lock(&LIVE)
+        .iter()
+        .filter(|(_, t)| t.owner == *owner)
+        .map(|(id, t)| t.listed(*id))
+        .collect()
 }
 
 /// What a person is told when a tunnel is refused at the cap: how many are open to this member,
 /// to which services, and how to free one (decider, 2026-10-01).
-fn limit_said(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> String {
+fn limit_said(
+    live: &std::collections::BTreeMap<u64, Live>,
+    owner: &Digest32,
+    peer: &Digest32,
+) -> String {
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for t in live.values().filter(|t| t.peer == *peer) {
+    for t in live
+        .values()
+        .filter(|t| t.owner == *owner && t.peer == *peer)
+    {
         *counts.entry(t.service.clone()).or_default() += 1;
     }
     let services: Vec<String> = counts
@@ -1437,8 +1848,15 @@ fn set_tunnel_window(connection: &Connection, tunnels: u32) {
 
 /// Whether `peer` already has as many live tunnels with this node as it may, on whatever
 /// connections they run.
-fn at_tunnel_cap(live: &std::collections::BTreeMap<u64, Live>, peer: &Digest32) -> bool {
-    live.values().filter(|t| t.peer == *peer).count() >= TUNNELS_PER_PEER as usize
+fn at_tunnel_cap(
+    live: &std::collections::BTreeMap<u64, Live>,
+    owner: &Digest32,
+    peer: &Digest32,
+) -> bool {
+    live.values()
+        .filter(|t| t.owner == *owner && t.peer == *peer)
+        .count()
+        >= TUNNELS_PER_PEER as usize
 }
 
 /// The next [`VoxConnection::serial`].
@@ -1459,17 +1877,22 @@ impl VoxConnection {
     pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
         let opened = unix_now();
-        let watch = TunnelWatch::new(opened);
+        let watch = TunnelWatch::new(opened, self.local.id, self.local.stuck_after());
         {
             // Counted and taken under one lock, so two tunnels asked for at once cannot both
             // take the last place.
             let mut live = lock(&LIVE);
-            if at_tunnel_cap(&live, &self.peer_id) {
-                return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
+            if at_tunnel_cap(&live, &self.local.id, &self.peer_id) {
+                return Err(Error::TunnelLimit(limit_said(
+                    &live,
+                    &self.local.id,
+                    &self.peer_id,
+                )));
             }
             live.insert(
                 id,
                 Live {
+                    owner: self.local.id,
                     peer: self.peer_id,
                     service: service.to_owned(),
                     outbound,
@@ -1499,8 +1922,12 @@ impl VoxConnection {
     /// [`Error::TunnelLimit`], saying what it holds and how to free one.
     pub fn room_for_a_tunnel(&self) -> Result<()> {
         let live = lock(&LIVE);
-        if at_tunnel_cap(&live, &self.peer_id) {
-            return Err(Error::TunnelLimit(limit_said(&live, &self.peer_id)));
+        if at_tunnel_cap(&live, &self.local.id, &self.peer_id) {
+            return Err(Error::TunnelLimit(limit_said(
+                &live,
+                &self.local.id,
+                &self.peer_id,
+            )));
         }
         Ok(())
     }
@@ -1509,7 +1936,7 @@ impl VoxConnection {
     /// (`TunnelStatus::Full`): the member's live tunnels here are the same ones it counted.
     #[must_use]
     pub fn tunnel_limit(&self) -> Error {
-        Error::TunnelLimit(limit_said(&lock(&LIVE), &self.peer_id))
+        Error::TunnelLimit(limit_said(&lock(&LIVE), &self.local.id, &self.peer_id))
     }
 
     /// **A name for this connection that no other connection in this process is ever given.**
@@ -1521,6 +1948,18 @@ impl VoxConnection {
     #[must_use]
     pub fn serial(&self) -> u64 {
         self.serial
+    }
+
+    /// The node this end of the connection is: whose tunnels and counts its are (ADR-026 P-1).
+    #[must_use]
+    pub fn local_id(&self) -> Digest32 {
+        self.local.id
+    }
+
+    /// The node this end is ([`LocalNode`]).
+    #[must_use]
+    pub fn local(&self) -> &Arc<LocalNode> {
+        &self.local
     }
 
     /// The authenticated peer identity fingerprint.

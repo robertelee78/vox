@@ -2,8 +2,9 @@
 //! four members of one room, each a real `vox lan up` — the shipped binary, driven as a person
 //! would (ADR-018, "Only real use of the product is a test"). The room is made the way a
 //! person makes it: an anchor (`vox node`), `vox id`, `vox trust add`, `vox daemon`,
-//! `vox room create`, `vox room invite`, `vox room join`; then the daemons stop and each
-//! member runs `vox lan up <room> --allow 5000 --stats-file … --metrics 127.0.0.1:0`.
+//! `vox room create`, `vox room invite`, `vox room join`; then each member runs
+//! `vox lan up <room> --allow 5000 --stats-file …`, a client of its own `vox daemon`, which runs
+//! the LAN (ADR-026 S-5). alice's daemon serves `--metrics 127.0.0.1:0`.
 //!
 //! **The one piece that is not the shipped binary is root's.** `vox lan up` asks a helper,
 //! over a Unix socket, for an interface, and the real helper (`sudo vox lan helper`) creates a
@@ -30,7 +31,8 @@
 //!    links to nobody, though she dials all three, watched for longer than her longest
 //!    redial interval; and alice's running `vox lan up` answers `vox status --json` on its
 //!    control socket (V030-04, #236) with carol's dials counted as refused as untrusted,
-//!    and its `--metrics` endpoint answers with them counted among the refused app streams.
+//!    and her daemon's `--metrics` endpoint answers with them counted among the refused app
+//!    streams.
 //! 3. **Unicast reaches the member holding the address, unchanged** — UDP over IPv4 and
 //!    IPv6, a TCP segment, an ICMP echo, 1280-byte packets — and no member receives a
 //!    packet addressed to another.
@@ -246,21 +248,28 @@ fn member_dir(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
 }
 
 /// A `vox daemon`, answering `vox room list` before this returns.
-fn daemon(name: &str, data: &Path, port: u16, anchor: &str, pass_file: &Path) -> VoxProc {
+fn daemon(
+    name: &str,
+    data: &Path,
+    port: u16,
+    anchor: &str,
+    pass_file: &Path,
+    metrics: bool,
+) -> VoxProc {
     let listen = format!("127.0.0.1:{port}");
-    let p = VoxProc::spawn(
-        name,
-        data,
-        &args(&[
-            "daemon",
-            "--listen",
-            &listen,
-            "--anchor",
-            anchor,
-            "--passphrase-file",
-            pass_file.to_str().unwrap(),
-        ]),
-    );
+    let mut argv = vec![
+        "daemon",
+        "--listen",
+        &listen,
+        "--anchor",
+        anchor,
+        "--passphrase-file",
+        pass_file.to_str().unwrap(),
+    ];
+    if metrics {
+        argv.extend(["--metrics", "127.0.0.1:0"]);
+    }
+    let p = VoxProc::spawn(name, data, &args(&argv));
     let deadline = Instant::now() + SETUP;
     while Instant::now() < deadline {
         if vox_once(data, &args(&["room", "list"])).0 {
@@ -297,43 +306,12 @@ fn scrape(addr: &str) -> String {
         .map_or(got.clone(), |(_, body)| body.to_owned())
 }
 
-/// Send `sig` to `p` by its PID and wait for it to exit, as a person's Ctrl-C or a service
-/// manager's stop would; `Drop` kills it by PID if it has not.
-fn stop(p: &mut VoxProc, sig: &str) {
-    let ok = Command::new("kill")
-        .args([sig, &p.child.id().to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(ok, "kill {sig} {}", p.name);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
-        if matches!(p.child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("{} did not stop within 20 s of {sig}", p.name);
-}
-
 fn free_udp_port() -> u16 {
     std::net::UdpSocket::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port()
-}
-
-/// Wait until nothing holds UDP `port`, so the next `vox` of that member can bind it.
-fn port_free(port: u16) {
-    let deadline = Instant::now() + TIMEOUT;
-    while std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
-        assert!(
-            Instant::now() < deadline,
-            "127.0.0.1:{port} was never released"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Poll `f` until it is true, up to [`TIMEOUT`]; panic with `side` (`PRODUCT`,
@@ -358,7 +336,7 @@ fn settle() {
 // ---- root's piece, answered by the test: the helper's protocol, a socket pair for a utun ----
 
 mod standin {
-    use std::io::{BufRead as _, BufReader, IoSlice};
+    use std::io::{BufRead as _, BufReader, IoSlice, Write as _};
     use std::mem::MaybeUninit;
     use std::os::fd::AsFd as _;
     use std::os::unix::net::{UnixDatagram, UnixListener};
@@ -393,8 +371,13 @@ mod standin {
                     let Ok(stream) = stream else { return };
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let mut line = String::new();
-                    // `vox lan up` first connects only to see that a helper answers.
                     if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    // `vox lan up` first asks whether a helper is there, and the helper
+                    // answers with its name and protocol (`lan_cli::helper_answers`).
+                    if line.trim() == "hello" {
+                        let _ = (&stream).write_all(b"vox lan helper 1\n");
                         continue;
                     }
                     me.asked.lock().unwrap().push(line.trim().to_owned());
@@ -469,26 +452,18 @@ struct Host {
     name: &'static str,
     dir: PathBuf,
     id: String,
-    /// The UDP port this member's machine listens on, as a machine keeps its own.
-    port: u16,
     socket: PathBuf,
     stats_file: PathBuf,
     os: Os,
     lan: Option<VoxProc>,
-    /// Where its running `vox lan up --metrics` serves its counters, as it printed it.
+    /// Where its daemon's `--metrics` serves its counters, as the daemon printed it (alice's).
     metrics: Option<String>,
     v4: Ipv4Addr,
     v6: Ipv6Addr,
 }
 
 impl Host {
-    fn new(
-        tmp: &tempfile::TempDir,
-        name: &'static str,
-        dir: PathBuf,
-        id: String,
-        port: u16,
-    ) -> Self {
+    fn new(tmp: &tempfile::TempDir, name: &'static str, dir: PathBuf, id: String) -> Self {
         let os = Os::default();
         let socket = tmp.path().join(format!("{name}.sock"));
         os.serve(&socket);
@@ -496,7 +471,6 @@ impl Host {
             name,
             dir,
             id,
-            port,
             socket,
             stats_file: tmp.path().join(format!("{name}.json")),
             os,
@@ -507,13 +481,10 @@ impl Host {
         }
     }
 
-    /// `vox lan up <room> --allow 5000 --metrics 127.0.0.1:0`, until it says it is up and has
-    /// written its stats.
+    /// `vox lan up <room> --allow 5000`, until it says it is up and has written its stats.
     fn up(&mut self, anchor: &str, room: &str) {
         let _ = std::fs::remove_file(&self.stats_file);
-        port_free(self.port);
         let allow = LISTED.to_string();
-        let listen = format!("127.0.0.1:{}", self.port);
         // While the interface is handed over, free local sockets as fast as possible, as a
         // busy machine does: each free runs macOS's collector for descriptors in flight,
         // so a descriptor left with no reference but the message is flushed every time
@@ -541,26 +512,16 @@ impl Host {
                 pass_file.to_str().unwrap(),
                 "--anchor",
                 anchor,
-                "--listen",
-                &listen,
                 "--helper-socket",
                 self.socket.to_str().unwrap(),
                 "--stats-file",
                 self.stats_file.to_str().unwrap(),
                 "--allow",
                 &allow,
-                "--metrics",
-                "127.0.0.1:0",
             ]),
         );
         p.expect_within(SETUP, "vox lan up to come up", |l| {
             l.starts_with("vox lan up on ")
-        });
-        // Printed before the LAN comes up, so it is among the lines already read.
-        self.metrics = p.seen.iter().find_map(|l| {
-            l.strip_prefix("vox lan: metrics http://")
-                .and_then(|r| r.strip_suffix("/metrics"))
-                .map(str::to_owned)
         });
         handing_over.store(false, Ordering::Relaxed);
         churn.join().expect("the socket churn");
@@ -693,11 +654,11 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
     // Each member's machine keeps one UDP port, for its daemon and later its LAN, as a
     // person's does with the default `--listen`.
     let ports: Vec<u16> = names.iter().map(|_| free_udp_port()).collect();
-    let mut daemons: Vec<VoxProc> = names
+    let daemons: Vec<VoxProc> = names
         .iter()
         .zip(&dirs)
         .zip(&ports)
-        .map(|((n, d), port)| daemon(n, d, *port, &spec, &pass_file))
+        .map(|((n, d), port)| daemon(n, d, *port, &spec, &pass_file, *n == "alice"))
         .collect();
     let (ok, out, err) = vox_in(
         &dirs[0],
@@ -777,22 +738,28 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    for d in &mut daemons {
-        stop(d, "-TERM");
-    }
-    drop(daemons);
+    // The daemons keep running: each `vox lan up` is a client of its member's daemon, which runs
+    // the LAN as that member's node (ADR-026 S-5). alice's serves the metrics checked in (2).
+    let mut daemons = daemons;
+    let metrics = daemons[0]
+        .line_within(TIMEOUT, |l| l.starts_with("vox daemon: metrics http://"))
+        .and_then(|l| {
+            l.strip_prefix("vox daemon: metrics http://")
+                .and_then(|r| r.strip_suffix("/metrics"))
+                .map(str::to_owned)
+        });
 
     // ---- four LANs ----
     let mut hosts: Vec<Host> = names
         .iter()
         .zip(dirs)
         .zip(&ids)
-        .zip(ports)
-        .map(|(((n, d), id), port)| Host::new(&tmp, n, d, id.clone(), port))
+        .map(|((n, d), id)| Host::new(&tmp, n, d, id.clone()))
         .collect();
     for h in &mut hosts {
         h.up(&spec, &room);
     }
+    hosts[0].metrics = metrics;
     let [a, b, d, c] = &mut hosts[..] else {
         unreachable!()
     };
@@ -917,12 +884,13 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
     );
     // And its metrics endpoint answers, with the same refusals counted.
     let at = a.metrics.clone().unwrap_or_else(|| {
-        panic!("PRODUCT: alice's `vox lan up --metrics 127.0.0.1:0` never said where it serves metrics")
+        panic!("PRODUCT: alice's `vox daemon --metrics 127.0.0.1:0` never said where it serves metrics")
     });
     let scraped = scrape(&at);
     let refused = scraped
         .lines()
-        .find_map(|l| l.strip_prefix("vox_app_streams_refused_total "))
+        // Labelled with the node it counts for (ADR-026 P-1): alice's profile, `default`.
+        .find_map(|l| l.strip_prefix("vox_app_streams_refused_total{node=\"default\"} "))
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or_else(|| {
             panic!("PRODUCT: alice's metrics at {at} have no vox_app_streams_refused_total:\n{scraped}")
@@ -1306,6 +1274,70 @@ fn lan_up_without_a_helper_refuses_and_creates_nothing() {
         !tmp.path().join("data").exists() && !tmp.path().join("cfg").exists(),
         "it touched the profile before refusing"
     );
+}
+
+/// Something listening on the helper's path that is not a helper is refused **at once**, named,
+/// before the profile is touched (#75's review). A connection alone was the check, so a socket
+/// that took the connection and said nothing passed it, and `vox lan up` waited 30 s for a device
+/// that never came. Two such sockets: one that never says a word, one that answers in another
+/// protocol. Mutant: `lan_cli::helper_answers` back to a bare connect, red as
+/// `PRODUCT: vox lan up did not refuse …`.
+#[test]
+fn lan_up_refuses_a_socket_that_is_not_a_helper_at_once() {
+    use std::io::{BufRead as _, BufReader};
+    use std::os::unix::net::UnixListener;
+    watchdog::arm();
+    for (kind, answer) in [
+        ("silent", None),
+        ("another protocol", Some("HTTP/1.1 400 Bad Request\n")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("not-a-helper.sock");
+        let listener = UnixListener::bind(&socket).expect("APPARATUS: bind the stand-in socket");
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                if let Some(a) = answer {
+                    let mut line = String::new();
+                    let _ = BufReader::new(&stream).read_line(&mut line);
+                    let _ = (&stream).write_all(a.as_bytes());
+                }
+                // Held open, as a live server holds a connection it has no answer for.
+                held.push(stream);
+            }
+        });
+        let t0 = Instant::now();
+        let out = Command::new(VOX)
+            .args(["lan", "up", "family", "--helper-socket"])
+            .arg(&socket)
+            .env("VOX_DATA_DIR", tmp.path().join("data"))
+            .env("VOX_CONFIG_DIR", tmp.path().join("cfg"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let took = t0.elapsed();
+        let err = String::from_utf8_lossy(&out.stderr);
+        eprintln!(
+            "[vox lan up, {kind} socket] exit {:?} after {:.2} s: {err}",
+            out.status.code(),
+            took.as_secs_f64()
+        );
+        assert!(
+            !out.status.success()
+                && took < Duration::from_secs(5)
+                && err.contains(&socket.display().to_string())
+                && err.contains("not as a vox LAN helper"),
+            "PRODUCT: vox lan up did not refuse a {kind} socket that is not a helper at once, \
+             naming it: exit {:?} after {:.2} s, said: {err}",
+            out.status.code(),
+            took.as_secs_f64()
+        );
+        assert!(
+            !tmp.path().join("data").exists() && !tmp.path().join("cfg").exists(),
+            "PRODUCT: vox lan up touched the profile before refusing a {kind} socket"
+        );
+    }
 }
 
 /// The helper, run without root, refuses and leaves no socket behind — it is the one

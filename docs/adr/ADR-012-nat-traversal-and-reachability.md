@@ -2,13 +2,11 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted. Built on integrate/v0.3.0, except where a requirement says otherwise. All
-four rungs of the reachability ladder run in the node (`crates/vox-core/src/nat/`,
-`crates/vox-core/src/node/{network,net,coordstream,circuitstream}.rs`,
-`crates/vox-core/src/transport/mux.rs`). Not built: a DHT (N-31). UPnP-IGD has not yet been checked
-against a real router (N-14). **Decided 2026-10-03, not built (#397, ADR-026):** the daemon owns
-the machine's one presence (N-41–N-48); until it is built, each profile's daemon binds, maps and
-self-tests on its own.
+**Status**: Accepted. Built in v0.3.0, except where a requirement says otherwise. All four rungs of
+the reachability ladder run in the node (`crates/vox-core/src/nat/`,
+`crates/vox-core/src/node/{network,net,coordstream,circuitstream,presence}.rs`,
+`crates/vox-core/src/transport/mux.rs`), and the daemon owns the machine's one presence (N-41–N-48).
+Not built: a DHT (N-31). UPnP-IGD has not yet been checked against a real router (N-14).
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, ipv6, port-mapping, relay, anchor
@@ -83,9 +81,8 @@ relay circuit.
   - It MUST scan the XML for the elements it needs, with no XML parser.
   - The client MUST NOT trust anything a router says beyond the mapping it grants.
   - A router that grants only permanent leases (725) MUST be asked again with lease 0, and that
-    mapping MUST be deleted when the node locks or shuts down. *Decided, not built:* the mapping
-    belongs to the daemon and is deleted when the daemon stops, never when a node detaches (N-43).
-    There is no node lock under ADR-026 (N-2).
+    mapping belongs to the daemon and MUST be deleted when the daemon stops, never when a node
+    detaches (N-43).
 
   Status: built and proved against a specification-faithful in-process gateway; not yet validated on
   a real router.
@@ -168,9 +165,9 @@ relay circuit.
     MUST be promoted in its place (`promote_heard`), or, with none, the silent one MUST be closed. This
     runs on a once-a-second task (`tend_liveness`) and on the next lookup.
   - A newcomer from another process of the same identity MUST supersede every connection to the
-    process before it (V210-57). *Decided, not built:* with one daemon per machine, "process" is the
-    remote daemon's leaf together with the remote node (ADR-011 requirement 35), and "one connection
-    per peer" is per (local node, remote node) (ADR-026 I-3).
+    process before it (V210-57). A process is the remote daemon's leaf together with the remote
+    node's per-attach instance (ADR-011 requirement 35), and "one connection per peer" is per (local
+    node, remote node) (ADR-026 I-3).
   - **Known limit:** liveness is the count of datagrams routed to a connection, taken before
     authentication, so an on-path attacker who knows a connection ID can keep a dead connection
     looking alive. That returns the node to QUIC's 60 s idle timeout, no worse than without the rule.
@@ -290,7 +287,12 @@ relay circuit.
 
 ### The daemon's one presence (ADR-026)
 
-*Decided 2026-10-03, not built (#397).*
+Built. Proofs: `two_nodes_answer_at_one_address_proof` and `two_nodes_are_clients_of_one_daemon_proof`
+(N-41, N-42, N-46), `node::presence` tests (N-43, N-44, N-45, in process),
+`the_daemon_reads_its_relay_limits_from_its_config` (N-45),
+`a_dial_that_reaches_another_node_names_no_one_proof` (N-47),
+`a_first_punched_connection_is_prompt_proof` (N-48). N-43's unmapping at the daemon's stop is not
+proved: it needs a gateway.
 
 - **N-41.** The daemon, not a node, MUST bind the one UDP socket and QUIC endpoint of the machine's
   account, and run the dual-stack self-test once per bind.
@@ -304,6 +306,9 @@ relay circuit.
   R33).
   - The daemon MUST keep one relay circuit ledger, and the relay limits (`MAX_RELAYED_CIRCUITS`,
     `MAX_CIRCUITS_PER_ASKER`) MUST apply per daemon, configured in `.daemon/config`.
+  - `.daemon/config` MUST name them `relay-circuits = N` and `relay-circuits-per-asker = N`
+    (defaults 64 and 4 when absent); a value that is not a whole number MUST stop the daemon with
+    an error naming the key.
   - Boards MUST be per node: each node keeps its own board store, with its own capacities.
 - **N-46.** Each attached node MUST publish its own address record, naming the daemon's shared
   ip:port. Nodes on one machine are therefore visibly co-hosted (an accepted cost, ADR-026).

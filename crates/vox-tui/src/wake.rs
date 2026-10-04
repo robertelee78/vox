@@ -214,57 +214,16 @@ pub fn reachability(paths: &Paths, session: &str) -> &'static str {
 /// session registered by it would have its wakes sent to the Claude session. Vox never wakes a
 /// Codex session (V210-169); it is registered with no endpoint, so the poster is told so.
 pub fn register(paths: &Paths, session: &str, codex: bool) {
-    let mut reg = if codex {
-        Session {
-            session: session.to_owned(),
-            harness: "codex".into(),
-            endpoint: String::new(),
-            token: String::new(),
-            state: BUSY.into(),
-            state_ms: now_millis(),
-            first_seen_ms: 0,
-            last_drained_ms: 0,
-        }
-    } else if let (Ok(endpoint), Ok(token)) = (
-        std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
-        std::env::var("CLAUDE_CODE_MESSAGING_TOKEN"),
-    ) {
-        Session {
-            session: session.to_owned(),
-            harness: "claude".into(),
-            endpoint,
-            token,
-            state: BUSY.into(),
-            state_ms: now_millis(),
-            first_seen_ms: 0,
-            last_drained_ms: 0,
-        }
-    } else if let (Ok(endpoint), Ok(token)) = (
-        std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
-        std::env::var("VOX_OPENCODE_WAKE_TOKEN"),
-    ) {
-        Session {
-            session: session.to_owned(),
-            harness: "opencode".into(),
-            endpoint,
-            token,
-            state: BUSY.into(),
-            state_ms: now_millis(),
-            first_seen_ms: 0,
-            last_drained_ms: 0,
-        }
-    } else {
-        Session {
-            session: session.to_owned(),
-            harness: std::env::var("VOX_HARNESS").unwrap_or_else(|_| "unknown".into()),
-            endpoint: String::new(),
-            token: String::new(),
-            state: BUSY.into(),
-            state_ms: now_millis(),
-            first_seen_ms: 0,
-            last_drained_ms: 0,
-        }
-    };
+    store(paths, &Session::from_env(session, codex));
+}
+
+/// Store `reg` as its session's registration (ADR-020 6.10): the daemon's half of
+/// [`register`], the client's half being [`Session::from_env`]. When the session was first seen
+/// is kept from its earlier record; this turn is its last drain.
+pub fn store(paths: &Paths, reg: &Session) {
+    let mut reg = reg.clone();
+    let session = reg.session.clone();
+    let session = session.as_str();
     // When the session was first seen outlives this turn's rewrite (V030-16).
     let now = now_millis();
     reg.first_seen_ms = load(paths, session)
@@ -279,6 +238,66 @@ pub fn register(paths: &Paths, session: &str, codex: bool) {
     if let Ok(body) = serde_json::to_vec(&reg) {
         let _ =
             vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
+    }
+}
+
+impl Session {
+    /// The registration a hook builds from its harness's environment (the client's half of
+    /// [`register`]; the daemon stores it with [`store`], since the daemon's environment is not
+    /// the harness's).
+    #[must_use]
+    pub fn from_env(session: &str, codex: bool) -> Self {
+        if codex {
+            Session {
+                session: session.to_owned(),
+                harness: "codex".into(),
+                endpoint: String::new(),
+                token: String::new(),
+                state: BUSY.into(),
+                state_ms: now_millis(),
+                first_seen_ms: 0,
+                last_drained_ms: 0,
+            }
+        } else if let (Ok(endpoint), Ok(token)) = (
+            std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
+            std::env::var("CLAUDE_CODE_MESSAGING_TOKEN"),
+        ) {
+            Session {
+                session: session.to_owned(),
+                harness: "claude".into(),
+                endpoint,
+                token,
+                state: BUSY.into(),
+                state_ms: now_millis(),
+                first_seen_ms: 0,
+                last_drained_ms: 0,
+            }
+        } else if let (Ok(endpoint), Ok(token)) = (
+            std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
+            std::env::var("VOX_OPENCODE_WAKE_TOKEN"),
+        ) {
+            Session {
+                session: session.to_owned(),
+                harness: "opencode".into(),
+                endpoint,
+                token,
+                state: BUSY.into(),
+                state_ms: now_millis(),
+                first_seen_ms: 0,
+                last_drained_ms: 0,
+            }
+        } else {
+            Session {
+                session: session.to_owned(),
+                harness: std::env::var("VOX_HARNESS").unwrap_or_else(|_| "unknown".into()),
+                endpoint: String::new(),
+                token: String::new(),
+                state: BUSY.into(),
+                state_ms: now_millis(),
+                first_seen_ms: 0,
+                last_drained_ms: 0,
+            }
+        }
     }
 }
 

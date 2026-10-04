@@ -21,6 +21,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -70,12 +73,23 @@ impl Member {
         }
     }
 
-    /// The port this profile keeps (`<profile>/port`).
+    /// The port this node keeps: its own `<data>/nodes/default/port`, else the data root's
+    /// `<data>/.daemon/port` (ADR-026 D-3), where a daemon of several nodes keeps its one port.
     fn kept_port(&self) -> u16 {
-        std::fs::read_to_string(self.dir.join("default").join("port"))
-            .ok()
-            .and_then(|t| t.trim().parse().ok())
-            .expect("the profile records the port it first bound")
+        let read = |p: PathBuf| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+        };
+        read(layout::node_dir(&self.dir, layout::DEFAULT_NODE).join("port"))
+            .or_else(|| read(layout::daemon_dir(&self.dir).join("port")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT (staging): {} records no port it first bound, in its node's \
+                     directory or the daemon's",
+                    self.name
+                )
+            })
     }
 
     fn daemon_said(&self, tag: &str) -> String {

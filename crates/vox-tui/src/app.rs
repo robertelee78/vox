@@ -1,15 +1,13 @@
 //! The interactive terminal event loop and runtime (ADR-015 §"Async runtime",
 //! §"At-rest … screen security"; ADR-016 M13.5).
 //!
-//! ## Runtime shape (ADR-015)
-//! [`run_live`] builds a **multi-threaded tokio runtime**, spawns the embedded
-//! `vox-core` node on it, and runs the UI loop on the calling thread as the
-//! **blocking crossterm task**: crossterm's event polling is synchronous, so the
-//! loop owns the terminal while the node's actor and the signal handler run on
-//! the runtime. A `CancellationToken` stops the auxiliary tasks and the node is
-//! shut down (locking everything) on every exit path. The loop reads the node's
-//! latest [`ViewModel`] projection each frame and hands it a [`Command`] per user
-//! action through the [`CoreHandle`] boundary.
+//! ## Runtime shape (ADR-015, ADR-026 S-4)
+//! [`run_live`] builds a **multi-threaded tokio runtime** and makes the TUI a **client of the
+//! account's daemon**: it hosts no node and holds no node lock. It runs the UI loop on the
+//! calling thread as the **blocking crossterm task**: crossterm's event polling is synchronous,
+//! so the loop owns the terminal while the daemon connections and the signal handler run on the
+//! runtime. The loop reads the latest [`ViewModel`] projection each frame and hands it a
+//! [`Command`] per user action through the [`CoreHandle`] boundary ([`DaemonCore`]).
 //!
 //! ## Screen security (ADR-015)
 //! Terminal I/O is behind [`TerminalIo`] so the sequence is **testable**: the
@@ -18,11 +16,12 @@
 //! primary buffer / scrollback; the real backend restores the terminal on every
 //! exit path (normal return, error, panic unwind) via a RAII guard.
 //!
-//! ## Locking (ADR-015)
-//! `:lock`, the idle timer ([`crate::state::IDLE_LOCK_SECS`]) and `SIGHUP` all
-//! lock the node (every SEK and the signer are wiped). When the view reports
-//! `locked`, the masked unlock prompt opens; a profile without an identity opens
-//! the create-identity prompt at startup.
+//! ## No lock (ADR-026 N-2, ADR-015 11.2–11.3)
+//! There is no lock: a node takes its passphrase once, when it attaches, and its secrets are wiped
+//! when it detaches, in the daemon. When the view reports the node not attached, the masked
+//! prompt asks for its passphrase and attaches it; a node without an identity opens the
+//! create-identity prompt. `SIGHUP`, like `SIGTERM` and `q`, stops the TUI cleanly and does
+//! nothing to its node.
 
 use std::io::{self, Stdout, Write};
 use std::time::Duration;
@@ -34,13 +33,11 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
-use tokio_util::sync::CancellationToken;
-use vox_core::node::actor::Node;
 use vox_core::node::api::{NodeCommand, Secret};
 use vox_core::node::paths::Paths;
 
-use crate::live::LiveCore;
-use crate::state::{idle_lock_due, Action, PromptKind, UiState};
+use crate::live::DaemonCore;
+use crate::state::{Action, PromptKind, UiState};
 use crate::ui::render;
 use crate::viewmodel::{Command, CommandStatus, ViewModel};
 
@@ -89,9 +86,9 @@ impl AppError {
 
 /// The contract the loop uses to talk to the running core: it provides the current
 /// [`ViewModel`] to render and consumes [`Command`]s the user issues. The live
-/// implementation is [`LiveCore`] (an embedded `vox-core` node); [`OfflineCore`]
+/// implementation is [`DaemonCore`] (a client of the account's daemon); [`OfflineCore`]
 /// is the no-node shell used by tests.
-/// What the TUI's status line says while creating or unlocking the identity waits for another
+/// What the TUI's status line says while creating the identity waits for another
 /// vox holding the profile.
 pub const WAITING_FOR_PROFILE_TUI: &str =
     "waiting: another vox holds this profile open, and only one at a time may write it — this goes on by itself";
@@ -114,11 +111,16 @@ pub trait CoreHandle {
     fn startup_notice(&self) -> Option<String> {
         None
     }
+    /// Why the TUI cannot go on, once it cannot: the daemon it is a client of stopped. The loop
+    /// then ends, and the TUI exits non-zero saying so (ADR-026 L-7).
+    fn ended(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A no-node core binding: renders an empty/seeded view and records commands as
 /// status messages without fabricating channels, messages, or trust state. Used
-/// by tests; the binary always runs [`LiveCore`].
+/// by tests; the binary always runs [`DaemonCore`].
 #[derive(Default)]
 pub struct OfflineCore {
     view: ViewModel,
@@ -142,7 +144,6 @@ impl CoreHandle for OfflineCore {
         match command {
             Command::CreateChannel { .. } | Command::Join { .. } => CommandStatus::NeedsNode,
             Command::SendText { .. } => CommandStatus::NotConnected,
-            Command::Lock => CommandStatus::Locked,
             _ => CommandStatus::Queued,
         }
     }
@@ -409,20 +410,9 @@ mod secret_input {
     }
 }
 
-/// A wall-clock source for the idle-lock timer (seconds).
-pub type Clock = Box<dyn Fn() -> u64>;
-
-fn system_clock() -> Clock {
-    Box::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    })
-}
-
 /// Run the interactive TUI against `core` on the real terminal.
 pub fn run_tui(core: impl CoreHandle) -> Result<(), AppError> {
-    run_loop(CrosstermIo::new(), core, system_clock())
+    run_loop(CrosstermIo::new(), core)
 }
 
 /// Run the full client: runtime + embedded node + terminal loop, for `paths`.
@@ -546,7 +536,7 @@ pub(crate) fn stop_requested(verb: &'static str) -> impl std::future::Future<Out
 pub fn run_node(
     paths: Paths,
     listen: std::net::SocketAddr,
-    anchors: vox_core::nat::bootstrap::BootstrapSet,
+    anchor_specs: Vec<String>,
     serve_only: Option<std::collections::BTreeSet<vox_core::hash::Digest32>>,
 ) -> Result<(), AppError> {
     use vox_core::identity::composite::RootSigner;
@@ -554,37 +544,53 @@ pub fn run_node(
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let signer = vox_core::node::headless::load_or_create_identity(&paths)?;
-    let fingerprint = signer.fingerprint();
-    let cfg = vox_core::node::actor::NodeConfig::new()
-        .bind(vox_core::node::actor::Bind::Addr(listen))
-        .anchors(anchors)
-        .headless(signer)
-        .anchor_boards(true)
-        .on_profile_wait(crate::tunnel_cli::say_waiting);
-    let cfg = match serve_only {
-        Some(creators) => {
-            println!(
-                "vox node: serving only rooms made by the {} identit{} this profile trusts",
-                creators.len(),
-                if creators.len() == 1 { "y" } else { "ies" }
-            );
-            cfg.serve_only(creators)
-        }
-        None => cfg,
-    };
-    // Kept for the anchors file the loop below writes (M17.4); the node takes its own clone.
-    let anchors_paths = paths.clone();
-    let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
+    // **Every stop signal is a clean stop, taken first** (V210-93, V210-85): SIGINT, SIGTERM, SIGHUP
+    // and SIGQUIT, before the lock is waited for.
+    let mut interrupted = Box::pin({
+        let _in_runtime = rt.enter();
+        stop_requested("vox node")
+    });
+    // Its key, made here when there is none (ADR-026 C-5): what the daemon then attaches.
+    let fingerprint = vox_core::node::headless::load_or_create_identity(&paths)?.fingerprint();
     let fp = vox_core::node::link::b32_encode(&fingerprint);
-    println!("vox node: identity {fp}");
-    // An anchor binds as it spawns, before the loop below listens, so a moved port is said here.
-    while let Some(ev) = node.try_next_event() {
-        if let vox_core::node::api::NodeEvent::NodeNote { note } = ev {
-            eprintln!("vox node: {note}");
-        }
+    let account = paths.account();
+    let node = crate::client::name_of(&paths)?;
+    // **`vox node` is a daemon with one headless node in the anchor role** (ADR-026 N-5), not a
+    // process of another kind: it holds the account, serves its socket, and attaches the node.
+    let Some(serving) =
+        crate::daemon::take_account(&account, &rt, listen, &anchor_specs, Some(&node))?
+    else {
+        return Err(AppError::Refused {
+            code: 1,
+            message: format!(
+                "a vox daemon is already running for {}; attach the anchor to it: vox node \
+                 attach {node}",
+                account.data_root.display()
+            ),
+        });
+    };
+    let router = serving.router.clone();
+    router.attach_kept();
+    if let Some(creators) = serve_only {
+        println!(
+            "vox node: serving only rooms made by the {} identit{} this profile trusts",
+            creators.len(),
+            if creators.len() == 1 { "y" } else { "ies" }
+        );
+        router.serve_only(&node, creators);
     }
-    rt.block_on(async {
+    rt.block_on(router.attach(&node, None, None, Vec::new(), Vec::new()))
+        .map_err(|r| AppError::Usage(r.to_string()))?;
+    let Some(node) = router.handle_of(&node) else {
+        return Err(AppError::Usage(format!(
+            "node {node} detached as it attached"
+        )));
+    };
+    // Kept for the anchors file the loop below writes (M17.4).
+    let anchors_paths = paths.clone();
+    println!("vox node: identity {fp}");
+    println!("vox node: control socket {}", account.socket().display());
+    let signal = rt.block_on(async {
         // Addresses are discovered on a task after start-up (a route probe and a
         // gateway request); print the anchor specs once they are known, then serve.
         let mut printed: Vec<String> = Vec::new();
@@ -605,8 +611,6 @@ pub fn run_node(
         // `kill` send, SIGHUP and SIGQUIT stop it the same way. Left to their defaults they killed
         // it on the spot, closes unsent — SIGQUIT with a core dump — and every peer counted the
         // anchor as connected until it stopped answering.
-        let interrupted = stop_requested("vox node");
-        tokio::pin!(interrupted);
         loop {
             tokio::select! {
                 _ = ticks.tick() => {
@@ -800,31 +804,23 @@ pub fn run_node(
                         }
                     }
                 }
-                signal = &mut interrupted => {
-                    println!("vox node: stopped by {}", signal.name());
-                    println!("vox node: shutting down");
-                    let _ = node.apply(NodeCommand::Shutdown).await;
-                    break;
-                }
+                signal = &mut interrupted => break signal,
             }
         }
     });
-    Ok(())
+    println!("vox node: stopped by {}", signal.name());
+    println!("vox node: shutting down");
+    let stopped = crate::daemon::stop_daemon(rt, &router, &serving.presence, Some(signal));
+    drop(serving);
+    stopped
 }
-
-/// How often a daemon re-reads its anchor configuration and re-resolves it.
-///
-/// Short enough that a moved anchor is followed within a minute, long enough that it is
-/// not a resolver load: the node only acts when something actually changed, because
-/// merging an address it already holds is a no-op.
-const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.
 /// A clean stop takes milliseconds; this is for a node stuck waiting on a peer that vanished.
 /// It must stay longer than the node's own worst-case stop
 /// ([`vox_core::node::actor::STOP_WORST_CASE`], 4.45 s, the sum of the stop's budget), so a stop
 /// that waits every one of them out still closes its connections before the daemon leaves.
-const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const SHUTDOWN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
 const _: () = assert!(
     vox_core::node::actor::STOP_WORST_CASE.as_millis() + 500 <= SHUTDOWN_PATIENCE.as_millis(),
     "the daemon gives a stop that waits out every bound at least 0.5 s more"
@@ -840,7 +836,7 @@ const TEST_SHUTDOWN_PATIENCE_ENV: &str = "VOX_TEST_SHUTDOWN_PATIENCE_MS";
 /// node's stop is budgeted to fit the real patience, so no real scene runs past it; a proof stages
 /// a stop that gives up, and what the daemon then says and how it exits, with a shorter one. It
 /// only ever shortens it; unset, empty or unparsable is the real patience.
-fn shutdown_patience() -> std::time::Duration {
+pub(crate) fn shutdown_patience() -> std::time::Duration {
     #[cfg(feature = "test-knobs")]
     if let Some(ms) = std::env::var(TEST_SHUTDOWN_PATIENCE_ENV)
         .ok()
@@ -849,318 +845,6 @@ fn shutdown_patience() -> std::time::Duration {
         return std::time::Duration::from_millis(ms).min(SHUTDOWN_PATIENCE);
     }
     SHUTDOWN_PATIENCE
-}
-
-/// How long one wake may take before it is abandoned.
-const WAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Whether `text` is an envelope that could interrupt anyone at all: urgent and addressed.
-/// Checked before the node's view is copied, so the common message costs no copy.
-fn may_wake(text: &str) -> bool {
-    vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.urgent && !e.to.is_empty())
-}
-
-/// Whether `text` is an envelope that answers an earlier one: it may be a reply some session is
-/// owed a notice for (V030-20).
-fn may_answer(text: &str) -> bool {
-    vox_agentcomms::envelope::Envelope::parse(text).is_ok_and(|e| e.re.is_some())
-}
-
-/// The interrupt decision for one entry that just landed in `channel_id`: when it addresses
-/// this node and is marked urgent (ADR-020 §6), and has hops left (§9), every session registered
-/// on this node but the one that posted it, and but one already in its reply chain (V210-121), is
-/// owed a notice. [`tend`] sends it. Everything else waits for the session's next turn.
-///
-/// `view` is the node's view as the entry is judged: the room's log, for the hop budget and the
-/// reply chain.
-fn judge(
-    paths: &vox_core::node::paths::Paths,
-    view: &vox_core::node::api::NodeView,
-    channel_id: &vox_core::hash::Digest32,
-    row: &vox_core::node::api::MessageRow,
-) {
-    let Ok(envelope) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
-        return;
-    };
-    if !envelope.urgent || envelope.to.is_empty() {
-        return;
-    }
-    let room = vox_core::node::link::b32_encode(channel_id);
-    // **A message with no hops left interrupts nobody** (ADR-020 §9, V210-79): the budget
-    // is the only loop guard that provably ends an urgent reply chain. It still queues.
-    let empty = vox_core::node::api::Timeline::default();
-    let timeline = view
-        .open_channels
-        .iter()
-        .find(|d| d.channel_id == *channel_id)
-        .map_or(&empty, |d| &d.timeline);
-    if crate::wake::hops_left(&envelope, timeline) == 0 {
-        eprintln!(
-            "vox daemon: not interrupting anyone for {}: its hop budget is spent; it waits for \
-             the next turn",
-            &vox_core::node::link::b32_encode(&row.entry_hash)[..12]
-        );
-        return;
-    }
-    // **A message wakes the agents of the nodes it addresses** (V210-161): `to` names nodes by
-    // fingerprint, and every session of this node hears every room it holds.
-    let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
-        return;
-    };
-    if !envelope.may_interrupt(&vox_core::node::link::b32_encode(&me)) {
-        return;
-    }
-    for session in crate::wake::registered(paths) {
-        if row.author == me && envelope.from == session.session {
-            continue;
-        }
-        // **Not a session already in this conversation** (V210-121): a reply chain that comes
-        // back to a session that spoke in it is two agents keeping each other awake. The hop
-        // budget ends such a chain eventually; this ends it at the first turn back. It queues.
-        if crate::wake::in_chain(&envelope, timeline, &me, &session.session) {
-            eprintln!(
-                "vox daemon: not interrupting session {} for {}: it already spoke in the reply \
-                 chain this answers; it reads it on its next turn",
-                session.session,
-                &vox_core::node::link::b32_encode(&row.entry_hash)[..12]
-            );
-            continue;
-        }
-        // Recorded **before** the notice is sent, so the session's answer with no `--re` replies
-        // to this (V210-121) however soon it comes: recorded after, an answer could beat the
-        // record. A notice that then fails still put the message before the session's next turn.
-        crate::wake::note_woke(paths, &session.session, &room, &row.entry_hash);
-        // **Codex is never woken** (V210-169): nothing is owed it in notices; it reads at its next
-        // turn, and a poster on this node is told so ([`crate::wake::uninterruptible`]).
-        if !crate::wake::wakeable(&session.harness) {
-            continue;
-        }
-        let mut n = crate::wake::notices(paths, &session.session);
-        if !n.urgent_due {
-            n.urgent_due = true;
-            if let Err(e) = crate::wake::save_notices(paths, &session.session, &n) {
-                eprintln!(
-                    "vox daemon: could not record that session {} is owed a notice: {e}",
-                    session.session
-                );
-            }
-        }
-    }
-}
-
-/// Send each session the notice it is owed now, if any (ADR-020 §6; V030-15, V030-20).
-///
-/// A session hears every room its node holds (V210-163), so it is owed one notice across all of
-/// them. It is looked at when it is owed an urgent notice, while a reply to it is unread, and
-/// when an answer to anything landed in one of its rooms (`answered`). What it is owed is
-/// **counted here, just before sending**, from each room and the session's cursor there, so a
-/// message its drain already read is never announced. [`crate::wake::tend`] has the rules; the
-/// notice carries counts and senders, never a message.
-fn tend(
-    paths: &vox_core::node::paths::Paths,
-    view: &vox_core::node::api::NodeView,
-    answered: &std::collections::HashSet<vox_core::hash::Digest32>,
-    t: &mut Tending,
-) {
-    let (settings, problems) = crate::wake::Settings::load(paths);
-    let now = crate::wake::now_millis();
-    // **A setting that cannot be read is said, not silently replaced**: when it changes, and
-    // again every ten minutes while it stands.
-    if problems != t.problems || now.saturating_sub(t.problems_said) >= 600_000 {
-        for problem in &problems {
-            eprintln!("vox daemon: {problem}; its default is used until it is fixed");
-        }
-        t.problems_said = if problems.is_empty() { 0 } else { now };
-        t.problems = problems;
-    }
-    let said_held = &mut t.said_held;
-    let me = view.identity.as_ref().map(|i| i.fingerprint);
-    let starting = std::mem::take(&mut t.starting);
-    let any_answered = view
-        .open_channels
-        .iter()
-        .any(|d| answered.contains(&d.channel_id));
-    for session in crate::wake::registered(paths) {
-        if !crate::wake::wakeable(&session.harness) {
-            continue;
-        }
-        let mut n = crate::wake::notices(paths, &session.session);
-        // Looked at only when something may be owed: every room is read to count it.
-        if !(starting || n.active(&settings) || any_answered) {
-            continue;
-        }
-        // Each room's unread, and the session's read position across all of them: the notice
-        // is outstanding until any of its cursors moves.
-        let mut rooms = Vec::new();
-        let mut cursors = Vec::new();
-        for d in &view.open_channels {
-            let room = vox_core::node::link::b32_encode(&d.channel_id);
-            let cursor = crate::agent_hook::load_cursor(paths, &room, &session.session);
-            let ahead = crate::agent_hook::delivered_ahead(paths, &room, &session.session);
-            cursors.push(format!(
-                "{room}={}",
-                cursor
-                    .as_ref()
-                    .map(vox_core::node::link::b32_encode)
-                    .unwrap_or_default()
-            ));
-            let (urgent, replies) = crate::wake::unread(&d.timeline, me, &session, cursor, &ahead);
-            if !urgent.is_empty() || !replies.is_empty() {
-                rooms.push((d, urgent, replies));
-            }
-        }
-        let urgent: usize = rooms.iter().map(|(_, u, _)| u.len()).sum();
-        let newest_reply = rooms
-            .iter()
-            .flat_map(|(_, _, r)| r.iter())
-            .max_by_key(|r| r.arrival)
-            .map(|r| vox_core::node::link::b32_encode(&r.entry_hash));
-        let before = n.clone();
-        // **At start every session is counted from its cursors.** This guards one window only: a
-        // daemon killed after a row reached its store and before the wake loop looked at it (the
-        // next sweep, at most 2 s). Such a row is history to the restarted loop, so nothing new
-        // marks it. Rows that land while the daemon is down arrive by sync after it starts and are
-        // judged as new without this. The window cannot be staged through the shipped binary
-        // (`vox room post` needs a running node), so this is unproven by mutant: a review-only guard.
-        if starting && urgent > 0 {
-            n.urgent_due = true;
-        }
-        let outcome = crate::wake::tend(
-            &mut n,
-            Some(cursors.join(" ")),
-            urgent,
-            newest_reply,
-            session.idle(now, settings.busy_idle),
-            now,
-            &settings,
-        );
-        if n != before {
-            if let Err(e) = crate::wake::save_notices(paths, &session.session, &n) {
-                eprintln!(
-                    "vox daemon: could not record the notices owed to session {}: {e}",
-                    session.session
-                );
-            }
-        }
-        match outcome {
-            crate::wake::Tended::Quiet => {}
-            crate::wake::Tended::AlreadyRead => eprintln!(
-                "vox daemon: not waking session {}: it already read the urgent message(s) owed \
-                 a notice",
-                session.session
-            ),
-            crate::wake::Tended::Held => {
-                if said_held.insert(session.session.clone()) {
-                    eprintln!(
-                        "vox daemon: not waking session {} again yet: the notice sent to it is \
-                         outstanding until it reads or {}s pass",
-                        session.session,
-                        settings.wake_hold.as_secs()
-                    );
-                }
-            }
-            crate::wake::Tended::Send => {
-                said_held.remove(&session.session);
-                // The reader's own name for each sender, and "you" for another session of this
-                // node (V210-162): its own fingerprint read as "not in keyring".
-                let me = view.identity.as_ref().map(|i| i.fingerprint);
-                let name = |r: &&vox_core::node::api::MessageRow| {
-                    crate::ident::author_for(&view.trusted, me.as_ref(), &r.author)
-                };
-                let owed: Vec<crate::agent_hook::Owed> = rooms
-                    .iter()
-                    .map(|(d, urgent, replies)| {
-                        let label = vox_core::node::link::b32_encode(&d.channel_id);
-                        let room_name = view
-                            .channels
-                            .iter()
-                            .find(|c| c.channel_id == d.channel_id)
-                            .and_then(|c| c.local_name.clone())
-                            .unwrap_or_default();
-                        crate::agent_hook::Owed {
-                            room_label: label[..12.min(label.len())].to_owned(),
-                            room_name,
-                            urgent: urgent.iter().map(name).collect(),
-                            replies: replies.iter().map(name).collect(),
-                        }
-                    })
-                    .collect();
-                let text = crate::agent_hook::render_wake(&owed);
-                let hold = u64::try_from(settings.wake_hold.as_millis()).unwrap_or(u64::MAX);
-                deliver(paths.clone(), session, text, (before, n, hold));
-            }
-        }
-    }
-}
-
-/// What the wake loop remembers between looks (see [`tend`]).
-#[derive(Default)]
-struct Tending {
-    /// The first look since the daemon started: every session is counted from its cursor.
-    starting: bool,
-    /// The sessions already told, on stderr, that their notice is held.
-    said_held: std::collections::HashSet<String>,
-    /// The settings problems last said, and when.
-    problems: Vec<String>,
-    problems_said: u64,
-}
-
-/// Wake `session` with `text`, on a task of its own.
-///
-/// **One wedged session must not stall every other wake.** Each is its own task, bounded by a
-/// deadline: a session endpoint that accepts and never reads would otherwise hold the wake
-/// loop — and so every later interrupt — indefinitely.
-///
-/// **A notice that does not arrive stays owed** (`undo`: the record before and after it was sent,
-/// and the hold): it is tried again once the hold passes or the session's cursor moves.
-fn deliver(
-    paths: vox_core::node::paths::Paths,
-    session: crate::wake::Session,
-    text: String,
-    undo: (crate::wake::Notices, crate::wake::Notices, u64),
-) {
-    tokio::spawn(async move {
-        let failed = |paths: &vox_core::node::paths::Paths| {
-            crate::wake::undelivered(paths, &session.session, &undo.0, &undo.1, undo.2);
-        };
-        let woke = crate::wake::wake(&session, &text);
-        match tokio::time::timeout(WAKE_DEADLINE, woke).await {
-            Ok(Ok(())) => eprintln!("vox daemon: woke session {}", session.session),
-            // A session that has ended is forgotten, so its name's later messages are
-            // not tried against it for ever.
-            Ok(Err(crate::wake::WakeError::Gone(e))) => {
-                let forgot = crate::wake::forget(&paths, &session);
-                eprintln!(
-                    "vox daemon: session {} is gone ({e}){}",
-                    session.session,
-                    if forgot {
-                        "; forgot its registration"
-                    } else {
-                        ""
-                    }
-                );
-            }
-            // Reported, never fatal: an agent that cannot be interrupted still reads the
-            // message on its next turn, which is the whole point of queueing always.
-            Ok(Err(e)) => {
-                failed(&paths);
-                eprintln!(
-                    "vox daemon: could not interrupt session {}: {e}; it stays owed, and is \
-                     tried again",
-                    session.session
-                );
-            }
-            Err(_) => {
-                failed(&paths);
-                eprintln!(
-                    "vox daemon: interrupting session {} took longer than {}s; gave up for now — \
-                     it stays owed, and is tried again",
-                    session.session,
-                    WAKE_DEADLINE.as_secs()
-                );
-            }
-        }
-    });
 }
 
 impl AppError {
@@ -1184,10 +868,10 @@ pub(crate) fn say(line: std::fmt::Arguments<'_>) {
 }
 
 /// The identity passphrase `vox daemon` unlocks with, and the room lines that follow it.
-type DaemonPassphrases = (zeroize::Zeroizing<String>, Vec<String>);
+pub(crate) type DaemonPassphrases = (zeroize::Zeroizing<String>, Vec<String>);
 
 /// What a start-up wait of `vox daemon` ended with: what it waited for, or a stop.
-enum Asked<T> {
+pub(crate) enum Asked<T> {
     Got(T),
     Stopped(StopSignal),
 }
@@ -1195,7 +879,7 @@ enum Asked<T> {
 /// `VOX_IDENTITY_PASSPHRASE`, when set: how an agent's harness gives a daemon its identity
 /// passphrase (V210-159, decider 2026-10-02, option A). Set to nothing, it gives none on purpose
 /// (V030-36).
-fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
+pub(crate) fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
     std::env::var("VOX_IDENTITY_PASSPHRASE")
         .ok()
         .map(zeroize::Zeroizing::new)
@@ -1205,7 +889,7 @@ fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
 /// `VOX_IDENTITY_PASSPHRASE` (the identity alone), the terminal (asked for without echo, and
 /// **without waiting for end of input**: one line is the passphrase, V210-153), or stdin that is
 /// not a terminal, read to its end. A stop ends any wait for them.
-fn daemon_passphrases(
+pub(crate) fn daemon_passphrases(
     rt: &tokio::runtime::Runtime,
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
     passphrase_file: Option<std::path::PathBuf>,
@@ -1349,7 +1033,7 @@ const HANGUP_GRACE: Duration = Duration::from_secs(1);
 
 /// One line typed at the terminal, without echo, racing `stop`; `None` when its input ended with
 /// none. A stop leaves the terminal as it was: echo comes back whichever ends the wait.
-fn ask_without_echo(
+pub(crate) fn ask_without_echo(
     rt: &tokio::runtime::Runtime,
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = StopSignal>>>,
     prompt: &str,
@@ -1387,25 +1071,6 @@ fn ask_without_echo(
         let _ = writeln!(io::stderr());
     }
     asked
-}
-
-/// A daemon stopped before it served: its node, if it had one, is shut down, and it says which
-/// signal, exiting 0 as any stop of a server does (V210-153). The runtime is not waited for: a
-/// thread of it may still be reading the terminal.
-fn stopped_while_starting(
-    rt: tokio::runtime::Runtime,
-    node: Option<&vox_core::node::actor::NodeHandle>,
-    signal: StopSignal,
-) -> Result<(), AppError> {
-    if let Some(node) = node {
-        let _ = rt.block_on(tokio::time::timeout(
-            shutdown_patience(),
-            node.apply(NodeCommand::Shutdown),
-        ));
-    }
-    rt.shutdown_background();
-    say(format_args!("vox daemon: stopped by {}", signal.name()));
-    Ok(())
 }
 
 /// Reading a line at the terminal without echo, and without crossterm's raw mode: the terminal
@@ -1492,7 +1157,7 @@ mod no_echo {
 
 /// Open every closed room `line` opens, as `vox daemon` reads a room line: the whole line as a
 /// passphrase first, then `<room> <passphrase>`.
-async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle, line: &str) {
+pub(crate) async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle, line: &str) {
     // **Each line is resolved, not parsed.** The obvious split — `<room> <pass>`
     // on the first space — is ambiguous the moment a passphrase contains a
     // space, and passphrases contain spaces: this file already notes that one
@@ -1598,506 +1263,6 @@ async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle, line: &str
     }
 }
 
-/// Run this profile's node **without a terminal**, so agent sessions can attach
-/// (ADR-020 §12).
-///
-/// This exists because neither of the other two ways to run a node can serve an
-/// unattended host:
-///
-/// - [`run_live`] is the TUI. It is the only other caller of `node::ipc::bind`, it
-///   needs a TTY to prompt for the passphrase, and per ADR-015 it **locks the node
-///   on SIGHUP** — so detaching it from a terminal defeats it by design.
-/// - [`run_node`] is an anchor. It serves the board and carries circuits, but it is
-///   headless in the other sense: no identity is unlocked, it holds no room and it
-///   can read nothing.
-///
-/// So an agent on a server had no node to attach to, which contradicted this ADR's
-/// own premise that sessions may be on "n-count remote hosts".
-///
-/// ## Passphrases
-///
-/// From `--passphrase-file`, else `VOX_IDENTITY_PASSPHRASE` (the identity's alone: how an agent's
-/// harness starts one, decider 2026-10-02), else asked for at the terminal without echo, else
-/// read from stdin to its end. Never from argv, which every process on the machine can read.
-///
-/// The format of a file or of stdin is one passphrase per line, because a room needs **two** keys, not
-/// one — ADR-010's double lock means unlocking the identity does not open a room:
-///
-/// ```text
-/// <identity passphrase>
-/// <room id or unique prefix> <that room's passphrase>
-/// <room id or unique prefix> <that room's passphrase>
-/// ```
-///
-/// A room line splits at its **first space**, so a room passphrase may contain
-/// spaces — which the generated ones do. With no room lines the daemon unlocks the
-/// identity and holds no open room, which is enough to serve `vox room list` and
-/// nothing else.
-///
-/// `--passphrase-file` reads the same format from a file, for a service manager
-/// that prefers one.
-///
-/// # Errors
-/// If the runtime cannot start, the node cannot spawn, the passphrase is unreadable
-/// or wrong, a named room is unknown or its passphrase is refused, or the control
-/// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
-/// because serving that socket is this command's entire purpose.
-/// How long `vox daemon` keeps retrying a profile another vox is in the middle of closing.
-const PROFILE_RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
-
-pub fn run_daemon(
-    paths: Paths,
-    listen: std::net::SocketAddr,
-    anchors: vox_core::nat::bootstrap::BootstrapSet,
-    anchor_specs: Vec<String>,
-    passphrase_file: Option<std::path::PathBuf>,
-    metrics: Option<std::net::SocketAddr>,
-) -> Result<(), AppError> {
-    // Refused before anything is read or unlocked: a metrics endpoint the network can
-    // reach names every peer and room this node talks to (PRD-001 R38).
-    if let Some(addr) = metrics {
-        if !addr.ip().is_loopback() {
-            return Err(AppError::Usage(format!(
-                "--metrics {addr}: the metrics endpoint binds loopback only (127.0.0.1 or \
-                 ::1); it names every peer and room this node talks to"
-            )));
-        }
-    }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
-    // **Every stop signal is a clean stop, taken from the start** (V210-108, V210-153): SIGINT,
-    // SIGTERM, SIGHUP and SIGQUIT. Taken first, before the passphrase is read: the read came
-    // first, so a daemon closed with its terminal while it waited there died on the default
-    // action. A stop while the daemon waits for a passphrase ends it at once; one sent during a
-    // later start-up step is acted on once that step has finished.
-    let mut stop = Box::pin({
-        // Registering needs the runtime's signal driver, not a task.
-        let _in_runtime = rt.enter();
-        stop_requested("vox daemon")
-    });
-    let interactive = passphrase_file.is_none()
-        && daemon_env_passphrase().is_none()
-        && io::IsTerminal::is_terminal(&io::stdin());
-    let (identity, rooms) = match daemon_passphrases(&rt, &mut stop, passphrase_file)? {
-        Asked::Got(got) => got,
-        Asked::Stopped(signal) => return stopped_while_starting(rt, None, signal),
-    };
-    let identity = identity.as_str();
-    // **Wait briefly for a profile that is being closed.** redb allows one process per
-    // store, and a daemon started the moment another vox finished with the profile could
-    // still find the file open: it failed at once with "another vox already has this
-    // profile open" and never retried. Measured in `remote_interrupt_proof`, which hands a
-    // profile from an in-process node to `vox daemon`: once handshakes became concurrent
-    // (v0.2.8) it lost that race in most runs — even in a run where the old node's `Store`
-    // had already been dropped before the daemon was spawned. What held the file those last
-    // milliseconds is not identified; this does not claim to know. It makes the daemon
-    // tolerant of the window. A few seconds of retrying costs a person nothing, and a vox
-    // that genuinely holds the profile still gets the same message after the wait.
-    let started = std::time::Instant::now();
-    let node = loop {
-        let cfg = vox_core::node::actor::NodeConfig::new()
-            .bind(vox_core::node::actor::Bind::Addr(listen))
-            .anchors(anchors.clone())
-            .on_profile_wait(crate::tunnel_cli::say_waiting);
-        match rt.block_on(async { Node::spawn_config(paths.clone(), cfg) }) {
-            Err(vox_core::error::Error::ProfileBusy)
-                if started.elapsed() < PROFILE_RELEASE_PATIENCE =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            other => break other?,
-        }
-    };
-
-    rt.block_on(async {
-        let outcome = crate::tunnel_cli::apply_saying_waits(
-            &node,
-            NodeCommand::Unlock {
-                passphrase: Secret::new(identity.as_bytes().to_vec()),
-            },
-        )
-        .await;
-        if !outcome.is_done() {
-            // **Say what to do, not which enum variant lost.** A new person is sent here
-            // by `vox room list`'s "start one: vox daemon", and this is the second thing
-            // they see; `Failed(NoIdentity)` names nothing they can act on and does not
-            // mention that `vox id` is what creates an identity. The two failures a
-            // person actually hits are distinguished, because the remedies are opposite:
-            // one means make an identity, the other means you typed the wrong thing.
-            use vox_core::node::api::{Fault, Outcome};
-            return Err(AppError::Usage(match outcome {
-                Outcome::Failed(Fault::NoIdentity) => format!(
-                    "this profile has no identity yet, so there is nothing to unlock.\n\
-                     \x20      Make one:  vox id\n\
-                     \x20      Then start the daemon again. Profile: {}",
-                    paths.profile_dir.display()
-                ),
-                Outcome::Failed(Fault::WrongPassphrase) => {
-                    "that identity passphrase is wrong.\n       The first line piped to \
-                     `vox daemon` is the identity passphrase; lines after it open rooms."
-                        .to_owned()
-                }
-                // Unlocking also brings the node onto the network, so a `--listen` address
-                // that cannot be bound fails here. It said `Failed(Internal)` — a bug report for
-                // an occupied port (PRD-001 R36) — and then "something else already holds that
-                // UDP port" for every cause, an address this machine does not have included
-                // (V210-134). Now it names the cause and quotes the operating system.
-                Outcome::Failed(fault) if fault.is_bind() => format!(
-                    "cannot listen on {listen}: {}",
-                    crate::tunnel_cli::bind_failure(listen, crate::tunnel_cli::Socket::Udp, fault)
-                        .unwrap_or_default()
-                ),
-                other => format!("could not unlock this profile's identity: {other}"),
-            }));
-        }
-        // Then the second lock. `vox room post|read|board` all need the room OPEN,
-        // not merely known — a daemon that unlocked the identity and stopped there
-        // would answer `room list` and refuse everything else, which is the defect
-        // this proof found the first time it ran.
-        for line in &rooms {
-            open_rooms_by_line(&node, line).await;
-        }
-        Ok(())
-    })?;
-    // **At a terminal, the rooms still closed are asked for** (V210-153), one passphrase at a
-    // time, as a piped line would give them; an empty one starts the daemon without them.
-    if interactive {
-        loop {
-            let shut = node.view().channels.iter().filter(|c| !c.open).count();
-            if shut == 0 {
-                break;
-            }
-            let prompt = format!(
-                "passphrase for a closed room ({shut} closed; Enter to start without them)"
-            );
-            let line = match ask_without_echo(&rt, &mut stop, &prompt) {
-                // End of input starts it without them, as Enter does.
-                Asked::Got(line) => line?.unwrap_or_default(),
-                Asked::Stopped(signal) => {
-                    return stopped_while_starting(rt, Some(&node), signal);
-                }
-            };
-            if line.is_empty() {
-                break;
-            }
-            rt.block_on(open_rooms_by_line(&node, &line));
-        }
-    }
-    // Say what is actually held, by id, because the names cannot be shown for the
-    // rooms that stayed closed and a silent daemon is how this went unnoticed.
-    let view = node.view();
-    let (open, shut) = (
-        view.channels.iter().filter(|c| c.open).count(),
-        view.channels.iter().filter(|c| !c.open).count(),
-    );
-    if shut > 0 {
-        eprintln!(
-            "vox daemon: {open} room(s) open, {shut} still closed — a closed room \
-             answers nothing but `room list`"
-        );
-    }
-
-    // **Follow the anchor when it moves.**
-    //
-    // An anchor spec may name a host rather than an address, and the reason it may is
-    // that a home connection's address changes whenever the ISP decides — the point
-    // being that a person should not have to re-issue it to every client. Resolution
-    // happened once, when this process read its configuration, so a daemon that runs for
-    // days held whatever the name meant at startup and redialled that address for ever.
-    // The failure attributes badly: the anchor is up, the name is right, and the client
-    // says only that it cannot reach a peer.
-    //
-    // So re-read the configuration and re-resolve every spec on a timer, and hand the
-    // node anything new. Re-reading is what makes this provable without a DNS record to
-    // move: the same `merge_anchor_spec` runs again, so a name is resolved again whether
-    // it was the file or the record that changed.
-    {
-        let node = node.clone();
-        let paths = paths.clone();
-        let specs = anchor_specs.clone();
-        rt.spawn(async move {
-            // What the last read skipped, so a bad line is said when it appears, not every 30 s.
-            let mut said: Vec<String> = Vec::new();
-            loop {
-                tokio::time::sleep(ANCHOR_REFRESH).await;
-                // On a blocking thread: a name is resolved here, and a slow resolver must not
-                // hold a runtime worker (V210-75).
-                let (paths, specs) = (paths.clone(), specs.clone());
-                let Ok((set, skipped)) = tokio::task::spawn_blocking(move || {
-                    let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
-                    // A bad line is skipped, not a reason to skip every anchor (V210-75).
-                    let skipped =
-                        vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file())
-                            .unwrap_or_default();
-                    for spec in &specs {
-                        let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
-                    }
-                    (set, skipped)
-                })
-                .await
-                else {
-                    continue;
-                };
-                if skipped != said {
-                    for line in &skipped {
-                        eprintln!("vox daemon: {line}");
-                    }
-                    said = skipped;
-                }
-                if !set.is_empty() {
-                    let _ = node
-                        .apply(vox_core::node::api::NodeCommand::AddAnchors { anchors: set })
-                        .await;
-                }
-            }
-        });
-    }
-
-    if let Some(addr) = metrics {
-        let listener = rt
-            .block_on(vox_core::node::status::bind_metrics(addr))
-            .map_err(|e| AppError::Usage(e.to_string()))?;
-        let bound = listener.local_addr().map_err(AppError::Io)?;
-        rt.spawn(vox_core::node::status::serve_metrics(
-            listener,
-            node.clone(),
-        ));
-        println!("vox daemon: metrics http://{bound}/metrics");
-    }
-
-    // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
-    let _ipc = rt
-        .block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) })
-        .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
-
-    // Tell the operator when `vox status` would flag something, and when it clears
-    // (PRD-001 R37). Off with `notify = off` in the profile's config file.
-    rt.spawn(crate::notify::watch(node.clone(), paths.clone()));
-
-    let fp = node
-        .view()
-        .identity
-        .map(|i| vox_core::node::link::b32_encode(&i.fingerprint))
-        .unwrap_or_default();
-    println!("vox daemon: identity {fp}");
-    println!(
-        "vox daemon: control socket {}",
-        paths.socket_file().display()
-    );
-    for room in node.view().open_channels {
-        println!(
-            "vox daemon: holding room {} open",
-            vox_core::node::link::b32_encode(&room.channel_id)
-        );
-    }
-
-    // **The interrupt path (ADR-020 §6).** The daemon is the only thing that sees
-    // every entry as it lands and also knows which local sessions exist, so it is
-    // where "addressed and urgent" turns into a wake. The rule is deliberately
-    // narrow: a message interrupts only if it names this node *and* is marked
-    // urgent. Everything else waits for the next turn, because an interrupt that
-    // fires on everything is a queue with worse manners.
-    //
-    // **An event is a wake, never the data** (ADR-020 §6; ADR-021 F15). The node emits
-    // `NewEntry` only for its OWN appends. An entry that arrives from another member is
-    // announced as `Synced`, and one made readable by a sender key as
-    // `SenderKeyReceived` — neither carries the row. This loop used to act on `NewEntry`
-    // alone, so an urgent message from an agent on ANOTHER machine — the case the
-    // interrupt path exists for — could never interrupt anybody. So every room is swept
-    // for rows this loop has not yet judged: on those events, on `Lagged`, and on a
-    // two-second tick, so a view that had not yet published a row when its event arrived
-    // is caught on the next sweep rather than missed for good.
-    {
-        let node = node.clone();
-        let paths = paths.clone();
-        rt.spawn(async move {
-            let mut events = node.subscribe();
-            // Everything already in a room when the daemon starts is history, not news:
-            // an interrupt is for what lands while the daemon is running.
-            let mut seen: std::collections::HashSet<vox_core::hash::Digest32> = node
-                .view()
-                .open_channels
-                .iter()
-                .flat_map(|d| d.timeline.iter().map(|r| r.entry_hash))
-                .collect();
-            // How far each room's timeline has been swept, and its row there. A timeline grows at
-            // its end, so a sweep reads only what was added since the last one (V210-120): it read
-            // the whole room on every sync, so each message cost the room's history. A room whose
-            // timeline no longer has that row there (it was closed and reopened) is read whole.
-            let mut swept: std::collections::HashMap<
-                vox_core::hash::Digest32,
-                (usize, Option<vox_core::hash::Digest32>),
-            > = node
-                .view()
-                .open_channels
-                .iter()
-                .map(|d| {
-                    (
-                        d.channel_id,
-                        (d.timeline.len(), d.timeline.last().map(|r| r.entry_hash)),
-                    )
-                })
-                .collect();
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-            // The rooms where an answer to anything landed since the last look: a session there
-            // may now be owed a reply's notice (V030-20).
-            let mut answered: std::collections::HashSet<vox_core::hash::Digest32> =
-                std::collections::HashSet::new();
-            let mut tending = Tending {
-                starting: true,
-                ..Tending::default()
-            };
-            // Counted at once, not at the first tick.
-            tend(&paths, &node.view(), &answered, &mut tending);
-            loop {
-                let sweep = tokio::select! {
-                    item = events.next() => match item {
-                        None => break,
-                        Some(vox_core::node::actor::EventStreamItem::Lagged(n)) => {
-                            eprintln!("vox daemon: fell behind the node's events by {n}; re-reading every room");
-                            true
-                        }
-                        Some(vox_core::node::actor::EventStreamItem::Event(ev)) => {
-                            // **A daemon is the node nobody is watching, so it has to say
-                            // things out loud** — unreachable peers, refused publishes,
-                            // stalls — which `vox node` has always reported.
-                            crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
-                            match ev {
-                                vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
-                                    // The view — every open room's timeline — is copied only
-                                    // for a message that could interrupt someone.
-                                    if seen.insert(row.entry_hash) {
-                                        // A ping is the daemon's to answer, never a model's
-                                        // (V030-16).
-                                        if crate::ping::is_ping(&row.text) {
-                                            crate::ping::answer(
-                                                &node,
-                                                &paths,
-                                                &node.view(),
-                                                channel_id,
-                                                &row,
-                                            );
-                                        }
-                                        if may_wake(&row.text) {
-                                            judge(&paths, &node.view(), &channel_id, &row);
-                                        }
-                                        if may_answer(&row.text) {
-                                            answered.insert(channel_id);
-                                        }
-                                    }
-                                    // Looked at at once, rather than at the next tick.
-                                    true
-                                }
-                                vox_core::node::api::NodeEvent::Synced { .. }
-                                | vox_core::node::api::NodeEvent::SenderKeyReceived { .. } => true,
-                                _ => false,
-                            }
-                        }
-                    },
-                    _ = tick.tick() => true,
-                };
-                if sweep {
-                    let view = node.view();
-                    // Every unseen row is marked seen; only one that could interrupt
-                    // someone is copied out to be judged.
-                    let mut fresh = Vec::new();
-                    let mut pings = Vec::new();
-                    for d in &view.open_channels {
-                        let from = match swept.get(&d.channel_id) {
-                            Some(&(n, last))
-                                if n > 0
-                                    && d.timeline.get(n - 1).map(|r| r.entry_hash) == last =>
-                            {
-                                n
-                            }
-                            _ => 0,
-                        };
-                        for r in d.timeline.iter_from(from) {
-                            if !seen.insert(r.entry_hash) {
-                                continue;
-                            }
-                            if may_wake(&r.text) {
-                                fresh.push((d.channel_id, r.clone()));
-                            }
-                            if crate::ping::is_ping(&r.text) {
-                                pings.push((d.channel_id, r.clone()));
-                            }
-                            if may_answer(&r.text) {
-                                answered.insert(d.channel_id);
-                            }
-                        }
-                        swept.insert(
-                            d.channel_id,
-                            (d.timeline.len(), d.timeline.last().map(|r| r.entry_hash)),
-                        );
-                    }
-                    for (cid, row) in fresh {
-                        judge(&paths, &view, &cid, &row);
-                    }
-                    for (cid, row) in pings {
-                        crate::ping::answer(&node, &paths, &view, cid, &row);
-                    }
-                    tend(&paths, &view, &answered, &mut tending);
-                    answered.clear();
-                }
-            }
-        });
-    }
-
-    let stopped = rt.block_on(async {
-        // **SIGHUP stops it too** (V210-108). It used to be ignored, on the reading that a daemon
-        // has no terminal to lose and a service manager sends SIGHUP to ask for a reload. But this
-        // daemon has nothing to reload, and people start it from tmux and ssh sessions, whose
-        // closing sends SIGHUP: an ignored hangup left a daemon nobody could see still holding the
-        // profile. Each of the four stops it the same way.
-        // A server's stop is its normal end: once its node has stopped it says which signal and
-        // exits 0, as a service manager expects of a service it stopped. A stop that did not
-        // finish says so and exits non-zero (below).
-        let signal = stop.await;
-        say(format_args!(
-            "vox daemon: shutting down on {}",
-            signal.name()
-        ));
-        // **Bounded.** The node handles one thing at a time, so `Shutdown` waits behind whatever
-        // it is doing — and it can be doing a network round trip to a peer that has vanished.
-        // Measured: a daemon that had joined a room through an anchor, with the anchor gone,
-        // printed this line and then sat for 59.6 s (the connection's idle timeout) while the
-        // node finished publishing to a board nobody was reading. A service manager's SIGTERM
-        // has to mean stop. Whatever the node was mid-way through is lost either way; its
-        // state on disk is committed per step, so nothing half-written is left by leaving.
-        let patience = shutdown_patience();
-        let finished = tokio::time::timeout(patience, node.apply(NodeCommand::Shutdown))
-            .await
-            .is_ok();
-        (signal, patience, finished)
-    });
-    // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
-    // session runs on one.
-    rt.shutdown_timeout(SHUTDOWN_PATIENCE);
-    let (signal, patience, finished) = stopped;
-    if !finished {
-        // **A stop that gave up is not a stop** (decider, V210-93). The daemon leaves, as it must,
-        // but its node's ordered stop was cut short: the closes it had not yet sent never left,
-        // and those peers learn it went only by their own timeouts. That is a failure, said as
-        // one, with an error status, never "stopped by …" and 0.
-        return Err(AppError::Refused {
-            code: 1,
-            message: format!(
-                "the daemon did not finish stopping on {} within {}s: its node was mid-way \
-                 through a network exchange with a peer that is not answering. It left anyway, so \
-                 a peer it had not yet said goodbye to learns it went only when its connection \
-                 times out",
-                signal.name(),
-                patience.as_secs_f64()
-            ),
-        });
-    }
-    say(format_args!("vox daemon: stopped by {}", signal.name()));
-    Ok(())
-}
-
 /// Write this anchor's own specs into the profile's anchors file (ADR-017 decision 7, M17.4),
 /// returning the path written.
 ///
@@ -2113,7 +1278,9 @@ fn write_anchors_file(
     listening: &[String],
 ) -> std::io::Result<std::path::PathBuf> {
     use std::fmt::Write as _;
-    let path = paths.anchors_file();
+    // The account's file, not this node's own (ADR-026 F-2): every node on this machine reads
+    // it unless it keeps an anchors file of its own, so each of them reaches its anchor unasked.
+    let path = paths.config_dir.join(vox_core::node::paths::ANCHORS_FILE);
     let mut body = String::from(
         "# Written by `vox node`. Anchors this profile publishes to, reads from and reaches\n\
          # peers through: one <fingerprint>@<multiaddr> per line. Add anchors on other\n\
@@ -2132,143 +1299,97 @@ fn write_anchors_file(
 }
 
 pub fn run_live(
-    paths: Paths,
+    account: vox_core::node::paths::Account,
+    node: Option<String>,
     listen: std::net::SocketAddr,
-    anchors: vox_core::nat::bootstrap::BootstrapSet,
+    anchors: Vec<String>,
 ) -> Result<(), AppError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    // Opening the profile happens before the TUI takes the screen, so a wait for another vox
-    // holding it is said on the terminal as a CLI verb says it (V210-100).
-    let cfg = vox_core::node::actor::NodeConfig::new()
-        .bind(vox_core::node::actor::Bind::Addr(listen))
-        .anchors(anchors)
-        .on_profile_wait(crate::tunnel_cli::say_waiting);
-    let node = rt.block_on(async { Node::spawn_config(paths.clone(), cfg) })?;
-    // The ADR-020 control socket, so agent sessions on this machine can attach to
-    // this node rather than each running one of their own. Held for the life of
-    // the client: dropping it stops accepting and unlinks the path.
-    //
-    // A failure here is reported and not fatal. The socket is an extra surface,
-    // and a client that cannot offer it should still be a client — refusing to
-    // start the TUI because another feature could not bind would be the wrong
-    // trade.
-    let _ipc = match rt.block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) }) {
-        Ok(server) => Some(server),
-        Err(e) => {
-            eprintln!("vox: control socket unavailable ({e}); `vox room` will not attach");
-            None
-        }
-    };
-    let cancel = CancellationToken::new();
+    // The daemon first, before the TUI takes the screen, so a daemon that will not start is said
+    // on the terminal (ADR-026 S-2).
+    rt.block_on(crate::daemon_client::ensure_daemon(
+        &account, listen, &anchors,
+    ))?;
+    // The node it acts as (C-3): named, else the only one attached, else the only one on disk, else
+    // `default` for a data root with none, whose identity the TUI makes.
+    let node = crate::client::resolve_node(node.as_deref(), &account, true)
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let core = DaemonCore::new(rt.handle().clone(), account, node, anchors, stop.clone())?;
     let io = CrosstermIo::new();
     #[cfg(unix)]
     {
-        // **SIGTERM quits as `q` does** (V210-93): the terminal is restored and the node shut
-        // down, so its connections close and its peers learn at once. Left to its default it
-        // killed the process with nothing sent and the terminal left raw.
-        let stop = io.stop_flag();
-        let term = {
-            let _in_rt = rt.enter();
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        };
-        if let Ok(mut term) = term {
-            rt.spawn(async move {
-                if term.recv().await.is_some() {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
-        }
-        // SIGHUP (terminal went away) locks the node (ADR-015).
-        let n = node.clone();
-        let c = cancel.clone();
-        rt.spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let Ok(mut hup) = signal(SignalKind::hangup()) else {
-                return;
+        // **SIGTERM and SIGHUP stop the TUI as `q` does** (V210-93, ADR-026 S-4): the terminal is
+        // restored and the connections to the daemon close. The node is the daemon's: it is left
+        // as it is, attached for as long as anything holds it. Left to their defaults these killed
+        // the process with the terminal left raw. A wait on the daemon is given up at once (the
+        // TUI waited out an attach before it stopped: 9.5 s, measured).
+        for kind in [
+            tokio::signal::unix::SignalKind::terminate(),
+            tokio::signal::unix::SignalKind::hangup(),
+        ] {
+            let flag = io.stop_flag();
+            let stop = stop.clone();
+            let signal = {
+                let _in_rt = rt.enter();
+                tokio::signal::unix::signal(kind)
             };
-            loop {
-                tokio::select! {
-                    _ = hup.recv() => { let _ = n.apply(NodeCommand::Lock).await; }
-                    () = c.cancelled() => break,
-                }
+            if let Ok(mut signal) = signal {
+                rt.spawn(async move {
+                    if signal.recv().await.is_some() {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        stop.cancel();
+                    }
+                });
             }
-        });
+        }
     }
-    let core = LiveCore::new(node.clone(), rt.handle().clone());
-    let result = run_loop(io, core, system_clock());
-    cancel.cancel();
-    // Shutdown locks (wipes every SEK and the signer) before the process exits.
-    let _ = rt.block_on(node.apply(NodeCommand::Shutdown));
+    let result = run_loop(io, core);
+    rt.shutdown_timeout(Duration::from_secs(1));
     result
 }
 
 /// The loop over an abstract terminal (the testable core of [`run_tui`]).
-pub fn run_loop(
-    mut io: impl TerminalIo,
-    mut core: impl CoreHandle,
-    clock: Clock,
-) -> Result<(), AppError> {
+pub fn run_loop(mut io: impl TerminalIo, mut core: impl CoreHandle) -> Result<(), AppError> {
     io.enter()?;
-    let result = event_loop(&mut io, &mut core, &clock);
+    let result = event_loop(&mut io, &mut core);
     io.leave()?;
     result
 }
 
-/// Say a lock is under way before asking for it. A lock waits for work still holding a secret —
-/// an Argon2id seal, a passphrase check, a room being reopened — to finish and wipe it (V210-94),
-/// which can take a derivation's time, and the TUI waits on the answer: without this it looked
-/// frozen.
-fn say_locking(io: &mut impl TerminalIo, vm: &ViewModel, ui: &mut UiState) -> Result<(), AppError> {
-    ui.status_message = Some("locking… waiting for work that holds a secret to finish".to_owned());
-    io.draw(&mut |f| render(f, vm, ui))?;
-    Ok(())
-}
-
-fn event_loop(
-    io: &mut impl TerminalIo,
-    core: &mut impl CoreHandle,
-    clock: &Clock,
-) -> Result<(), AppError> {
+fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<(), AppError> {
     let mut ui = UiState::new();
     // Surface any startup notice (e.g. the offline-shell banner) until the user acts.
     ui.status_message = core.startup_notice();
-    let mut last_input = clock();
-    let mut was_locked: Option<bool> = None;
+    let mut was_attached: Option<bool> = None;
     loop {
         if io.stop_requested() {
             return Ok(());
         }
         let vm = core.view();
+        // The daemon it is a client of stopped: nothing here can go on (ADR-026 L-7).
+        if let Some(why) = core.ended() {
+            return Err(AppError::Usage(why));
+        }
         ui.settle(&vm);
 
-        // Onboarding / re-auth prompts: open once per transition, never on top of
-        // another modal.
+        // Onboarding / attach prompts: open once per transition, never on top of another modal.
         if ui.mode.is_normal() {
-            if !vm.has_identity && was_locked.is_none() {
+            if !vm.has_identity && was_attached.is_none() {
                 ui.start_prompt(PromptKind::CreateIdentity, None);
-            } else if vm.locked && vm.has_identity && was_locked != Some(true) {
-                ui.start_prompt(PromptKind::Unlock, None);
+            } else if !vm.attached && vm.has_identity && was_attached != Some(false) {
+                ui.start_prompt(PromptKind::Attach, None);
             }
         }
-        was_locked = Some(vm.locked);
+        was_attached = Some(vm.attached);
 
         io.draw(&mut |f| render(f, &vm, &mut ui))?;
 
-        // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
-        let now = clock();
-        if !vm.locked && !vm.locking && vm.has_identity && idle_lock_due(last_input, now) {
-            say_locking(io, &vm, &mut ui)?;
-            ui.status_message = Some(core.apply(Command::Lock).message());
-            last_input = now;
-            continue;
-        }
-
-        // Poll so the render loop never blocks indefinitely (core-pushed updates
-        // and the idle timer are folded in each tick).
-        // A passphrase is read past the terminal library (V210-94): see `poll_secret_key`.
+        // Poll so the render loop never blocks indefinitely (daemon updates are folded in each
+        // tick). A passphrase is read past the terminal library (V210-94): see `poll_secret_key`.
         let key = if ui.typing_a_secret() {
             io.poll_secret_key(Duration::from_millis(250))?
         } else {
@@ -2277,14 +1398,10 @@ fn event_loop(
         let Some(key) = key else {
             continue;
         };
-        last_input = clock();
         match ui.on_key(key, &vm) {
             Action::Quit => return Ok(()),
             Action::Redraw => {}
             Action::Dispatch(cmd) => {
-                if matches!(cmd, Command::Lock) {
-                    say_locking(io, &vm, &mut ui)?;
-                }
                 // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
                 // this terminal, and a line written there lands inside the screen.
                 let status = core.apply_noting(cmd, &mut || {

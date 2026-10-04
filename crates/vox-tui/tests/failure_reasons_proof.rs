@@ -534,7 +534,10 @@ fn every_common_failure_names_its_cause() {
         &said,
         &[
             &format!("cannot listen on {udp_addr}"),
-            "already holds that UDP port",
+            // The daemon's one presence binds the port (ADR-026 D-3) and says it in the
+            // system's own words, with who holds it (V210-134).
+            "another program already holds it",
+            "Address already in use",
         ],
     );
     drop(udp);
@@ -635,7 +638,9 @@ fn every_common_failure_names_its_cause() {
         ],
         "",
     );
-    forward.expect_out("the forward's bound address", |l| l.contains(" → "));
+    forward.expect_out("the forward's bound address", |l| {
+        l.starts_with("vox: forwarding ")
+    });
     // Two opposite outcomes, told apart: the forward never took a connection (staging), or it
     // took one and the service's echo came back — the host carried an untrusted guest's bytes
     // to the service, which is the product's security failing, never a CANNOT MEASURE.

@@ -42,8 +42,14 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
+
+#[path = "support/layout.rs"]
+mod layout;
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -69,7 +75,19 @@ impl Drop for Daemon {
     }
 }
 
-fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
+fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let verb: Vec<&str> = args.to_vec();
+    match attach::needs(dir, &verb) {
+        Some(node) => {
+            attach::Root::at(dir, IDENTITY).attached(&node, || vox_plain(dir, args, stdin))
+        }
+        None => vox_plain(dir, args, stdin),
+    }
+}
+
+fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)
@@ -200,14 +218,15 @@ fn ranges(seen: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
     out
 }
 
-/// The profile's `store.redb`, under `<data>/<profile>/`.
+/// The default node's `store.redb`, under `<data>/nodes/default/`.
 fn store_file(dir: &Path) -> PathBuf {
-    std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot list the profile dir {dir:?}: {e}"))
-        .filter_map(Result::ok)
-        .map(|e| e.path().join("store.redb"))
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("PRODUCT (staging): no <profile>/store.redb under {dir:?}"))
+    let p = layout::node_dir(dir, layout::DEFAULT_NODE).join("store.redb");
+    assert!(
+        p.is_file(),
+        "PRODUCT (staging): no store at {}",
+        p.display()
+    );
+    p
 }
 
 /// The attack: delete the counter's row from a stopped node's store. Returns the rows the `meta`

@@ -106,8 +106,10 @@ fn flood_batch(
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let mut other = [salt ^ 0x33; 32];
             other[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            let s = SoftwareRootSigner::from_component_seeds(&seed, &other)
-                .expect("APPARATUS: build the stand-in peer's signer");
+            let s = std::sync::Arc::new(
+                SoftwareRootSigner::from_component_seeds(&seed, &other)
+                    .expect("APPARATUS: build the stand-in peer's signer"),
+            );
             let t = hostile::now();
             let ring = PrekeyRing::generate(&s, &seed, t)
                 .expect("APPARATUS: generate the stand-in peer's prekeys");

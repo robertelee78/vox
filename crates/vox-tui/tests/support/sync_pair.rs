@@ -24,6 +24,14 @@ use std::time::{Duration, Instant};
 
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 
+#[path = "layout.rs"]
+mod layout;
+
+#[path = "attach.rs"]
+mod attach;
+#[allow(unused_imports)] // not every includer uses every item
+pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
+
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const ID_PASS: &str = "an identity passphrase";
 pub const ROOM_PASS: &str = "the room passphrase";
@@ -78,7 +86,7 @@ impl Drop for Proc {
     }
 }
 
-fn drain(child: &mut Child) -> Arc<Mutex<String>> {
+pub fn drain(child: &mut Child) -> Arc<Mutex<String>> {
     let said = Arc::new(Mutex::new(String::new()));
     let out = child.stdout.take();
     let err = child.stderr.take();
@@ -215,6 +223,14 @@ pub struct Member {
     pub fp: String,
 }
 
+impl Drop for Member {
+    /// The safety net: a daemon still holding this member's data root is stopped by its pid
+    /// ([`reap_daemon`]).
+    fn drop(&mut self) {
+        reap_daemon(&self.dir);
+    }
+}
+
 impl Member {
     pub fn new(root: &Path, name: &'static str) -> Self {
         let dir = root.join(name);
@@ -280,8 +296,16 @@ impl Member {
         )
     }
 
+    /// `vox trust add` of `other`. With no daemon holding this member's node yet (a trust made
+    /// before its daemon starts), the node is attached for the verb and let go after (ADR-026 L-2).
     pub fn trust(&self, other: &Member) {
-        let (ok, out, err) = self.vox(&["trust", "add", &other.fp, "--name", other.name], None);
+        let run = || self.vox(&["trust", "add", &other.fp, "--name", other.name], None);
+        let root = attach::Root::at(&self.dir, ID_PASS);
+        let (ok, out, err) = if root.daemon_running() {
+            run()
+        } else {
+            root.attached(DEFAULT_NODE, run)
+        };
         assert!(
             ok,
             "PRODUCT: {}'s `vox trust add` of {} failed.\nstdout:\n{out}\nstderr:\n{err}",
@@ -471,7 +495,7 @@ impl Member {
             )
         });
         let client = rt
-            .block_on(IpcClient::open(&paths.socket_file()))
+            .block_on(attach::paths_client(&paths))
             .unwrap_or_else(|e| {
                 panic!(
                     "CANNOT MEASURE: the harness could not attach to {}'s control socket: {e}",

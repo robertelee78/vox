@@ -56,7 +56,19 @@ const IMMEDIATE: Duration = Duration::from_secs(2);
 const SETUP: Duration = Duration::from_secs(90);
 
 /// A one-shot `vox` verb in `dir`'s profile, `stdin` piped in when given.
-fn vox(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
+fn vox(dir: &std::path::Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let verb: Vec<&str> = argv.to_vec();
+    match world::attach::needs(dir, &verb) {
+        Some(node) => {
+            world::attach::Root::at(dir, IDENTITY).attached(&node, || vox_plain(dir, argv, stdin))
+        }
+        None => vox_plain(dir, argv, stdin),
+    }
+}
+
+fn vox_plain(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(VOX)
         .args(argv)
         .env("VOX_DATA_DIR", dir)

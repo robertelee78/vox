@@ -19,9 +19,6 @@
 
 #![cfg(unix)]
 
-#[path = "support/world.rs"]
-mod world;
-
 #[path = "support/sync_pair.rs"]
 mod sync_pair;
 
@@ -31,15 +28,12 @@ mod watchdog;
 use std::io::{Read as _, Write as _};
 use std::time::{Duration, Instant};
 
-use sync_pair::Member;
-use world::{args, VoxProc};
+use sync_pair::{Member, Proc};
 
 /// `vox daemon --listen 127.0.0.1:0 --metrics <metrics>` on `m`'s profile.
-fn daemon_with_metrics(m: &Member, metrics: &str) -> VoxProc {
-    VoxProc::spawn(
-        m.name,
-        &m.dir,
-        &args(&[
+fn daemon_with_metrics(m: &Member, metrics: &str) -> Proc {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_vox"))
+        .args([
             "daemon",
             "--listen",
             "127.0.0.1:0",
@@ -47,8 +41,37 @@ fn daemon_with_metrics(m: &Member, metrics: &str) -> VoxProc {
             metrics,
             "--passphrase-file",
             m.pass.to_str().expect("APPARATUS: a UTF-8 path"),
-        ]),
-    )
+        ])
+        .env("VOX_DATA_DIR", &m.dir)
+        .env("VOX_CONFIG_DIR", m.dir.join("cfg"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {}'s daemon: {e}", m.name));
+    let said = sync_pair::drain(&mut child);
+    Proc { child, said }
+}
+
+/// The first line of `p`'s output that `pred` accepts, waiting up to 60 s for it.
+fn line_from(p: &mut Proc, what: &str, pred: impl Fn(&str) -> bool) -> String {
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(l) = p
+            .transcript()
+            .lines()
+            .find(|l| pred(l.trim_start_matches("! ")))
+        {
+            return l.trim_start_matches("! ").to_owned();
+        }
+        assert!(
+            Instant::now() < until,
+            "PRODUCT (staging): the daemon never said {what} ({}):\n{}",
+            p.state(),
+            p.transcript()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// One scrape of `addr`'s `/metrics`: the body.
@@ -82,7 +105,7 @@ fn sample(body: &str, name: &str) -> Option<u64> {
 #[ignore = "a real vox daemon with production Argon2id; CI runs it in release"]
 fn a_metrics_endpoint_the_network_could_reach_is_refused() {
     watchdog::arm();
-    let tmp = world::tempdir();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let alice = Member::new(tmp.path(), "alice");
     let mut daemon = daemon_with_metrics(&alice, "0.0.0.0:0");
     let until = Instant::now() + Duration::from_secs(60);
@@ -111,11 +134,11 @@ fn a_metrics_endpoint_the_network_could_reach_is_refused() {
 #[ignore = "real vox daemons with production Argon2id; CI runs it in release"]
 fn the_metrics_count_a_connected_peer_and_a_completed_sync() {
     watchdog::arm();
-    let tmp = world::tempdir();
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
     let alice = Member::new(tmp.path(), "alice");
     let bob = Member::new(tmp.path(), "bob");
     let mut alice_daemon = daemon_with_metrics(&alice, "127.0.0.1:0");
-    let said = alice_daemon.expect_staging("the metrics address", |l| {
+    let said = line_from(&mut alice_daemon, "the metrics address", |l| {
         l.starts_with("vox daemon: metrics http://")
     });
     let addr = said

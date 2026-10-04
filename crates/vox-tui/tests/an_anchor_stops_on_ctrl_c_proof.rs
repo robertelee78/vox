@@ -353,13 +353,13 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
         })
     };
     let terminal = open();
-    // `vox up <room>`; `vox forward <service>.<host fp>.<room>.vox <local>`, its only form.
-    let mut a = vec![verb.to_owned()];
-    if verb == "forward" {
-        a.extend([w.service_host(), "127.0.0.1:0".into()]);
+    // `vox up <room>`, or `vox forward <service>.<node>.<room>.vox <local>` — the only shape a
+    // forward takes (V030-25).
+    let mut a = if verb == "forward" {
+        vec![verb.to_owned(), w.service_host(), "127.0.0.1:0".into()]
     } else {
-        a.push(w.room.clone());
-    }
+        vec![verb.to_owned(), w.room.clone()]
+    };
     a.extend([
         "--anchor".into(),
         w.host_anchor.clone(),

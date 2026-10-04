@@ -225,7 +225,7 @@ pub async fn read_all(
         .map_err(|e| AppError::Usage(e.to_string()))?
     {
         Frame::Rows { rows } => Ok(rows),
-        other => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        other => Err(crate::client::unexpected(&other)),
     }
 }
 
@@ -275,7 +275,7 @@ pub async fn structured(
         {
             Frame::Rows { rows: got } => rows.extend(got),
             Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            other => return Err(crate::client::unexpected(&other)),
         }
     }
     let wanted: std::collections::BTreeSet<&str> = ops.iter().map(String::as_str).collect();
@@ -334,7 +334,7 @@ pub async fn reply_chain(
         .await?
         {
             Frame::Rows { rows } => rows,
-            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            other => return Err(crate::client::unexpected(&other)),
         };
         let Some(row) = rows.into_iter().find(|r| r.entry_hash == hash) else {
             break;
@@ -373,7 +373,7 @@ pub async fn find(
         .await?
         {
             Frame::Rows { rows } => found.extend(rows),
-            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            other => return Err(crate::client::unexpected(&other)),
         }
     }
     Ok(found)
@@ -411,7 +411,7 @@ pub async fn wake_context(
         .await?
         {
             Frame::Rows { rows } => found.extend(rows),
-            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            other => return Err(crate::client::unexpected(&other)),
         }
     }
     let Some(oldest) = found.first().map(|r| r.entry_hash) else {
@@ -492,7 +492,7 @@ pub async fn read_upto(
                 return Ok(None)
             }
             Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            other => return Err(crate::client::unexpected(&other)),
         }
     }
 }
@@ -523,7 +523,7 @@ pub async fn snapshot(client: &mut IpcClient, channel_id: Digest32) -> Result<Sn
     let rows = structured(client, channel_id, COORDINATION, &[]).await?;
     let roster = match ask(client, &Request::Roster { channel_id }).await? {
         Frame::Members { members } => members,
-        other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        other => return Err(crate::client::unexpected(&other)),
     };
     let posted = posted_of(&rows);
     let now = now_millis();
@@ -687,7 +687,7 @@ pub async fn post_once(
     .await?
     {
         Frame::Ok => {}
-        other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        other => return Err(crate::client::unexpected(&other)),
     }
 
     // **This post's own entry, by content — and waited for.** The node answers `Ok` once the

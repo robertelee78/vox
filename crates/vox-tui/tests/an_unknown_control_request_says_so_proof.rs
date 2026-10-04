@@ -6,7 +6,8 @@
 //! "malformed identity bundle: ipc request unknown tag": every control-socket decode failure was
 //! reported as a malformed identity bundle, which points at identity corruption.
 //!
-//! What this drives: a real `vox daemon`, and a client that speaks the socket's framing (a 4-byte
+//! What this drives: a real `vox daemon`, and a client of its account socket that speaks the
+//! socket's framing (a 4-byte
 //! big-endian length, then a CBOR body) the way an older or newer `vox` would, sending a request
 //! with an unknown tag.
 //!
@@ -68,7 +69,8 @@ fn an_unknown_control_request_says_so() {
     );
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        let (ok, out, err) = vox_once(&data, &args(&["room", "list"]));
+        // Plain: this waits for the proof's own daemon, and attaches nothing meanwhile.
+        let (ok, out, err) = world::vox_once_plain(&data, &args(&["room", "list"]));
         if ok {
             break;
         }
@@ -81,7 +83,8 @@ fn an_unknown_control_request_says_so() {
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let socket = data.join("default").join("node.sock");
+    // The account socket (ADR-026 C-1): the one control socket a data root has.
+    let socket = world::attach::account_socket(&data);
     assert!(
         socket.exists(),
         "PRODUCT (staging): no control socket at {} (a long path is hashed elsewhere)",
@@ -92,7 +95,30 @@ fn an_unknown_control_request_says_so() {
     s.set_read_timeout(Some(Duration::from_secs(10)))
         .expect("APPARATUS: set a read timeout");
     let hello = read_frame(&mut s, "the greeting");
-    println!("[proof] the node greeted with {} bytes", hello.len());
+    println!("[proof] the daemon greeted with {} bytes", hello.len());
+    // Act as node `default`, as every client of the account socket does first (ADR-026 C-2);
+    // the unknown request then goes to the node, as one from a client of another version would.
+    let using = vox_core::node::daemonipc::Opening::Use(vox_core::node::daemonipc::UseNode {
+        node: vox_core::node::paths::NodeName::parse(world::DEFAULT_NODE)
+            .expect("APPARATUS: a node name"),
+        attach: vox_core::node::daemonipc::AttachMode::No,
+        passphrase: None,
+        anchors: Vec::new(),
+    })
+    .to_bytes();
+    s.write_all(
+        &u32::try_from(using.len())
+            .expect("APPARATUS: a Use under 4 GiB")
+            .to_be_bytes(),
+    )
+    .unwrap_or_else(|e| panic!("PRODUCT: the daemon closed the socket before the Use: {e}"));
+    s.write_all(&using)
+        .unwrap_or_else(|e| panic!("PRODUCT: the daemon closed the socket mid-Use: {e}"));
+    let answer = read_frame(&mut s, "the answer to the Use");
+    println!(
+        "[proof] the daemon answered the Use with {} bytes",
+        answer.len()
+    );
 
     // A request with a tag no vox knows: the CBOR array [9999].
     let body = [0x81u8, 0x19, 0x27, 0x0F];

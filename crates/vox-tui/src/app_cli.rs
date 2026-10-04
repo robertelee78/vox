@@ -30,13 +30,7 @@ use crate::app::AppError;
 use crate::tunnel_cli::resolve_prefix;
 
 async fn client(paths: &Paths) -> Result<IpcClient, AppError> {
-    let sock = paths.socket_file();
-    IpcClient::open(&sock).await.map_err(|_| {
-        AppError::Usage(format!(
-            "no node answers at {} — start one with `vox daemon` (or `vox tui`)",
-            sock.display()
-        ))
-    })
+    crate::client::open(&crate::client::one_shot(paths)?).await
 }
 
 /// Resolve a room prefix against the rooms the node holds.
@@ -47,7 +41,8 @@ async fn room(c: &mut IpcClient, prefix: &str) -> Result<Digest32, AppError> {
             resolve_prefix(prefix, &ids)
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        other => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
@@ -56,7 +51,8 @@ async fn member(c: &mut IpcClient, room: Digest32, prefix: &str) -> Result<Diges
     match c.request(&Request::Roster { channel_id: room }).await {
         Ok(Frame::Members { members }) => resolve_prefix(prefix, &members),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        other => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
 
@@ -65,8 +61,8 @@ pub async fn listen(paths: &Paths, room_prefix: &str, label: &str) -> Result<(),
     let mut c = client(paths).await?;
     let room_id = room(&mut c, room_prefix).await?;
     drop(c);
-    let sock = paths.socket_file();
-    let mut listener = appipc::listen(&sock, Some(room_id), label)
+    let at = crate::client::one_shot(paths)?;
+    let mut listener = appipc::listen(&at, Some(room_id), label)
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
     eprintln!("vox app: listening for {label} in {}", short(&room_id));
@@ -75,7 +71,7 @@ pub async fn listen(paths: &Paths, room_prefix: &str, label: &str) -> Result<(),
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?
         .ok_or_else(|| AppError::Usage("the node stopped".into()))?;
-    let (stream, info) = appipc::accept(&sock, incoming.id)
+    let (stream, info) = appipc::accept(&at, incoming.id)
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
     // One stream, like `nc -l`: stop listening once it is taken.
@@ -101,9 +97,15 @@ pub async fn open(
     let room_id = room(&mut c, room_prefix).await?;
     let peer = member(&mut c, room_id, peer_prefix).await?;
     drop(c);
-    let (stream, info) = appipc::open(&paths.socket_file(), room_id, peer, labels, datagrams)
-        .await
-        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let (stream, info) = appipc::open(
+        &crate::client::one_shot(paths)?,
+        room_id,
+        peer,
+        labels,
+        datagrams,
+    )
+    .await
+    .map_err(|e| AppError::Usage(e.to_string()))?;
     eprintln!("vox app: {} to {}", info.label, b32_encode(&info.peer));
     pipe(stream, info.datagrams).await
 }

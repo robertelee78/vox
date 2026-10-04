@@ -105,11 +105,35 @@ pub fn disabled(paths: &Paths) -> bool {
         })
 }
 
+/// The program a notification is handed to instead of the desktop's, run as
+/// `<program> <title> <body>`: the node's `notify-command = <program>` setting (ADR-026 F-2: its
+/// own `config/config`, else the account's), else `VOX_NOTIFY_COMMAND`.
+///
+/// **A setting of the node, not of the process** (V030-35): several nodes share one daemon, and
+/// an environment variable would hand every node's notices to one program. The variable stays
+/// for a daemon run by hand in the foreground, whose environment is the person's own.
+#[must_use]
+pub fn command(paths: &Paths) -> Option<std::ffi::OsString> {
+    let set = std::fs::read_to_string(paths.config_file())
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with('#'))
+                .filter_map(|l| l.split_once('='))
+                .find(|(k, _)| k.trim() == "notify-command")
+                .map(|(_, v)| v.trim().to_owned())
+        })
+        .filter(|v| !v.is_empty());
+    set.map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("VOX_NOTIFY_COMMAND"))
+}
+
 /// Raise one notification. Never blocks the caller for long, and never fails it: a
 /// desktop that cannot show a notification is not a reason to stop watching.
-fn raise(note: &Note) {
+fn raise(note: &Note, command: Option<&std::ffi::OsStr>) {
     eprintln!("vox daemon: {} — {}", note.title, note.body);
-    if let Some(cmd) = std::env::var_os("VOX_NOTIFY_COMMAND") {
+    if let Some(cmd) = command {
         let _ = std::process::Command::new(cmd)
             .arg(&note.title)
             .arg(&note.body)
@@ -146,6 +170,7 @@ pub async fn watch(node: NodeHandle, paths: Paths) {
         );
         return;
     }
+    let command = command(&paths);
     let mut tracker = Tracker::default();
     let mut every = tokio::time::interval(CHECK_EVERY);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -156,7 +181,8 @@ pub async fn watch(node: NodeHandle, paths: Paths) {
         };
         for note in tracker.observe(&report.unhealthy) {
             // Off the runtime: a notification program is a child process to wait for.
-            let _ = tokio::task::spawn_blocking(move || raise(&note)).await;
+            let command = command.clone();
+            let _ = tokio::task::spawn_blocking(move || raise(&note, command.as_deref())).await;
         }
     }
 }

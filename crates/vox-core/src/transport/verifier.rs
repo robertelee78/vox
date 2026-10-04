@@ -1,32 +1,11 @@
-//! Custom rustls certificate verifiers that authenticate a peer by its Vox
-//! composite identity instead of a CA chain (ADR-011 §"Identity authentication
-//! (libp2p-style, no CA/PKI)").
+//! The rustls certificate verifiers of the **neutral handshake** (ADR-011 requirement 27): each
+//! side holds the other only to a neutral daemon leaf
+//! ([`crate::transport::identity_cert::check_neutral_leaf`]), and rustls checks, through the
+//! provider's `verify_tls13_signature`, that the peer holds that leaf's key. Which node is behind
+//! it is not a TLS question: the identity exchange ([`crate::transport::identity`]) proves it.
 //!
-//! rustls always performs the TLS-level handshake-signature check via the crypto
-//! provider; these verifiers add the Vox layer on top:
-//! 1. They do **not** consult any CA root store (there is none).
-//! 2. They run [`super::identity_cert::verify_peer_certificate`] to recover the
-//!    peer's authenticated [`CompositePublicKey`] from the leaf's identity
-//!    extension + composite PoP.
-//! 3. They require the recovered identity's fingerprint to equal the
-//!    **expected peer** (when one is pinned), aborting on mismatch — the
-//!    [`crate::wire::WireError::AuthenticatorInvalid`] (`0x05`) case of ADR-011.
-//! 4. They still delegate the TLS 1.3 handshake-signature verification to
-//!    `rustls::crypto::verify_tls13_signature` with the provider's supported
-//!    algorithms, so the cert key actually owns the handshake.
-//!
-//! The recovered fingerprint of a *completed* handshake is published through a
-//! shared cell ([`VerifiedPeer`]) so the connecting code can read who it talked
-//! to and record the session-establishment entry (tag `0x0011`).
-//!
-//! ## Why all failures collapse to one TLS error
-//! A missing extension, a malformed extension, a bad PoP, and a wrong-but-valid
-//! identity all surface to rustls as `CertificateError::ApplicationVerificationFailure`.
-//! That deliberate flattening means a network probe cannot distinguish "this peer
-//! has no Vox identity" from "this peer is the wrong Vox identity" — the same
-//! single-error discipline ADR-005's join PoP and ADR-010's at-rest unlock use.
-
-use std::sync::{Arc, Mutex};
+//! Every failure is the same flattened `ApplicationVerificationFailure`, so a probe learns nothing
+//! from which check failed.
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls13_signature, WebPkiSupportedAlgorithms};
@@ -34,153 +13,52 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{CertificateError, DigitallySignedStruct, DistinguishedName, Error, SignatureScheme};
 
-use crate::hash::Digest32;
-use crate::identity::composite::CompositePublicKey;
-use crate::transport::identity_cert::verify_peer_certificate;
+// ---------------------------------------------------------------------------
+// Neutral verifiers (ADR-011 requirement 27): the TLS handshake authenticates only the daemon.
+// ---------------------------------------------------------------------------
 
-/// A shared, write-once slot that records the peer identity a verifier
-/// authenticated, so the connecting side can read it after the handshake.
-///
-/// Each connection gets its own [`VerifiedPeer`]; the verifier writes the
-/// recovered fingerprint on success and the connecting code reads it to build the
-/// session-establishment record and to confirm the expected peer at the
-/// application layer too.
-#[derive(Clone, Debug, Default)]
-pub struct VerifiedPeer {
-    inner: Arc<Mutex<Option<Digest32>>>,
-    /// Why this end's verifier refused the peer, for this end's own error only: the wire carries
-    /// one uninformative alert whatever the reason (V210-143).
-    rejected: Arc<Mutex<Option<String>>>,
-}
-
-impl VerifiedPeer {
-    /// A fresh, empty slot.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The authenticated peer fingerprint, if the handshake completed and the
-    /// verifier accepted it.
-    #[must_use]
-    pub fn fingerprint(&self) -> Option<Digest32> {
-        // A poisoned lock can only happen if a verifier panicked while holding it;
-        // our verifiers never panic, so recover the inner value rather than
-        // propagating (this is read-only observation).
-        self.inner.lock().map_or(None, |g| *g)
-    }
-
-    fn set(&self, fp: Digest32) {
-        if let Ok(mut g) = self.inner.lock() {
-            *g = Some(fp);
-        }
-    }
-
-    /// Why this end's verifier refused the peer's certificate, if it did.
-    #[must_use]
-    pub fn rejection(&self) -> Option<String> {
-        self.rejected.lock().map_or(None, |g| g.clone())
-    }
-
-    fn reject(&self, why: String) {
-        if let Ok(mut g) = self.rejected.lock() {
-            *g = Some(why);
-        }
-    }
-}
-
-/// The first 26 base32 characters of a fingerprint, as the node's own messages name a peer.
-fn short(fp: &Digest32) -> String {
-    let full = crate::node::link::b32_encode(fp);
-    full.chars().take(26).collect()
-}
-
-/// Who a verifier requires the peer to be.
-#[derive(Clone, Debug)]
-enum Expectation {
-    /// The peer must present this exact identity fingerprint (initiator dialing a
-    /// known peer).
-    Pinned(Digest32),
-    /// Any well-formed Vox identity is accepted (a responder that does not yet know
-    /// who is dialing); the authenticated fingerprint is still recorded.
-    AnyVoxIdentity,
-}
-
-/// Authenticate `cert` as a Vox peer: recover the identity from the extension +
-/// PoP, enforce the expectation, and publish the fingerprint. Returns the rustls
-/// flattened error on any failure.
-fn authenticate(
-    cert: &CertificateDer<'_>,
-    expect: &Expectation,
-    out: &VerifiedPeer,
-) -> Result<Digest32, Error> {
-    let identity: CompositePublicKey = verify_peer_certificate(cert.as_ref()).map_err(|e| {
-        out.reject(format!(
-            "the peer's certificate carries no valid Vox identity ({e})"
+/// Accept `end_entity` as a neutral daemon leaf (see
+/// [`crate::transport::identity_cert::check_neutral_leaf`]): one self-signed Ed25519 leaf, no
+/// chain. Every failure is the same flattened TLS error.
+fn neutral(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> Result<(), Error> {
+    if !intermediates.is_empty() {
+        return Err(Error::InvalidCertificate(
+            CertificateError::ApplicationVerificationFailure,
         ));
-        Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
-    })?;
-    let fp = identity.fingerprint();
-    match expect {
-        Expectation::Pinned(expected) if &fp != expected => {
-            // Wrong identity: on the wire, the same error as "no identity", so a peer learns
-            // nothing from which check failed. This end says which (V210-143): an honest peer
-            // that answered in another's place — a port another process shares — was reported as
-            // "signature verification failed", and nothing said who had answered.
-            out.reject(format!(
-                "the peer that answered is {}, not the expected {}",
-                short(&fp),
-                short(expected)
-            ));
-            return Err(Error::InvalidCertificate(
-                CertificateError::ApplicationVerificationFailure,
-            ));
-        }
-        _ => {}
     }
-    out.set(fp);
-    Ok(fp)
+    crate::transport::identity_cert::check_neutral_leaf(end_entity.as_ref())
+        .map_err(|_| Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure))
 }
 
-// ---------------------------------------------------------------------------
-// Client-side: verify the *server's* certificate.
-// ---------------------------------------------------------------------------
-
-/// The client-side verifier (authenticates the server we dialed).
+/// The client-side verifier of a **neutral** handshake: the server proves it holds a neutral
+/// daemon leaf and nothing more. Which node answered is proved by the identity exchange
+/// ([`crate::transport::identity::dial`]), never here (ADR-011 requirements 27 and 37).
 #[derive(Debug)]
-pub struct VoxServerCertVerifier {
+pub struct NeutralServerVerifier {
     supported: WebPkiSupportedAlgorithms,
-    expect: Expectation,
-    verified: VerifiedPeer,
 }
 
-impl VoxServerCertVerifier {
-    /// A verifier pinning the server to `expected_peer` (the dialer knows whom it
-    /// wants to reach). `verified` receives the authenticated fingerprint.
+impl NeutralServerVerifier {
+    /// A verifier over the provider's signature algorithms.
     #[must_use]
-    pub fn pinned(
-        supported: WebPkiSupportedAlgorithms,
-        expected_peer: Digest32,
-        verified: VerifiedPeer,
-    ) -> Self {
-        Self {
-            supported,
-            expect: Expectation::Pinned(expected_peer),
-            verified,
-        }
+    pub fn new(supported: WebPkiSupportedAlgorithms) -> Self {
+        Self { supported }
     }
 }
 
-impl ServerCertVerifier for VoxServerCertVerifier {
+impl ServerCertVerifier for NeutralServerVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
+        intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        authenticate(end_entity, &self.expect, &self.verified)?;
+        neutral(end_entity, intermediates)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -190,8 +68,6 @@ impl ServerCertVerifier for VoxServerCertVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        // Vox transport is TLS 1.3 only (the configs pin TLS13). A 1.2 signature
-        // request should never arrive; refuse rather than accept.
         Err(Error::PeerIncompatible(
             rustls::PeerIncompatible::Tls12NotOffered,
         ))
@@ -211,60 +87,34 @@ impl ServerCertVerifier for VoxServerCertVerifier {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server-side: verify the *client's* certificate.
-// ---------------------------------------------------------------------------
-
-/// The server-side verifier (authenticates a client that dialed us). Mutual TLS
-/// is mandatory in Vox: both directions present and prove a Vox identity.
+/// The server-side verifier of a **neutral** handshake. A client certificate stays mandatory:
+/// the listener needs the dialler's daemon leaf for the dialler's process identity,
+/// `sha256(leaf ‖ instance)` (ADR-011 requirement 35).
 #[derive(Debug)]
-pub struct VoxClientCertVerifier {
+pub struct NeutralClientVerifier {
     supported: WebPkiSupportedAlgorithms,
-    expect: Expectation,
-    verified: VerifiedPeer,
 }
 
-impl VoxClientCertVerifier {
-    /// A verifier that accepts any well-formed Vox identity (the listener does not
-    /// pin who may connect; the application layer applies admission/consent after
-    /// authentication). `verified` receives the authenticated fingerprint.
+impl NeutralClientVerifier {
+    /// A verifier over the provider's signature algorithms.
     #[must_use]
-    pub fn any_identity(supported: WebPkiSupportedAlgorithms, verified: VerifiedPeer) -> Self {
-        Self {
-            supported,
-            expect: Expectation::AnyVoxIdentity,
-            verified,
-        }
-    }
-
-    /// A verifier that pins the connecting client to `expected_peer`.
-    #[must_use]
-    pub fn pinned(
-        supported: WebPkiSupportedAlgorithms,
-        expected_peer: Digest32,
-        verified: VerifiedPeer,
-    ) -> Self {
-        Self {
-            supported,
-            expect: Expectation::Pinned(expected_peer),
-            verified,
-        }
+    pub fn new(supported: WebPkiSupportedAlgorithms) -> Self {
+        Self { supported }
     }
 }
 
-impl ClientCertVerifier for VoxClientCertVerifier {
+impl ClientCertVerifier for NeutralClientVerifier {
     fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        // No CA roots — authentication is by the Vox identity extension.
         &[]
     }
 
     fn verify_client_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
+        intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        authenticate(end_entity, &self.expect, &self.verified)?;
+        neutral(end_entity, intermediates)?;
         Ok(ClientCertVerified::assertion())
     }
 

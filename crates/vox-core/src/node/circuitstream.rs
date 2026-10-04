@@ -229,24 +229,21 @@ fn origin(d: &mut Decoder<'_>) -> Result<[[u8; 16]; 3]> {
 }
 
 /// **Where the peer at the far end of `asker` is, as this relay says it to a target**: the
-/// asker's three source keys (`nat::source::Source::of_conn`), each keyed with a secret this
-/// process drew at random and cut to 16 bytes. Two asks from one place give the same tags and two
-/// from different places different ones, so the target can group what this relay carries by where
-/// it comes from; the keys are never sent and are new every run, so the target cannot work the
-/// address back out of them.
+/// asker's three source keys (`nat::source::Source::of_conn`), each keyed with a secret the
+/// relaying node drew at random ([`LocalNode::origin_key`]) and cut to 16 bytes. Two asks from one
+/// place give the same tags and two from different places different ones, so the target can group
+/// what this relay carries by where it comes from; the keys are never sent and are new every run,
+/// so the target cannot work the address back out of them. The key is the relaying node's own
+/// (ADR-026 P-1): two nodes of one process relaying for one asker give unlinkable tags, as two
+/// processes would.
+///
+/// [`LocalNode::origin_key`]: crate::transport::quic::LocalNode::origin_key
 ///
 /// # Errors
-/// If the OS CSPRNG is unavailable, the first time the key is drawn.
+/// If the MAC cannot be keyed, which a 32-byte key never fails.
 pub fn origin_tags(asker: &VoxConnection) -> Result<[[u8; 16]; 3]> {
     use hmac::{Hmac, Mac};
-    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    let key = match KEY.get() {
-        Some(key) => key,
-        None => {
-            let drawn: [u8; 32] = crate::identity::rng::random_array()?;
-            KEY.get_or_init(|| drawn)
-        }
-    };
+    let key = asker.local().origin_key();
     let levels = crate::nat::source::Source::of_conn(asker).0;
     let mut tags = [[0u8; 16]; 3];
     for (tag, level) in tags.iter_mut().zip(levels.iter()) {
@@ -283,10 +280,73 @@ pub struct CircuitLedger {
     inner: Mutex<LedgerInner>,
 }
 
+/// The relay limits of one presence (ADR-012 N-45): how many circuits it carries in all, and for
+/// any one asker. Read from the daemon's `.daemon/config` (ADR-026 F-2) as `relay-circuits = N`
+/// and `relay-circuits-per-asker = N`; either one missing keeps its default
+/// ([`MAX_RELAYED_CIRCUITS`], [`MAX_CIRCUITS_PER_ASKER`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayLimits {
+    /// Circuits carried at once, in all.
+    pub total: usize,
+    /// Circuits carried at once for any one asker.
+    pub per_asker: usize,
+}
+
+impl Default for RelayLimits {
+    fn default() -> Self {
+        Self {
+            total: MAX_RELAYED_CIRCUITS,
+            per_asker: MAX_CIRCUITS_PER_ASKER,
+        }
+    }
+}
+
+impl RelayLimits {
+    /// The limits a `.daemon/config` text sets: `key = value` lines, `#` comments; other keys
+    /// belong to other settings and are left alone.
+    ///
+    /// # Errors
+    /// A relay key whose value is not a whole number, in words naming the key and the value.
+    pub fn parse(text: &str) -> std::result::Result<Self, String> {
+        let mut limits = Self::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            let slot = match key {
+                "relay-circuits" => &mut limits.total,
+                "relay-circuits-per-asker" => &mut limits.per_asker,
+                _ => continue,
+            };
+            *slot = value.parse().map_err(|_| {
+                format!(
+                    "{key} = {value:?} in the daemon's config is not a whole number of circuits"
+                )
+            })?;
+        }
+        Ok(limits)
+    }
+
+    /// The limits in the file at `path`; the defaults when there is no such file.
+    ///
+    /// # Errors
+    /// As [`Self::parse`], with the file named.
+    pub fn read(path: &std::path::Path) -> std::result::Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Err(_) => Ok(Self::default()),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct LedgerInner {
     total: usize,
     per_asker: BTreeMap<Digest32, usize>,
+    /// The limits set for this ledger; `None` is the default.
+    limits: Option<RelayLimits>,
 }
 
 /// One relayed circuit's place in the ledger.
@@ -302,7 +362,8 @@ impl CircuitLedger {
     pub fn take(self: &Arc<Self>, asker: Digest32) -> Option<CircuitSlot> {
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let mine = g.per_asker.get(&asker).copied().unwrap_or(0);
-        if g.total >= MAX_RELAYED_CIRCUITS || mine >= MAX_CIRCUITS_PER_ASKER {
+        let limits = g.limits.unwrap_or_default();
+        if g.total >= limits.total || mine >= limits.per_asker {
             return None;
         }
         g.total += 1;
@@ -311,6 +372,24 @@ impl CircuitLedger {
             asker,
             ledger: Arc::clone(self),
         })
+    }
+
+    /// Hold this ledger to `limits` from now on (circuits already carried stay).
+    pub fn set_limits(&self, limits: RelayLimits) {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .limits = Some(limits);
+    }
+
+    /// The limits this ledger holds to.
+    #[must_use]
+    pub fn limits(&self) -> RelayLimits {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .limits
+            .unwrap_or_default()
     }
 
     /// How many circuits are being carried right now.
@@ -453,18 +532,29 @@ where
 /// How many circuits this process has asked a relay for, per target peer (`vox status --json`'s
 /// `reach.circuits`, V210-53, #232). Counted here, in the one function every outbound circuit
 /// goes through — the ladder's circuit rung and `NodeNet::circuit_through` alike — so a second
-/// circuit to one peer shows however it was opened. One process is one node, so a process-wide
-/// count is that node's.
-static OUTBOUND_CIRCUITS: std::sync::Mutex<BTreeMap<Digest32, u64>> =
+/// circuit to one peer shows however it was opened. A process may host several nodes (ADR-026
+/// P-1), so each count is kept under (the node that asked, the target).
+static OUTBOUND_CIRCUITS: std::sync::Mutex<BTreeMap<(Digest32, Digest32), u64>> =
     std::sync::Mutex::new(BTreeMap::new());
 
-/// This node's outbound circuit count per target peer, counted in [`connect_through`].
+/// The node `local`'s outbound circuit count per target peer, counted in [`connect_through`].
 #[must_use]
-pub fn outbound_circuits() -> BTreeMap<Digest32, u64> {
+pub fn outbound_circuits(local: &Digest32) -> BTreeMap<Digest32, u64> {
     OUTBOUND_CIRCUITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+        .iter()
+        .filter(|((l, _), _)| l == local)
+        .map(|((_, peer), n)| (*peer, *n))
+        .collect()
+}
+
+/// Drop the node `local`'s outbound circuit counts: it has left this process for good.
+pub fn forget_node(local: &Digest32) {
+    OUTBOUND_CIRCUITS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(l, _), _| l != local);
 }
 
 /// Ask `relay` for a circuit to `peer` and, once it is up, dial `peer` through it.
@@ -481,7 +571,7 @@ pub async fn connect_through(
     *OUTBOUND_CIRCUITS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(peer)
+        .entry((endpoint.local_id(), peer))
         .or_default() += 1;
     match opening_answer(&mut recv).await? {
         CircuitFrame::Opened => {}

@@ -70,7 +70,7 @@ serde_json.workspace = true
 semver.workspace = true
 # The LAN helper passes its utun descriptor over a socket: `net`. `vox daemon` asks for its
 # passphrase with echo off and the terminal otherwise as it was (V210-153): `termios`.
-rustix = { workspace = true, features = ["net", "termios"] }
+rustix = { workspace = true, features = ["net", "termios", "process"] }
 # ADR-021 §6: a minted operation id is 128 bits of OS randomness.
 getrandom.workspace = true
 
@@ -79,6 +79,11 @@ getrandom.workspace = true
 # nix's safe wrappers so `#![forbid(unsafe_code)]` holds.
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
+
+# A daemon a client starts closes every descriptor it inherited past stdio (ADR-026 S-2), with
+# nix's safe `close`, so `#![forbid(unsafe_code)]` holds on Linux too.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]

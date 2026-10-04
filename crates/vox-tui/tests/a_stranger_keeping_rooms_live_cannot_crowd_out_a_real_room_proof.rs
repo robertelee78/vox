@@ -216,13 +216,13 @@ impl Networks {
 
 /// Connect as `signer` from `local` to the node at `addr`, pinned to `id`.
 async fn connect_from(
-    signer: &SoftwareRootSigner,
+    signer: &Arc<SoftwareRootSigner>,
     local: SocketAddr,
     addr: SocketAddr,
     id: Digest32,
 ) -> (VoxEndpoint, Arc<VoxConnection>) {
-    let endpoint =
-        VoxEndpoint::bind(signer, local).expect("APPARATUS: bind the stand-in peer's endpoint");
+    let endpoint = VoxEndpoint::bind(Arc::clone(signer) as Arc<_>, local)
+        .expect("APPARATUS: bind the stand-in peer's endpoint");
     let conn = endpoint
         .connect(addr, id, hostile::now())
         .await

@@ -18,9 +18,10 @@
 //! request whose echo payload crossed the forward rode the direct path; one whose payload did not
 //! rode the anchor's circuit.
 //!
-//! **Cold, each sample.** Each sample starts a **new** `vox up` on a **new** port, so no connection
-//! and no forward mapping carries over; the last one was stopped with Ctrl-C (by PID), so the host
-//! was told it went away. The two production-Argon2id unlocks `vox up` does before it can take a
+//! **Cold, each sample.** Each sample starts a **new** `vox up`, so no connection carries over; the
+//! last one was stopped with Ctrl-C (by PID), so the host was told it went away. It sends from the
+//! port the guest's node keeps from run to run (ADR-026 D-3), as a person's would, so the forward's
+//! mapping for that source is the one the last sample used. The two production-Argon2id unlocks `vox up` does before it can take a
 //! request are outside the clock, as a person waits for them at the prompt. The clock starts at the
 //! earlier of the moment `vox up` says it is up and the first datagram of that `vox up` at the
 //! forward — so a dial the node begins by itself, before anyone asks, is on the clock too.
@@ -695,6 +696,7 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
     let mut requests = 0usize;
     for i in 0..SAMPLES {
         let before = w.forward.sources();
+        let spawned = Instant::now();
         let (mut up, proxy, ready) = w.up(&format!("up-{i}"));
 
         // First request: the proxy holds the CONNECT until it has a path (HOST_PATIENCE).
@@ -744,15 +746,23 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
         }
 
         // The clock's start: `vox up` ready, or its first datagram at the forward if that was
-        // earlier (a dial begun before anyone asked).
-        let new: Vec<Instant> = w
-            .forward
-            .sources()
-            .into_iter()
-            .filter(|(src, _)| !before.contains_key(src))
-            .map(|(_, at)| at)
-            .collect();
-        let first_dgram = new.iter().min().copied();
+        // earlier (a dial begun before anyone asked). **Its first datagram is the first to arrive
+        // after it was started, from whatever source**: a node keeps its UDP port from run to run
+        // (ADR-026 D-3, V210-167), so a new `vox up` sends from the address the last one did, and
+        // "a source the forward had not seen" found none (#410).
+        let first = w.forward.first_since(spawned);
+        let first_dgram = first.map(|(at, _)| at);
+        if let Some((_, src)) = first {
+            eprintln!(
+                "[proof] sample {i}: the first datagram at the forward came from {src}, {} \
+                 before",
+                if before.contains_key(&src) {
+                    "a source seen"
+                } else {
+                    "a source not seen"
+                }
+            );
+        }
         let t0 = match first_dgram {
             Some(d) if d < ready => {
                 dialled_before_ready += 1;
@@ -778,6 +788,27 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
             },
             direct_at.map_or_else(|| "NEVER".to_owned(), |_| format!("{d:?}"))
         );
+        // **A slow sample says what each side noticed** (the guest's `vox up` and its daemon, the
+        // host), times from this sample's ready, so a red names its cause rather than a number.
+        if a >= TARGET || d >= TARGET {
+            for l in up.said_since(ready) {
+                eprintln!("[proof]   up-{i} said: {l}");
+            }
+            for l in w.host.said_since(ready) {
+                eprintln!("[proof]   the host said: {l}");
+            }
+            let log = std::fs::read_to_string(w.guest_dir.join(".daemon/log")).unwrap_or_default();
+            for l in log
+                .lines()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                eprintln!("[proof]   the guest's daemon log: {l}");
+            }
+        }
         any.push(a);
         direct.push(d);
         // The circuits this `vox up` asked a relay for, to the host it could reach directly.

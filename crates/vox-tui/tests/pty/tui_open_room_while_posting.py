@@ -23,7 +23,7 @@ import os, subprocess, sys, threading, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pyte, stage, is_attached  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, POST_ROOM, OPEN_ROOM, TAG = sys.argv[1:9]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
@@ -80,7 +80,7 @@ try:
 
     tui.pump(3)
     tui.key(IDPASS + "\r", 1)
-    if not tui.until(lambda: "unlocked" in status(), 90):
+    if not tui.until(lambda: is_attached(status()), 90):
         print(f"{TAG} RED: PRODUCT (staging): the TUI never unlocked within 90 s:\n{tui.text()}")
         sys.exit(1)
     stage("the post room answers through the TUI's socket")

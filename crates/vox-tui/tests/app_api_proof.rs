@@ -833,7 +833,7 @@ fn an_untrusted_refusal_is_the_unknown_kind_refusal() {
             .signer_arc()
             .expect("CANNOT MEASURE: mallory's signer");
         let ep = vox_core::transport::quic::VoxEndpoint::bind(
-            &*signer,
+            signer.clone(),
             "127.0.0.1:0".parse().expect("APPARATUS: an address"),
         )
         .expect("CANNOT MEASURE: the attacker's endpoint binds");
@@ -1260,7 +1260,7 @@ fn a_datagram_for_no_flow_or_an_unknown_context_is_dropped_and_counted() {
             .expect("CANNOT MEASURE: bob's identity unlocks");
         let signer = profile.signer_arc().expect("CANNOT MEASURE: bob's signer");
         let ep = vox_core::transport::quic::VoxEndpoint::bind(
-            &*signer,
+            signer.clone(),
             "127.0.0.1:0".parse().expect("APPARATUS: an address"),
         )
         .expect("CANNOT MEASURE: the attacker's endpoint binds");

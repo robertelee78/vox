@@ -48,6 +48,11 @@ pub enum StreamKind {
     /// every member it can reach, and its client says "you hold it" only when every one folds to
     /// that claim. See `node::agreestream`. Members only. Not 9, which [`StreamKind::App`] takes.
     Agree = 10,
+    /// **The identity exchange** (ADR-011 requirement 28): the first client-opened stream of every
+    /// connection, carrying `ASK`, `PROVE` and `CLAIM` (`transport::identity`). It is never
+    /// dispatched: a stream that opens with this kind after the exchange closes the connection
+    /// (requirement 33).
+    Identity = 11,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -69,6 +74,7 @@ impl StreamKind {
             8 => Some(Self::Goodbye),
             9 => Some(Self::App),
             10 => Some(Self::Agree),
+            11 => Some(Self::Identity),
             _ => None,
         }
     }

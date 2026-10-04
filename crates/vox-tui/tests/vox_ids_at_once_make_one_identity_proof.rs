@@ -31,6 +31,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -41,7 +44,7 @@ const TRIALS: usize = 20;
 /// `vox id`s started together on each.
 const AT_ONCE: usize = 3;
 /// What the loser of the race says.
-const CONCURRENT: &str = "another vox created this profile's identity at the same time";
+const CONCURRENT: &str = "another vox created this node's identity at the same time";
 /// What a run says that finds the winner still holding the profile: one serving it, or one that
 /// has not finished.
 const BUSY: [&str; 2] = [
@@ -84,7 +87,14 @@ fn leftovers(dir: &Path) -> Vec<String> {
                 .filter(|n| n.contains(".orphaned-") || n == "vault.tmp")
                 .collect()
         })
-        .unwrap_or_default()
+        // A directory that is not there holds no leftover only because it is not where `vox`
+        // keeps them: that reads clean and measures nothing.
+        .unwrap_or_else(|e| {
+            panic!(
+                "PRODUCT (staging): no node directory at {}: {e}",
+                dir.display()
+            )
+        })
 }
 
 #[test]
@@ -125,7 +135,7 @@ fn vox_ids_started_at_once_make_one_identity_and_report_only_it() {
             .output()
             .unwrap_or_else(|e| panic!("APPARATUS: could not run the later vox id: {e}"));
         let held = String::from_utf8_lossy(&later.stdout).trim().to_owned();
-        let left = leftovers(&data.join("default"));
+        let left = leftovers(&layout::node_dir(&data, layout::DEFAULT_NODE));
         let oks = outs.iter().filter(|o| o.0).count();
         eprintln!(
             "[proof] trial {trial}: {oks}/{AT_ONCE} exited 0; later vox id ok={} {held}; leftovers {left:?}",
