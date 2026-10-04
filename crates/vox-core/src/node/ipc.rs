@@ -2830,6 +2830,10 @@ pub struct Lease {
     pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
     /// A request the daemon serves itself, beyond the node's vocabulary, if it has one.
     pub extension: Option<std::sync::Arc<dyn Extension>>,
+    /// What attaching the node said, when this `Use` attached it ([`DaemonFrame::Using`]).
+    ///
+    /// [`DaemonFrame::Using`]: crate::node::daemonipc::DaemonFrame::Using
+    pub notes: Vec<String>,
 }
 
 /// A request the daemon's own build serves on a node's connection, beyond what this crate knows:
@@ -3004,10 +3008,12 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
         detached,
         hold,
         extension,
+        notes,
     } = lease;
     let using = crate::node::daemonipc::DaemonFrame::Using {
         node: node.clone(),
         me: handle.view().identity.map(|i| i.fingerprint),
+        notes,
     };
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
     let mut held = Held::default();
@@ -4011,6 +4017,8 @@ pub struct IpcClient {
     /// The node this connection acts as on the daemon's socket (ADR-026 C-2), which a check on a
     /// waiting request names in its own `Use`; `None` for a node's own socket.
     node: Option<crate::node::paths::NodeName>,
+    /// What attaching the node said, when this connection's `Use` attached it.
+    notes: Vec<String>,
 }
 
 /// Where a client of the daemon reaches its node (ADR-026 C-2): the account's one socket, and the
@@ -4066,6 +4074,16 @@ impl NodeSocket {
 /// As [`crate::node::daemonipc::DaemonClient::open`]; [`IpcHandshake::Refused`], in the daemon's
 /// words, when it refuses the `Use`; [`IpcHandshake::NotHello`] for any other answer.
 pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> {
+    open_as_noting(at).await.map(|(s, me, _)| (s, me))
+}
+
+/// [`open_as`], with what attaching the node said when this `Use` attached it.
+///
+/// # Errors
+/// As [`open_as`].
+pub async fn open_as_noting(
+    at: &NodeSocket,
+) -> Result<(UnixStream, Option<Digest32>, Vec<String>)> {
     use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
     let DaemonClient { mut stream, .. } = DaemonClient::open(&at.path).await?;
     // Wiped once sent: it may carry the identity passphrase (C-6).
@@ -4078,7 +4096,7 @@ pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> 
         return Err(hung_up(&at.path).await);
     };
     match DaemonFrame::from_bytes(&answer)? {
-        DaemonFrame::Using { me, .. } => Ok((stream, me)),
+        DaemonFrame::Using { me, notes, .. } => Ok((stream, me, notes)),
         DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
             reason: r.to_string(),
         })),
@@ -4183,11 +4201,12 @@ impl IpcClient {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         match DaemonFrame::from_bytes(&answer)? {
-            DaemonFrame::Using { me, node } => Ok(Ok(Self {
+            DaemonFrame::Using { me, node, notes } => Ok(Ok(Self {
                 stream,
                 me,
                 path: path.to_owned(),
                 node: Some(node),
+                notes,
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
@@ -4238,6 +4257,7 @@ impl IpcClient {
             me,
             path: path.to_owned(),
             node: None,
+            notes: Vec::new(),
         })
     }
 
@@ -4246,13 +4266,21 @@ impl IpcClient {
     /// # Errors
     /// As [`open_as`].
     pub async fn open_at(at: &NodeSocket) -> Result<Self> {
-        let (stream, me) = open_as(at).await?;
+        let (stream, me, notes) = open_as_noting(at).await?;
         Ok(Self {
             stream,
             me,
             path: at.path.clone(),
             node: Some(at.using.node.clone()),
+            notes,
         })
+    }
+
+    /// What attaching the node said, when this connection's `Use` attached it: for a verb that
+    /// holds a session to print in the person's own terminal (PRD-001 R23, R36).
+    #[must_use]
+    pub fn attach_notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// Send one request and read its answer.

@@ -22,7 +22,8 @@
 //!   why, and that it carries on.
 //! - alice's `vox daemon` **starts** (answers `vox room list`) and says it carries on; she
 //!   `vox room create`s a room, posts in it, and `vox room invite`s.
-//! - bob **`vox connect`s** with that address and the room passphrase, and exits 0.
+//! - bob **`vox connect`s** with that address and the room passphrase, and exits 0, saying in his
+//!   own terminal what the attach of his node said (the daemon it started logs it too).
 //! - bob's `vox daemon` starts, and bob **reads alice's post** with `vox room read` — the room
 //!   reached him directly, with no anchor anywhere.
 //! - bob's **`vox tui`** unlocks, opens the room and closes it (`tests/pty/tui_close_room.py`).
@@ -45,7 +46,8 @@
 //!
 //! **The mutation that must turn it red:** the daemon's attach (`host.rs`) dropping what the
 //! anchors file skipped again, as it did from the daemon re-architecture until #410: the trust
-//! arm turns red as PRODUCT, nothing having said the file. And for the
+//! arm turns red as PRODUCT, nothing having said the file. And `client::hold` no longer printing
+//! the attach's notes: bob's `vox connect` arm turns red as PRODUCT, his terminal told nothing. And for the
 //! "waits on" half: `vox tui` sleeping before it draws when its anchors file names no usable
 //! anchor must turn the TUI arm red as PRODUCT, not CANNOT MEASURE. And for the last arm: the
 //! `BoardUnreachable` advice saying "the anchor could not be reached … check `vox node`" again
@@ -401,18 +403,23 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         "bob-connect",
     );
     let status = connect.exited_within(CONNECT_WITHIN);
-    let said = format!("{}{}", connect.said(), daemon_log(&bob, at));
+    // **In bob's own terminal** (R23, R36): the daemon `vox connect` started writes only to its
+    // log, so the verb that attached the node prints what the attach said.
+    let said = connect.said();
+    let logged = daemon_log(&bob, at);
     println!(
-        "[proof] bob's vox connect: exited {status:?} after {:?}; it or the daemon it started said \
-         it carries on: {}",
+        "[proof] bob's vox connect: exited {status:?} after {:?}; said it carries on in his \
+         terminal: {}; the daemon it started logged it: {}",
         t0.elapsed(),
-        carries_on(&said, &bob_file)
+        carries_on(&said, &bob_file),
+        carries_on(&logged, &bob_file)
     );
     assert!(
         status.is_some_and(|s| s.success()) && carries_on(&said, &bob_file),
         "PRODUCT: bob's `vox connect` to alice, who is directly reachable, with an anchors file \
-         that names no usable anchor, must join (exit 0), and it or the daemon it started must say \
-         it carries on; it exited {status:?} within {CONNECT_WITHIN:?}; they said:\n{said}"
+         that names no usable anchor, must join (exit 0) and say in his terminal that it carries \
+         on; it exited {status:?} within {CONNECT_WITHIN:?} and said:\n{said}\nthe daemon it \
+         started logged:\n{logged}"
     );
     drop(connect);
 

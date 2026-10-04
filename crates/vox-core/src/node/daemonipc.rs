@@ -380,6 +380,10 @@ pub enum DaemonFrame {
         node: NodeName,
         /// Its identity's fingerprint, or `None` if it has none yet.
         me: Option<Digest32>,
+        /// What attaching the node said, when this `Use` attached it: each line the daemon also
+        /// logs (a skipped anchors line, a node carrying on with no anchor), for the client to
+        /// print in the person's own terminal (PRD-001 R23, R36). Empty when it was attached.
+        notes: Vec<String>,
     },
     /// The `Use` or request was refused.
     Refused(Refusal),
@@ -811,9 +815,10 @@ impl DaemonFrame {
                     .uint(u64::from(*pid));
                 put_infos(&mut e, attached);
             }
-            DaemonFrame::Using { node, me } => {
-                e.array(3).uint(T_USING).text(node.as_str());
+            DaemonFrame::Using { node, me, notes } => {
+                e.array(4).uint(T_USING).text(node.as_str());
                 put_fp(&mut e, me.as_ref());
+                put_texts(&mut e, notes);
             }
             DaemonFrame::Refused(r) => {
                 e.array(2).uint(T_REFUSED);
@@ -891,9 +896,10 @@ impl DaemonFrame {
                     attached,
                 }
             }
-            (T_USING, 3) => DaemonFrame::Using {
+            (T_USING, 4) => DaemonFrame::Using {
                 node: name(&mut d, "ipc using node")?,
                 me: fp(&mut d, "ipc using identity")?,
+                notes: texts(&mut d, "ipc using notes")?,
             },
             (T_REFUSED, 2) => DaemonFrame::Refused(refusal(&mut d)?),
             (T_NODES, 2) => DaemonFrame::Nodes(infos(&mut d)?),
@@ -1204,10 +1210,12 @@ mod tests {
             DaemonFrame::Using {
                 node: n("a"),
                 me: None,
+                notes: Vec::new(),
             },
             DaemonFrame::Using {
                 node: n("a"),
                 me: Some([1u8; 32]),
+                notes: vec!["a note".into(), "another".into()],
             },
             DaemonFrame::Nodes(vec![
                 info("a", NodeState::Detached),
