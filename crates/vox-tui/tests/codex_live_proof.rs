@@ -5,10 +5,13 @@
 //! trusts Vox's entry and nothing else. It cannot prove the entry then *fires*: that takes a
 //! model turn, and a sign-in. This proof takes both, on the decider's request (2026-10-03):
 //!
-//! 1. a real `vox daemon`, a room made with `vox room create`, and a codeword posted into it
-//!    with `vox room post` — a token that appears nowhere in the prompt, the hook entry or Codex;
+//! 1. the agent's own node, made as its skill says (`vox node create`, ADR-026 N-6), attached with
+//!    `vox node attach`, which starts the account's daemon; a room made with `vox room create`,
+//!    and a codeword posted into it with `vox room post` — a token that appears nowhere in the
+//!    prompt, the hook entry or Codex;
 //! 2. two isolated `CODEX_HOME`s, each holding exactly the `hooks.json` that `vox agent plugin
-//!    codex` prints, and nothing of the operator's Codex configuration;
+//!    codex --node <node>` prints (`vox agent hook --node <node>`, ADR-020 2.1), and nothing of
+//!    the operator's Codex configuration;
 //! 3. `vox agent trust codex` run against one of them alone, and Codex's own `hooks/list` asked
 //!    in both: `trusted` in one, `untrusted` in the other;
 //! 4. one `codex exec` turn in each, the same prompt, which asks for a codeword if the context
@@ -37,6 +40,12 @@
 //! sign-in is within an hour of that age, and after each turn reports, by comparison alone, if
 //! Codex rewrote the copy.
 //!
+//! **A dry run stops before Codex.** With `VOX_PROOF_STOP_BEFORE_CODEX=1` the proof does its
+//! setup, the sign-in's age check, the node, daemon, room and codeword, both homes, and the
+//! sandbox's canary probe, then stops before the first thing that starts Codex (`vox agent trust
+//! codex`, which runs Codex's app-server) and before the sign-in is copied anywhere. It says
+//! `STOPPED BEFORE CODEX` and passes.
+//!
 //! **Never a login screen.** `codex exec` does not prompt; a turn that fails for want of a
 //! sign-in is `CANNOT MEASURE`, and the run stops there.
 //!
@@ -63,25 +72,54 @@ mod oc_sandbox;
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
-const IDENTITY: &str = "identity passphrase";
+/// The agent's own node (ADR-026 N-6): `<harness>-<host>`, as the skill names it.
+const NODE: &str = "codex-proof";
 
 /// What the model is asked: tiny, and naming no codeword.
 const PROMPT: &str = "If your context contains a Vox room message with a codeword, reply with \
                       only that codeword. Otherwise reply with only the word none. Do not run \
                       any command.";
 
-/// A `vox daemon`, killed by its own PID when dropped.
-struct Daemon(Child);
+/// The daemon `vox node attach` started for the run's data root, stopped by its own PID (the
+/// one in `.daemon/lock`) when dropped.
+struct Daemon(PathBuf);
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let pid = std::fs::read_to_string(self.0.join(".daemon/lock"))
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok());
+        if let Some(pid) = pid {
+            let _ = Command::new("/bin/kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(15)
+                && Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
     }
+}
+
+/// A dry run (`VOX_PROOF_STOP_BEFORE_CODEX=1`): everything up to the first thing that starts Codex.
+fn dry_run() -> bool {
+    std::env::var("VOX_PROOF_STOP_BEFORE_CODEX").is_ok_and(|v| v == "1")
+}
+
+/// Whether a Codex sign-in last refreshed at `refreshed` (Unix seconds) is too close to Codex's
+/// eight-day refresh at `now` to run a turn: within an hour of it, or past it.
+fn too_close_to_refresh(refreshed: u64, now: u64) -> bool {
+    now.saturating_sub(refreshed) >= 8 * 86_400 - 3_600
 }
 
 fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, String, String) {
@@ -89,8 +127,11 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
-        // In the environment, not argv: a command line is world-readable (ADR-015).
-        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        // The agent's node has no passphrase (ADR-026 N-6): its hook, in Codex's cleared
+        // environment, attaches it with none.
+        .env("VOX_IDENTITY_PASSPHRASE", "")
+        .env("VOX_NODE", NODE)
+        .env("VOX_LISTEN", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(if input.is_some() {
@@ -233,14 +274,14 @@ fn trust_status(codex: &Path, h: &CodexHome, path: &str, data: &Path, cfg: &Path
         .into_iter()
         .flatten()
         .flat_map(|d| d["hooks"].as_array().cloned().unwrap_or_default())
-        .filter(|h| h["command"] == "vox agent hook")
+        .filter(|h| h["command"] == format!("vox agent hook --node {NODE}"))
         .map(|h| h["trustStatus"].as_str().unwrap_or_default().to_owned())
         .collect();
     assert_eq!(
         statuses.len(),
         1,
-        "PRODUCT: Codex must list exactly one `vox agent hook` entry from what `vox agent plugin \
-         codex` prints; it lists {statuses:?}"
+        "PRODUCT: Codex must list exactly one `vox agent hook --node {NODE}` entry from what `vox \
+         agent plugin codex --node {NODE}` prints; it lists {statuses:?}"
     );
     statuses[0].clone()
 }
@@ -326,13 +367,21 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_else(|e| panic!("APPARATUS: the clock is before 1970: {e}"))
             .as_secs();
-        let age = now.saturating_sub(epoch_of(stamp));
+        let refreshed = epoch_of(stamp);
+        let age = now.saturating_sub(refreshed);
         println!(
             "[proof] Codex's sign-in was last refreshed {}h ago",
             age / 3600
         );
+        // A dry run starts no Codex and copies no sign-in, so it says the refusal and goes on.
+        if dry_run() && too_close_to_refresh(refreshed, now) {
+            println!(
+                "[proof] a live run would refuse here now: the sign-in is within an hour of \
+                 Codex's eight-day refresh, or past it"
+            );
+        }
         assert!(
-            age < 8 * 86_400 - 3_600,
+            dry_run() || !too_close_to_refresh(refreshed, now),
             "CANNOT MEASURE: Codex's sign-in is within an hour of its eight-day refresh; a refresh \
              inside the sandbox would rotate the operator's token. Run any Codex turn yourself \
              first, then this proof"
@@ -359,38 +408,21 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         .unwrap_or_else(|e| panic!("APPARATUS: cannot copy vox into the run: {e}"));
     let path = format!("{}:{}", bin.display(), oc_sandbox::SANDBOX_PATH);
 
-    // ---- a real daemon, a real room, and a codeword only the room knows ----
-    let (ok, fp, err) = vox(&data, &cfg, &["id"], None);
+    // ---- the agent's own node, its daemon, a real room, and a codeword only the room knows ----
+    let (ok, out, err) = vox(&data, &cfg, &["node", "create", NODE], None);
+    assert!(ok, "PRODUCT: `vox node create {NODE}` failed: {out}{err}");
+    let (ok, out, err) = vox(&data, &cfg, &["node", "attach", NODE], None);
+    let _daemon = Daemon(data.clone());
     assert!(
-        ok && fp.trim().len() == 52,
-        "PRODUCT: `vox id` did not make an identity: {fp:?} {err}"
-    );
-    let pass = root.join("identity.pass");
-    std::fs::write(&pass, format!("{IDENTITY}\n"))
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the passphrase file: {e}"));
-    let _daemon = Daemon(
-        Command::new(VOX)
-            .args(["daemon", "--listen", "127.0.0.1:0"])
-            .env("VOX_DATA_DIR", &data)
-            .env("VOX_CONFIG_DIR", &cfg)
-            .env_remove("VOX_ROOM")
-            .stdin(Stdio::from(std::fs::File::open(&pass).unwrap_or_else(
-                |e| panic!("APPARATUS: cannot open the passphrase file: {e}"),
-            )))
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(
-                std::fs::File::create(root.join("daemon.err"))
-                    .unwrap_or_else(|e| panic!("APPARATUS: cannot make daemon.err: {e}")),
-            ))
-            .spawn()
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox daemon`: {e}")),
+        ok,
+        "PRODUCT (staging): `vox node attach {NODE}` (which starts the daemon) failed: {out}{err}"
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     while !vox(&data, &cfg, &["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): the daemon never answered; its stderr: {:?}",
-            std::fs::read_to_string(root.join("daemon.err")).unwrap_or_default()
+            "PRODUCT (staging): the daemon never answered; its log: {:?}",
+            std::fs::read_to_string(data.join(".daemon/log")).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -437,18 +469,70 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
 
     // ---- two isolated Codex homes, each with exactly what `vox agent plugin codex` prints ----
     let plugin = Command::new(VOX)
-        .args(["agent", "plugin", "codex"])
+        .args(["agent", "plugin", "codex", "--node", NODE])
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin codex: {e}"));
     assert!(
         plugin.status.success(),
-        "PRODUCT: `vox agent plugin codex` failed"
+        "PRODUCT: `vox agent plugin codex --node {NODE}` failed"
     );
     let trusted = CodexHome::new(&root, "trusted");
     let untrusted = CodexHome::new(&root, "untrusted");
     for h in [&trusted, &untrusted] {
         std::fs::write(h.codex_home.join("hooks.json"), &plugin.stdout)
             .unwrap_or_else(|e| panic!("APPARATUS: cannot write hooks.json: {e}"));
+    }
+
+    // ---- the sandbox, probed against the canary before any turn ----
+    let canary = oc_sandbox::Canary::plant();
+    let profile = root.join("codex.sb");
+    std::fs::write(
+        &profile,
+        oc_sandbox::sandbox_profile(&[&root], &[&codex_release]),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox profile: {e}"));
+    oc_sandbox::probe_profile(&profile, &canary, "codex");
+
+    // ---- a dry run stops here: nothing above started Codex or copied its sign-in ----
+    if dry_run() {
+        // What the trusted turn's hook will run, run here the way Codex would run it: the
+        // printed command, under the same sandbox and the same cleared environment, with a
+        // hook input as Codex sends one. It reaches the daemon and drains the codeword.
+        let command = format!("vox agent hook --node {NODE}");
+        let mut hook = trusted.command(Path::new("/usr/bin/sandbox-exec"), &path, &data, &cfg);
+        hook.arg("-f")
+            .arg(&profile)
+            .args(["/bin/sh", "-c", &command])
+            .current_dir(&work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = hook
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run the hook in the sandbox: {e}"));
+        let _ = child
+            .stdin
+            .take()
+            .map(|mut i| i.write_all(br#"{"session_id":"dry-run","turn_id":"t1"}"#));
+        let out = child
+            .wait_with_output()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot collect the hook's output: {e}"));
+        let drained = String::from_utf8_lossy(&out.stdout).into_owned();
+        canary.check(&drained, "the sandboxed hook's output");
+        assert!(
+            out.status.success() && drained.contains(&codeword),
+            "PRODUCT: `{command}`, run as Codex would run it in the sandbox, did not drain the \
+             room's codeword: {drained}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        println!(
+            "[proof] the printed hook, run in the sandbox as Codex runs it, drained {codeword}"
+        );
+        println!(
+            "[proof] STOPPED BEFORE CODEX: node {NODE}, daemon, room {room}, codeword, both homes \
+             and the sandbox probe are ready; no Codex was started and no sign-in was copied"
+        );
+        return;
     }
 
     // ---- the trust grant, in one home alone; Codex's own answer for both ----
@@ -475,16 +559,6 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         u, "untrusted",
         "APPARATUS (precondition not met): the untrusted home's entry is not untrusted"
     );
-
-    // ---- the sandbox, probed against the canary before any turn ----
-    let canary = oc_sandbox::Canary::plant();
-    let profile = root.join("codex.sb");
-    std::fs::write(
-        &profile,
-        oc_sandbox::sandbox_profile(&[&root], &[&codex_release]),
-    )
-    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox profile: {e}"));
-    oc_sandbox::probe_profile(&profile, &canary, "codex");
 
     // ---- one turn in each home ----
     let turn = |h: &CodexHome, name: &str| -> Turn {
@@ -606,4 +680,18 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         t.answer.trim()
     );
     println!("[proof] trusted turn: the model answered with the codeword {codeword}");
+}
+
+/// The refusal near Codex's token refresh, at its edges: a sign-in refreshed 8 days less 61
+/// minutes ago runs; 8 days less 59 minutes, 8 days, and later, refuse. Pure arithmetic; no
+/// Codex, no model.
+#[test]
+fn a_sign_in_within_an_hour_of_its_refresh_is_refused() {
+    let now = 2_000_000_000;
+    let day = 86_400;
+    assert!(!too_close_to_refresh(now - (8 * day - 61 * 60), now));
+    assert!(too_close_to_refresh(now - (8 * day - 59 * 60), now));
+    assert!(too_close_to_refresh(now - 8 * day, now));
+    assert!(too_close_to_refresh(now - 9 * day, now));
+    assert!(!too_close_to_refresh(now, now));
 }
