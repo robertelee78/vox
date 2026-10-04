@@ -3964,6 +3964,10 @@ pub struct NodeSocket {
     pub path: PathBuf,
     /// What each connection opens with.
     pub using: crate::node::daemonipc::UseNode,
+    /// Called once if the daemon has not greeted within a second
+    /// ([`crate::node::daemonipc::DaemonClient::open_noting`]); the caller says the wait where its
+    /// user sees it.
+    pub waiting: Option<fn()>,
 }
 
 impl std::fmt::Debug for NodeSocket {
@@ -3989,6 +3993,7 @@ impl NodeSocket {
                 passphrase: None,
                 anchors: Vec::new(),
             },
+            waiting: None,
         }
     }
 
@@ -3996,7 +4001,10 @@ impl NodeSocket {
     /// opens, and every connection after the first of a held verb, whose first holds it.
     #[must_use]
     pub fn attached_only(&self) -> Self {
-        Self::one_shot(self.path.clone(), self.using.node.clone())
+        Self {
+            waiting: self.waiting,
+            ..Self::one_shot(self.path.clone(), self.using.node.clone())
+        }
     }
 }
 
@@ -4009,7 +4017,7 @@ impl NodeSocket {
 /// words, when it refuses the `Use`; [`IpcHandshake::NotHello`] for any other answer.
 pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> {
     use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
-    let DaemonClient { mut stream, .. } = DaemonClient::open(&at.path).await?;
+    let DaemonClient { mut stream, .. } = DaemonClient::open_noting(&at.path, at.waiting).await?;
     // Wiped once sent: it may carry the identity passphrase (C-6).
     let opening = zeroize::Zeroizing::new(Opening::Use(at.using.clone()).to_bytes());
     if let Err(e) = write_frame(&mut stream, &opening).await {
