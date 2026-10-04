@@ -2,19 +2,15 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Withdrawn (2026-09-24, PRD-001 R43). Deniable mode was never enabled in any release.
-The code is removed on integrate/v0.3.0 (`crates/vox-core/src/deniable/` is gone, b0f82185). Only
-the requirements below bind: they say what remains on the wire so existing rooms keep their names.
-The withdrawn design is kept, as R43 requires, in the non-normative record at the end.
+**Status**: Withdrawn (PRD-001 R43). The code is removed. Only the requirements below bind: they say
+what remains on the wire so existing rooms keep their names. As R43 requires, the withdrawn design is
+kept in the non-normative design record at the end.
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 
 ## Context
 
-Deniability was a per-channel option: after an epoch closed, nothing would prove to an outsider who
-wrote a message. Asked for its best use (a transcript that leaks from a seized device proves nothing),
-the decider judged it not worth finishing for a system built for himself and his family. Enabling it
-needed a driver to run the protocol over a log, re-key hardening, and a formal analysis. Nothing else
-in Vox depended on it.
+Deniability would have been a per-channel option: after an epoch closed, nothing would prove to an
+outsider who wrote a message. Vox does not offer it (PRD-001 R43); every room is attributable.
 
 ## Requirements
 
@@ -29,8 +25,7 @@ in Vox depended on it.
 4. The ADR-008 struct tags `0x000B` (formerly `dgka-setup`) and `0x0010` (formerly `esk-publication`)
    MUST stay reserved: a build MUST NOT write them, and they MUST NOT be reused. A frame carrying either
    MUST be refused as an unknown struct tag (`UnknownStructTag`, sync wire error `0x03`).
-   *Status:* planned (R43, #93, `fix/r43-deniable-removal`). On integrate/v0.3.0 both are still listed
-   in `StructTag`, with their domain-separation labels, though nothing writes them.
+   *Status:* built (`wire.rs` marks both reserved).
 
 ## Consequences
 
@@ -42,9 +37,9 @@ in Vox depended on it.
 
 ADR-002, ADR-003, ADR-006, ADR-007, ADR-008 (the log and its struct tags), ADR-014.
 
-## Record of the withdrawn design (non-normative)
+## Design record (non-normative)
 
-Kept because R43 says the ADR keeps the design. Nothing in this section binds the code.
+The withdrawn design, kept as R43 requires. Nothing in this section binds the code.
 
 - **Scope:** weak (content) deniability, after mpENC: message contents deniable, participation not.
   Repudiation was retrospective: offline, against a later judge, not live unlinkability.
@@ -70,15 +65,6 @@ Kept because R43 says the ADR keeps the design. Nothing in this section binds th
 - **Forks:** automatic freezing was disabled for deniable content, because it would have been a
   framing primitive. A content fork raised a non-attributable alarm. Governance forks stayed
   attributable.
-- **Open when withdrawn:**
-  - no formal analysis outside the team (an internal one existed, with reduction sketches only);
-  - the codec could not drive a real exchange, because the only carrier of round-3 `X_i` was
-    `Confirm`, which needs every `X_*`;
-  - re-key skipped the commitment round and the static reveal signature;
-  - epoch-close gating read a caller-supplied epoch;
-  - no pinned test vectors;
-  - repudiation existed only for members who actually published `esk_i`, and a non-publisher was
-    visible on the log.
 
 ## Engineering Mantra
 

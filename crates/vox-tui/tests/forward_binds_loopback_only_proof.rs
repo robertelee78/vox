@@ -12,7 +12,7 @@
 //! that service is one the host would carry.
 //!
 //! **Asserted.**
-//! 1. `vox forward <room> <host> <port> 0.0.0.0:<P>` — the guest asking for a forward on every
+//! 1. `vox forward <port>.<host>.<room>.vox 0.0.0.0:<P>` — the guest asking for a forward on every
 //!    interface — **exits non-zero within 60 s, says the port must be on loopback, and never
 //!    reports a bound forward**. It is refused before any dial: it never says it is waiting for
 //!    a path to the host.
@@ -63,7 +63,7 @@ fn a_forward_refuses_to_bind_where_the_network_can_reach_it() {
         &w.guest_dir,
         &args(&[
             "forward",
-            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
+            &w.service_host(),
             &exposed,
             "--anchor",
             &w.guest_anchor,

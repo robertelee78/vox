@@ -10,8 +10,8 @@ each profile runs its own daemon and socket. The code is `crates/vox-agentcomms`
 gate), `crates/vox-tui/src/{agent_hook,wake,room_cli,coord,app,codex_trust}.rs` (the drain hook,
 the wake, the `vox room` and `vox agent` verbs, `vox daemon`), `crates/vox-tui/assets/agent-skill.md`
 (the skill) and `crates/vox-core/src/node/{ipc,trust,status}.rs` (the control socket, the trust
-keyring, the status report). Milestones M19.1a–M19.12 are built; M19.7's rehearsal (two live
-agent sessions and the operator in one room) ran on one host, and the two-machine claim is not made. Not built: the in-room approval
+keyring, the status report). Milestones M19.1a–M19.12 are built; M19.7 is proved on one host,
+not across two machines. Not built: the in-room approval
 entry point (3.7), per-message read metadata (3.10), volatile context on plain posts and
 session-static facts in `hello` (4.9), the takeover rule in the skill (5.7, #19), `status`
 supersession (9.7). Open gaps: 6.8's start-up guard has no mutant (#368); a trusted Codex hook
@@ -28,9 +28,8 @@ agent; Vox has no typed agent/human distinction and no room types.
 
 Agent comms exists so that agents and the operator can divide up work (who does what) and work
 through hard problems together, across machines and NATs, with no SSH tunnels or pairwise peer
-configuration. It is not a mirror of agent activity: in the decider's words, n agents "chattering
-away like they do in ctm" would be "such a wall of shit that I would not be able to keep up". The
-room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
+configuration. It is not a mirror of agent activity: a room carrying every agent's running chatter
+could not be followed by the person in it. The room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
 verdicts, delivery) is recorded on GitHub through awa, not in the room (ADR-021).
 
 The design rests on three findings from prior art: addressing must be a structured field, never

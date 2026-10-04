@@ -563,6 +563,9 @@ fn every_common_failure_names_its_cause() {
         "PRODUCT (staging) (4, 5, 7): vox connect failed: {said}"
     );
 
+    // The service's address, the only form `vox forward` takes (V030-25).
+    let service_address = format!("{port}.{host_fp}.{room}.vox");
+
     // ---- (4) and (5): a local TCP port that is taken ----
     let busy = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
     let busy_addr = busy
@@ -600,7 +603,7 @@ fn every_common_failure_names_its_cause() {
         &guest_dir,
         &[
             "forward",
-            &format!("{}.{}.{}.vox", port, host_fp, room),
+            &service_address,
             &busy_addr,
             "--anchor",
             &spec,
@@ -626,7 +629,7 @@ fn every_common_failure_names_its_cause() {
         &guest_dir,
         &[
             "forward",
-            &format!("{}.{}.{}.vox", port, host_fp, room),
+            &service_address,
             &local,
             "--anchor",
             &spec,

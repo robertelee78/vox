@@ -298,7 +298,7 @@ fn a_forward_keeps_carrying_when_its_path_changes_from_relayed_to_direct() {
         &w.guest_dir,
         &args(&[
             "forward",
-            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
+            &w.hostname(),
             "127.0.0.1:0",
             "--anchor",
             &w.anchor.v6_spec,
@@ -737,14 +737,17 @@ fn a_refused_socks_connect_is_refused_in_the_reply_and_says_why() {
 fn a_refusal_tells_the_refused_side_nothing_new() {
     watchdog::arm();
     // A stranger: joined with the address and the passphrase, never trusted. It asks for the
-    // port the host offers and for one it does not. If the answers differ, the refusal has told
-    // it which ports the host serves (ADR-013 dark services; PRD-001 R23, "the remote side
-    // learns nothing new").
+    // service the host shares and for one it does not. What the room's log says is shared is
+    // every member's to read (V030-25, `vox service list`), so a `vox forward` to a name no share
+    // carries is refused at once on the stranger's side, and that tells it nothing its own listing
+    // did not. Past that, the host's refusal and the proxy's reply must not differ (ADR-013 dark
+    // services; PRD-001 R23, "the remote side learns nothing new").
     let w = World::new(echo_service(), false);
     let guest_dir = w.guest_dir.clone();
     let unoffered = unoffered_port(w.service_port);
     let mut seen = Vec::new();
-    for (label, port) in [("offered", w.service_port), ("unoffered", unoffered)] {
+    #[allow(clippy::single_element_loop)] // the shared service; the other is asked below
+    for (label, port) in [("offered", w.service_port)] {
         let (mut fwd, at) = w.forward_port(&format!("{label}-forward"), &guest_dir, port);
         let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
             panic!("PRODUCT (staging): the forward at {at} refused a connection: {e}")
@@ -766,6 +769,40 @@ fn a_refusal_tells_the_refused_side_nothing_new() {
         );
         seen.push((label, got.len(), ending, said));
     }
+    // The unoffered name through `vox forward`: refused here, naming no share, and the stranger's
+    // own listing already shows what is shared.
+    let (ok, out, err) = vox_once(
+        &guest_dir,
+        &args(&[
+            "forward",
+            &format!("{unoffered}.{}.{}.vox", w.host_fp, w.room),
+            "127.0.0.1:0",
+            "--anchor",
+            &w.guest_anchor,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+    );
+    let (list_ok, listed, list_err) = vox_once(
+        &guest_dir,
+        &args(&["service", "list", &w.room, "--listen", "127.0.0.1:0"]),
+    );
+    eprintln!(
+        "[test] unoffered {unoffered} by vox forward: ok={ok} {out}{err}\n[test] the stranger's \
+         listing: {listed}{list_err}"
+    );
+    assert!(
+        !ok && err.contains(&format!("shares no service called `{unoffered}`")),
+        "PRODUCT: a forward to a name no share carries must be refused, saying so: {out}{err}"
+    );
+    let offered_address = format!("  {}.", w.service_port);
+    assert!(
+        list_ok
+            && listed.contains(&offered_address)
+            && !listed.contains(&format!("  {unoffered}.")),
+        "PRODUCT (staging): the stranger's `vox service list` must already show the shared \
+         service and not the other, or the refusal told it something new: {listed}{list_err}"
+    );
     let mut codes = Vec::new();
     let (_up, proxy) = w.up("stranger-up", &guest_dir);
     // The service is its address's first part (V030-25): the offered one by its name, the
@@ -776,23 +813,11 @@ fn a_refusal_tells_the_refused_side_nothing_new() {
         eprintln!("[test] {label} port {port}: SOCKS reply code {code}");
         codes.push((label, code));
     }
-    let (a, b) = (&seen[0], &seen[1]);
+    let a = &seen[0];
     assert!(
-        a.1 == 0 && b.1 == 0,
-        "PRODUCT: a refused stranger was carried bytes: {} from the offered port, {} from the \
-         unoffered",
-        a.1,
-        b.1
-    );
-    assert_eq!(
-        (a.2, &a.3),
-        (b.2, &b.3),
-        "PRODUCT: the refusal told a stranger which port the host offers: the offered port \
-         ended {:?} and said {:?}; the unoffered ended {:?} and said {:?}",
-        a.2,
-        a.3,
-        b.2,
-        b.3
+        a.1 == 0,
+        "PRODUCT: a refused stranger was carried {} bytes from the shared service",
+        a.1
     );
     assert_eq!(
         codes[0].1, codes[1].1,

@@ -3,7 +3,7 @@
 //! Two requests, additive to protocol 6 and away from the sequential tags:
 //!
 //! - **Resolve** `<node>.<room>.vox` against the running node's rooms and keyring, which is
-//!   what lets `vox forward nas.family.vox 22` work while a daemon holds the profile.
+//!   what lets `vox forward ssh.nas.family.vox` work while a daemon holds the profile.
 //! - **Up**: bring the SOCKS proxy up inside the running node, across every room it
 //!   holds. The connection then carries one line per refusal or cut session, and the
 //!   proxy stops when the connection closes — so `vox up` stays a foreground command whose
@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::node::actor::NodeHandle;
 use crate::node::ipc::{read_frame, write_frame, Frame, NodeSocket};
+use crate::node::resolver::{ServiceRoom, ShareState};
 
 const T_RESOLVE: u64 = 2401;
 const T_RESOLVED: u64 = 2402;
@@ -77,11 +78,17 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle, req: NameReques
             let body = match handle.resolve_name(&name).await {
                 Ok(room) => {
                     let mut e = Encoder::new();
-                    e.array(4)
+                    let share = match room.share {
+                        ShareState::Stated => 0,
+                        ShareState::Absent => 1,
+                        ShareState::NotYetKnown => 2,
+                    };
+                    e.array(5)
                         .uint(T_RESOLVED)
                         .bytes(&room.channel_id)
                         .bytes(&room.host)
-                        .text(&room.service);
+                        .text(&room.service)
+                        .uint(share);
                     e.finish()
                 }
                 Err(why) => error(why),
@@ -152,11 +159,12 @@ fn reason(body: &[u8]) -> Error {
     }
 }
 
-/// Resolve `name` with the node `at` names: `(room, member, service)`.
+/// Resolve `name` with the node `at` names: the room, the member, the service's tag, and what
+/// the room's log says of the share.
 ///
 /// # Errors
 /// If no node answers, or the name leads nowhere — with the node's reason.
-pub async fn resolve(at: &NodeSocket, name: &str) -> Result<(Digest32, Digest32, String)> {
+pub async fn resolve(at: &NodeSocket, name: &str) -> Result<ServiceRoom> {
     let mut stream = connect(at).await?;
     write_frame(
         &mut stream,
@@ -167,7 +175,7 @@ pub async fn resolve(at: &NodeSocket, name: &str) -> Result<(Digest32, Digest32,
         .await?
         .ok_or(Error::MalformedBundle("ipc closed before reply"))?;
     let mut d = Decoder::new(&body);
-    if let (Ok(4), Ok(T_RESOLVED)) = (d.array(), d.uint()) {
+    if let (Ok(5), Ok(T_RESOLVED)) = (d.array(), d.uint()) {
         let mut digest = || -> Result<Digest32> {
             Digest32::try_from(
                 d.bytes()
@@ -175,12 +183,23 @@ pub async fn resolve(at: &NodeSocket, name: &str) -> Result<(Digest32, Digest32,
             )
             .map_err(|_| Error::MalformedBundle("ipc naming"))
         };
-        let (room, host) = (digest()?, digest()?);
+        let (channel_id, host) = (digest()?, digest()?);
         let service = d
             .text()
             .map_err(|_| Error::MalformedBundle("ipc naming"))?
             .to_owned();
-        return Ok((room, host, service));
+        let share = match d.uint() {
+            Ok(0) => ShareState::Stated,
+            Ok(1) => ShareState::Absent,
+            Ok(2) => ShareState::NotYetKnown,
+            _ => return Err(Error::MalformedBundle("ipc naming")),
+        };
+        return Ok(ServiceRoom {
+            channel_id,
+            host,
+            service,
+            share,
+        });
     }
     Err(reason(&body))
 }

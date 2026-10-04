@@ -14,17 +14,23 @@
 //! - **A cold joiner syncs it**: signed from the checkpoint onward, and hash-chained skeletons
 //!   below it (its own store is measured the same way). The order it prints with
 //!   `vox room read --hashes` is identical to alice's.
-//! - **A forged entry below the checkpoint is refused as pre-checkpoint**, not raised as a fork:
-//!   one signed by alice's own key (an equivocation) and one without a signature, both offered
-//!   to alice's room through the same acceptance path sync uses.
-//!
 //! - **V030-10: a newcomer after an expiry reads the author on.** The expired skeletons are taken,
 //!   bob reckons them expired himself (none shows as "not received yet", none is shown), and
 //!   alice's next message reaches him.
 //!
-//! Mutations (each run, each red): shedding disabled; the pre-checkpoint refusal removed;
-//! v0.2.10's Withheld rule (a payload-less entry set aside) — "bob never caught up"; expiry never
-//! reckoned by the receiver — bob shows the expired ones as not received yet.
+//! **Measured, not driven, in this process:** the page sizes. No `vox` command reports them, and
+//! the store file does not shrink when a page does (redb reuses its pages), so the claim that the
+//! bytes go is read from the stopped node's store. Nothing here acts as a participant.
+//!
+//! **Moved:** a forged entry below the checkpoint, refused as pre-checkpoint and never raised as a
+//! fork, was offered here to a stopped node's room in this process. It is proved through the
+//! shipped daemon by `retention_requirements_proof`'s R10 (#227): a conflicting entry signed with
+//! the author's own key is offered over a real sync session to a running member, whose
+//! `vox status --json` must count it refused below the checkpoint and freeze nobody.
+//!
+//! Mutations (each run, each red): shedding disabled; v0.2.10's Withheld rule (a payload-less
+//! entry set aside) — "bob never caught up"; expiry never reckoned by the receiver — bob shows
+//! the expired ones as not received yet.
 
 #![cfg(unix)]
 
@@ -257,7 +263,7 @@ fn log_pages(dir: &Path) -> Vec<usize> {
         match vox_core::node::profile::Profile::open(paths.clone()) {
             Ok(p) => break p,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(200)),
-            Err(e) => panic!("the store did not open: {e:?}"),
+            Err(e) => panic!("CANNOT MEASURE: the stopped node's store did not open: {e:?}"),
         }
     };
     let store = profile.store();
@@ -277,57 +283,6 @@ fn page_stats(pages: &[usize]) -> (usize, usize, usize) {
         pages.iter().sum(),
         pages.iter().filter(|p| **p < COMPOSITE_SIG_LEN).count(),
     )
-}
-
-/// Offer `entry` to alice's room, stopped, through the acceptance path a sync uses; the error
-/// text, or `None` if it was taken.
-fn offer(
-    dir: &Path,
-    forge: impl FnOnce(&vox_core::node::profile::Profile, [u8; 32], u64) -> vox_core::log::entry::Entry,
-) -> (Option<String>, usize, usize) {
-    let paths = vox_core::node::paths::Paths::resolve("default", Some(dir), Some(&dir.join("cfg")))
-        .unwrap();
-    let mut profile = vox_core::node::profile::Profile::open(paths).expect("open the store");
-    profile.unlock(IDENTITY.as_bytes()).expect("unlock");
-    let cid = profile.store().channels().unwrap()[0];
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let mut ch =
-        vox_core::node::channel::ChannelState::open(&profile, &cid, ROOMPASS.as_bytes(), now)
-            .expect("open the room");
-    let before = ch.entry_count();
-    let entry = forge(&profile, cid, ch.epoch());
-    let outcome = ch.accept_entry(profile.store(), entry, now);
-    let after = ch.entry_count();
-    (outcome.err().map(|e| format!("{e}")), before, after)
-}
-
-/// A skeleton for alice's own feed at `seq`, conflicting with the one she holds there.
-fn forged_skeleton(
-    author: [u8; 32],
-    cid: [u8; 32],
-    epoch: u64,
-    seq: u64,
-) -> vox_core::log::entry::EntrySkeleton {
-    vox_core::log::entry::EntrySkeleton {
-        author_id: author,
-        seq,
-        prev_hash: [7u8; 32],
-        lipmaa_backlink: [7u8; 32],
-        channel_id: cid,
-        epoch,
-        algo_ids: [
-            vox_core::suite::algo::COMPOSITE_ED25519_ML_DSA_65,
-            vox_core::suite::algo::AES_256_GCM,
-        ],
-        payload_hash: vox_core::hash::sha256(b"a forged message"),
-        payload_len: 16,
-        end_of_feed: false,
-        claimed_ms: 0,
-        seen: Vec::new(),
-    }
 }
 
 #[test]
@@ -422,40 +377,6 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
         b_bytes.saturating_sub(a_bytes) >= shed * COMPOSITE_SIG_LEN,
         "the log shrank by less than the signatures shed"
     );
-
-    // ---- a forged entry below the checkpoint is refused as pre-checkpoint ------------------
-    let signed = offer(alice, |profile, cid, epoch| {
-        let signer = profile.signer().unwrap();
-        let sk = forged_skeleton(profile.fingerprint(), cid, epoch, 5);
-        vox_core::log::entry::Entry::build_signed_skeleton_only(signer, sk).unwrap()
-    });
-    let unsigned = offer(alice, |profile, cid, epoch| {
-        let signer = profile.signer().unwrap();
-        let sk = forged_skeleton(profile.fingerprint(), cid, epoch, 6);
-        let mut e = vox_core::log::entry::Entry::build_signed_skeleton_only(signer, sk).unwrap();
-        e.drop_signature();
-        e
-    });
-    for (what, (err, before, after)) in [("signed by alice", &signed), ("unsigned", &unsigned)] {
-        println!("forged entry {what}: {err:?}; the room held {before} entries, then {after}");
-        assert_eq!(
-            before, after,
-            "a forged entry below the checkpoint was stored"
-        );
-    }
-    // The unsigned one is refused inside a sync session by the same predicate; offered alone
-    // it is refused before it (an unsigned entry needs its feed). The signed one is the test:
-    // alice's own key made it, so it would be a fork proof anywhere else.
-    assert!(
-        signed
-            .0
-            .as_deref()
-            .is_some_and(|e| e.contains("at or below its author's checkpoint")),
-        "an equivocation below the checkpoint must be refused as pre-checkpoint, not frozen \
-         as a fork: {:?}",
-        signed.0
-    );
-    assert!(unsigned.0.is_some(), "an unsigned forged entry was taken");
 
     // ---- a restart opens the room; a cold joiner syncs it --------------------------------
     let alice_d = daemon(

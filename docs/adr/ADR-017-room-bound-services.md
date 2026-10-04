@@ -2,14 +2,11 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted (third revision 2026-09-21: consent-bound services; fourth revision 2026-09-24:
-local names; addressing restated by the decider 2026-10-02).
-
-Built on integrate/v0.3.0:
+**Status**: Accepted. Built on integrate/v0.3.0:
 - the reach gate, "in the host's trust keyring AND a current author of the room"
-  (`NodeActor::refresh_reachers`, `tunnel::session::accept`), with the genesis service grant
-  consulted by nothing (`Evaluator::service_grant_verdict` returns `None`), no `vox grant` verb and no
-  `bind:` check on offering a service (3.1–3.11, M17.7);
+  (`NodeActor::refresh_reachers`, `tunnel::session::accept`); the genesis service grant removed (its
+  slot is always empty), no `vox grant` verb and no `bind:` check on offering a service (3.1–3.11,
+  M17.7, R44);
 - no consent on join, and witnessed board admission (3.4, M17.6);
 - `vox trust remove` changing the lock in every shared room (10.8, M17.14);
 - the live reacher set, teardown of live and parked sessions, and the reason given to the far end
@@ -18,16 +15,15 @@ Built on integrate/v0.3.0:
 - `vox up` as an unprivileged SOCKS5 proxy, with the room optional (decision 5, M17.3);
 - the carried session seeing only loopback, and attribution at the gate (decision 6);
 - anchors as configuration, followed while a daemon runs (decision 7, M17.4);
-- refusal of rooms made before v0.3.0 (11.4).
+- addresses: only `service.node.room.vox` connects, with named shares and `vox forward` by address
+  only (decision 12, #339);
+- passphrase rotation removed (11.3) and rooms made before v0.3.0 refused (11.4).
 
-Where this tree's code differs from these requirements:
-- **`vox serve`** still creates a room, with a generated passphrase, and shares the named services in
-  it. Binding a service into a room that already exists is `vox service add`. Naming the
-  audience and non-audience is not built (4.1, 4.2).
-- **Passphrase rotation** is removed by V030-32, but its code is still on this tree; the removal is
-  pending under #380 (11.3).
-- **Proofs**: the parked-stream withdrawal has no real-binary proof yet, RP-10 (#117).
-
+Not built:
+- `vox serve` into an existing room, naming the audience and non-audience (4.1, 4.2): `vox serve`
+  still creates a room; `vox service add` binds into an existing one.
+- The parked-stream withdrawal has no real-binary proof yet, RP-10 (#117).
+- The daemon/node split (ADR-026) amends 5.2, 7.1, 7.4, 10.5 and 12.11; it is decided, not built.
 **Date**: 2026-09-21
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: services, tunneling, ux, consent, discovery, hidden-service
@@ -38,9 +34,9 @@ ADR-013 makes the overlay carry TCP and UDP between members. This ADR specifies 
 it: a person shares a local service with a room, and the people they trust in that room reach it with
 ordinary tools. The aim is to replace a Tor private service.
 
-The decider's rule: *"When I am approving someone to read my messages in a room I am also approving
-them to use any service that I have granted to that room."* And its converse: someone who joins and
-whom the host has not approved *"should not know about that service"*.
+The rule: approving someone to read your messages in a room also approves them to use every service
+you share with that room; and someone who joins and whom the host has not approved does not learn of
+that service.
 
 Joining a room is a passphrase and a proof of work, which is not a decision about a person. The
 approval to read is such a decision, already made per person. So reach rides on the approval to read.
@@ -234,8 +230,7 @@ is what a person offers. A tunnel is how bytes reach it.
   reachable, and their live sessions MUST be torn down. A room the node no longer holds MUST have an
   empty reacher set.
 - **11.2** Leaving one room MUST NOT disturb a service bound to another.
-- **11.3** Passphrase rotation is removed (V030-32). Status: its code is still on this tree, and its
-  removal is pending under #380.
+- **11.3** Passphrase rotation is removed (ADR-007 G-21).
 - **11.4** A room made before v0.3.0 MUST be refused, with "make the room again"
   (`Fault::RoomFromBeforeV030`). The genesis service grant MUST be removed, along with `<room-id>.vox`
   resolving to a room's creator (R44, #94; #339). The grant slot stays in the genesis layout, always
@@ -259,7 +254,8 @@ is what a person offers. A tunnel is how bytes reach it.
   refused with a sentence saying which, to this node's operator only. Only the SOCKS reply code
   reaches the tool.
 - **12.6** The port in a SOCKS request MUST NOT select the service; the name does. A UDP service is
-  asked for as `udp/<name>`.
+  shared as `vox serve <name>=<port>/udp`; its address is the same form as any other, the share
+  records that it is UDP, and the host's gate looks it up as `udp/<name>`.
 - **12.7** A service name MUST be one DNS label of at most 63 characters. `vox serve` takes each share
   as `<name>=<port>[/tcp|/udp]`. One name MUST NOT be shared twice by a node in a room, over either
   transport; the second share MUST be refused, naming it. A service moves by being removed and shared
@@ -274,8 +270,14 @@ is what a person offers. A tunnel is how bytes reach it.
   the node and room places.
 - **12.11** A service MUST be named only by its address: `vox forward` MUST take a
   `service.node.room.vox` address and MUST NOT take a room, a member and a service as separate
-  arguments (decider, 2026-10-03). *Decided, not built:* the separate-argument form
-  `vox forward <room> <member> <service>` is still on this tree and is to be removed.
+  arguments. Any other first argument MUST be refused. The address is resolved by the node holding
+  the profile: the running daemon, else a node the verb unlocks, which reopens the rooms the profile
+  holds open. *Decided, not built (ADR-026 S-3, N-2):* the address is resolved by the daemon, as the
+  node the client names (ADR-026 C-3); no verb unlocks or hosts a node.
+- **12.12** A forward MUST NOT wait for a share it can see is absent (PRD-001 R23). While the named
+  room has not completed its first sync, the share's statement may still be on its way, and the
+  forward MAY wait for it. Once the room has synced and its log carries no share of that name by
+  that node, the forward MUST be refused at once, saying so.
 
 Built (#339): `node::resolver`, `governance::share`, `ChannelState::{say_share, shares}`,
 `vox serve <name>=<port>`, `vox service list`, `vox forward <service>.<node>.<room>.vox [<local>]`.
@@ -289,24 +291,13 @@ Proved by `crates/vox-tui/tests/a_service_is_reached_only_by_its_address_proof.r
 - **13.3** An address MUST NOT be a capability. Holding a name MUST NOT be sufficient to connect.
 - **13.4** There MUST be no global namespace and no name resolution off the machine.
 
-## Fixed since
+### 14. Accepting joiners (M17.17)
 
-- **Join auto-consent** (`join` released the sender key to the responder): removed by M17.6. Proof:
-  `no_consent_without_a_ring_entry_proof.rs` (RP-28, #135).
-- **`bind:` left `vox serve` working only for a room's creator**: removed with M17.7.
-- **Stale output** (`vox serve` "anyone who joins with both may reach it"; `vox service add` "dark
-  until you `vox grant`"): replaced in M17.7.
-- **The first CONNECT refused before the board was read**: fixed by `up::reach_host_with_patience`
-  (5.6).
-- **Recomputes tore down live sessions** (unconditional `send_replace` on every accept): fixed by
-  `publish_reachers` (10.5).
-- **An anchor host name resolved once, at startup**: fixed by `ANCHOR_REFRESH` re-resolution (7.4).
-  Proof: `a_daemon_follows_its_anchor_proof.rs` (RP-32, #139).
-- **Open proof gap (M17.17): the accept loop serialised handshakes**, locking out a second joiner
-  for up to 30 s. Closed in v0.2.8: each handshake runs on its own task, bounded at
-  `HANDSHAKES_IN_FLIGHT` (64), with `retry()` or `refuse()` at the cap and never a queue, and the
-  duplicate-connection tie-break uses an order-independent TLS-exporter key (`tie_key`). Proof:
-  `a_second_joiner_is_not_locked_out.rs`.
+- **14.1** Each inbound handshake MUST run on its own task, bounded at `HANDSHAKES_IN_FLIGHT` (64).
+  At the cap the node MUST answer with `retry()` or `refuse()`, never a queue, so one slow joiner
+  cannot lock out another. Proof: `a_second_joiner_is_not_locked_out.rs`.
+- **14.2** The duplicate-connection tie-break MUST use an order-independent key derived from the TLS
+  exporter (`tie_key`).
 
 ## Consequences
 

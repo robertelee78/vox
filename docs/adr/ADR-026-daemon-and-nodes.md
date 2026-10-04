@@ -6,6 +6,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 `crates/vox-core/src/node/`, `crates/vox-core/src/transport/`, `crates/vox-tui/src/`), except: N-2
 (the TUI still locks its node), S-4 and C-7 (the TUI still embeds its node), and what is marked
 *Deferred*. §10 names the proof of each claim.
+**Date**: 2026-10-03
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: daemon, node, identity, control-plane, lifecycle, layout
 
@@ -24,8 +25,8 @@ network presence from the start: there is no interim design with one socket per 
 
 ### 1. The daemon
 
-- **D-1.** There MUST be at most one daemon per data root. Two data roots under one OS account
-  (`VOX_DATA_DIR`) MAY each run their own daemon; each has its own lock, socket, port and nodes. A
+- **D-1.** There MUST be at most one daemon per data root, so normally one per OS account, which has
+  one data root. Two data roots under one OS account (`VOX_DATA_DIR`) MAY each run their own daemon; each has its own lock, socket, port and nodes. A
   daemon MUST hold an exclusive lock on `<data root>/.daemon/lock` for its whole life; a second daemon
   that cannot take the lock MUST exit, saying a daemon is already running. A second `vox daemon`
   invocation that names a node MUST hand that node to the running daemon (attach, §3) instead.

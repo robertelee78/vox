@@ -454,6 +454,9 @@ pub struct ChannelDetail {
     pub services: Vec<(String, std::net::SocketAddr)>,
     /// The services shared in this channel by every member, as its log says (V030-25).
     pub shares: Vec<crate::node::channel::Share>,
+    /// Whether this node has completed the room's first sync since joining it (V210-164): until
+    /// then its log may not yet hold what the room's members have written, shares included.
+    pub synced: bool,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
@@ -1159,7 +1162,7 @@ impl Fault {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
             }
             Fault::NotAServiceRoom => {
-                "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+                "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service by its address, `vox forward <service>.<node>.<room>.vox`"
             }
             Fault::AboveRoomRetention => {
                 "a member may keep this room's messages for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"

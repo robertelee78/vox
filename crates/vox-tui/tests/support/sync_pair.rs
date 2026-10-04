@@ -86,7 +86,7 @@ impl Drop for Proc {
     }
 }
 
-fn drain(child: &mut Child) -> Arc<Mutex<String>> {
+pub fn drain(child: &mut Child) -> Arc<Mutex<String>> {
     let said = Arc::new(Mutex::new(String::new()));
     let out = child.stdout.take();
     let err = child.stderr.take();

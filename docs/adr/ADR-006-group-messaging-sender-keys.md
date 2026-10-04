@@ -110,9 +110,6 @@ recipient, which is what per-sender trust needs.
 2. `GroupMessage::to_wire` reuses the *signing* label as its wire prefix rather than a struct-tag frame
    (safe — different arity — but inconsistent with the SKDM rule).
 
-Fixed since: rotation was advisory (`SenderChain::encrypt` never refused past the bound); the node now
-rotates on every append (S-14, M18.1).
-
 ## Consequences
 
 - The per-author key model makes per-sender trust (ADR-007) natural, with one-to-many broadcast.

@@ -288,7 +288,7 @@ fn a_tunnels_last_bytes_arrive_when_its_host_stops() {
         &guest_dir,
         &args(&[
             "forward",
-            &format!("{}.{}.{}.vox", backend, host_fp.trim(), room),
+            &format!("{backend}.{}.{room}.vox", host_fp.trim()),
             "127.0.0.1:0",
             "--anchor",
             &anchor.v6_spec,
