@@ -1736,3 +1736,179 @@ pub enum NodeEvent {
     /// The actor has stopped.
     Shutdown,
 }
+
+impl NodeEvent {
+    /// The event as a sentence a person can read, for a front end that shows events as text (the
+    /// macOS app's notices): never the event's debug form, which is a struct dump (R36). Room and
+    /// member ids are given as their first 12 characters, as the CLI shows them.
+    #[must_use]
+    pub fn words(&self) -> String {
+        fn short(d: &Digest32) -> String {
+            crate::node::link::b32_encode(d).chars().take(12).collect()
+        }
+        match self {
+            NodeEvent::WaitingForProfile => {
+                "waiting for another vox that is using this identity's files".into()
+            }
+            NodeEvent::NewEntry { channel_id, .. } => {
+                format!("a new message in room {}", short(channel_id))
+            }
+            NodeEvent::Unlocked => "the identity is unlocked".into(),
+            NodeEvent::Locked => "the identity is locked".into(),
+            NodeEvent::ChannelOpened { channel_id } => {
+                format!("room {} is open", short(channel_id))
+            }
+            NodeEvent::ChannelClosed { channel_id } => {
+                format!("room {} is closed", short(channel_id))
+            }
+            NodeEvent::RoomEnded {
+                channel_id,
+                handed,
+                members,
+            } => format!(
+                "room {} ended; {handed} of its {members} members were told directly, the rest \
+                 learn it from them",
+                short(channel_id)
+            ),
+            NodeEvent::RoomRemoved { channel_id } => {
+                format!("room {} was removed from this device", short(channel_id))
+            }
+            NodeEvent::PeerJoined { channel_id, peer } => format!(
+                "{} joined room {}; they read nothing until you trust them",
+                short(peer),
+                short(channel_id)
+            ),
+            NodeEvent::KeyNotTaken {
+                channel_id,
+                peer,
+                why,
+            } => format!(
+                "{} did not take your key for room {} — {why}; it is sent again",
+                short(peer),
+                short(channel_id)
+            ),
+            NodeEvent::SenderKeyReceived {
+                channel_id, peer, ..
+            } => format!(
+                "{}'s messages in room {} can be read now",
+                short(peer),
+                short(channel_id)
+            ),
+            NodeEvent::ReachWithdrawn { channel_id, port } => format!(
+                "the host withdrew your reach to port {port} in room {}, so the tunnel was cut",
+                short(channel_id)
+            ),
+            NodeEvent::SyncFailed {
+                channel_id,
+                peer,
+                reason,
+            } => format!(
+                "sync of room {} with {} did not complete — {reason}",
+                short(channel_id),
+                short(peer)
+            ),
+            NodeEvent::RoomNotRemembered { channel_id, why } => format!(
+                "room {} is open, but will not reopen by itself after a restart — {why}",
+                short(channel_id)
+            ),
+            NodeEvent::Stalled { what, millis } => {
+                format!("busy {millis} ms — {what} — nobody could be answered")
+            }
+            NodeEvent::PublishRefused {
+                channel_id,
+                what,
+                why,
+            } => format!(
+                "a board would not take {what} for room {} — {why}",
+                short(channel_id)
+            ),
+            NodeEvent::PublishCured { channel_id, what } => format!(
+                "{what} for room {} was taken on a republish",
+                short(channel_id)
+            ),
+            NodeEvent::RetentionAboveRoom {
+                channel_id,
+                node,
+                room,
+            } => format!(
+                "this device asks to keep room {}'s messages for {node} s, but the room keeps \
+                 them for {room} s, which is what applies",
+                short(channel_id)
+            ),
+            NodeEvent::ConnectionNote { peer, note } => {
+                format!("connection to {} — {note}", short(peer))
+            }
+            NodeEvent::NodeNote { note } => note.clone(),
+            NodeEvent::HandshakesQueued {
+                waited, refused, ..
+            } => format!(
+                "a burst of connections: {waited} waited for a handshake slot and {refused} were \
+                 turned away"
+            ),
+            NodeEvent::JoinFailed { reason } => format!("a join did not complete — {reason}"),
+            NodeEvent::JoinSteps { joined, steps } => {
+                if *joined {
+                    format!("the join got in — {steps}")
+                } else {
+                    format!("the join did not get in — {steps}")
+                }
+            }
+            NodeEvent::JoinStep { step } => format!("joining: {step}"),
+            NodeEvent::StillRelayed { peer, reason } => {
+                format!("still relayed to {} — {reason}", short(peer))
+            }
+            NodeEvent::ProxyRefused { reason } => format!("tunnel refused or cut — {reason}"),
+            NodeEvent::TunnelClosed { reason } => format!("tunnel closed — {reason}"),
+            NodeEvent::PeerUnreachable { peer, why } => {
+                format!("could not reach {} — {why}", short(peer))
+            }
+            NodeEvent::Forwarding {
+                host,
+                service_tag,
+                local,
+                ..
+            } => format!("forwarding {local} to {service_tag} on {}", short(host)),
+            NodeEvent::AddressWithheld { reason, .. } => {
+                format!("the address was not handed out — {reason}")
+            }
+            NodeEvent::AddressNote { note, .. } => note.clone(),
+            NodeEvent::InviteLink { channel_id, url } => {
+                format!("invite link for room {}: {url}", short(channel_id))
+            }
+            NodeEvent::Joined {
+                channel_id,
+                responder,
+            } => format!(
+                "joined room {}, let in by {}",
+                short(channel_id),
+                short(responder)
+            ),
+            NodeEvent::Consented { channel_id, target } => format!(
+                "{} can now read your messages in room {}",
+                short(target),
+                short(channel_id)
+            ),
+            NodeEvent::Revoked {
+                channel_id, target, ..
+            } => format!(
+                "{} can no longer read your new messages in room {}",
+                short(target),
+                short(channel_id)
+            ),
+            NodeEvent::TunnelServed {
+                client,
+                service_tag,
+                ..
+            } => format!("{} reached {service_tag}", short(client)),
+            NodeEvent::ProxyUp { hostname, bind, .. } => {
+                format!("{hostname} is reachable through {bind}")
+            }
+            NodeEvent::Synced {
+                channel_id,
+                applied,
+                ..
+            } => format!("room {} synced: {applied} new entries", short(channel_id)),
+            NodeEvent::Shutdown => "the node stopped".into(),
+        }
+    }
+}

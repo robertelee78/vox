@@ -48,6 +48,9 @@ optional_proof::not_run!(posts_sealed_before_trust_stay_unreadable_and_everythin
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
@@ -301,7 +304,9 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
         fps.push(out.trim().to_owned());
     }
     // Only bob trusts alice up front; alice's decision comes later.
-    let (ok, _, err) = vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None);
+    let (ok, _, err) = attach::Root::at(&bob, IDENTITY).ensure("default", || {
+        vox(&bob, &["trust", "add", &fps[0], "--name", "alice"], None)
+    });
     assert!(ok, "PRODUCT (staging): bob trusts alice: {err}");
 
     let alice_daemon = daemon(&alice, "alice");
@@ -330,7 +335,9 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
 
     // No pause around the decision: the order is logical, so the same second as a mint or a
     // post decides nothing.
-    let (ok, _, err) = vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None);
+    let (ok, _, err) = attach::Root::at(&alice, IDENTITY).ensure("default", || {
+        vox(&alice, &["trust", "add", &fps[1], "--name", "bob"], None)
+    });
     assert!(ok, "PRODUCT (staging): alice trusts bob: {err}");
 
     post_range(&alice, &room_a, 1_101, 1_110);

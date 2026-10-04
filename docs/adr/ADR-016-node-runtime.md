@@ -52,7 +52,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 - **NR-13a.** Dropping the last `NodeHandle` MUST lock the node exactly as `Lock` does, then end the actor.
 - **NR-13b.** The TUI MUST lock after `IDLE_LOCK_SECS` (5 minutes) without input (ADR-015). *Removed by ADR-026 N-2 (#409): the TUI has no lock.*
 - **NR-14 (M15.2c).** A headless node MUST refuse `Lock`. *Removed by ADR-026 N-2 (#409): there is no `Lock`.*
-- **NR-15.** `vox daemon`, `vox node` and every long-running verb MUST stop cleanly on SIGINT, SIGTERM, SIGHUP and SIGQUIT (V210-108). The daemon stops every node cleanly on those signals (`an_anchor_stops_on_ctrl_c_proof`), and a foreground client whose daemon stops exits non-zero, saying so (built, not yet proved).
+- **NR-15.** `vox daemon`, `vox node` and every long-running verb MUST stop cleanly on SIGINT, SIGTERM, SIGHUP and SIGQUIT (V210-108). The daemon stops every node cleanly on those signals (`an_anchor_stops_on_ctrl_c_proof`), and a foreground client whose daemon stops exits non-zero, saying so (`the_nodes_of_one_daemon_proof`).
 
 ### Channel lifecycle
 

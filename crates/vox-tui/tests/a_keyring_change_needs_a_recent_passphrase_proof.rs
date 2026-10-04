@@ -27,6 +27,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
@@ -35,7 +38,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use vox_core::node::ipc::{Frame, IpcClient, Request};
+use vox_core::node::ipc::{Frame, Request};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity pass phrase";
@@ -127,9 +130,10 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Fram
         .build()
         .expect("APPARATUS: runtime");
     rt.block_on(async {
-        let mut client = IpcClient::open(sock)
+        // The account socket, as node `default` (ADR-026 C-2): what every client sends on.
+        let mut client = attach::client_at(sock, "default")
             .await
-            .expect("CANNOT MEASURE: the control socket did not answer");
+            .unwrap_or_else(|e| panic!("CANNOT MEASURE: the control socket did not answer: {e}"));
         tokio::time::timeout(
             ANSWERS_WITHIN,
             client.request(&Request::Trust {

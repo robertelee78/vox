@@ -18,6 +18,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,6 +35,14 @@ struct Account {
     _tmp: tempfile::TempDir,
     data: PathBuf,
     cfg: PathBuf,
+}
+
+impl Drop for Account {
+    /// A daemon a client started for this account (no child of this proof) is stopped by the pid
+    /// in its lock, however the proof ends.
+    fn drop(&mut self) {
+        layout::reap_daemon(&self.data);
+    }
 }
 
 impl Account {
@@ -152,6 +163,14 @@ fn wait_until(within: Duration, mut f: impl FnMut() -> bool) -> bool {
 struct Daemon {
     child: Child,
     out: PathBuf,
+}
+
+impl Drop for Daemon {
+    /// By its own handle, never by pattern: a proof that fails leaves no daemon behind.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Daemon {

@@ -28,6 +28,9 @@ use vox_core::node::paths::Paths;
 
 #[path = "layout.rs"]
 mod layout;
+
+#[path = "attach.rs"]
+mod attach;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
 
@@ -197,7 +200,31 @@ impl Worker {
         self.vox_bin_env(bin, session, &[], args, stdin)
     }
 
+    /// As a person runs it since ADR-026 L-2: a verb that needs this worker's node attached, run
+    /// while no daemon holds its data root, runs with the node attached by `vox node attach` and
+    /// let go after.
     fn vox_bin_env(
+        &self,
+        bin: &str,
+        session: Option<&str>,
+        env: &[(&str, &str)],
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Out {
+        match attach::needs(&self.data, args).filter(|_| bin == VOX) {
+            Some(node) => attach::Root {
+                data: self.data.clone(),
+                cfg: self.cfg.clone(),
+                passphrase: ID_PASS.to_owned(),
+            }
+            .attached(&node, || {
+                self.vox_bin_env_plain(bin, session, env, args, stdin)
+            }),
+            None => self.vox_bin_env_plain(bin, session, env, args, stdin),
+        }
+    }
+
+    fn vox_bin_env_plain(
         &self,
         bin: &str,
         session: Option<&str>,
@@ -788,14 +815,12 @@ pub fn resource<'a>(board: &'a serde_json::Value, r: &str) -> Option<&'a serde_j
 /// Post raw text straight onto the control socket, as a peer speaking the protocol
 /// does — for writing exactly what another, older or foreign, binary would write.
 pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
-    let mut c = vox_core::node::ipc::IpcClient::open(&w.paths.socket_file())
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "CANNOT MEASURE: the harness could not open {}'s control socket: {e}",
-                w.name
-            )
-        });
+    let mut c = attach::paths_client(&w.paths).await.unwrap_or_else(|e| {
+        panic!(
+            "CANNOT MEASURE: the harness could not open {}'s control socket: {e}",
+            w.name
+        )
+    });
     match c
         .request(&vox_core::node::ipc::Request::Post {
             channel_id: cid,

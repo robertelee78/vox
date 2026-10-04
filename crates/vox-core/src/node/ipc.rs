@@ -2888,9 +2888,14 @@ impl Drop for Counted {
 /// # Errors
 /// If the socket cannot be placed.
 pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
-    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet.
+    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet. **Not
+    // the shared fallback** (`<tmp>/vox-<uid>`, for a data root whose socket path is too long):
+    // `create_private_dir` follows a symlink and changes the mode of whatever it points at, and
+    // anyone can plant one there. `place_socket` creates or refuses that one itself, by lstat.
     if let Some(dir) = path.parent() {
-        crate::node::paths::create_private_dir(dir)?;
+        if !crate::node::paths::is_socket_fallback_dir(dir) {
+            crate::node::paths::create_private_dir(dir)?;
+        }
     }
     let listener = place_socket(&path)?;
     let me = crate::node::paths::my_uid();
@@ -3678,7 +3683,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         crate::node::api::Outcome::Failed(fault) => {
                             format!("Failed({})", fault.name())
                         }
-                        other => format!("{other:?}"),
+                        other => other.to_string(),
                     };
                     let (mut steps, mut said) = (None, None);
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
