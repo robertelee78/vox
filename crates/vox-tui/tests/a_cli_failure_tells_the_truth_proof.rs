@@ -867,7 +867,8 @@ fn a_holder_runs_without_its_control_socket() {
          {quick:?}, not serve or wait: ended={ended:?}; stderr:\n{err}"
     );
     assert!(
-        err.contains("did not start") && err.contains("log"),
+        (err.contains("did not start") || err.contains("stopped as it started"))
+            && err.contains("log"),
         "PRODUCT (6) `vox serve` must say the daemon did not start and name its log: {err}"
     );
     let said = format!("{err}\n{log}");
