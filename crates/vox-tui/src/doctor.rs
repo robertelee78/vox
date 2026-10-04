@@ -207,7 +207,7 @@ async fn room_or_only(client: &mut IpcClient, room: Option<&str>) -> Result<Dige
     let rooms = match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => rooms,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     match rooms.as_slice() {
@@ -647,7 +647,10 @@ async fn drain_self_test(paths: &Paths, client: &mut IpcClient, channel_id: Dige
         Ok(other) => {
             return fail(
                 id,
-                format!("the node answered the drain's read with {other:?}"),
+                format!(
+                    "the node did not answer the drain's read: {}",
+                    crate::client::unexpected(&other)
+                ),
                 "restart the node with this vox",
             )
         }
@@ -745,7 +748,10 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
         Ok(other) => {
             return vec![warn(
                 "trust",
-                format!("the node did not say who trusts whom: {other:?}"),
+                format!(
+                    "the node did not say who trusts whom: {}",
+                    crate::client::unexpected(&other)
+                ),
                 "restart the node with this vox",
             )]
         }
@@ -760,11 +766,15 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
     let members = match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => members,
         other => {
+            let why = match other {
+                Ok(f) => crate::client::unexpected(&f).to_string(),
+                Err(e) => e.to_string(),
+            };
             return vec![warn(
                 "trust",
-                format!("the room's members could not be read: {other:?}"),
+                format!("the room's members could not be read: {why}"),
                 "run the doctor again",
-            )]
+            )];
         }
     };
     let me = client.me();
