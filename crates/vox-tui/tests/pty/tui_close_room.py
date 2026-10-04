@@ -10,7 +10,7 @@ ANSI cannot be grepped, because the TUI repaints only what changed. The status l
 an unknown command (`:zzz`) first, so "done" afterwards can only be the close's answer.
 
 Exit 0 = the TUI said "done" to `:close`. 1 = a product red, with its screen: `RED: vox tui
-exited before it asked to unlock`, `RED: the TUI never unlocked`, `RED: no "done" after
+exited before its node attached`, `RED: the TUI's node never attached`, `RED: no "done" after
 :close`, or `RED: vox tui exited at <stage>`, `RED: PRODUCT (staging): the status line still says done after
 :zzz` (an unknown command must replace it, or a later "done" proves nothing); or `HUNG at <stage>` with the driver's stack (`vox_pty.py`, V210-54) — every wait here is
 bounded, so a driver past its budget is a TUI that stopped reading what was typed. 2 = apparatus
@@ -91,18 +91,24 @@ def status():
 
 
 try:
-    stage("unlock")
+    # **Attach, not unlock** (ADR-026 N-2, S-4): the TUI is a client of the daemon, and a node has
+    # no locked state. A node the daemon holds already is attached with no question; one it does
+    # not is attached with its passphrase, asked for once. The status bar says `node <name>  ·
+    # attached: …` either way, and it is looked for on the whole screen: the notes a node says
+    # as it attaches (an anchors file it skipped, say) can push it above the bottom rows.
+    stage("attach")
     tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], env)
     tui.pump(3)
     if tui.closed:
         # Gone before it asked for anything: the product stopped, and its screen says why.
-        give(1, f"RED: vox tui exited before it asked to unlock:\n{tui.text()}")
-    key(IDPASS + "\r", 1)
-    # Production Argon2id: the unlock takes seconds. Unlocked, the rooms list names the room.
-    unlocked = tui.until(lambda: tui.closed or is_attached(status()), 60)
+        give(1, f"RED: vox tui exited before its node attached:\n{tui.text()}")
+    if not is_attached(tui.text()) and "passphrase" in tui.text().lower():
+        key(IDPASS + "\r", 1)
+    # Production Argon2id: an attach that takes the passphrase takes seconds.
+    attached = tui.until(lambda: tui.closed or is_attached(tui.text()), 60)
     gone_check()
-    if not unlocked:
-        give(1, f"RED: the TUI never unlocked, with the right passphrase typed:\n{tui.text()}")
+    if not attached:
+        give(1, f"RED: the TUI's node never attached, with the right passphrase typed:\n{tui.text()}")
     stage("open the room")
     tui.pump(3)
     gone_check()

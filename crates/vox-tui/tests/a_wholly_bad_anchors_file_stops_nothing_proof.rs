@@ -552,7 +552,7 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     assert!(
         out.code == Some(0) && said.contains("bob the TUI said done to :close"),
         "PRODUCT: bob's `vox tui`, with an anchors file that names no usable anchor and alice \
-         directly reachable, did not unlock, open the room and close it as a person does; the \
+         directly reachable, did not attach its node, open the room and close it as a person does; the \
          driver exited {:?} at stage {:?} and saw this screen:\n{said}",
         out.code,
         out.stage.as_deref().unwrap_or("(before its first stage)")
