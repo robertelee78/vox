@@ -697,23 +697,23 @@ fn reach_count(dir: &std::path::Path, peer: &str, who: &str, field: &str) -> u64
         "PRODUCT (staging): {who}'s `vox status --json` did not answer, so how many circuits it asked \
          for is unknown.\nstdout:\n{out}\nstderr:\n{err}"
     );
-    let Some(reach) = out.split("\"reach\":[").nth(1) else {
+    // Parsed as JSON: a row's own arrays (`retired`, #335) ended a substring search for the
+    // section's `]` after the first row, so every peer but the first read as a measured 0.
+    let status: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_else(|e| {
+        panic!("PRODUCT (staging): {who}'s `vox status --json` is not JSON ({e}):\n{out}")
+    });
+    let Some(reach) = status["reach"].as_array() else {
         panic!(
             "PRODUCT (staging): {who}'s `vox status --json` has no `reach` section, so how many \
              circuits it asked for is unknown:\n{out}"
         );
     };
-    let reach = reach.split(']').next().unwrap_or_default();
-    let Some(row) = reach.split("{\"peer\":\"").find(|r| r.starts_with(peer)) else {
+    let Some(row) = reach.iter().find(|r| r["peer"].as_str() == Some(peer)) else {
         return 0;
     };
-    row.split(&format!("\"{field}\":"))
-        .nth(1)
-        .and_then(|n| n.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or_else(|| {
-            panic!("PRODUCT (staging): {who}'s `reach` row for {peer} has no {field:?}: {row}")
-        })
+    row[field].as_u64().unwrap_or_else(|| {
+        panic!("PRODUCT (staging): {who}'s `reach` row for {peer} has no {field:?}: {row}")
+    })
 }
 
 /// The `path` of `peer`'s row in the `peers` of the `vox status --json` of the node on `dir`
