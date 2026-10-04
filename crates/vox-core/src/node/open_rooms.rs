@@ -188,6 +188,12 @@ impl OpenRooms {
 
     /// Seal and write the set. Requires an unlocked identity.
     pub fn save(&self, store: &Store, signer: &VaultRootSigner) -> Result<()> {
+        store.put_meta(OPEN_ROOMS_META_KEY, &self.sealed(signer)?)
+    }
+
+    /// The set sealed as [`Self::save`] writes it under [`OPEN_ROOMS_META_KEY`], for a caller that
+    /// writes it in a batch of its own (a join, with the room it remembers: #412).
+    pub fn sealed(&self, signer: &VaultRootSigner) -> Result<Vec<u8>> {
         let sek = open_rooms_sek(signer)?;
         let sealed = seal_segment(
             &sek,
@@ -198,7 +204,7 @@ impl OpenRooms {
         let mut blob = Vec::with_capacity(NONCE_LEN + sealed.ciphertext.len());
         blob.extend_from_slice(&sealed.nonce);
         blob.extend_from_slice(&sealed.ciphertext);
-        store.put_meta(OPEN_ROOMS_META_KEY, &blob)
+        Ok(blob)
     }
 
     /// Read and open the set, or an empty one if this node has never held a room open. Requires an

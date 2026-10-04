@@ -162,7 +162,8 @@ pub(crate) fn room_closed(id: &Digest32, name: &str) -> AppError {
     AppError::Usage(format!(
         "{which} is closed on this node, so there is nothing to read or post. A daemon \
          reopens every room it held open, so this one was closed in `vox tui` or did not \
-         reopen. Open it in `vox tui`, or give `vox daemon` a line with its passphrase"
+         reopen (its log says why). Open it in `vox tui`, or join it again: `vox room join` \
+         with its address and passphrase opens a room this node holds closed"
     ))
 }
 
