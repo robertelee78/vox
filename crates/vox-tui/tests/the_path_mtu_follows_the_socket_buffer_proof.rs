@@ -173,11 +173,14 @@ fn run_arm(granted: usize, short: bool, staged: Option<&std::path::Path>) {
             .and_then(|t| t.split_whitespace().next()?.parse().ok())
             .unwrap_or_else(|| panic!("PRODUCT (staging): no daemon holds {}", dir.display()));
         let log = std::fs::read_to_string(dir.join(".daemon").join("log")).unwrap_or_default();
-        (
-            name.to_owned(),
-            pid,
-            log.lines().map(str::to_owned).collect(),
-        )
+        // The log holds every daemon this data root has run (one started for an attach before
+        // this one, say): only the running daemon's lines, after the last one's "stopped".
+        let lines: Vec<String> = log.lines().map(str::to_owned).collect();
+        let from = lines
+            .iter()
+            .rposition(|l| l.starts_with("vox daemon: stopped"))
+            .map_or(0, |i| i + 1);
+        (name.to_owned(), pid, lines[from..].to_vec())
     };
     let guest_daemon = daemon_of("the guest's daemon", &w.guest_dir);
     let host_daemon = daemon_of("the host's daemon", &w.host_dir);
