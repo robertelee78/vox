@@ -1267,7 +1267,13 @@ pub async fn forward_named(
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    eprintln!("vox: bound in {} ms", first_attempt.elapsed().as_millis());
+    // The daemon binds the forward only once it has reached the host (#215), so this is how long
+    // reaching it took: said as it always was, with the host and the one request it took.
+    eprintln!(
+        "vox: reached {} in {} ms (1 attempt)",
+        short(&host),
+        first_attempt.elapsed().as_millis()
+    );
     println!(
         "vox: forwarding {bound} to {service} on {name} ({})",
         short(&host)
