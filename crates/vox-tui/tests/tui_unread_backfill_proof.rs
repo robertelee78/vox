@@ -47,6 +47,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -58,7 +61,17 @@ const ROWS: u16 = 30;
 const COLS: u16 = 120;
 
 /// One `vox` command, run to completion against a profile.
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
 fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let verb: Vec<&str> = args.to_vec();
+    match attach::needs(dir, &verb) {
+        Some(node) => attach::Root::at(dir, IDPASS).attached(&node, || vox_plain(dir, args, stdin)),
+        None => vox_plain(dir, args, stdin),
+    }
+}
+
+fn vox_plain(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", dir)

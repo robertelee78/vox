@@ -1063,11 +1063,7 @@ fn the_control_socket_is_private_and_a_client_refuses_one_that_is_not_its_own() 
     let p = Profile::new(&tmp.path().join("a".repeat(90)), &t_env);
     let q = Profile::new(&tmp.path().join("b".repeat(90)), &t_env);
     assert!(
-        layout::node_dir(&p.data, layout::DEFAULT_NODE)
-            .join("node.sock")
-            .as_os_str()
-            .len()
-            > 104,
+        p.data.join(".daemon").join("vox.sock").as_os_str().len() > 104,
         "APPARATUS, CANNOT MEASURE: the proof's profile path is short enough for the natural \
          socket"
     );

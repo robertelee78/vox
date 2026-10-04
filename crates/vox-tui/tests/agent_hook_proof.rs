@@ -68,7 +68,7 @@ const HARNESS_VARS: &[&str] = &[
     "VOX_ROOM",
     "VOX_AGENT_NAME",
     "VOX_HARNESS",
-    "VOX_PROFILE",
+    "VOX_NODE",
     "VOX_ANCHORS",
     "VOX_LISTEN",
     "CLAUDE_CODE_MESSAGING_SOCKET",
