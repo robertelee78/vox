@@ -2701,8 +2701,8 @@ pub fn run() -> ExitCode {
         Cmd::Lan(LanCmd::Up(a)) => {
             // Asked before the node is touched: without a helper nothing here can work, and a
             // refusal should leave nothing behind.
-            if !crate::lan_cli::helper_reachable(&a.helper_socket) {
-                eprintln!("vox: {}", crate::lan_cli::no_helper(&a.helper_socket));
+            if let Err(why) = crate::lan_cli::helper_answers(&a.helper_socket) {
+                eprintln!("vox: {why}");
                 return ExitCode::FAILURE;
             }
             let paths = match a.room.profile.paths() {
