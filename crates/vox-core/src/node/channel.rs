@@ -1804,6 +1804,7 @@ impl ChannelState {
                 None => BTreeMap::new(),
             };
 
+        Self::refresh_gov_preds(&dag, &mut gov_entries);
         let evaluator = Arc::new(Self::build_evaluator(
             &genesis,
             &authors,
@@ -2302,6 +2303,7 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        Self::refresh_gov_preds(&self.dag, &mut self.gov_entries);
         self.evaluator = Arc::new(Self::rebuild_evaluator(
             &self.genesis,
             &self.authors,
@@ -4288,6 +4290,7 @@ impl ChannelState {
         self.next_log_id = id.saturating_add(1);
         self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.gov_entries.push(gov);
+        Self::refresh_gov_preds(&self.dag, &mut self.gov_entries);
         self.evaluator = Arc::new(Self::rebuild_evaluator(
             &self.genesis,
             &self.authors,
@@ -4303,6 +4306,28 @@ impl ChannelState {
     /// never trusted for authority).
     fn gov_heads(&self) -> std::collections::BTreeSet<Digest32> {
         self.gov_entries.iter().map(|g| g.entry_hash).collect()
+    }
+
+    /// Set every governance entry's causal predecessors from the log itself (ADR-007 G-23, G-25,
+    /// #380): the governance entries that happened before it through its signed `seen` and feed
+    /// links ([`Dag::happened_before`]), the same on every node that holds them.
+    ///
+    /// **Not what this node held when the entry arrived.** A synced entry was given this node's
+    /// governance heads as its past, so an entry another member wrote without seeing one of them
+    /// was taken here as having seen it: an end an admin wrote while cut off, which arrived after
+    /// the creator's revocation of that admin, was placed after the revocation on one node and
+    /// before it on the author's own — and every entry reopened from the store had no past at all.
+    /// Removal wins only over what is concurrent; concurrency read from arrival order is not
+    /// concurrency.
+    fn refresh_gov_preds(dag: &Dag, gov_entries: &mut [GovEntry]) {
+        let hashes: Vec<Digest32> = gov_entries.iter().map(|g| g.entry_hash).collect();
+        for g in gov_entries.iter_mut() {
+            g.causal_predecessors = hashes
+                .iter()
+                .copied()
+                .filter(|h| *h != g.entry_hash && dag.happened_before(h, &g.entry_hash))
+                .collect();
+        }
     }
 
     /// The stored entries set aside when this room opened (V210-74), each as `author#seq: why`.
@@ -4395,6 +4420,7 @@ impl ChannelState {
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<(Vec<Rendered>, usize)> {
         let mut dropped = 0usize;
+        Self::refresh_gov_preds(&self.dag, &mut self.gov_entries);
         match Self::rebuild_evaluator(
             &self.genesis,
             &self.authors,
@@ -4408,6 +4434,7 @@ impl ChannelState {
                 let pending: Vec<GovEntry> = self.gov_entries.drain(at..).collect();
                 for gov in pending {
                     self.gov_entries.push(gov);
+                    Self::refresh_gov_preds(&self.dag, &mut self.gov_entries);
                     match Self::rebuild_evaluator(
                         &self.genesis,
                         &self.authors,
@@ -5397,6 +5424,7 @@ impl ChannelState {
             Some(g) => {
                 let could_read = self.readable_authors();
                 self.gov_entries.push(g);
+                Self::refresh_gov_preds(&self.dag, &mut self.gov_entries);
                 self.evaluator = Arc::new(Self::rebuild_evaluator(
                     &self.genesis,
                     &self.authors,
