@@ -43,7 +43,12 @@ impl Account {
     fn new() -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("vd")
-            .tempdir_in("/private/tmp")
+            // Short, for the socket path: macOS's /private/tmp, else /tmp (Linux).
+            .tempdir_in(if Path::new("/private/tmp").is_dir() {
+                "/private/tmp"
+            } else {
+                "/tmp"
+            })
             .unwrap();
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
