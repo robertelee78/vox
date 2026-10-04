@@ -2406,6 +2406,9 @@ impl JoinSteps {
     fn note(&mut self, what: String) {
         self.0.push(what);
     }
+    fn append(&mut self, other: JoinSteps) {
+        self.0.extend(other.0);
+    }
     fn render(&self) -> String {
         self.0.join(", ")
     }
@@ -2456,7 +2459,13 @@ impl Joiner {
                 let said = match Self::dial_with(&net, &tx, id, &endpoints, true).await {
                     Err(e) => Err(format!("board {} was not reached: {e}", short_id(id))),
                     Ok(conn) => match net.fetch_channel(&conn, &room, 0).await {
-                        Err(e) => Err(format!("board {} could not be read: {e}", short_id(id))),
+                        Err(e) => Err(match went_offline(&conn) {
+                            Some(how) => format!(
+                                "board {} went offline as the room was read: {how}",
+                                short_id(id)
+                            ),
+                            None => format!("board {} could not be read: {e}", short_id(id)),
+                        }),
                         Ok(set) if set.genesis.is_none() => Err(match set.ended_by {
                             Some(by) => format!(
                                 "board {} says room {} has ended: {} ended it",
@@ -2720,24 +2729,52 @@ impl Joiner {
             }
             Err(e) => {
                 let fault = on_the_board(fault_of(&e));
+                let who = if parsed.responder == Some(board.peer_id()) {
+                    "the room's host"
+                } else {
+                    "anchor"
+                };
+                // **A board that stopped as it was read went offline; it did not answer** (#406).
+                // A daemon finishes a node's stop after its last client has gone, and a join that
+                // reached the node in that moment saw it answer and then close: "the room's host
+                // answered, then its connection closed … run the join again", with every board
+                // still up saying it had nothing for the room. The host had gone offline, which
+                // is what leaves a room unpublished where a joiner looks; so it counts as a board
+                // not reached, and the boards that were reached decide the answer.
+                let offline = went_offline(&board);
                 // #302's wording, which `tunnel_cli::board_unreachable_advice` reads: a board that
                 // answered and then closed before the room was fetched.
-                let why = vec![if fault == Fault::BoardUnreachable {
-                    let who = if parsed.responder == Some(board.peer_id()) {
-                        "the room's host"
-                    } else {
-                        "anchor"
-                    };
-                    format!(
-                        "{who} {} answered, then its connection closed before the room was \
-                         fetched: {e}",
+                let why = vec![match &offline {
+                    Some(how) => format!(
+                        "{who} {} went offline as the room was read: {how}",
                         short(board.peer_id())
-                    )
-                } else {
-                    format!("board {} could not be read: {e}", short(board.peer_id()))
+                    ),
+                    None if fault == Fault::BoardUnreachable => format!(
+                        "{who} {} answered, then its connection closed before the room was \
+                         fetched: {e}{}",
+                        short(board.peer_id()),
+                        board
+                            .quinn()
+                            .close_reason()
+                            .map(|c| format!(" ({})", crate::transport::quic::closed_text(&c)))
+                            .unwrap_or_default()
+                    ),
+                    None => format!("board {} could not be read: {e}", short(board.peer_id())),
                 }];
                 self.another_board_with_the_room(&tried, why, fault, steps)
-                    .await?
+                    .await
+                    .map_err(|mut lost| {
+                        if offline.is_some()
+                            && lost.fault == Fault::BoardUnreachable
+                            && lost
+                                .why
+                                .iter()
+                                .any(|w| w.contains(" has nothing for room "))
+                        {
+                            lost.fault = Fault::RoomNotOnBoard;
+                        }
+                        lost
+                    })?
             }
         };
         Ok((found.0, found.1, tried))
@@ -2756,14 +2793,37 @@ impl Joiner {
         // every board the join reached says it has nothing for the room, the join asks again, for
         // as long as a join waits for a board ([`Node::BOARD_PATIENCE`]), and says what it is
         // waiting for. Any other answer ends the search as before.
+        //
+        // **The first search's steps and the last's, not every search's** (#406): the steps of
+        // every search were kept, so a join that waited out its patience printed thirty copies of
+        // "board 0.00s, fetch 0.00s, the other boards …" as its steps. The first search says how
+        // long reaching a board took, the searches between are one step, and the last search's
+        // steps say how it ended.
         let started = std::time::Instant::now();
+        let mut searches = 0_u32;
+        let mut first_done = started;
         let (mut board, mut set, mut tried) = loop {
-            match self.a_board_with_the_room(steps).await {
+            let mut search = JoinSteps::default();
+            let t = std::time::Instant::now();
+            let found = self.a_board_with_the_room(&mut search).await;
+            let retry = matches!(&found, Err(lost) if lost.fault == Fault::RoomNotOnBoard
+                && started.elapsed() + ROOM_RETRY < Node::BOARD_PATIENCE);
+            if searches == 0 {
+                steps.append(search);
+                first_done = std::time::Instant::now();
+            } else if !retry {
+                if searches > 1 {
+                    steps.lasted(
+                        &format!("asked {} time(s) more", searches - 1),
+                        t.saturating_duration_since(first_done),
+                    );
+                }
+                steps.append(search);
+            }
+            searches += 1;
+            match found {
                 Ok(found) => break found,
-                Err(lost)
-                    if lost.fault == Fault::RoomNotOnBoard
-                        && started.elapsed() + ROOM_RETRY < Node::BOARD_PATIENCE =>
-                {
+                Err(_) if retry => {
                     self.begin(format!(
                         "waiting: no board this address names holds room {} yet — its host has \
                          not published it there; asking again (up to {}s)",
@@ -3074,6 +3134,31 @@ impl Joiner {
 
 /// A fault met while talking to the board itself: an `Unreachable` there is the board's, not a
 /// member's, and says so (#192).
+/// How `conn`'s peer went offline, if its connection ended because the peer stopped or no longer
+/// holds the node it was dialled for: it said it was stopping (V210-93), it closed with
+/// [`crate::wire::WireError::ShuttingDown`], or its daemon answered
+/// [`crate::wire::WireError::NotAvailable`] (ADR-011: the node is not attached there). `None` for
+/// a connection still open, or one that ended any other way.
+fn went_offline(conn: &VoxConnection) -> Option<String> {
+    use crate::wire::WireError;
+    if conn.peer_stopped() {
+        return Some("it said it was stopping".to_owned());
+    }
+    match conn.quinn().close_reason()? {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            match u8::try_from(close.error_code.into_inner())
+                .ok()
+                .and_then(WireError::from_code)?
+            {
+                WireError::ShuttingDown => Some("it stopped".to_owned()),
+                WireError::NotAvailable => Some("its node is not there (not available)".to_owned()),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 const fn on_the_board(fault: Fault) -> Fault {
     match fault {
         Fault::Unreachable => Fault::BoardUnreachable,
