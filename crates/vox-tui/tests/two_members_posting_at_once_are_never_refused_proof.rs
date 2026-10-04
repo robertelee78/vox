@@ -33,6 +33,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod attach;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -321,27 +323,36 @@ fn two_members_posting_at_once_are_never_refused() {
     let members = [Member::new(root, "alice"), Member::new(root, "bob")];
     let fps: Vec<String> = members.iter().map(Member::fingerprint).collect();
     for (i, m) in members.iter().enumerate() {
-        for (j, other) in members.iter().enumerate() {
-            if i != j {
-                let (ok, _, err) = m.vox(
-                    &[
-                        "trust",
-                        "add",
-                        &fps[j],
-                        "--name",
-                        other.name,
-                        "--identity-passphrase-file",
-                        m.pass.to_str().expect("APPARATUS: a non-UTF-8 temp path"),
-                    ],
-                    None,
-                );
-                assert!(
-                    ok,
-                    "PRODUCT (staging): {} could not trust {}: {err}",
-                    m.name, other.name
-                );
+        // Trust is a one-shot verb: its node is attached for it and let go after, before the
+        // member's own daemon starts (ADR-026 L-2).
+        let root = attach::Root {
+            data: m.data.clone(),
+            cfg: m.cfg.clone(),
+            passphrase: ID_PASS.trim_end_matches('\n').to_owned(),
+        };
+        root.attached("default", || {
+            for (j, other) in members.iter().enumerate() {
+                if i != j {
+                    let (ok, _, err) = m.vox(
+                        &[
+                            "trust",
+                            "add",
+                            &fps[j],
+                            "--name",
+                            other.name,
+                            "--identity-passphrase-file",
+                            m.pass.to_str().expect("APPARATUS: a non-UTF-8 temp path"),
+                        ],
+                        None,
+                    );
+                    assert!(
+                        ok,
+                        "PRODUCT (staging): {} could not trust {}: {err}",
+                        m.name, other.name
+                    );
+                }
             }
-        }
+        });
     }
     let daemons: Vec<Proc> = members
         .iter()
