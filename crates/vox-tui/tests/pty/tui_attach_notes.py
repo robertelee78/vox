@@ -35,8 +35,9 @@ try:
     tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], env)
 
     def bottom():
-        """The bottom rows: the status bar and the notice line."""
-        return " ".join(" ".join(r.split()) for r in tui.display()[-3:])
+        """The bottom rows: the status bar and the line under it, which a long notice wraps onto
+        several rows of."""
+        return " ".join(" ".join(r.split()) for r in tui.display()[-6:])
 
     stage("the attach prompt")
     if not tui.until(lambda: tui.closed or "attach node" in tui.text().lower(), 60):

@@ -332,14 +332,18 @@ impl DaemonCore {
                 // What attaching the node said (a skipped anchors line, carrying on with no
                 // anchor), in the TUI's notice line: the daemon writes it only to its log (R23).
                 let notes = conn.client.attach_notes().to_vec();
-                if !notes.is_empty() {
-                    self.notice = Some(notes.join("; "));
-                }
                 self.conn = Some(conn);
                 self.has_identity = true;
                 self.asked = None;
                 self.timeline = None;
-                CommandStatus::Done
+                if notes.is_empty() {
+                    return CommandStatus::Done;
+                }
+                let said = notes.join("; ");
+                self.notice = Some(said.clone());
+                // Also as the attach's own answer: the status line shows a command's answer over
+                // the notice line, so a bare "done" hid what the attach said.
+                CommandStatus::Said(said)
             }
             Ok(Err(refusal)) => refused(&refusal),
             Err(e) => CommandStatus::Said(format!("the daemon could not be reached: {e}")),

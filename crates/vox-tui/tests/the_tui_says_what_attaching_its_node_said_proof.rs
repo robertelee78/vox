@@ -73,8 +73,7 @@ fn the_tui_says_what_attaching_its_node_said() {
         out.code, out.took, out.stage
     );
     let Some(said) = said else {
-        let side = if out.stdout.contains("bob RED: PRODUCT") || out.stdout.contains("bob HUNG at")
-        {
+        let side = if out.has_verdict("bob") && !out.stdout.contains("bob APPARATUS") {
             "PRODUCT (staging)"
         } else {
             "APPARATUS"
