@@ -608,7 +608,7 @@ fn a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts() {
         return;
     }
 
-    let token = access_token(&real_home);
+    let token = access_token(real_home);
 
     // ---- one turn for each node ----
     let turn = |node: &str, h: &ClaudeHome| -> Turn {
