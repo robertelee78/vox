@@ -73,6 +73,9 @@ optional_proof::not_run!(r41_a_tunnel_does_not_throttle_the_link_it_runs_over);
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
@@ -657,7 +660,21 @@ fn vox_once(dir: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     vox_once_env(dir, args, &[])
 }
 
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
 fn vox_once_env(
+    dir: &std::path::Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    match attach::needs(dir, args) {
+        Some(node) => attach::Root::at(dir, "identity passphrase")
+            .attached(&node, || vox_once_env_plain(dir, args, env)),
+        None => vox_once_env_plain(dir, args, env),
+    }
+}
+
+fn vox_once_env_plain(
     dir: &std::path::Path,
     args: &[&str],
     env: &[(&str, &str)],
