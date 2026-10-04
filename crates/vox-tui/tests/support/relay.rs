@@ -540,9 +540,10 @@ impl RelayWorld {
         (bound, ready)
     }
 
-    /// The room's name for the host's service, as a SOCKS5 client asks `vox up` for it.
+    /// The host's service by its address, `<service>.<node>.<room>.vox`: the only `.vox` form that
+    /// resolves (V030-25; the decider, 2026-10-02). The service is named for its port.
     pub fn hostname(&self) -> String {
-        format!("{}.vox", self.room)
+        format!("{}.{}.{}.vox", self.service, self.host_fp, self.room)
     }
 
     /// **The path is a relay, said by the guest.** The forward's upgrade tries a direct dial and

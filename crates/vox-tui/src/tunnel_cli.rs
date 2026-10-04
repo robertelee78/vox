@@ -1158,14 +1158,30 @@ pub async fn up(
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
     waiting.on("the vox daemon to stop");
+    // **What the node says about its reaches is said here too** (PRD-001 R23, R36): a path that
+    // stays relayed, a peer that cannot be reached, a refusal's reason. The proxy's own notes say
+    // which name matched nothing; the node's events say what happened to the connection it made.
+    let mut events = crate::client::events(&held.at).await.ok();
     let closed = crate::client::hold_until_closed(&mut held.client);
     tokio::pin!(closed);
     loop {
+        let event = async {
+            match events.as_mut() {
+                Some(e) => e.next().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             why = &mut closed => return Err(why),
             note = up.next_note() => match note {
                 Some(note) => eprintln!("vox: {note}"),
                 None => return Err((&mut closed).await),
+            },
+            ev = event => match ev {
+                Ok(Some(Frame::Event(ev))) => say_if_it_explains_a_failure(&ev),
+                Ok(Some(_)) => {}
+                // The subscription ends with the node; the holding connection says why.
+                Ok(None) | Err(_) => events = None,
             },
         }
     }
