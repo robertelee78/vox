@@ -1753,8 +1753,6 @@ impl NodeEvent {
             NodeEvent::NewEntry { channel_id, .. } => {
                 format!("a new message in room {}", short(channel_id))
             }
-            NodeEvent::Unlocked => "the identity is unlocked".into(),
-            NodeEvent::Locked => "the identity is locked".into(),
             NodeEvent::ChannelOpened { channel_id } => {
                 format!("room {} is open", short(channel_id))
             }
