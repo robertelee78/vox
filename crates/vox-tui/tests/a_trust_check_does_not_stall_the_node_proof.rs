@@ -178,7 +178,13 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
                             ],
                         )
                     };
-                    assert!(o.ok, "PRODUCT (staging): a checked keyring change: {o:?}");
+                    // Checked either way: made, or — with a 0 s window and four checks racing,
+                    // one passing may not restart the window for another — refused after its
+                    // passphrase was checked. Anything else is not the load this proof needs.
+                    assert!(
+                        o.ok || o.stderr.contains("needs your identity passphrase again"),
+                        "PRODUCT (staging): a checked keyring change: {o:?}"
+                    );
                     add = !add;
                     checks.fetch_add(1, Ordering::SeqCst);
                 }

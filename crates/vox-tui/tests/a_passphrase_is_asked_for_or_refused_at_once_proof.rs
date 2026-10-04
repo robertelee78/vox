@@ -35,6 +35,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/layout.rs"]
+mod layout;
+
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -415,6 +418,8 @@ fn no_command_waits_for_input_it_cannot_get() {
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
     let (alice, _) = profile(tmp.path(), "alice");
     let (bob, bob_fp) = profile(tmp.path(), "bob");
+    // A daemon a client starts here (`vox node attach` starts one) is stopped by its lock's pid.
+    let _reaper = layout::Reaper(vec![bob.clone(), alice.clone()]);
 
     // Alice's daemon, as a harness starts it: the passphrase in the environment, stdin open and
     // never written. It must serve without waiting for stdin to close.
@@ -498,9 +503,11 @@ fn no_command_waits_for_input_it_cannot_get() {
         false,
         &["no terminal to ask at", "--passphrase-file"],
     );
-    // With no node running: each opens the profile itself, which needs the identity passphrase.
+    // With no daemon holding bob's node. Since ADR-026 (L-2, C-6) a one-shot verb never opens the
+    // node itself: it refuses at once, saying how to attach it, and asks for no passphrase. `vox id`
+    // of an identity that exists reads its fingerprint, which needs none.
+    check("vox id", &mut vox_cmd(&bob, &["id"]), true, &[&bob_fp]);
     for (what, args) in [
-        ("vox id", vec!["id"]),
         ("vox trust list (no node)", vec!["trust", "list"]),
         (
             "vox trust add (no node)",
@@ -511,13 +518,16 @@ fn no_command_waits_for_input_it_cannot_get() {
             vec!["service", "add", "aaaa", "ssh", "127.0.0.1:22"],
         ),
     ] {
-        check(
-            what,
-            &mut vox_cmd(&bob, &args),
-            false,
-            &["no terminal to ask at", "VOX_IDENTITY_PASSPHRASE"],
-        );
+        check(what, &mut vox_cmd(&bob, &args), false, &["vox node attach"]);
     }
+    // The verb that opens the node is `vox node attach`: with no terminal and no passphrase given,
+    // it must not wait, and must say how to give one.
+    check(
+        "vox node attach (no passphrase)",
+        &mut vox_cmd(&bob, &["node", "attach", "default"]),
+        false,
+        &["no terminal to ask at", "VOX_IDENTITY_PASSPHRASE"],
+    );
     // `vox connect` asks for the room's passphrase first.
     check(
         "vox connect",
