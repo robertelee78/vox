@@ -30,9 +30,14 @@
 //! staging, including a partition that did not hold (carol's end refused, so it never wrote one)
 //! or logs that never met; `APPARATUS:` a signal that could not be sent.
 //!
-//! **Mutation that must turn it red:** the room-lifecycle fold counting an end from an issuer that
+//! **The same for a retention** (`a_retention_set_by_an_admin_revoked_meanwhile_does_not_stand`):
+//! carol, cut off, sets the room's retention — a policy update, which a delegated admin may make
+//! (#319) — and once the logs meet every node keeps the retention the room had.
+//!
+//! **Mutations that must turn it red:** the room-lifecycle fold counting an end from an issuer that
 //! was an admin in the end's strict past, whatever revocation is concurrent with it — removal-wins
-//! not applied to an end (the core before #380's fix).
+//! not applied to an end; and the policy fold doing the same for a policy update (the core before
+//! #380's fixes).
 
 #![cfg(unix)]
 
