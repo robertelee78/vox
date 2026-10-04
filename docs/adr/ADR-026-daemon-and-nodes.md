@@ -64,8 +64,10 @@ network presence from the start: there is no interim design with one socket per 
   node MUST receive its passphrase once, when it attaches, and MUST run in full while attached: it
   dials, accepts, syncs, serves, relays and publishes. After the keyring window (30 minutes,
   V210-159), only keyring changes (trust add, remove, rename) MUST ask for the passphrase again.
-  Detaching is the only way a node stops. *Not built: the TUI still locks its node (ADR-015
-  11.2–11.3).*
+  Detaching is the only way a node stops. *Built (#409): there is no `Lock` command and no
+  `Locked` or `Unlocked` event; the vault is opened once, by the daemon's attach, and a detach wipes
+  the node's secrets once work holding one has finished
+  (`a_detach_leaves_no_secret_in_memory_proof`).*
 - **N-3.** All attached nodes MUST run concurrently: each syncs, receives, serves and wakes its agents
   independently. Selecting a node for a request MUST NOT idle, pause or deprioritise any other node.
 - **N-4.** There MUST NOT be an "active node". A node is named only to say which node an action is
@@ -148,7 +150,9 @@ network presence from the start: there is no interim design with one socket per 
   `vox daemon` attaching its own foreground node is that node's client: it MAY read
   `VOX_IDENTITY_PASSPHRASE` for that node only, never for a node another client asks it to attach.
 - **C-7.** The socket MUST offer what the TUI needs as a client: open and close of a closed room,
-  per-node status, attach and detach. *Not built (with S-4).*
+  per-node status, attach and detach. *Built (#409): `OpenRoom`/`CloseRoom`, the node snapshot
+  (`node::snapshot`), status and tunnel close on the node's connection, and the daemon's attach,
+  detach and events; the TUI uses only these (`the_tui_shows_the_room_truthfully_proof`, `tui_member_names_proof`, `tui_unread_backfill_proof`).*
 
 ### 5. Starting the daemon and the clients
 
@@ -162,9 +166,12 @@ network presence from the start: there is no interim design with one socket per 
 - **S-3.** No verb MUST host its own node: `serve`, `connect`, `up`, `forward`, `service`, `trust` and
   every other verb MUST be clients of the daemon.
 - **S-4. Clients.** The TUI and the macOS app MUST be clients of the daemon (ADR-014, ADR-015); they
-  MUST NOT embed a node. A client has no node lock: SIGHUP MUST stop the client cleanly and leave its
-  node attached. The one exception is the iOS app (v0.4.0), which hosts its own node because iOS runs
-  no background daemon. *Not built: the TUI still embeds its node.*
+  MUST NOT embed a node. A client has no node lock: SIGHUP MUST stop the client cleanly, the same as
+  quitting, and the client MUST only drop its hold, so a node it attached implicitly detaches if that
+  was its last holder (L-3) and one attached by hand or with `--keep` stays attached. The one
+  exception is the iOS app (v0.4.0), which hosts its own node because iOS runs no background daemon.
+  *Built for the TUI (#409): `the_tui_shows_the_room_truthfully_proof`, `tui_member_names_proof`, `tui_unread_backfill_proof`, `a_detach_leaves_no_secret_in_memory_proof` (SIGHUP
+  mid-attach). Not built for the macOS app (ADR-014).*
 - **S-5. `vox lan up`.** The user-side `vox lan up` MUST be a daemon client holding a session (L-7).
   The daemon, as the same uid, MUST ask the root helper (`sudo vox lan helper`) for the device and
   run the LAN itself. The helper MUST serve its interface over its own socket owned by `SUDO_UID`;

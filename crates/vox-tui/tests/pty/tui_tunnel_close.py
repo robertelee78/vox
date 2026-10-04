@@ -25,7 +25,7 @@ import os, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pyte, stage, is_attached  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, CUE, TAG = sys.argv[1:8]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
@@ -66,7 +66,7 @@ try:
     tui.pump(3)
     tui.key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds.
-    if not tui.until(lambda: "unlocked" in status(), 60):
+    if not tui.until(lambda: is_attached(status()), 60):
         print(f"{TAG} APPARATUS: the TUI never unlocked:\n{tui.text()}")
         sys.exit(2)
     stage("open the room")
@@ -115,7 +115,8 @@ try:
     chosen = after[0]
     tui.key("x", 1)
     said = f"tunnel {chosen} "
-    gone = "was closed by a person in the TUI"
+    # The TUI closes it through its node in the daemon, which words it from the node's side.
+    gone = "was closed by a person on this side"
     if not tui.until(lambda: any(said in r and gone in r for r in tui.display()), 20, 0.25):
         cue("red", f"{chosen}\n{tui.text()}")
         print(f"{TAG} RED: after `x`, the TUI never said tunnel {chosen} {gone!r}:\n{tui.text()}")

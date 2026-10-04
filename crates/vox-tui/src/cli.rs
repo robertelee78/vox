@@ -1201,6 +1201,10 @@ pub enum NodeCmd {
         /// Read the new identity's passphrase from this file (first line; `-` reads stdin).
         #[arg(long)]
         passphrase_file: Option<PathBuf>,
+        /// Make a headless node, an anchor's: a key file with no passphrase, which holds no room
+        /// and can read nothing. `vox node --node <name>` runs it.
+        #[arg(long)]
+        headless: bool,
         #[command(flatten)]
         account: AccountArgs,
     },
@@ -1240,8 +1244,9 @@ fn run_node_cmd(cmd: NodeCmd) -> ExitCode {
         NodeCmd::Create {
             name,
             passphrase_file,
+            headless,
             account,
-        } => crate::client::node_create(&account.as_node_args(), &name, passphrase_file),
+        } => crate::client::node_create(&account.as_node_args(), &name, passphrase_file, headless),
         NodeCmd::Attach {
             name,
             keep,
@@ -1832,21 +1837,24 @@ pub fn run() -> ExitCode {
     });
     match cli.command.unwrap_or(default_tui) {
         Cmd::Tui(args) => {
-            let paths = match args.paths_creating() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("vox: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let anchors = match args.anchor_set() {
+            // The TUI is a client of the account's daemon (ADR-026 S-4): it names a node, and the
+            // daemon holds it. A node named neither by flag nor environment is resolved by C-3.
+            let account = match vox_core::node::paths::Account::of(
+                args.data_dir.as_deref(),
+                args.config_dir.as_deref(),
+            ) {
                 Ok(a) => a,
                 Err(e) => {
                     eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            match run_live(paths, args.listen, anchors) {
+            match run_live(
+                account,
+                args.node.clone(),
+                args.listen,
+                args.anchors.clone(),
+            ) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox: {e}");
@@ -1857,27 +1865,22 @@ pub fn run() -> ExitCode {
         Cmd::Node(AnchorArgs { cmd: Some(cmd), .. }) => run_node_cmd(cmd),
         Cmd::Node(node_args) => {
             let args = &node_args.profile;
-            let paths = match args.paths_creating() {
+            let paths = match crate::client::anchor_paths_of(args) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("vox node: {e}");
                     return ExitCode::FAILURE;
                 }
             };
-            // Of the node just resolved, which an empty data root makes: `paths()` would refuse to
-            // choose one there, and `vox node` must start (ADR-026 N-5).
-            let anchors = match args.anchor_set_lenient_at(&paths) {
-                Ok((a, None)) => a,
-                // An anchor may run with no anchor of its own, but it says why it has none.
-                Ok((a, Some(unusable))) => {
-                    eprintln!("vox node: {unusable}; running with no anchor of its own");
-                    a
-                }
-                Err(e) => {
+            // Checked here, so a malformed one is refused before the daemon starts; the daemon
+            // attaches the anchor with them, beside the node's anchors file.
+            let mut checked = vox_core::nat::bootstrap::BootstrapSet::new();
+            for spec in args.anchor_specs() {
+                if let Err(e) = vox_core::node::link::merge_anchor_spec(&mut checked, &spec) {
                     eprintln!("vox node: --anchor: {e}");
                     return ExitCode::FAILURE;
                 }
-            };
+            }
             let serve_only = match node_args.serve_only(&paths) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1892,7 +1895,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match run_node(paths, args.listen, anchors, serve_only) {
+            match run_node(paths, args.listen, args.anchor_specs(), serve_only) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("vox node: {e}");
@@ -2555,6 +2558,15 @@ pub fn run() -> ExitCode {
         // is offered again whenever the node attaches (V030-06), and the room it is offered in is
         // one the node holds open. Nothing here opens a room or asks for a passphrase.
         Cmd::Service(sub) => {
+            let given = match &sub {
+                ServiceCmd::Add(a) => a.room.passphrase.as_ref(),
+                ServiceCmd::Remove(r) => r.room.passphrase.as_ref(),
+                ServiceCmd::List(_) => None,
+            };
+            if let Err(e) = crate::tunnel_cli::refuse_disclosed_room_passphrase(given) {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             let profile = match &sub {
                 ServiceCmd::Add(a) => &a.room.profile,
                 ServiceCmd::Remove(r) => &r.room.profile,
@@ -2615,6 +2627,12 @@ pub fn run() -> ExitCode {
         // owner check is the boundary.
         Cmd::Trust(sub) => run_trust_over_socket(sub),
         Cmd::Up(args) => {
+            if let Err(e) =
+                crate::tunnel_cli::refuse_disclosed_room_passphrase(args.passphrase.as_ref())
+            {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             let paths = match args.profile.paths() {
                 Ok(p) => p,
                 Err(e) => {
@@ -2625,13 +2643,6 @@ pub fn run() -> ExitCode {
             let waiting = crate::tunnel_cli::Waiting::client();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
-                if args.passphrase.is_some() {
-                    return Err(AppError::Usage(format!(
-                        "--passphrase is refused: a command line is readable by every process on \
-                         this machine. {}",
-                        crate::tunnel_cli::GIVE_ROOM_PASSPHRASE
-                    )));
-                }
                 let room_pp = match &args.passphrase_file {
                     Some(f) => {
                         let text = crate::tunnel_cli::passphrase_file_text(f)?;
@@ -2696,10 +2707,16 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Lan(LanCmd::Up(a)) => {
+            if let Err(e) =
+                crate::tunnel_cli::refuse_disclosed_room_passphrase(a.room.passphrase.as_ref())
+            {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             // Asked before the node is touched: without a helper nothing here can work, and a
             // refusal should leave nothing behind.
-            if !crate::lan_cli::helper_reachable(&a.helper_socket) {
-                eprintln!("vox: {}", crate::lan_cli::no_helper(&a.helper_socket));
+            if let Err(why) = crate::lan_cli::helper_answers(&a.helper_socket) {
+                eprintln!("vox: {why}");
                 return ExitCode::FAILURE;
             }
             let paths = match a.room.profile.paths() {
