@@ -27,7 +27,7 @@ mod layout;
 pub mod attach;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{
-    daemon_lock, find_named, kill_daemon, node_dir, reap_daemon, Reaper, DEFAULT_NODE,
+    daemon_lock, daemon_pid, find_named, kill_daemon, node_dir, reap_daemon, Reaper, DEFAULT_NODE,
 };
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");

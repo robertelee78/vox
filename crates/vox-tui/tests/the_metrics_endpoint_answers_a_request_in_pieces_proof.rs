@@ -8,7 +8,9 @@
 //! (`Connection reset by peer`).
 //!
 //! **What this drives.** `vox id`, then `vox daemon --metrics 127.0.0.1:0`, whose own stdout names
-//! the bound address (`vox daemon: metrics http://…/metrics`). The proof is the scraper: it writes
+//! the bound address (`vox daemon: metrics http://…/metrics`) and then says it attached the node
+//! (`vox daemon: node default attached`); the endpoint answers from the first line on, with the
+//! node's families only once the node is attached, so the scrapes wait for the second. The proof is the scraper: it writes
 //! the request line, waits, writes the headers and the blank line that ends them, waits again, and
 //! only then reads, as a scraper on a slow path does.
 //!
@@ -92,6 +94,13 @@ fn a_scrape_whose_request_arrives_in_pieces_gets_the_whole_response() {
         .trim_start_matches("vox daemon: metrics http://")
         .trim_end_matches("/metrics")
         .to_owned();
+    // The endpoint is up before the node is (ADR-026): until `default` is attached, a scrape
+    // honestly carries only the daemon's own families (`vox_daemon_nodes_attached 0`) and no
+    // `vox_up` or health for a node it does not yet hold. The scrapes below are of the node's
+    // metrics, so they start once the daemon says the node it was given a passphrase for is in.
+    daemon.expect_line("that it attached the node `default`", |l| {
+        l.contains("vox daemon: node default attached")
+    });
 
     let mut reds = Vec::new();
 

@@ -1122,12 +1122,18 @@ impl NodeNet {
         // cannot dial its guest at all, while the guest could dial it, bridged through the anchor
         // for every sync; now the guest dials it back, racing the circuit, and a direct
         // connection that lands replaces the relayed one.
+        //
+        // **Racing, not first.** The address the coordinator sees for this node is asked inside
+        // the dial-back's own task: asked here, inline, it cost every circuit below one round trip
+        // to the coordinator before it was even asked for (a fresh node's first relayed reach
+        // asked its circuit 109–121 ms in, through an anchor 100 ms away).
         for coordinator in &helpers {
-            let observed = self.observed_or_ask(coordinator.peer_id()).await;
             let Ok(local_eps) = self.local_endpoints() else {
                 continue;
             };
-            let local = coordstream::punch_endpoints(observed, &local_eps);
+            let known = self.observed_addr();
+            let presence = Arc::clone(&self.presence);
+            let me = self.local_id();
             let coordinator = Arc::clone(coordinator);
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now();
@@ -1147,6 +1153,19 @@ impl NodeNet {
                         );
                     }
                 }
+                // What `observed_or_ask` does, here in the race: the agreed observed address, or
+                // the coordinator's word on it, worth its one round trip to the punch.
+                let observed = match known {
+                    Some(addr) => Some(addr),
+                    None => match coordstream::ask_observed(&coordinator).await {
+                        Ok(addr) => {
+                            presence.note_observed(me, coordinator.peer_id(), addr);
+                            Some(addr)
+                        }
+                        Err(_) => None,
+                    },
+                };
+                let local = coordstream::punch_endpoints(observed, &local_eps);
                 let session = async {
                     let (mut send, mut recv) =
                         coordstream::open_punch_session(&coordinator, peer).await?;
