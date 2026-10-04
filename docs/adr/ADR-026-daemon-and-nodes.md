@@ -273,9 +273,8 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 11. a node keeps running in full past the keyring window, and only a keyring change asks for the
     passphrase again (`a_keyring_change_needs_a_recent_passphrase_proof`);
 12. R40 and R42 are re-measured (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
-    `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`; R42
-    over the relay is measured by `a_first_relayed_connection_is_under_two_seconds_proof`, which is
-    not yet green on its restart claim);
+    `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`,
+    `a_first_relayed_connection_is_under_two_seconds_proof`);
 13. the process-wide-state enumeration (P-1) (`every_process_wide_state_is_listed`).
 
 ADR-011's identity-exchange proofs are listed there.

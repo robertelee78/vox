@@ -2334,6 +2334,11 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // An old layout moves first (ADR-026 F-3), as for every verb.
+            if let Err(e) = vox_core::node::layout::migrate(&account, Some(&node)) {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             let paths = match account.node_paths(&node) {
                 Ok(p) => p,
                 Err(e) => {
