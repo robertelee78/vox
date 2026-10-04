@@ -148,7 +148,8 @@ use std::time::{Duration, Instant};
 
 use world::{
     args, counting_echo_service, echo_service, read_to_end_within, resetting_service, round_trip,
-    socks5_connect, socks5_connect_within, vox_once, Ending, VoxProc, World, PARTIAL,
+    socks5_connect, socks5_connect_within, vox_once, vox_once_attached, Ending, VoxProc, World,
+    PARTIAL,
 };
 
 /// How soon a refused connection must fail for its application once the path to the host is
@@ -783,17 +784,12 @@ fn a_refusal_tells_the_refused_side_nothing_new() {
             "127.0.0.1:0",
         ]),
     );
-    // A listing is a one-shot verb (ADR-026 L-2): the stranger's node is attached for it first, as
-    // a person would, since the forward that held it has ended.
-    let (attached, _, attach_err) = vox_once(
+    // A one-shot verb acts on an attached node (ADR-026 L-2): the stranger attaches it, as a
+    // person does, whether or not the daemon its forward started is still lingering (L-8).
+    let (list_ok, listed, list_err) = vox_once_attached(
         &guest_dir,
-        &args(&["node", "attach", "default", "--listen", "127.0.0.1:0"]),
+        &args(&["service", "list", &w.room, "--listen", "127.0.0.1:0"]),
     );
-    assert!(
-        attached,
-        "PRODUCT (staging): the stranger's `vox node attach default` failed: {attach_err}"
-    );
-    let (list_ok, listed, list_err) = vox_once(&guest_dir, &args(&["service", "list", &w.room]));
     eprintln!(
         "[test] unoffered {unoffered} by vox forward: ok={ok} {out}{err}\n[test] the stranger's \
          listing: {listed}{list_err}"
@@ -1426,6 +1422,13 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
         } else {
             "the driver is still running".to_owned()
         };
+        // **A driver that could not run is the apparatus, said as that alone**: with no `pyte`
+        // the TUI was never driven, so nothing here says what the product did.
+        assert!(
+            !said.contains("guest APPARATUS: pyte is not importable"),
+            "APPARATUS: the TUI driver could not run (set VOX_PYTE_PATH to where `pyte` is \
+             importable); {said}"
+        );
         panic!("PRODUCT (staging): the guest's TUI never opened its room; {said}");
     }
 

@@ -2794,6 +2794,13 @@ async fn serve_requests(
             // request and the first read is missed.
             let events = handle.subscribe();
             write_frame(&mut stream, &Frame::Ok.to_bytes()).await?;
+            // **What it missed, said first** (#407): a board connection made before this client
+            // subscribed — at its attach, say — was noted then, to nobody. The same note, now.
+            for (peer, note) in handle.view().boards_connected {
+                let frame =
+                    Frame::Event(crate::node::api::NodeEvent::ConnectionNote { peer, note });
+                write_frame(&mut stream, &frame.to_bytes()).await?;
+            }
             return tokio::select! {
                 r = pump(stream, events) => r,
                 () = node_detached(&mut watch) => Ok(()),

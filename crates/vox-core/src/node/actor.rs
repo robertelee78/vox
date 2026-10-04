@@ -6310,23 +6310,12 @@ impl Node {
                 // told a person reaching a host directly that they were using an anchor. An anchor
                 // is one this node was given (`--anchor`, the anchors file) or a room names that is
                 // not one of its members.
-                let anchor = self.anchors.get(&peer).is_some()
-                    || self
-                        .room_anchors
-                        .values()
-                        .any(|set| set.get(&peer).is_some());
                 if let Some(net) = self.net.as_ref() {
-                    net.manager().note(
-                        peer,
-                        if anchor {
-                            "connected to this anchor"
-                        } else {
-                            "connected to this room host's board"
-                        }
-                        .to_owned(),
-                    );
+                    net.manager().note(peer, self.board_note(&peer).to_owned());
                 }
                 self.anchor_ids.insert(peer);
+                // In the view at once, for a client subscribing after this note went (#407).
+                self.publish().await;
                 // A new connection may be to a board that restarted and lost what it held: what it
                 // holds is learnt again from the round below, before an address names it (V210-96).
                 self.on_board.retain(|(_, b)| *b != peer);
@@ -13563,6 +13552,7 @@ impl Node {
             relayed_peers: Vec::new(),
             connected: 0,
             connected_peers: Vec::new(),
+            boards_connected: Vec::new(),
             relaying: 0,
         });
     }
@@ -13704,6 +13694,7 @@ impl Node {
             relaying,
             connected: connected_peers.len(),
             connected_peers,
+            boards_connected: self.boards_connected(),
         };
         (view, read)
     }
@@ -13717,6 +13708,32 @@ impl Node {
         shown.relayed_peers != relayed_peers
             || shown.relaying != relaying
             || shown.connected_peers != connected_peers
+            || shown.boards_connected != self.boards_connected()
+    }
+
+    /// What is said of a connection to the board `peer`: an anchor is one this node was given
+    /// (`--anchor`, the anchors file) or a room names that is not one of its members; any other
+    /// board is a room host's own (V210-107).
+    fn board_note(&self, peer: &Digest32) -> &'static str {
+        let anchor = self.anchors.get(peer).is_some()
+            || self
+                .room_anchors
+                .values()
+                .any(|set| set.get(peer).is_some());
+        if anchor {
+            "connected to this anchor"
+        } else {
+            "connected to this room host's board"
+        }
+    }
+
+    /// The boards this node holds an open connection to now, each with [`Self::board_note`].
+    fn boards_connected(&self) -> Vec<(Digest32, String)> {
+        self.anchors_up
+            .iter()
+            .filter(|(_, conn)| conn.quinn().close_reason().is_none())
+            .map(|(peer, _)| (*peer, self.board_note(peer).to_owned()))
+            .collect()
     }
 
     /// The peers the connection manager holds a connection to, in fingerprint order.
