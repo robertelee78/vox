@@ -2793,6 +2793,13 @@ async fn serve_requests(
         let intent = Held::intent(&request);
         let reply = tokio::select! {
             reply = serve_request(handle, request) => reply,
+            // **A client that hangs up mid-request is noticed then, not when the request ends**
+            // (ADR-026 L-3): a `vox connect` stopped during its join kept its connection — and the
+            // hold it carries on its node — until the join finished, so an implicit node's detach,
+            // and the goodbye its connections owe their peers, waited on a join nobody wanted.
+            // The request is abandoned; what it started in the node goes on, or stops with the
+            // node.
+            () = subscriber_gone(&stream) => return Ok(()),
             () = node_detached(&mut watch) => {
                 if let Some(b) = gone(&node) {
                     let _ = write_frame(&mut stream, &b).await;
