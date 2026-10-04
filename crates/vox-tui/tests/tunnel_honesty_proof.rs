@@ -293,18 +293,13 @@ const PATH_CHANGED_WITHIN: Duration = Duration::from_secs(75);
 fn a_forward_keeps_carrying_when_its_path_changes_from_relayed_to_direct() {
     watchdog::arm();
     let mut w = port_forward::ForwardedWorld::new(false);
-    let pass = world::room_pass_file(&w.guest_dir, &w.passphrase);
     let mut fwd = world::VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &pass,
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",
@@ -312,9 +307,9 @@ fn a_forward_keeps_carrying_when_its_path_changes_from_relayed_to_direct() {
         ]),
     );
     let line = fwd.expect_line("the forward's bound address", |l| {
-        l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+        l.starts_with("vox: forwarding ")
     });
-    let at = world::address_in(&mut fwd, &line, 1);
+    let at = world::address_in(&mut fwd, &line, 2);
     let payload: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
 
     // Staging: relayed, observed. The connection rides the anchor's circuit, and none of its

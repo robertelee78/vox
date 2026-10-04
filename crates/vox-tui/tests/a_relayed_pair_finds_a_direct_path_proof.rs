@@ -94,18 +94,14 @@ const RELAYED_REACH_WITHIN: Duration = Duration::from_millis(1000);
 /// Start the guest's `vox forward` to the host's service through the closed forward, and read how
 /// long it says reaching the host took; it is returned still running, for the caller to stop.
 fn relayed_reach_ms(w: &ForwardedWorld) -> (u128, world::VoxProc) {
-    use world::{args, room_pass_file, VoxProc};
+    use world::{args, VoxProc};
     let mut fwd = VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service_port.to_string(),
+            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &room_pass_file(&w.guest_dir, &w.passphrase),
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",
