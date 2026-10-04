@@ -1218,7 +1218,11 @@ impl Fault {
         {
             return Self::from_name(name);
         }
-        Self::ALL.iter().copied().find(|f| f.explain() == first)
+        // A fault's explanation may run to a second line of advice; its first line names it.
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|f| f.explain().lines().next() == Some(first))
     }
 }
 
