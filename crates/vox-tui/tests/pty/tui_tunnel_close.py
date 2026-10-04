@@ -25,7 +25,7 @@ import os, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pyte, stage, is_attached  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, CUE, TAG = sys.argv[1:8]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
@@ -66,7 +66,7 @@ try:
     tui.pump(3)
     tui.key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds.
-    if not tui.until(lambda: "unlocked" in status(), 60):
+    if not tui.until(lambda: is_attached(status()), 60):
         print(f"{TAG} APPARATUS: the TUI never unlocked:\n{tui.text()}")
         sys.exit(2)
     stage("open the room")

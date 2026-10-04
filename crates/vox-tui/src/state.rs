@@ -16,21 +16,12 @@ use crate::viewmodel::{Command, ViewModel};
 /// How many lines PageUp/PageDown scroll the timeline.
 pub const TIMELINE_PAGE: usize = 10;
 
-/// Idle time after which the app locks itself (ADR-015 §Screen security: 5 min).
-pub const IDLE_LOCK_SECS: u64 = 5 * 60;
-
-/// Whether the idle-lock timer has elapsed.
-#[must_use]
-pub fn idle_lock_due(last_input_secs: u64, now_secs: u64) -> bool {
-    now_secs.saturating_sub(last_input_secs) >= IDLE_LOCK_SECS
-}
-
-/// Which masked onboarding/unlock prompt is open (ADR-015: passphrases are entered
+/// Which masked onboarding/attach prompt is open (ADR-015: passphrases are entered
 /// through a masked prompt, never on the palette line).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptKind {
-    /// Unlock the identity: `[passphrase]`.
-    Unlock,
+    /// Attach the node: `[passphrase]`, given once (ADR-026 N-2).
+    Attach,
     /// Create the identity: `[passphrase, confirm]`.
     CreateIdentity,
     /// Create a channel: `[name, passphrase, confirm]`.
@@ -50,7 +41,7 @@ impl PromptKind {
     #[must_use]
     pub fn fields(self) -> &'static [&'static str] {
         match self {
-            PromptKind::Unlock => &["identity passphrase"],
+            PromptKind::Attach => &["identity passphrase"],
             PromptKind::CreateIdentity => &["new identity passphrase", "confirm passphrase"],
             PromptKind::CreateChannel => {
                 &["channel name", "channel passphrase", "confirm passphrase"]
@@ -80,7 +71,7 @@ impl PromptKind {
     #[must_use]
     pub fn title(self) -> &'static str {
         match self {
-            PromptKind::Unlock => "Unlock",
+            PromptKind::Attach => "Attach node",
             PromptKind::CreateIdentity => "Create identity",
             PromptKind::CreateChannel => "Create channel",
             PromptKind::OpenChannel => "Open channel",
@@ -186,7 +177,7 @@ pub enum Mode {
     Normal,
     /// The command palette is open; the buffer holds the typed command line.
     CommandPalette(String),
-    /// A masked onboarding/unlock prompt is open (modal).
+    /// A masked onboarding/attach prompt is open (modal).
     Prompt(Prompt),
 }
 
@@ -294,7 +285,7 @@ impl UiState {
     /// selection-relative commands; this method never mutates trust state.
     pub fn on_key(&mut self, key: KeyEvent, vm: &ViewModel) -> Action {
         // Ctrl-C always quits — from any mode, including an open prompt or palette
-        // (the exit path restores the terminal and the node shuts down locked).
+        // (the exit path restores the terminal; the node is the daemon's, and stays with it).
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.mode = Mode::Normal;
             return Action::Quit;
@@ -414,7 +405,7 @@ impl UiState {
     }
 
     /// Open a masked prompt (also used by the loop for onboarding: no identity ⇒
-    /// create; locked ⇒ unlock).
+    /// create; not attached ⇒ attach).
     pub fn start_prompt(&mut self, kind: PromptKind, target: Option<Digest32>) {
         self.mode = Mode::Prompt(Prompt::new(kind, target));
     }
@@ -465,7 +456,7 @@ impl UiState {
         };
         let secret = |s: &Zeroizing<String>| SecretString::from(s.as_str().to_owned());
         match p.kind {
-            PromptKind::Unlock => Action::Dispatch(Command::Unlock {
+            PromptKind::Attach => Action::Dispatch(Command::Attach {
                 passphrase: secret(&p.fields[0]),
             }),
             PromptKind::OpenChannel => match p.target {
@@ -714,16 +705,16 @@ pub enum Parsed {
 /// Per ADR-015 every action MUST be reachable by a typed command. Channel-
 /// independent verbs work anywhere (incl. the channel list):
 /// - `quit` / `q` — exit
-/// - `lock` — lock the app
+/// - `node <name>` — act as another node of this account
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
 /// - `send <text…>`, `invite`.
 ///
-/// **Create / join / unlock / init are not one-line palette commands.** They require
+/// **Create / join / attach / init are not one-line palette commands.** They require
 /// a passphrase, which ADR-015 mandates be entered through a **masked** prompt and
 /// shared out-of-band — never echoed on the palette line or stored in a status
-/// string. The verbs `init`, `unlock`, `new <name>` therefore *open the prompt*;
+/// string. The verbs `init`, `attach`, `new <name>` therefore *open the prompt*;
 /// the secret is typed there — and so does `join`, whose prompt takes the `vox://`
 /// link in the clear (it carries no secret) and the passphrase masked. This is a
 /// security-driven exception to "one-line command", not a chord-only path. Every *non-secret* action is reachable here by
@@ -737,8 +728,12 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     // Channel-independent verbs first — these must not require an open channel.
     match verb {
         "quit" | "q" => return Some(Parsed::Quit),
-        "lock" => return Some(Parsed::Core(Command::Lock)),
-        "unlock" => return Some(Parsed::Prompt(PromptKind::Unlock, None)),
+        "attach" => return Some(Parsed::Prompt(PromptKind::Attach, None)),
+        "node" if !rest.is_empty() => {
+            return Some(Parsed::Core(Command::UseNode {
+                name: rest.to_owned(),
+            }))
+        }
         "init" => return Some(Parsed::Prompt(PromptKind::CreateIdentity, None)),
         "new" if !rest.is_empty() => {
             return Some(Parsed::Prompt(

@@ -601,8 +601,6 @@ pub enum NodeCommand {
         /// The identity passphrase.
         passphrase: Secret,
     },
-    /// App-lock: drop the identity signer and every open channel's SEK.
-    Lock,
     /// Create a channel (needs the unlocked identity).
     CreateChannel {
         /// The local (device-only) name.
@@ -1183,6 +1181,23 @@ impl Fault {
     }
 }
 
+impl Fault {
+    /// The fault whose [`Fault::explain`] is `text`, or that `text` names as `Failed(<name>)` (the
+    /// join's answer, V210-114), if there is one: how a client of the daemon gets back the typed
+    /// fault a request failed with.
+    #[must_use]
+    pub fn from_explanation(text: &str) -> Option<Self> {
+        let first = text.lines().next().unwrap_or_default();
+        if let Some(name) = first
+            .strip_prefix("Failed(")
+            .and_then(|r| r.strip_suffix(')'))
+        {
+            return Self::from_name(name);
+        }
+        Self::ALL.iter().copied().find(|f| f.explain() == first)
+    }
+}
+
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.explain())
@@ -1207,6 +1222,10 @@ macro_rules! fault_names {
                     $(Fault::$fault => stringify!($fault),)*
                 }
             }
+
+            /// Every fault, so a client given only a fault's explanation over the control socket
+            /// can tell which it was ([`Fault::from_explanation`]).
+            pub const ALL: &'static [Fault] = &[$(Fault::$fault,)*];
 
             /// The fault named `name` (as [`Fault::name`] gives it), if there is one.
             #[must_use]
@@ -1363,10 +1382,6 @@ pub enum NodeEvent {
         /// The rendered entry.
         row: MessageRow,
     },
-    /// The identity was unlocked.
-    Unlocked,
-    /// The identity (and every open channel) was locked.
-    Locked,
     /// A channel was opened.
     ChannelOpened {
         /// The channel.
@@ -1738,8 +1753,6 @@ impl NodeEvent {
             NodeEvent::NewEntry { channel_id, .. } => {
                 format!("a new message in room {}", short(channel_id))
             }
-            NodeEvent::Unlocked => "the identity is unlocked".into(),
-            NodeEvent::Locked => "the identity is locked".into(),
             NodeEvent::ChannelOpened { channel_id } => {
                 format!("room {} is open", short(channel_id))
             }

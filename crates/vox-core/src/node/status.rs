@@ -1526,16 +1526,40 @@ pub async fn request_close(
     at: &crate::node::ipc::NodeSocket,
     which: &crate::transport::quic::TunnelSelector,
 ) -> Result<(u64, String)> {
+    let body = tokio::time::timeout(
+        crate::node::ipc::ANSWER_WITHIN,
+        exchange(at, close_body(which)),
+    )
+    .await
+    .map_err(|_| crate::node::ipc::silent())??;
+    close_reply(&body)
+}
+
+/// [`request_close`] on a connection already acting as a node on the daemon's account socket
+/// (ADR-026 C-2): what a client of the daemon, the TUI first, closes a tunnel with.
+///
+/// # Errors
+/// If the node cannot be reached or answers something else.
+pub async fn request_close_on(
+    client: &mut crate::node::ipc::IpcClient,
+    which: &crate::transport::quic::TunnelSelector,
+) -> Result<(u64, String)> {
+    let body = client.exchange(&close_body(which)).await?;
+    close_reply(&body)
+}
+
+fn close_body(which: &crate::transport::quic::TunnelSelector) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(4)
         .uint(T_TUNNEL_CLOSE)
         .text(&which.id.map(|i| i.to_string()).unwrap_or_default())
         .text(which.member.as_deref().unwrap_or_default())
         .text(which.service.as_deref().unwrap_or_default());
-    let body = tokio::time::timeout(crate::node::ipc::ANSWER_WITHIN, exchange(at, e.finish()))
-        .await
-        .map_err(|_| crate::node::ipc::silent())??;
-    let mut d = Decoder::new(&body);
+    e.finish()
+}
+
+fn close_reply(body: &[u8]) -> Result<(u64, String)> {
+    let mut d = Decoder::new(body);
     if let (Ok(3), Ok(T_TUNNEL_CLOSED)) = (d.array(), d.uint()) {
         let n = d
             .uint()
