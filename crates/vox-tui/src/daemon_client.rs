@@ -86,6 +86,7 @@ pub async fn ensure_daemon(
         ))
     })?;
     let t0 = Instant::now();
+    let mut lost = false;
     let outcome = loop {
         if DaemonClient::open(&socket).await.is_ok() {
             break Ok(Daemon::Started);
@@ -93,9 +94,15 @@ pub async fn ensure_daemon(
         // **A daemon that ended is not waited for** (S-2): it said why in its log, and the
         // client says it at once. One that ended because another took the lock first left
         // that one answering.
-        if let Ok(Some(_)) = child.try_wait() {
+        if !lost && matches!(child.try_wait(), Ok(Some(_))) {
             if DaemonClient::open(&socket).await.is_ok() {
                 break Ok(Daemon::Running);
+            }
+            // **Lost the race to another start** (D-1, S-2): that daemon holds the lock and may
+            // not have bound the socket yet. Its socket is waited for, within the same bound.
+            if since(&log_path, from).contains("a daemon is already running") {
+                lost = true;
+                continue;
             }
             break Err(AppError::Usage(format!(
                 "the daemon stopped as it started; it said (its log is {}):\n{}",
