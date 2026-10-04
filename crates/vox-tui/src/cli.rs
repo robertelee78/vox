@@ -55,6 +55,10 @@ where
                     crate::app::say(format_args!("vox: stopped by {}", signal.name()));
                     crate::app::say(format_args!("vox: stopping"));
                     Ok(())
+                } else if waiting.held() {
+                    // A held client (`vox up`, `vox forward`, `vox lan up`): stopped as a client
+                    // is, 128 + the signal's number, saying which signal (V210-108).
+                    Err(crate::app::AppError::stopped_by(signal))
                 } else {
                     Err(waiting.stopped_by(signal))
                 };
@@ -2618,7 +2622,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let waiting = crate::tunnel_cli::Waiting::server();
+            let waiting = crate::tunnel_cli::Waiting::client();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
                 if args.passphrase.is_some() {
@@ -2670,7 +2674,7 @@ pub fn run() -> ExitCode {
                 .local
                 .clone()
                 .unwrap_or_else(|| "127.0.0.1:0".to_owned());
-            let waiting = crate::tunnel_cli::Waiting::server();
+            let waiting = crate::tunnel_cli::Waiting::client();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
                 crate::tunnel_cli::forward_named(
@@ -2705,7 +2709,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let waiting = crate::tunnel_cli::Waiting::server();
+            let waiting = crate::tunnel_cli::Waiting::client();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
                 crate::lan_cli::up_held(&paths, &a, &steps).await
