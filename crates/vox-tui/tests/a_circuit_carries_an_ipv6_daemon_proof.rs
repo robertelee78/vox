@@ -367,6 +367,18 @@ fn circuits_to(dir: &std::path::Path, peer: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether the node in `dir` holds a connection to `peer` now, by its own `vox status --json`.
+fn holds(dir: &std::path::Path, peer: &str) -> bool {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    ok && serde_json::from_str::<serde_json::Value>(out.trim()).is_ok_and(|v| {
+        v["reach"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|r| r["peer"].as_str() == Some(peer) && !r["connection"].is_null())
+    })
+}
+
 /// What `d` said about `peer` from its `mark`th line on: every line naming the peer's short id.
 fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
     d.said()
@@ -391,8 +403,9 @@ fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
 /// **Staging, forced on every run with no switch in the product.** bob listens on `127.0.0.1` and
 /// carol on `[::1]`, so the anchor's circuit is their only path to each other. Both daemons are
 /// restarted, so neither holds a connection to the other; `vox status --json` naming no circuit
-/// between them is checked. Then the crossing is ordered with SIGSTOP/SIGCONT, so it does not rest
-/// on which of two tasks the anchor happens to run first:
+/// between them is checked, and each holding its connection to the anchor. Then the crossing is
+/// ordered with SIGSTOP/SIGCONT, so it does not rest on which of two tasks the anchor happens to
+/// run first:
 ///
 /// 1. The anchor is frozen, and bob and carol trust each other at once, which makes each dial the
 ///    other. The run waits until each has asked the relay for a circuit to the other (`vox status
@@ -500,6 +513,26 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
         }),
         "PRODUCT (staging): a restarted daemon never listed the room"
     );
+    // And each holds its connection to the anchor, the relay the crossing goes through. A daemon
+    // lists its rooms as soon as its node is attached (ADR-026), before its anchor dial lands:
+    // frozen then, the anchor fails a member's dial ("the identity stream failed"), and that
+    // member has nobody to ask for a circuit, so nothing crosses.
+    let anchor_fp = anchor
+        .v4_spec
+        .split_once('@')
+        .map(|(fp, _)| fp.to_owned())
+        .expect("APPARATUS: the anchor's spec is fp@address");
+    assert!(
+        until("bob and carol hold their anchor connections", 60, || {
+            holds(bob_dir, &anchor_fp) && holds(carol_dir, &anchor_fp)
+        }),
+        "PRODUCT (staging): a restarted member never held a connection to its anchor within 60 s: \
+         bob {}, carol {}\nbob said:\n{}\ncarol said:\n{}",
+        holds(bob_dir, &anchor_fp),
+        holds(carol_dir, &anchor_fp),
+        bob.said(),
+        carol.said()
+    );
 
     // ---- precondition: neither has dialled the other ----
     let (bob_fp, carol_fp) = (fps[1].as_str(), fps[2].as_str());
@@ -560,7 +593,26 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     assert!(
         asked,
         "PRODUCT (staging): bob and carol did not both ask the frozen relay for a circuit to each \
-         other within 5 s, so the crossing was not staged"
+         other within 5 s, so the crossing was not staged. Circuits asked since: bob->carol {}, \
+         carol->bob {} (before {before:?}); `trust add` said: bob {:?} {}, carol {:?} {}\nbob \
+         said:\n{}\ncarol said:\n{}",
+        circuits_to(bob_dir, carol_fp),
+        circuits_to(carol_dir, bob_fp),
+        b.0,
+        b.2,
+        c.0,
+        c.2,
+        bob.said()
+            .lines()
+            .skip(marks.0)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        carol
+            .said()
+            .lines()
+            .skip(marks.1)
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
     assert!(b.0, "PRODUCT: bob trusts carol: {}", b.2);
     assert!(c.0, "PRODUCT: carol trusts bob: {}", c.2);
