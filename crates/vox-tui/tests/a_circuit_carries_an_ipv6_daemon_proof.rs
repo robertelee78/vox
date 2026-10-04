@@ -817,8 +817,8 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
             let (b, c) = (open_to(bob_dir, carol_fp), open_to(carol_dir, bob_fp));
             !b.is_empty() && b == c && held_tag(bob_dir, carol_fp) == held_tag(carol_dir, bob_fp)
         }),
-        "PRODUCT: bob and carol have different connections to each other: bob holds {:?} of {:?}, \
-         carol holds {:?} of {:?}\nbob said:\n{}\ncarol said:\n{}",
+        "PRODUCT: bob and carol do not keep the same connections to each other: bob holds {:?} of \
+         {:?}, carol holds {:?} of {:?}\nbob said:\n{}\ncarol said:\n{}",
         held_tag(bob_dir, carol_fp),
         open_to(bob_dir, carol_fp),
         held_tag(carol_dir, bob_fp),
