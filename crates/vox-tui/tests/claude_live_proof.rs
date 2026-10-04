@@ -228,15 +228,19 @@ fn access_token(real_home: &Path) -> String {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|_| {
         panic!("APPARATUS: the `{KEYCHAIN_ITEM}` item is not the JSON Claude Code writes")
     });
+    // Only the access token and its expiry are kept; the item, refresh token included, is dropped
+    // here, and its bytes with it.
     let oauth = &v["claudeAiOauth"];
     let token = oauth["accessToken"]
         .as_str()
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| {
-            panic!("CANNOT MEASURE: the `{KEYCHAIN_ITEM}` item holds no access token")
-        })
-        .to_owned();
+        .map(str::to_owned);
     let expires = oauth["expiresAt"].as_u64().unwrap_or(0) / 1000;
+    drop(v);
+    drop(out);
+    let token = token.unwrap_or_else(|| {
+        panic!("CANNOT MEASURE: the `{KEYCHAIN_ITEM}` item holds no access token")
+    });
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_else(|e| panic!("APPARATUS: the clock is before 1970: {e}"))
@@ -328,6 +332,34 @@ fn evidence(text: &str, needle: &str) -> Option<String> {
         to += 1;
     }
     Some(line[from..to].to_owned())
+}
+
+/// How many files are under `dir`, and those (by path relative to `dir`) whose bytes hold any of
+/// `needles`. The `vox` copy in `bin/` is skipped: it is this build's binary, not a turn's output.
+fn files_holding(dir: &Path, needles: &[&str]) -> (usize, Vec<String>) {
+    let (mut count, mut hits) = (0, Vec::new());
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_dir() {
+                if p != dir.join("bin") {
+                    stack.push(p);
+                }
+            } else if kind.is_file() {
+                count += 1;
+                let bytes = std::fs::read(&p).unwrap_or_default();
+                if needles
+                    .iter()
+                    .any(|n| bytes.windows(n.len()).any(|w| w == n.as_bytes()))
+                {
+                    hits.push(p.strip_prefix(dir).unwrap_or(&p).display().to_string());
+                }
+            }
+        }
+    }
+    (count, hits)
 }
 
 /// What a turn left: everything it printed, its answer, and its transcripts.
@@ -688,13 +720,31 @@ fn a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts() {
             out.status.success(),
             "APPARATUS, CANNOT MEASURE: the {node} Claude Code turn failed (exit {:?}): {}",
             out.status.code(),
-            said.chars().rev().take(3000).collect::<String>().chars().rev().collect::<String>()
+            said.chars()
+                .rev()
+                .take(3000)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect::<String>()
         );
         Turn { said, answer, logs }
     };
     let u = turn(UNTRUSTED, &homes[1].1);
     let t = turn(TRUSTED, &homes[0].1);
+    // **Nothing of the sign-in, nor the canary, was written anywhere in the run**: every file the
+    // turns, their hooks and Claude Code left under the root, read and searched — config,
+    // transcripts, session state, caches, logs.
+    let (files, holding) = files_holding(&root, &[&token, &canary.text]);
     drop(token);
+    println!(
+        "[proof] every file the run left under its root ({files} files) searched for the token and the canary: {} hold either",
+        holding.len()
+    );
+    assert!(
+        holding.is_empty(),
+        "APPARATUS: the sign-in token or the canary was written to {holding:?} under the run's root"
+    );
 
     // ---- the verdicts ----
     let injected = evidence(&t.logs, &codeword);
