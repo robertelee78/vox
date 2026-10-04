@@ -645,7 +645,11 @@ fn already_running(
                 .await
                 .map_err(|e| AppError::Usage(e.to_string()))?
             {
-                DaemonFrame::Attached(_) => {}
+                DaemonFrame::Attached(_, notes) => {
+                    for note in &notes {
+                        eprintln!("vox daemon: {note}");
+                    }
+                }
                 DaemonFrame::Refused(r) => {
                     return Err(AppError::Usage(refusal_words(&r, account, &node)))
                 }

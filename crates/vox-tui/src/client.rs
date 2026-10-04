@@ -720,7 +720,12 @@ pub async fn node_attach(
         })
         .await
     {
-        Ok(DaemonFrame::Attached(info)) => {
+        Ok(DaemonFrame::Attached(info, notes)) => {
+            // What attaching it said, in this terminal: the daemon `vox node attach` started
+            // writes only to its log (R23, R36).
+            for note in &notes {
+                eprintln!("vox: {note}");
+            }
             println!("vox: node {} attached{}", info.name, kept(&info));
             Ok(())
         }
