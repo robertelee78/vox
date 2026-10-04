@@ -1049,9 +1049,20 @@ impl World {
                 "127.0.0.1:0",
             ]),
         );
-        let line = fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: forwarding ")
-        });
+        // A forward that never binds is shown with what both daemons said meanwhile: the wait it
+        // is in (the room's first sync, a reach) is the daemons', not the client's.
+        let line = fwd
+            .try_expect_within(LINE_TIMEOUT, "the forward's bound address", |l| {
+                l.starts_with("vox: forwarding ")
+            })
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{why}\n---- the host's daemon log (tail) ----\n{}\n---- the forwarding \
+                     side's daemon log (tail) ----\n{}",
+                    log_tail(&self.host_dir, 60),
+                    log_tail(dir, 60)
+                )
+            });
         let bound = address_in(&mut fwd, &line, 2);
         (fwd, bound)
     }
@@ -1291,5 +1302,17 @@ pub fn read_to_end_within(s: &mut TcpStream, within: Duration) -> (Vec<u8>, Endi
             Err(e) if e.kind() == ErrorKind::ConnectionReset => return (got, Ending::Reset),
             Err(e) => return (got, Ending::OtherError(e.kind())),
         }
+    }
+}
+
+/// The last `n` lines of the daemon log of the data root `dir` (`.daemon/log`), or why there are
+/// none.
+fn log_tail(dir: &Path, n: usize) -> String {
+    match std::fs::read_to_string(dir.join(".daemon").join("log")) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(n)..].join("\n")
+        }
+        Err(e) => format!("(no daemon log: {e})"),
     }
 }
