@@ -2371,10 +2371,19 @@ pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10
 /// The error for a node that closed the connection before replying (V210-101): never "malformed",
 /// since nothing arrived to be malformed. A fresh connection, bounded, tells a node that is gone
 /// from one that ended this request itself.
+///
+/// **Running means greeting, not accepting**: a process being killed closes its connections and
+/// its listening socket in whatever order the kernel takes, and a connect in between lands in the
+/// backlog of a listener about to close. Measured: a daemon SIGKILLed mid-request was reported
+/// "still running". Only a hello read back counts.
 pub async fn hung_up(path: &Path) -> Error {
     let still_running = matches!(
-        tokio::time::timeout(ANSWER_WITHIN, connect_own(path)).await,
-        Ok(Ok(_))
+        tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut s = connect_own(path).await?;
+            read_frame(&mut s).await
+        })
+        .await,
+        Ok(Ok(Some(_)))
     );
     Error::Ipc(IpcHandshake::HungUp { still_running })
 }

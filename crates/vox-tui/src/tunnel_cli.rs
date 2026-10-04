@@ -1103,6 +1103,7 @@ pub async fn connect(
     // waits for, once, rather than sitting silent for up to half a minute.
     let mut said_waiting = std::collections::HashSet::new();
     let mut following = true;
+    let mut said_steps = false;
     let reply = loop {
         tokio::select! {
             reply = &mut join => break reply,
@@ -1112,6 +1113,11 @@ pub async fn connect(
                         eprintln!("vox: {step}");
                     }
                     waiting.on(step);
+                }
+                // Its steps, said once it got in or did not (#192), and what explains a wait.
+                Ok(Some(Frame::Event(ev))) => {
+                    say_if_it_explains_a_failure(&ev);
+                    said_steps |= matches!(ev, NodeEvent::JoinSteps { .. });
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => following = false,
@@ -1143,7 +1149,7 @@ pub async fn connect(
     // **What the join did, said** (#192): the node raises its steps before it answers, so they
     // are in the subscription already; said as `join got in — <steps>`, with anything else that
     // explains a wait.
-    if following {
+    if following && !said_steps {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
         while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, steps.next()).await {
             if let Frame::Event(ev) = frame {
