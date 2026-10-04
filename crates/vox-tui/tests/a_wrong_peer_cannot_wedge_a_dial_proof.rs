@@ -200,6 +200,8 @@ fn a_dial_whose_first_address_answers_as_somebody_else_goes_on_to_the_next() {
 
     let (ok, guest_fp, err) = world::vox_once(&guest_dir, &args(&["id"]));
     assert!(ok, "PRODUCT (staging): vox id (guest) failed: {err}");
+    // The host's node first: a verb acts as a node that exists (ADR-026 C-3).
+    world::fingerprint(&host_dir, "host");
     let (ok, out, err) = world::vox_once(
         &host_dir,
         &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),

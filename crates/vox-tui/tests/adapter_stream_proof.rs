@@ -26,8 +26,9 @@
 //! - the consumer **killed three times** with SIGKILL at points inside the bursts, each
 //!   time restarted from the cursor it had persisted.
 //! - then the consumer's **node** killed with SIGKILL and started again (ADR-021 F19), after
-//!   alice and bob have posted alternately so bob's local order differs from canonical
-//!   order (the proof says PRODUCT (staging) if it does not).
+//!   alice and bob have posted alternately so bob holds late arrivals — rows that took their
+//!   place above rows already shown, so his order of arrival differs from the room's one order
+//!   (R13; the proof says PRODUCT (staging) if he holds none).
 //!
 //! - a **second consumer** of the same room on the same node, attached at the same time
 //!   and never paused or killed, as a second tracker's adapter would be (RP-18, RP-45).
@@ -663,15 +664,14 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     );
 
     // ---- the consumer's NODE restarts (ADR-021 F19) ----
-    // The cursor only means "everything after this row" if the rows before it are still
-    // before it once bob's node has restarted. bob's order is local, not canonical, and the
-    // node rebuilds it from its sealed cache on reopen. So bob's local order is made to
-    // differ from the canonical one, without a race: bob's daemon is stopped, alice posts
-    // (her row cannot reach him), bob's `vox room post` is issued and waits on his control
-    // socket, and his daemon is continued. His post is then a row created after hers and
-    // taken in one step, while hers needs a sync session of several round trips, so bob holds
-    // his later row before her earlier one. A node that rebuilt canonically, or in any other
-    // order, is then told apart from one that kept its order.
+    // The cursor only means "everything after this row" if the rows that arrived before it still
+    // did once bob's node has restarted. The room has one order on every node (R13), and a row
+    // that arrives late takes its place above rows already shown, so a cursor reads on in order
+    // of arrival, which the node rebuilds from its sealed cache on reopen. So bob is given late
+    // arrivals, without a race: bob's daemon is stopped, alice posts 20 rows, alice's daemon is
+    // stopped, bob's is continued and he posts 20, and alice's is continued over 10 s later. Her
+    // rows were created before his and reach him only once she is continued: late. A node that rebuilt its order of arrival from
+    // position on reopen is then told apart from one that kept it.
     let bob_pid = bob
         .daemon_pid()
         .unwrap_or_else(|| panic!("APPARATUS: the harness kept no pid for bob's daemon"));
@@ -682,21 +682,36 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
             .is_ok_and(|s| s.success());
         assert!(ok, "APPARATUS: `kill {sig} {bob_pid}` failed");
     };
+    let alice_pid = alice
+        .daemon_pid()
+        .unwrap_or_else(|| panic!("APPARATUS: the harness kept no pid for alice's daemon"));
+    let to_alice = |sig: &str| {
+        let ok = Command::new("kill")
+            .args([sig, &alice_pid.to_string()])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "APPARATUS: `kill {sig} {alice_pid}` failed");
+    };
+    // Alice's rows are made while bob cannot take them, and stay undelivered while bob makes his:
+    // alice is stopped before bob is continued, so her sync session, which needs her answers,
+    // cannot complete. Bob's rows are on his screen for longer than `LATE_AFTER_MS` (10 s) before
+    // she is continued, so her earlier rows reach him late (ADR-023 decision 1).
+    to_bob("-STOP");
     for i in 0..20 {
-        to_bob("-STOP");
         let o = alice.vox(None, &["room", "post", &r, &format!("F19 alice {i:02}")]);
-        let posted = std::thread::scope(|s| {
-            let bobs = s.spawn(|| bob.vox(None, &["room", "post", &r, &format!("F19 bob {i:02}")]));
-            // Long enough for bob's request to be written to his control socket.
-            std::thread::sleep(Duration::from_millis(200));
-            to_bob("-CONT");
-            bobs.join()
-        });
         assert!(o.ok, "PRODUCT: alice's post {i} was refused: {o:?}");
-        let o = posted
-            .unwrap_or_else(|_| panic!("APPARATUS: the thread posting bob's post {i} panicked"));
+    }
+    to_alice("-STOP");
+    to_bob("-CONT");
+    for i in 0..20 {
+        let o = bob.vox(None, &["room", "post", &r, &format!("F19 bob {i:02}")]);
         assert!(o.ok, "PRODUCT: bob's post {i} was refused: {o:?}");
     }
+    // Shown on bob's node: his tail reads his own rows as they land.
+    let o = bob.vox(None, &["room", "read", &r]);
+    assert!(o.ok, "PRODUCT: bob's `room read` failed: {o:?}");
+    std::thread::sleep(Duration::from_secs(12));
+    to_alice("-CONT");
     until(
         bob,
         None,
@@ -729,42 +744,70 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     let held = order(bob);
     let before = hashes(&held);
     let before_position = position(bob);
-    let mut canonical = held.clone();
-    canonical.sort_by_key(|x| {
-        (
-            x["created_millis"].as_u64().unwrap_or_else(|| {
-                panic!("PRODUCT: a row of `room read --json` has no created_millis: {x}")
-            }),
-            x["entry_hash"]
-                .as_str()
-                .unwrap_or_else(|| {
-                    panic!("PRODUCT: a row of `room read --json` has no entry_hash: {x}")
-                })
-                .to_owned(),
-        )
-    });
-    let off_canonical = before
-        .iter()
-        .zip(hashes(&canonical))
-        .filter(|(a, b)| **a != *b)
-        .count();
+    // Late arrivals (R13, ADR-023 decision 1): rows that took their place above rows bob had
+    // already shown. The room's order is one on every node, so only these make bob's order of
+    // arrival — what a cursor reads on in — differ from the order rows are shown in; a node that
+    // rebuilt arrival from position on reopen is told apart only if there are some.
+    let late = {
+        let o = bob.vox(None, &["room", "read", &r, "--late", "--json"]);
+        assert!(o.ok, "PRODUCT: `room read --late --json` failed: {o:?}");
+        o.ndjson().len()
+    };
     // The consumer's persisted cursor: the last row it processed, before the interleave.
-    let followed: Vec<String> = before
+    // What follows the cursor is what bob's node took after it, in order of arrival — so the late
+    // rows, which sit above the cursor in the room's order, are among them. Read from the node.
+    let followed: Vec<String> = {
+        let o = bob.vox(None, &["room", "read", &r, "--since", &cursor, "--json"]);
+        assert!(
+            o.ok,
+            "PRODUCT: `room read --since <cursor> --json` failed: {o:?}"
+        );
+        hashes(&o.ndjson())
+    };
+    // A second cursor where arrival and position part: bob's last row, which he took before
+    // alice's late rows, which sit above it in the room's order. By position nothing follows it;
+    // by arrival all of her late rows do.
+    let bob_last = held
         .iter()
-        .skip_while(|h| **h != cursor)
+        .rev()
+        .find(|x| x["text"].as_str() == Some("F19 bob 19"))
+        .and_then(|x| x["entry_hash"].as_str())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): bob's `F19 bob 19` is not in his read"))
+        .to_owned();
+    let after_bob: Vec<String> = {
+        let o = bob.vox(None, &["room", "read", &r, "--since", &bob_last, "--json"]);
+        assert!(
+            o.ok,
+            "PRODUCT: `room read --since <bob's last> --json` failed: {o:?}"
+        );
+        hashes(&o.ndjson())
+    };
+    let by_position = before
+        .iter()
+        .skip_while(|h| **h != bob_last)
         .skip(1)
-        .cloned()
-        .collect();
+        .count();
     eprintln!(
-        "[proof] before bob's node restarts: {} rows, {off_canonical} of them off canonical \
-         order, position {before_position}; {} rows follow the consumer's cursor",
+        "[proof] after bob's last row: {} by arrival, {by_position} by position",
+        after_bob.len()
+    );
+    assert!(
+        after_bob.len() >= late && after_bob.len() > by_position,
+        "PRODUCT: reading on from bob's last row must yield the {late} rows that arrived after it \
+         (late, above it in the room's order): {} by arrival, {by_position} by position",
+        after_bob.len()
+    );
+    eprintln!(
+        "[proof] before bob's node restarts: {} rows, {late} of them late arrivals, position \
+         {before_position}; {} rows follow the consumer's cursor",
         before.len(),
         followed.len()
     );
     assert!(
-        off_canonical > 0,
-        "PRODUCT (staging): bob's local order equals canonical order, so a node \
-         that rebuilt it canonically on reopen could not be told apart"
+        late > 0,
+        "PRODUCT (staging): bob holds no late arrival, so his order of arrival equals the order \
+         rows are shown in, and a node that rebuilt it from position on reopen could not be told \
+         apart"
     );
     assert!(
         followed.len() >= 40,
@@ -822,6 +865,22 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
     }
     let _ = run.child.kill();
     let _ = run.child.wait();
+    // And from the cursor where arrival and position part: the same late rows, after the restart.
+    let after_bob_again: Vec<String> = {
+        let o = bob.vox(None, &["room", "read", &r, "--since", &bob_last, "--json"]);
+        assert!(
+            o.ok,
+            "PRODUCT: `room read --since <bob's last> --json` failed: {o:?}"
+        );
+        hashes(&o.ndjson())
+    };
+    assert!(
+        after_bob_again == after_bob,
+        "PRODUCT: after the restart, what follows bob's last row by arrival changed: {} rows \
+         before, {} after — the node rebuilt its order of arrival from position",
+        after_bob.len(),
+        after_bob_again.len()
+    );
     eprintln!(
         "[proof] after the restart: same {} rows in the same order, position {after_position}, \
          tail --since the consumer's cursor resumed with {} of {} rows",

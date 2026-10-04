@@ -363,7 +363,8 @@ fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
     drop(setup);
     let (ok, _, err) = vox(data, cfg, &["room", "list"]);
     assert!(
-        !ok && err.contains("no node is running"),
+        // Since ADR-026 (L-2): no daemon holds the node, said as that.
+        !ok && err.contains("no vox daemon is running"),
         "PRODUCT (staging): the profile must be held by nothing before the proof starts: {err:?}"
     );
     room
