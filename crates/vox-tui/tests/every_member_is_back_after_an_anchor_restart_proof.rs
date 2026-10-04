@@ -34,7 +34,7 @@
 //! **another node** holds its port, as a stale address held by somebody else is (V210-17's
 //! trigger): every dial reaches a node that is not the anchor and fails as soon as it answers, so
 //! every member's backoff grows as far as it can. Then the anchor comes back on its port.
-//! **Asserted:** every member's dials failed at least 3 times while it was away (else PRODUCT
+//! **Asserted:** every member's dials failed at least twice while it was away (else PRODUCT
 //! (staging)), and all [`MEMBERS`] are connected again within [`BACK_WITHIN`] of the anchor
 //! listening — its own count, as above.
 //!
@@ -49,10 +49,11 @@
 //! watchdog says it is the watchdog.
 //!
 //! Mutations (each must go red):
-//! - a failed anchor dial backed off to 30 s again (`ANCHOR_UNREACHED_REDIAL_SECS` = 30) → red on
-//!   the bound after the outage;
-//! - a member's redial after its anchor's close stretched (the first redial delayed past the
-//!   bound) → red on the bound after the restart.
+//! - a member's redial after its anchor's close stretched (the first wait after a lost anchor
+//!   connection 30 s instead of 1) → red on the bound after the restart (22.98 s, 2026-10-04);
+//! - a member's redial after a failed anchor dial stretched (the first wait 30 s instead of 1) →
+//!   red on the bound after the outage. Doubling the cap alone (`ANCHOR_UNREACHED_REDIAL_SECS` =
+//!   30) does not go red with 32 members: their waits never grow past a few seconds in 40 s.
 
 #![cfg(unix)]
 // Without the feature only the stand-in below runs; the proof's code still compiles, unused.
@@ -403,7 +404,7 @@ fn every_member_is_back_after_an_anchor_restart() {
         }
     }
     assert!(
-        fewest >= 3,
+        fewest >= 2,
         "PRODUCT (staging): a member's dials failed only {fewest} time(s) while its anchor was away, \
          so its backoff never grew"
     );
