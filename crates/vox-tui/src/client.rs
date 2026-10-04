@@ -511,9 +511,9 @@ pub fn attach_passphrase(
 /// # Errors
 /// If the identity exists already, or cannot be written.
 pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    // The node's own clock, a test step included (V210-64): an identity made here is stamped as
+    // the node making it would have stamped it.
+    let now = (vox_core::time::clock_with_test_skew())();
     // **A wait is said, once, after a second** (V210-100): another vox making this node's identity
     // holds its directory, and one stopped (Ctrl-Z) holds it until resumed; this one waiting with
     // nothing on the screen looked hung.
@@ -524,7 +524,15 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
         vox_core::atrest::sek::Argon2Profile::default(),
         &crate::tunnel_cli::say_waiting,
     ) {
-        Ok(p) => Ok(p.fingerprint()),
+        // **Its prekey ring is made with it**, as the node making an identity makes it, so the
+        // ring's age is the identity's (V210-77): what a node attaching later keeps up, not
+        // something it makes afresh.
+        Ok(p) => {
+            let signer = p.signer()?;
+            let dh_secret = *signer.x25519_identity_secret();
+            vox_core::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now)?;
+            Ok(p.fingerprint())
+        }
         // Waited the whole patience and the holder is still not done: say what holds it and how to
         // find it, never to stop a node — the holder may only be slow, or stopped.
         Err(Error::ProfileBusy) => Err(AppError::Usage(format!(

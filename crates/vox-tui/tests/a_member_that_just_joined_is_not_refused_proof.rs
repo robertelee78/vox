@@ -15,29 +15,26 @@
 //! 1. no joiner reports a failed sync as a governance, malformed-data or authenticator failure;
 //! 2. alice reads each joiner's first post within [`READ_WITHIN`] of it being posted.
 //!
-//! 3. **the window was reached**: at least one joiner was told "not a member of the room yet"
-//!    (`NotYetMember`), the honest name for it, which the push retry resolves. A run in which none
-//!    was is `PRODUCT (staging)`, never a pass: it would have passed with the
-//!    defect present (V210-106).
+//! **Retired (2026-10-03): the window itself.** This proof also asserted that at least one joiner
+//! was told "not a member of the room yet" (`NotYetMember`) by its anchor, the sign that a joiner
+//! had synced with the anchor while the anchor knew it only by its pre-join record, and it had a
+//! mutant for that path (a joiner's pre-join record dropped when its admitting bundle lands). That
+//! window can no longer arise: a member runs no sync session with an anchor that is not a member
+//! (a606ac9a), so a joiner never syncs with its anchor at all, and the defect of #217 has no path.
+//! Claims 1 and 2 stay: they guard what a person sees, a joiner that posts at once read promptly
+//! and no sync failure misnamed.
 //!
-//! **How the window is forced.** It is a race between the joiner's first session with its anchor
-//! and its address record landing there, and the record usually wins: with #261 on the tree, runs
-//! met the window in 0 of 4. So each joiner's daemon runs with the test-only
-//! `VOX_TEST_HOLD_ADDRESS_MS` = [`HOLD_ADDRESS_MS`] (the `test-knobs` feature, V210-105), which keeps
-//! its address record off every board for that long after it joins, while its bundle goes as usual
-//! and is mirrored by alice. Its first syncs with the anchor then meet an anchor that knows it only
-//! by its pre-join record and that bundle — every joiner, every run. The proof refuses as CANNOT
-//! MEASURE a `vox` built without the knob.
+//! Each joiner's daemon still runs with the test-only `VOX_TEST_HOLD_ADDRESS_MS` =
+//! [`HOLD_ADDRESS_MS`] (the `test-knobs` feature, V210-105), which keeps its address record off
+//! every board for that long after it joins: claims 1 and 2 then hold with the record late.
 //!
 //! **Why it still makes load.** The other three refusals below are races of their own, so the proof
 //! runs one `yes` per core while the joiners join — started here, killed here by PID, and checked
 //! gone — and each joiner is a fresh chance. Run it alone (the timing lock), as every
 //! timing-sensitive proof is.
 //!
-//! **Mutation that must turn it red:** a joiner's pre-join record dropped when the bundle that
-//! admits it lands (#297 c1, which ac-ver286c2 caught): the anchor then knows the joiner as neither
-//! member nor pending joiner, refuses its sync uninformatively, and it reports "authenticator
-//! invalid" — a PRODUCT red.
+//! **Mutation that must turn it red:** a failed sync reported under a misleading name (governance,
+//! malformed data, authenticator) by any member at join — claim 1.
 //!
 //! What it guards is four refusals of a member at join, each once sent as `0x05`: the anchor's gate
 //! refusing a pending joiner (now `NotYetMember`), the joiner's gate and actor refusing the member
@@ -360,14 +357,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
         "PRODUCT: a member that had just joined reported a failed sync as a governance, \
          malformed-data or authenticator failure: {misnamed:#?}"
     );
-    // Green only if the window was met: with no sync told "not a member yet", nothing above was
-    // asked of the anchor while it knew a joiner only by its pre-join record, and the defect would
-    // have passed too.
-    assert!(
-        not_yet > 0,
-        "PRODUCT (staging): no joiner's sync was told \"not a member yet\", so \
-         no joiner synced with the anchor while it knew it only by its pre-join record, though each \
-         held its address record back for {HOLD_ADDRESS_MS} ms"
-    );
+    // The window of #217 is no longer asserted (see the module doc): `not_yet` is said, not
+    // required.
     let _ = anchor.transcript();
 }
