@@ -551,6 +551,13 @@ impl DaemonCore {
             NodeEvent::AddressWithheld { reason, .. } => {
                 self.notice = Some(format!("no invite link: {reason}"));
             }
+            // **A join this node refused, or one that did not complete, is the operator's to
+            // see** (#406): a refusal is security-relevant, and the TUI is the client a person
+            // watches. The reason names the joiner and the step, never a passphrase (the node
+            // words it so: `answering <joiner>: join proof-of-possession failed`).
+            NodeEvent::JoinFailed { reason } => {
+                self.notice = Some(format!("a join did not complete — {reason}"));
+            }
             NodeEvent::Joined { responder, .. } => {
                 self.notice = Some(format!("joined via {}", self.member_name(&responder)));
             }

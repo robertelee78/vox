@@ -635,6 +635,16 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         // which only asks for it — what it said of the steps it took and what each member answered
         // is the half of the story the host cannot tell.
         let joiner_err = tmp.join(format!("{}.daemon.err", w.name));
+        if !o.ok {
+            // The host says why it refused once its node has the exchange's outcome, a moment
+            // after the joiner hears "refused": read too soon, its log was empty (#406).
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(5)
+                && !read_log(&host_err).contains("a join did not complete")
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         assert!(
             o.ok,
             "PRODUCT: {} could not join the room: `vox room join` was refused after {:?} \
