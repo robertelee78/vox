@@ -138,9 +138,23 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
     };
 
     // ---- the harnesses' wiring ----
-    checks.extend(claude_hooks());
-    checks.push(codex_hook());
-    checks.push(opencode_plugin());
+    let node = paths
+        .profile_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| vox_core::node::paths::NodeName::parse(n).ok());
+    match &node {
+        Some(node) => {
+            checks.extend(claude_hooks(node));
+            checks.push(codex_hook(node));
+            checks.push(opencode_plugin(node));
+        }
+        None => checks.push(fail(
+            "node-name",
+            format!("{} is not a node's directory", paths.profile_dir.display()),
+            "name the node with --node",
+        )),
+    }
 
     // ---- the drain, sessions, trust and versions ----
     match (client.as_mut(), channel) {
@@ -207,7 +221,7 @@ async fn room_or_only(client: &mut IpcClient, room: Option<&str>) -> Result<Dige
     let rooms = match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => rooms,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     match rooms.as_slice() {
@@ -256,12 +270,28 @@ fn runs_vox_hook(command: &str) -> bool {
         .any(|w| (w[0] == "vox" || w[0].ends_with("/vox")) && w[1] == "agent" && w[2] == "hook")
 }
 
-/// How many entries for `event` in the settings file at `path` run `vox agent hook`, or why the
-/// file could not be read. A file that does not exist holds none.
-fn hook_count(path: &Path, event: &str) -> Result<usize, String> {
+/// The node a hook command acts as: the value of its `--node`, or `None` when it names none
+/// (such a hook refuses, ADR-020 2.1).
+fn hook_node(command: &str) -> Option<&str> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    tokens.windows(2).find(|w| w[0] == "--node").map(|w| w[1])
+}
+
+/// What a `vox agent hook` entry acting as some node other than `node` is told: none, or which.
+fn wrong_node(command: &str, node: &vox_core::node::paths::NodeName) -> Option<String> {
+    match hook_node(command) {
+        Some(n) if n == node.as_str() => None,
+        Some(n) => Some(format!("acts as node {n}, not this node ({node})")),
+        None => Some("names no node (`--node`), so it refuses every turn".to_owned()),
+    }
+}
+
+/// The commands of the entries for `event` in the settings file at `path` that run `vox agent
+/// hook`, or why the file could not be read. A file that does not exist holds none.
+fn hook_commands(path: &Path, event: &str) -> Result<Vec<String>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{} cannot be read: {e}", path.display())),
     };
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
@@ -275,12 +305,13 @@ fn hook_count(path: &Path, event: &str) -> Result<usize, String> {
         .into_iter()
         .flatten()
         .flat_map(|group| group["hooks"].as_array().into_iter().flatten())
-        .filter(|h| h["command"].as_str().is_some_and(runs_vox_hook))
-        .count())
+        .filter_map(|h| h["command"].as_str().filter(|c| runs_vox_hook(c)))
+        .map(str::to_owned)
+        .collect())
 }
 
 /// One check per event: an entry running `vox agent hook`, once, at user scope.
-fn claude_hooks() -> Vec<Check> {
+fn claude_hooks(node: &vox_core::node::paths::NodeName) -> Vec<Check> {
     let Some(dir) = dir_of("CLAUDE_CONFIG_DIR", ".claude") else {
         return vec![warn(
             "claude-hook",
@@ -307,34 +338,43 @@ fn claude_hooks() -> Vec<Check> {
                     format!("Claude Code is not set up here (no {})", dir.display()),
                 );
             }
-            let at_user = match hook_count(&user, event) {
-                Ok(n) => n,
+            let user_commands = match hook_commands(&user, event) {
+                Ok(c) => c,
                 Err(e) => return fail(id, e, format!("make {} valid JSON", user.display())),
             };
+            let at_user = user_commands.len();
             let mut at_project = Vec::new();
             for p in &project {
-                match hook_count(p, event) {
+                match hook_commands(p, event).map(|c| c.len()) {
                     Ok(0) => {}
                     Ok(n) => at_project.push((p, n)),
                     Err(e) => return fail(id, e, format!("make {} valid JSON", p.display())),
                 }
             }
             let total = at_user + at_project.iter().map(|(_, n)| n).sum::<usize>();
+            let plugin = format!("vox agent plugin claude --node {node}");
             match (at_user, total) {
-                (1, 1) => ok(
-                    id,
-                    format!("runs `vox agent hook` once, from {}", user.display()),
-                ),
+                (1, 1) => match wrong_node(&user_commands[0], node) {
+                    None => ok(
+                        id,
+                        format!(
+                            "runs `vox agent hook --node {node}` once, from {}",
+                            user.display()
+                        ),
+                    ),
+                    Some(why) => fail(
+                        id,
+                        format!("the `vox agent hook` entry in {} {why}", user.display()),
+                        format!("replace it with what `{plugin}` prints"),
+                    ),
+                },
                 (_, 0) => warn(
                     id,
                     format!(
                         "no `vox agent hook` entry for {event} in {}",
                         user.display()
                     ),
-                    format!(
-                        "merge what `vox agent plugin claude` prints into {}",
-                        user.display()
-                    ),
+                    format!("merge what `{plugin}` prints into {}", user.display()),
                 ),
                 (0, _) => warn(
                     id,
@@ -412,7 +452,7 @@ fn trusted_in(config: &str, key: &str) -> bool {
 
 /// Codex's hook: a Vox entry in its user `hooks.json`, in the shape Codex runs, and trusted, as
 /// Codex's own `config.toml` records it. Read from the files: no Codex process is started.
-fn codex_hook() -> Check {
+fn codex_hook(node: &vox_core::node::paths::NodeName) -> Check {
     let id = "codex-hook";
     let Some(dir) = dir_of("CODEX_HOME", ".codex") else {
         return warn(
@@ -428,7 +468,7 @@ fn codex_hook() -> Check {
         );
     }
     let hooks_file = dir.join("hooks.json");
-    let plugin = "merge what `vox agent plugin codex` prints into";
+    let plugin = format!("merge what `vox agent plugin codex --node {node}` prints into");
     let hooks: serde_json::Value = match std::fs::read_to_string(&hooks_file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
         Err(e) => {
@@ -456,6 +496,7 @@ fn codex_hook() -> Check {
     // Codex resolves it (macOS's `/var` is `/private/var`).
     let real = std::fs::canonicalize(&hooks_file).unwrap_or_else(|_| hooks_file.clone());
     let mut keys = Vec::new();
+    let mut wrong = Vec::new();
     let mut bare = 0;
     for (event, groups) in hooks["hooks"].as_object().into_iter().flatten() {
         for (g, group) in groups.as_array().into_iter().flatten().enumerate() {
@@ -463,8 +504,11 @@ fn codex_hook() -> Check {
                 bare += 1;
             }
             for (h, hook) in group["hooks"].as_array().into_iter().flatten().enumerate() {
-                if hook["command"].as_str().is_some_and(runs_vox_hook) {
+                if let Some(command) = hook["command"].as_str().filter(|c| runs_vox_hook(c)) {
                     keys.push(format!("{}:{}:{g}:{h}", real.display(), snake(event)));
+                    if let Some(why) = wrong_node(command, node) {
+                        wrong.push(why);
+                    }
                 }
             }
         }
@@ -478,7 +522,7 @@ fn codex_hook() -> Check {
                      not run: an entry belongs inside a group's `hooks` list",
                     hooks_file.display()
                 ),
-                "replace it with what `vox agent plugin codex` prints".to_owned(),
+                format!("replace it with what `vox agent plugin codex --node {node}` prints"),
             )
         } else {
             warn(
@@ -493,6 +537,19 @@ fn codex_hook() -> Check {
                 ),
             )
         };
+    }
+    if let Some(why) = wrong.first() {
+        return fail(
+            id,
+            format!(
+                "the `vox agent hook` entry in {} {why}",
+                hooks_file.display()
+            ),
+            format!(
+                "replace it with what `vox agent plugin codex --node {node}` prints, then run \
+                 `vox agent trust codex`"
+            ),
+        );
     }
     let config_file = dir.join("config.toml");
     let config = std::fs::read_to_string(&config_file).unwrap_or_default();
@@ -554,8 +611,9 @@ fn vox_plugins(dir: &Path) -> Vec<(PathBuf, String)> {
 }
 
 /// OpenCode's plugin: present once, and byte for byte the one this build prints.
-fn opencode_plugin() -> Check {
+fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> Check {
     let id = "opencode-plugin";
+    let this = crate::agent_hook::opencode_plugin(node);
     let dir = std::env::var_os("OPENCODE_CONFIG_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -585,19 +643,25 @@ fn opencode_plugin() -> Check {
         [] => warn(
             id,
             format!("no Vox plugin in {}", dir.join("plugin").display()),
-            format!("`vox agent plugin opencode > {}`", target.display()),
+            format!(
+                "`vox agent plugin opencode --node {node} > {}`",
+                target.display()
+            ),
         ),
-        [(path, text)] if text == crate::agent_hook::OPENCODE_PLUGIN => {
+        [(path, text)] if *text == this => {
             ok(id, format!("{} is this build's plugin", path.display()))
         }
         [(path, _)] => fail(
             id,
             format!(
-                "{} is not the plugin this vox ({}) prints: an older or edited copy",
+                "{} is not the plugin this vox ({}) prints for node {node}: an older or edited copy, or another node's",
                 path.display(),
                 crate::coord::VERSION
             ),
-            format!("`vox agent plugin opencode > {}`", path.display()),
+            format!(
+                "`vox agent plugin opencode --node {node} > {}`",
+                path.display()
+            ),
         ),
         many => fail(
             id,
@@ -647,7 +711,10 @@ async fn drain_self_test(paths: &Paths, client: &mut IpcClient, channel_id: Dige
         Ok(other) => {
             return fail(
                 id,
-                format!("the node answered the drain's read with {other:?}"),
+                format!(
+                    "the node did not answer the drain's read: {}",
+                    crate::client::unexpected(&other)
+                ),
                 "restart the node with this vox",
             )
         }
@@ -745,7 +812,10 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
         Ok(other) => {
             return vec![warn(
                 "trust",
-                format!("the node did not say who trusts whom: {other:?}"),
+                format!(
+                    "the node did not say who trusts whom: {}",
+                    crate::client::unexpected(&other)
+                ),
                 "restart the node with this vox",
             )]
         }
@@ -760,11 +830,15 @@ async fn trust(client: &mut IpcClient, channel_id: Digest32) -> Vec<Check> {
     let members = match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => members,
         other => {
+            let why = match other {
+                Ok(f) => crate::client::unexpected(&f).to_string(),
+                Err(e) => e.to_string(),
+            };
             return vec![warn(
                 "trust",
-                format!("the room's members could not be read: {other:?}"),
+                format!("the room's members could not be read: {why}"),
                 "run the doctor again",
-            )]
+            )];
         }
     };
     let me = client.me();

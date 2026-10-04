@@ -832,7 +832,8 @@ fn ok_or(reply: vox_core::error::Result<Frame>, doing: &str) -> Result<(), AppEr
             "{doing}: node {node} was detached from the vox daemon while it waited"
         ))),
         Ok(other) => Err(AppError::Usage(format!(
-            "{doing}: unexpected reply {other:?}"
+            "{doing}: {}",
+            crate::client::unexpected(&other)
         ))),
         Err(e) => Err(AppError::Usage(format!("{doing}: {e}"))),
     }
@@ -843,7 +844,7 @@ async fn room_ids(client: &mut IpcClient) -> Result<Vec<Digest32>, AppError> {
     match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms.into_iter().map(|r| r.0).collect()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -970,7 +971,7 @@ pub async fn serve(
         Ok(Frame::Error { reason }) => {
             return Err(AppError::Usage(format!("cannot mint an address: {reason}")))
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     waiting.on("the vox daemon to stop");
@@ -1096,7 +1097,7 @@ pub async fn connect(
                 "node {node} was detached from the vox daemon while it joined"
             )))
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     }
     let channel_id = vox_core::node::link::InviteLink::parse(url)
@@ -1179,7 +1180,7 @@ pub(crate) async fn open_named_room(
     let rooms = match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => rooms,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     if rooms.is_empty() {
@@ -1263,7 +1264,7 @@ pub async fn forward_named(
                 },
             ));
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     eprintln!("vox: bound in {} ms", first_attempt.elapsed().as_millis());

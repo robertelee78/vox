@@ -542,7 +542,7 @@ fn already_running(
                 DaemonFrame::Refused(r) => {
                     return Err(AppError::Usage(refusal_words(&r, account, &node)))
                 }
-                other => return Err(AppError::Usage(format!("unexpected answer: {other:?}"))),
+                other => return Err(crate::client::unexpected_daemon(&other)),
             }
         }
         let client = IpcClient::open_node(
