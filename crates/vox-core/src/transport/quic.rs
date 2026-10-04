@@ -1429,6 +1429,7 @@ fn finish_connection(
         peer_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         carrier: None,
         tunnels: Arc::new(Mutex::new(0)),
+        dropped: None,
     })
 }
 
@@ -1494,6 +1495,8 @@ pub struct VoxConnection {
     /// ([`VoxConnection::carry_tunnel`]). Shared with each [`TunnelCredit`], so a credit needs no
     /// borrow of the connection.
     tunnels: Arc<Mutex<u32>>,
+    /// Told when this is dropped (see [`Self::tell_when_dropped`]).
+    dropped: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Drop for VoxConnection {
@@ -2151,6 +2154,15 @@ impl VoxConnection {
     #[must_use]
     pub fn closed_here(&self) -> Option<WireError> {
         self.closed_here.get().copied()
+    }
+
+    /// A receiver that resolves when this `VoxConnection` is dropped, for a task that holds a
+    /// handle of the connection for its own reasons and must not keep it open on that account:
+    /// a relay circuit's driver, which lingers until the connection closes (#335).
+    pub(crate) fn tell_when_dropped(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.dropped = Some(tx);
+        rx
     }
 
     /// The underlying quinn connection, for advanced callers (M11 tunnels).

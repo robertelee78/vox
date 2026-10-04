@@ -599,7 +599,7 @@ pub async fn connect_through(
     // race (M15.1b) — aborts it on drop, which drops the port, which detaches the
     // circuit and closes the stream, which tells the relay and the far side to let go.
     let driver = DriverGuard::new(tokio::spawn(terminate(port, Arc::clone(relay), flow)));
-    let conn =
+    let mut conn =
         crate::nat::reachability::connect_direct(Arc::clone(endpoint), &[target], peer, now_secs)
             .await?;
     // **The circuit ends when the connection it carries does.** Nothing else ends it: the
@@ -610,10 +610,24 @@ pub async fn connect_through(
     // relay slot, and of the relay's connections to both ends held as carrying.
     //
     // A short linger first, so the close itself crosses the circuit before it goes.
+    //
+    // **Nor does this keep the connection open.** The handle it waits on is a handle like any
+    // other, and quinn closes a connection only once its last handle goes: a connection dropped
+    // unfiled — a rung that completed alongside the one a ladder took — stayed open at both
+    // ends for as long as its circuit did, and the far end, which had filed it, kept it as the
+    // peer's connection and sent its keys where nobody read them (#335). Dropped, it is closed,
+    // with the reason a connection that lost to another is given.
     if let Some(abort) = driver.keep() {
         let inner = conn.quinn().clone();
+        let dropped = conn.tell_when_dropped();
         tokio::spawn(async move {
-            inner.closed().await;
+            tokio::select! {
+                _ = inner.closed() => {}
+                _ = dropped => {
+                    let err = crate::wire::WireError::Superseded;
+                    inner.close(crate::transport::quic::close_code(err), err.to_string().as_bytes());
+                }
+            }
             tokio::time::sleep(CIRCUIT_CLOSE_LINGER).await;
             abort.abort();
         });
