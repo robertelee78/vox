@@ -186,6 +186,11 @@ fn a_guest_that_arrives_before_the_anchor_holds_the_room_still_joins_through_the
 /// the one thing it has to do: the anchor sending each member the other's circuit, then each member
 /// taking it.
 const STAGE: Duration = Duration::from_millis(1500);
+/// The product's knob (`vox_core::node::network::TEST_LADDER_SETTLE_ENV`, test-knobs builds only):
+/// how long a reach waits, after its first rung connects, before it files that connection.
+const LADDER_SETTLE_ENV: &str = "VOX_TEST_LADDER_SETTLE_MS";
+/// Long enough for a member's other circuit, through the other anchor, to connect meanwhile.
+const SETTLE_MS: &str = "1500";
 /// Each reads the other within this of the release.
 const BOUND: Duration = Duration::from_secs(8);
 /// How long after the release the reads are watched for, past the 10 s a lost dial waits out, so a
@@ -273,9 +278,21 @@ impl Daemon {
     }
 }
 
-fn daemon(dir: &std::path::Path, listen: &str, anchor: &str) -> Daemon {
+fn daemon(dir: &std::path::Path, listen: &str, anchors: &[&str]) -> Daemon {
+    daemon_with(dir, listen, anchors, &[])
+}
+
+/// [`daemon`], with `env` set for it.
+fn daemon_with(
+    dir: &std::path::Path,
+    listen: &str,
+    anchors: &[&str],
+    env: &[(&str, &str)],
+) -> Daemon {
     let mut child = Command::new(VOX)
-        .args(["daemon", "--listen", listen, "--anchor", anchor])
+        .args(["daemon", "--listen", listen])
+        .args(anchors.iter().flat_map(|a| ["--anchor", a]))
+        .envs(env.iter().copied())
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env_remove("VOX_ROOM")
@@ -398,6 +415,49 @@ fn holds(dir: &std::path::Path, peer: &str) -> bool {
     })
 }
 
+/// The connection the node in `dir` holds to `peer`, by its tag (the same at both ends), by its own
+/// `vox status --json`; `None` if it holds none.
+fn held_tag(dir: &std::path::Path, peer: &str) -> Option<String> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).ok().filter(|_| ok)?;
+    v["reach"]
+        .as_array()?
+        .iter()
+        .find(|r| r["peer"].as_str() == Some(peer))
+        .and_then(|r| r["connection"].as_str())
+        .map(str::to_owned)
+}
+
+/// Every connection the node in `dir` has open to `peer`: the one it holds and the ones displaced
+/// but still read, by tag, by its own `vox status --json`.
+fn open_to(dir: &std::path::Path, peer: &str) -> std::collections::BTreeSet<String> {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    let v: serde_json::Value = match serde_json::from_str(out.trim()) {
+        Ok(v) if ok => v,
+        _ => return std::collections::BTreeSet::new(),
+    };
+    v["reach"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["peer"].as_str() == Some(peer))
+        .flat_map(|r| {
+            r["connection"]
+                .as_str()
+                .into_iter()
+                .chain(
+                    r["retired"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|t| t.as_str()),
+                )
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// What `d` said about `peer` from its `mark`th line on: every line naming the peer's short id.
 fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
     d.said()
@@ -419,31 +479,47 @@ fn about(d: &Daemon, mark: usize, peer: &str) -> Vec<String> {
 /// 10 s: a first relayed connection took 10558 ms on CI (R42, run 36601388611), and the two members
 /// did not read each other until then.
 ///
-/// **Staging, forced on every run with no switch in the product.** bob listens on `127.0.0.1` and
-/// carol on `[::1]`, so the anchor's circuit is their only path to each other. Both daemons are
-/// restarted, so neither holds a connection to the other; `vox status --json` naming no circuit
-/// between them is checked, and each holding its connection to the anchor. Then the crossing is
-/// ordered with SIGSTOP/SIGCONT, so it does not rest on which of two tasks the anchor happens to
-/// run first:
+/// **Through two relays at once** (#335): a member asks every peer it holds for a circuit, so two
+/// relays carry two circuits each way, and a member's two dials connect within milliseconds of each
+/// other. Its ladder filed the first and dropped the second — unfiled, and not closed either, since
+/// the circuit's own driver held a handle of it. The far end had accepted both and kept the one with
+/// the lower tie-break key, which could be the one dropped: it sent its keys on a connection nobody
+/// read, and one member never read the other (integrate 1c8810fc: bob read carol at 540 ms, carol
+/// never read bob).
 ///
-/// 1. The anchor is frozen, and bob and carol trust each other at once, which makes each dial the
-///    other. The run waits until each has asked the relay for a circuit to the other (`vox status
-///    --json`), or it is `PRODUCT (staging)`.
-/// 2. bob and carol are frozen and the anchor runs: it hands each the other's circuit request,
-///    which waits in the frozen member, and then waits for their answers.
-/// 3. The anchor is frozen again and bob and carol run: each takes the other's circuit (one attach
-///    each) and answers into the frozen anchor. Neither can yet hear that its own circuit is open.
-/// 4. The anchor runs: each hears its own circuit is open and attaches it second.
+/// **Staging, forced on every run.** bob listens on `127.0.0.1` and carol on `[::1]`, so circuits
+/// are their only path to each other. Both daemons are restarted with two anchors each, so neither
+/// holds a connection to the other; `vox status --json` naming no circuit between them is checked,
+/// and each holding its connections to both anchors and having synced the room. Each ladder files
+/// its first connection only after `SETTLE_MS` (`VOX_TEST_LADDER_SETTLE_MS`, a `test-knobs` switch),
+/// so the other anchor's circuit has connected by then on every run, not only on a loaded machine.
+/// alice, whom both also hold and so also ask, is frozen until the release. Then the crossing is
+/// ordered with SIGSTOP/SIGCONT, so it does not rest on which of two tasks an anchor happens to run
+/// first:
 ///
-/// So on both ends the far end's circuit is attached first and the member's own second, which is
+/// 1. The anchors are frozen, and bob and carol trust each other at once, which makes each dial the
+///    other. The run waits until each has asked both anchors for a circuit to the other (`vox
+///    status --json`), or it is `PRODUCT (staging)`.
+/// 2. bob and carol are frozen and the anchors run: each hands each member the other's circuit
+///    request, which waits in the frozen member, and then waits for their answers.
+/// 3. The anchors are frozen again and bob and carol run: each takes the other's circuits and
+///    answers into the frozen anchors. Neither can yet hear that its own circuits are open.
+/// 4. The anchors run: each hears its own circuits are open and attaches them last.
+///
+/// So on both ends the far end's circuits are attached first and the member's own after, which is
 /// the order in which unmapping the earlier circuit loses **both** dials. Left to the anchor, one
 /// order in two lost only one dial, the other connected, and the members read each other anyway.
 ///
-/// **Asserted, as the members see it:** each reads a post of the other's within [`BOUND`] of the
-/// release. A `PRODUCT:` red is the product's verdict; `PRODUCT (staging)` is the staging not achieved.
+/// **Asserted, as the members see it:** the two ends have the same connections open to each other
+/// and hold the same one (`vox status --json`, `reach[].connection` and `reach[].retired`), and
+/// each reads a post of the other's within [`BOUND`] of the release. A `PRODUCT:` red is the
+/// product's verdict; `PRODUCT (staging)` is the staging not achieved.
 ///
-/// **Mutation that must turn it red:** in `MuxSocket::attach`, remove the earlier circuit to the
-/// same peer when a new one is attached (the code before V210-80).
+/// **Mutations that must turn it red:** in `MuxSocket::attach`, remove the earlier circuit to the
+/// same peer when a new one is attached (the code before V210-80); or, together, return from the
+/// reach ladder with only its first connection filed and let a circuit's driver hold a connection
+/// open after it is dropped (the code before #335). Either one of those two alone is held by the
+/// other.
 #[test]
 #[ignore = "three daemons and a relay anchor with production Argon2id; CI runs it in release"]
 fn two_members_dialling_each_other_through_one_relay_both_get_through() {
@@ -458,6 +534,7 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     }
     let (alice_dir, bob_dir, carol_dir) = (&dirs[0], &dirs[1], &dirs[2]);
     let anchor = Anchor::start(&tmp.path().join("anchor"));
+    let second = Anchor::start(&tmp.path().join("second"));
     let mut fps = Vec::new();
     for d in &dirs {
         let (ok, out, err) = vox(d, &["id"], None);
@@ -467,9 +544,9 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     // alice and bob on IPv4, carol on IPv6: bob and carol reach each other only through the
     // anchor's relay.
     let carol_spec = Split::Families.guest_spec(&anchor).to_owned();
-    let _alice = daemon(alice_dir, "127.0.0.1:0", &anchor.v4_spec);
-    let bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec);
-    let carol = daemon(carol_dir, Split::Families.guest_listen(), &carol_spec);
+    let alice = daemon(alice_dir, "127.0.0.1:0", &[&anchor.v4_spec]);
+    let bob = daemon(bob_dir, "127.0.0.1:0", &[&anchor.v4_spec]);
+    let carol = daemon(carol_dir, Split::Families.guest_listen(), &[&carol_spec]);
 
     // alice's room; alice and each joiner trust each other. bob and carol do NOT, yet.
     for (i, name) in [(1usize, "bob"), (2, "carol")] {
@@ -523,8 +600,22 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     // Fresh processes, so neither holds a connection to the other from the joins.
     drop(bob);
     drop(carol);
-    let bob = daemon(bob_dir, "127.0.0.1:0", &anchor.v4_spec);
-    let carol = daemon(carol_dir, Split::Families.guest_listen(), &carol_spec);
+    // Restarted with a second anchor each, so each asks two relays for a circuit to the other,
+    // both one hop from both members; and with each ladder filing its first connection only
+    // after `SETTLE`, so both circuits' connections are made before either is filed, every run.
+    let settle = [(LADDER_SETTLE_ENV, SETTLE_MS)];
+    let bob = daemon_with(
+        bob_dir,
+        "127.0.0.1:0",
+        &[&anchor.v4_spec, &second.v4_spec],
+        &settle,
+    );
+    let carol = daemon_with(
+        carol_dir,
+        Split::Families.guest_listen(),
+        &[&carol_spec, Split::Families.guest_spec(&second)],
+        &settle,
+    );
     assert!(
         until("bob and carol hold their room", 60, || {
             vox(bob_dir, &["room", "list"], None).1.contains(&room)
@@ -536,19 +627,22 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     // lists its rooms as soon as its node is attached (ADR-026), before its anchor dial lands:
     // frozen then, the anchor fails a member's dial ("the identity stream failed"), and that
     // member has nobody to ask for a circuit, so nothing crosses.
-    let anchor_fp = anchor
-        .v4_spec
-        .split_once('@')
-        .map(|(fp, _)| fp.to_owned())
-        .expect("APPARATUS: the anchor's spec is fp@address");
+    let fp_of = |a: &Anchor| {
+        a.v4_spec
+            .split_once('@')
+            .map(|(fp, _)| fp.to_owned())
+            .expect("APPARATUS: an anchor's spec is fp@address")
+    };
+    let anchors = [fp_of(&anchor), fp_of(&second)];
+    let holds_both = |d: &std::path::Path| anchors.iter().all(|a| holds(d, a));
     assert!(
         until("bob and carol hold their anchor connections", 60, || {
-            holds(bob_dir, &anchor_fp) && holds(carol_dir, &anchor_fp)
+            holds_both(bob_dir) && holds_both(carol_dir)
         }),
-        "PRODUCT (staging): a restarted member never held a connection to its anchor within 60 s: \
-         bob {}, carol {}\nbob said:\n{}\ncarol said:\n{}",
-        holds(bob_dir, &anchor_fp),
-        holds(carol_dir, &anchor_fp),
+        "PRODUCT (staging): a restarted member never held connections to both its anchors within \
+         60 s: bob {}, carol {}\nbob said:\n{}\ncarol said:\n{}",
+        holds_both(bob_dir),
+        holds_both(carol_dir),
         bob.said(),
         carol.said()
     );
@@ -585,9 +679,14 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     let marks = (bob.said().lines().count(), carol.said().lines().count());
 
     // ---- the crossing, in the order that loses both dials to the defect ----
-    let anchor_pid = [anchor.proc.child.id()];
+    // alice is a member each holds a connection to, so each asks her for a circuit too; she is
+    // frozen until the release, so only the two anchors' circuits, each one hop from both members,
+    // are in step.
+    let relays = [anchor.proc.child.id(), second.proc.child.id()];
     let members = [bob.0.id(), carol.0.id()];
-    signal(&anchor_pid, "-STOP");
+    let alice_pid = [alice.0.id()];
+    signal(&alice_pid, "-STOP");
+    signal(&relays, "-STOP");
     let frozen = Instant::now();
     let (asked, released, b, c) = std::thread::scope(|s| {
         // 1. Both dial; each request waits in the frozen anchor.
@@ -599,26 +698,28 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
             )
         });
         let c = s.spawn(|| vox(carol_dir, &["trust", "add", bob_fp, "--name", "bob"], None));
+        // Of both relays: one circuit each way through the anchor, and one through alice.
         let asked = until(
-            "bob and carol ask the frozen relay for each other",
+            "bob and carol ask both frozen relays for each other",
             5,
             || {
-                circuits_to(bob_dir, carol_fp) > before.0
-                    && circuits_to(carol_dir, bob_fp) > before.1
+                circuits_to(bob_dir, carol_fp) > before.0 + 1
+                    && circuits_to(carol_dir, bob_fp) > before.1 + 1
             },
         );
         if asked {
-            // 2. The anchor hands each member the other's circuit; both wait in the members.
+            // 2. The relays hand each member the other's circuits; they wait in the members.
             signal(&members, "-STOP");
-            signal(&anchor_pid, "-CONT");
+            signal(&relays, "-CONT");
             std::thread::sleep(STAGE);
-            // 3. Each member takes the other's circuit; its answer waits in the anchor.
-            signal(&anchor_pid, "-STOP");
+            // 3. Each member takes the other's circuits; its answers wait in the relays.
+            signal(&relays, "-STOP");
             signal(&members, "-CONT");
             std::thread::sleep(STAGE);
         }
-        // 4. Each member hears its own circuit is open.
-        signal(&anchor_pid, "-CONT");
+        // 4. Each member hears its own circuits are open.
+        signal(&relays, "-CONT");
+        signal(&alice_pid, "-CONT");
         let released = Instant::now();
         (
             asked,
@@ -629,7 +730,7 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     });
     assert!(
         asked,
-        "PRODUCT (staging): bob and carol did not both ask the frozen relay for a circuit to each \
+        "PRODUCT (staging): bob and carol did not both ask both frozen relays for a circuit to each \
          other within 5 s, so the crossing was not staged. Circuits asked since: bob->carol {}, \
          carol->bob {} (before {before:?}); `trust add` said: bob {:?} {}, carol {:?} {}\nbob \
          said:\n{}\ncarol said:\n{}",
@@ -709,7 +810,24 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
         after.0,
         after.1
     );
-    // 2. Each reads the other promptly.
+    // 2. The two ends have the same connections open to each other, and hold the same one: a
+    //    connection one end keeps and the other neither holds nor reads is one whose keys are lost.
+    assert!(
+        until("bob and carol have the same connections open", 5, || {
+            let (b, c) = (open_to(bob_dir, carol_fp), open_to(carol_dir, bob_fp));
+            !b.is_empty() && b == c && held_tag(bob_dir, carol_fp) == held_tag(carol_dir, bob_fp)
+        }),
+        "PRODUCT: bob and carol have different connections to each other: bob holds {:?} of {:?}, \
+         carol holds {:?} of {:?}\nbob said:\n{}\ncarol said:\n{}",
+        held_tag(bob_dir, carol_fp),
+        open_to(bob_dir, carol_fp),
+        held_tag(carol_dir, bob_fp),
+        open_to(carol_dir, bob_fp),
+        bob_said.join("\n"),
+        carol_said.join("\n")
+    );
+    // 3. Each reads the other promptly.
+    let held = (held_tag(bob_dir, carol_fp), held_tag(carol_dir, bob_fp));
     for (who, at) in [
         ("bob reads carol", bob_reads_carol),
         ("carol reads bob", carol_reads_bob),
@@ -717,7 +835,11 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
         assert!(
             at.is_some_and(|t| t < BOUND),
             "PRODUCT: {who} at {at:?} after the release, over {BOUND:?}: a dial between two members \
-             crossing through one relay waited out its timeout\nbob said:\n{}\ncarol said:\n{}",
+             crossing through the relays waited out its timeout, or the two ends kept different \
+             connections (bob holds {:?} to carol, carol holds {:?} to bob)\nbob said:\n{}\ncarol \
+             said:\n{}",
+            held.0,
+            held.1,
             bob_said.join("\n"),
             carol_said.join("\n")
         );
