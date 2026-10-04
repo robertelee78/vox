@@ -745,6 +745,14 @@ pub fn my_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// Whether `dir` is the shared temp directory's per-user socket directory (`<tmp>/vox-<uid>`),
+/// which only [`prepare_socket_dir`] may create or check: it is in a directory other users can
+/// write, so it is never followed through a symlink or changed by a path.
+#[must_use]
+pub fn is_socket_fallback_dir(dir: &Path) -> bool {
+    dir == socket_fallback_dir()
+}
+
 /// The directory a control socket goes in when the profile's own path is too long:
 /// `<tmp>/vox-<uid>` (see [`Paths::socket_file`]).
 fn socket_fallback_dir() -> PathBuf {
