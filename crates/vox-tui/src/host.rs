@@ -644,10 +644,30 @@ impl Router {
             .node_paths(node)
             .map_err(|e| failed(e.to_string()))?;
         // The daemon's anchors, the node's own anchors file, and what this attach names.
+        //
+        // **What the file could not give is said, here** (V210-107, under ADR-026): each skipped
+        // line, and that a file naming no usable anchor leaves the node with none, which it
+        // carries on without. The daemon is the one vox that reads the file now; dropping what it
+        // skipped left a person whose file named a host that no longer resolves with nothing said
+        // anywhere (#410: the wholly-bad anchors file proof).
         let mut set = self.inner.defaults.anchors.clone();
-        let _ = vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file());
+        let file = paths.anchors_file();
+        let skipped = vox_core::node::link::merge_anchors_file(&mut set, &file)
+            .unwrap_or_else(|e| vec![e.to_string()]);
+        for line in &skipped {
+            eprintln!("vox daemon: {line}");
+        }
         for spec in anchors {
             let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+        }
+        if set.is_empty() && !skipped.is_empty() {
+            eprintln!(
+                "vox daemon: node {node}: {}; carrying on with no anchor",
+                vox_core::error::Error::AnchorsFileUnusable {
+                    path: file.display().to_string(),
+                    skipped: skipped.len(),
+                }
+            );
         }
         let started = std::time::Instant::now();
         let bind = (self.inner.defaults.bind)(node);

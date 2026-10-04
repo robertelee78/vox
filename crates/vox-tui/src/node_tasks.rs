@@ -77,8 +77,16 @@ const ANCHOR_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// move: the same `merge_anchor_spec` runs again, so a name is resolved again whether
 /// it was the file or the record that changed.
 async fn follow_anchors(node: NodeHandle, paths: Paths, specs: Vec<String>) {
-    // What the last read skipped, so a bad line is said when it appears, not every 30 s.
-    let mut said: Vec<String> = Vec::new();
+    // What the last read skipped, so a bad line is said when it appears, not every 30 s. The
+    // attach said what the file skipped then (host.rs), so that is the first read's.
+    let first = paths.clone();
+    let mut said: Vec<String> = tokio::task::spawn_blocking(move || {
+        let mut set = vox_core::nat::bootstrap::BootstrapSet::new();
+        vox_core::node::link::merge_anchors_file(&mut set, &first.anchors_file())
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
     loop {
         tokio::time::sleep(ANCHOR_REFRESH).await;
         // On a blocking thread: a name is resolved here, and a slow resolver must not
