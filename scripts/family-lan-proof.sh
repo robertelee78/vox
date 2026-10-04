@@ -139,6 +139,20 @@ wait_line() { # log pattern seconds [pid] — print the first matching line
     return 1
 }
 
+# Why a background `vox` this script started is gone (R36): its exit status, and the signal
+# that ended it when there was one. sudo ends itself with the signal that ended its command, so
+# 128 + n is the command's signal n. A process that prints nothing and exits still says this.
+why_gone() { # pid name
+    local rc
+    wait "$1" 2>/dev/null
+    rc=$?
+    if ((rc > 128)); then
+        echo "$2 exited with status $rc: ended by signal $((rc - 128)) (SIG$(kill -l $((rc - 128)) 2>/dev/null))" >&2
+    else
+        echo "$2 exited with status $rc" >&2
+    fi
+}
+
 stop_pid() {
     local p=$1 i
     kill -TERM "$p" 2>/dev/null || return 0
@@ -412,7 +426,12 @@ for m in alice bob carol; do
         --allow "$ALLOW"
 done
 for m in alice bob carol; do
-    LINE=$(wait_line "$WORK/lan_$m.log" '^vox lan up on utun' 300 "$(eval echo "\$PID_lan_$m")") || exit 1
+    LINE=$(wait_line "$WORK/lan_$m.log" '^vox lan up on utun' 300 "$(eval echo "\$PID_lan_$m")") || {
+        why_gone "$(eval echo "\$PID_lan_$m")" "vox lan up ($m)"
+        echo "$m's daemon said:" >&2
+        sed 's/^/    /' "$WORK/daemon_$m.log" >&2
+        exit 1
+    }
     IF=$(echo "$LINE" | awk '{print $5}')
     IFACES+=("$IF")
     eval "IF_$m=$IF"
