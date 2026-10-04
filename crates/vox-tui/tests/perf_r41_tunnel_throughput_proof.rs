@@ -917,12 +917,13 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         ],
         &nowhere,
     );
+    // "vox: forwarding <addr> to <service> on <address>" (V030-25).
     let line = forward.expect_line("the forward's bound address", |l| {
-        l.starts_with("vox: ") && l.contains(" → ")
+        l.starts_with("vox: forwarding ")
     });
     let tunnel: SocketAddr = line
         .split_whitespace()
-        .nth(1)
+        .nth(2)
         .expect("PRODUCT: an address")
         .parse()
         .expect("PRODUCT: a socket address");
