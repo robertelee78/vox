@@ -67,11 +67,28 @@ pub fn migrate(account: &Account, starting: Option<&NodeName>) -> Result<Migrati
         return Ok(MigrationReport::default());
     }
     let _lock = account.lock()?;
-    migrate_held(account, starting)
+    let report = migrate_held(account, starting)?;
+    // Said once, here, by the verb that met the old layout; the daemon, which migrates through
+    // [`migrate_held`], says it in its own words (ADR-026 F-3).
+    for (from, name) in &report.moved {
+        eprintln!(
+            "vox: moved {} to {} (from v0.3.0 each node lives under {NODES_DIR}/)",
+            from.display(),
+            account.node_dir(name).display()
+        );
+    }
+    for (name, anchor) in &report.split {
+        eprintln!(
+            "vox: node {name}'s anchor key is now node {anchor} ({}): one node is one identity",
+            account.node_dir(anchor).display()
+        );
+    }
+    Ok(report)
 }
 
 /// [`migrate`] for a caller that already holds the account lock (the daemon, which holds it for
-/// its whole life, ADR-026 D-1).
+/// its whole life, ADR-026 D-1). It says nothing: what it moved is in the report, for the caller
+/// to say once.
 ///
 /// # Errors
 /// As [`migrate`].
@@ -155,11 +172,6 @@ pub fn migrate_held(account: &Account, starting: Option<&NodeName>) -> Result<Mi
         std::fs::rename(&dir, &to)
             .map_err(|e| refuse(format!("moving {} to {}: {e}", dir.display(), to.display())))?;
         sync_dir(&to)?;
-        eprintln!(
-            "vox: moved {} to {} (from v0.3.0 each node lives under {NODES_DIR}/)",
-            dir.display(),
-            to.display()
-        );
         report.moved.push((dir, name));
     }
 
@@ -190,10 +202,6 @@ pub fn migrate_held(account: &Account, starting: Option<&NodeName>) -> Result<Mi
         })?;
         sync_dir(&to)?;
         sync_dir(&from)?;
-        eprintln!(
-            "vox: node {name}'s anchor key is now node {anchor} ({}): one node is one identity",
-            to_dir.display()
-        );
         report.split.push((name, anchor));
     }
     Ok(report)

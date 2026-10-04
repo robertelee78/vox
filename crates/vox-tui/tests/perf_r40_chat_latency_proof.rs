@@ -302,7 +302,12 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     )
     .expect("APPARATUS: resolve a profile's paths");
     let mut reader = rt
-        .block_on(attach::paths_client(&bob_paths))
+        .block_on(IpcClient::open_at(
+            &vox_core::node::ipc::NodeSocket::one_shot(
+                bob_paths.account().socket(),
+                vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: a node name"),
+            ),
+        ))
         .expect("PRODUCT: attach to bob's node");
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms

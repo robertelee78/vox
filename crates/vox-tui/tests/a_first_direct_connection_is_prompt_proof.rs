@@ -495,7 +495,7 @@ fn a_node_reads_the_board_before_bridging() {
         &dave,
         &args(&[
             "forward",
-            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
+            &w.hostname(),
             "127.0.0.1:0",
             "--anchor",
             &w.anchor.v6_spec,
@@ -576,7 +576,7 @@ fn forward_once(w: &ForwardedWorld) -> (String, u64, Vec<String>) {
         &w.guest_dir,
         &args(&[
             "forward",
-            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
+            &w.hostname(),
             "127.0.0.1:0",
             "--anchor",
             &w.anchor.v6_spec,
@@ -788,6 +788,27 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
             },
             direct_at.map_or_else(|| "NEVER".to_owned(), |_| format!("{d:?}"))
         );
+        // **A slow sample says what each side noticed** (the guest's `vox up` and its daemon, the
+        // host), times from this sample's ready, so a red names its cause rather than a number.
+        if a >= TARGET || d >= TARGET {
+            for l in up.said_since(ready) {
+                eprintln!("[proof]   up-{i} said: {l}");
+            }
+            for l in w.host.said_since(ready) {
+                eprintln!("[proof]   the host said: {l}");
+            }
+            let log = std::fs::read_to_string(w.guest_dir.join(".daemon/log")).unwrap_or_default();
+            for l in log
+                .lines()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                eprintln!("[proof]   the guest's daemon log: {l}");
+            }
+        }
         any.push(a);
         direct.push(d);
         // The circuits this `vox up` asked a relay for, to the host it could reach directly.

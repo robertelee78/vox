@@ -478,11 +478,10 @@ impl RelayWorld {
 
     fn spawn_forward(&mut self, spec: &str, extra: &[&str]) -> SocketAddr {
         let listen = self.guest_net().0;
-        // `<service>.<host>.<room>.vox`: the only shape a forward takes (V030-25).
-        let address = format!("{}.{}.{}.vox", self.service, self.host_fp, self.room);
+        let name = self.hostname();
         let mut list = vec![
             "forward",
-            &address,
+            &name,
             "127.0.0.1:0",
             "--anchor",
             spec,
@@ -495,7 +494,7 @@ impl RelayWorld {
         }
         let mut fwd = VoxProc::spawn("forward", &self.guest_dir, &args(&list));
         let line = fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: forwarding ")
+            l.starts_with("vox: forwarding 127.0.0.1:")
         });
         let at = address_in(&mut fwd, &line, 2);
         self.fwd = Some(fwd);
@@ -537,9 +536,10 @@ impl RelayWorld {
         (bound, ready)
     }
 
-    /// The room's name for the host's service, as a SOCKS5 client asks `vox up` for it.
+    /// The host's service by its address, `<service>.<node>.<room>.vox`: the only `.vox` form that
+    /// resolves (V030-25; the decider, 2026-10-02). The service is named for its port.
     pub fn hostname(&self) -> String {
-        format!("{}.vox", self.room)
+        format!("{}.{}.{}.vox", self.service, self.host_fp, self.room)
     }
 
     /// **The path is a relay, said by the guest.** The forward's upgrade tries a direct dial and

@@ -414,7 +414,7 @@ fn an_agent_session_is_checked_from_both_sides() {
         &v,
         "claude-hook UserPromptSubmit",
         "warn",
-        "vox agent plugin claude",
+        "vox agent plugin claude --node default",
     );
     write(&home.claude(), &wired);
 
@@ -452,7 +452,7 @@ fn an_agent_session_is_checked_from_both_sides() {
         &v,
         "opencode-plugin",
         "fail",
-        "vox agent plugin opencode >",
+        "vox agent plugin opencode --node default >",
     );
     write(&home.plugin(), &js);
 

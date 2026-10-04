@@ -100,7 +100,7 @@ fn relayed_reach_ms(w: &ForwardedWorld) -> (u128, world::VoxProc) {
         &w.guest_dir,
         &args(&[
             "forward",
-            &format!("{}.{}.{}.vox", w.service_port, w.host_fp, w.room),
+            &w.hostname(),
             "127.0.0.1:0",
             "--anchor",
             &w.anchor.v6_spec,

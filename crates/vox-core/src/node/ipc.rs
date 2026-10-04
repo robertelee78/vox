@@ -3681,7 +3681,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                         crate::node::api::Outcome::Failed(fault) => {
                             format!("Failed({})", fault.name())
                         }
-                        other => format!("{other:?}"),
+                        other => other.to_string(),
                     };
                     let (mut steps, mut said) = (None, None);
                     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);

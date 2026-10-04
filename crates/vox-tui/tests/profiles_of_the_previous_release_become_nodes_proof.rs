@@ -65,8 +65,9 @@ fn cmd(exe: &Path, root: &Root, profile: &str, argv: &[&str]) -> Command {
     c.args(argv)
         .env("VOX_DATA_DIR", &root.data)
         .env("VOX_CONFIG_DIR", &root.cfg)
-        // v0.2.9 names its profile by VOX_PROFILE; this build names its node by VOX_NODE.
         .env("VOX_PROFILE", profile)
+        // This build names a node by `VOX_NODE` (ADR-026 C-3); the previous release reads only
+        // `VOX_PROFILE`.
         .env("VOX_NODE", profile)
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
         .env_remove("VOX_ROOM")
@@ -339,6 +340,24 @@ fn migrate(first: First) {
     if first == First::Id {
         let (said, moved) = ok("PRODUCT", new, &root, "default", &["id"], "");
         println!("[proof] this build's first `vox id` said:\n{moved}");
+        // Each move said once (#399): one line per directory, never two.
+        let told = |what: &str| moved.lines().filter(|l| l.contains(what)).count();
+        for (what, name) in [
+            ("/default to ", "default"),
+            ("/anchor to ", "anchor"),
+            ("/both to ", "both"),
+        ] {
+            assert_eq!(
+                told(what),
+                1,
+                "PRODUCT: `vox id` must say once that it moved {name}; it said:\n{moved}"
+            );
+        }
+        assert_eq!(
+            told("anchor key is now node both-anchor"),
+            1,
+            "PRODUCT: `vox id` must say once that both's anchor key became a node; it said:\n{moved}"
+        );
         let got = said.lines().next().unwrap_or_default().trim().to_owned();
         assert_eq!(
             got, fp_default,
@@ -383,6 +402,16 @@ fn migrate(first: First) {
             l.contains("node both's anchor key is now node both-anchor")
         });
         println!("[proof] the daemon said: {moved} / {split} / {ran_as}");
+        // Each move said once (#399): by the daemon, in its words, not a second time beside it.
+        let all = d.said();
+        let count = |pred: &dyn Fn(&str) -> bool| all.lines().filter(|l| pred(l)).count();
+        let moves_of_default = count(&|l| l.contains("moved ") && l.contains("default"));
+        let splits = count(&|l| l.contains("anchor key is now node both-anchor"));
+        assert!(
+            moves_of_default == 1 && splits == 1,
+            "PRODUCT: every move must be said once; the daemon said the move of default \
+             {moves_of_default} times and the split of both {splits} times:\n{all}"
+        );
         assert_eq!(
             ran_as.trim_start_matches("vox daemon: identity ").trim(),
             fp_default,
