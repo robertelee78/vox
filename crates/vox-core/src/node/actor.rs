@@ -13356,7 +13356,7 @@ impl Node {
                     crate::node::retention::RetentionConfig::write_room(&file, channel_id, own)
                 });
             if written.is_err() {
-                return Outcome::Failed(Fault::Storage);
+                return Outcome::Failed(Fault::RetentionFileUnwritable);
             }
             self.retention_read_at = 0;
             self.refresh_node_retention(now);
@@ -14224,6 +14224,10 @@ pub fn fault_of(e: &Error) -> Fault {
             op: crate::node::profile::VAULT_WRITE,
             ..
         } => Fault::IdentityFileUnwritable,
+        Error::Path {
+            op: crate::node::profile::VAULT_REWRITE,
+            ..
+        } => Fault::IdentityFileNotRewritten,
         // Retention is the admin's to set; anyone else is refused, and told why. It was mapped to
         // `Refused`, which reads "the other side refused" — for a check this node made itself,
         // about its own identity, with nobody on any other side (found by the R7 gate).

@@ -20,8 +20,8 @@
 //!    node is unlocked where it is attached (ADR-026), so what is recorded is the foreground
 //!    `vox daemon --node default`, stopped once it reports the identity.
 //! 3. A headless node's identity file (`vox node`).
-//! 4. A vault write that fails leaves the old vault in place and readable, and the next unlock
-//!    completes the migration.
+//! 4. A vault write that fails leaves the old vault in place and readable, says the identity file
+//!    could not be written, and the next unlock completes the migration.
 //!
 //! **What is read in this process, and why.** Every claim is made by the shipped binary; the test
 //! only reads what it left on disk. The vault's format version is read with
@@ -31,7 +31,8 @@
 //! the obstacle is gone — never an unlock in this process.
 //!
 //! Mutations: the temporary file not flushed, the directory not flushed, or the file created at
-//! the umask's mode and `chmod`ed after, each breaks 1–3.
+//! the umask's mode and `chmod`ed after, each breaks 1–3. A failed vault rewrite reported as the
+//! store breaks 4.
 
 #![cfg(target_os = "macos")]
 
@@ -308,6 +309,14 @@ fn a_file_that_holds_the_identity_is_published_durably() {
     assert!(
         kept,
         "PRODUCT: a failed vault write lost or changed the old vault: {out}{err}"
+    );
+    // The refusal names the file that failed (R36): the identity file, not the store.
+    assert!(
+        err.contains("identity file (vault.cbor) could not be written")
+            && err.contains("data directory is writable")
+            && !err.contains("store could not be read or written"),
+        "PRODUCT: a vault rewrite that failed must say the identity file (vault.cbor) could not \
+         be written: {out}{err}"
     );
     std::fs::remove_dir_all(node_dir(&erin, DEFAULT_NODE).join("vault.tmp"))
         .expect("APPARATUS: remove the blocking directory from where the migration moved it");

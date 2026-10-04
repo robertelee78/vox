@@ -880,6 +880,14 @@ pub enum Fault {
     /// Making an identity, its file (`vault.cbor`) could not be written. Not [`Fault::Storage`],
     /// which named the store when the store was fine (V210-77).
     IdentityFileUnwritable,
+    /// Unlocking an identity of an older vox, its file (`vault.cbor`) could not be rewritten in
+    /// this build's format; the old file is kept, unchanged. Not [`Fault::Storage`], which named
+    /// the store, nor [`Fault::IdentityFileUnwritable`], which says no identity was made.
+    IdentityFileNotRewritten,
+    /// A member's own retention for a room could not be saved: its file (`retention`, in the
+    /// node's configuration directory) could not be written. Not [`Fault::Storage`], which named
+    /// the store.
+    RetentionFileUnwritable,
     /// The identity passphrase was right, but something this identity sealed (its trust
     /// keyring, pending consents or prekey ring) will not open under it: the data was altered,
     /// or written by another identity. Not [`Fault::WrongPassphrase`], which sent a person to
@@ -1068,6 +1076,12 @@ impl Fault {
             Fault::ProfileBusy => {
                 "another vox holds this profile open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
             }
+            Fault::RetentionFileUnwritable => {
+                "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
+            }
+            Fault::IdentityFileNotRewritten => {
+                "the profile's identity file (vault.cbor) could not be written in this vox's format, so the old one was kept\n       check free disk space, and that the data directory is writable; then run it again"
+            }
             Fault::IdentityFileUnwritable => {
                 "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
             }
@@ -1233,6 +1247,8 @@ fault_names!(
     Storage,
     ProfileBusy,
     IdentityFileUnwritable,
+    IdentityFileNotRewritten,
+    RetentionFileUnwritable,
     SealedUnreadable,
     ShuttingDown,
     NotNetworked,
