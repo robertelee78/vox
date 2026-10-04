@@ -367,6 +367,25 @@ fn circuits_to(dir: &std::path::Path, peer: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether the node in `dir` has completed a sync of `room` since it started, and lists `member`
+/// in it, by its own `vox status --json`: what a member needs before it writes a consent there.
+/// A node that has not synced a room since it joined writes nothing in it (V210-164), so a
+/// `vox trust add` then releases no key and dials nobody (#335).
+fn synced_with(dir: &std::path::Path, room: &str, member: &str) -> bool {
+    let (ok, out, _) = vox(dir, &["status", "--json"], None);
+    ok && serde_json::from_str::<serde_json::Value>(out.trim()).is_ok_and(|v| {
+        v["rooms"].as_array().into_iter().flatten().any(|r| {
+            r["id"].as_str().is_some_and(|id| id.starts_with(room))
+                && !r["last_sync"].is_null()
+                && r["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|m| m["id"].as_str() == Some(member))
+        })
+    })
+}
+
 /// Whether the node in `dir` holds a connection to `peer` now, by its own `vox status --json`.
 fn holds(dir: &std::path::Path, peer: &str) -> bool {
     let (ok, out, _) = vox(dir, &["status", "--json"], None);
@@ -536,6 +555,24 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
 
     // ---- precondition: neither has dialled the other ----
     let (bob_fp, carol_fp) = (fps[1].as_str(), fps[2].as_str());
+    // And each has synced the room since it restarted, so it may write there and knows the other
+    // as a member. A member that had not — carol, on her IPv6-only socket, syncs only through the
+    // anchor, and was restarted straight after her join — writes no consent on `trust add` and so
+    // dials nobody: under load this staged nothing in 6 of 6 runs, her node saying "its consent in
+    // room … waits: this node has not synced the room since it joined".
+    assert!(
+        until(
+            "bob and carol have synced the room, each listing the other",
+            60,
+            || { synced_with(bob_dir, &room, carol_fp) && synced_with(carol_dir, &room, bob_fp) }
+        ),
+        "PRODUCT (staging): a restarted member never synced the room within 60 s: bob {}, carol \
+         {}\nbob said:\n{}\ncarol said:\n{}",
+        synced_with(bob_dir, &room, carol_fp),
+        synced_with(carol_dir, &room, bob_fp),
+        bob.said(),
+        carol.said()
+    );
     let before = (
         circuits_to(bob_dir, carol_fp),
         circuits_to(carol_dir, bob_fp),
