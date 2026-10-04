@@ -6,7 +6,7 @@
 //! when it is stopped, or non-zero when the daemon or the node goes from under it.
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use vox_core::hash::Digest32;
 use vox_core::node::actor::NodeHandle;
@@ -1103,6 +1103,7 @@ pub async fn connect(
     // waits for, once, rather than sitting silent for up to half a minute.
     let mut said_waiting = std::collections::HashSet::new();
     let mut following = true;
+    let mut said_steps = false;
     let reply = loop {
         tokio::select! {
             reply = &mut join => break reply,
@@ -1112,6 +1113,11 @@ pub async fn connect(
                         eprintln!("vox: {step}");
                     }
                     waiting.on(step);
+                }
+                // Its steps, said once it got in or did not (#192), and what explains a wait.
+                Ok(Some(Frame::Event(ev))) => {
+                    say_if_it_explains_a_failure(&ev);
+                    said_steps |= matches!(ev, NodeEvent::JoinSteps { .. });
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => following = false,
@@ -1139,6 +1145,20 @@ pub async fn connect(
         }
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
+    }
+    // **What the join did, said** (#192): the node raises its steps before it answers, so they
+    // are in the subscription already; said as `join got in — <steps>`, with anything else that
+    // explains a wait.
+    if following && !said_steps {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, steps.next()).await {
+            if let Frame::Event(ev) = frame {
+                say_if_it_explains_a_failure(&ev);
+                if matches!(ev, NodeEvent::JoinSteps { .. }) {
+                    break;
+                }
+            }
+        }
     }
     let channel_id = vox_core::node::link::InviteLink::parse(url)
         .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?
@@ -1273,6 +1293,29 @@ pub(crate) async fn open_named_room(
     Ok(channel_id)
 }
 
+/// Whether `host` shares `service` in `channel_id` over UDP: each UDP share the room lists is
+/// resolved as this node writes it, and compared.
+async fn shared_udp(
+    held: &mut crate::client::Held,
+    channel_id: Digest32,
+    host: Digest32,
+    service: &str,
+) -> bool {
+    let Ok(Frame::Services { shared, .. }) =
+        held.client.request(&Request::Services { channel_id }).await
+    else {
+        return false;
+    };
+    for (address, _, _) in shared.iter().filter(|s| s.2) {
+        if let Ok(found) = vox_core::node::nameipc::resolve(&held.at, address).await {
+            if found == (channel_id, host, service.to_owned()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// `vox forward <service>.<node>.<room>.vox [<local>]`: resolved and carried by the daemon for
 /// this node, until stopped (V030-25, ADR-026 L-7).
 ///
@@ -1292,6 +1335,13 @@ pub async fn forward_named(
     let (channel_id, host, service) = vox_core::node::nameipc::resolve(&held.at, name)
         .await
         .map_err(|e| AppError::Usage(format!("{name}: {e}")))?;
+    // **A UDP service is forwarded as one** (ADR-022 decision 6): its address names it as any
+    // other, and the room says which shares are UDP. One that is, is asked for as `udp/<name>`.
+    let service = if shared_udp(&mut held, channel_id, host, &service).await {
+        format!("udp/{service}")
+    } else {
+        service
+    };
     // A bare port means loopback; `127.0.0.1:0` picks one.
     let local = match local.parse::<u16>() {
         Ok(port) => format!("127.0.0.1:{port}"),

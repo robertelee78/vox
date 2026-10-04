@@ -380,13 +380,19 @@ pub enum DaemonFrame {
         node: NodeName,
         /// Its identity's fingerprint, or `None` if it has none yet.
         me: Option<Digest32>,
+        /// What attaching the node said, when this `Use` attached it: each line the daemon also
+        /// logs (a skipped anchors line, a node carrying on with no anchor), for the client to
+        /// print in the person's own terminal (PRD-001 R23, R36). Empty when it was attached.
+        notes: Vec<String>,
     },
     /// The `Use` or request was refused.
     Refused(Refusal),
     /// The nodes a [`DaemonRequest::Nodes`] asked for.
     Nodes(Vec<NodeInfo>),
-    /// The node a [`DaemonRequest::Attach`] attached.
-    Attached(NodeInfo),
+    /// The node a [`DaemonRequest::Attach`] attached, and what attaching it said when this request
+    /// attached it (a skipped anchors line, a node carrying on with no anchor), for the client to
+    /// print in the person's own terminal (PRD-001 R23, R36). Empty when it was attached already.
+    Attached(NodeInfo, Vec<String>),
     /// A daemon request succeeded and carries nothing further.
     Ok,
     /// What a [`DaemonRequest::SessionEnd`] did: whether the session was registered, and whether
@@ -811,9 +817,10 @@ impl DaemonFrame {
                     .uint(u64::from(*pid));
                 put_infos(&mut e, attached);
             }
-            DaemonFrame::Using { node, me } => {
-                e.array(3).uint(T_USING).text(node.as_str());
+            DaemonFrame::Using { node, me, notes } => {
+                e.array(4).uint(T_USING).text(node.as_str());
                 put_fp(&mut e, me.as_ref());
+                put_texts(&mut e, notes);
             }
             DaemonFrame::Refused(r) => {
                 e.array(2).uint(T_REFUSED);
@@ -823,9 +830,10 @@ impl DaemonFrame {
                 e.array(2).uint(T_NODES);
                 put_infos(&mut e, v);
             }
-            DaemonFrame::Attached(i) => {
-                e.array(2).uint(T_ATTACHED_INFO);
+            DaemonFrame::Attached(i, notes) => {
+                e.array(3).uint(T_ATTACHED_INFO);
                 put_info(&mut e, i);
+                put_texts(&mut e, notes);
             }
             DaemonFrame::Ok => {
                 e.array(1).uint(T_DAEMON_OK);
@@ -891,13 +899,16 @@ impl DaemonFrame {
                     attached,
                 }
             }
-            (T_USING, 3) => DaemonFrame::Using {
+            (T_USING, 4) => DaemonFrame::Using {
                 node: name(&mut d, "ipc using node")?,
                 me: fp(&mut d, "ipc using identity")?,
+                notes: texts(&mut d, "ipc using notes")?,
             },
             (T_REFUSED, 2) => DaemonFrame::Refused(refusal(&mut d)?),
             (T_NODES, 2) => DaemonFrame::Nodes(infos(&mut d)?),
-            (T_ATTACHED_INFO, 2) => DaemonFrame::Attached(info(&mut d)?),
+            (T_ATTACHED_INFO, 3) => {
+                DaemonFrame::Attached(info(&mut d)?, texts(&mut d, "ipc attached notes")?)
+            }
             (T_DAEMON_OK, 1) => DaemonFrame::Ok,
             (T_SESSION_ENDED, 3) => DaemonFrame::SessionEnded {
                 was_registered: flag(&mut d, "ipc session ended registered")?,
@@ -965,14 +976,37 @@ impl DaemonClient {
     /// greeting, greets with another protocol, or greets with something that is not a daemon's
     /// hello (a node of protocol 8 or before).
     pub async fn open(path: &std::path::Path) -> Result<Self> {
+        Self::open_noting(path, None).await
+    }
+
+    /// [`DaemonClient::open`], calling `waiting` once if the daemon has not greeted within
+    /// [`crate::node::profile::LOCK_PATIENCE`], so the caller can say so where its user will see it.
+    ///
+    /// **A wait for the daemon is never silent** (V210-100, ADR-026): a daemon busy migrating or
+    /// attaching a node, or one stopped (Ctrl-Z), takes the connection and greets only when it can;
+    /// a client that waited with nothing on the screen looked hung, for up to
+    /// [`crate::node::ipc::ANSWER_WITHIN`].
+    ///
+    /// # Errors
+    /// As [`DaemonClient::open`].
+    pub async fn open_noting(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
-        let (stream, hello) = tokio::time::timeout(ANSWER_WITHIN, async {
+        let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
             let mut stream = connect_own(path).await?;
             let hello = read_frame(&mut stream).await?;
             Ok::<_, Error>((stream, hello))
-        })
-        .await
+        });
+        tokio::pin!(greeted);
+        let (stream, hello) = tokio::select! {
+            out = &mut greeted => out,
+            () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
+                if let Some(say) = waiting {
+                    say();
+                }
+                greeted.await
+            }
+        }
         .map_err(|_| silent())??;
         let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
@@ -1204,16 +1238,19 @@ mod tests {
             DaemonFrame::Using {
                 node: n("a"),
                 me: None,
+                notes: Vec::new(),
             },
             DaemonFrame::Using {
                 node: n("a"),
                 me: Some([1u8; 32]),
+                notes: vec!["a note".into(), "another".into()],
             },
             DaemonFrame::Nodes(vec![
                 info("a", NodeState::Detached),
                 info("b", NodeState::Detaching),
             ]),
-            DaemonFrame::Attached(info("a", NodeState::Attached)),
+            DaemonFrame::Attached(info("a", NodeState::Attached), Vec::new()),
+            DaemonFrame::Attached(info("a", NodeState::Attached), vec!["a note".into()]),
             DaemonFrame::Ok,
             DaemonFrame::SessionEnded {
                 was_registered: true,

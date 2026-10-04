@@ -227,6 +227,15 @@ impl Proc {
     }
 }
 
+/// The pid of the daemon holding `dir`'s lock (it writes it there): what does a held verb's work,
+/// so what a proof suspends to make that work wait (ADR-026 S-3: `vox serve` is only its client).
+fn daemon_pid_of(dir: &std::path::Path) -> u32 {
+    std::fs::read_to_string(dir.join(".daemon").join("lock"))
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no daemon holds {}", dir.display()))
+}
+
 fn signal(sig: &str, pid: u32) -> bool {
     Command::new("kill")
         .args([&format!("-{sig}"), &pid.to_string()])
@@ -446,7 +455,7 @@ fn a_cli_failure_tells_the_truth() {
         &format!("{IDPASS}\n"),
     );
     late.expect_out("its control socket", |l| l.contains("control socket"));
-    let (host_pid, late_pid) = (host.child.id(), late.child.id());
+    let (host_pid, late_pid) = (daemon_pid_of(&host_dir), late.child.id());
     // The host is suspended, so the join waits on it and is still being worked on a second
     // after it is asked.
     assert!(
@@ -1089,7 +1098,7 @@ fn a_connect_stopped_by_a_signal_says_why() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
-        signal("STOP", host.child.id()),
+        signal("STOP", daemon_pid_of(&host_dir)),
         "APPARATUS: `kill -STOP` the host failed"
     );
 
@@ -1244,6 +1253,8 @@ fn a_connect_stopped_by_a_signal_says_why() {
         eprintln!("[proof] {name}: said why, waited in {waited:?}");
     }
     drop(service);
+    // The host's daemon was suspended for the joins to wait on; resumed, it can be stopped.
+    signal("CONT", daemon_pid_of(&host_dir));
     eprintln!(
         "[proof] {}/{} stops said why (SIGTERM, SIGINT, SIGHUP, SIGQUIT)",
         stops.len(),

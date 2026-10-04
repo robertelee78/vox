@@ -2371,10 +2371,19 @@ pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10
 /// The error for a node that closed the connection before replying (V210-101): never "malformed",
 /// since nothing arrived to be malformed. A fresh connection, bounded, tells a node that is gone
 /// from one that ended this request itself.
+///
+/// **Running means greeting, not accepting**: a process being killed closes its connections and
+/// its listening socket in whatever order the kernel takes, and a connect in between lands in the
+/// backlog of a listener about to close. Measured: a daemon SIGKILLed mid-request was reported
+/// "still running". Only a hello read back counts.
 pub async fn hung_up(path: &Path) -> Error {
     let still_running = matches!(
-        tokio::time::timeout(ANSWER_WITHIN, connect_own(path)).await,
-        Ok(Ok(_))
+        tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut s = connect_own(path).await?;
+            read_frame(&mut s).await
+        })
+        .await,
+        Ok(Ok(Some(_)))
     );
     Error::Ipc(IpcHandshake::HungUp { still_running })
 }
@@ -2821,6 +2830,10 @@ pub struct Lease {
     pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
     /// A request the daemon serves itself, beyond the node's vocabulary, if it has one.
     pub extension: Option<std::sync::Arc<dyn Extension>>,
+    /// What attaching the node said, when this `Use` attached it ([`DaemonFrame::Using`]).
+    ///
+    /// [`DaemonFrame::Using`]: crate::node::daemonipc::DaemonFrame::Using
+    pub notes: Vec<String>,
 }
 
 /// A request the daemon's own build serves on a node's connection, beyond what this crate knows:
@@ -2995,10 +3008,12 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
         detached,
         hold,
         extension,
+        notes,
     } = lease;
     let using = crate::node::daemonipc::DaemonFrame::Using {
         node: node.clone(),
         me: handle.view().identity.map(|i| i.fingerprint),
+        notes,
     };
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
     let mut held = Held::default();
@@ -4002,6 +4017,8 @@ pub struct IpcClient {
     /// The node this connection acts as on the daemon's socket (ADR-026 C-2), which a check on a
     /// waiting request names in its own `Use`; `None` for a node's own socket.
     node: Option<crate::node::paths::NodeName>,
+    /// What attaching the node said, when this connection's `Use` attached it.
+    notes: Vec<String>,
 }
 
 /// Where a client of the daemon reaches its node (ADR-026 C-2): the account's one socket, and the
@@ -4013,6 +4030,10 @@ pub struct NodeSocket {
     pub path: PathBuf,
     /// What each connection opens with.
     pub using: crate::node::daemonipc::UseNode,
+    /// Called once if the daemon has not greeted within a second
+    /// ([`crate::node::daemonipc::DaemonClient::open_noting`]); the caller says the wait where its
+    /// user sees it.
+    pub waiting: Option<fn()>,
 }
 
 impl std::fmt::Debug for NodeSocket {
@@ -4038,6 +4059,7 @@ impl NodeSocket {
                 passphrase: None,
                 anchors: Vec::new(),
             },
+            waiting: None,
         }
     }
 
@@ -4045,7 +4067,10 @@ impl NodeSocket {
     /// opens, and every connection after the first of a held verb, whose first holds it.
     #[must_use]
     pub fn attached_only(&self) -> Self {
-        Self::one_shot(self.path.clone(), self.using.node.clone())
+        Self {
+            waiting: self.waiting,
+            ..Self::one_shot(self.path.clone(), self.using.node.clone())
+        }
     }
 }
 
@@ -4057,8 +4082,18 @@ impl NodeSocket {
 /// As [`crate::node::daemonipc::DaemonClient::open`]; [`IpcHandshake::Refused`], in the daemon's
 /// words, when it refuses the `Use`; [`IpcHandshake::NotHello`] for any other answer.
 pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> {
+    open_as_noting(at).await.map(|(s, me, _)| (s, me))
+}
+
+/// [`open_as`], with what attaching the node said when this `Use` attached it.
+///
+/// # Errors
+/// As [`open_as`].
+pub async fn open_as_noting(
+    at: &NodeSocket,
+) -> Result<(UnixStream, Option<Digest32>, Vec<String>)> {
     use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
-    let DaemonClient { mut stream, .. } = DaemonClient::open(&at.path).await?;
+    let DaemonClient { mut stream, .. } = DaemonClient::open_noting(&at.path, at.waiting).await?;
     // Wiped once sent: it may carry the identity passphrase (C-6).
     let opening = zeroize::Zeroizing::new(Opening::Use(at.using.clone()).to_bytes());
     if let Err(e) = write_frame(&mut stream, &opening).await {
@@ -4069,7 +4104,7 @@ pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> 
         return Err(hung_up(&at.path).await);
     };
     match DaemonFrame::from_bytes(&answer)? {
-        DaemonFrame::Using { me, .. } => Ok((stream, me)),
+        DaemonFrame::Using { me, notes, .. } => Ok((stream, me, notes)),
         DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
             reason: r.to_string(),
         })),
@@ -4174,11 +4209,12 @@ impl IpcClient {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         match DaemonFrame::from_bytes(&answer)? {
-            DaemonFrame::Using { me, node } => Ok(Ok(Self {
+            DaemonFrame::Using { me, node, notes } => Ok(Ok(Self {
                 stream,
                 me,
                 path: path.to_owned(),
                 node: Some(node),
+                notes,
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
@@ -4229,6 +4265,7 @@ impl IpcClient {
             me,
             path: path.to_owned(),
             node: None,
+            notes: Vec::new(),
         })
     }
 
@@ -4237,13 +4274,21 @@ impl IpcClient {
     /// # Errors
     /// As [`open_as`].
     pub async fn open_at(at: &NodeSocket) -> Result<Self> {
-        let (stream, me) = open_as(at).await?;
+        let (stream, me, notes) = open_as_noting(at).await?;
         Ok(Self {
             stream,
             me,
             path: at.path.clone(),
             node: Some(at.using.node.clone()),
+            notes,
         })
+    }
+
+    /// What attaching the node said, when this connection's `Use` attached it: for a verb that
+    /// holds a session to print in the person's own terminal (PRD-001 R23, R36).
+    #[must_use]
+    pub fn attach_notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// Send one request and read its answer.

@@ -1175,7 +1175,7 @@ impl Daemon {
         })?
         .map_err(|e| AppError::Usage(e.to_string()))?;
         match asked {
-            DaemonFrame::Attached(_) => Ok(()),
+            DaemonFrame::Attached(..) => Ok(()),
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
                 Err(AppError::Usage(format!(
                     "node {node} is still detaching; this turn reads nothing"
