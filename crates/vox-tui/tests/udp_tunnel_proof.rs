@@ -339,7 +339,7 @@ fn socks_payload<'a>(reply: &'a [u8], name: &str, port: u16) -> &'a [u8] {
 /// The datagrams `dir`'s node fragmented on its connections to `peer`, as its `vox status --json`
 /// lists them: **every** entry for that peer summed, so a flow carried on a connection other than
 /// the one listed first is counted too.
-fn fragmented_by(dir: &std::path::Path, peer: &str) -> (u64, String) {
+fn fragmented_by(dir: &std::path::Path, peer: &str) -> (u64, u64, String) {
     let (ok, out, err) = vox_once(dir, &args(&["status", "--json"]));
     assert!(ok, "PRODUCT: `vox status --json` failed: {out}\n{err}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
@@ -351,25 +351,36 @@ fn fragmented_by(dir: &std::path::Path, peer: &str) -> (u64, String) {
         !toward.is_empty(),
         "PRODUCT: `vox status --json` lists no connection to {peer}: {out}"
     );
-    let sum = toward
-        .iter()
-        .map(|p| {
-            p["datagrams"]["fragmented"].as_u64().unwrap_or_else(|| {
-                panic!("PRODUCT: a connection to {peer} has no datagrams.fragmented: {p}")
+    let count = |field: &str| -> u64 {
+        toward
+            .iter()
+            .map(|p| {
+                p["datagrams"][field].as_u64().unwrap_or_else(|| {
+                    panic!("PRODUCT: a connection to {peer} has no datagrams.{field}: {p}")
+                })
             })
-        })
-        .sum();
-    (sum, serde_json::to_string(&toward).unwrap_or_default())
+            .sum()
+    };
+    (
+        count("fragmented"),
+        count("sent") + count("delivered"),
+        serde_json::to_string(&toward).unwrap_or_default(),
+    )
 }
 
 /// The datagrams fragmented **on either end** of the host–guest flow: the host's replies toward
 /// the guest and the guest's queries toward the host. A 9000-byte payload crosses both ways, so
 /// fragmenting anywhere shows here, whichever end's connection the flow rode.
-fn fragmented_both_ways(w: &World) -> (u64, String) {
-    let (host, host_said) = fragmented_by(&w.host_dir, &w.guest_fp);
-    let (guest, guest_said) = fragmented_by(&w.guest_dir, &w.host_fp);
+///
+/// Also how many datagrams either end's status says moved between them at all (sent and
+/// delivered): payloads that crossed while that stays zero is a status that does not report the
+/// connection that carried them (R35), not a run that could not measure.
+fn fragmented_both_ways(w: &World) -> (u64, u64, String) {
+    let (host, host_moved, host_said) = fragmented_by(&w.host_dir, &w.guest_fp);
+    let (guest, guest_moved, guest_said) = fragmented_by(&w.guest_dir, &w.host_fp);
     (
         host + guest,
+        host_moved + guest_moved,
         format!("host toward guest: {host_said}\nguest toward host: {guest_said}"),
     )
 }
@@ -510,6 +521,7 @@ fn serves_udp(path: PathKind) {
     let mut intact = 0;
     let mut fragmented = (0, 0);
     let mut counters = String::new();
+    let mut moved = 0u64;
     for size in [1400usize, 4000, OVERSIZE] {
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let before = (size == OVERSIZE).then(|| fragmented_both_ways(&w).0);
@@ -518,12 +530,13 @@ fn serves_udp(path: PathKind) {
             // Read until it moves, for a few seconds: a status is a snapshot, and one taken the
             // moment the echo is back may predate the counters the send moved.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            let (mut after, mut said) = fragmented_both_ways(&w);
+            let (mut after, mut carried, mut said) = fragmented_both_ways(&w);
             while after <= before && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(250));
-                (after, said) = fragmented_both_ways(&w);
+                (after, carried, said) = fragmented_both_ways(&w);
             }
             fragmented = (before, after);
+            moved = carried;
             counters = said;
         }
         let ok = got
@@ -547,6 +560,15 @@ fn serves_udp(path: PathKind) {
     assert_eq!(
         intact, 3,
         "PRODUCT: all three oversize payloads (1400, 4000 and {OVERSIZE} bytes) must cross intact"
+    );
+    // **Status must report the connection that carried them** (R35): three payloads crossed
+    // both ways, so a status that lists no datagram at all between the two is not telling the
+    // truth — never a run that could not measure.
+    assert!(
+        moved > 0,
+        "PRODUCT: three payloads crossed between host and guest, yet neither end's `vox status` \
+         lists a datagram sent or delivered on any connection between them: it does not report \
+         the connection that carried them. The connections, as each end lists them:\n{counters}"
     );
     assert!(
         fragmented.1 > fragmented.0,

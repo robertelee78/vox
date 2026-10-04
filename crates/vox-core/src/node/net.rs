@@ -562,6 +562,31 @@ impl ConnectionManager {
         lock(&self.conns).get(peer).is_some_and(|c| is_live(c))
     }
 
+    /// **Test-only** (`test-knobs`, V210-105): every primary connection held, by peer.
+    #[cfg(feature = "test-knobs")]
+    #[must_use]
+    pub fn primaries(&self) -> Vec<(Digest32, Arc<VoxConnection>)> {
+        lock(&self.conns)
+            .iter()
+            .map(|(p, c)| (*p, Arc::clone(c)))
+            .collect()
+    }
+
+    /// **Test-only** (`test-knobs`, V210-105): file `conn` as its peer's primary **whatever the
+    /// tie-break would say**, retiring the one held, as a better path does: what the held one
+    /// carries stays on it until done. What a proof needs to stage a flow left on a retired
+    /// connection every time, where the tie-break does it half the time.
+    #[cfg(feature = "test-knobs")]
+    pub fn file_superseding(&self, conn: VoxConnection) -> Arc<VoxConnection> {
+        let conn = Arc::new(conn);
+        let peer = conn.peer_id();
+        if let Some(held) = lock(&self.conns).insert(peer, Arc::clone(&conn)) {
+            let retire_at = (self.clock)().saturating_add(self.retire_grace_secs);
+            lock(&self.retiring).push((held, retire_at));
+        }
+        conn
+    }
+
     /// The live connections to `peer` a better path displaced, which still carry what was already on
     /// them (a tunnel, a datagram flow), **looking only**, like [`Self::holds`].
     #[must_use]
