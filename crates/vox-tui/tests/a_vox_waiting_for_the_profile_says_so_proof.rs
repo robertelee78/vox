@@ -1,55 +1,53 @@
-//! V210-100 (#296) — **a vox that waits for another one's profile lock says so where its user
-//! sees it, and the one it waited for goes first**, through the shipped binary.
+//! V210-100 (#296), on the daemon (ADR-026, #409) — **a vox that waits says what it waits for,
+//! where its user sees it, and nothing waits silently or for ever**, through the shipped binary.
 //!
-//! Creating an identity (V210-91) and migrating a v0.2.9 profile (V210-100) each hold the profile
-//! directory's lock, and a second vox on the same profile waits for it. That is a second or two
-//! when the holder is working; a holder that is stopped (Ctrl-Z) holds the lock until it is
-//! resumed. Three things are claimed of the vox that waits:
-//! - **It says so, once, after a second**: a CLI verb on stderr, with advice that is true wherever
-//!   the other vox runs; `vox tui` in its own status line, never on stderr — stderr is the
-//!   terminal it draws on, and a line written there landed across its prompt box and stayed.
-//! - **It lets the holder go first.** It used to keep the store open read-only while it waited,
-//!   and a read-only handle stops anyone opening the store writable: the holder, resumed, was
-//!   refused at its own unlock and the waiter went first. Now the holder's command succeeds, and
-//!   then the waiter's.
-//! - It waits; it does not fail while the holder is stopped.
-//! - **If the holder is still not done when it stops waiting, it says so truthfully**: that
-//!   another vox is still using the profile, and how to find it (`lsof` on the profile directory,
-//!   which names the holder), never to stop a node — the holder may only be slow or stopped.
+//! Under ADR-026 two things can make a vox wait, and both are staged here with a holder that is
+//! stopped (Ctrl-Z, SIGSTOP) while it holds what the other needs:
+//! - **a node's directory**, held while its identity is made (C-5: in the client, `vox id` or the
+//!   TUI's first-run prompt). Another vox making the same node's identity waits for it;
+//! - **the daemon itself**, while it moves an older profile into `nodes/` and attaches it (F-3,
+//!   L-2): it takes a client's connection and greets only once it can. A client waits for its
+//!   greeting.
 //!
-//! Staging, per arm: vox A takes the lock and holds it (`VOX_TEST_LOCK_HOLD_MS`, proof-only,
+//! Claimed of the vox that waits:
+//! - **It says so, once, after a second**: a CLI verb on stderr; `vox tui` in its own status line
+//!   when it waits inside the screen, and on the terminal, as a CLI verb does, when it waits before
+//!   it takes the screen — never on stderr across its screen.
+//! - It waits; it does not fail while the holder is stopped (within its bound).
+//! - **The holder goes first**, and then the waiter answers: a creation the holder made is named
+//!   (`another vox created this node's identity at the same time`), a request is served.
+//! - **Past its bound it stops, saying so truthfully**: that another vox is still using the node's
+//!   directory and how to find it (`lsof`, which names the holder), never to stop a node — the
+//!   holder may only be slow or stopped.
+//!
+//! Staging, per arm: vox A takes what B needs and holds it (`VOX_TEST_LOCK_HOLD_MS`, proof-only,
 //! inert when unset, says when it has the lock), and is stopped with SIGSTOP by its PID; vox B
 //! starts; A is resumed with SIGCONT. Five arms:
-//! 1. **CLI, create**: two `vox id`s on a fresh profile. B is refused, naming the concurrent
-//!    creation; A made the identity.
-//! 2. **CLI, migration**: two `vox trust add`s on a profile the **released v0.2.9 binary** wrote.
-//!    **A exits 0, then B exits 0** (B after A), and `vox trust list` names both.
-//! 3. **TUI, create** (`tests/pty/tui_lock_wait.py`): `vox id` holds the lock, `vox tui` is given a
-//!    passphrase at its first-run prompt; read through `pyte`.
-//! 4. **TUI, migration**: `vox trust add` holds the lock migrating a v0.2.9 profile. `vox tui`
-//!    waits when it opens the profile, before it takes the screen, and says so on the terminal as
-//!    a CLI verb does; once A is done the TUI starts, its screen clean, and is given the passphrase
-//!    at its unlock prompt. A exits 0; the TUI then unlocks.
-//! 5. **CLI, past the patience**: two `vox trust add`s on a profile this build made; A stays
-//!    stopped until B gives up. B is refused saying another vox is still using the profile, not
-//!    "Stop that node", and `lsof` on the directory it names lists A's PID. A, resumed, exits 0.
-//!
-//! Asserted, per CLI arm: B says it is waiting within [`SAYS_WITHIN`], exactly once, and is still
-//! running [`STOPPED_FOR`] later. Per TUI arm: it says it is waiting within 15 s (arm 3 in its
-//! status line, arm 4 on the terminal before it starts); on the TUI's screen no CLI text is
-//! anywhere (quoted if it is) and every box border row ends with its partner; after SIGCONT the
-//! TUI answers as above.
+//! 1. **CLI, create**: two `vox id`s on a fresh data root. B says it waits for the node's
+//!    directory; once A has made the identity, B is refused, naming the concurrent creation.
+//! 2. **CLI, migration**: `vox daemon` (A) moves a profile the **released v0.2.9 binary** wrote
+//!    into `nodes/` and attaches it, and is stopped holding it; `vox trust add` (B) says it waits
+//!    for the daemon, and once A is resumed is served: B exits 0, `vox trust list` names the
+//!    trusted identity, and A, stopped afterwards, exits 0.
+//! 3. **TUI, create** (`tests/pty/tui_lock_wait.py`): `vox id` holds the node's directory, `vox
+//!    tui` is given a passphrase at its first-run prompt and says it waits in its status line; then
+//!    names the concurrent creation.
+//! 4. **TUI, migration**: as arm 2, with `vox tui` as B. It waits for the daemon before it takes
+//!    the screen and says so on the terminal; once A is resumed the TUI starts, its screen clean,
+//!    and shows its node attached (given the passphrase at its attach prompt if asked).
+//! 5. **CLI, past the patience**: two `vox id`s; A stays stopped until B gives up. B is refused
+//!    saying another vox is still using the node's directory, not "Stop that node", and `lsof` on
+//!    the directory it names lists A's PID. A, resumed, exits 0.
 //!
 //! Every red names its side: a PRODUCT verdict quotes what the product said or drew; a vox step
-//! of the staging that failed (A never said it took the lock, `vox id` for arm 5, the TUI driver
+//! of the staging that failed (A never said it holds the lock, `vox id` for arm 5, the TUI driver
 //! saying the TUI failed or hung) is PRODUCT (staging); only the proof's own machinery (a signal
 //! that could not be sent, `lsof` that would not run, the released v0.2.9 binary it stages with,
 //! a driver that stopped for any other reason) is APPARATUS, CANNOT MEASURE.
 //!
-//! Mutations that must turn it red: the notice removed (B waits in silence, arms 1–4); the notice
-//! written to stderr by the lock or the node (arms 3–4: CLI text on the TUI's screen); the waiter
-//! keeping the store open while it waits (arms 2 and 4: A is refused); the refusal telling a
-//! user to stop a holder that serves nothing (arm 5).
+//! Mutations that must turn it red: the notice removed (B waits in silence, arms 1–4: the client's
+//! `create_noting` given no notice, or `open_noting` given none); the notice written to stderr while
+//! the TUI draws (arm 3: CLI text on the TUI's screen).
 
 #![cfg(unix)]
 
@@ -86,9 +84,11 @@ const FINISHES_WITHIN: Duration = Duration::from_secs(240);
 const HOLD_MS: &str = "4000";
 const HOLDING: &str = "holding the profile lock";
 const WAITING: &str = "waiting: another vox holds this profile open";
-const CONCURRENT: &str = "another vox created this profile's identity at the same time";
+/// What a client says while the daemon has not greeted it.
+const DAEMON_WAITING: &str = "waiting: the vox daemon here has not answered yet";
+const CONCURRENT: &str = "another vox created this node's identity at the same time";
 /// What B says when A has not finished in all the time B waits (arm 5).
-const STILL_USING: &str = "another vox is still using this profile";
+const STILL_USING: &str = "another vox is still using this node's directory";
 /// What B points to, to find A: `lsof` on the profile directory.
 const FIND_IT: &str = "To see which process it is: lsof ";
 /// The remedy for a holder that serves the profile (a daemon or a TUI): wrong for one that is
@@ -184,12 +184,19 @@ fn exits(a: &mut VoxProc, b: &mut VoxProc) -> [Option<(ExitStatus, Instant)>; 2]
 enum Then {
     /// A made the identity; B is refused, naming the concurrent creation.
     ARefusesB,
-    /// A exits 0, then B exits 0.
-    AThenB,
+    /// A is a daemon: B exits 0 once A is resumed, and A, stopped then, exits 0.
+    DaemonServesB,
 }
 
 /// A CLI arm: A holds the lock and is stopped, B waits; then A is resumed.
-fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Then) -> Vec<String> {
+fn cli_arm(
+    label: &str,
+    data: &Path,
+    a_args: &[&str],
+    b_args: &[&str],
+    waiting: &str,
+    then: &Then,
+) -> Vec<String> {
     let (mut a, a_pid) = hold_and_stop(label, data, a_args);
     let t0 = Instant::now();
     let mut b = VoxProc::spawn(&format!("{label} B"), data, &args(b_args));
@@ -198,7 +205,7 @@ fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Th
     while t0.elapsed() < SAYS_WITHIN && said_at.is_none() {
         if let Ok(line) = b.lines.recv_timeout(Duration::from_millis(100)) {
             eprintln!("[{label} B] {line}");
-            if line.contains(WAITING) {
+            if line.contains(waiting) {
                 said_at = Some(t0.elapsed());
             }
             b.seen.push(line);
@@ -213,10 +220,15 @@ fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Th
     let waited = t0.elapsed();
     signal(a_pid, "-CONT");
     let resumed = Instant::now();
+    if matches!(then, Then::DaemonServesB) {
+        // A daemon runs until stopped: once B has its answer, A is asked to stop as a person would.
+        let _ = exit_of(&mut b, resumed + FINISHES_WITHIN);
+        signal(a_pid, "-TERM");
+    }
     let [ea, eb] = exits(&mut a, &mut b);
     let b_said = b.transcript();
     let a_said = a.transcript();
-    let notices = b_said.matches(WAITING).count();
+    let notices = b_said.matches(waiting).count();
     let at = |e: &Option<(ExitStatus, Instant)>| {
         e.map(|(s, t)| format!("{s} at +{:.2}s", t.duration_since(resumed).as_secs_f64()))
     };
@@ -265,16 +277,15 @@ fn cli_arm(label: &str, data: &Path, a_args: &[&str], b_args: &[&str], then: &Th
                 ));
             }
         }
-        Then::AThenB => {
+        Then::DaemonServesB => {
             if !sb.success() {
                 red.push(format!(
-                    "PRODUCT: {label}: B failed after A finished ({sb}): {b_said}"
+                    "PRODUCT: {label}: B was not served once the daemon was resumed ({sb}): {b_said}"
                 ));
-            } else if tb < ta {
+            } else if ta < tb {
                 red.push(format!(
-                    "PRODUCT: {label}: B finished before A, which held the lock first ({:.2}s \
-                     earlier)",
-                    ta.duration_since(tb).as_secs_f64()
+                    "PRODUCT: {label}: the daemon ended before it served B ({:.2}s earlier)",
+                    tb.duration_since(ta).as_secs_f64()
                 ));
             }
         }
@@ -380,10 +391,14 @@ fn tui_arm(label: &str, data: &Path, mode: &str, a_args: &[&str], answer: &[&str
             &pid.to_string(),
         ],
     );
-    // The driver resumes A; make sure, then let it finish.
+    // The driver resumes A; make sure, then let it finish. A daemon runs until stopped: it is
+    // asked to, as a person would.
     let _ = Command::new("kill")
         .args(["-CONT", &pid.to_string()])
         .status();
+    if a_args.first() == Some(&"daemon") {
+        signal(pid, "-TERM");
+    }
     let ea = exit_of(&mut a, Instant::now() + FINISHES_WITHIN);
     let said = out.stdout.clone();
     println!(
@@ -490,7 +505,7 @@ fn a_vox_waiting_for_the_profile_says_so() {
         run_old(&d, &["id"]);
         d
     };
-    let (x_fp, y_fp) = (run_old(&dir("x"), &["id"]), run_old(&dir("y"), &["id"]));
+    let y_fp = run_old(&dir("y"), &["id"]);
     let mut red = Vec::new();
 
     // ---- 1. CLI, create ---------------------------------------------------------------------
@@ -499,17 +514,19 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &dir("fresh-cli"),
         &["id"],
         &["id"],
+        WAITING,
         &Then::ARefusesB,
     ));
 
-    // ---- 2. CLI, migration: A's `trust add` succeeds, then B's -------------------------------
+    // ---- 2. CLI, migration: the daemon moves and attaches the node; B's `trust add` waits ----
     let carol = v029("carol");
     red.extend(cli_arm(
         "cli-migration",
         &carol,
-        &["trust", "add", &x_fp, "--name", "x"],
+        &["daemon", "--listen", "127.0.0.1:0"],
         &["trust", "add", &y_fp, "--name", "y"],
-        &Then::AThenB,
+        DAEMON_WAITING,
+        &Then::DaemonServesB,
     ));
     let (ok, listed, err) = vox_once(&carol, &args(&["trust", "list"]));
     println!(
@@ -521,14 +538,14 @@ fn a_vox_waiting_for_the_profile_says_so() {
         "PRODUCT: cli-migration: `vox trust list` afterwards failed: {listed}{err}"
     );
     if red.iter().all(|r| !r.contains("cli-migration")) {
-        for name in ["x", "y"] {
+        for name in ["y"] {
             if !listed
                 .lines()
                 .any(|l| l.trim_end().ends_with(&format!("  {name}")))
             {
                 red.push(format!(
-                    "PRODUCT: cli-migration: both `trust add`s exited 0, and `trust list` does \
-                     not name {name}: {listed}"
+                    "PRODUCT: cli-migration: `trust add` exited 0, and `trust list` does not \
+                     name {name}: {listed}"
                 ));
             }
         }
@@ -548,22 +565,16 @@ fn a_vox_waiting_for_the_profile_says_so() {
         "tui-migration",
         &v029("dave"),
         "startup",
-        &["trust", "add", &x_fp, "--name", "x"],
-        &["unlocked", "done"],
+        &["daemon", "--listen", "127.0.0.1:0"],
+        &["attached: default"],
     ));
 
     // ---- 5. CLI, past the patience: A never lets go while B waits ---------------------------
-    let erin = dir("erin");
-    let (ok, made, err) = vox_once(&erin, &args(&["id"]));
-    assert!(
-        ok,
-        "PRODUCT (staging): `vox id` could not make the profile for arm 5: {made}{err}"
-    );
     red.extend(past_patience_arm(
         "cli-past-patience",
-        &erin,
-        &["trust", "add", &x_fp, "--name", "x"],
-        &["trust", "add", &y_fp, "--name", "y"],
+        &dir("erin"),
+        &["id"],
+        &["id"],
     ));
 
     assert!(red.is_empty(), "PRODUCT: {red:#?}");
