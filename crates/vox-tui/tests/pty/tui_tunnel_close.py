@@ -66,7 +66,7 @@ try:
     tui.pump(3)
     tui.key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds.
-    if not tui.until(lambda: is_attached(status()), 60):
+    if not tui.until(lambda: is_attached(tui.text()), 60):
         print(f"{TAG} APPARATUS: the TUI never unlocked:\n{tui.text()}")
         sys.exit(2)
     stage("open the room")

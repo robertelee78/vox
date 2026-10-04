@@ -104,7 +104,7 @@ try:
         resume()
         # Its node attached by the daemon already, or attaching: the TUI uses it, or asks for its
         # passphrase once (ADR-026 N-2).
-        if not tui.until(lambda: "attach node" in tui.text().lower() or is_attached(status()), 120):
+        if not tui.until(lambda: "attach node" in tui.text().lower() or is_attached(tui.text()), 120):
             print(f"{TAG} RED: PRODUCT: the TUI never showed its node, nor asked to attach it:\n"
                   f"{tui.text()}")
             sys.exit(1)
@@ -113,7 +113,7 @@ try:
         if "attach node" in tui.text().lower():
             stage("attach")
             tui.key(IDPASS + "\r", 0.5)
-        if tui.until(lambda: is_attached(status()), 180):
+        if tui.until(lambda: is_attached(tui.text()), 180):
             code = 0
             print(f"{TAG} AFTER: {status()}")
         else:

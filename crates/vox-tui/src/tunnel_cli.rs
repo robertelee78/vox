@@ -355,6 +355,26 @@ fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
 /// reaching one (a relayed path took 18 s).
 const SHARE_PATIENCE: Duration = vox_core::node::up::HOST_PATIENCE;
 
+/// The test-only variable that shortens [`SHARE_PATIENCE`], in milliseconds (see
+/// [`share_patience`]).
+#[cfg(feature = "test-knobs")]
+const TEST_SHARE_PATIENCE_ENV: &str = "VOX_TEST_SHARE_PATIENCE_MS";
+
+/// [`SHARE_PATIENCE`], or **shorter**, read from `VOX_TEST_SHARE_PATIENCE_MS` in a build with the
+/// `test-knobs` feature. **Test-only: for proofs; no shipped build reads it** (V210-105): a proof
+/// that a room never synced is refused, not guessed, need not wait the whole patience out. It
+/// only ever shortens it; unset, empty or unparsable is the real patience.
+fn share_patience() -> Duration {
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_SHARE_PATIENCE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms).min(SHARE_PATIENCE);
+    }
+    SHARE_PATIENCE
+}
+
 /// What a one-shot verb is waiting for, and since when: what it says when it is stopped before it
 /// finishes (V210-85).
 ///
@@ -1346,14 +1366,14 @@ pub async fn forward_named(
     // A room this node joined and has not yet synced may not hold the statement yet; it arrives
     // with the first sync, so only that case waits. A synced room whose log carries no such
     // share is refused at once, with the reason (PRD-001 R23).
-    let share_deadline = Instant::now() + SHARE_PATIENCE;
+    let share_deadline = Instant::now() + share_patience();
     // **A wait is said** (V210-100): up to SHARE_PATIENCE with nothing on the screen looked hung.
     if room.share == ShareState::NotYetKnown {
         waiting.on("the room's first sync, for what is shared there");
         eprintln!(
             "vox: {name}: waiting for this room's first sync with a member, to know what is shared \
              there (up to {}s)",
-            SHARE_PATIENCE.as_secs()
+            share_patience().as_secs()
         );
     }
     while room.share == ShareState::NotYetKnown && Instant::now() < share_deadline {

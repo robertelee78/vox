@@ -80,7 +80,7 @@ try:
 
     tui.pump(3)
     tui.key(IDPASS + "\r", 1)
-    if not tui.until(lambda: is_attached(status()), 90):
+    if not tui.until(lambda: is_attached(tui.text()), 90):
         print(f"{TAG} RED: PRODUCT (staging): the TUI never unlocked within 90 s:\n{tui.text()}")
         sys.exit(1)
     stage("the post room answers through the TUI's socket")

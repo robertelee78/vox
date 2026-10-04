@@ -336,26 +336,42 @@ fn socks_payload<'a>(reply: &'a [u8], name: &str, port: u16) -> &'a [u8] {
     &reply[7 + len..]
 }
 
-/// `datagrams.fragmented` on the host's connection to `peer`, from the host's own
-/// `vox status --json` — the counter a person can read. Per connection, so on the relayed
-/// path it counts the flow's fragmenting and not the circuit's (that is the host's connection
-/// to the anchor, another peer).
-fn fragmented_toward(w: &World, peer: &str) -> u64 {
-    let (ok, out, err) = vox_once(&w.host_dir, &args(&["status", "--json"]));
-    assert!(
-        ok,
-        "PRODUCT: `vox status --json` on the running host failed: {out}\n{err}"
-    );
+/// The datagrams `dir`'s node fragmented on its connections to `peer`, as its `vox status --json`
+/// lists them: **every** entry for that peer summed, so a flow carried on a connection other than
+/// the one listed first is counted too.
+fn fragmented_by(dir: &std::path::Path, peer: &str) -> (u64, String) {
+    let (ok, out, err) = vox_once(dir, &args(&["status", "--json"]));
+    assert!(ok, "PRODUCT: `vox status --json` failed: {out}\n{err}");
     let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
         panic!("PRODUCT: `vox status --json` printed something that is not JSON ({e}): {out}")
     });
     let peers = v["peers"].as_array().cloned().unwrap_or_default();
-    let Some(p) = peers.iter().find(|p| p["id"] == peer) else {
-        panic!("PRODUCT: the host's `vox status --json` lists no connection to the guest {peer}: {out}")
-    };
-    p["datagrams"]["fragmented"].as_u64().unwrap_or_else(|| {
-        panic!("PRODUCT: the host's connection to the guest has no datagrams.fragmented: {p}")
-    })
+    let toward: Vec<&serde_json::Value> = peers.iter().filter(|p| p["id"] == peer).collect();
+    assert!(
+        !toward.is_empty(),
+        "PRODUCT: `vox status --json` lists no connection to {peer}: {out}"
+    );
+    let sum = toward
+        .iter()
+        .map(|p| {
+            p["datagrams"]["fragmented"].as_u64().unwrap_or_else(|| {
+                panic!("PRODUCT: a connection to {peer} has no datagrams.fragmented: {p}")
+            })
+        })
+        .sum();
+    (sum, serde_json::to_string(&toward).unwrap_or_default())
+}
+
+/// The datagrams fragmented **on either end** of the host–guest flow: the host's replies toward
+/// the guest and the guest's queries toward the host. A 9000-byte payload crosses both ways, so
+/// fragmenting anywhere shows here, whichever end's connection the flow rode.
+fn fragmented_both_ways(w: &World) -> (u64, String) {
+    let (host, host_said) = fragmented_by(&w.host_dir, &w.guest_fp);
+    let (guest, guest_said) = fragmented_by(&w.guest_dir, &w.host_fp);
+    (
+        host + guest,
+        format!("host toward guest: {host_said}\nguest toward host: {guest_said}"),
+    )
 }
 
 /// Proofs 1, 4 and 6, and M22.4, in one world.
@@ -493,12 +509,22 @@ fn serves_udp(path: PathKind) {
     // `CANNOT MEASURE`, not a pass.
     let mut intact = 0;
     let mut fragmented = (0, 0);
+    let mut counters = String::new();
     for size in [1400usize, 4000, OVERSIZE] {
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
-        let before = (size == OVERSIZE).then(|| fragmented_toward(&w, &w.guest_fp));
+        let before = (size == OVERSIZE).then(|| fragmented_both_ways(&w).0);
         let got = ask(&payload);
         if let Some(before) = before {
-            fragmented = (before, fragmented_toward(&w, &w.guest_fp));
+            // Read until it moves, for a few seconds: a status is a snapshot, and one taken the
+            // moment the echo is back may predate the counters the send moved.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut after, mut said) = fragmented_both_ways(&w);
+            while after <= before && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(250));
+                (after, said) = fragmented_both_ways(&w);
+            }
+            fragmented = (before, after);
+            counters = said;
         }
         let ok = got
             .as_ref()
@@ -514,7 +540,7 @@ fn serves_udp(path: PathKind) {
         intact += usize::from(ok);
     }
     eprintln!(
-        "[test] proof 4 ({path:?}): the host's connection to the guest fragmented {} \
+        "[test] proof 4 ({path:?}): the host's and the guest's connections fragmented {} \
          datagram(s) before the {OVERSIZE}-byte payload and {} after",
         fragmented.0, fragmented.1
     );
@@ -524,9 +550,9 @@ fn serves_udp(path: PathKind) {
     );
     assert!(
         fragmented.1 > fragmented.0,
-        "CANNOT MEASURE: the {OVERSIZE}-byte payload crossed without the host's connection to the \
-         guest fragmenting anything ({} before, {} after), so this run never exercised \
-         fragmentation",
+        "CANNOT MEASURE: the {OVERSIZE}-byte payload crossed without either end's connections \
+         fragmenting anything ({} before, {} after), so this run never exercised \
+         fragmentation. The connections, as each end lists them:\n{counters}",
         fragmented.0,
         fragmented.1
     );

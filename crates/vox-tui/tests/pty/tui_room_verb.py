@@ -109,7 +109,7 @@ try:
         give(1, f"RED: vox tui exited before it asked to unlock:\n{tui.text()}")
     key(IDPASS + "\r", 1)
     # Production Argon2id: the unlock takes seconds. Unlocked, the rooms list names the room.
-    unlocked = tui.until(lambda: tui.closed or is_attached(status()), 90)
+    unlocked = tui.until(lambda: tui.closed or is_attached(tui.text()), 90)
     gone_check()
     if not unlocked:
         give(1, f"RED: the TUI never unlocked, with the right passphrase typed:\n{tui.text()}")
