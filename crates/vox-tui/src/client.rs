@@ -433,6 +433,12 @@ pub async fn hold(
         },
     };
     let client = open(&at).await?;
+    // What attaching the node said (a skipped anchors line, carrying on with no anchor), in the
+    // person's own terminal as well as the daemon's log (R23, R36): the daemon this verb started
+    // writes only to `<data root>/.daemon/log`.
+    for note in client.attach_notes() {
+        eprintln!("vox: {note}");
+    }
     let me = client.me();
     Ok(Held {
         client,
