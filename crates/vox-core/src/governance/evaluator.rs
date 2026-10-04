@@ -695,6 +695,11 @@ impl<'a> Resolver<'a> {
     /// author holds `policy` in the update's STRICT past, over the canonical order,
     /// taking the latest retention (`ttl`). A policy update carries nothing else
     /// (V030-32): history mode and the suite floor stay as the genesis set them.
+    ///
+    /// **Removal wins over an update made meanwhile** (ADR-007 G-23, G-25, #380), as over an end
+    /// ([`Resolver::resolve_lifecycle`]): a delegated admin, cut off while the creator takes its
+    /// admin back, sets the room's retention on its own node, which rightly took it; an
+    /// authorized revocation of that admin concurrent with the update voids it once the logs meet.
     fn resolve_policy(&mut self, genesis: &Genesis) -> Result<ChannelPolicy> {
         let mut policy = genesis.body.policy;
         let order: Vec<&GovEntry> = self.causality.order.clone();
@@ -710,6 +715,7 @@ impl<'a> Resolver<'a> {
                 .authority
                 .get(&e.author_id)
                 .is_some_and(|c| c.grants(&Capability::Policy))
+                || self.revoked_meanwhile(&e.author_id, &e.entry_hash)?
             {
                 continue;
             }

@@ -104,19 +104,23 @@ fn standing(w: &support::Worker, room: &str, short: &str, n: usize) -> (support:
     (post, line)
 }
 
-#[test]
-#[ignore = "real vox daemons and an anchor, a staged partition (SIGSTOP), over a minute"]
-fn an_end_by_an_admin_revoked_meanwhile_does_not_stand() {
-    watchdog::arm();
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+/// The partition, staged (see the module docs): alice names carol an admin; carol is down while
+/// alice takes it back; alice, bob and the anchor are frozen while carol, back and cut off, posts
+/// and then does `act` — which her node, still listing her as an admin, must take; then everyone is
+/// resumed, and this returns once the logs have met: alice and bob hold carol's post (and so what
+/// she did after it), and carol's node holds the revocation. The room, and the time the logs met.
+fn partitioned(
+    tmp: &std::path::Path,
+    what: &str,
+    act: impl FnOnce(&support::Worker, &str) -> support::Out,
+) -> (support::Room, Instant) {
     let rt = tokio::runtime::Runtime::new().expect("APPARATUS: no runtime");
     let mut room = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(support::room(tmp.path(), &["alice", "bob", "carol"]))
+        rt.block_on(support::room(tmp, &["alice", "bob", "carol"]))
     }))
     .unwrap_or_else(|_| panic!("PRODUCT (staging): the room could not be set up"));
     let id = room.id.clone();
     let id = id.as_str();
-    let short: String = id.chars().take(12).collect();
     let carol_fp = room.workers[2].b32();
 
     // alice names carol an admin; carol's node holds it.
@@ -147,22 +151,14 @@ fn an_end_by_an_admin_revoked_meanwhile_does_not_stand() {
         .daemon_pid()
         .expect("APPARATUS: no pid for bob's daemon");
     let anchor_d = room.anchor_pid();
-    for (pid, what) in [
+    let frozen = [
         (alice_d, "alice's daemon"),
         (bob_d, "bob's daemon"),
         (anchor_d, "the anchor"),
-    ] {
-        signal(pid, "-STOP", what);
+    ];
+    for (pid, who) in frozen {
+        signal(pid, "-STOP", who);
     }
-    let resume = || {
-        for (pid, what) in [
-            (alice_d, "alice's daemon"),
-            (bob_d, "bob's daemon"),
-            (anchor_d, "the anchor"),
-        ] {
-            signal(pid, "-CONT", what);
-        }
-    };
     let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         room.restart(2);
         let carol = &room.workers[2];
@@ -171,59 +167,67 @@ fn an_end_by_an_admin_revoked_meanwhile_does_not_stand() {
             "PRODUCT (staging): carol's node held the revocation though cut off: the partition did \
              not hold"
         );
-        // A post first: carol's end names everything her node holds as its causal past, this
-        // post included, so a node holding the end holds the post. The post is what `vox room
+        // A post first: what carol does next names everything her node holds as its causal past,
+        // this post included, so a node holding that holds the post. The post is what `vox room
         // read` shows (a governance entry is not in it); seeing it on alice's and bob's nodes is
-        // the sign that carol's log, end and all, reached them.
+        // the sign that carol's log, and what she did, reached them.
         let before = order(carol, id);
-        let o = carol.vox(
-            None,
-            &["room", "post", id, "carol, cut off, before her end"],
-        );
-        assert!(
-            o.ok,
-            "PRODUCT (staging): carol's post before her end: {o:?}"
-        );
+        let o = carol.vox(None, &["room", "post", id, "carol, cut off"]);
+        assert!(o.ok, "PRODUCT (staging): carol's post while cut off: {o:?}");
         let posted = order(carol, id)
             .difference(&before)
             .cloned()
             .collect::<Vec<_>>();
-        let o = carol.vox(None, &["room", "end", id]);
+        let o = act(carol, id);
         assert!(
             o.ok,
-            "PRODUCT (staging): carol's node, still listing her as an admin, refused `vox room \
-             end`, so no end was written to test: {o:?}"
+            "PRODUCT (staging): carol's node, still listing her as an admin, refused to {what}, so \
+             nothing was written to test: {o:?}"
         );
         posted
     }));
-    resume();
-    let end_entries = staged.unwrap_or_else(|e| std::panic::resume_unwind(e));
-    println!("[proof] carol, cut off, posted {end_entries:?} and ended the room");
+    for (pid, who) in frozen {
+        signal(pid, "-CONT", who);
+    }
+    let posted = staged.unwrap_or_else(|e| std::panic::resume_unwind(e));
+    println!("[proof] carol, cut off, posted {posted:?} and did: {what}");
     assert!(
-        !end_entries.is_empty(),
+        !posted.is_empty(),
         "PRODUCT (staging): carol's post added no entry to her node's log"
     );
 
-    // The logs meet: alice and bob hold carol's end, carol holds the revocation.
+    // The logs meet: alice and bob hold what carol did, carol holds the revocation.
     let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
+    let holds = |w: &support::Worker| {
+        let held = order(w, id);
+        posted.iter().all(|e| held.contains(e))
+    };
     let met = until(WITHIN, || {
-        let has_end = |w: &support::Worker| {
-            let held = order(w, id);
-            end_entries.iter().all(|e| held.contains(e))
-        };
-        has_end(alice) && has_end(bob) && !lists_admin(carol, id, &carol_fp)
+        holds(alice) && holds(bob) && !lists_admin(carol, id, &carol_fp)
     });
     assert!(
         met,
-        "PRODUCT (staging): the logs never met within {WITHIN:?}: alice holds the end {}, bob {}, \
-         carol holds the revocation {}",
-        end_entries.iter().all(|e| order(alice, id).contains(e)),
-        end_entries.iter().all(|e| order(bob, id).contains(e)),
+        "PRODUCT (staging): the logs never met within {WITHIN:?}: alice holds carol's post {}, bob \
+         {}, carol holds the revocation {}",
+        holds(alice),
+        holds(bob),
         !lists_admin(carol, id, &carol_fp)
     );
-    let met_at = Instant::now();
-    println!("[proof] the logs met: alice and bob hold carol's end, carol holds the revocation");
+    println!("[proof] the logs met: alice and bob hold what carol did, carol holds the revocation");
+    (room, Instant::now())
+}
 
+#[test]
+#[ignore = "real vox daemons and an anchor, a staged partition (SIGSTOP), over a minute"]
+fn an_end_by_an_admin_revoked_meanwhile_does_not_stand() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let (room, met_at) = partitioned(tmp.path(), "end the room", |carol, id| {
+        carol.vox(None, &["room", "end", id])
+    });
+    let id = room.id.as_str();
+    let short: String = id.chars().take(12).collect();
+    let (alice, bob, carol) = (&room.workers[0], &room.workers[1], &room.workers[2]);
     let mut red = Vec::new();
     let mut check = |when: &str, n: usize, workers: &[&support::Worker]| {
         for w in workers {
@@ -249,5 +253,68 @@ fn an_end_by_an_admin_revoked_meanwhile_does_not_stand() {
     // so keeps it.
     std::thread::sleep(WIND_DOWN.saturating_sub(met_at.elapsed()));
     check("past carol's wind-down", 3, &[alice, bob, carol]);
+    assert!(red.is_empty(), "{red:#?}");
+}
+
+/// The retention a node applies to the room, from `vox status --json` (seconds; `0` forever).
+fn retention(w: &support::Worker, room: &str) -> Option<u64> {
+    let o = w.vox(None, &["status", "--json"]);
+    o.json()["rooms"]
+        .as_array()?
+        .iter()
+        .find(|r| r["id"].as_str() == Some(room))?["retention"]
+        .as_u64()
+}
+
+#[test]
+#[ignore = "real vox daemons and an anchor, a staged partition (SIGSTOP), over a minute"]
+fn a_retention_set_by_an_admin_revoked_meanwhile_does_not_stand() {
+    // The same partition: carol, cut off, sets the room's retention (a policy update, which a
+    // delegated admin may make, #319). Once the logs meet, every node keeps the room's retention as
+    // it was: removal wins over a policy update concurrent with the revocation (ADR-007 G-23, G-25).
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let set_to: u64 = 7 * 24 * 3600;
+    let (room, _) = partitioned(
+        tmp.path(),
+        "set the room's retention to a week",
+        |carol, id| {
+            carol.vox(
+                None,
+                &[
+                    "room",
+                    "retention",
+                    id,
+                    "1w",
+                    "--identity-passphrase-file",
+                    carol
+                        .pass
+                        .to_str()
+                        .expect("APPARATUS: a temp path is not UTF-8"),
+                ],
+            )
+        },
+    );
+    let id = room.id.as_str();
+    let mut red = Vec::new();
+    for when in ["once the logs met", "later"] {
+        if when == "later" {
+            std::thread::sleep(SETTLE);
+        }
+        for w in &room.workers {
+            let r = retention(w, id);
+            println!(
+                "[proof] {when}: {}'s node applies retention {r:?} s",
+                w.name
+            );
+            if r == Some(set_to) || r.is_none() {
+                red.push(format!(
+                    "PRODUCT: {when}: {}'s node applies carol's retention ({r:?} s), set by carol \
+                     while alice was taking her admin back (ADR-007 G-23, G-25)",
+                    w.name
+                ));
+            }
+        }
+    }
     assert!(red.is_empty(), "{red:#?}");
 }
