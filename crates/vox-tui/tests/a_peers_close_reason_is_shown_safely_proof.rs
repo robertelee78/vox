@@ -15,13 +15,17 @@
 //! - `vox node --anchor <hostile>`, which reports each loss of its anchor and why;
 //! - `vox connect` of an address naming the hostile peer as the room's host, a joiner.
 //!
-//! **Asserted (PRODUCT).** Neither process's output holds any of those characters, nor a line
-//! the reason started, nor more of the reason than the cap. **CANNOT MEASURE** if the peer never
-//! closed a connection, or if `vox node` never said why its anchor went: then nothing was
-//! printed to check.
+//! **Asserted (PRODUCT).** `vox node` says why its anchor went, quoting the reason (#191);
+//! neither process's output holds any of those characters, nor a line the reason started, nor
+//! more of the reason than the cap. **CANNOT MEASURE** if the peer never closed a connection.
 //!
-//! **Mutation that must turn it red (PRODUCT).** `transport::quic::peer_text` returning its input
-//! unchanged: the reason is printed raw, ESC and all.
+//! The close fills a whole packet, and quinn-proto writes it up to 7 bytes over the path MTU when
+//! its code is more than a byte (0x7e57 is 4): a receiver whose buffer stopped at the ceiling lost
+//! it, met the peer's stateless reset, and reported "reset by peer" with no reason.
+//!
+//! **Mutations that must turn it red (PRODUCT).** `transport::quic::peer_text` returning its input
+//! unchanged: the reason is printed raw, ESC and all. No receive headroom over the path-MTU
+//! ceiling (`RECEIVE_HEADROOM` 0): the close is lost and `vox node` says "reset by peer".
 
 #![cfg(unix)]
 
@@ -151,8 +155,8 @@ fn a_peers_close_reason_never_reaches_the_terminal_raw() {
     );
     assert!(
         said.iter().any(|l| l.contains("owned")),
-        "CANNOT MEASURE: vox node never said why its anchor went, so no close reason was printed \
-         to check"
+        "PRODUCT: vox node never said why its anchor went: the anchor's close reason did not reach \
+         it, or was not shown"
     );
     check("vox node", &said);
 
