@@ -783,10 +783,17 @@ fn a_refusal_tells_the_refused_side_nothing_new() {
             "127.0.0.1:0",
         ]),
     );
-    let (list_ok, listed, list_err) = vox_once(
+    // A listing is a one-shot verb (ADR-026 L-2): the stranger's node is attached for it first, as
+    // a person would, since the forward that held it has ended.
+    let (attached, _, attach_err) = vox_once(
         &guest_dir,
-        &args(&["service", "list", &w.room, "--listen", "127.0.0.1:0"]),
+        &args(&["node", "attach", "default", "--listen", "127.0.0.1:0"]),
     );
+    assert!(
+        attached,
+        "PRODUCT (staging): the stranger's `vox node attach default` failed: {attach_err}"
+    );
+    let (list_ok, listed, list_err) = vox_once(&guest_dir, &args(&["service", "list", &w.room]));
     eprintln!(
         "[test] unoffered {unoffered} by vox forward: ok={ok} {out}{err}\n[test] the stranger's \
          listing: {listed}{list_err}"

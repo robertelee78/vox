@@ -1347,6 +1347,15 @@ pub async fn forward_named(
     // with the first sync, so only that case waits. A synced room whose log carries no such
     // share is refused at once, with the reason (PRD-001 R23).
     let share_deadline = Instant::now() + SHARE_PATIENCE;
+    // **A wait is said** (V210-100): up to SHARE_PATIENCE with nothing on the screen looked hung.
+    if room.share == ShareState::NotYetKnown {
+        waiting.on("the room's first sync, for what is shared there");
+        eprintln!(
+            "vox: {name}: waiting for this room's first sync with a member, to know what is shared \
+             there (up to {}s)",
+            SHARE_PATIENCE.as_secs()
+        );
+    }
     while room.share == ShareState::NotYetKnown && Instant::now() < share_deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
         room = resolve().await?;
