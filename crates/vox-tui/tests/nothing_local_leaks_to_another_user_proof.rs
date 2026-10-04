@@ -1462,9 +1462,9 @@ fn a_room_passphrase_is_never_taken_from_argv_or_the_environment() {
         "PRODUCT: a room passphrase in the environment was not refused (ok={ok}): {err}"
     );
 
-    // The control: the file form gets past the passphrase check to the next step, unlocking the
-    // identity, which this profile does not have. A refusal by the check is the product
-    // refusing the form it tells people to use.
+    // The control: the file form gets past the passphrase check to the next step — the node,
+    // attached, holds no room `aaaa` (since ADR-026 the node exists: C-3). A refusal by the check
+    // is the product refusing the form it tells people to use.
     let (_, _, err) = p.run(
         &[
             &base[..],
@@ -1483,8 +1483,8 @@ fn a_room_passphrase_is_never_taken_from_argv_or_the_environment() {
         "PRODUCT: --passphrase-file, the form the refusals name, was refused too: {err}"
     );
     assert!(
-        err.contains("no identity yet"),
-        "PRODUCT (staging): --passphrase-file did not reach the identity unlock after the check, so \
+        err.contains("holds no rooms"),
+        "PRODUCT (staging): --passphrase-file did not reach the room lookup after the check, so \
          this control does not show the file form passes it: {err}"
     );
     eprintln!(

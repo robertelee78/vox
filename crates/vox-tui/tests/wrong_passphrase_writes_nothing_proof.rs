@@ -1,5 +1,5 @@
 //! A **wrong identity passphrase writes nothing** to the profile — driven through the shipped
-//! binary, for every one-shot verb that opens a profile itself.
+//! binary, for every verb that opens a node with the identity passphrase.
 //!
 //! Found the hard way on 2026-09-25: a one-shot verb run against a profile with the wrong
 //! passphrase refused, correctly — and had already committed a write to that profile's
@@ -9,14 +9,13 @@
 //! writing, and a profile that changes when nobody could unlock it is one whose timestamps
 //! cannot be trusted as evidence.
 //!
-//! What it asserts, for `serve`, `forward`, `up`, `connect`, `service add` and `daemon`, each run with
+//! What it asserts, for `serve`, `forward`, `up`, `connect`, `node attach` and `daemon`, each run with
 //! the wrong identity passphrase against a real profile with an identity in it:
 //!
 //! 1. the verb refuses, for the passphrase;
 //! 2. `store.redb` is **byte-identical** afterwards, with an **unchanged mtime**;
-//! 3. and the single-writer rule still holds: with a `vox daemon` holding the profile, a
-//!    one-shot verb is still refused as busy — deferring the write must not have loosened the
-//!    lock.
+//! 3. (withdrawn: the single-writer rule is ADR-026's one daemon per data root, D-1, proved in
+//!    `the_daemon_and_its_nodes_proof`; a verb is a client and opens no node.)
 //!
 //! Mutation: committing the schema check on every open (the old order) turns (2) red.
 
@@ -28,10 +27,9 @@ mod watchdog;
 #[path = "support/layout.rs"]
 mod layout;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "the right identity passphrase";
@@ -167,20 +165,9 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
                 "127.0.0.1:0",
             ],
         ),
-        (
-            "service add",
-            vec![
-                "service",
-                "add",
-                "aaaa",
-                "ssh",
-                "127.0.0.1:22",
-                "--passphrase-file",
-                room_pass,
-                "--listen",
-                "127.0.0.1:0",
-            ],
-        ),
+        // Since ADR-026 a one-shot verb (`vox service add`) opens no node and asks for no
+        // passphrase (L-2); `vox node attach` is the verb that opens it with one.
+        ("node attach", vec!["node", "attach", "default"]),
     ];
 
     // Past the filesystem's mtime granularity, so a write in the next second shows.
@@ -242,80 +229,7 @@ fn a_wrong_identity_passphrase_writes_nothing_to_the_profile() {
     eprintln!("[daemon] refused; store.redb byte-identical, mtime unchanged");
     eprintln!("{refused} of {} verbs wrote nothing", verbs.len() + 1);
 
-    // (3) The lock still holds: a daemon has the profile, a one-shot verb is refused as busy.
-    let daemon_err = tmp.path().join("daemon.err");
-    let mut daemon = Command::new(VOX)
-        .args(["daemon", "--listen", "127.0.0.1:0"])
-        .env("VOX_DATA_DIR", &dir)
-        .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
-        .env_remove("VOX_ROOM")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::from(
-            std::fs::File::create(&daemon_err).expect("APPARATUS: create the daemon's stderr file"),
-        ))
-        .spawn()
-        .expect("APPARATUS: could not spawn `vox daemon`");
-    // Its passphrase is in its environment; stdin stays open and unread, as under a supervisor.
-    let _stdin = daemon.stdin.take();
-    // Read its stdout on a thread, so a daemon that stays up and silent is bounded by the
-    // deadline here, not by the watchdog.
-    let out = daemon
-        .stdout
-        .take()
-        .expect("APPARATUS: the daemon's stdout was not piped");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for l in BufReader::new(out).lines().map_while(Result::ok) {
-            if tx.send(l).is_err() {
-                break;
-            }
-        }
-    });
-    let up_within = Duration::from_secs(90);
-    let deadline = Instant::now() + up_within;
-    let mut said_out = Vec::new();
-    loop {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(l) if l.contains("control socket") => break,
-            Ok(l) => said_out.push(l),
-            Err(why) => {
-                let _ = daemon.kill();
-                let _ = daemon.wait();
-                panic!(
-                    "PRODUCT (staging): the holding `vox daemon` {} \
-                     before naming its control socket.\nstdout:\n{}\nstderr:\n{}",
-                    if matches!(why, mpsc::RecvTimeoutError::Timeout) {
-                        format!("was not up within {up_within:?}")
-                    } else {
-                        "exited".to_owned()
-                    },
-                    said_out.join("\n"),
-                    std::fs::read_to_string(&daemon_err).unwrap_or_default()
-                );
-            }
-        }
-    }
-    let (ok, said) = vox(
-        &dir,
-        IDPASS,
-        &["serve", "9=9", "--listen", "127.0.0.1:0"],
-        "",
-    );
-    daemon
-        .kill()
-        .expect("APPARATUS: could not signal the holding daemon");
-    daemon
-        .wait()
-        .expect("APPARATUS: could not reap the holding daemon");
-    assert!(
-        !ok,
-        "PRODUCT: a second process on a held profile was not refused; `vox serve` said: {said}"
-    );
-    assert!(
-        said.contains("already running for this profile"),
-        "PRODUCT: the refusal did not say the profile is held; `vox serve` said: {said}"
-    );
-    eprintln!("[lock] a one-shot verb against a held profile is still refused");
+    // (3) withdrawn: since ADR-026 a verb is a client and only the data root's one daemon opens
+    // a node, so there is no second opener to refuse; one daemon per data root (D-1) is
+    // `the_daemon_and_its_nodes_proof`'s.
 }
