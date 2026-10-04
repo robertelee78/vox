@@ -498,9 +498,16 @@ fn no_command_waits_for_input_it_cannot_get() {
         false,
         &["no terminal to ask at", "--passphrase-file"],
     );
-    // With no node running: each opens the profile itself, which needs the identity passphrase.
+    // With no node attached (ADR-026 L-2, S-3): `vox id` reads the public fingerprint from the
+    // node's files and needs no passphrase; the one-shot verbs refuse at once, saying how to attach
+    // the node, and never open it themselves.
+    check(
+        "vox id (no node)",
+        &mut vox_cmd(&bob, &["id"]),
+        true,
+        &[bob_fp.as_str()],
+    );
     for (what, args) in [
-        ("vox id", vec!["id"]),
         ("vox trust list (no node)", vec!["trust", "list"]),
         (
             "vox trust add (no node)",
@@ -511,12 +518,7 @@ fn no_command_waits_for_input_it_cannot_get() {
             vec!["service", "add", "aaaa", "ssh", "127.0.0.1:22"],
         ),
     ] {
-        check(
-            what,
-            &mut vox_cmd(&bob, &args),
-            false,
-            &["no terminal to ask at", "VOX_IDENTITY_PASSPHRASE"],
-        );
+        check(what, &mut vox_cmd(&bob, &args), false, &["vox node attach"]);
     }
     // `vox connect` asks for the room's passphrase first.
     check(
@@ -525,13 +527,14 @@ fn no_command_waits_for_input_it_cannot_get() {
         false,
         &["no terminal to ask at", "--passphrase-file"],
     );
-    // The room passphrase too, once the identity's is given.
+    // A passphrase given changes nothing for a one-shot verb: it never attaches its node, so it
+    // reads none and refuses at once, saying how to attach it (ADR-026 L-2).
     check(
-        "vox service add (identity given, no room passphrase)",
+        "vox service add (identity given, no node attached)",
         vox_cmd(&bob, &["service", "add", "aaaa", "ssh", "127.0.0.1:22"])
             .env("VOX_IDENTITY_PASSPHRASE", IDPASS),
         false,
-        &["no terminal to ask at", "--passphrase-file"],
+        &["vox node attach"],
     );
     let _ = daemon.kill();
     let _ = daemon.wait();

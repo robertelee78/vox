@@ -164,7 +164,10 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             if let Some(signal) = attach_foreground(args, &account, &rt, &mut stop, &router, node)?
             {
                 // A stop while it asked for a passphrase ends it at once, as it always has.
-                let _ = rt.block_on(tokio::time::timeout(shutdown_patience(), router.stop_all()));
+                // The timeout is made inside the runtime: made outside, its timer has no reactor.
+                let _ = rt.block_on(async {
+                    tokio::time::timeout(shutdown_patience(), router.stop_all()).await
+                });
                 rt.shutdown_background();
                 say(format_args!("vox daemon: stopped by {}", signal.name()));
                 return Ok(());

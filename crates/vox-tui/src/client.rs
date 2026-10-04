@@ -382,6 +382,10 @@ pub async fn hold(
         w.on("the vox daemon to answer");
     }
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+    // **Held open until the node is attached**: a daemon this started exits once it has no node
+    // and no client (L-8), and making an identity or asking for a passphrase takes longer than
+    // its linger. This connection is a client.
+    let _alive = DaemonClient::open(&account.socket()).await;
     warn_if_listening_elsewhere(&account, args.listen).await;
     let attached = DaemonClient::open(&account.socket())
         .await
@@ -635,6 +639,9 @@ pub async fn node_attach(
         args.config_dir.as_deref(),
     )?;
     ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+    // Held open while the passphrase is read: the daemon this started would otherwise exit as
+    // idle before the attach reaches it (L-8).
+    let mut d = daemon(&account).await?;
     let file = passphrase_file.clone();
     let _ = paths;
     let passphrase = tokio::task::spawn_blocking(move || attach_passphrase(None, file))
@@ -644,7 +651,6 @@ pub async fn node_attach(
         Some(f) => KeepSource::File(absolute(&f)),
         None => KeepSource::None,
     });
-    let mut d = daemon(&account).await?;
     match d
         .request(DaemonRequest::Attach {
             node: name.clone(),
