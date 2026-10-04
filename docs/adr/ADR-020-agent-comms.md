@@ -228,7 +228,11 @@ they are not a defence against one that lies.
   - the cursor is per session, written after emitting, and moves only past what was shown;
   - a cursor the node no longer holds restarts from the room's first message and the injection MUST
     say so;
-  - a message whose body has not arrived ("not received yet") is not injected and is never a cursor.
+  - a message whose body has not arrived ("not received yet") is not injected and is never a cursor;
+  - coordination traffic not for this session (`status`, `hello`, `bye`, `working`, `blocked`,
+    `result`, `failed`, `accept`, `decline`, `ack`, the claim protocol, `ping`, `pong`) MUST be
+    counted in one line per room, not shown (V030-18): a `--type status` post is counted, not shown,
+    in the per-turn read. A row addressed to this node, or answering this session, is shown in full.
 - **6.7** The drain MUST skip a session's own posts only when both the author fingerprint and
   `from` match this session (ADR-021 §7, F8).
 - **6.8 (V030-15).** A wake MUST be an announce-only notice: how many urgent messages and replies

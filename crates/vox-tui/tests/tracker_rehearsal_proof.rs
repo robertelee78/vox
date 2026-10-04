@@ -513,8 +513,14 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         if std::env::var_os("VOX_PROOF_WITHOUT_PLUGIN").is_some() {
             let _ = std::fs::remove_file(&plugin);
         } else {
-            std::fs::write(&plugin, vox_tui::agent_hook::OPENCODE_PLUGIN)
-                .expect("APPARATUS: write a staging file");
+            std::fs::write(
+                &plugin,
+                vox_tui::agent_hook::opencode_plugin(
+                    &vox_core::node::paths::NodeName::parse("default")
+                        .expect("APPARATUS: the node name"),
+                ),
+            )
+            .expect("APPARATUS: write a staging file");
         }
         agents.push(Agent {
             worker: w,

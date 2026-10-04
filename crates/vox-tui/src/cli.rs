@@ -789,9 +789,9 @@ enum AgentCmd {
     /// no hook command and loads JavaScript plugins, so it gets a plugin file.
     ///
     /// ```text
-    /// vox agent plugin opencode > ~/.config/opencode/plugin/vox.js
-    /// vox agent plugin claude            # merge into ~/.claude/settings.json
-    /// vox agent plugin codex             # merge into Codex's hooks.json
+    /// vox agent plugin opencode --node opencode-mbp > ~/.config/opencode/plugin/vox.js
+    /// vox agent plugin claude --node claude-mbp   # merge into ~/.claude/settings.json
+    /// vox agent plugin codex --node codex-mbp     # merge into Codex's hooks.json
     /// ```
     ///
     /// The integration goes to stdout so it can be redirected or piped through
@@ -2480,16 +2480,9 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let hook = format!("vox agent hook --node {node}");
             match args.harness.to_ascii_lowercase().as_str() {
                 "opencode" => {
-                    print!(
-                        "{}",
-                        crate::agent_hook::OPENCODE_PLUGIN.replace(
-                            "agent hook --format",
-                            &format!("agent hook --node {node} --format")
-                        )
-                    );
+                    print!("{}", crate::agent_hook::opencode_plugin(&node));
                     eprintln!(
                     "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/plugin/vox.js, and install the skill \
                      beside it: {}\n     The plugin drains every room the node holds.",
@@ -2508,15 +2501,12 @@ pub fn run() -> ExitCode {
                     // `UserPromptSubmit` drains the room; `Stop` records that a turn ended, so an
                     // unread reply can be announced to an idle session; `SessionEnd` removes the
                     // session's registration (V030-20).
-                    print!(
-                        "{}",
-                        crate::agent_hook::CLAUDE_HOOKS
-                            .replace("\"vox agent hook\"", &format!("\"{hook}\""))
-                    );
+                    print!("{}", crate::agent_hook::claude_settings(&node));
                     eprintln!(
                         "vox: merge that into ~/.claude/settings.json (user scope, so a session \
-                     opened in any repository hears its rooms), and install the skill beside \
-                     it: {}\n     The hook drains every room the node holds.",
+                     opened in any repository hears its rooms; `env` names the node every `vox` \
+                     the agent runs acts as), and install the skill beside it: {}\n     The \
+                     hook drains every room the node holds.",
                         skill_install("claude", skill_dir("claude").unwrap_or_default())
                     );
                     ExitCode::SUCCESS
@@ -2525,15 +2515,12 @@ pub fn run() -> ExitCode {
                 // lists a bare `{ "command": … }` entry as no hook at all, so the room never
                 // drained (V210-169).
                 "codex" => {
-                    println!(
-                        "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
-                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
-                     \"{hook}\", \"async\": false }}\n        ]\n      }}\n    ]\n  \
-                     }}\n}}"
-                    );
+                    print!("{}", crate::agent_hook::codex_hooks(&node));
                     eprintln!(
                     "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
-                     — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
+                     — Codex runs a hook only once it is trusted.\n     Codex sets no \
+                     environment for its shell from here: pass `--node {node}` to every `vox` \
+                     the agent runs.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
                      drain into nothing.\n     The hook drains every room the node holds.\n     \
                      Vox never interrupts a Codex session: an urgent message to one waits \

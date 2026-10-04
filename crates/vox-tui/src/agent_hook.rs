@@ -1721,8 +1721,56 @@ pub const CLAUDE_HOOKS: &str = r#"{
 }
 "#;
 
+/// The hook command a harness runs for `node` (ADR-020 2.1): it acts only as that node.
+#[must_use]
+pub fn hook_command(node: &vox_core::node::paths::NodeName) -> String {
+    format!("vox agent hook --node {node}")
+}
+
+/// Claude Code's settings for `node`, as `vox agent plugin claude --node <name>` prints them: the
+/// hook entries, and `VOX_NODE` in the session's environment, so every `vox` the agent runs acts as
+/// its own node, never as a person's node on the same machine (ADR-026 N-6).
+#[must_use]
+pub fn claude_settings(node: &vox_core::node::paths::NodeName) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(CLAUDE_HOOKS).unwrap_or_default();
+    let command = serde_json::Value::String(hook_command(node));
+    if let Some(events) = v["hooks"].as_object_mut() {
+        for groups in events.values_mut() {
+            for group in groups.as_array_mut().into_iter().flatten() {
+                for hook in group["hooks"].as_array_mut().into_iter().flatten() {
+                    hook["command"] = command.clone();
+                }
+            }
+        }
+    }
+    v["env"] = serde_json::json!({ "VOX_NODE": node.as_str() });
+    let mut text = serde_json::to_string_pretty(&v).unwrap_or_default();
+    text.push('\n');
+    text
+}
+
+/// Codex's `hooks.json` entry for `node`, as `vox agent plugin codex --node <name>` prints it.
+/// `async` MUST be false: an async hook's output is observed and discarded.
+#[must_use]
+pub fn codex_hooks(node: &vox_core::node::paths::NodeName) -> String {
+    let v = serde_json::json!({
+        "hooks": { "UserPromptSubmit": [ { "hooks": [
+            { "type": "command", "command": hook_command(node), "async": false }
+        ] } ] }
+    });
+    let mut text = serde_json::to_string_pretty(&v).unwrap_or_default();
+    text.push('\n');
+    text
+}
+
+/// The OpenCode plugin for `node`, as `vox agent plugin opencode --node <name>` prints it.
+#[must_use]
+pub fn opencode_plugin(node: &vox_core::node::paths::NodeName) -> String {
+    OPENCODE_PLUGIN.replace("@VOX_NODE@", node.as_str())
+}
+
 /// The OpenCode plugin, shipped in the binary so `vox agent plugin opencode` can
-/// print it.
+/// print it, with `@VOX_NODE@` where [`opencode_plugin`] writes the node.
 ///
 /// OpenCode is the odd harness of the three: Claude Code and Codex both run a
 /// **command** at turn start, so they need only a settings entry naming `vox agent

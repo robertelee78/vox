@@ -198,6 +198,11 @@ function defang(text) {
 /** The most wake notices remembered per session until OpenCode runs a turn on them. */
 const MAX_RELAYED = 16
 
+// The agent's own node, written in by `vox agent plugin opencode --node <name>` (ADR-020 2.1): the
+// drain hook acts only as it, and every shell this session runs names it in `VOX_NODE`, so the
+// agent's `vox room …` act as its node too, never as a person's node on the same machine.
+const VOX_NODE = "@VOX_NODE@"
+
 /**
  * `relayed` notes each wake notice relayed to a session (session id → its texts), before
  * OpenCode is handed it: OpenCode may run the prompt's `chat.message` before `promptAsync`
@@ -320,7 +325,8 @@ export default async function vox({ $, client }) {
       try {
         if (input?.sessionID && output?.env) {
           output.env.VOX_SESSION = input.sessionID
-          log("shell.env: VOX_SESSION=" + input.sessionID)
+          output.env.VOX_NODE = VOX_NODE
+          log("shell.env: VOX_SESSION=" + input.sessionID + " VOX_NODE=" + VOX_NODE)
         }
       } catch (e) {
         log("shell.env: threw: " + e)
@@ -356,7 +362,7 @@ export default async function vox({ $, client }) {
         }
 
         const result =
-          await $`${bin} agent hook --format text --session ${sessionID}`
+          await $`${bin} agent hook --node ${VOX_NODE} --format text --session ${sessionID}`
             .env(env)
             .quiet()
             .nothrow()
