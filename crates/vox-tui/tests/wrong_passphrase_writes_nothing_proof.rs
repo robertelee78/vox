@@ -80,7 +80,11 @@ fn vox(dir: &std::path::Path, pass: &str, args: &[&str], stdin: &str) -> (bool, 
 /// token, and the R36 work (PRD-001) replaces it with "the passphrase is wrong". What this
 /// gate proves is that nothing was written, not how the refusal reads.
 fn refused_for_the_passphrase(said: &str) -> bool {
-    said.contains("passphrase is wrong") || said.contains("WrongPassphrase")
+    // Since ADR-026 the daemon refuses the attach: "that passphrase does not open node <n>'s
+    // identity".
+    said.contains("passphrase is wrong")
+        || said.contains("WrongPassphrase")
+        || said.contains("passphrase does not open")
 }
 
 fn snapshot(store: &std::path::Path) -> (Vec<u8>, SystemTime) {

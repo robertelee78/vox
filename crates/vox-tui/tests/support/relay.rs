@@ -566,8 +566,11 @@ impl RelayWorld {
             .expect("APPARATUS: the proof crashed a host it had not started");
         let pid = host.child.id();
         drop(host);
+        // `vox serve` is a client (ADR-026 S-3): the host's node runs in its daemon, which is
+        // what crashes — SIGKILL by the pid in its lock.
+        let daemon = crate::world::kill_daemon(&self.host_dir);
         let crashed = Instant::now();
-        eprintln!("[test] host pid {pid} killed and reaped");
+        eprintln!("[test] host pid {pid} killed and reaped; its daemon {daemon:?} killed");
         let pass_file = self.tmp.path().join("daemon-passphrases");
         std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase))
             .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));

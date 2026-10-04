@@ -26,7 +26,9 @@ mod layout;
 #[path = "attach.rs"]
 pub mod attach;
 #[allow(unused_imports)] // not every includer uses every item
-pub use layout::{daemon_lock, find_named, node_dir, reap_daemon, Reaper, DEFAULT_NODE};
+pub use layout::{
+    daemon_lock, find_named, kill_daemon, node_dir, reap_daemon, Reaper, DEFAULT_NODE,
+};
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const IDENTITY: &str = "identity passphrase";
@@ -334,19 +336,16 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
     let needs = args
         .first()
         .is_some_and(|v| NEEDS_ATTACHED.contains(&v.as_str()));
-    let root = attach::Root::at(data, IDENTITY);
-    if needs && !root.daemon_running() && !layout::node_dir(data, DEFAULT_NODE).exists() {
-        // No node to attach: the verb says so itself.
+    if !needs {
         return vox_once_plain(data, args);
     }
-    if needs && !root.daemon_running() {
-        let node = args
-            .windows(2)
-            .find(|w| w[0] == "--node")
-            .map_or(DEFAULT_NODE.to_owned(), |w| w[1].clone());
-        return root.attached(&node, || vox_once_plain(data, args));
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match attach::needs(data, &argv) {
+        Some(node) => {
+            attach::Root::at(data, IDENTITY).attached(&node, || vox_once_plain(data, args))
+        }
+        None => vox_once_plain(data, args),
     }
-    vox_once_plain(data, args)
 }
 
 /// [`vox_once`] exactly as given, attaching nothing.
@@ -927,6 +926,9 @@ impl World {
             // Reaped by the drop; say so rather than assume it (ADR-018 §6).
             eprintln!("[test] host `vox serve` pid {pid} killed and reaped");
         }
+        // `vox serve` is a client (ADR-026 S-3): its node runs in the host's daemon, which is what
+        // stops when a host goes away. Stopped cleanly, by the pid in its lock.
+        reap_daemon(&self.host_dir);
         let pass_file = self.tmp.path().join("daemon-passphrases");
         std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase))
             .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));

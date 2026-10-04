@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long a verb waits for a daemon the proof is starting before it attaches the node itself.
+const DAEMON_GRACE: Duration = Duration::from_secs(3);
+
 /// How long a detached node's auto-started daemon may take to exit (it lingers 1 s, ADR-026 L-8).
 const GONE_WITHIN: Duration = Duration::from_secs(20);
 
@@ -218,9 +221,15 @@ pub fn needs(data: &Path, argv: &[&str]) -> Option<String> {
     if !argv.first().is_some_and(|v| NEEDS_ATTACHED.contains(v)) {
         return None;
     }
+    // A daemon the proof itself is starting may not hold the lock yet: given a moment, it is the
+    // one the verb talks to, and nothing is attached (or later detached) behind its back.
     let root = Root::at(data, "");
-    if root.daemon_running() {
-        return None;
+    let t0 = Instant::now();
+    while t0.elapsed() < DAEMON_GRACE {
+        if root.daemon_running() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
     let node = argv
         .windows(2)
