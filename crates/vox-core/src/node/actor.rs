@@ -11063,14 +11063,17 @@ impl Node {
                             })
                             .await;
                     }
-                    Err(e) => {
-                        let _ = tx
-                            .send(NetEvent::ReachFailed {
-                                peer,
-                                why: e.to_string(),
-                            })
-                            .await;
-                    }
+                    // **Said, not filed as a failed reach.** This is one direct dial at one heard
+                    // address, often one this node's socket cannot use at all (an IPv4 address
+                    // heard on an `[::1]`-only socket: "no direct candidates"). It says nothing of
+                    // the member's other paths: filed as `ReachFailed`, it backed off the member's
+                    // sync ports as Unreachable, and the reach that would have asked the anchor
+                    // for a circuit did not come for seconds. A member no path reaches still backs
+                    // off: its sync reach, the whole ladder, files its own failure.
+                    Err(e) => net.manager().note(
+                        peer,
+                        format!("the dial at the address heard nearby ({at}) failed: {e}"),
+                    ),
                 }
             });
         }
