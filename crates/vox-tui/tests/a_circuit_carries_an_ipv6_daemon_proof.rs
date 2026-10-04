@@ -127,9 +127,16 @@ fn a_guest_on_an_ipv6_socket_reaches_its_host_through_a_relay_circuit() {
 
 // ---- a guest that arrives before the anchor holds the room (V210-143) ----------------------------
 
-/// How long the host keeps its room off the anchor: past the guest's arrival, and well inside the
-/// join's 30 s patience once the host's publish backoff (1, 2, 4 s) has run.
-const HOST_HOLD_MS: &str = "3000";
+/// How long the host keeps its room off the anchor, from its first publish: past the guest's
+/// arrival, and well inside the join's 30 s patience once the host's publish backoff has run.
+///
+/// The guest's `vox connect` unlocks its identity (production Argon2id) and starts its daemon
+/// before it asks, which took longer than the 3 s this was under load (4 runs at once, 1 red): the
+/// anchor held the room by then and nothing was staged. The host retries a held round after 1, 2,
+/// 4 and 8 s, each shortened by up to a quarter (`publish_retry_after`): its fourth round comes
+/// 5.25–7 s in and is held, its fifth 11.25–15 s in and is not. So the guest has 10 s to ask, and
+/// waits at most 15 s for the room.
+const HOST_HOLD_MS: &str = "10000";
 
 /// **A guest that asks before the anchor holds the room still joins** (V210-143).
 ///
@@ -143,8 +150,8 @@ const HOST_HOLD_MS: &str = "3000";
 ///
 /// Staged with the test-only `VOX_TEST_HOLD_ROOM_FROM_ANCHORS_MS`: the host's publish rounds to the
 /// anchor fail for [`HOST_HOLD_MS`] and are retried on their backoff. The guest asks at once.
-/// - The guest must say it is waiting for the room (`vox: waiting: …`), or the staging was not
-///   achieved: PRODUCT (staging).
+/// - The guest must say it is waiting for the room (`vox: waiting: …`), or the moment was not
+///   staged and the run measured nothing: CANNOT MEASURE.
 /// - It must then join through the relay, within the join's patience: PRODUCT, quoting it.
 ///
 /// **The mutation that must turn it red:** the join's repeated search removed, so a search that
@@ -174,9 +181,9 @@ fn a_guest_that_arrives_before_the_anchor_holds_the_room_still_joins_through_the
     );
     assert!(
         waited,
-        "PRODUCT (staging): the guest joined without saying it waited for the \
-         room, so the anchor already held it and the moment V210-143 is about was not staged; the \
-         joiner said:\n{err}"
+        "CANNOT MEASURE: the guest joined without saying it waited for the room, so the anchor \
+         already held it ({HOST_HOLD_MS} ms after the host first published) and the moment \
+         V210-143 is about was not staged; the joiner said:\n{err}"
     );
 }
 
