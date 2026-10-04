@@ -31,6 +31,8 @@
 
 #[path = "support/hostile.rs"]
 mod hostile;
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]

@@ -49,6 +49,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/raw_sync.rs"]
 mod raw_sync;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -207,13 +209,6 @@ impl Drop for Rt {
     }
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port: {e}"))
-        .port()
-}
-
 /// The apparatus clock: how long this machine takes, now, to start a process that is **not**
 /// vox (`/usr/bin/true`), spawned as vox is. A stalled runner stalls this too; a vox that is slow,
 /// even only to start, does not, so it reads as the product's (the #332 trap).
@@ -320,9 +315,12 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
 
     let victim_id = fingerprint(&victim_dir);
     let _ = fingerprint(&mallory_dir);
-    let victim_port = free_udp_port();
-    let victim_listen = format!("127.0.0.1:{victim_port}");
-    let _victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
+    let _victim = daemon("victim", &victim_dir, "127.0.0.1:0", &spec, &pass_file);
+    // Where the victim chose to listen, from its own report (#410).
+    let victim_listen =
+        ports::loopback_listen(&vox_once(&victim_dir, &args(&["status", "--json"])).1)
+            .expect("PRODUCT (staging): the victim reports a loopback listen address")
+            .to_string();
     let mallory = daemon("mallory", &mallory_dir, "127.0.0.1:0", &spec, &pass_file);
 
     let (ok, out, err) = vox_in(

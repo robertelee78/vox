@@ -47,6 +47,8 @@
 
 #[path = "support/hostile.rs"]
 mod hostile;
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -54,9 +56,7 @@ mod world;
 
 use std::time::{Duration, Instant};
 
-use hostile::{
-    connect, create_room, daemon, fingerprint, free_port, profile_dir, put, stranger, vox_in, Rt,
-};
+use hostile::{connect, create_room, daemon, fingerprint, profile_dir, put, stranger, vox_in, Rt};
 use vox_core::governance::genesis::{ChannelPolicy, Genesis};
 use vox_core::identity::composite::{RootSigner, SoftwareRootSigner};
 use vox_core::nat::multiaddr::EndpointList;
@@ -162,15 +162,6 @@ fn join(dir: &std::path::Path, link: &str, name: &str) -> (bool, Duration, Strin
     (ok, t0.elapsed(), format!("{out}{err}"))
 }
 
-/// A UDP port free on both families: one taken on IPv4 alone would make a `[::]` bind land
-/// elsewhere for IPv4 (a dual-stack collision).
-fn free_dual_port() -> u16 {
-    std::net::UdpSocket::bind("[::]:0")
-        .and_then(|s| s.local_addr())
-        .expect("APPARATUS: bind a dual-stack socket")
-        .port()
-}
-
 #[test]
 #[ignore = "real vox processes with production Argon2id, a flood and two real joins; run in release"]
 fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
@@ -184,12 +175,13 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
-    let anchor_port = free_dual_port();
     // **The flood and the joiner come from two sources** (ADR-011 requirement 34 limits `ASK`s
     // per source): the anchor and the victim listen on both families, every stand-in dials them
     // at `::1`, and the real joiner reaches them at `127.0.0.1`. A flood from the joiner's own
     // address would spend the joiner's rate as well, which is no part of what this proves.
-    let (_anchor, spec) = hostile::anchor(&anchor_dir, &format!("[::]:{anchor_port}"));
+    // Each on a port of its own choosing (the product's own dual-stack bind), read back (#410).
+    let (_anchor, spec) = hostile::anchor(&anchor_dir, "[::]:0");
+    let anchor_port = ports::spec_port(&spec);
     let anchor_id = vox_core::node::link::b32_decode(
         spec.split('@').next().expect("PRODUCT: an anchor spec"),
         "anchor fingerprint",
@@ -197,14 +189,8 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     .expect("PRODUCT: the anchor's fingerprint");
     let victim_id = fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
-    let victim_port = free_dual_port();
-    let _victim = hostile::daemon_on(
-        "victim",
-        &victim_dir,
-        &format!("[::]:{victim_port}"),
-        &spec,
-        &pass_file,
-    );
+    let _victim = hostile::daemon_on("victim", &victim_dir, "[::]:0", &spec, &pass_file);
+    let victim_port = hostile::listening_port(&victim_dir);
     let (room, link) = create_room(&victim_dir, "first", ROOM_PASS);
     // The anchor holds the room once the victim has published it there.
     std::thread::sleep(Duration::from_secs(3));
@@ -321,7 +307,7 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     );
 
     // ---- 3. real joins, through the flooded nodes ------------------------------------------
-    let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
+    let _joiner = daemon("joiner", &joiner_dir, 0, &spec, &pass_file);
     let (ok1, took1, said1) = join(&joiner_dir, &link, "first");
     println!("[proof] join of the flooded room: ok={ok1} in {took1:?}");
     let (ok2, took2, said2) = join(&joiner_dir, &second_link, "second");

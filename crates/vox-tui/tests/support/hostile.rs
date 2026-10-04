@@ -198,6 +198,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use crate::ports;
 use crate::world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
 /// How long any one piece of setup may take before the proof says it cannot measure.
@@ -230,12 +231,13 @@ pub fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String)
     )
 }
 
-/// A free loopback UDP port.
-pub fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("APPARATUS: bind a socket")
-        .local_addr()
-        .expect("APPARATUS: read a socket the proof bound")
+/// The loopback port the daemon at `data` listens on, from its own `vox status --json` (#410):
+/// a daemon is started on port 0 and its port read back, never picked ahead and raced for.
+pub fn listening_port(data: &Path) -> u16 {
+    let (ok, out, err) = vox_once(data, &args(&["status", "--json"]));
+    assert!(ok, "PRODUCT (staging): vox status --json: {err}");
+    ports::loopback_listen(&out)
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no loopback address in `listening`: {out}"))
         .port()
 }
 
@@ -297,10 +299,18 @@ pub fn daemon_on(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &
                 .expect("APPARATUS: a path that is not UTF-8"),
         ]),
     );
+    let mut p = p;
     let deadline = Instant::now() + SETUP;
     while Instant::now() < deadline {
         if vox_once(data, &args(&["room", "list"])).0 {
             return p;
+        }
+        if matches!(p.child.try_wait(), Ok(Some(_))) && ports::bind_refused(&p.transcript()) {
+            panic!(
+                "{}: {name}'s daemon on {listen}:\n{}",
+                ports::APPARATUS_BIND,
+                p.transcript()
+            );
         }
         std::thread::sleep(Duration::from_millis(250));
     }

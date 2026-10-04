@@ -35,6 +35,8 @@ mod world;
 
 #[path = "support/hostile.rs"]
 mod hostile;
+#[path = "support/ports.rs"]
+mod ports;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

@@ -306,14 +306,6 @@ fn scrape(addr: &str) -> String {
         .map_or(got.clone(), |(_, body)| body.to_owned())
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Poll `f` until it is true, up to [`TIMEOUT`]; panic with `side` (`PRODUCT`,
 /// `PRODUCT (staging)`) and `what` if it never is.
 fn until(side: &str, what: &str, mut f: impl FnMut() -> bool) {
@@ -651,14 +643,11 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
     }
     let pass_file = tmp.path().join("passphrases");
     std::fs::write(&pass_file, format!("{IDENTITY}\n{ROOM_PASS}\n")).unwrap();
-    // Each member's machine keeps one UDP port, for its daemon and later its LAN, as a
-    // person's does with the default `--listen`.
-    let ports: Vec<u16> = names.iter().map(|_| free_udp_port()).collect();
+    // Each member's daemon on a port of its own choosing (#410), never one picked ahead.
     let daemons: Vec<VoxProc> = names
         .iter()
         .zip(&dirs)
-        .zip(&ports)
-        .map(|((n, d), port)| daemon(n, d, *port, &spec, &pass_file, *n == "alice"))
+        .map(|(n, d)| daemon(n, d, 0, &spec, &pass_file, *n == "alice"))
         .collect();
     let (ok, out, err) = vox_in(
         &dirs[0],

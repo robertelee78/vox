@@ -119,13 +119,6 @@ fn stop(mut p: VoxProc) {
     // Drop kills it by PID.
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("APPARATUS: cannot probe for a free port")
-        .port()
-}
-
 fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
     let mut p = VoxProc::spawn(
         name,
@@ -244,9 +237,11 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     let idpass = tmp.path().join("idpass");
     std::fs::write(&idpass, IDENTITY).expect("APPARATUS: cannot write a staging file");
 
-    let port = free_udp_port();
-    let listen = format!("127.0.0.1:{port}");
-    let mut anchor = VoxProc::spawn("anchor", &anchor_dir, &args(&["node", "--listen", &listen]));
+    let mut anchor = VoxProc::spawn(
+        "anchor",
+        &anchor_dir,
+        &args(&["node", "--listen", "127.0.0.1:0"]),
+    );
     let spec = anchor
         .expect_line("an --anchor spec", |l| {
             l.trim_start().contains("@/ip4/127.0.0.1/udp/")

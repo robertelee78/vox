@@ -71,6 +71,8 @@
 
 #[path = "support/hostile.rs"]
 mod hostile;
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -81,8 +83,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hostile::{
-    answer_circuits, ask_circuit, connect, create_room, daemon, fingerprint, free_port,
-    member_signer, profile_dir, put, stranger, vox_in, CircuitAnswer, Rt,
+    answer_circuits, ask_circuit, connect, create_room, daemon, fingerprint, member_signer,
+    profile_dir, put, stranger, vox_in, CircuitAnswer, Rt,
 };
 use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::governance::membership::issue_consent_grant;
@@ -365,8 +367,9 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         .expect("APPARATUS (harness error): the identity passphrase file");
 
     // ---- the real room ------------------------------------------------------------------
-    let anchor_port = free_port();
-    let (_anchor, spec) = hostile::anchor(&anchor_dir, &format!("127.0.0.1:{anchor_port}"));
+    // On a port of its own choosing, read back from its spec (#410).
+    let (_anchor, spec) = hostile::anchor(&anchor_dir, "127.0.0.1:0");
+    let anchor_port = ports::spec_port(&spec);
     let anchor_id = vox_core::node::link::b32_decode(
         spec.split('@')
             .next()
@@ -377,11 +380,11 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let victim_id = fingerprint(&victim_dir);
     let charlie_id = fingerprint(&charlie_dir);
     let bravo_id = fingerprint(&bravo_dir);
-    let victim_port = free_port();
-    let _victim = daemon("victim", &victim_dir, victim_port, &spec, &pass_file);
+    let _victim = daemon("victim", &victim_dir, 0, &spec, &pass_file);
+    let victim_port = hostile::listening_port(&victim_dir);
     let (room, link) = create_room(&victim_dir, "team", ROOM_PASS);
     for (name, dir) in [("bravo", &bravo_dir), ("charlie", &charlie_dir)] {
-        let d = daemon(name, dir, free_port(), &spec, &pass_file);
+        let d = daemon(name, dir, 0, &spec, &pass_file);
         let (ok, out, err) = vox_in(
             dir,
             &[

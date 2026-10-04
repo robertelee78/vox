@@ -285,14 +285,6 @@ fn filler(n: usize) -> String {
     vox_core::node::link::b32_encode(&id)
 }
 
-fn free_tcp_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("APPARATUS: bind a socket")
-        .local_addr()
-        .expect("APPARATUS: read a socket the proof bound")
-        .port()
-}
-
 #[test]
 #[ignore = "four real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn every_common_failure_names_its_cause() {
@@ -623,14 +615,13 @@ fn every_common_failure_names_its_cause() {
     drop(busy);
 
     // ---- (7) a forward into a host that has not trusted this guest ----
-    let local = format!("127.0.0.1:{}", free_tcp_port());
     let forward = Proc::spawn(
         "forward",
         &guest_dir,
         &[
             "forward",
             &service_address,
-            &local,
+            "127.0.0.1:0",
             "--anchor",
             &spec,
             "--listen",
@@ -638,9 +629,16 @@ fn every_common_failure_names_its_cause() {
         ],
         "",
     );
-    forward.expect_out("the forward's bound address", |l| {
-        l.starts_with("vox: forwarding ")
-    });
+    // Where the forward bound, from its own line (#410), not a port picked ahead.
+    let local = forward
+        .expect_out("the forward's bound address", |l| {
+            l.starts_with("vox: forwarding ")
+        })
+        .trim_start_matches("vox: forwarding ")
+        .split_whitespace()
+        .next()
+        .expect("PRODUCT (staging): the forward's line names its address")
+        .to_owned();
     // Two opposite outcomes, told apart: the forward never took a connection (staging), or it
     // took one and the service's echo came back — the host carried an untrusted guest's bytes
     // to the service, which is the product's security failing, never a CANNOT MEASURE.

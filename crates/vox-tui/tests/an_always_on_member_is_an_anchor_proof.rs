@@ -17,8 +17,7 @@
 //! - What A posts, B reads.
 //! - A `vox` step that fails while the scene is set (a verb, a daemon that never serves its
 //!   socket or says its identity, C listing no room or no invitation) is the product failing:
-//!   `PRODUCT (staging):`. Only C finding no free port is `CANNOT MEASURE`; this test's own
-//!   spawns, pipes and files are `APPARATUS:`.
+//!   `PRODUCT (staging):`. This test's own spawns, pipes and files are `APPARATUS:`.
 //!
 //! **Why a file of its own.** Every other proof with an anchor uses `vox node`; none points
 //! `--anchor` at a member.
@@ -29,6 +28,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/world.rs"]
 mod world;
 
@@ -142,14 +143,12 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
     let (b_dir, b_fp) = member(tmp.path(), "b");
 
     // ---- C, the always-on member, on both families ----
-    // The port is picked free and then released, so another process can take it first; a few
-    // fresh tries cover that race, as `world.rs` does for a relaying anchor.
-    let (port, mut c) = (0..5)
-        .find_map(|_| {
-            let port = world::free_dual_stack_port();
-            try_daemon("c", &c_dir, &format!("[::]:{port}"), None).map(|c| (port, c))
-        })
-        .expect("CANNOT MEASURE (staging): C found no free dual-stack port in 5 tries");
+    // On a port of its own choosing, read back from its own report (#410): a port the proof
+    // picked and released could be another program's by the time C bound it.
+    let mut c = daemon("c", &c_dir, "[::]:0", None);
+    let port = ports::loopback_listen(&staged(&c_dir, &["status", "--json"], ""))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): C's report names no loopback address"))
+        .port();
     let id = c
         .line_within(world::LINE_TIMEOUT, |l| {
             l.starts_with("vox daemon: identity ")
