@@ -491,6 +491,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AddressReached { .. } => "keeping a room address whose host answered",
         NetEvent::Reopened { .. } => "holding a room that reopened",
         NetEvent::ReopenGone { .. } => "forgetting a room that no longer exists",
+        NetEvent::ReopenFailed { .. } => "saying why a room did not reopen",
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
@@ -1205,6 +1206,15 @@ enum NetEvent {
     ReopenGone {
         /// The room.
         channel_id: Digest32,
+    },
+    /// A room in the reopen set would not open (#412): it stays remembered, and closed, and the
+    /// operator is told why — a room that stayed closed with no word was a room nobody could
+    /// tell how to get back.
+    ReopenFailed {
+        /// The room.
+        channel_id: Digest32,
+        /// What refused it.
+        why: String,
     },
     /// The reopening has tried every room (#208). A room still marked as reopening would not
     /// open: it stays remembered, and closed. The unlock is answered now.
@@ -5887,6 +5897,17 @@ impl Node {
                 self.reopening.remove(&channel_id);
                 let _ = self.forget_open(&channel_id);
             }
+            NetEvent::ReopenFailed { channel_id, why } => {
+                let _ = self.event_tx.send(NodeEvent::NodeNote {
+                    note: format!(
+                        "room {} did not reopen: {why}; it stays closed",
+                        crate::node::link::b32_encode(&channel_id)
+                            .chars()
+                            .take(12)
+                            .collect::<String>()
+                    ),
+                });
+            }
             NetEvent::LockSettled => self.settle_lock().await,
             NetEvent::ReopenFinished => {
                 self.reopening.clear();
@@ -7801,6 +7822,16 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
         };
+        // **A room this profile holds, closed, is opened by its passphrase** (#412): joining it
+        // again found it in the profile and failed as an internal error, so a member whose room
+        // stayed closed could not get back in. Its address and passphrase are what open it.
+        if matches!(
+            profile.store().get_sek_wrap(&parsed.channel_id),
+            Ok(Some(_))
+        ) {
+            self.begin_open_channel(parsed.channel_id, passphrase, reply);
+            return;
+        }
         let Ok(signer) = profile.signer_arc() else {
             let _ = reply.send(Outcome::Failed(Fault::Locked));
             return;
@@ -11952,24 +11983,31 @@ impl Node {
                 let opened = secret_blocking(&secret_work, move || {
                     match store.get_sek_wrap(&id) {
                         Ok(Some(_)) => {}
-                        Ok(None) => return Some(Err(())),
+                        Ok(None) => return Err(None),
                         // Unreadable now: left in the set for the next unlock, and closed.
-                        Err(_) => return None,
+                        Err(e) => return Err(Some(e.to_string())),
                     }
                     let sek = crate::atrest::sek::Sek::from_bytes(sek);
                     ChannelState::open_with_sek(&store, &id, sek, &passphrase, me, now)
-                        .ok()
-                        .map(Ok)
+                        .map_err(|e| Some(e.to_string()))
                 })
                 .await;
                 let event = match opened {
-                    Some(Some(Ok(channel))) => NetEvent::Reopened {
+                    Some(Ok(channel)) => NetEvent::Reopened {
                         channel_id: id,
                         channel: Box::new(channel),
                     },
-                    Some(Some(Err(()))) => NetEvent::ReopenGone { channel_id: id },
-                    // A room that exists but will not open stays remembered and closed.
-                    Some(None) | None => continue,
+                    Some(Err(None)) => NetEvent::ReopenGone { channel_id: id },
+                    // A room that exists but will not open stays remembered and closed, and why
+                    // is said (#412).
+                    Some(Err(Some(why))) => NetEvent::ReopenFailed {
+                        channel_id: id,
+                        why,
+                    },
+                    None => NetEvent::ReopenFailed {
+                        channel_id: id,
+                        why: "the reopening stopped before it was tried".to_owned(),
+                    },
                 };
                 if tx.send(event).await.is_err() {
                     return;

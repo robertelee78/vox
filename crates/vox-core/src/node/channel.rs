@@ -2103,6 +2103,16 @@ impl ChannelState {
             SEG_UNSETTLED,
             &seal_segment(&sek, SegmentKind::KeyMaterial, SEG_UNSETTLED, &[1])?,
         )?;
+        // **Remembered as open in the same batch** (#412). Written after it, a crash between the
+        // two left a room in the profile that the restarted node did not reopen and every re-join
+        // refused as already held: the member could not get back in. Now a crash leaves either no
+        // room, which a re-join makes, or a room that reopens.
+        let mut open = crate::node::open_rooms::OpenRooms::load(profile.store(), signer)?;
+        open.remember(*channel_id, sek.key_bytes()?, channel_passphrase)?;
+        batch.put_meta(
+            crate::node::open_rooms::OPEN_ROOMS_META_KEY,
+            &open.sealed(signer)?,
+        )?;
         batch.commit()?;
 
         let mut admission = AdmissionPolicy::new();

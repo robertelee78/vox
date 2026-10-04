@@ -1195,16 +1195,19 @@ pub(crate) async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle,
         .map(|c| c.channel_id)
         .collect();
     let mut opened_by_line = false;
+    // What refused the line, per room: said if it opened nothing (#412), never dropped.
+    let mut refused: Vec<(vox_core::hash::Digest32, String)> = Vec::new();
     for channel_id in closed_now {
-        if node
+        let outcome = node
             .apply(NodeCommand::OpenChannel {
                 channel_id,
                 passphrase: Secret::new(line.as_bytes().to_vec()),
             })
-            .await
-            .is_done()
-        {
+            .await;
+        if outcome.is_done() {
             opened_by_line = true;
+        } else {
+            refused.push((channel_id, outcome.to_string()));
         }
     }
     if opened_by_line {
@@ -1243,23 +1246,22 @@ pub(crate) async fn open_rooms_by_line(node: &vox_core::node::actor::NodeHandle,
         eprintln!("vox daemon: could not open that room: {outcome}");
         return;
     }
-    // Neither form opened anything. Nothing to undo — a room this did not open
-    // stays closed — and the report at the end of this loop names what is still
-    // shut, so this is stated rather than silent.
-    let closed: Vec<_> = node
-        .view()
-        .channels
-        .iter()
-        .filter(|c| !c.open)
-        .map(|c| c.channel_id)
-        .collect();
-    for channel_id in closed {
-        let _ = node
-            .apply(NodeCommand::OpenChannel {
-                channel_id,
-                passphrase: Secret::new(line.as_bytes().to_vec()),
-            })
-            .await;
+    // Neither form opened anything. Nothing to undo — a room this did not open stays closed —
+    // and what refused the line is said for each room it was tried on (#412): a line that opened
+    // nothing with no word left a person giving the right passphrase to a room that could not
+    // open, and no way to tell.
+    if refused.is_empty() {
+        eprintln!("vox daemon: that line opened no room: no room here is closed");
+    }
+    for (channel_id, why) in refused {
+        eprintln!(
+            "vox daemon: that line did not open room {}: {}",
+            vox_core::node::link::b32_encode(&channel_id)
+                .chars()
+                .take(12)
+                .collect::<String>(),
+            why.lines().next().unwrap_or_default()
+        );
     }
 }
 
