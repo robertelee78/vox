@@ -76,6 +76,9 @@ struct Inner {
     rt: Handle,
     defaults: Defaults,
     slots: Mutex<BTreeMap<NodeName, Slot>>,
+    /// For a headless node in the anchor role, the creators whose rooms it serves; absent, any
+    /// room (`vox node --serve`, ADR-026 N-5).
+    serve_only: Mutex<BTreeMap<NodeName, BTreeSet<Digest32>>>,
     events: broadcast::Sender<DaemonEvent>,
     metrics: Arc<DaemonMetrics>,
     stopping: AtomicBool,
@@ -221,6 +224,7 @@ impl Router {
                 stopping: AtomicBool::new(false),
                 next_generation: AtomicU64::new(1),
                 stop_asked: tokio::sync::Notify::new(),
+                serve_only: Mutex::default(),
                 unfinished_stop: AtomicBool::new(false),
                 connections: Arc::default(),
             }),
@@ -236,6 +240,12 @@ impl Router {
     /// Wait until a client asks the daemon to stop ([`DaemonRequest::Stop`]).
     pub async fn stop_asked(&self) {
         self.inner.stop_asked.notified().await;
+    }
+
+    /// Serve only rooms made by `creators` from headless node `node`, the next time it attaches
+    /// in the anchor role (`vox node --serve trusted`).
+    pub fn serve_only(&self, node: &NodeName, creators: BTreeSet<Digest32>) {
+        lock(&self.inner.serve_only).insert(node.clone(), creators);
     }
 
     /// The attached nodes and their handles, for the metrics endpoint.
@@ -644,10 +654,30 @@ impl Router {
             .node_paths(node)
             .map_err(|e| failed(e.to_string()))?;
         // The daemon's anchors, the node's own anchors file, and what this attach names.
+        //
+        // **What the file could not give is said, here** (V210-107, under ADR-026): each skipped
+        // line, and that a file naming no usable anchor leaves the node with none, which it
+        // carries on without. The daemon is the one vox that reads the file now; dropping what it
+        // skipped left a person whose file named a host that no longer resolves with nothing said
+        // anywhere (#410: the wholly-bad anchors file proof).
         let mut set = self.inner.defaults.anchors.clone();
-        let _ = vox_core::node::link::merge_anchors_file(&mut set, &paths.anchors_file());
+        let file = paths.anchors_file();
+        let skipped = vox_core::node::link::merge_anchors_file(&mut set, &file)
+            .unwrap_or_else(|e| vec![e.to_string()]);
+        for line in &skipped {
+            eprintln!("vox daemon: {line}");
+        }
         for spec in anchors {
             let _ = vox_core::node::link::merge_anchor_spec(&mut set, spec);
+        }
+        if set.is_empty() && !skipped.is_empty() {
+            eprintln!(
+                "vox daemon: node {node}: {}; carrying on with no anchor",
+                vox_core::error::Error::AnchorsFileUnusable {
+                    path: file.display().to_string(),
+                    skipped: skipped.len(),
+                }
+            );
         }
         let started = std::time::Instant::now();
         let bind = (self.inner.defaults.bind)(node);
@@ -655,12 +685,36 @@ impl Router {
             Some(Bind::Addr(a)) => Some(*a),
             _ => None,
         };
+        // **A node with a headless key and no vault is an anchor** (ADR-026 N-5, ADR-016): it
+        // runs as that key from spawn, with no passphrase, serving its board for the rooms
+        // published to it.
+        let anchor_key = || {
+            vox_core::node::headless::load_or_create_identity(&paths)
+                .map_err(|e| failed(e.to_string()))
+        };
+        // Its fingerprint: the key is read again for each spawn, which takes it.
+        let anchor: Option<Digest32> = if !paths.vault_file().is_file()
+            && vox_core::node::headless::identity_file(&paths).is_file()
+        {
+            Some(vox_core::identity::composite::RootSigner::fingerprint(
+                &anchor_key()?,
+            ))
+        } else {
+            None
+        };
+        let serve_only = lock(&self.inner.serve_only).get(node).cloned();
         let (handle, actor) = loop {
             let mut cfg = NodeConfig::new()
                 .anchors(set.clone())
                 .on_profile_wait(crate::tunnel_cli::say_waiting);
             if let Some(bind) = &bind {
                 cfg = cfg.bind(bind.clone());
+            }
+            if anchor.is_some() {
+                cfg = cfg.headless(anchor_key()?).anchor_boards(true);
+                if let Some(creators) = &serve_only {
+                    cfg = cfg.serve_only(creators.clone());
+                }
             }
             let p = paths.clone();
             let spawned = tokio::task::spawn_blocking(move || Node::spawn_supervised(p, cfg))
@@ -701,13 +755,18 @@ impl Router {
         }
         let empty = Zeroizing::new(String::new());
         let pass = passphrase.unwrap_or(&empty);
-        let outcome = crate::tunnel_cli::apply_saying_waits(
-            &handle,
-            NodeCommand::Unlock {
-                passphrase: Secret::new(pass.as_bytes().to_vec()),
-            },
-        )
-        .await;
+        // An anchor has nothing to unlock: it is networked from spawn.
+        let outcome = if anchor.is_some() {
+            Outcome::Done
+        } else {
+            crate::tunnel_cli::apply_saying_waits(
+                &handle,
+                NodeCommand::Unlock {
+                    passphrase: Secret::new(pass.as_bytes().to_vec()),
+                },
+            )
+            .await
+        };
         if !outcome.is_done() {
             let outcome_text = outcome.to_string();
             let refusal = match outcome {
@@ -740,13 +799,16 @@ impl Router {
         if *ended.borrow() {
             return Err(failed("its actor stopped while it attached".into()));
         }
-        let tasks = NodeTasks::start(
-            &self.inner.rt,
-            &handle,
-            &paths,
-            self.inner.defaults.anchor_specs.clone(),
-        );
-        let fingerprint = handle.view().identity.map(|i| i.fingerprint);
+        // An anchor wakes no agent, notifies nobody and follows no anchor of its own: it is one.
+        let tasks = anchor.is_none().then(|| {
+            NodeTasks::start(
+                &self.inner.rt,
+                &handle,
+                &paths,
+                self.inner.defaults.anchor_specs.clone(),
+            )
+        });
+        let fingerprint = anchor.or_else(|| handle.view().identity.map(|i| i.fingerprint));
         Ok(Box::new(Attached {
             handle,
             paths,
@@ -755,7 +817,7 @@ impl Router {
             keep: None,
             holders: 0,
             sessions: BTreeSet::new(),
-            tasks: Some(tasks),
+            tasks,
             detached: watch::channel(false).0,
             ended,
             fingerprint,

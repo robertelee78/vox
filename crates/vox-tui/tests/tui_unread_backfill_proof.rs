@@ -360,7 +360,7 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     tui.expect("home selected", 10, |t| t.contains("▶ home"));
     tui.keys(b"\r");
     // The list's title is gone once a room is on screen.
-    tui.expect("home on screen", 10, |t| !t.contains("Channels (Enter"));
+    tui.expect("home on screen", 10, |t| !t.contains("Rooms (Enter"));
 
     // Bob trusts alice: his own decision about who reads HIM, which renders nothing of
     // hers. Measured by hand, a consent that only one side has given did not deliver the
@@ -416,8 +416,8 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
 
     // ---- back to the list, where the badge is drawn ----
     tui.keys(b"\x1b");
-    tui.expect("the channel list", 10, |t| {
-        t.contains("Channels (Enter") && t.contains("▶ home")
+    tui.expect("the room list", 10, |t| {
+        t.contains("Rooms (Enter") && t.contains("▶ home")
     });
     let mission = tui.line_for("mission").expect("mission's line");
     let home = tui.line_for("home").expect("home's line");

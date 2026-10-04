@@ -814,6 +814,20 @@ pub fn room_passphrase_for(
     Ok(encouraged(prompt_passphrase("room passphrase")?, "room"))
 }
 
+/// Refuse the room passphrase sources that disclose it (V210-72): `--passphrase` and
+/// `VOX_ROOM_PASSPHRASE`, for a verb that takes one only from a file or not at all. Said before
+/// anything else, so a person relying on either learns it was never read.
+///
+/// # Errors
+/// Either is given.
+pub fn refuse_disclosed_room_passphrase(given: Option<&String>) -> Result<(), AppError> {
+    if given.is_some() || std::env::var_os("VOX_ROOM_PASSPHRASE").is_some() {
+        // The same words as every verb that reads one.
+        room_passphrase_for(given, None)?;
+    }
+    Ok(())
+}
+
 /// `passphrase`, after one line on stderr encouraging one when it is empty (V030-36).
 ///
 /// **An empty passphrase is accepted, not refused** (decider 2026-10-02: "passphrase is a good

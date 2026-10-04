@@ -33,7 +33,6 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
-use vox_core::node::actor::Node;
 use vox_core::node::api::{NodeCommand, Secret};
 use vox_core::node::paths::Paths;
 
@@ -537,7 +536,7 @@ pub(crate) fn stop_requested(verb: &'static str) -> impl std::future::Future<Out
 pub fn run_node(
     paths: Paths,
     listen: std::net::SocketAddr,
-    anchors: vox_core::nat::bootstrap::BootstrapSet,
+    anchor_specs: Vec<String>,
     serve_only: Option<std::collections::BTreeSet<vox_core::hash::Digest32>>,
 ) -> Result<(), AppError> {
     use vox_core::identity::composite::RootSigner;
@@ -545,37 +544,53 @@ pub fn run_node(
         .worker_threads(2)
         .enable_all()
         .build()?;
-    let signer = vox_core::node::headless::load_or_create_identity(&paths)?;
-    let fingerprint = signer.fingerprint();
-    let cfg = vox_core::node::actor::NodeConfig::new()
-        .bind(vox_core::node::actor::Bind::Addr(listen))
-        .anchors(anchors)
-        .headless(signer)
-        .anchor_boards(true)
-        .on_profile_wait(crate::tunnel_cli::say_waiting);
-    let cfg = match serve_only {
-        Some(creators) => {
-            println!(
-                "vox node: serving only rooms made by the {} identit{} this profile trusts",
-                creators.len(),
-                if creators.len() == 1 { "y" } else { "ies" }
-            );
-            cfg.serve_only(creators)
-        }
-        None => cfg,
-    };
-    // Kept for the anchors file the loop below writes (M17.4); the node takes its own clone.
-    let anchors_paths = paths.clone();
-    let node = rt.block_on(async { Node::spawn_config(paths, cfg) })?;
+    // **Every stop signal is a clean stop, taken first** (V210-93, V210-85): SIGINT, SIGTERM, SIGHUP
+    // and SIGQUIT, before the lock is waited for.
+    let mut interrupted = Box::pin({
+        let _in_runtime = rt.enter();
+        stop_requested("vox node")
+    });
+    // Its key, made here when there is none (ADR-026 C-5): what the daemon then attaches.
+    let fingerprint = vox_core::node::headless::load_or_create_identity(&paths)?.fingerprint();
     let fp = vox_core::node::link::b32_encode(&fingerprint);
-    println!("vox node: identity {fp}");
-    // An anchor binds as it spawns, before the loop below listens, so a moved port is said here.
-    while let Some(ev) = node.try_next_event() {
-        if let vox_core::node::api::NodeEvent::NodeNote { note } = ev {
-            eprintln!("vox node: {note}");
-        }
+    let account = paths.account();
+    let node = crate::client::name_of(&paths)?;
+    // **`vox node` is a daemon with one headless node in the anchor role** (ADR-026 N-5), not a
+    // process of another kind: it holds the account, serves its socket, and attaches the node.
+    let Some(serving) =
+        crate::daemon::take_account(&account, &rt, listen, &anchor_specs, Some(&node))?
+    else {
+        return Err(AppError::Refused {
+            code: 1,
+            message: format!(
+                "a vox daemon is already running for {}; attach the anchor to it: vox node \
+                 attach {node}",
+                account.data_root.display()
+            ),
+        });
+    };
+    let router = serving.router.clone();
+    router.attach_kept();
+    if let Some(creators) = serve_only {
+        println!(
+            "vox node: serving only rooms made by the {} identit{} this profile trusts",
+            creators.len(),
+            if creators.len() == 1 { "y" } else { "ies" }
+        );
+        router.serve_only(&node, creators);
     }
-    rt.block_on(async {
+    rt.block_on(router.attach(&node, None, None, Vec::new(), Vec::new()))
+        .map_err(|r| AppError::Usage(r.to_string()))?;
+    let Some(node) = router.handle_of(&node) else {
+        return Err(AppError::Usage(format!(
+            "node {node} detached as it attached"
+        )));
+    };
+    // Kept for the anchors file the loop below writes (M17.4).
+    let anchors_paths = paths.clone();
+    println!("vox node: identity {fp}");
+    println!("vox node: control socket {}", account.socket().display());
+    let signal = rt.block_on(async {
         // Addresses are discovered on a task after start-up (a route probe and a
         // gateway request); print the anchor specs once they are known, then serve.
         let mut printed: Vec<String> = Vec::new();
@@ -596,8 +611,6 @@ pub fn run_node(
         // `kill` send, SIGHUP and SIGQUIT stop it the same way. Left to their defaults they killed
         // it on the spot, closes unsent — SIGQUIT with a core dump — and every peer counted the
         // anchor as connected until it stopped answering.
-        let interrupted = stop_requested("vox node");
-        tokio::pin!(interrupted);
         loop {
             tokio::select! {
                 _ = ticks.tick() => {
@@ -791,16 +804,15 @@ pub fn run_node(
                         }
                     }
                 }
-                signal = &mut interrupted => {
-                    println!("vox node: stopped by {}", signal.name());
-                    println!("vox node: shutting down");
-                    let _ = node.apply(NodeCommand::Shutdown).await;
-                    break;
-                }
+                signal = &mut interrupted => break signal,
             }
         }
     });
-    Ok(())
+    println!("vox node: stopped by {}", signal.name());
+    println!("vox node: shutting down");
+    let stopped = crate::daemon::stop_daemon(rt, &router, &serving.presence, Some(signal));
+    drop(serving);
+    stopped
 }
 
 /// How long `vox daemon` waits for its node to stop on SIGTERM or Ctrl-C before leaving anyway.

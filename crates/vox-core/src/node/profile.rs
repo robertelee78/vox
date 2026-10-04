@@ -39,6 +39,10 @@ const META_CREATED: &str = "identity_created";
 
 /// The operation a failure to write the vault is reported as, so it is named as the vault's.
 pub const VAULT_WRITE: &str = "write the identity file";
+/// The [`Error::Path`] op of a failed rewrite of an existing identity's vault (the v1 → v2
+/// migration): the identity is still there, in its old file, which is not what
+/// [`VAULT_WRITE`]'s "no identity was made" says.
+pub const VAULT_REWRITE: &str = "rewrite the identity file";
 
 /// An opened profile: sealed vault + store, and the unlocked identity when
 /// unlocked.
@@ -289,7 +293,16 @@ impl Profile {
         self.store.rewrite_fresh()?;
         let profile = Argon2Profile::from_id(self.vault.profile_id)?;
         let vault = IdentityVault::seal_with_salt(backup, passphrase, profile, &self.vault.salt)?;
-        write_private_file(&self.paths.vault_file(), &vault.to_canonical_vec())?;
+        // Named as the vault's, not the store's: it is the file that could not be written.
+        write_private_file(&self.paths.vault_file(), &vault.to_canonical_vec()).map_err(
+            |e| match e {
+                Error::Path { detail, .. } => Error::Path {
+                    op: VAULT_REWRITE,
+                    detail,
+                },
+                other => other,
+            },
+        )?;
         self.vault = vault;
         Ok(())
     }

@@ -78,6 +78,15 @@ const IDLE_LINGER: Duration = Duration::from_secs(1);
 /// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
 /// because serving that socket is this command's entire purpose.
 pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
+    if args.as_detached {
+        // **None of its starter's descriptors** (ADR-026 S-2): stdin is /dev/null and stdout and
+        // stderr are `.daemon/log`, as the client set them; anything else it inherited — a
+        // harness's pipe that reached the hook without close-on-exec, say — is closed here,
+        // before anything of the daemon's own (its runtime) is open. Kept open, it held the
+        // hook's output pipe for the daemon's life, and a harness that reads its hook to the end
+        // waited for ever (#405, the two_hooks hang).
+        close_inherited_fds();
+    }
     // Refused before anything is read or unlocked: a metrics endpoint the network can
     // reach names every peer and room this node talks to (PRD-001 R38).
     if let Some(addr) = args.metrics {
@@ -126,67 +135,17 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         stop_requested("vox daemon")
     });
     let named = named_node(args)?;
-    let Some(lock) = account
-        .try_lock()
-        .map_err(|e| AppError::Usage(e.to_string()))?
+    let Some(serving) = take_account(
+        &account,
+        &rt,
+        args.profile.listen,
+        &args.profile.anchors,
+        named.as_ref(),
+    )?
     else {
         return already_running(args, &account, rt, &mut stop, named);
     };
-    let lock = Arc::new(Mutex::new(lock));
-    write_pid(&lock);
-    // Under the lock, once: an older layout moves into `nodes/` (F-3).
-    let report = vox_core::node::layout::migrate_held(&account, named.as_ref())
-        .map_err(|e| AppError::Usage(e.to_string()))?;
-    for (from, node) in &report.moved {
-        eprintln!("vox daemon: moved {} to node {node}", from.display());
-    }
-    for (node, anchor) in &report.split {
-        eprintln!("vox daemon: node {node}'s anchor key is now node {anchor}");
-    }
-
-    let mut anchors = vox_core::nat::bootstrap::BootstrapSet::new();
-    for spec in &args.profile.anchors {
-        if !spec.trim().is_empty() {
-            vox_core::node::link::merge_anchor_spec(&mut anchors, spec)
-                .map_err(|e| AppError::Usage(e.to_string()))?;
-        }
-    }
-    // **The daemon's one presence** (ADR-026 D-3, ADR-012 N-41–N-45): one socket and endpoint
-    // for every node it attaches, on the data root's kept port (`.daemon/port`), with the relay
-    // limits of `.daemon/config`.
-    let limits = vox_core::node::circuitstream::RelayLimits::read(&account.daemon_config_file())
-        .map_err(AppError::Usage)?;
-    let presence = rt
-        .block_on(async {
-            let (shared, moved) = vox_core::node::presence::NetPresence::bind_kept(
-                args.profile.listen,
-                &account.port_file(),
-                None,
-            )?;
-            if let Some(moved) = moved {
-                eprintln!("vox daemon: {moved}");
-            }
-            Ok::<_, vox_core::error::Error>(vox_core::node::presence::NetPresence::start(shared))
-        })
-        .map_err(|e| AppError::Usage(format!("listen on {}: {e}", args.profile.listen)))?;
-    presence.ledger().set_limits(limits);
-    let router = Router::new(
-        account.clone(),
-        rt.handle().clone(),
-        Defaults {
-            bind: shared_presence(&presence),
-            anchors,
-            anchor_specs: args.profile.anchors.clone(),
-            listen: args.profile.listen.to_string(),
-            patience: shutdown_patience(),
-        },
-    );
-    // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
-    let _socket = rt
-        .block_on(async {
-            vox_core::node::ipc::bind_account(Arc::new(router.clone()), account.socket())
-        })
-        .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
+    let router = serving.router.clone();
     router.attach_kept();
 
     if let Some(addr) = args.metrics {
@@ -276,7 +235,122 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             () = idle => None,
         }
     });
-    stop_daemon(rt, &router, &presence, signal)
+    stop_daemon(rt, &router, &serving.presence, signal)
+}
+
+/// What a daemon that holds its account runs: its router, its account socket and its lock, each
+/// held for as long as this is.
+pub(crate) struct Serving {
+    /// The router.
+    pub router: Router,
+    /// The daemon's one presence, closed when it stops (N-43).
+    pub presence: Arc<vox_core::node::presence::NetPresence>,
+    _socket: vox_core::node::ipc::IpcServer,
+    _lock: Arc<Mutex<std::fs::File>>,
+}
+
+/// Become the account's daemon (D-1): take its lock, move an older layout into `nodes/` (F-3),
+/// and serve the account socket (C-1) through a new router. `None` when another daemon holds
+/// the lock.
+///
+/// # Errors
+/// The lock or the migration fails, an `--anchor` is malformed, or the socket cannot be bound.
+pub(crate) fn take_account(
+    account: &Account,
+    rt: &tokio::runtime::Runtime,
+    listen: std::net::SocketAddr,
+    anchor_specs: &[String],
+    named: Option<&NodeName>,
+) -> Result<Option<Serving>, AppError> {
+    let Some(lock) = account
+        .try_lock()
+        .map_err(|e| AppError::Usage(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let lock = Arc::new(Mutex::new(lock));
+    write_pid(&lock);
+    // Under the lock, once: an older layout moves into `nodes/` (F-3).
+    let report = vox_core::node::layout::migrate_held(account, named)
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    for (from, node) in &report.moved {
+        eprintln!("vox daemon: moved {} to node {node}", from.display());
+    }
+    for (node, anchor) in &report.split {
+        eprintln!("vox daemon: node {node}'s anchor key is now node {anchor}");
+    }
+    let mut anchors = vox_core::nat::bootstrap::BootstrapSet::new();
+    for spec in anchor_specs {
+        if !spec.trim().is_empty() {
+            vox_core::node::link::merge_anchor_spec(&mut anchors, spec)
+                .map_err(|e| AppError::Usage(e.to_string()))?;
+        }
+    }
+    // **The daemon's one presence** (ADR-026 D-3, ADR-012 N-41–N-45): one socket and endpoint
+    // for every node it attaches, on the data root's kept port (`.daemon/port`), with the relay
+    // limits of `.daemon/config`.
+    let limits = vox_core::node::circuitstream::RelayLimits::read(&account.daemon_config_file())
+        .map_err(AppError::Usage)?;
+    let presence = rt
+        .block_on(async {
+            let (shared, moved) = vox_core::node::presence::NetPresence::bind_kept(
+                listen,
+                &account.port_file(),
+                None,
+            )?;
+            if let Some(moved) = moved {
+                eprintln!("vox daemon: {moved}");
+            }
+            Ok::<_, vox_core::error::Error>(vox_core::node::presence::NetPresence::start(shared))
+        })
+        .map_err(|e| AppError::Usage(format!("listen on {listen}: {e}")))?;
+    presence.ledger().set_limits(limits);
+    let router = Router::new(
+        account.clone(),
+        rt.handle().clone(),
+        Defaults {
+            bind: shared_presence(&presence),
+            anchors,
+            anchor_specs: anchor_specs.to_vec(),
+            listen: listen.to_string(),
+            patience: shutdown_patience(),
+        },
+    );
+    // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
+    let socket = rt
+        .block_on(async {
+            vox_core::node::ipc::bind_account(Arc::new(router.clone()), account.socket())
+        })
+        .map_err(|e| AppError::Usage(format!("control socket: {e}")))?;
+    Ok(Some(Serving {
+        router,
+        presence,
+        _socket: socket,
+        _lock: lock,
+    }))
+}
+
+/// Close every descriptor this process holds past stdin, stdout and stderr: what an auto-started
+/// daemon inherited from the client that started it. Called before anything of its own is open.
+fn close_inherited_fds() {
+    #[cfg(target_os = "macos")]
+    let dir = "/dev/fd";
+    #[cfg(target_os = "linux")]
+    let dir = "/proc/self/fd";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        // Listed first, closed after: the listing's own descriptor is among them, and closing it
+        // once the listing is dropped fails harmlessly.
+        let fds: Vec<i32> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for fd in fds.into_iter().filter(|fd| *fd > 2) {
+            let _ = nix::unistd::close(fd);
+        }
+    }
 }
 
 /// The node `vox daemon` was named (C-3's first step): `--node` / `VOX_NODE`, or a `--profile`
@@ -441,7 +515,7 @@ fn refusal_words(r: &Refusal, account: &Account, node: &NodeName) -> String {
 
 /// Detach every node and end the daemon, with the exit rules `vox daemon` has always had: a stop
 /// that finished exits 0 saying which signal; one that gave up says so and fails (V210-93).
-fn stop_daemon(
+pub(crate) fn stop_daemon(
     rt: tokio::runtime::Runtime,
     router: &Router,
     presence: &vox_core::node::presence::NetPresence,

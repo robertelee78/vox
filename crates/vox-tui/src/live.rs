@@ -349,7 +349,7 @@ impl DaemonCore {
     ) -> CommandStatus {
         let paths = match self.account.node_paths(&self.node) {
             Ok(p) => p,
-            Err(_) => return CommandStatus::Failed(UiError::Storage),
+            Err(e) => return fault_status(vox_core::node::actor::fault_of(&e)),
         };
         let pass = Zeroizing::new(passphrase.expose_secret().to_owned());
         // Whether it had one when this TUI looked (at start, or at `:node`): one there now that was
@@ -406,7 +406,8 @@ impl DaemonCore {
             Ok(Err(vox_core::error::Error::ProfileBusy)) => {
                 CommandStatus::Failed(UiError::ProfileBusy)
             }
-            Ok(Err(_)) => CommandStatus::Failed(UiError::Storage),
+            // The identity file, the store, or a directory: in the fault's own words.
+            Ok(Err(e)) => fault_status(vox_core::node::actor::fault_of(&e)),
             Err(_) => CommandStatus::Failed(UiError::Internal),
         }
     }
@@ -942,23 +943,60 @@ fn lost_status(lost: Lost) -> CommandStatus {
     }
 }
 
-/// A daemon's refusal of a `Use`, as the TUI says it.
+/// A daemon's refusal of a `Use`, as the TUI says it: a failed unlock in the daemon's words,
+/// which carry the fault's own (the identity file that could not be written, say), on one line.
 fn refused(refusal: &Refusal) -> CommandStatus {
     match refusal {
         Refusal::WrongPassphrase { .. } => CommandStatus::Failed(UiError::WrongPassphrase),
         Refusal::NodeInUse { .. } => CommandStatus::Failed(UiError::ProfileBusy),
         Refusal::NoIdentity { .. } => CommandStatus::Failed(UiError::NoIdentity),
-        other => CommandStatus::Said(other.to_string()),
+        other => CommandStatus::Said(one_line(&other.to_string())),
     }
 }
 
-/// A node's error answer, as the TUI says it: the fault it names, mapped onto the UI's closed set,
-/// or the node's own sentence when it names none.
+/// A node's error answer, as the TUI says it: the fault it names, mapped onto the UI's closed set
+/// — or in the fault's own words where the closed set has none that fit — or the node's own
+/// sentence when it names none.
 fn failed(reason: &str) -> CommandStatus {
     match Fault::from_explanation(reason) {
-        Some(f) => CommandStatus::Failed(ui_error(f)),
+        Some(f) => fault_status(f),
         None => CommandStatus::Said(reason.lines().next().unwrap_or_default().to_owned()),
     }
+}
+
+/// How the TUI says fault `f`: the UI's closed set where it has the words, else the words the CLI
+/// prints for `f`, on one line (R36: a refusal names its own cause).
+fn fault_status(f: Fault) -> CommandStatus {
+    if in_its_own_words(f) {
+        CommandStatus::Said(one_line(f.explain()))
+    } else {
+        CommandStatus::Failed(ui_error(f))
+    }
+}
+
+/// Faults the UI's closed set would say wrongly: a file that could not be written is named by
+/// the fault and by nothing in the set, and "may end it" is not what an admin change or an idle
+/// end is refused for, nor is "no reachable peer" a member that left the room.
+const fn in_its_own_words(f: Fault) -> bool {
+    matches!(
+        f,
+        Fault::Storage
+            | Fault::IdentityFileUnwritable
+            | Fault::IdentityFileNotRewritten
+            | Fault::RetentionFileUnwritable
+            | Fault::NotCreator
+            | Fault::NotRoomCreator
+            | Fault::ResponderLeft
+    )
+}
+
+/// `text`'s lines as one status line: a fault's advice follows its cause after a dash.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" — ")
 }
 
 /// Map a node [`Fault`] onto the UI's closed error set.
@@ -973,7 +1011,10 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
         Fault::TooLong => UiError::TooLong,
         Fault::KeyringFull => UiError::KeyringFull,
-        Fault::Storage | Fault::IdentityFileUnwritable => UiError::Storage,
+        Fault::Storage
+        | Fault::IdentityFileUnwritable
+        | Fault::IdentityFileNotRewritten
+        | Fault::RetentionFileUnwritable => UiError::Storage,
         Fault::SealedUnreadable => UiError::SealedUnreadable,
         Fault::ShuttingDown | Fault::Internal => UiError::Internal,
         // A link that will not parse is malformed input, not a network failure.
