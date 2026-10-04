@@ -2,35 +2,29 @@
 //!
 //! A process may host several nodes. The tunnel registries, the finishing count, the stuck-after
 //! setting and the mux's circuit tables used to be one per process, which was right only while a
-//! process was one node. Each is now filed under its node, and this gate drives two nodes, `A`
-//! and `B`, side by side in one process, each on its own endpoint, against real QUIC peers on
-//! loopback:
+//! process was one node. Each is now filed under its node.
 //!
-//! 1. **A lists and closes only its own tunnels.** A's list holds A's tunnel and not B's; A
-//!    closing by B's member prefix, or by B's tunnel number, closes nothing of B's; A closing its
-//!    own by number closes it, and only A's closed list then shows it.
-//! 2. **A's stuck tunnel closes by A's setting while B's lives.** A gives a stuck tunnel 2 s, B
-//!    600 s. Both tunnels have bytes waiting for an application that reads nothing: A's is closed
-//!    as stuck in about 2 s, B's is still live after it.
-//! 3. **A's stop does not wait for B's finishing tunnel.** B's tunnel has sent its last bytes to
+//! **What a person sees is proved on the shipped binary** (#410): a node listing and closing only
+//! its own tunnels, and a stuck tunnel closing by its own node's setting, are
+//! `two_nodes_in_one_daemon_keep_their_own_tunnels_proof` — one daemon holding two nodes, read
+//! through `vox status --json --node` and closed through `vox tunnel close --node`. This gate keeps
+//! the two parts with no surface a person sees, driving two nodes, `A` and `B`, side by side in
+//! one process, each on its own endpoint, against real QUIC peers on loopback:
+//!
+//! 1. **A's stop does not wait for B's finishing tunnel.** B's tunnel has sent its last bytes to
 //!    a peer that is frozen, so it waits for an acknowledgement (up to 10 s). A waiting for its
 //!    own tunnels to be acknowledged returns at once; B waiting for its own does not.
-//! 4. **Two nodes hold circuits to one peer without collision, and a circuit is answered only by
+//! 2. **Two nodes hold circuits to one peer without collision, and a circuit is answered only by
 //!    its own node** (Tr4). On one shared mux, A and B each attach a circuit to the same peer `X`:
 //!    two addresses, each found under its own node; dropping A's leaves B's. A circuit of A's is
 //!    not one B may answer on.
 //!
-//! In-process, not the shipped binary: today's binary runs one node per process, so two nodes in
-//! one process exist only here until the daemon hosts them (ADR-026 §10 proof 4 is the
-//! real-binary form, after D5/D6).
+//! **Which side a red is on.** A node waiting on another node's state, or answering on its circuit,
+//! is `PRODUCT:`. A premise that did not hold (B's tunnel not finishing, a peer that would not
+//! connect) is `APPARATUS:` / `CANNOT MEASURE`.
 //!
-//! **Which side a red is on.** A node seeing, closing, timing out or waiting on another node's
-//! state is `PRODUCT:`. A premise that did not hold (B's tunnel not finishing, a peer that would
-//! not connect) is `APPARATUS:` / `CANNOT MEASURE`.
-//!
-//! Mutants (each reverted after): remove the owner filter in `close_tunnels` → red on 1;
-//! `LocalNode::stuck_after` read from one process-wide value → red on 2; one global finishing
-//! counter → red on 3; `MuxSocket::serves_on` without the owner check → red on 4.
+//! Mutants (each reverted after): one global finishing counter → red on 1;
+//! `MuxSocket::serves_on` without the owner check → red on 2.
 
 #![cfg(unix)]
 
@@ -44,12 +38,8 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
 
-use vox_core::hash::Digest32;
 use vox_core::identity::composite::SoftwareRootSigner;
-use vox_core::transport::quic::{
-    close_tunnels, closed_tunnels, live_tunnels, unix_now, TunnelSelector, VoxConnection,
-    VoxEndpoint,
-};
+use vox_core::transport::quic::{unix_now, VoxConnection, VoxEndpoint};
 use vox_core::tunnel::session;
 
 fn loopback() -> SocketAddr {
@@ -58,19 +48,6 @@ fn loopback() -> SocketAddr {
 
 fn signer() -> Arc<SoftwareRootSigner> {
     Arc::new(SoftwareRootSigner::generate().expect("APPARATUS: generate an identity"))
-}
-
-/// A peer endpoint accepting on loopback; every connection it accepts is sent to the caller.
-fn host(ep: Arc<VoxEndpoint>) -> tokio::sync::mpsc::UnboundedReceiver<VoxConnection> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Ok(Some(conn)) = ep.accept(unix_now()).await {
-            if tx.send(conn).is_err() {
-                break;
-            }
-        }
-    });
-    rx
 }
 
 /// `local` dials `peer` and both ends' connections come back: (local's, peer's).
@@ -105,202 +82,6 @@ async fn tcp_pair() -> (TcpStream, TcpStream) {
         spliced.expect("APPARATUS: tcp accept").0,
         app.expect("APPARATUS: tcp connect"),
     )
-}
-
-fn member_prefix(id: &Digest32) -> String {
-    vox_core::node::link::b32_encode(id)
-        .chars()
-        .take(12)
-        .collect()
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "in-process gate for ADR-026 P-1 (#402); run on demand"]
-async fn a_node_lists_and_closes_only_its_own_tunnels() {
-    watchdog::arm();
-    let a = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind A");
-    let b = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind B");
-    let x = Arc::new(VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind X"));
-    let y = Arc::new(VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind Y"));
-    let (mut at_x, mut at_y) = (host(Arc::clone(&x)), host(Arc::clone(&y)));
-    let (a_to_x, _x_side) = connect(&a, &x, &mut at_x).await;
-    let (b_to_y, _y_side) = connect(&b, &y, &mut at_y).await;
-    let (ida, idb) = (a.local_id(), b.local_id());
-    assert_eq!(
-        a_to_x.local_id(),
-        ida,
-        "APPARATUS: A's connection is not A's"
-    );
-
-    let credit_a = a_to_x
-        .carry_tunnel("a-service", true)
-        .expect("APPARATUS: A's tunnel");
-    let credit_b = b_to_y
-        .carry_tunnel("b-service", true)
-        .expect("APPARATUS: B's tunnel");
-    let listed_a = live_tunnels(&ida);
-    let listed_b = live_tunnels(&idb);
-    assert!(
-        listed_a.iter().all(|t| t.service == "a-service") && listed_a.len() == 1,
-        "PRODUCT: A's tunnel list is not A's alone: {listed_a:?}"
-    );
-    assert!(
-        listed_b.iter().all(|t| t.service == "b-service") && listed_b.len() == 1,
-        "PRODUCT: B's tunnel list is not B's alone: {listed_b:?}"
-    );
-    let b_number = listed_b[0].id;
-
-    // A, closing by B's member's prefix and by B's tunnel number, closes nothing.
-    let by_member = close_tunnels(
-        &ida,
-        &TunnelSelector {
-            member: Some(member_prefix(&y.local_id())),
-            ..Default::default()
-        },
-        "closed by a person on this side",
-    )
-    .expect("PRODUCT: A's close by B's member was refused, not empty");
-    let by_number = close_tunnels(
-        &ida,
-        &TunnelSelector {
-            id: Some(b_number),
-            ..Default::default()
-        },
-        "closed by a person on this side",
-    )
-    .expect("PRODUCT: A's close by B's number was refused, not empty");
-    assert!(
-        by_member.is_empty() && by_number.is_empty(),
-        "PRODUCT: A closed B's tunnel: by member {by_member:?}, by number {by_number:?}"
-    );
-    let b_asked =
-        tokio::time::timeout(Duration::from_millis(300), credit_b.watch().close_asked()).await;
-    assert!(
-        b_asked.is_err(),
-        "PRODUCT: B's tunnel was asked to close by A: {b_asked:?}"
-    );
-
-    // A's own, by number, is closed, and only A's closed list says so.
-    let a_number = listed_a[0].id;
-    let closed = close_tunnels(
-        &ida,
-        &TunnelSelector {
-            id: Some(a_number),
-            ..Default::default()
-        },
-        "closed by a person on this side",
-    )
-    .expect("PRODUCT: A's close of its own tunnel was refused");
-    assert_eq!(closed.len(), 1, "PRODUCT: A could not close its own tunnel");
-    drop(credit_a);
-    assert!(
-        closed_tunnels(&ida).iter().any(|t| t.id == a_number),
-        "PRODUCT: A's closed list misses the tunnel A closed"
-    );
-    assert!(
-        closed_tunnels(&idb).is_empty(),
-        "PRODUCT: B's closed list shows a tunnel B never closed: {:?}",
-        closed_tunnels(&idb)
-    );
-    assert_eq!(
-        live_tunnels(&idb).len(),
-        1,
-        "PRODUCT: B's tunnel left B's list"
-    );
-    drop(credit_b);
-}
-
-/// Carry a tunnel on `conn` (the node's end) whose bytes the application never reads: `peer`
-/// opens the stream and writes without end, the node splices it into a TCP connection whose far
-/// end reads nothing. The splice's result arrives on the returned channel when it ends.
-async fn tunnel_nobody_reads(
-    conn: Arc<VoxConnection>,
-    peer: Arc<VoxConnection>,
-) -> (
-    tokio::sync::oneshot::Receiver<Instant>,
-    tokio::task::JoinHandle<()>,
-    TcpStream,
-) {
-    let credit = conn
-        .carry_tunnel("stuck-service", false)
-        .expect("APPARATUS: carry the tunnel");
-    let (mut send, recv) = peer.open_stream().await.expect("APPARATUS: open");
-    let writer = tokio::spawn(async move {
-        let chunk = vec![7u8; 64 * 1024];
-        let _ = recv;
-        while send.write_all(&chunk).await.is_ok() {}
-    });
-    let (node_send, node_recv) =
-        tokio::time::timeout(Duration::from_secs(10), conn.accept_stream())
-            .await
-            .expect("APPARATUS: the stream did not arrive")
-            .expect("APPARATUS: accept the stream");
-    let (spliced, app) = tcp_pair().await;
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let watch = credit.watch();
-        let _ = session::splice_watched(node_send, node_recv, spliced, watch).await;
-        // The credit first: its drop is what files the tunnel on its node's closed list, so the
-        // end is signalled only once the list says it (#410). Signalled first, the gate read the
-        // list in the moment between and found it empty.
-        drop(credit);
-        let _ = done_tx.send(Instant::now());
-    });
-    (done_rx, writer, app)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "in-process gate for ADR-026 P-1 (#402); run on demand"]
-async fn a_stuck_tunnel_closes_by_its_own_nodes_setting() {
-    watchdog::arm();
-    let a = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind A");
-    let b = VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind B");
-    // Set A's, then B's: a process-wide setting would leave both at B's 600 s.
-    a.local().set_stuck_after(Duration::from_secs(2));
-    b.local().set_stuck_after(Duration::from_secs(600));
-    let x = Arc::new(VoxEndpoint::bind(signer(), loopback()).expect("APPARATUS: bind X"));
-    let mut at_x = host(Arc::clone(&x));
-    let (a_to_x, x_to_a) = connect(&a, &x, &mut at_x).await;
-    let (b_to_x, x_to_b) = connect(&b, &x, &mut at_x).await;
-    let started = Instant::now();
-    let (a_done, a_writer, _a_app) = tunnel_nobody_reads(Arc::new(a_to_x), Arc::new(x_to_a)).await;
-    let (mut b_done, b_writer, _b_app) =
-        tunnel_nobody_reads(Arc::new(b_to_x), Arc::new(x_to_b)).await;
-
-    let a_ended = tokio::time::timeout(Duration::from_secs(20), a_done)
-        .await
-        .map(|r| r.map(|at| at.duration_since(started)));
-    let Ok(Ok(after)) = a_ended else {
-        panic!("PRODUCT: A's stuck tunnel was not closed within 20 s, with A's setting at 2 s");
-    };
-    assert!(
-        after >= Duration::from_secs(2),
-        "PRODUCT: A's tunnel closed after {after:?}, before A's 2 s"
-    );
-    let a_closed = closed_tunnels(&a.local_id());
-    assert!(
-        a_closed.iter().any(|t| t.why.contains("stuck")),
-        "PRODUCT: A's closed list does not say its tunnel was closed as stuck: {a_closed:?}"
-    );
-    // B's waited as long, and more: it lives, by B's own 600 s.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert!(
-        b_done.try_recv().is_err(),
-        "PRODUCT: B's tunnel ended with A's, though B gives a stuck tunnel 600 s"
-    );
-    assert_eq!(
-        live_tunnels(&b.local_id()).len(),
-        1,
-        "PRODUCT: B's tunnel is not on B's list"
-    );
-    assert!(
-        closed_tunnels(&b.local_id()).is_empty(),
-        "PRODUCT: B's closed list holds a tunnel: {:?}",
-        closed_tunnels(&b.local_id())
-    );
-    a_writer.abort();
-    b_writer.abort();
-    eprintln!("A's stuck tunnel closed after {after:?}; B's lived past it");
 }
 
 #[test]
