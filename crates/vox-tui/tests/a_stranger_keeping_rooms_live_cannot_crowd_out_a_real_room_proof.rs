@@ -56,6 +56,8 @@
 
 #[path = "support/hostile.rs"]
 mod hostile;
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -68,7 +70,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hostile::{create_room, daemon, fingerprint, free_port, profile_dir, stranger, vox_in, Rt};
+use hostile::{create_room, daemon, fingerprint, profile_dir, stranger, vox_in, Rt};
 use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::hash::Digest32;
 use vox_core::identity::composite::{RootSigner, SoftwareRootSigner};
@@ -107,14 +109,17 @@ fn policy() -> ChannelPolicy {
     }
 }
 
-/// Start `vox node` dual-stack on `[::]:port`, with `env`; returns it with its IPv4 spec and
-/// fingerprint.
+/// Start `vox node` dual-stack on `[::]:port`, with `env`; returns it with its IPv4 spec, its
+/// fingerprint and its port. Port 0 lets it choose, and the port is read back from its own spec
+/// (#410): a port the proof picked ahead was taken by another program before the anchor bound it.
+/// A restart passes the port it had, which another program can still have taken in between; that
+/// exits the anchor saying so, and the red says APPARATUS (`VoxProc::expect_line`).
 fn dual_anchor(
     name: &str,
     data: &Path,
     port: u16,
     env: &[(&str, &str)],
-) -> (VoxProc, String, Digest32) {
+) -> (VoxProc, String, Digest32, u16) {
     let mut p = VoxProc::spawn_env(
         name,
         data,
@@ -132,7 +137,8 @@ fn dual_anchor(
     let fp = spec.split('@').next().expect("PRODUCT: fp@addr").to_owned();
     let id =
         vox_core::node::link::b32_decode(&fp, "anchor fingerprint").expect("PRODUCT: fingerprint");
-    (p, format!("{fp}@/ip4/127.0.0.1/udp/{port}"), id)
+    let port = ports::spec_port(&spec);
+    (p, format!("{fp}@/ip4/127.0.0.1/udp/{port}"), id, port)
 }
 
 /// The stranger's second network, as the reds name it.
@@ -495,14 +501,13 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
     );
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
-    let port = free_port();
-    let (_anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    let (_anchor, spec, anchor_id, port) = dual_anchor("anchor", &anchor_dir, 0, &[]);
     let anchor6: SocketAddr = format!("[::1]:{port}")
         .parse()
         .expect("APPARATUS: a socket address the proof wrote");
     fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
-    let _victim = daemon("victim", &victim_dir, free_port(), &spec, &pass_file);
+    let _victim = daemon("victim", &victim_dir, 0, &spec, &pass_file);
     let (first, _) = create_room(&victim_dir, "first", ROOM_PASS);
     std::thread::sleep(Duration::from_secs(3));
 
@@ -531,7 +536,7 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
         "PRODUCT: a room created after a stranger filled the anchor with {ROOMS} rooms it keeps live is not \
          on the anchor: the stranger crowded it out"
     );
-    let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
+    let _joiner = daemon("joiner", &joiner_dir, 0, &spec, &pass_file);
     real_join(
         &joiner_dir,
         &second_link,
@@ -552,19 +557,18 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
     );
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
-    let port = free_port();
     let skew = AWAY_MS.to_string();
-    let (_anchor, spec, anchor_id) = dual_anchor(
+    let (_anchor, spec, anchor_id, port) = dual_anchor(
         "anchor",
         &anchor_dir,
-        port,
+        0,
         &[("VOX_TEST_CLOCK_STEP_MS", &skew)],
     );
     let anchor6: SocketAddr = format!("[::1]:{port}")
         .parse()
         .expect("APPARATUS: a socket address the proof wrote");
     fingerprint(&victim_dir);
-    let _victim = daemon("victim", &victim_dir, free_port(), &spec, &pass_file);
+    let _victim = daemon("victim", &victim_dir, 0, &spec, &pass_file);
     let (away, _) = create_room(&victim_dir, "away", ROOM_PASS);
     let rt = Rt::new();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -613,12 +617,11 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
     );
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
-    let port = free_port();
-    let (_anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    let (_anchor, spec, anchor_id, port) = dual_anchor("anchor", &anchor_dir, 0, &[]);
     let nets = Networks::to(port);
     fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
-    let _victim = daemon("victim", &victim_dir, free_port(), &spec, &pass_file);
+    let _victim = daemon("victim", &victim_dir, 0, &spec, &pass_file);
     let (room, link) = create_room(&victim_dir, "first", ROOM_PASS);
     let rt = Rt::new();
     await_published(&rt, nets.anchor6, anchor_id, room);
@@ -647,7 +650,7 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
         "PRODUCT: a stranger re-sent a room's own records from its network and its flood then evicted the \
          room in use from the anchor ({kept:?}): the re-send credited the room to the stranger"
     );
-    let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
+    let _joiner = daemon("joiner", &joiner_dir, 0, &spec, &pass_file);
     real_join(
         &joiner_dir,
         &link,
@@ -668,12 +671,11 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     );
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
-    let port = free_port();
-    let (anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    let (anchor, spec, anchor_id, port) = dual_anchor("anchor", &anchor_dir, 0, &[]);
     let nets = Networks::to(port);
     fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
-    let victim = daemon("victim", &victim_dir, free_port(), &spec, &pass_file);
+    let victim = daemon("victim", &victim_dir, 0, &spec, &pass_file);
     let (room, link) = create_room(&victim_dir, "first", ROOM_PASS);
     let rt = Rt::new();
     await_published(&rt, nets.anchor6, anchor_id, room);
@@ -684,7 +686,7 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     // The victim is held still while the anchor restarts, so the stranger is first to the board.
     signal(&victim, "-STOP");
     drop(anchor);
-    let (_anchor, spec2, id2) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    let (_anchor, spec2, id2, _) = dual_anchor("anchor", &anchor_dir, port, &[]);
     assert!(
         spec2 == spec && id2 == anchor_id,
         "PRODUCT (staging): the restarted anchor came back as {spec2}, not {spec}"
@@ -742,7 +744,7 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
          though its member resumed {REPUBLISH_SETTLE:?} before the flood: the stranger put the \
          room back first, and the member's own puts credited nothing"
     );
-    let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
+    let _joiner = daemon("joiner", &joiner_dir, 0, &spec, &pass_file);
     real_join(
         &joiner_dir,
         &link,
@@ -771,15 +773,14 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     );
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
-    let port = free_port();
-    let (anchor, spec, anchor_id) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    let (anchor, spec, anchor_id, port) = dual_anchor("anchor", &anchor_dir, 0, &[]);
     let nets = Networks::to(port);
     fingerprint(&creator_dir);
     fingerprint(&member_dir);
     fingerprint(&joiner_dir);
-    let creator = daemon("creator", &creator_dir, free_port(), &spec, &pass_file);
+    let creator = daemon("creator", &creator_dir, 0, &spec, &pass_file);
     let (room, creator_link) = create_room(&creator_dir, "first", ROOM_PASS);
-    let member = daemon("member", &member_dir, free_port(), &spec, &pass_file);
+    let member = daemon("member", &member_dir, 0, &spec, &pass_file);
     let (ok, out, err) = vox_in(
         &member_dir,
         &[
@@ -841,7 +842,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     signal(&creator, "-STOP");
     signal(&member, "-STOP");
     drop(anchor);
-    let (_anchor, spec2, id2) = dual_anchor("anchor", &anchor_dir, port, &[]);
+    let (_anchor, spec2, id2, _) = dual_anchor("anchor", &anchor_dir, port, &[]);
     assert!(
         spec2 == spec && id2 == anchor_id,
         "PRODUCT (staging): the restarted anchor came back as {spec2}, not {spec}"
@@ -904,7 +905,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
          its own record ({kept:?}): a member's own put of a record the board already holds credited \
          nothing, so the room was credited to no one with the flood"
     );
-    let _joiner = daemon("joiner", &joiner_dir, free_port(), &spec, &pass_file);
+    let _joiner = daemon("joiner", &joiner_dir, 0, &spec, &pass_file);
     real_join(
         &joiner_dir,
         &member_link,

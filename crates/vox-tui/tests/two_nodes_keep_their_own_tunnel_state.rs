@@ -240,8 +240,11 @@ async fn tunnel_nobody_reads(
     tokio::spawn(async move {
         let watch = credit.watch();
         let _ = session::splice_watched(node_send, node_recv, spliced, watch).await;
-        let _ = done_tx.send(Instant::now());
+        // The credit first: its drop is what files the tunnel on its node's closed list, so the
+        // end is signalled only once the list says it (#410). Signalled first, the gate read the
+        // list in the moment between and found it empty.
         drop(credit);
+        let _ = done_tx.send(Instant::now());
     });
     (done_rx, writer, app)
 }

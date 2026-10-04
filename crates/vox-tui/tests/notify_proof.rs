@@ -23,6 +23,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/world.rs"]
 mod world;
 
@@ -76,13 +78,6 @@ fn status(data: &Path) -> Value {
     assert!(ok, "PRODUCT: `vox status --json` failed: {err}");
     serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("PRODUCT: `vox status --json` printed no JSON ({e}): {out}"))
-}
-
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("APPARATUS: a free UDP port")
-        .port()
 }
 
 /// Wait until nothing holds UDP `port`, so a daemon can bind it again.
@@ -160,6 +155,13 @@ fn daemon(
     while Instant::now() < deadline {
         if vox_once(data, &args(&["room", "list"])).0 {
             return p;
+        }
+        if matches!(p.child.try_wait(), Ok(Some(_))) && ports::bind_refused(&p.transcript()) {
+            panic!(
+                "{}: {name}'s daemon on {listen}:\n{}",
+                ports::APPARATUS_BIND,
+                p.transcript()
+            );
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -264,11 +266,12 @@ fn scene(
     }
     before_alice(&alice_dir);
 
-    let (alice_port, bob_port) = (free_udp_port(), free_udp_port());
-    let alice = daemon(
-        "alice", &alice_dir, alice_port, &spec, &pass_file, alice_env,
-    );
-    let bob = daemon("bob", &bob_dir, bob_port, &spec, &pass_file, &[]);
+    let alice = daemon("alice", &alice_dir, 0, &spec, &pass_file, alice_env);
+    let bob = daemon("bob", &bob_dir, 0, &spec, &pass_file, &[]);
+    // The port bob chose, from his own report, for his restart to come back on (#410).
+    let bob_port = ports::loopback_listen(&vox_once(&bob_dir, &args(&["status", "--json"])).1)
+        .expect("PRODUCT (staging): bob reports a loopback listen address")
+        .port();
 
     let (ok, out, err) = vox_in(
         &alice_dir,

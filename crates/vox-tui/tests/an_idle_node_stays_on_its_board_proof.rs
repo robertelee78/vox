@@ -55,6 +55,8 @@ optional_proof::not_run!(
     a_round_to_one_anchor_does_not_put_off_the_others
 );
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/world.rs"]
 mod world;
 
@@ -229,16 +231,9 @@ fn a_round_to_one_anchor_does_not_put_off_the_others() {
     idle_then_join(true);
 }
 
-/// A free loopback UDP port, for an anchor that must come back where it was.
-fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("APPARATUS: bind a socket")
-        .local_addr()
-        .expect("APPARATUS: read a socket the proof bound")
-        .port()
-}
-
-/// A `vox node` anchor listening on `port`, and its `--anchor` spec.
+/// A `vox node` anchor listening on `port` (0: its own choice, read back from its spec — #410), and
+/// its `--anchor` spec. A restart on a port another program took meanwhile reads as APPARATUS
+/// (`VoxProc::expect_line`).
 fn anchor_on(name: &str, data: &Path, port: u16, ttl: &str) -> (VoxProc, String) {
     let mut p = VoxProc::spawn_env(
         name,
@@ -294,10 +289,10 @@ fn idle_then_join(churn: bool) {
     let idpass = tmp.path().join("idpass");
     std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
 
-    let (anchor, spec) = anchor_on("anchor", &anchor_dir, free_port(), &ttl_s);
-    // Anchor B, only with `churn`: on a port it can come back to.
-    let second_port = free_port();
-    let mut second = churn.then(|| anchor_on("second", &second_dir, second_port, &ttl_s));
+    let (anchor, spec) = anchor_on("anchor", &anchor_dir, 0, &ttl_s);
+    // Anchor B, only with `churn`: on a port it can come back to, its own first choice.
+    let mut second = churn.then(|| anchor_on("second", &second_dir, 0, &ttl_s));
+    let second_port = second.as_ref().map_or(0, |(_, b)| ports::spec_port(b));
     let anchors = match &second {
         Some((_, b)) => format!("{spec},{}", b),
         None => spec.clone(),

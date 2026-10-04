@@ -63,13 +63,14 @@ mod watchdog;
 
 #[path = "support/attach.rs"]
 mod attach;
+#[path = "support/ports.rs"]
+mod ports;
 
 #[path = "support/syscalls.rs"]
 mod syscalls;
 
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -157,14 +158,17 @@ fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, S
     )
 }
 
-fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .map(|a| a.port())
-        .expect("APPARATUS: a free port")
+/// The loopback port the daemon at `dir` chose, from its own `vox status --json` (#410): a daemon
+/// starts on port 0 and its restarts come back on the port read here, never one picked ahead.
+fn listening_port(dir: &Path) -> u16 {
+    let (_, status, _) = vox(dir, &["status", "--json"], None);
+    ports::loopback_listen(&status)
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no loopback listen address in {status}"))
+        .port()
 }
 
-/// Start `vox daemon` on `port` with the identity passphrase piped in; `extra` is its environment.
+/// Start `vox daemon` on `port` (0: its own choice) with the identity passphrase piped in; `extra`
+/// is its environment.
 fn daemon(dir: &Path, port: u16, anchor: &str, tag: &str, extra: &[(&str, &Path)]) -> Proc {
     let err = std::fs::File::options()
         .create(true)
@@ -198,6 +202,13 @@ fn attached(dir: &Path, tag: &str) -> String {
         if ok {
             return out;
         }
+        let said =
+            std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default();
+        assert!(
+            !ports::bind_refused(&said),
+            "{}: {tag}'s daemon:\n{said}",
+            ports::APPARATUS_BIND
+        );
         last = err;
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -256,19 +267,15 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
     // ---- the anchor, and alice with a room --------------------------------------------------
     let anchor_dir = root.join("anchor");
     std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: create a staging directory");
-    let anchor_port = free_udp_port();
     let anchor_out = anchor_dir.join("node.out");
     let _anchor = Proc(
-        command(
-            &anchor_dir,
-            &["node", "--listen", &format!("127.0.0.1:{anchor_port}")],
-        )
-        .stdout(Stdio::from(
-            std::fs::File::create(&anchor_out).expect("APPARATUS: create a staging file"),
-        ))
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("APPARATUS: spawn the anchor"),
+        command(&anchor_dir, &["node", "--listen", "127.0.0.1:0"])
+            .stdout(Stdio::from(
+                std::fs::File::create(&anchor_out).expect("APPARATUS: create a staging file"),
+            ))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("APPARATUS: spawn the anchor"),
     );
     let t0 = Instant::now();
     let spec = loop {
@@ -285,12 +292,12 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
     let (ok, alice_fp, err) = vox(&alice, &["id"], None);
     assert!(ok, "PRODUCT (staging): vox id: {err}");
     let alice_fp = alice_fp.trim().to_owned();
-    let alice_port = free_udp_port();
-    let mut alice_daemon = daemon(&alice, alice_port, &spec, "alice", &env);
+    let mut alice_daemon = daemon(&alice, 0, &spec, "alice", &env);
     let before: BTreeSet<String> = attached(&alice, "alice")
         .split_whitespace()
         .map(str::to_owned)
         .collect();
+    let alice_port = listening_port(&alice);
     let (ok, _, err) = vox(
         &alice,
         &["room", "create", "--passphrase-file", "-", "--name", "r"],
@@ -336,9 +343,9 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         let bob_fp = bob_fp.trim().to_owned();
         let (ok, _, err) = vox(&bob, &["trust", "add", &alice_fp, "--name", "alice"], None);
         assert!(ok, "PRODUCT (staging): bob{k} trusts alice: {err}");
-        let bob_port = free_udp_port();
-        let mut bob_daemon = daemon(&bob, bob_port, &spec, "bob", &[]);
+        let mut bob_daemon = daemon(&bob, 0, &spec, "bob", &[]);
         attached(&bob, "bob");
+        let bob_port = listening_port(&bob);
         let (ok, _, err) = vox(
             &bob,
             &[
@@ -550,19 +557,15 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
     // ---- the anchor, and alice ---------------------------------------------------------------
     let anchor_dir = root.join("anchor");
     std::fs::create_dir_all(anchor_dir.join("cfg")).expect("APPARATUS: create a staging directory");
-    let anchor_port = free_udp_port();
     let anchor_out = anchor_dir.join("node.out");
     let _anchor = Proc(
-        command(
-            &anchor_dir,
-            &["node", "--listen", &format!("127.0.0.1:{anchor_port}")],
-        )
-        .stdout(Stdio::from(
-            std::fs::File::create(&anchor_out).expect("APPARATUS: create a staging file"),
-        ))
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("APPARATUS: spawn the anchor"),
+        command(&anchor_dir, &["node", "--listen", "127.0.0.1:0"])
+            .stdout(Stdio::from(
+                std::fs::File::create(&anchor_out).expect("APPARATUS: create a staging file"),
+            ))
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("APPARATUS: spawn the anchor"),
     );
     let t0 = Instant::now();
     let spec = loop {
@@ -579,9 +582,9 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
     let (ok, alice_fp, err) = vox(&alice, &["id"], None);
     assert!(ok, "PRODUCT (staging): vox id: {err}");
     let alice_fp = alice_fp.trim().to_owned();
-    let alice_port = free_udp_port();
-    let mut alice_daemon = daemon(&alice, alice_port, &spec, "alice", &env);
+    let mut alice_daemon = daemon(&alice, 0, &spec, "alice", &env);
     attached(&alice, "alice");
+    let alice_port = listening_port(&alice);
     let flushes = || {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
@@ -610,9 +613,9 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
         let (ok, host_fp, err) = vox(&host, &["id"], None);
         assert!(ok, "PRODUCT (staging): vox id: {err}");
         let host_fp = host_fp.trim().to_owned();
-        let host_port = free_udp_port();
-        let mut host_daemon = daemon(&host, host_port, &spec, "host", &[]);
+        let mut host_daemon = daemon(&host, 0, &spec, "host", &[]);
         attached(&host, "host");
+        let host_port = listening_port(&host);
         let (ok, _, err) = vox(&host, &["trust", "add", &alice_fp, "--name", "alice"], None);
         assert!(ok, "PRODUCT (staging): host{k} trusts alice: {err}");
         let (ok, _, err) = vox(

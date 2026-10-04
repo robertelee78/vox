@@ -45,6 +45,8 @@ mod watchdog;
 
 #[path = "support/attach.rs"]
 mod attach;
+#[path = "support/ports.rs"]
+mod ports;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -103,13 +105,14 @@ fn daemon(dir: &Path, tag: &str, stdin_lines: &str) -> Daemon {
     daemon_on(dir, tag, stdin_lines, "127.0.0.1:0")
 }
 
-/// A free loopback UDP port, so a node can come back on the address its peers know.
-fn free_port() -> String {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: a free UDP port");
-    format!(
-        "127.0.0.1:{}",
-        s.local_addr().expect("APPARATUS: a free UDP port").port()
-    )
+/// Where the daemon at `dir` listens, from its own `vox status --json` (#410): a daemon starts on
+/// port 0, and a restart that must come back on the address its peers know reads it here, never
+/// from a port picked ahead.
+fn listening(dir: &Path) -> String {
+    let (_, status, _) = vox(dir, &["status", "--json"], None);
+    ports::loopback_listen(&status)
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no loopback listen address in {status}"))
+        .to_string()
 }
 
 /// [`daemon`] listening on `listen`.
@@ -144,6 +147,19 @@ fn attached(dir: &Path, tag: &str) -> String {
         if ok {
             return out;
         }
+        // A daemon that could not bind where the proof put it measured nothing (#410).
+        let said: String = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".err"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect();
+        assert!(
+            !ports::bind_refused(&said),
+            "{}: {tag}'s daemon:\n{said}",
+            ports::APPARATUS_BIND
+        );
         last = err;
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -424,12 +440,14 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     // Alice's node keeps a minute, whatever the room says.
     std::fs::write(alice.join("cfg").join("retention"), "default 60\n")
         .expect("APPARATUS: alice's node retention file");
-    // Fixed addresses, so both can be restarted and still find each other below.
-    let (bob_at, alice_at) = (free_port(), free_port());
-    let bob_d = daemon_on(&bob, "bob", &format!("{IDENTITY}\n"), &bob_at);
+    // Each on a port of its own choosing, kept so both can be restarted on it below and still find
+    // each other.
+    let bob_d = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
     attached(&bob, "bob");
-    let alice_d = daemon_on(&alice, "alice", &format!("{IDENTITY}\n"), &alice_at);
+    let bob_at = listening(&bob);
+    let alice_d = daemon(&alice, "alice", &format!("{IDENTITY}\n"));
     attached(&alice, "alice");
+    let alice_at = listening(&alice);
     let room = room(&bob, &alice);
     let (ok, out, err) = vox(&bob, &["room", "retention", &room, "1w"], None);
     assert!(ok, "PRODUCT (staging): vox room retention 1w: {err}");

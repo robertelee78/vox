@@ -101,15 +101,20 @@ fn every_member_is_back_after_an_anchor_restart() {
     let anchor_dir = tmp.path().join("anchor");
     std::fs::create_dir_all(anchor_dir.join("cfg"))
         .expect("APPARATUS: cannot make a profile directory");
-    let port = world::free_dual_stack_port();
-    let listen = format!("[::]:{port}");
-    let mut anchor = VoxProc::spawn("anchor", &anchor_dir, &args(&["node", "--listen", &listen]));
+    // On a port of its own choosing, read back from its spec (#410); it comes back on that port.
+    let mut anchor = VoxProc::spawn(
+        "anchor",
+        &anchor_dir,
+        &args(&["node", "--listen", "[::]:0"]),
+    );
     let spec = anchor
         .expect_line("the anchor's --anchor spec", |l| {
             l.contains("@/ip4/127.0.0.1/udp/")
         })
         .trim()
         .to_owned();
+    let port = world::spec_addr(&spec).port();
+    let listen = format!("[::]:{port}");
     // The same anchor, dialled from each loopback address (each its own source, ADR-011 req 34).
     let specs = [
         world::respec(

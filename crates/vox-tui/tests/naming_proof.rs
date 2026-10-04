@@ -45,6 +45,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/world.rs"]
 mod world;
 
@@ -115,13 +117,6 @@ struct Member {
     daemon: Option<VoxProc>,
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("APPARATUS: a free UDP port")
-        .port()
-}
-
 fn member(tmp: &Path, name: &'static str) -> Member {
     let dir = tmp.join(name);
     std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: a profile directory");
@@ -137,7 +132,8 @@ fn member(tmp: &Path, name: &'static str) -> Member {
         name,
         dir,
         fp,
-        listen: format!("127.0.0.1:{}", free_udp_port()),
+        // Its own choice of port at its first start, kept for its restarts (#410).
+        listen: "127.0.0.1:0".to_owned(),
         daemon: None,
     }
 }
@@ -198,6 +194,15 @@ impl Member {
             {
                 break;
             }
+            if matches!(p.child.try_wait(), Ok(Some(_))) && ports::bind_refused(&p.transcript()) {
+                panic!(
+                    "{}: {}'s daemon on {}:\n{}",
+                    ports::APPARATUS_BIND,
+                    self.name,
+                    self.listen,
+                    p.transcript()
+                );
+            }
             if Instant::now() >= deadline {
                 panic!(
                     "PRODUCT (staging): {}'s daemon never held {rooms:?} \
@@ -207,6 +212,18 @@ impl Member {
                 );
             }
             std::thread::sleep(Duration::from_millis(200));
+        }
+        // The port it chose, read back from its own report, so a restart comes back on it (#410).
+        if self.listen.ends_with(":0") {
+            let (_, status, _) = vox(&self.dir, &["status", "--json"], None);
+            self.listen = ports::loopback_listen(&status)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "PRODUCT (staging): {} reports no loopback listen: {status}",
+                        self.name
+                    )
+                })
+                .to_string();
         }
         self.daemon = Some(p);
     }

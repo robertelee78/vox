@@ -42,6 +42,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/raw_sync.rs"]
 mod raw_sync;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -189,13 +191,6 @@ impl Drop for Rt {
     }
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .unwrap_or_else(|e| panic!("APPARATUS: no free UDP port: {e}"))
-        .port()
-}
-
 fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -> VoxProc {
     let p = VoxProc::spawn(
         name,
@@ -212,10 +207,18 @@ fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -
                 .expect("APPARATUS: the passphrase file's path is not UTF-8"),
         ]),
     );
+    let mut p = p;
     let deadline = Instant::now() + SETUP;
     while Instant::now() < deadline {
         if vox_once(data, &args(&["room", "list"])).0 {
             return p;
+        }
+        if matches!(p.child.try_wait(), Ok(Some(_))) && ports::bind_refused(&p.transcript()) {
+            panic!(
+                "{}: {name}'s daemon on {listen}:\n{}",
+                ports::APPARATUS_BIND,
+                p.transcript()
+            );
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -313,9 +316,12 @@ fn taken_first_key_after(halt: Halt) {
     let victim_id = fingerprint(&victim_dir);
     let mallory_id = fingerprint(&mallory_dir);
     let mallory_b32 = vox_core::node::link::b32_encode(&mallory_id);
-    let victim_port = free_udp_port();
-    let victim_listen = format!("127.0.0.1:{victim_port}");
-    let victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
+    let victim = daemon("victim", &victim_dir, "127.0.0.1:0", &spec, &pass_file);
+    // Where the victim chose to listen, from its own report (#410).
+    let victim_listen =
+        ports::loopback_listen(&vox_once(&victim_dir, &args(&["status", "--json"])).1)
+            .expect("PRODUCT (staging): the victim reports a loopback listen address")
+            .to_string();
     let mallory = daemon("mallory", &mallory_dir, "127.0.0.1:0", &spec, &pass_file);
 
     let (ok, out, err) = vox_in(

@@ -34,6 +34,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/raw_sync.rs"]
 mod raw_sync;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -118,14 +120,6 @@ impl Drop for Rt {
     }
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("APPARATUS: bind a socket")
-        .local_addr()
-        .expect("APPARATUS: read a socket the proof bound")
-        .port()
-}
-
 fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -> VoxProc {
     let p = VoxProc::spawn(
         name,
@@ -205,9 +199,12 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
     let victim_id = fingerprint(&victim_dir);
     let mallory_id = fingerprint(&mallory_dir);
     let mallory_b32 = vox_core::node::link::b32_encode(&mallory_id);
-    let victim_port = free_udp_port();
-    let victim_listen = format!("127.0.0.1:{victim_port}");
-    let mut victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
+    let mut victim = daemon("victim", &victim_dir, "127.0.0.1:0", &spec, &pass_file);
+    // Where the victim chose to listen, from its own report (#410).
+    let victim_listen =
+        ports::loopback_listen(&vox_once(&victim_dir, &args(&["status", "--json"])).1)
+            .expect("PRODUCT (staging): the victim reports a loopback listen address")
+            .to_string();
     let mallory = daemon("mallory", &mallory_dir, "127.0.0.1:0", &spec, &pass_file);
 
     let (ok, out, err) = vox_in(

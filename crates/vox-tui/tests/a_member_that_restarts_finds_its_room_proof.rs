@@ -24,6 +24,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -90,10 +92,14 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
     )
 }
 
-/// A free loopback UDP port, so a node can come back on the address its peers know.
-fn free_port() -> String {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    format!("127.0.0.1:{}", s.local_addr().unwrap().port())
+/// Where the daemon at `dir` listens, from its own `vox status --json` (#410): a daemon starts on
+/// port 0, and a restart that must come back on the address its peers know reads it here, never
+/// from a port picked ahead.
+fn listening(dir: &Path) -> String {
+    let (_, status, _) = vox(dir, &["status", "--json"], None);
+    ports::loopback_listen(&status)
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no loopback listen address in {status}"))
+        .to_string()
 }
 
 /// `vox daemon` on `listen`, with `env` added, answering on its socket before this returns.
@@ -127,6 +133,13 @@ fn daemon(
         if vox(dir, &["room", "list"], None).0 {
             return d;
         }
+        let said =
+            std::fs::read_to_string(dir.join(format!("daemon-{tag}.err"))).unwrap_or_default();
+        assert!(
+            !ports::bind_refused(&said),
+            "{}: {tag}'s daemon on {listen}:\n{said}",
+            ports::APPARATUS_BIND
+        );
         assert!(
             Instant::now() < deadline,
             "{tag}'s daemon never answered: {}",
@@ -244,15 +257,15 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
     let t = tempfile::tempdir().unwrap();
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
-    let (alice_at, bob_at) = (free_port(), free_port());
     let mut alice_d = Some(daemon(
         &alice,
         "alice",
         &format!("{IDENTITY}\n"),
-        &alice_at,
+        "127.0.0.1:0",
         &[],
     ));
-    let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"), &bob_at, &[]);
+    let alice_at = listening(&alice);
+    let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"), "127.0.0.1:0", &[]);
     let room = create(&alice);
     join(&alice, &bob, &room);
     trust(&alice, &bob_fp, "bob");
@@ -261,7 +274,14 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
     until_readable(&bob, &[&alice], &room);
 
     let mut results = Vec::new();
-    for (case, listen) in [("same port", alice_at.clone()), ("new port", free_port())] {
+    // The new port is one alice's running daemon does not hold, so the case cannot fall back to
+    // her old one, as a restart on port 0 can (the system hands a freed port out again). Another
+    // program can take it before she binds it; her daemon then says so and the red is APPARATUS.
+    let new_port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: a free UDP port")
+        .to_string();
+    for (case, listen) in [("same port", alice_at.clone()), ("new port", new_port)] {
         drop(alice_d.take()); // stopped by PID
         let away = format!("posted while alice was down ({case})");
         post(&bob, &room, &away);

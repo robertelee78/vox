@@ -32,6 +32,8 @@
 
 #[path = "support/hostile.rs"]
 mod hostile;
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -42,8 +44,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hostile::{
-    answer_circuits, ask_circuit, connect, create_room, daemon, fingerprint, free_port,
-    member_signer, profile_dir, put, stranger, vox_in, CircuitAnswer, Rt,
+    answer_circuits, ask_circuit, connect, create_room, daemon, fingerprint, member_signer,
+    profile_dir, put, stranger, vox_in, CircuitAnswer, Rt,
 };
 use vox_core::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use vox_core::hash::Digest32;
@@ -114,12 +116,10 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         ok,
         "PRODUCT (staging): the operator's vox trust add: {out}{err}"
     );
-    let anchor_port = free_port();
-    let (mut anchor, spec) = hostile::anchor_with(
-        &anchor_dir,
-        &format!("127.0.0.1:{anchor_port}"),
-        &["--serve", "trusted"],
-    );
+    // On a port of its own choosing, read back from its spec (#410).
+    let (mut anchor, spec) =
+        hostile::anchor_with(&anchor_dir, "127.0.0.1:0", &["--serve", "trusted"]);
+    let anchor_port = ports::spec_port(&spec);
     let said = anchor.transcript();
     println!(
         "[proof] the anchor said: {}",
@@ -136,11 +136,10 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     .expect("PRODUCT: the anchor's fingerprint");
 
     // ---- 1. the trusted creator's room, end to end -----------------------------------------
-    let victim_port = free_port();
-    let _victim = daemon("victim", &victim_dir, victim_port, &spec, &pass_file);
+    let _victim = daemon("victim", &victim_dir, 0, &spec, &pass_file);
     let (room, link) = create_room(&victim_dir, "team", ROOM_PASS);
     for (name, dir) in [("bravo", &bravo_dir), ("charlie", &charlie_dir)] {
-        let d = daemon(name, dir, free_port(), &spec, &pass_file);
+        let d = daemon(name, dir, 0, &spec, &pass_file);
         let (ok, out, err) = vox_in(
             dir,
             &[

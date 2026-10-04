@@ -40,6 +40,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -116,13 +118,14 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
     )
 }
 
-/// A free loopback UDP port, so a node can come back on the address its peers know.
-fn free_port() -> String {
-    let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: a free UDP port");
-    format!(
-        "127.0.0.1:{}",
-        s.local_addr().expect("APPARATUS: a free UDP port").port()
-    )
+/// Where the daemon at `dir` listens, from its own `vox status --json` (#410): a daemon starts on
+/// port 0, and a restart that must come back on the address its peers know reads it here, never
+/// from a port picked ahead.
+fn listening(dir: &Path) -> String {
+    let (_, status, _) = vox(dir, &["status", "--json"], None);
+    ports::loopback_listen(&status)
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no loopback listen address in {status}"))
+        .to_string()
 }
 
 /// `vox daemon` on `listen`, with `env` added, answering on its socket before this returns.
@@ -828,7 +831,6 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
     let (carol, carol_fp) = identity(t.path(), "carol");
-    let bob_at = free_port();
     let mut alice_d = Some(daemon(
         &alice,
         "alice",
@@ -836,7 +838,8 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
         "127.0.0.1:0",
         &[],
     ));
-    let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"), &bob_at, &[]);
+    let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"), "127.0.0.1:0", &[]);
+    let bob_at = listening(&bob);
     let _c = daemon(
         &carol,
         "carol",

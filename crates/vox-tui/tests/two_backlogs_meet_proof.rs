@@ -111,14 +111,6 @@ fn stop(mut p: VoxProc) {
     // Drop kills it by PID.
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .expect("APPARATUS: bind a socket")
-        .local_addr()
-        .expect("APPARATUS: read a socket the proof bound")
-        .port()
-}
-
 fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path) -> VoxProc {
     let p = VoxProc::spawn(
         name,
@@ -189,9 +181,11 @@ fn two_backlogs_that_meet_both_cross() {
     let idpass = tmp.path().join("idpass");
     std::fs::write(&idpass, IDENTITY).expect("APPARATUS: write a staging file");
 
-    let port = free_udp_port();
-    let listen = format!("127.0.0.1:{port}");
-    let mut anchor = VoxProc::spawn("anchor", &anchor_dir, &args(&["node", "--listen", &listen]));
+    let mut anchor = VoxProc::spawn(
+        "anchor",
+        &anchor_dir,
+        &args(&["node", "--listen", "127.0.0.1:0"]),
+    );
     let spec = anchor
         .expect_line("an --anchor spec", |l| {
             l.trim_start().contains("@/ip4/127.0.0.1/udp/")

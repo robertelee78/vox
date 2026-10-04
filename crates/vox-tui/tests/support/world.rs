@@ -214,13 +214,24 @@ impl VoxProc {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // **A port another program took is the apparatus's failure** (#410): the
+                    // process never ran, so nothing about the product was measured.
+                    let side = if self
+                        .seen
+                        .iter()
+                        .any(|l| l.contains("Address already in use"))
+                    {
+                        "APPARATUS: the port the proof put it on was taken by another program;"
+                    } else {
+                        "PRODUCT:"
+                    };
                     return Err(format!(
-                        "PRODUCT: {} exited ({}) after {:?}, before saying {what}. It said:\n{}",
+                        "{side} {} exited ({}) after {:?}, before saying {what}. It said:\n{}",
                         self.name.clone(),
                         self.exit_status(),
                         self.started.elapsed(),
                         self.seen.join("\n")
-                    ))
+                    ));
                 }
             }
         }
@@ -555,7 +566,10 @@ pub struct Setup {
 }
 
 /// A UDP port free on the dual-stack wildcard **and on IPv4**, for an anchor that must be
-/// reachable over both IPv4 and IPv6 loopback.
+/// reachable over both IPv4 and IPv6 loopback, **for a proof that must name the port before the
+/// anchor starts** (a NAT stand-in configured with it). Anything else listens on `[::]:0` and reads
+/// its port back (#410): a port picked here is free only until another program takes it, and an
+/// anchor that then cannot bind it is said as APPARATUS (`VoxProc::expect_within`).
 ///
 /// macOS hands an ephemeral `[::]:0` a port another program holds on IPv4 (about one in six
 /// under load), and a node told to listen on it then rightly refuses: its IPv4 traffic would
@@ -830,22 +844,26 @@ impl World {
                 // loopback only, so each reaches the anchor and neither can send a single
                 // packet to the other. Every direct rung fails by construction and the
                 // only path between them is a circuit the anchor carries.
-                // The port is picked free and then released, so another process can take
-                // it first; a few fresh tries cover that race.
-                let (port, anchor, id) = (0..5)
-                    .find_map(|_| {
-                        let port = free_dual_stack_port();
-                        let mut anchor = VoxProc::spawn(
-                            "anchor",
-                            &anchor_dir,
-                            &args(&["node", "--listen", &format!("[::]:{port}")]),
-                        );
-                        let id = anchor
-                            .line_within(LINE_TIMEOUT, |l| l.starts_with("vox node: identity "))?;
-                        Some((port, anchor, id))
-                    })
-                    .expect("an anchor on a free dual-stack port");
-                let fp = id.split_whitespace().last().unwrap().to_owned();
+                // On a port of its own choosing, read back from its spec (#410): a port picked
+                // and released could be another program's by the time the anchor bound it.
+                let mut anchor = VoxProc::spawn(
+                    "anchor",
+                    &anchor_dir,
+                    &args(&["node", "--listen", "[::]:0"]),
+                );
+                let line = anchor.expect_line("an --anchor spec", |l| {
+                    !l.starts_with("! ") && l.contains('@') && l.contains("/udp/")
+                });
+                let spec = line
+                    .split_whitespace()
+                    .find(|w| w.contains('@') && w.contains("/udp/"))
+                    .expect("APPARATUS: the line matched for the spec holds it");
+                let port = spec_addr(spec).port();
+                let fp = spec
+                    .split('@')
+                    .next()
+                    .expect("PRODUCT: fp@address")
+                    .to_owned();
                 let v4 = SocketAddr::from(([127, 0, 0, 1], port));
                 let guest_addr = setup
                     .guest_leg

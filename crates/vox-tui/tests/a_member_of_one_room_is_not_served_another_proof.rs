@@ -18,6 +18,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "support/world.rs"]
 mod world;
 
@@ -68,15 +70,6 @@ fn vox_in(data: &Path, argv: &[&str], stdin: &str) -> (bool, String, String) {
     )
 }
 
-/// A port that was free a moment ago. Another process can take it before the daemon binds it
-/// (a bind-and-release race), which [`daemon`] reports as APPARATUS, never as the product.
-fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("APPARATUS: find a free port")
-        .port()
-}
-
 /// Start `vox daemon` for `data`, reading its passphrases from `pass_file`, and wait until it answers.
 fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> VoxProc {
     let mut p = VoxProc::spawn(
@@ -97,6 +90,9 @@ fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> V
         if vox_once(data, &args(&["room", "list"])).0 {
             return p;
         }
+        if matches!(p.child.try_wait(), Ok(Some(_))) && ports::bind_refused(&p.transcript()) {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
     // The port taken by another process after it was found free is the staging's race, and the
@@ -105,7 +101,7 @@ fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> V
     let side = if said.contains("Address already in use")
         || said.contains("something else already holds that UDP port")
     {
-        "APPARATUS: port 127.0.0.1:{port} was taken after it was found free, so"
+        "APPARATUS: port 127.0.0.1:{port} was taken by another program, so"
     } else {
         "PRODUCT (staging):"
     };
@@ -205,8 +201,12 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
     let xavier_id = vox_core::node::link::b32_encode(&fingerprint(&xavier_dir, "xavier"));
 
     // ---- the victim holds two rooms; xavier joins only alpha, through the real binary --------
-    let victim_port = free_port();
-    let victim = daemon("victim", &victim_dir, victim_port, &spec, &idpass);
+    let victim = daemon("victim", &victim_dir, 0, &spec, &idpass);
+    // The port the victim chose, from its own report, for its restart below (#410).
+    let victim_port =
+        ports::loopback_listen(&vox_once(&victim_dir, &args(&["status", "--json"])).1)
+            .expect("PRODUCT (staging): the victim reports a loopback listen address")
+            .port();
     let (a_full, a_link, a_short) = room_with_posts(&victim_dir, "alpha", "alpha passphrase");
     let (b_full, _b_link, _) = room_with_posts(&victim_dir, "bravo", "bravo passphrase");
     let a = vox_tui::tunnel_cli::parse_fingerprint(&a_full)
@@ -214,7 +214,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
     let b = vox_tui::tunnel_cli::parse_fingerprint(&b_full)
         .unwrap_or_else(|e| panic!("PRODUCT (staging): room bravo's id {b_full:?}: {e}"));
 
-    let xavier = daemon("xavier", &xavier_dir, free_port(), &spec, &idpass);
+    let xavier = daemon("xavier", &xavier_dir, 0, &spec, &idpass);
     let (ok, out, err) = vox_in(
         &xavier_dir,
         &[

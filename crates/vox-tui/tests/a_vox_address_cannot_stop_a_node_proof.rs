@@ -51,6 +51,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/ports.rs"]
+mod ports;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 #[path = "support/world.rs"]
@@ -189,13 +191,6 @@ impl Drop for Rt {
     }
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("APPARATUS: no free UDP port")
-        .port()
-}
-
 fn daemon(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -> VoxProc {
     let p = VoxProc::spawn(
         name,
@@ -277,8 +272,12 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
         .expect("PRODUCT (staging): the anchor's spec line names no address")
         .to_owned();
     let victim_id = fingerprint(&victim_dir);
-    let victim_listen = format!("127.0.0.1:{}", free_udp_port());
-    let _victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
+    let _victim = daemon("victim", &victim_dir, "127.0.0.1:0", &spec, &pass_file);
+    // Where the victim chose to listen, from its own report (#410).
+    let victim_listen =
+        ports::loopback_listen(&vox_once(&victim_dir, &args(&["status", "--json"])).1)
+            .expect("PRODUCT (staging): the victim reports a loopback listen address")
+            .to_string();
     let (ok, out, err) = vox_in(
         &victim_dir,
         &["room", "create", "--passphrase-file", "-", "--name", "team"],

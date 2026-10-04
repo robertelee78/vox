@@ -99,13 +99,6 @@ fn vox_plain(dir: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, S
     )
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .and_then(|s| s.local_addr())
-        .expect("APPARATUS: a free UDP port")
-        .port()
-}
-
 /// A profile with an identity; its directory and fingerprint.
 fn profile(tmp: &Path, name: &str) -> (PathBuf, String) {
     let dir = tmp.join(name);
@@ -147,7 +140,7 @@ fn daemon(name: &str, dir: &Path, anchor: &str) -> VoxProc {
         &args(&[
             "daemon",
             "--listen",
-            &format!("127.0.0.1:{}", free_udp_port()),
+            "127.0.0.1:0",
             "--anchor",
             anchor,
             "--passphrase-file",
@@ -372,7 +365,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
             "--anchor",
             &spec,
             "--listen",
-            &format!("127.0.0.1:{}", free_udp_port()),
+            "127.0.0.1:0",
         ]),
     );
     let room = after_label(
