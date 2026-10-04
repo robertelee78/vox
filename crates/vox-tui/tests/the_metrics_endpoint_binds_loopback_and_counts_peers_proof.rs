@@ -95,11 +95,25 @@ fn scrape(addr: &str) -> String {
 }
 
 /// The value of the sample `name` (with its label set, if any) in a scrape's body.
-fn sample(body: &str, name: &str) -> Option<u64> {
-    body.lines()
-        .filter(|l| !l.starts_with('#'))
-        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+/// The value of the first sample of `family` carrying every label in `labels`. A daemon labels
+/// each node's samples `node="<name>"` (ADR-026 P-1), so a sample is matched by its labels, not
+/// by its text.
+fn sample(body: &str, family: &str, labels: &[(&str, &str)]) -> Option<u64> {
+    body.lines().filter(|l| !l.starts_with('#')).find_map(|l| {
+        let (series, value) = l.rsplit_once(' ')?;
+        let (name, set) = match series.split_once('{') {
+            Some((n, rest)) => (n, rest.strip_suffix('}')?),
+            None => (series, ""),
+        };
+        let has = |k: &str, v: &str| set.split(',').any(|kv| kv == format!("{k}=\"{v}\""));
+        (name == family && labels.iter().all(|(k, v)| has(k, v)))
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
+
+/// The node a [`Member`]'s daemon runs: the data root's one, `default`.
+const NODE: (&str, &str) = ("node", "default");
 
 #[test]
 #[ignore = "a real vox daemon with production Argon2id; CI runs it in release"]
@@ -163,11 +177,12 @@ fn the_metrics_count_a_connected_peer_and_a_completed_sync() {
         .and_then(|r| r["id"].as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| panic!("PRODUCT (staging): alice's report lists the room"));
-    let last_sync = format!("vox_room_last_sync_seconds{{room=\"{room_b32}\"}}");
+    let last_sync = "vox_room_last_sync_seconds";
+    let in_room = [NODE, ("room", room_b32.as_str())];
     let before = scrape(&addr);
     let (peers0, sync0) = (
-        sample(&before, "vox_peers_connected"),
-        sample(&before, &last_sync),
+        sample(&before, "vox_peers_connected", &[NODE]),
+        sample(&before, last_sync, &in_room),
     );
 
     let _bob_daemon = bob.daemon(None);
@@ -179,16 +194,16 @@ fn the_metrics_count_a_connected_peer_and_a_completed_sync() {
     let until = Instant::now() + Duration::from_secs(90);
     let after = loop {
         let body = scrape(&addr);
-        let moved = sample(&body, "vox_peers_connected").is_some_and(|n| n >= 1)
-            && sample(&body, &last_sync).is_some_and(|t| t > 0);
+        let moved = sample(&body, "vox_peers_connected", &[NODE]).is_some_and(|n| n >= 1)
+            && sample(&body, last_sync, &in_room).is_some_and(|t| t > 0);
         if moved || Instant::now() >= until {
             break body;
         }
         std::thread::sleep(Duration::from_millis(500));
     };
     let (peers1, sync1) = (
-        sample(&after, "vox_peers_connected"),
-        sample(&after, &last_sync),
+        sample(&after, "vox_peers_connected", &[NODE]),
+        sample(&after, last_sync, &in_room),
     );
     eprintln!(
         "[proof] before bob joined: vox_peers_connected {peers0:?}, {last_sync} {sync0:?}\n\

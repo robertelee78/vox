@@ -643,12 +643,13 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
         out.trim().to_owned()
     };
     let (alice_fp, carol_fp) = (fp(&alice), fp(&carol));
+    // A one-shot verb acts on an attached node (ADR-026 L-2): carol's daemon first.
+    let _carol_d = daemon(&carol, "carol", &format!("{IDENTITY}\n"));
+    attached(&carol, "carol");
     for (dir, other, name) in [(&alice, &carol_fp, "carol"), (&carol, &alice_fp, "alice")] {
         let (ok, _, err) = vox(dir, &["trust", "add", other, "--name", name], None);
         assert!(ok, "PRODUCT (staging): vox trust add {name}: {err}");
     }
-    let _carol_d = daemon(&carol, "carol", &format!("{IDENTITY}\n"));
-    attached(&carol, "carol");
     let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
     assert!(ok, "PRODUCT (staging): vox room invite: {err}");
     let (ok, _, err) = vox(
