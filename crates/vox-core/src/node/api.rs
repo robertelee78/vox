@@ -601,8 +601,6 @@ pub enum NodeCommand {
         /// The identity passphrase.
         passphrase: Secret,
     },
-    /// App-lock: drop the identity signer and every open channel's SEK.
-    Lock,
     /// Create a channel (needs the unlocked identity).
     CreateChannel {
         /// The local (device-only) name.
@@ -1384,10 +1382,6 @@ pub enum NodeEvent {
         /// The rendered entry.
         row: MessageRow,
     },
-    /// The identity was unlocked.
-    Unlocked,
-    /// The identity (and every open channel) was locked.
-    Locked,
     /// A channel was opened.
     ChannelOpened {
         /// The channel.

@@ -3485,10 +3485,6 @@ pub struct Node {
     /// back yet (`NetEvent::LockSettled`, V210-94). While any is, the node is *locking*: the
     /// identity is already locked and refuses new work, but not every secret is gone yet.
     locking: usize,
-    /// Lock replies held until the node has settled locked.
-    lock_waiters: Vec<oneshot::Sender<Outcome>>,
-    /// Whether a lock now settling found the node unlocked, so settling says `Locked`.
-    lock_was_unlocked: bool,
     /// Unlocks asked for while locking, run once it has settled: an unlock in between would
     /// start new work beside threads still holding the old secrets.
     unlock_after_lock: Vec<(Secret, oneshot::Sender<Outcome>)>,
@@ -3982,8 +3978,6 @@ impl Node {
             reopen_task: None,
             unlock_waiters: Vec::new(),
             locking: 0,
-            lock_waiters: Vec::new(),
-            lock_was_unlocked: false,
             unlock_after_lock: Vec::new(),
             view_stale: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
@@ -4292,26 +4286,6 @@ impl Node {
                         self.publish().await;
                         continue;
                     }
-                    // **A lock is answered once it has settled, and the actor does not wait for
-                    // that** (V210-94, and V210-71's rule that nothing slow stalls the actor). The
-                    // lock itself — the identity, the rooms, the tasks, the network — happens now;
-                    // waiting for work still holding a secret happens on a task of its own, which
-                    // reports `NetEvent::LockSettled`. Meanwhile the node answers everyone else and
-                    // says it is locking.
-                    if matches!(command, NodeCommand::Lock) && self.headless.is_none() {
-                        drop(self.lock_all().await);
-                        self.lock_waiters.push(reply);
-                        // What work finished just before the lock and queued for the actor — a
-                        // sealed room key and its passphrase, a joined room, a reopened room — is
-                        // handled now, not on a later turn: each is refused while locked and its
-                        // secrets dropped, and until then they sat in this queue after the lock.
-                        while let Ok(event) = net_rx.try_recv() {
-                            self.handle_net(event).await;
-                        }
-                        self.note_if_stalled(name, started);
-                        self.publish().await;
-                        continue;
-                    }
                     let outcome = self.handle(command).await;
                     self.note_if_stalled(name, started);
                     self.publish().await;
@@ -4422,18 +4396,6 @@ impl Node {
         match command {
             NodeCommand::CreateIdentity { passphrase } => self.create_identity(&passphrase),
             NodeCommand::Unlock { passphrase } => self.unlock(&passphrase).await,
-            NodeCommand::Lock => {
-                // A headless node has no vault, so there is nothing to lock and no
-                // passphrase to unlock it with: locking it would take the anchor off
-                // the network permanently, until somebody noticed and restarted it.
-                // Refused rather than obeyed (ADR-016 M15.2c).
-                if self.headless.is_some() {
-                    return Outcome::Failed(Fault::NoIdentity);
-                }
-                // Not reached for a node with an identity: `run` answers its lock once it settles.
-                drop(self.lock_all().await);
-                Outcome::Done
-            }
             NodeCommand::AddAnchors { anchors } => {
                 // `merge` keeps the first entry per identity, so it would discard exactly
                 // the thing a refresh carries: the same anchor at its new address.
@@ -4678,7 +4640,6 @@ impl Node {
                     return Outcome::Failed(fault_of(&e));
                 }
                 self.note_passphrase_entered();
-                let _ = self.event_tx.send(NodeEvent::Unlocked);
                 self.reopen_remembered().await;
                 Outcome::Done
             }
@@ -11489,7 +11450,6 @@ impl Node {
     /// up to one Argon2id derivation, it would answer nobody meanwhile (V210-71). Until then the
     /// node is *locking* ([`NodeView::locking`]). The returned receiver fires once it has settled.
     async fn lock_all(&mut self) -> oneshot::Receiver<()> {
-        let was_unlocked = self.profile.as_ref().is_some_and(Profile::is_unlocked);
         self.passphrase_entered_at
             .store(0, std::sync::atomic::Ordering::Relaxed);
         for (_, shared) in std::mem::take(&mut self.channels) {
@@ -11568,7 +11528,6 @@ impl Node {
         // And take the network down: a locked node has no identity to present, so it
         // must not keep serving or holding connections (M14.7d).
         self.stop_network().await;
-        self.lock_was_unlocked |= was_unlocked;
         self.locking += 1;
         let (settled, on_settled) = oneshot::channel();
         let secret_work = Arc::clone(&self.secret_work);
@@ -11601,12 +11560,6 @@ impl Node {
         }
         // The view first: whoever is told the lock is done reads a locked view.
         self.publish().await;
-        for reply in std::mem::take(&mut self.lock_waiters) {
-            let _ = reply.send(Outcome::Done);
-        }
-        if std::mem::take(&mut self.lock_was_unlocked) {
-            let _ = self.event_tx.send(NodeEvent::Locked);
-        }
         for (passphrase, reply) in std::mem::take(&mut self.unlock_after_lock) {
             self.unlock_and_answer(&passphrase, reply).await;
         }
