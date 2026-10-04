@@ -479,6 +479,43 @@ pub async fn hold_until_closed(client: &mut IpcClient) -> AppError {
     }
 }
 
+/// What a verb says when its node answered a request with a frame it did not ask for, in words
+/// (R36): a detach while the request was in flight (L-3) as that, a node's refusal as its reason,
+/// and anything else by the frame's name only. Its fields are never printed: a frame's `Debug`
+/// is a struct dump a person cannot act on, and some frames carry room content.
+#[must_use]
+pub fn unexpected(frame: &Frame) -> AppError {
+    AppError::Usage(match frame {
+        Frame::NodeDetached { node } => {
+            format!("node {node} was detached from the vox daemon, so this stopped")
+        }
+        Frame::Error { reason } => reason.clone(),
+        other => mismatch(&format!("{other:?}")),
+    })
+}
+
+/// [`unexpected`] for a daemon-level answer.
+#[must_use]
+pub fn unexpected_daemon(frame: &DaemonFrame) -> AppError {
+    AppError::Usage(match frame {
+        DaemonFrame::Refused(r) => r.to_string(),
+        other => mismatch(&format!("{other:?}")),
+    })
+}
+
+/// A frame no verb expects here, named by its variant alone: this vox and the daemon disagree
+/// about the protocol, which a restart of the daemon on this vox settles.
+fn mismatch(debug: &str) -> String {
+    let name = debug
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or_default();
+    format!(
+        "the vox daemon answered with {name}, which this command does not expect; if vox was \
+         updated, restart the daemon so both are the same version"
+    )
+}
+
 /// A connection's subscription to its node's events, as the node it holds; `None`, having said
 /// why, when none could be had.
 pub async fn events(at: &NodeSocket) -> Result<IpcClient, AppError> {
@@ -574,7 +611,7 @@ pub async fn node_attach(
             Ok(())
         }
         Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected_daemon(&other)),
         Err(e) => Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
     }
 }
@@ -596,7 +633,7 @@ pub async fn node_detach(args: &NodeArgs, name: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected_daemon(&other)),
         Err(e) => Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
     }
 }

@@ -1161,7 +1161,7 @@ impl Daemon {
         {
             DaemonFrame::Attached(_) => Ok(()),
             DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string())),
-            other => Err(AppError::Usage(format!("unexpected answer: {other:?}"))),
+            other => Err(crate::client::unexpected_daemon(&other)),
         }
     }
 
@@ -1309,7 +1309,7 @@ async fn drain(
     let rooms = match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => rooms,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let rooms: Vec<(Digest32, String, bool, String)> = match room_arg {
