@@ -175,13 +175,14 @@ fn a_first_relayed_connection_completes_in_under_two_seconds() {
     // Per sample: the proxy found no anchor connected yet on an attempt (a wait on its start-up).
     let mut before_its_anchor: Vec<bool> = Vec::new();
     for n in 0..SAMPLES {
-        // A fresh `vox up` each time, on a fresh node process: the previous `vox up` is killed by
-        // its PID, and so is the guest's daemon, by the PID in its lock, with no goodbye — a
-        // process gone as a crash goes, which is what the anchor's supersession is for. This
-        // `vox up` starts the next daemon and attaches the node anew (ADR-026: every verb is a
-        // daemon client, so killing the verb alone no longer ends the node).
-        drop(w.fwd.take());
+        // A fresh `vox up` each time, on a fresh node process. **The guest's daemon is killed
+        // first**, by the PID in its lock, while the last `vox up` still holds its node: the node
+        // goes as a crash goes, with its connections live and no goodbye — what the anchor's
+        // supersession is for. Killing the `vox up` first would let the node detach cleanly (its
+        // last holder gone), say goodbye and close its connections, and leave the anchor nothing
+        // to supersede. Then the `vox up` goes, and this one starts the next daemon.
         kill_daemon(&w.guest_dir);
+        drop(w.fwd.take());
         let (proxy, ready) = w.up();
         let payload = format!("sample {n}");
         let first = request(&mut w, proxy, payload.as_bytes(), n);

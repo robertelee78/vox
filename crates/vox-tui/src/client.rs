@@ -70,7 +70,16 @@ impl NodeArgs {
     /// # Errors
     /// If neither a flag, the env vars nor `HOME` names a directory.
     pub fn account(&self) -> vox_core::error::Result<Account> {
-        Account::of(self.data_dir.as_deref(), self.config_dir.as_deref())
+        let account = Account::of(self.data_dir.as_deref(), self.config_dir.as_deref())?;
+        // **An old layout moves before any node is resolved** (ADR-026 F-3): every client entry
+        // point comes through here, so a data root of the layout before v0.3.0 is found as nodes
+        // by whichever verb a person runs first. A no-op once it has moved.
+        let named = self
+            .node
+            .as_deref()
+            .and_then(|n| vox_core::node::paths::NodeName::parse(n).ok());
+        vox_core::node::layout::migrate(&account, named.as_ref())?;
+        Ok(account)
     }
 
     /// Resolve the node (C-3) for a verb that does not create an identity, and its paths.
@@ -295,10 +304,11 @@ pub fn said(at: &NodeSocket, e: Error) -> AppError {
     let node = &at.using.node;
     let path = at.path.display();
     AppError::Usage(match e {
-        Error::Ipc(IpcHandshake::Unreachable { .. }) => format!(
+        // The cause stays named (#191): the OS's reason the connect failed, beside the socket.
+        Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
             "no vox daemon is running for this data root, so node {node} is not attached.\n\
              \x20      Start one:  vox daemon      (or `vox node attach {node}`)\n\
-             \x20      Socket: {path}"
+             \x20      Socket: {path} ({reason})"
         ),
         Error::Ipc(IpcHandshake::Refused { reason }) => reason,
         Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {

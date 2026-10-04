@@ -161,8 +161,7 @@ const _: () = assert!(crate::node::content::MAX_TEXT_LEN + ROW_OVERHEAD <= ROWS_
 const T_HELLO: u64 = 1;
 const T_LAGGED: u64 = 2;
 const T_NEW_ENTRY: u64 = 10;
-const T_UNLOCKED: u64 = 11;
-const T_LOCKED: u64 = 12;
+// 11 and 12 were `Unlocked` and `Locked`: there is no lock (ADR-026 N-2). Never reuse them.
 const T_CHANNEL_OPENED: u64 = 13;
 const T_CHANNEL_CLOSED: u64 = 14;
 const T_PEER_JOINED: u64 = 15;
@@ -1552,14 +1551,8 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .uint(row.arrival)
                 .uint(u64::from(row.late));
         }
-        NodeEvent::Unlocked => {
-            e.array(1).uint(T_UNLOCKED);
-        }
         NodeEvent::WaitingForProfile => {
             e.array(1).uint(T_WAITING_FOR_PROFILE);
-        }
-        NodeEvent::Locked => {
-            e.array(1).uint(T_LOCKED);
         }
         NodeEvent::Shutdown => {
             e.array(1).uint(T_SHUTDOWN);
@@ -2048,9 +2041,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 },
             }
         }
-        (T_UNLOCKED, 1) => NodeEvent::Unlocked,
         (T_WAITING_FOR_PROFILE, 1) => NodeEvent::WaitingForProfile,
-        (T_LOCKED, 1) => NodeEvent::Locked,
         (T_SHUTDOWN, 1) => NodeEvent::Shutdown,
         (T_CHANNEL_OPENED, 2) => NodeEvent::ChannelOpened {
             channel_id: digest(d)?,
@@ -2732,6 +2723,12 @@ async fn serve_requests(
             crate::node::status::serve(&mut stream, handle).await?;
             continue;
         }
+        // ADR-026 C-7: what a client that draws the node's rooms needs, the TUI first. Answered,
+        // and the connection serves on.
+        if crate::node::snapshot::is_request(&body) {
+            write_frame(&mut stream, &crate::node::snapshot::answer(handle)).await?;
+            continue;
+        }
         // V030-11: `vox tunnel close`. The live tunnels are kept in this process, so it is
         // answered here, and the connection serves on.
         if let Some(which) = crate::node::status::close_request(&body) {
@@ -2891,9 +2888,14 @@ impl Drop for Counted {
 /// # Errors
 /// If the socket cannot be placed.
 pub fn bind_account<D: Dispatch>(dispatch: std::sync::Arc<D>, path: PathBuf) -> Result<IpcServer> {
-    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet.
+    // `.daemon/` is the daemon's own, made private here if the lock has not made it yet. **Not
+    // the shared fallback** (`<tmp>/vox-<uid>`, for a data root whose socket path is too long):
+    // `create_private_dir` follows a symlink and changes the mode of whatever it points at, and
+    // anyone can plant one there. `place_socket` creates or refuses that one itself, by lstat.
     if let Some(dir) = path.parent() {
-        crate::node::paths::create_private_dir(dir)?;
+        if !crate::node::paths::is_socket_fallback_dir(dir) {
+            crate::node::paths::create_private_dir(dir)?;
+        }
     }
     let listener = place_socket(&path)?;
     let me = crate::node::paths::my_uid();
@@ -4220,6 +4222,28 @@ impl IpcClient {
                 return Err(hung_up(path).await);
             };
             Frame::from_bytes(&body)
+        };
+        while_answering(path, node.as_ref(), exchange).await
+    }
+
+    /// Send one request body this module has no [`Request`] for — a status, a tunnel close, a
+    /// snapshot ([`crate::node::snapshot`]) — and return the one reply body, bounded as
+    /// [`IpcClient::request`] is.
+    ///
+    /// # Errors
+    /// If the node cannot be reached, or hangs up before it answers.
+    pub async fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>> {
+        let Self {
+            stream, path, node, ..
+        } = self;
+        let exchange = async {
+            if let Err(e) = write_frame(stream, body).await {
+                return Err(named(path, e).await);
+            }
+            match read_frame(stream).await? {
+                Some(reply) => Ok(reply),
+                None => Err(hung_up(path).await),
+            }
         };
         while_answering(path, node.as_ref(), exchange).await
     }

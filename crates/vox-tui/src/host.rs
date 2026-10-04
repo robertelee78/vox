@@ -541,8 +541,18 @@ impl Router {
                 Step::WaitAttach(mut rx) => {
                     let _ = rx.wait_for(Option::is_some).await;
                 }
+                // **Bounded** (#408): a detach waits for the node's secret work however long it
+                // takes (L-3), and a hook asking for its node sits inside a model's turn. Past
+                // the bound the request is refused, saying the node is still detaching.
                 Step::WaitDetach(mut rx) => {
-                    let _ = rx.wait_for(|d| *d).await;
+                    let waited = tokio::time::timeout(
+                        vox_core::node::daemonipc::DETACHING_PATIENCE,
+                        rx.wait_for(|d| *d),
+                    )
+                    .await;
+                    if waited.is_err() {
+                        return Err(Refusal::StillDetaching { node: node.clone() });
+                    }
                 }
                 Step::NotAttached => return Err(Refusal::NotAttached { node: node.clone() }),
                 Step::Mine(tx) => {

@@ -20,7 +20,7 @@
 //! ## What runs
 //!
 //! - alice: a real `vox daemon`;
-//! - bob: the real `vox tui`, on a pseudo-terminal, unlocked by typing the passphrase at its
+//! - bob: the real `vox tui`, on a pseudo-terminal, its node attached by typing the passphrase at its
 //!   prompt; what it draws is replayed into a screen grid and read the way a person reads it;
 //! - rooms are made over bob's TUI's own control socket with the real CLI: bob's `home`, and
 //!   alice's `mission`, which bob joins;
@@ -47,6 +47,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -58,7 +61,17 @@ const ROWS: u16 = 30;
 const COLS: u16 = 120;
 
 /// One `vox` command, run to completion against a profile.
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
 fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let verb: Vec<&str> = args.to_vec();
+    match attach::needs(dir, &verb) {
+        Some(node) => attach::Root::at(dir, IDPASS).attached(&node, || vox_plain(dir, args, stdin)),
+        None => vox_plain(dir, args, stdin),
+    }
+}
+
+fn vox_plain(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", dir)
@@ -251,13 +264,16 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
         Daemon(child, said)
     };
 
-    // ---- bob: the TUI, unlocked at its own prompt ----
+    // ---- bob: the TUI, its node attached with the passphrase at its own prompt ----
     let mut tui = Tui::spawn(&bob_dir);
-    tui.expect("the unlock prompt", 60, |t| {
+    tui.expect("the passphrase prompt", 60, |t| {
         t.to_lowercase().contains("passphrase")
     });
     tui.keys(format!("{IDPASS}\r").as_bytes());
-    tui.expect("that it unlocked", 90, |t| t.contains("unlocked"));
+    // There is no locked state (ADR-026 N-2): the status bar names the node, attached.
+    tui.expect("that its node attached", 90, |t| {
+        t.contains("  ·  attached: ") && !t.contains("(not attached)")
+    });
 
     // ---- rooms, made over the TUI's own control socket ----
     // alice's daemon answers only once it has unlocked and bound its socket. The wait must see

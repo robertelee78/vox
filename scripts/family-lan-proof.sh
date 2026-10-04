@@ -30,10 +30,17 @@
 #
 # What runs as root, and why: `vox lan helper` (it creates the utun interfaces — that is
 # its whole job) and this script's own bookkeeping (killing what it started, `ifconfig`
-# and `netstat` snapshots). Every `vox` node, every profile and every probe socket runs as
-# the account that invoked sudo, with profiles in a fresh temporary directory: this never
-# opens ~/Library/Application Support/vox. A trap stops everything it started, by PID, on
-# any exit, and prints the before/after either way.
+# and `netstat` snapshots). Every `vox` — each member's daemon and every client verb — and
+# every probe socket runs as the account that invoked sudo, each member in its own fresh
+# temporary data root: this never opens ~/Library/Application Support/vox. A trap stops
+# everything it started, by PID, on any exit, and prints the before/after either way.
+#
+# The daemon model (ADR-026): each member is one node in its own data root, run by that
+# root's one `vox daemon`, which the script starts by hand with the node attached, so the
+# daemon and the node live until the trap stops them, never auto-started and out of sight.
+# Every other `vox` is a client of that daemon. `vox lan up` holds the node while the
+# daemon asks the helper for the device and runs the LAN (S-5): the utun's descriptor is
+# held by the daemon, so the interface goes when `vox lan up` stops or the daemon does.
 #
 # Why not `dns-sd -B`: this Mac has ONE mDNSResponder, which listens on every interface at
 # once, so a service registered "on bob" is browsable "from alice" without a packet
@@ -86,15 +93,19 @@ snapshot() { # $1 = before|after
     netstat -rn | awk 'NF>=4 {print $1, $2, $3, $4}' | sort >"$WORK/$1.routes"
 }
 
-# Every `vox` a member runs: as the invoking account, in that member's own temporary
-# profile. Never the real one. `voxcmd` fills VOXCMD rather than running anything, so a
+# Every `vox` a member runs: as the invoking account, in that member's own temporary data
+# root, as that member's node (VOX_NODE, ADR-026 C-3). Never the real profile. Passphrases
+# go in files the invoking account owns, mode 0600: vox refuses them on a command line and
+# refuses VOX_ROOM_PASSPHRASE. `voxcmd` fills VOXCMD rather than running anything, so a
 # background `vox` is started as a plain command and `$!` is its own PID (sudo, which
 # passes a TERM on to vox) — never a subshell that would leave it orphaned when killed.
 voxcmd() { # member
     VOXCMD=("${AS_USER[@]}" env
-        VOX_DATA_DIR="$WORK/$1/data" VOX_CONFIG_DIR="$WORK/$1/cfg"
-        VOX_IDENTITY_PASSPHRASE="$IDENTITY" VOX_ROOM_PASSPHRASE="${ROOM_PP:-}"
+        VOX_DATA_DIR="$WORK/$1/data" VOX_CONFIG_DIR="$WORK/$1/cfg" VOX_NODE="$1"
         "$VOX")
+}
+user_file() { # path text — written as the invoking account, mode 0600
+    printf '%s\n' "$2" | "${AS_USER[@]}" sh -c 'umask 077; cat >"$1"' sh "$1"
 }
 vox_as() { # member args... — in the foreground
     voxcmd "$1"
@@ -110,10 +121,17 @@ bg() { # name command... — background, output to $WORK/<name>.log, PID recorde
     eval "PID_$name=$!"
 }
 
-wait_line() { # log pattern seconds — print the first matching line
-    local log=$1 pat=$2 secs=$3 i
+wait_line() { # log pattern seconds [pid] — print the first matching line
+    local log=$1 pat=$2 secs=$3 pid=${4:-} i
     for ((i = 0; i < secs * 10; i++)); do
         if grep -m1 -E "$pat" "$log" 2>/dev/null; then return 0; fi
+        # The process that would print it is gone: no need to wait out the clock.
+        if [[ -n $pid ]] && ! kill -0 "$pid" 2>/dev/null; then
+            grep -m1 -E "$pat" "$log" 2>/dev/null && return 0
+            echo "exited without printing /$pat/; $log:" >&2
+            sed 's/^/    /' "$log" >&2
+            return 1
+        fi
         sleep 0.1
     done
     echo "timed out after ${secs}s waiting for /$pat/ in $log:" >&2
@@ -135,13 +153,23 @@ teardown() {
     [[ $TORN_DOWN == 1 ]] && return
     TORN_DOWN=1
     say "teardown: stopping ${#PIDS[@]} processes by PID"
-    local p
-    # The LANs and the helper first, then the rest.
-    for p in "${PIDS[@]}"; do stop_pid "$p"; done
+    local p i m
+    # Newest first: the probes, the LANs, the helper, then the daemons that ran the LANs
+    # (stopping one detaches its node cleanly), and the anchor last.
+    for ((i = ${#PIDS[@]} - 1; i >= 0; i--)); do stop_pid "${PIDS[i]}"; done
     wait 2>/dev/null
     local left=0
-    for p in "${PIDS[@]}"; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
-    echo "processes still running: $left"
+    for p in ${PIDS[@]+"${PIDS[@]}"}; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
+    # A daemon this script did not start (a client that found its member's daemon gone
+    # starts one in the background) holds its data root's lock: found there, by PID.
+    for m in alice bob carol; do
+        for p in $(lsof -t "$WORK/$m/data/.daemon/lock" 2>/dev/null); do
+            echo "a daemon the script did not start held $m's data root: pid $p"
+            stop_pid "$p"
+            left=$((left + 1))
+        done
+    done
+    echo "processes still running or found left over: $left"
     rm -f "$WORK/helper.sock"
     sleep 1
     snapshot after
@@ -153,7 +181,7 @@ teardown() {
     say "routes: diff of \`netstat -rn\` before -> after (anything here is not ours unless flagged)"
     diff "$WORK/before.routes" "$WORK/after.routes" | sed 's/^/    /' || true
     local stale=""
-    for i in "${IFACES[@]}"; do
+    for i in ${IFACES[@]+"${IFACES[@]}"}; do
         grep -qx "$i" "$WORK/after.ifaces" && stale+=" interface:$i"
         grep -qw "$i" "$WORK/after.routes" && stale+=" route-via:$i"
     done
@@ -167,7 +195,7 @@ teardown() {
         fail "teardown: left behind:$stale (processes: $left)"
     fi
     say "summary"
-    printf '%s\n' "${RESULTS[@]}"
+    printf '%s\n' ${RESULTS[@]+"${RESULTS[@]}"}
     echo
     echo "logs and profiles (test passphrases only): $WORK"
 }
@@ -307,37 +335,64 @@ jget() { # file python-expression-over-d
     "$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); print($2)" "$1"
 }
 
-# ---- the room: an anchor, alice's room, bob and carol joined ----
+# ---- the room: an anchor, three nodes and their daemons, alice's room, bob and carol joined ----
 say "setting up the room (production Argon2id and a real proof of work: a few minutes)"
 for m in anchor alice bob carol; do "${AS_USER[@]}" mkdir -p "$WORK/$m/cfg"; done
 voxcmd anchor
 bg anchor "${VOXCMD[@]}" node --listen 127.0.0.1:0
-ANCHOR=$(wait_line "$WORK/anchor.log" '^ *[A-Za-z0-9]+@/ip4/' 180 | tr -d '[:space:]') || exit 1
+ANCHOR=$(wait_line "$WORK/anchor.log" '^ *[A-Za-z0-9]+@/ip4/' 180 "$PID_anchor" | tr -d '[:space:]') || exit 1
 echo "anchor $ANCHOR"
+# Each member: a node made in the client, then its data root's daemon, started by hand with
+# that node attached, so it runs until the trap stops it (ADR-026 L-2, L-8).
 for m in alice bob carol; do
-    FP=$(vox_as "$m" id | tr -d '[:space:]') || { fail "vox id ($m)"; exit 1; }
+    user_file "$WORK/$m/identity.pass" "$IDENTITY"
+    voxcmd "$m"
+    FP=$("${VOXCMD[@]}" node create "$m" --passphrase-file "$WORK/$m/identity.pass" 2>"$WORK/create-$m.log" \
+        | tail -1 | tr -d '[:space:]')
+    [[ ${#FP} == 52 ]] || { fail "vox node create $m: '$FP' $(tail -3 "$WORK/create-$m.log")"; exit 1; }
     eval "FP_$m=$FP"
     echo "$m $FP"
+    bg "daemon_$m" "${VOXCMD[@]}" daemon --listen 127.0.0.1:0 --anchor "$ANCHOR" \
+        --passphrase-file "$WORK/$m/identity.pass"
 done
-vox_as alice trust add "$FP_bob" --name bob >/dev/null && vox_as bob trust add "$FP_alice" --name alice >/dev/null \
-    && vox_as carol trust add "$FP_alice" --name alice >/dev/null && vox_as carol trust add "$FP_bob" --name bob >/dev/null \
-    || { fail "trust add"; exit 1; }
+for m in alice bob carol; do
+    for ((i = 0; i < 300; i++)); do
+        vox_as "$m" node list 2>/dev/null | grep -qw attached && break
+        sleep 0.1
+    done
+    vox_as "$m" node list >"$WORK/nodes-$m.txt" 2>&1
+    grep -qw attached "$WORK/nodes-$m.txt" \
+        || { fail "$m's daemon never attached $m: $(cat "$WORK/nodes-$m.txt") $(tail -3 "$WORK/daemon_$m.log")"; exit 1; }
+    echo "$m's daemon: $(tr '\n' ' ' <"$WORK/nodes-$m.txt")"
+done
+trust() { # member fingerprint name
+    vox_as "$1" trust add "$2" --name "$3" --identity-passphrase-file "$WORK/$1/identity.pass" \
+        >>"$WORK/trust-$1.log" 2>&1 || { fail "vox trust add ($1 trusts $3): $(tail -3 "$WORK/trust-$1.log")"; exit 1; }
+}
+trust alice "$FP_bob" bob
+trust bob "$FP_alice" alice
+trust carol "$FP_alice" alice
+trust carol "$FP_bob" bob
 echo "alice <-> bob trust each other; carol trusts both; nobody trusts carol"
 voxcmd alice
-bg serve "${VOXCMD[@]}" serve 9/udp --name lan --anchor "$ANCHOR" --listen 127.0.0.1:0
+bg serve "${VOXCMD[@]}" serve discard=9/udp --name lan --anchor "$ANCHOR" \
+    --identity-passphrase-file "$WORK/alice/identity.pass"
 # Everything after the label: a generated passphrase may hold spaces.
-ROOM=$(wait_line "$WORK/serve.log" '^room ' 300 | sed -E 's/^room +//') || exit 1
-ADDRESS=$(wait_line "$WORK/serve.log" '^address ' 60 | sed -E 's/^address +//') || exit 1
-ROOM_PP=$(wait_line "$WORK/serve.log" '^passphrase ' 60 | sed -E 's/^passphrase +//') || exit 1
+ROOM=$(wait_line "$WORK/serve.log" '^room ' 300 "$PID_serve" | sed -E 's/^room +//') || exit 1
+ADDRESS=$(wait_line "$WORK/serve.log" '^address ' 60 "$PID_serve" | sed -E 's/^address +//') || exit 1
+ROOM_PP=$(wait_line "$WORK/serve.log" '^passphrase ' 60 "$PID_serve" | sed -E 's/^passphrase +//') || exit 1
 echo "room $ROOM"
+for m in alice bob carol; do user_file "$WORK/$m/room.pass" "$ROOM_PP"; done
 for m in bob carol; do
-    vox_as "$m" connect "$ADDRESS" --passphrase "$ROOM_PP" --anchor "$ANCHOR" --listen 127.0.0.1:0 \
+    vox_as "$m" connect "$ADDRESS" --passphrase-file "$WORK/$m/room.pass" --anchor "$ANCHOR" \
+        --identity-passphrase-file "$WORK/$m/identity.pass" \
         >"$WORK/connect-$m.log" 2>&1 || { fail "vox connect ($m): $(tail -3 "$WORK/connect-$m.log")"; exit 1; }
     echo "$m joined"
     # PRD-001 D8: a one-shot `vox connect` leaves the host deaf for up to its 30 s
     # handshake bound, so the next join waits it out (as the proofs' harness does).
     [[ $m == bob ]] && sleep 35
 done
+# The serve client goes; alice's node stays attached in her daemon, holding the room.
 stop_pid "$PID_serve"
 
 # ---- the helper (root) and three LANs (not root) ----
@@ -346,15 +401,18 @@ stop_pid "$PID_serve"
 ALLOW=47010,47011,47030
 say "vox lan helper (root) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
 bg helper "$VOX" lan helper --socket "$WORK/helper.sock"
-wait_line "$WORK/helper.log" 'serving uid' 30 || exit 1
+wait_line "$WORK/helper.log" 'serving uid' 30 "$PID_helper" || exit 1
+# Each `vox lan up` is a client holding its member's node: its daemon, as $SUDO_USER, asks
+# the helper on helper.sock for the utun and runs the LAN, writing the stats file.
 for m in alice bob carol; do
     voxcmd "$m"
-    bg "lan_$m" "${VOXCMD[@]}" lan up "$ROOM" --anchor "$ANCHOR" --listen 127.0.0.1:0 \
+    bg "lan_$m" "${VOXCMD[@]}" lan up "$ROOM" --passphrase-file "$WORK/$m/room.pass" \
+        --identity-passphrase-file "$WORK/$m/identity.pass" \
         --helper-socket "$WORK/helper.sock" --stats-file "$WORK/$m.json" \
         --allow "$ALLOW"
 done
 for m in alice bob carol; do
-    LINE=$(wait_line "$WORK/lan_$m.log" '^vox lan up on utun' 300) || exit 1
+    LINE=$(wait_line "$WORK/lan_$m.log" '^vox lan up on utun' 300 "$(eval echo "\$PID_lan_$m")") || exit 1
     IF=$(echo "$LINE" | awk '{print $5}')
     IFACES+=("$IF")
     eval "IF_$m=$IF"
@@ -431,39 +489,64 @@ else
 fi
 
 # ---- 3. mDNS ----
+# Carol is judged by her LAN's counters, not her socket. On one Mac the kernel also hands a
+# packet sent on one utun to a matching socket on another, without any LAN carrying it (see 4);
+# what Vox delivered to carol is what her LAN wrote into her interface (to_os) and took from a
+# peer (from_peers). On separate machines the socket would be the evidence too.
 say "3. mDNS: query vox-lan-proof.local on alice, responder on bob, carol listening"
+B0=$(counter bob from_peers); CT0=$(counter carol to_os); CP0=$(counter carol from_peers)
 "${PROBE[@]}" mdns-respond "$IF_bob" "$V4_bob" 12 >"$WORK/mdns-respond.json" &
-PIDS+=($!)
+MDNS_BOB=$!
+PIDS+=("$MDNS_BOB")
 "${PROBE[@]}" mdns-listen "$IF_carol" "$V4_carol" 12 >"$WORK/mdns-carol.json" &
-PIDS+=($!)
+MDNS_CAROL=$!
+PIDS+=("$MDNS_CAROL")
 sleep 1
 Q=$(probe mdns-query "$IF_alice" "$V4_alice" 8)
-sleep 4
-echo "alice's query: $Q; bob's responder: $(cat "$WORK/mdns-respond.json"); carol heard: $(cat "$WORK/mdns-carol.json")"
+# Both listeners write their file when their 12 s are up: read them only then.
+wait "$MDNS_BOB" "$MDNS_CAROL" 2>/dev/null
+sleep 1 # the stats file is written twice a second
+DB=$(($(counter bob from_peers) - B0))
+DCT=$(($(counter carol to_os) - CT0)); DCP=$(($(counter carol from_peers) - CP0))
+echo "alice's query: $Q; bob's responder: $(cat "$WORK/mdns-respond.json"); bob's LAN +$DB from peers"
+echo "carol's LAN: +$DCT written to her interface, +$DCP from peers; (same-host note) carol's socket: $(cat "$WORK/mdns-carol.json")"
 GOT=$(echo "$Q" | "$PY" -c "import json,sys; print('$V4_bob' in json.load(sys.stdin)['answers'])")
-HEARD=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["heard"])' "$WORK/mdns-carol.json" 2>/dev/null || echo "?")
-if [[ $GOT == True && $HEARD == 0 ]]; then
-    pass "mdns: alice resolved vox-lan-proof.local to bob's $V4_bob; carol heard 0 packets"
+if [[ $GOT == True && $DB -ge 1 && $DCT == 0 && $DCP == 0 ]]; then
+    pass "mdns: alice resolved vox-lan-proof.local to bob's $V4_bob through bob's LAN (+$DB); carol's LAN delivered 0"
 else
-    fail "mdns: answer from bob: $GOT; carol heard: $HEARD"
+    fail "mdns: answer from bob: $GOT, bob's LAN +$DB; carol's LAN delivered $DCT (from peers $DCP)"
 fi
 
 # ---- 4. broadcast ----
+# **Same-host broadcast loopback.** macOS hands a broadcast sent on alice's utun to every local
+# socket bound to a matching port and address, IP_BOUND_IF or not: carol's socket gets alice's
+# broadcast straight from the kernel, with no LAN involved (the decider's run: carol's socket
+# 10/10, her LAN's from_peers and to_os 0). Between separate machines that cannot happen. So the
+# claim is the LAN counters: bob's LAN took the broadcast from alice and wrote it into bob's
+# interface, and carol's LAN wrote nothing. The socket counts are printed as a same-host note.
 say "4. UDP broadcast to $BCAST from alice; bob and carol listening"
+BP0=$(counter bob from_peers); BT0=$(counter bob to_os)
+CT0=$(counter carol to_os); CP0=$(counter carol from_peers)
 "${PROBE[@]}" udp-listen "$IF_bob" 47020 6 "vox-bcast" >"$WORK/bcast-bob.json" &
-PIDS+=($!)
+BC_BOB=$!
+PIDS+=("$BC_BOB")
 "${PROBE[@]}" udp-listen "$IF_carol" 47020 6 "vox-bcast" >"$WORK/bcast-carol.json" &
-PIDS+=($!)
+BC_CAROL=$!
+PIDS+=("$BC_CAROL")
 sleep 1
 probe udp-send "$IF_alice" "$V4_alice" "$BCAST" 47020 10 "vox-bcast" >/dev/null
-sleep 5
+wait "$BC_BOB" "$BC_CAROL" 2>/dev/null
+sleep 1 # the stats file is written twice a second
+DBP=$(($(counter bob from_peers) - BP0)); DBT=$(($(counter bob to_os) - BT0))
+DCT=$(($(counter carol to_os) - CT0)); DCP=$(($(counter carol from_peers) - CP0))
 BB=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/bcast-bob.json")
 BC=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/bcast-carol.json")
-echo "bob got $BB/10, carol got $BC/10"
-if [[ $BB -ge 9 && $BC == 0 ]]; then
-    pass "broadcast: bob got $BB/10, carol 0"
+echo "bob's LAN: +$DBP from peers, +$DBT written to his interface; carol's LAN: +$DCP from peers, +$DCT written"
+echo "(same-host note) sockets: bob got $BB/10, carol got $BC/10"
+if [[ $DBP -ge 9 && $DBT -ge 9 && $BB -ge 9 && $DCT == 0 && $DCP == 0 ]]; then
+    pass "broadcast: bob's LAN carried $DBP/10 from alice into his interface; carol's LAN delivered 0"
 else
-    fail "broadcast: bob $BB/10, carol $BC"
+    fail "broadcast: bob's LAN +$DBP from peers, +$DBT written, socket $BB/10; carol's LAN delivered $DCT (from peers $DCP)"
 fi
 
 # ---- 5. the untrusted member ----

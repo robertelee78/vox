@@ -52,7 +52,7 @@ const HARNESS_VARS: &[&str] = &[
     "VOX_ROOM",
     "VOX_AGENT_NAME",
     "VOX_HARNESS",
-    "VOX_PROFILE",
+    "VOX_NODE",
     "VOX_ANCHORS",
     "VOX_LISTEN",
     "VOX_OPENCODE_WAKE_SOCKET",

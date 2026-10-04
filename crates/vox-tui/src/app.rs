@@ -1,15 +1,13 @@
 //! The interactive terminal event loop and runtime (ADR-015 §"Async runtime",
 //! §"At-rest … screen security"; ADR-016 M13.5).
 //!
-//! ## Runtime shape (ADR-015)
-//! [`run_live`] builds a **multi-threaded tokio runtime**, spawns the embedded
-//! `vox-core` node on it, and runs the UI loop on the calling thread as the
-//! **blocking crossterm task**: crossterm's event polling is synchronous, so the
-//! loop owns the terminal while the node's actor and the signal handler run on
-//! the runtime. A `CancellationToken` stops the auxiliary tasks and the node is
-//! shut down (locking everything) on every exit path. The loop reads the node's
-//! latest [`ViewModel`] projection each frame and hands it a [`Command`] per user
-//! action through the [`CoreHandle`] boundary.
+//! ## Runtime shape (ADR-015, ADR-026 S-4)
+//! [`run_live`] builds a **multi-threaded tokio runtime** and makes the TUI a **client of the
+//! account's daemon**: it hosts no node and holds no node lock. It runs the UI loop on the
+//! calling thread as the **blocking crossterm task**: crossterm's event polling is synchronous,
+//! so the loop owns the terminal while the daemon connections and the signal handler run on the
+//! runtime. The loop reads the latest [`ViewModel`] projection each frame and hands it a
+//! [`Command`] per user action through the [`CoreHandle`] boundary ([`DaemonCore`]).
 //!
 //! ## Screen security (ADR-015)
 //! Terminal I/O is behind [`TerminalIo`] so the sequence is **testable**: the
@@ -18,11 +16,12 @@
 //! primary buffer / scrollback; the real backend restores the terminal on every
 //! exit path (normal return, error, panic unwind) via a RAII guard.
 //!
-//! ## Locking (ADR-015)
-//! `:lock`, the idle timer ([`crate::state::IDLE_LOCK_SECS`]) and `SIGHUP` all
-//! lock the node (every SEK and the signer are wiped). When the view reports
-//! `locked`, the masked unlock prompt opens; a profile without an identity opens
-//! the create-identity prompt at startup.
+//! ## No lock (ADR-026 N-2, ADR-015 11.2–11.3)
+//! There is no lock: a node takes its passphrase once, when it attaches, and its secrets are wiped
+//! when it detaches, in the daemon. When the view reports the node not attached, the masked
+//! prompt asks for its passphrase and attaches it; a node without an identity opens the
+//! create-identity prompt. `SIGHUP`, like `SIGTERM` and `q`, stops the TUI cleanly and does
+//! nothing to its node.
 
 use std::io::{self, Stdout, Write};
 use std::time::Duration;
@@ -34,13 +33,12 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
-use tokio_util::sync::CancellationToken;
 use vox_core::node::actor::Node;
 use vox_core::node::api::{NodeCommand, Secret};
 use vox_core::node::paths::Paths;
 
-use crate::live::LiveCore;
-use crate::state::{idle_lock_due, Action, PromptKind, UiState};
+use crate::live::DaemonCore;
+use crate::state::{Action, PromptKind, UiState};
 use crate::ui::render;
 use crate::viewmodel::{Command, CommandStatus, ViewModel};
 
@@ -89,9 +87,9 @@ impl AppError {
 
 /// The contract the loop uses to talk to the running core: it provides the current
 /// [`ViewModel`] to render and consumes [`Command`]s the user issues. The live
-/// implementation is [`LiveCore`] (an embedded `vox-core` node); [`OfflineCore`]
+/// implementation is [`DaemonCore`] (a client of the account's daemon); [`OfflineCore`]
 /// is the no-node shell used by tests.
-/// What the TUI's status line says while creating or unlocking the identity waits for another
+/// What the TUI's status line says while creating the identity waits for another
 /// vox holding the profile.
 pub const WAITING_FOR_PROFILE_TUI: &str =
     "waiting: another vox holds this profile open, and only one at a time may write it — this goes on by itself";
@@ -114,11 +112,16 @@ pub trait CoreHandle {
     fn startup_notice(&self) -> Option<String> {
         None
     }
+    /// Why the TUI cannot go on, once it cannot: the daemon it is a client of stopped. The loop
+    /// then ends, and the TUI exits non-zero saying so (ADR-026 L-7).
+    fn ended(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A no-node core binding: renders an empty/seeded view and records commands as
 /// status messages without fabricating channels, messages, or trust state. Used
-/// by tests; the binary always runs [`LiveCore`].
+/// by tests; the binary always runs [`DaemonCore`].
 #[derive(Default)]
 pub struct OfflineCore {
     view: ViewModel,
@@ -142,7 +145,6 @@ impl CoreHandle for OfflineCore {
         match command {
             Command::CreateChannel { .. } | Command::Join { .. } => CommandStatus::NeedsNode,
             Command::SendText { .. } => CommandStatus::NotConnected,
-            Command::Lock => CommandStatus::Locked,
             _ => CommandStatus::Queued,
         }
     }
@@ -409,20 +411,9 @@ mod secret_input {
     }
 }
 
-/// A wall-clock source for the idle-lock timer (seconds).
-pub type Clock = Box<dyn Fn() -> u64>;
-
-fn system_clock() -> Clock {
-    Box::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    })
-}
-
 /// Run the interactive TUI against `core` on the real terminal.
 pub fn run_tui(core: impl CoreHandle) -> Result<(), AppError> {
-    run_loop(CrosstermIo::new(), core, system_clock())
+    run_loop(CrosstermIo::new(), core)
 }
 
 /// Run the full client: runtime + embedded node + terminal loop, for `paths`.
@@ -1309,143 +1300,97 @@ fn write_anchors_file(
 }
 
 pub fn run_live(
-    paths: Paths,
+    account: vox_core::node::paths::Account,
+    node: Option<String>,
     listen: std::net::SocketAddr,
-    anchors: vox_core::nat::bootstrap::BootstrapSet,
+    anchors: Vec<String>,
 ) -> Result<(), AppError> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    // Opening the profile happens before the TUI takes the screen, so a wait for another vox
-    // holding it is said on the terminal as a CLI verb says it (V210-100).
-    let cfg = vox_core::node::actor::NodeConfig::new()
-        .bind(vox_core::node::actor::Bind::Addr(listen))
-        .anchors(anchors)
-        .on_profile_wait(crate::tunnel_cli::say_waiting);
-    let node = rt.block_on(async { Node::spawn_config(paths.clone(), cfg) })?;
-    // The ADR-020 control socket, so agent sessions on this machine can attach to
-    // this node rather than each running one of their own. Held for the life of
-    // the client: dropping it stops accepting and unlinks the path.
-    //
-    // A failure here is reported and not fatal. The socket is an extra surface,
-    // and a client that cannot offer it should still be a client — refusing to
-    // start the TUI because another feature could not bind would be the wrong
-    // trade.
-    let _ipc = match rt.block_on(async { vox_core::node::ipc::bind(node.clone(), &paths) }) {
-        Ok(server) => Some(server),
-        Err(e) => {
-            eprintln!("vox: control socket unavailable ({e}); `vox room` will not attach");
-            None
-        }
-    };
-    let cancel = CancellationToken::new();
+    // The daemon first, before the TUI takes the screen, so a daemon that will not start is said
+    // on the terminal (ADR-026 S-2).
+    rt.block_on(crate::daemon_client::ensure_daemon(
+        &account, listen, &anchors,
+    ))?;
+    // The node it acts as (C-3): named, else the only one attached, else the only one on disk, else
+    // `default` for a data root with none, whose identity the TUI makes.
+    let node = crate::client::resolve_node(node.as_deref(), &account, true)
+        .map_err(|e| AppError::Usage(e.to_string()))?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let core = DaemonCore::new(rt.handle().clone(), account, node, anchors, stop.clone())?;
     let io = CrosstermIo::new();
     #[cfg(unix)]
     {
-        // **SIGTERM quits as `q` does** (V210-93): the terminal is restored and the node shut
-        // down, so its connections close and its peers learn at once. Left to its default it
-        // killed the process with nothing sent and the terminal left raw.
-        let stop = io.stop_flag();
-        let term = {
-            let _in_rt = rt.enter();
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        };
-        if let Ok(mut term) = term {
-            rt.spawn(async move {
-                if term.recv().await.is_some() {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
-        }
-        // SIGHUP (terminal went away) locks the node (ADR-015).
-        let n = node.clone();
-        let c = cancel.clone();
-        rt.spawn(async move {
-            use tokio::signal::unix::{signal, SignalKind};
-            let Ok(mut hup) = signal(SignalKind::hangup()) else {
-                return;
+        // **SIGTERM and SIGHUP stop the TUI as `q` does** (V210-93, ADR-026 S-4): the terminal is
+        // restored and the connections to the daemon close. The node is the daemon's: it is left
+        // as it is, attached for as long as anything holds it. Left to their defaults these killed
+        // the process with the terminal left raw. A wait on the daemon is given up at once (the
+        // TUI waited out an attach before it stopped: 9.5 s, measured).
+        for kind in [
+            tokio::signal::unix::SignalKind::terminate(),
+            tokio::signal::unix::SignalKind::hangup(),
+        ] {
+            let flag = io.stop_flag();
+            let stop = stop.clone();
+            let signal = {
+                let _in_rt = rt.enter();
+                tokio::signal::unix::signal(kind)
             };
-            loop {
-                tokio::select! {
-                    _ = hup.recv() => { let _ = n.apply(NodeCommand::Lock).await; }
-                    () = c.cancelled() => break,
-                }
+            if let Ok(mut signal) = signal {
+                rt.spawn(async move {
+                    if signal.recv().await.is_some() {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        stop.cancel();
+                    }
+                });
             }
-        });
+        }
     }
-    let core = LiveCore::new(node.clone(), rt.handle().clone());
-    let result = run_loop(io, core, system_clock());
-    cancel.cancel();
-    // Shutdown locks (wipes every SEK and the signer) before the process exits.
-    let _ = rt.block_on(node.apply(NodeCommand::Shutdown));
+    let result = run_loop(io, core);
+    rt.shutdown_timeout(Duration::from_secs(1));
     result
 }
 
 /// The loop over an abstract terminal (the testable core of [`run_tui`]).
-pub fn run_loop(
-    mut io: impl TerminalIo,
-    mut core: impl CoreHandle,
-    clock: Clock,
-) -> Result<(), AppError> {
+pub fn run_loop(mut io: impl TerminalIo, mut core: impl CoreHandle) -> Result<(), AppError> {
     io.enter()?;
-    let result = event_loop(&mut io, &mut core, &clock);
+    let result = event_loop(&mut io, &mut core);
     io.leave()?;
     result
 }
 
-/// Say a lock is under way before asking for it. A lock waits for work still holding a secret —
-/// an Argon2id seal, a passphrase check, a room being reopened — to finish and wipe it (V210-94),
-/// which can take a derivation's time, and the TUI waits on the answer: without this it looked
-/// frozen.
-fn say_locking(io: &mut impl TerminalIo, vm: &ViewModel, ui: &mut UiState) -> Result<(), AppError> {
-    ui.status_message = Some("locking… waiting for work that holds a secret to finish".to_owned());
-    io.draw(&mut |f| render(f, vm, ui))?;
-    Ok(())
-}
-
-fn event_loop(
-    io: &mut impl TerminalIo,
-    core: &mut impl CoreHandle,
-    clock: &Clock,
-) -> Result<(), AppError> {
+fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<(), AppError> {
     let mut ui = UiState::new();
     // Surface any startup notice (e.g. the offline-shell banner) until the user acts.
     ui.status_message = core.startup_notice();
-    let mut last_input = clock();
-    let mut was_locked: Option<bool> = None;
+    let mut was_attached: Option<bool> = None;
     loop {
         if io.stop_requested() {
             return Ok(());
         }
         let vm = core.view();
+        // The daemon it is a client of stopped: nothing here can go on (ADR-026 L-7).
+        if let Some(why) = core.ended() {
+            return Err(AppError::Usage(why));
+        }
         ui.settle(&vm);
 
-        // Onboarding / re-auth prompts: open once per transition, never on top of
-        // another modal.
+        // Onboarding / attach prompts: open once per transition, never on top of another modal.
         if ui.mode.is_normal() {
-            if !vm.has_identity && was_locked.is_none() {
+            if !vm.has_identity && was_attached.is_none() {
                 ui.start_prompt(PromptKind::CreateIdentity, None);
-            } else if vm.locked && vm.has_identity && was_locked != Some(true) {
-                ui.start_prompt(PromptKind::Unlock, None);
+            } else if !vm.attached && vm.has_identity && was_attached != Some(false) {
+                ui.start_prompt(PromptKind::Attach, None);
             }
         }
-        was_locked = Some(vm.locked);
+        was_attached = Some(vm.attached);
 
         io.draw(&mut |f| render(f, &vm, &mut ui))?;
 
-        // Idle lock (ADR-015): lock the node after IDLE_LOCK_SECS without input.
-        let now = clock();
-        if !vm.locked && !vm.locking && vm.has_identity && idle_lock_due(last_input, now) {
-            say_locking(io, &vm, &mut ui)?;
-            ui.status_message = Some(core.apply(Command::Lock).message());
-            last_input = now;
-            continue;
-        }
-
-        // Poll so the render loop never blocks indefinitely (core-pushed updates
-        // and the idle timer are folded in each tick).
-        // A passphrase is read past the terminal library (V210-94): see `poll_secret_key`.
+        // Poll so the render loop never blocks indefinitely (daemon updates are folded in each
+        // tick). A passphrase is read past the terminal library (V210-94): see `poll_secret_key`.
         let key = if ui.typing_a_secret() {
             io.poll_secret_key(Duration::from_millis(250))?
         } else {
@@ -1454,14 +1399,10 @@ fn event_loop(
         let Some(key) = key else {
             continue;
         };
-        last_input = clock();
         match ui.on_key(key, &vm) {
             Action::Quit => return Ok(()),
             Action::Redraw => {}
             Action::Dispatch(cmd) => {
-                if matches!(cmd, Command::Lock) {
-                    say_locking(io, &vm, &mut ui)?;
-                }
                 // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
                 // this terminal, and a line written there lands inside the screen.
                 let status = core.apply_noting(cmd, &mut || {

@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long a verb waits for a daemon the proof is starting before it attaches the node itself.
+const DAEMON_GRACE: Duration = Duration::from_secs(3);
+
 /// How long a detached node's auto-started daemon may take to exit (it lingers 1 s, ADR-026 L-8).
 const GONE_WITHIN: Duration = Duration::from_secs(20);
 
@@ -82,10 +85,9 @@ impl Root {
         );
     }
 
-    /// `vox node detach <node>`, then wait until no daemon holds the data root's lock: a daemon a
-    /// client started exits once it has no node and no client (ADR-026 L-8), so a daemon the proof
-    /// starts next is the one that runs. `PRODUCT (staging):` if the detach fails or the daemon
-    /// stays.
+    /// `vox node detach <node>`, then wait up to [`GONE_WITHIN`] for the data root's daemon to go: a
+    /// daemon a client started exits once it has no node and no client (ADR-026 L-8), so a daemon
+    /// the proof starts next is the one that runs. `PRODUCT (staging):` if the detach fails.
     pub fn detach(&self, node: &str) {
         let (ok, said) = self.vox(&["node", "detach", node], "");
         assert!(
@@ -93,15 +95,17 @@ impl Root {
             "PRODUCT (staging): `vox node detach {node}` in {} failed: {said}",
             self.data.display()
         );
+        // A daemon this attach started exits once it holds nothing (L-8); one that holds another
+        // node, or the proof's own `vox daemon` that came up meanwhile, stays, and that is fine.
         let t0 = Instant::now();
-        while self.daemon_running() {
-            assert!(
-                t0.elapsed() < GONE_WITHIN,
-                "PRODUCT (staging): the daemon {} started for `vox node attach` did not exit \
-                 within {GONE_WITHIN:?} of its only node's detach",
+        while self.daemon_running() && t0.elapsed() < GONE_WITHIN {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if self.daemon_running() {
+            eprintln!(
+                "[harness] a daemon still holds {} {GONE_WITHIN:?} after `vox node detach {node}`",
                 self.data.display()
             );
-            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -112,6 +116,16 @@ impl Root {
         let out = f();
         self.detach(node);
         out
+    }
+
+    /// Run `f`, a one-shot verb, with `node` attached: as it is when a daemon already holds this
+    /// data root (the proof's own `vox daemon`), else attached for it and let go after.
+    pub fn ensure<T>(&self, node: &str, f: impl FnOnce() -> T) -> T {
+        if self.daemon_running() {
+            f()
+        } else {
+            self.attached(node, f)
+        }
     }
 
     /// Whether a process holds the data root's daemon lock.
@@ -128,4 +142,99 @@ impl Root {
             Err(std::fs::TryLockError::Error(_)) => false,
         }
     }
+}
+
+/// The data root's account socket (`<data>/.daemon/vox.sock`, or the short fallback a long path
+/// takes), as the shipped client computes it: every client reaches a node through it since the
+/// per-node socket went (ADR-026 C-1, C-2).
+pub fn account_socket(data: &Path) -> PathBuf {
+    vox_core::node::paths::Account::of(Some(data), Some(&data.join("cfg")))
+        .unwrap_or_else(|e| panic!("APPARATUS: the account of {}: {e}", data.display()))
+        .socket()
+}
+
+/// A control-socket client acting as node `node` of the data root `data`, through the daemon's
+/// account socket, never attaching it (a one-shot verb's `Use`): what `vox room …` sends its
+/// requests on. `Err` says why the daemon could not be reached or refused the node.
+pub async fn node_client(
+    data: &Path,
+    node: &str,
+) -> Result<vox_core::node::ipc::IpcClient, String> {
+    client_at(&account_socket(data), node).await
+}
+
+/// [`node_client`] on the account socket at `socket` (as a daemon names it in "vox daemon:
+/// control socket …").
+pub async fn client_at(
+    socket: &Path,
+    node: &str,
+) -> Result<vox_core::node::ipc::IpcClient, String> {
+    use vox_core::node::daemonipc::{AttachMode, UseNode};
+    let name = vox_core::node::paths::NodeName::parse(node)
+        .map_err(|e| format!("APPARATUS: node name {node:?}: {e}"))?;
+    let using = UseNode {
+        node: name,
+        attach: AttachMode::No,
+        passphrase: None,
+        anchors: Vec::new(),
+    };
+    match vox_core::node::ipc::IpcClient::open_node(socket, using).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(refused)) => Err(format!("the daemon refused node {node}: {refused:?}")),
+        Err(e) => Err(format!("the daemon's socket did not answer: {e}")),
+    }
+}
+
+/// [`node_client`] for the node `paths` resolves: its data root's account socket, as that node.
+pub async fn paths_client(
+    paths: &vox_core::node::paths::Paths,
+) -> Result<vox_core::node::ipc::IpcClient, String> {
+    use vox_core::node::daemonipc::{AttachMode, UseNode};
+    let name = paths
+        .profile_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("APPARATUS: no node name in {}", paths.profile_dir.display()))?;
+    let using = UseNode {
+        node: vox_core::node::paths::NodeName::parse(name)
+            .map_err(|e| format!("APPARATUS: node name {name:?}: {e}"))?,
+        attach: AttachMode::No,
+        passphrase: None,
+        anchors: Vec::new(),
+    };
+    match vox_core::node::ipc::IpcClient::open_node(&paths.account().socket(), using).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(refused)) => Err(format!("the daemon refused node {name}: {refused:?}")),
+        Err(e) => Err(format!("the daemon's socket did not answer: {e}")),
+    }
+}
+
+/// The verbs that refuse a node no daemon holds (ADR-026 L-2, ruled).
+pub const NEEDS_ATTACHED: &[&str] = &[
+    "room", "trust", "status", "service", "share", "app", "tunnel", "doctor",
+];
+
+/// The node to attach before running `argv` in data root `data` the way a person must since
+/// ADR-026 L-2 — its `--node`, else `default` — or `None`: the verb needs no attached node, a daemon
+/// already holds the root, or there is no such node (the verb then says so itself).
+pub fn needs(data: &Path, argv: &[&str]) -> Option<String> {
+    if !argv.first().is_some_and(|v| NEEDS_ATTACHED.contains(v)) {
+        return None;
+    }
+    // A daemon the proof itself is starting may not hold the lock yet: given a moment, it is the
+    // one the verb talks to, and nothing is attached (or later detached) behind its back.
+    let root = Root::at(data, "");
+    let t0 = Instant::now();
+    while t0.elapsed() < DAEMON_GRACE {
+        if root.daemon_running() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let node = argv
+        .windows(2)
+        .find(|w| w[0] == "--node")
+        .map_or("default", |w| w[1])
+        .to_owned();
+    data.join("nodes").join(&node).exists().then_some(node)
 }

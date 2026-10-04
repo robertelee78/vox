@@ -105,12 +105,8 @@ fn spawn_forward(w: &RelayWorld, port: u16, skew: Option<&str>) -> VoxProc {
         &w.guest_dir,
         &args(&[
             "forward",
-            &w.room,
-            &w.host_fp,
-            &w.service,
+            &format!("{}.{}.{}.vox", w.service, w.host_fp, w.room),
             "127.0.0.1:0",
-            "--passphrase-file",
-            &w.passphrase_file(),
             "--anchor",
             &w.anchor.v4_spec,
             "--listen",
@@ -154,9 +150,7 @@ fn a_fresh_process_is_taken_by_its_board() {
         let a_port = free_udp_port();
         let a_spawned = Instant::now();
         let mut a = spawn_forward(&w, a_port, None);
-        a.expect_line("A's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
-        });
+        a.expect_line("A's bound address", |l| l.starts_with("vox: forwarding "));
         let a_start = a_spawned.elapsed();
         let a_tag = format!("/udp/{a_port}");
         let deadline = Instant::now() + CURED_WITHIN;
@@ -182,7 +176,7 @@ fn a_fresh_process_is_taken_by_its_board() {
         let port = free_udp_port();
         let mut fwd = spawn_forward(&w, port, Some(&skew.to_string()));
         fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+            l.starts_with("vox: forwarding ")
         });
         let bound = Instant::now();
         let port_tag = format!("/udp/{port}");

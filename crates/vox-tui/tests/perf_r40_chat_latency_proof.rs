@@ -40,6 +40,9 @@ optional_proof::not_run!(r40_a_message_between_two_online_nodes_arrives_in_under
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};

@@ -239,9 +239,8 @@ connection, bound to the TLS session by its exporter.
     trips to the listener's admission. R40 (under 1 s) and R42 (under 2 s), and the hole punch's
     attempt timeout (ADR-012 `PUNCH_ATTEMPT_TIMEOUT`), MUST be re-measured with it. They are re-measured
     (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,
-    `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`; R42
-    over the relay is measured by `a_first_relayed_connection_is_under_two_seconds_proof`, which is
-    not yet green on its restart claim).
+    `a_first_direct_connection_is_prompt_proof`, `a_first_punched_connection_is_prompt_proof`,
+    `a_first_relayed_connection_is_under_two_seconds_proof`).
 38a. **Diagnostics.** A dialler whose expected node does not answer MUST say "nothing at `<address>`
     answers as `<expected node>`", and MUST NOT name anyone else (ADR-026 G-1)
     (`a_dial_that_reaches_another_node_names_no_one_proof`).

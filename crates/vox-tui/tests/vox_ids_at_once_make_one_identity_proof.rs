@@ -44,7 +44,7 @@ const TRIALS: usize = 20;
 /// `vox id`s started together on each.
 const AT_ONCE: usize = 3;
 /// What the loser of the race says.
-const CONCURRENT: &str = "another vox created this profile's identity at the same time";
+const CONCURRENT: &str = "another vox created this node's identity at the same time";
 /// What a run says that finds the winner still holding the profile: one serving it, or one that
 /// has not finished.
 const BUSY: [&str; 2] = [
