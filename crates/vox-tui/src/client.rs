@@ -498,7 +498,15 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
     // the node making it would have stamped it.
     let now = (vox_core::time::clock_with_test_skew())();
     match vox_core::node::profile::Profile::create(paths.clone(), passphrase.as_bytes(), now) {
-        Ok(p) => Ok(p.fingerprint()),
+        // **Its prekey ring is made with it**, as the node making an identity makes it, so the
+        // ring's age is the identity's (V210-77): what a node attaching later keeps up, not
+        // something it makes afresh.
+        Ok(p) => {
+            let signer = p.signer()?;
+            let dh_secret = *signer.x25519_identity_secret();
+            vox_core::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now)?;
+            Ok(p.fingerprint())
+        }
         Err(Error::Profile(why)) if why.contains("already exists") => Err(AppError::Usage(
             "another vox created this node's identity at the same time; nothing was created \
              here.\n\x20      Run `vox id` again to see the identity it made."
