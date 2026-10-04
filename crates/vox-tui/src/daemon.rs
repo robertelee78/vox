@@ -78,6 +78,15 @@ const IDLE_LINGER: Duration = Duration::from_secs(1);
 /// socket cannot be bound — the last of which **is** fatal here, unlike in the TUI,
 /// because serving that socket is this command's entire purpose.
 pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
+    if args.as_detached {
+        // **None of its starter's descriptors** (ADR-026 S-2): stdin is /dev/null and stdout and
+        // stderr are `.daemon/log`, as the client set them; anything else it inherited — a
+        // harness's pipe that reached the hook without close-on-exec, say — is closed here,
+        // before anything of the daemon's own (its runtime) is open. Kept open, it held the
+        // hook's output pipe for the daemon's life, and a harness that reads its hook to the end
+        // waited for ever (#405, the two_hooks hang).
+        close_inherited_fds();
+    }
     // Refused before anything is read or unlocked: a metrics endpoint the network can
     // reach names every peer and room this node talks to (PRD-001 R38).
     if let Some(addr) = args.metrics {
@@ -277,6 +286,29 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         }
     });
     stop_daemon(rt, &router, &presence, signal)
+}
+
+/// Close every descriptor this process holds past stdin, stdout and stderr: what an auto-started
+/// daemon inherited from the client that started it. Called before anything of its own is open.
+fn close_inherited_fds() {
+    #[cfg(target_os = "macos")]
+    let dir = "/dev/fd";
+    #[cfg(target_os = "linux")]
+    let dir = "/proc/self/fd";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        // Listed first, closed after: the listing's own descriptor is among them, and closing it
+        // once the listing is dropped fails harmlessly.
+        let fds: Vec<i32> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for fd in fds.into_iter().filter(|fd| *fd > 2) {
+            let _ = nix::unistd::close(fd);
+        }
+    }
 }
 
 /// The node `vox daemon` was named (C-3's first step): `--node` / `VOX_NODE`, or a `--profile`
