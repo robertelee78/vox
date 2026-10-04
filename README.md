@@ -25,8 +25,9 @@ There are only four things:
 - **Trust.** Being in a room lets you *see that* messages exist, not *read* them. Two nodes read
   each other only once **each trusts the other** (`vox trust add`). Trust is per node, not per room:
   once you and your mom trust each other, every room you share works, including rooms made later.
-- **Services.** A node can offer a local port to a room (`vox serve`); nodes it trusts can reach it
-  as `<name>.vox`.
+- **Services.** A node can offer a local TCP or UDP port to a room (`vox serve`); nodes it trusts
+  reach it as `<service>.<node>.<room>.vox`, and only that way. `<node>` and `<room>` are your own
+  names for them (or their fingerprint and id).
 
 An **anchor** is only a bridge: when two machines are both behind NAT and cannot find each other,
 an always-on `vox node` you run introduces them. It holds no room key and can read nothing. If
@@ -79,11 +80,30 @@ vox shell-setup --remove
 rm -rf ~/.local/bin/vox ~/.local/bin/.vox-*
 ```
 
-Your identity and rooms live in `~/.local/share/vox/<profile>/` (macOS:
-`~/Library/Application Support/vox/`). The commands above leave them alone; delete that directory
+Your nodes and their rooms live in `~/.local/share/vox/nodes/<name>/` (macOS:
+`~/Library/Application Support/vox/nodes/<name>/`). The commands above leave them alone; delete that directory
 too if you mean it — nobody can recover a room for you.
 
 ## Getting started
+
+### The daemon and your nodes
+
+Each data root (`VOX_DATA_DIR`) has **one `vox daemon`**: it holds the machine's one port and runs
+the nodes that are attached to it. A node is one identity; you can have several, for example
+yourself and one for each agent working beside you.
+
+```
+vox node create alice       # make a node (its passphrase is asked twice; empty is allowed)
+vox node attach alice       # attach it to the daemon, starting the daemon if none runs
+vox node list               # every node here, and whether it is attached
+vox node detach alice       # its connections close and its keys leave memory
+```
+
+Every verb acts as one node: `--node <name>` after the verb, or `VOX_NODE`; with only one node
+attached, that one. `--profile` is gone. Verbs that hold a session (`serve`, `connect`, `up`,
+`forward`, `lan up`) start the daemon and attach their node themselves. The one-shot verbs (`room`,
+`status`, `trust`, `share`, `service`, `app`) only ask an attached node, and say so if it is not:
+`vox node attach <name>` first.
 
 ### The interactive client
 
@@ -92,8 +112,9 @@ vox          # creates your identity on first run, then opens the terminal clien
 ```
 
 In the client: `:new` creates a room, `:invite` prints its address, `:join` takes one, `:open` and
-`:close` open and close a room, `:lock` and `:unlock` lock the node. The members pane shows, for each
-member, whether you trust them and whether they can read you.
+`:close` open and close a room, `:leave` and `:end` leave it or end it for everyone. The client is a
+client of the daemon: `:attach` attaches your node, and `:node <name>` acts as another of your nodes.
+The members pane shows, for each member, whether you trust them and whether they can read you.
 
 ### Two people, their first shared room
 
@@ -111,7 +132,10 @@ From then on you read each other. **Every later room you share needs only steps 
 carries over.
 
 `vox room leave <room>` leaves a room: the others are told, and the room is removed from your node.
-Joining again later works.
+Joining again later works. `vox room end <room>` ends it for everyone; only its creator, or an admin
+the creator named with `vox room admin add <room> <member>`, may. `vox room retention <room> 1w`
+sets how long the room keeps messages (`1h`, `1w`, `1m`, seconds, or `forever`), for everything
+already in it.
 
 ### Passphrases
 
@@ -137,21 +161,26 @@ A passphrase is never taken from the command line, where `ps` would show it.
 On the machine with the service:
 
 ```
-vox serve 22                          # offer local port 22 to a new room; prints its vox://
-                                      # address and the room's <52-char>.vox name
+vox serve ssh=22                      # offer local port 22 as "ssh" in a new room; prints its
+                                      # vox:// address, passphrase and the service's .vox name
 ```
 
 On the machine that wants in:
 
 ```
 vox connect <vox://…>                 # join the room (one-shot: joining is durable)
-vox up <room>                         # a loopback SOCKS5 proxy that resolves the .vox name;
+vox up                                # a loopback SOCKS5 proxy for every room this node holds;
                                       # prints the exact ProxyCommand line to use
-ssh -o "ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p" user@<52-char>.vox
+ssh -o "ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p" user@ssh.mom.family.vox
 ```
 
-Reaching a service follows trust: the host's node lets in only the nodes it trusts. For a tool with
-no proxy support, `vox forward` binds a local port instead.
+`ssh.mom.family.vox` is `<service>.<node>.<room>.vox`, with `mom` the name you gave her node in
+`vox trust add` and `family` your name for the room. Reaching a service follows trust: the host's
+node lets in only the nodes it trusts. For a tool with no proxy support, `vox forward
+ssh.mom.family.vox` binds a local port instead. UDP works the same way: `vox serve dns=53/udp`.
+
+To hand a room a file or a folder, `vox share <room> <path>` serves it until `--count` fetches or
+`--for` a time; members you trust fetch it with `vox room get`.
 
 If **both** machines are behind NAT, add an anchor (next section) and pass `--anchor <spec>` to
 `serve` and `up`.
@@ -175,6 +204,18 @@ A node remembers the port it first bound and binds it again on restart, so a mem
 is found where it was. Nodes on the same computer or LAN also find each other again on their own if
 one does move.
 
+### The family LAN (macOS)
+
+`vox lan up <room>` puts the members of a room on one virtual LAN: each gets an address on its own
+interface, and discovery (mDNS, broadcast) works across it, between members who trust each other.
+Nothing on your machine is reachable over it unless you list its port with `--allow`. Making a
+network interface needs root, and only a small helper has it; everything else runs as you:
+
+```
+sudo vox lan helper                   # in one terminal: creates interfaces, nothing else
+vox lan up <room> --allow 32400       # in another, as yourself
+```
+
 ## Agents
 
 Vox is how AI agents working on the same repository coordinate. Each agent is its own **node** in a
@@ -186,15 +227,16 @@ room with the other agents (and usually you):
   [awa](https://github.com/robertelee78/agent-work-accountability). Vox carries the conversation;
   the issue carries the record.
 
-An agent's node is a `vox daemon` running under the agent's own profile (`--profile`, or
-`VOX_DATA_DIR`/`VOX_CONFIG_DIR`). The agent uses the `vox room …` verbs against it: `post`, `read`,
-`claim` (exit 0 only once the other online members agree it is yours), `board`, `send`, `get`,
-`join`, `leave`.
+An agent is its own node, never a person's: `vox node create claude-laptop`, attached to the
+machine's daemon beside yours. The agent uses the `vox room …` verbs as that node (`--node`):
+`post`, `read`, `claim` (exit 0 only once the other online members agree it is yours), `board`,
+`send`, `get`, `join`, `leave`.
 
 Two things wire an agent session into its node, for **Claude Code, Codex and OpenCode**:
 
 ```
-vox agent plugin claude|codex|opencode   # the hook or plugin that hands the agent its rooms'
+vox agent plugin claude|codex|opencode --node claude-laptop
+                                         # the hook or plugin that hands the agent its node's
                                          # new messages at the start of every turn
 vox agent skill  claude|codex|opencode   # the agent-facing instructions (a SKILL.md)
 ```
@@ -297,13 +339,19 @@ Heavy, timing-bound or live-model checks need `--features optional-proofs`; see
 
 ## Status
 
-**v0.2.10** (October 2026). Linux and macOS, as a terminal client, CLI and daemon. Working today:
-identity and lock/unlock; rooms over the real network through the full NAT ladder; trust-gated
-reading; replication and sync; room-bound services and `ssh` over Vox; key rotation and per-member
-revocation; agent comms for Claude Code, Codex and OpenCode.
+**v0.3.0** (October 2026). Linux and macOS, as a terminal client, CLI and daemon. Working today:
+one daemon per data root with any number of nodes; rooms over the real network through the full NAT
+ladder; trust-gated reading; replication and sync; room-bound TCP and UDP services reached as
+`<service>.<node>.<room>.vox`, and `ssh` over Vox; `vox share`; the family LAN (macOS); leaving and
+ending rooms, admins and retention; key rotation and per-member revocation; agent comms for Claude
+Code, Codex and OpenCode, each agent its own node.
 
-Next: the native macOS client ([ADR-014](docs/adr/ADR-014-macos-client.md)) and v0.3.0's work. iOS
-is a separate, later capability.
+**Upgrading from v0.2.x:** on first run, each old profile directory is moved to `nodes/<name>/`
+with its identity and trust. Rooms made by an earlier vox are refused by v0.3.0: make them
+again, and send their members the new room link and passphrase.
+
+Next: the native macOS client ([ADR-014](docs/adr/ADR-014-macos-client.md)). iOS is a separate,
+later capability.
 
 ## Contributing
 
