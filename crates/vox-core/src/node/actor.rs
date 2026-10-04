@@ -6352,6 +6352,7 @@ impl Node {
                 }
                 puts.extend(self.withdrawn.values().cloned());
                 Self::put_withdraws(&conn, puts);
+                self.read_anchor_boards(Some(peer)).await;
             }
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
@@ -9502,6 +9503,58 @@ impl Node {
             }
             self.discover_rooms.extend(self.channels.keys().copied());
             self.sched_all = true;
+            self.read_anchor_boards(None).await;
+        }
+    }
+
+    /// **Read the boards of the anchors this node is connected to**, for every room naming them
+    /// ([`exchange_boards`]), each on a task of its own: `only` for one anchor that just
+    /// connected, or every connected one on the tick. A member of the room is not read here: its
+    /// board is read in every sync session with it.
+    async fn read_anchor_boards(&self, only: Option<Digest32>) {
+        let (Some(net), Some(store)) = (
+            self.net.as_ref().map(Arc::clone),
+            self.profile.as_ref().map(Profile::store_handle),
+        ) else {
+            return;
+        };
+        let now = self.now();
+        for (cid, shared) in &self.channels {
+            let (anchors, known) = {
+                let ch = shared.lock().await;
+                let anchors: Vec<Digest32> = ch
+                    .anchors()
+                    .nodes()
+                    .iter()
+                    .map(|a| a.id)
+                    .filter(|a| !ch.is_member(a))
+                    .filter(|a| only.is_none_or(|o| o == *a))
+                    .collect();
+                (anchors, ch.epoch())
+            };
+            for anchor in anchors {
+                let Some(conn) = self
+                    .anchors_up
+                    .get(&anchor)
+                    .filter(|c| c.quinn().close_reason().is_none())
+                    .map(Arc::clone)
+                else {
+                    continue;
+                };
+                let (net, store, shared, cid) = (
+                    Arc::clone(&net),
+                    Arc::clone(&store),
+                    Arc::clone(shared),
+                    *cid,
+                );
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        SETUP_PATIENCE,
+                        exchange_boards(&net, &conn, &shared, &store, cid, known, now),
+                    )
+                    .await;
+                });
+            }
         }
     }
 
@@ -9627,53 +9680,9 @@ impl Node {
                     // the budgets).
                     let setup = async {
                         if let Some(pstore) = admit_store {
-                            if let Ok(set) = net.fetch_channel(&conn, &cid, known).await {
-                                admitted_authors = admit_board_records(
-                                    shared,
-                                    &pstore,
-                                    &set.bundles,
-                                    ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                                    now,
-                                    Some(&net),
-                                )
-                                .await;
-                                // What the peer's board holds is filed on this node's own, so its board
-                                // carries the whole membership it knows. Bundles go first: they carry
-                                // the key an address record is verified with (M15.2a). Mirroring to the
-                                // anchors follows on the actor when `SyncDone` lands, because that needs
-                                // channel state.
-                                for wire in set
-                                    .bundles
-                                    .iter()
-                                    .map(MemberBundleRecord::to_wire)
-                                    .chain(set.members.iter().map(RendezvousRecord::to_wire))
-                                {
-                                    let _ = net.publish_local(&wire);
-                                }
-                                // **And the other way: what this node's board holds that the peer's
-                                // lacks.** A member who joined through this node is on this node's
-                                // board and no other, and the peer learned of it only when *it* next
-                                // read this board, on its own periodic sync: 24–28 s for a third
-                                // member to see a new one, measured. Offered here, a push that follows
-                                // a join carries the newcomer to every connected member at once.
-                                // Best-effort: a refusal (a record the peer's board already holds
-                                // newer) costs nothing, and the peer's own sync still reads this board.
-                                let missing = net.board_records_missing_from(&cid, known, &set);
-                                if !missing.is_empty() {
-                                    if let Ok(mut client) =
-                                        crate::nat::service::RendezvousClient::open(&conn).await
-                                    {
-                                        for wire in &missing {
-                                            if let Err(e) = client.put(wire).await {
-                                                if !matches!(e, Error::RendezvousRejected(_)) {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        client.finish();
-                                    }
-                                }
-                            }
+                            admitted_authors =
+                                exchange_boards(&net, &conn, shared, &pstore, cid, known, now)
+                                    .await;
                         }
                     };
                     let _ = tokio::time::timeout(SETUP_PATIENCE, setup).await;
@@ -13823,6 +13832,72 @@ impl crate::node::up::Names for NodeNames {
     ) -> std::result::Result<crate::node::resolver::ServiceRoom, String> {
         self.resolve(name).await
     }
+}
+
+/// **Exchange `conn`'s board for room `cid` with this node's** (ADR-008, ADR-016): read the
+/// members it knows and admit them, file its records on this node's board, and offer it the
+/// records this node's board holds that it lacks. Returns the authors admitted.
+///
+/// Run at the start of every outbound sync session, and with each anchor of the room this node is
+/// connected to ([`Node::read_anchor_boards`]). An anchor runs no sync session (ADR-023 RL-6.2),
+/// but its board is the one place a member that restarted learns where the others are and the
+/// bundles it opens pairwise sessions with: its own board starts empty. Without this a restarted
+/// member could release no key to a member it had not synced with since (#410:
+/// a_taken_first_key_is_not_sent_again's positive control, after the anchor stopped being a sync
+/// partner).
+async fn exchange_boards(
+    net: &NodeNet,
+    conn: &crate::transport::quic::VoxConnection,
+    shared: &tokio::sync::Mutex<ChannelState>,
+    pstore: &crate::node::store::Store,
+    cid: Digest32,
+    known: u64,
+    now: u64,
+) -> usize {
+    let Ok(set) = net.fetch_channel(conn, &cid, known).await else {
+        return 0;
+    };
+    let admitted_authors = admit_board_records(
+        shared,
+        pstore,
+        &set.bundles,
+        ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+        now,
+        Some(net),
+    )
+    .await;
+    // What the peer's board holds is filed on this node's own, so its board carries the whole
+    // membership it knows. Bundles go first: they carry the key an address record is verified
+    // with (M15.2a). Mirroring to the anchors follows on the actor when `SyncDone` lands, because
+    // that needs channel state.
+    for wire in set
+        .bundles
+        .iter()
+        .map(MemberBundleRecord::to_wire)
+        .chain(set.members.iter().map(RendezvousRecord::to_wire))
+    {
+        let _ = net.publish_local(&wire);
+    }
+    // **And the other way: what this node's board holds that the peer's lacks.** A member who
+    // joined through this node is on this node's board and no other, and the peer learned of it
+    // only when *it* next read this board, on its own periodic sync: 24–28 s for a third member to
+    // see a new one, measured. Offered here, a push that follows a join carries the newcomer to
+    // every connected member at once. Best-effort: a refusal (a record the peer's board already
+    // holds newer) costs nothing, and the peer's own sync still reads this board.
+    let missing = net.board_records_missing_from(&cid, known, &set);
+    if !missing.is_empty() {
+        if let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await {
+            for wire in &missing {
+                if let Err(e) = client.put(wire).await {
+                    if !matches!(e, Error::RendezvousRejected(_)) {
+                        break;
+                    }
+                }
+            }
+            client.finish();
+        }
+    }
+    admitted_authors
 }
 
 /// Admit as many board records as their M17.6 evidence allows, to a fixpoint.
