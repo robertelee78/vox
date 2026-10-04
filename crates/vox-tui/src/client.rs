@@ -127,6 +127,18 @@ impl NodeArgs {
     pub fn anchor_set_lenient(
         &self,
     ) -> vox_core::error::Result<(BootstrapSet, Option<vox_core::error::Error>)> {
+        self.anchor_set_lenient_at(&self.paths()?)
+    }
+
+    /// [`Self::anchor_set_lenient`] for the node at `paths`, already resolved: `vox node`'s,
+    /// which on an empty data root is made, where [`Self::paths`] would refuse to choose one.
+    ///
+    /// # Errors
+    /// As [`Self::anchor_set`].
+    pub fn anchor_set_lenient_at(
+        &self,
+        paths: &Paths,
+    ) -> vox_core::error::Result<(BootstrapSet, Option<vox_core::error::Error>)> {
         let mut set = BootstrapSet::new();
         // The node's anchors file first, then `--anchor` on top (ADR-017 decision 7, M17.4). Both
         // merge into one set rather than one replacing the other: an anchor is additive — more
@@ -134,7 +146,7 @@ impl NodeArgs {
         // line almost never means "and forget the one I configured". `vox node` writes its own
         // spec into that file, so a client on the same machine as its anchor needs no flag at
         // all. A line that cannot be used is skipped and said, and the others still count.
-        let file = self.paths()?.anchors_file();
+        let file = paths.anchors_file();
         let skipped = merge_anchors_file(&mut set, &file)?;
         for line in &skipped {
             eprintln!("vox: {line}");
