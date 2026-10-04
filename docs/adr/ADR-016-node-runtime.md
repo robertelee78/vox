@@ -10,7 +10,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 Identity (ADR-002), the pairwise channel (004), join (005), sender keys (006), governance (007), the log and sync (008), at-rest storage (010), transport (011), NAT traversal (012) and tunnelling (013) are each specified in their own ADR. This ADR specifies the node that composes them into one process a person runs: what it owns, how it stores, how a room is created and joined over the network, how it connects, syncs and anchors, and how it reports what it is doing.
 
-Decided by the decider on 2026-09-19: the persistence engine is **redb**; member prekey bundles are a **new rendezvous record kind**; the invite link **never carries the passphrase**; delivery is **single-device first, network second**. Carried from ADR-014 and ADR-015: **the client embeds the node**, and **a headless node is ciphertext-only**.
+The persistence engine is **redb**; member prekey bundles are a **new rendezvous record kind**; the invite link **never carries the passphrase**; delivery is **single-device first, network second**; and **a headless node is ciphertext-only**. Nodes run in the account's one daemon, and clients reach them through it (ADR-026, decided, not built).
 
 ## Requirements
 
@@ -42,7 +42,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
 - **NR-8.** A log append, its plaintext row and its chain-state advance MUST commit in one write transaction. A dropped batch writes nothing. A failed commit MUST poison the room until it is reopened, because reusing a sender-key iteration for different plaintext is key/nonce reuse.
 - **NR-9.** On open, the node MUST rebuild a room's DAG from its log segments through `Dag::accept`, because the store is a cache of verified entries and is never trusted as such. It MUST accept a cache row only if its entry is in the DAG.
 - **NR-10.** Paths MUST follow ADR-015 requirement 12.1 and its precedence: explicit, then `VOX_DATA_DIR`/`VOX_CONFIG_DIR`, then `XDG_*`, then the platform default. Data lives in `<data>/vox/<profile>/`. Files MUST be `0600` and directories `0700` (Unix). A profile name MUST be a single path component. Under ADR-026 (F-1–F-3) a node lives in `<data root>/nodes/<name>/` with its own config, the daemon in `<data root>/.daemon/`, and existing profiles migrate on the daemon's first start (`profiles_of_the_previous_release_become_nodes_proof`).
-- **NR-11.** A profile holds one identity (under ADR-026, a node directory holds one), and a second create MUST be refused. An existing profile MUST open locked. Unlock MUST refuse a vault whose identity disagrees with the store's recorded fingerprint.
+- **NR-11.** A profile holds one identity (under ADR-026, a node directory holds one), and a second create MUST be refused. An existing profile MUST open locked. Unlock MUST refuse a vault whose identity disagrees with the store's recorded fingerprint. *Decided, not built (ADR-026 N-2):* there is no locked state; attaching a node takes its passphrase, and MUST refuse a vault whose identity disagrees with the store's recorded fingerprint.
 - **NR-12. Planned.** The node is to reclaim space with `redb` compaction after pruning. `Profile::compact_store` exists, but nothing calls it.
 
 ### App-lock and signals
@@ -63,7 +63,7 @@ Decided by the decider on 2026-09-19: the persistence engine is **redb**; member
   - start the creator's first sender chain;
   - append the genesis and the creator's governance entries;
   - publish the room's records (NR-23).
-- **NR-17.** Opening a room MUST require the unlocked identity **and** the room passphrase. A node MUST retain a room's passphrase while the room is open, because answering a join needs it (ADR-005).
+- **NR-17.** Opening a room MUST require the unlocked identity **and** the room passphrase, which MAY be empty (ADR-005 J-2). A node MUST retain a room's passphrase while the room is open, because answering a join needs it (ADR-005).
 - **NR-17a.** A room's local name MUST live only in its sealed manifest, so a closed room is listed by id only.
 - **NR-17b.** A text message's body MUST NOT exceed `MAX_TEXT_LEN` (64 KiB).
 - **NR-17c.** An entry MUST be classified before it is stored: a struct-tagged governance frame is governance, a `vox/group-msg/v1` sender-key message is content, and anything else MUST be refused (`classify_payload`).
@@ -225,18 +225,10 @@ These are known and not fixed. Each stays until it is fixed, with the fixing com
 
 | # | Defect or limit | Where | Tracked |
 |---|---|---|---|
-| D1 | An anchor tracks epoch 0 only, so an epoch change is not carried on its board. | `node/anchor.rs:123`, `:154` | #356 |
-| D2 | Member→anchor sessions are proved on a relayed path on loopback only. Whether the `sync failed: transport` seen in the deleted `node_m15_anchor_gate` occurs behind real NATs is not measured. | — | untracked (see the V030-29 report) |
+| D1 | An anchor tracks epoch 0 only, so an epoch change would not be carried on its board. No operation advances a room's epoch (ADR-007 G-21), so this has no effect until one does. | `node/anchor.rs:123`, `:154` | #356 |
+| D2 | Member→anchor sessions are proved on a relayed path on loopback only. Whether the `sync failed: transport` seen in the deleted `node_m15_anchor_gate` occurs behind real NATs is not measured. | — | untracked |
 | D4 | ADR-008's golden-vector obligation is unmet, including for `0x0012`: no golden-vector test exists. | ADR-008 | open, awaiting the decider (V030-29 question 19) |
 | L1 | A first `ssh` into a fresh room can wait up to `HOST_PATIENCE` (300 s). | `node/up.rs:214` | limit, by design |
-
-Fixed since the old text, with evidence:
-- A cross-process join through an anchor failing about half the time: `cross_process_join_proof` is back in the blocking gate (fb2f3618, V210-19, #192).
-- Opening a stream had no deadline: `OPEN_STREAM_PATIENCE` (2afa020b).
-- A failed join did not name the rung that refused: it prints its steps and what each responder said (79ece6f4, #192).
-- Sessions this node starts were not checked: NR-41 (ce4a55f2, V29-04).
-- Member→anchor sessions failing on a relayed path: measured working through the shipped binary on loopback, with a mutant that turns it red (a568ac2d, V210-139, #358).
-- A member that restarts under the same identity was refused as the same pair while its old session waited: the newcomer's first connection now closes every connection to the old process (`ConnectionManager::file_inner`, V210-57), measured 12 of 12 under 0.15 s (a568ac2d, V210-139, #358).
 
 ## Consequences
 

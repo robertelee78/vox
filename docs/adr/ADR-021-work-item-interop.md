@@ -4,7 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: Accepted. Built on integrate/v0.3.0: M21.1–M21.10, in `crates/vox-agentcomms/src/{claim,ops,version,envelope}.rs`
 and `crates/vox-tui/src/{room_cli,coord,agent_hook}.rs`, each with a real-binary proof in
-`crates/vox-tui/tests/`. Every defect F1–F20 is fixed or retired (see "Fixed since"). Open: the
+`crates/vox-tui/tests/`. Open: the
 timing-dependent M21.4 mutant and the unused M21.5 mutation (#368); `adapter_stream_proof` on
 v0.3.0's single room order (V030-28, #350).
 **Date**: 2026-09-23
@@ -15,8 +15,8 @@ v0.3.0's single room order (V030-28, #350).
 
 The decider wants a work-management system, maintained by agents with no administration by him,
 that turns ADRs into epics and stories and tracks priorities, dependencies and verified
-completion. It is separate from Vox: "I'm not asking Vox to become the work tracker or derive the
-entire board from its room history." The tracker in use is awa, which records progress on GitHub.
+completion. It is separate from Vox: Vox does not become the work tracker, and the board is not
+derived from room history. The tracker in use is awa, which records progress on GitHub.
 Vox's agent comms records who does what (ADR-020 §5). This ADR is the smallest contract between
 them: stable work-item references, compatible event meanings, and a way for an adapter to consume
 the room.
@@ -274,26 +274,9 @@ socket protocol for this contract; MUST NOT validate a reference against a track
 defend against a dishonest worker (session names, stamps and op ids are declarations by trusted
 keys).
 
-### Fixed since
+### Known limits
 
-| # | Defect | Fixed |
-|---|---|---|
-| F1–F3 | handoff inert; handoff resolution non-convergent; ownership per node | M21.2 (`ca267d5`), `work_handoff_proof` |
-| F4, F7, F8 | CLI never filled `from`/`at`; `status` missing from the vocabulary; drain re-injected own posts | M21.6 (`ca267d5`), `drain_self_filter_proof` |
-| F5, F6 | no machine-readable output; `tail` could not resume | M21.5 (`a2e20cd`, `dbbdee7`), `adapter_stream_proof` |
-| F9, F10 | `--since` help said 64 characters; stale ADR index | M21.7 |
-| F11 | claim operations carried no version | M21.1 (`ca267d5`), `work_version_proof` |
-| F12 | two joiners of one room could not read each other | #11, `room_of_three_keys_proof` |
-| F13 | `tail` never showed another member's message | `a2e20cd`, `adapter_stream_proof` |
-| F14 | a rate-limited post failed as `Failed(Internal)` | retired: the rate quota is removed (PRD-001 R3, #12) |
-| F15 | the daemon woke only on its own node's posts | #13, `remote_interrupt_proof` (v0.2.8) |
-| F16 | `data.work` shape unchecked; `--data` skipped the version gate | #21, `work_ref_proof` |
-| F17 | a hand-opened OpenCode session could not be woken | #28, `opencode_plugin_proof` |
-| F18 | `adapter_stream_proof` waited ~120 s longer | #163 (V210-113 #309, V210-120 #317) |
-| F19 | local order across a restart unproved | #165, `adapter_stream_proof` |
-| F20 | seeded attempt id's two exclusions unproved | #166, `work_ref_proof` |
-
-Known limits that remain: F16's gate half (a `--data` reference passes the version gate) follows
+F16's gate half (a `--data` reference passes the version gate) follows
 by construction and is not separately proved; `work_version_proof` drives the gate through `--work`
 only. M21.8's assertions that a `release` is never Done and a `result` reaches Acceptance at most
 test the stub tracker's own rules, not Vox. The M21.4 no-post-read mutant is timing-dependent and

@@ -299,6 +299,26 @@ impl Credential {
     }
 }
 
+impl Credential {
+    /// A copy of the one credential file `from` at `to`, mode 0600, removed however the test
+    /// ends: for a harness whose credential file holds that harness's own sign-in alone (Codex's
+    /// `auth.json`), so nothing else of the operator's comes with it.
+    pub fn copy_file(from: &Path, to: &Path) -> Self {
+        let bytes = std::fs::read(from)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot read the harness's credential: {e}"));
+        leftovers::guard(1, to);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(to)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox's credential: {e}"));
+        f.write_all(&bytes)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox's credential: {e}"));
+        Self(to.to_path_buf())
+    }
+}
+
 impl Drop for Credential {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -373,6 +393,42 @@ pub fn provider_failure(said: &str) -> Option<String> {
         })
 }
 
+/// **Probe a profile before anything runs under it**: a shell confined by `path` must fail to
+/// read the canary (by both of its paths), to find it, and to list it in the real HOME, or the
+/// run stops here as APPARATUS.
+pub fn probe_profile(path: &Path, canary: &Canary, name: &str) {
+    let probe = Command::new("/usr/bin/sandbox-exec")
+        .arg("-f")
+        .arg(path)
+        .args(["/bin/sh", "-c"])
+        .arg(format!(
+            "cat {p:?} /System/Volumes/Data{p:?}; find / -name {n:?} 2>/dev/null; ls -a {h:?}",
+            p = canary.path.display().to_string(),
+            n = canary.name(),
+            h = crate::watchdog::temp_home::real_home()
+                .map(|h| h.display().to_string())
+                .unwrap_or_default(),
+        ))
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run the sandbox probe: {e}"));
+    let probed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    canary.check(&probed, "a sandboxed shell");
+    // The probe's output holds the real HOME's path and listing, so the red names the canary
+    // alone.
+    assert!(
+        !String::from_utf8_lossy(&probe.stdout).contains(&canary.name()),
+        "APPARATUS: the sandbox leaked: canary {} was listed or found by a sandboxed shell",
+        canary.name()
+    );
+    println!(
+        "[proof] sandbox probe ({name}): the canary in the real HOME is unreadable and unfound"
+    );
+}
+
 /// One run's OpenCode sandbox: its root (the fixture, HOME and TMPDIR a turn may use), the canary
 /// planted for it, and the credential copied into it.
 pub struct OcSandbox {
@@ -432,36 +488,7 @@ impl OcSandbox {
         let path = self.tmp.join(format!("{name}.sb"));
         std::fs::write(&path, sandbox_profile(&all_rw, &all_r))
             .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox profile: {e}"));
-        let probe = Command::new("/usr/bin/sandbox-exec")
-            .arg("-f")
-            .arg(&path)
-            .args(["/bin/sh", "-c"])
-            .arg(format!(
-                "cat {p:?} /System/Volumes/Data{p:?}; find / -name {n:?} 2>/dev/null; ls -a {h:?}",
-                p = self.canary.path.display().to_string(),
-                n = self.canary.name(),
-                h = crate::watchdog::temp_home::real_home()
-                    .map(|h| h.display().to_string())
-                    .unwrap_or_default(),
-            ))
-            .output()
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot run the sandbox probe: {e}"));
-        let probed = format!(
-            "{}{}",
-            String::from_utf8_lossy(&probe.stdout),
-            String::from_utf8_lossy(&probe.stderr)
-        );
-        self.canary.check(&probed, "a sandboxed shell");
-        // The probe's output holds the real HOME's path and listing, so the red names the canary
-        // alone.
-        assert!(
-            !String::from_utf8_lossy(&probe.stdout).contains(&self.canary.name()),
-            "APPARATUS: the sandbox leaked: canary {} was listed or found by a sandboxed shell",
-            self.canary.name()
-        );
-        println!(
-            "[proof] sandbox probe ({name}): the canary in the real HOME is unreadable and unfound"
-        );
+        probe_profile(&path, &self.canary, name);
         path
     }
 

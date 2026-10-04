@@ -3277,7 +3277,7 @@ impl ChannelState {
     }
 
     /// Forget that `target` holds this identity's current sender key, so the next
-    /// re-key round delivers it again (ADR-021 F12).
+    /// re-key round delivers it again (ADR-004 O4).
     ///
     /// For when the pairwise session a key was delivered over has been replaced by the
     /// one both ends keep: what was sealed under the dropped session cannot be opened.

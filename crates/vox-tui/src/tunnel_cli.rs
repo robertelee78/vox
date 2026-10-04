@@ -14,6 +14,7 @@ use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome};
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode};
 use vox_core::node::paths::Paths;
+use vox_core::node::resolver::{ServiceRoom, ShareState};
 
 use crate::app::AppError;
 
@@ -328,6 +329,31 @@ pub fn print_services(
         println!("  {tag}  →  {addr}");
     }
 }
+
+/// The refusal for an address whose share the room's log does not carry, or `None` when it does
+/// (V030-25, PRD-001 R23: said at once, on this side).
+fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
+    match room.share {
+        ShareState::Stated => None,
+        ShareState::Absent => Some(AppError::Usage(format!(
+            "{name}: {} shares no service called `{}` in that room \
+             (`vox service list {}` shows what is shared there)",
+            crate::ident::author_id(&room.host),
+            vox_core::node::channel::service_name(&room.service),
+            short(&room.channel_id)
+        ))),
+        ShareState::NotYetKnown => Some(AppError::Usage(format!(
+            "{name}: that room has not synced with its members since this node joined it, so what \
+             is shared there is not known here yet\n       try again once a member is reachable"
+        ))),
+    }
+}
+
+/// How long a forward waits, in a room this node has not yet synced, for the share an address
+/// names to arrive on the room's log: see [`forward_named`]. The same patience a forward has for
+/// reaching its host: the first sync is with the room's members, so it can take as long as
+/// reaching one (a relayed path took 18 s).
+const SHARE_PATIENCE: Duration = vox_core::node::up::HOST_PATIENCE;
 
 /// What a one-shot verb is waiting for, and since when: what it says when it is stopped before it
 /// finishes (V210-85).
@@ -1293,29 +1319,6 @@ pub(crate) async fn open_named_room(
     Ok(channel_id)
 }
 
-/// Whether `host` shares `service` in `channel_id` over UDP: each UDP share the room lists is
-/// resolved as this node writes it, and compared.
-async fn shared_udp(
-    held: &mut crate::client::Held,
-    channel_id: Digest32,
-    host: Digest32,
-    service: &str,
-) -> bool {
-    let Ok(Frame::Services { shared, .. }) =
-        held.client.request(&Request::Services { channel_id }).await
-    else {
-        return false;
-    };
-    for (address, _, _) in shared.iter().filter(|s| s.2) {
-        if let Ok(found) = vox_core::node::nameipc::resolve(&held.at, address).await {
-            if found == (channel_id, host, service.to_owned()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// `vox forward <service>.<node>.<room>.vox [<local>]`: resolved and carried by the daemon for
 /// this node, until stopped (V030-25, ADR-026 L-7).
 ///
@@ -1332,16 +1335,31 @@ pub async fn forward_named(
 ) -> Result<(), AppError> {
     let mut held = crate::client::hold(paths, args, pass, false, Some(waiting)).await?;
     waiting.on("the name to resolve");
-    let (channel_id, host, service) = vox_core::node::nameipc::resolve(&held.at, name)
-        .await
-        .map_err(|e| AppError::Usage(format!("{name}: {e}")))?;
-    // **A UDP service is forwarded as one** (ADR-022 decision 6): its address names it as any
-    // other, and the room says which shares are UDP. One that is, is asked for as `udp/<name>`.
-    let service = if shared_udp(&mut held, channel_id, host, &service).await {
-        format!("udp/{service}")
-    } else {
-        service
+    let resolve = || async {
+        vox_core::node::nameipc::resolve(&held.at, name)
+            .await
+            .map_err(|e| AppError::Usage(format!("{name}: {e}")))
     };
+    let mut room = resolve().await?;
+    // **Which share the name names is the room's log's to say** (V030-25): its transport — a UDP
+    // share is asked for as `udp/<name>` (ADR-022 decision 6) — and whether there is one at all.
+    // A room this node joined and has not yet synced may not hold the statement yet; it arrives
+    // with the first sync, so only that case waits. A synced room whose log carries no such
+    // share is refused at once, with the reason (PRD-001 R23).
+    let share_deadline = Instant::now() + SHARE_PATIENCE;
+    while room.share == ShareState::NotYetKnown && Instant::now() < share_deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        room = resolve().await?;
+    }
+    if let Some(refused) = share_refusal(name, &room) {
+        return Err(refused);
+    }
+    let ServiceRoom {
+        channel_id,
+        host,
+        service,
+        ..
+    } = room;
     // A bare port means loopback; `127.0.0.1:0` picks one.
     let local = match local.parse::<u16>() {
         Ok(port) => format!("127.0.0.1:{port}"),

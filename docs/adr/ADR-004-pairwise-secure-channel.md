@@ -101,6 +101,20 @@ initiators can consume the same one-time prekey concurrently.
   `InitialMessage` MUST travel as `PairwiseFrame::Hello` on the `pairwise` stream. The responder MUST
   apply the same checks as a join: the message names a signed prekey (and optionally a one-time
   prekey) from its own ring, C1 to C4 apply, and a replay is graded last-resort.
+- **O2. Competing sessions.** When two members each open a session to the other, both ends MUST keep
+  the one opened by the lower fingerprint, so both keep the same one. A second session from the same
+  opener MUST replace the first: a node opens a session only when it holds none, so a new hello from
+  the opener means it lost its state.
+- **O3. The hello until it is held.** Until the peer has taken a key sealed under a session, every
+  delivery over that session MUST carry its hello again, with an `Open` behind it; a hello that could
+  not be written MUST be offered again. A node that adopts the peer's session over its own (O2) MUST
+  send what it owes that peer as soon as the stream that carried the hello is answered, not on the
+  next tick.
+- **O4. Re-delivery after a replaced session.** When the session a sender key was delivered over is
+  replaced, the node MUST forget that the peer holds the key, so the next re-key round delivers it
+  again.
+
+O2–O4 together make every member of a room eventually read every other member it is trusted by.
 
 ### §"Post-quantum PCS (phased)"
 

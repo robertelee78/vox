@@ -105,13 +105,14 @@ fn a_rooms_own_anchor_is_redialled_after_it_restarts() {
         "PRODUCT (staging): the guest has an anchors file ({}), so its anchor would be configured",
         anchors_file.display()
     );
+    let address = format!("{}.{}.{}.vox", w.service, w.host_fp, w.room);
     let started = Instant::now();
     let mut fwd = VoxProc::spawn(
         "forward",
         &w.guest_dir,
         &args(&[
             "forward",
-            &format!("{}.{}.{}.vox", w.service, w.host_fp, w.room),
+            &address,
             "127.0.0.1:0",
             "--listen",
             Split::Families.guest_listen(),

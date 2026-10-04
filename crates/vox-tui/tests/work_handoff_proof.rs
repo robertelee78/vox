@@ -47,7 +47,7 @@
 //! no anchor, alice creates, bob and carol join, all six `Trust` edges applied; after
 //! 60 s, `bob never received the sender key of ["carol"]`. In a room of three, the two
 //! who joined cannot read each other — a user meets that the moment a third person
-//! arrives. It is recorded as **open defect F12 in ADR-021**, in `vox-core` key
+//! arrives. The rules that close it are ADR-004 O2–O4 and ADR-007 G-15a, in `vox-core` key
 //! distribution, not accepted as a gap; `node_m19_untrust_lock_gate` stays green only
 //! because it never has one joiner read another. Every property this proof asserts is
 //! a property of the fold across *nodes* and *sessions*, and two nodes with several

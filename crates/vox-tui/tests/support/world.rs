@@ -690,6 +690,67 @@ pub fn lossy_proxy(
     (addr, dropped, knob, sizes)
 }
 
+/// A UDP proxy on IPv4 loopback in front of `upstream` that carries no datagram larger than
+/// `max` bytes, in either direction: a path whose MTU is smaller than the one on the other side
+/// of `upstream`. Returns its address and how many datagrams it dropped for their size. One
+/// upstream socket per client address, as a NAT would.
+#[must_use]
+pub fn size_limited_proxy(
+    upstream: SocketAddr,
+    max: usize,
+) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    let front = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = front.local_addr().unwrap();
+    front.set_nonblocking(true).unwrap();
+    let dropped = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&dropped);
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let front = Arc::new(tokio::net::UdpSocket::from_std(front).unwrap());
+            let mut backs: std::collections::HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> =
+                std::collections::HashMap::new();
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let Ok((n, client)) = front.recv_from(&mut buf).await else {
+                    continue;
+                };
+                let back = if let Some(b) = backs.get(&client) {
+                    Arc::clone(b)
+                } else {
+                    let b = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                    b.connect(upstream).await.unwrap();
+                    backs.insert(client, Arc::clone(&b));
+                    let (b2, front2, counted2) =
+                        (Arc::clone(&b), Arc::clone(&front), Arc::clone(&counted));
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65_535];
+                        while let Ok(n) = b2.recv(&mut buf).await {
+                            if n > max {
+                                counted2.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let _ = front2.send_to(&buf[..n], client).await;
+                        }
+                    });
+                    b
+                };
+                if n > max {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let _ = back.send(&buf[..n]).await;
+            }
+        });
+    });
+    (addr, dropped)
+}
+
 /// The host's handshake bound (`HANDSHAKE_TIMEOUT`, 30 s) with a margin. See [`World::new`].
 pub const ACCEPT_WINDOW: Duration = Duration::from_secs(35);
 

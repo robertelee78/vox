@@ -14,8 +14,7 @@ Not built:
 - the consent-retry keying in D9 (Planned);
 - the proofs for P3, P4, P5 and P7.
 
-The P1 and P10 proofs were deleted with the decider's approval in V210-106 (#301, `233a870a`). P6
-asserts what P1 asserted about refusals.
+P1 and P10 have no proof on this tree (#301). P6 asserts what P1 asserted about refusals.
 
 On this tree D3's class set has three more classes from later items: `BodyArrived` (V030-10), and
 `Unlinked` and `Refused` (V210-74).
@@ -25,8 +24,8 @@ On this tree D3's class set has three more classes from later items: `BodyArrive
 
 ## Context
 
-The decider: *"it kind of reminds me of a networking hub vs. a switch — is there something that we can
-do that's more intelligent to make it more like a switch instead of a hub, with slots and queues"*.
+Sync is to be scheduled like a network switch, not a hub: with slots and queues, so one busy peer
+does not hold up the others.
 
 A sync session reconciles one room's log between two nodes over one QUIC bi-stream. Either end may
 open it, and both ends run the same steps:
@@ -37,11 +36,9 @@ open it, and both ends run the same steps:
 The room's lock is held one step at a time (`SessionRoom`), so two sessions on one room interleave
 safely. Duplicates are refused idempotently.
 
-Before this ADR, scheduling behaved like a hub:
-- two members posting at once each refused the other's session, then retried after a random wait;
-- past the slot cap, a due session was skipped, not queued;
-- "pushed" meant started, not completed;
-- seven maps and a flag answered one question, and disagreed.
+Scheduled like a hub, two members posting at once each refuse the other's session and retry after a
+random wait, a due session past the slot cap is skipped rather than queued, and "pushed" means
+started rather than completed.
 
 Option C, full duplex, removes the collision. It works as in switched Ethernet, TCP simultaneous
 open, Yjs `SyncStep1` from both ends, and WireGuard's simultaneous handshakes: it trades a duplicate
@@ -49,15 +46,15 @@ reconciliation for having no collision state.
 
 ## Requirements
 
-### The decider's decisions (2026-09-26)
+### The decider's decisions
 
 - **Decision 1.** The collision MUST be resolved by **option C, full duplex** (D4). The designated
   opener (A) and a glare rule (B) are rejected.
-- **Decision 2.** All of it was scheduled for v0.2.10: the defects and the collision redesign.
+- **Decision 2.** The scheduling defects and the collision redesign MUST ship together.
 - **Decision 3.** Observability MUST be simple counters in `vox status --json`, not a sync journal
   (S0b). Proofs MUST assert what a person sees, plus those counters.
-- **Decision 4.** The design review loop stopped after round 4. Implementation-level findings are
-  settled in the code and checked by the independent verifier, with no further design rounds.
+- **Decision 4.** Implementation-level findings MUST be settled in the code and checked by the
+  independent verifier.
 
 ### D1. One port per (room, peer)
 
@@ -277,17 +274,6 @@ feature, whose behaviour is chosen with `VOX_MUTANT_SENDER_MODE`. No shipped bui
 - A burst past the slot cap waits in a queue instead of waiting for the 30 s tick.
 - A faulty peer cannot get unrequested entries stored, and cannot drive a tight retry loop.
 - One stalled set of peers can still delay a live one by up to a session timeout (D6.3).
-
-### Fixed since
-
-- The bilateral serve-before-drain deadlock (V210-39, #212) is fixed: serve and drain run
-  concurrently (`d700d0a1`, `cf42f553`, merged `39c38841`). Proof: `two_backlogs_meet_proof`.
-- The defects in this ADR's scope are fixed by V210-34 (#209):
-  - a session skipped at the slot cap (P2);
-  - a truncated serve counted as done (D3, the `partial` counter);
-  - a failed partial apply that did not wake the room's other peers (D6a);
-  - a receiver storing entries it did not ask for (P9);
-  - an honest pair retrying zero-progress sessions without pacing (D3/D5).
 
 ## Related ADRs
 

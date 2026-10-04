@@ -1759,8 +1759,8 @@ enum Cmd {
     /// most other tools take `ALL_PROXY=socks5h://…`. Runs until stopped: SIGINT (Ctrl-C),
     /// SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Up(UpArgs),
-    /// Forward a local port to a member's service over the overlay — `ssh` over Vox
-    /// (ADR-013). Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
+    /// Forward a local port to a shared service, named by its address
+    /// `<service>.<node>.<room>.vox` — `ssh` over Vox (ADR-013, V030-25). Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
     /// cleanly.
     Forward(ForwardArgs),
     /// Put this machine on a room's **family LAN** (PRD-001 R28): a network interface on

@@ -1,4 +1,4 @@
-//! ADR-021 F12 — **every member of a room of three eventually reads every other
+//! ADR-004 O2–O4, ADR-007 G-15a — **every member of a room of three eventually reads every other
 //! member**, through the shipped binaries: a real `vox node` anchor and three real
 //! `vox daemon`s, every trust edge added before the daemons start, in both join orders.
 //!

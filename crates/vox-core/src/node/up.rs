@@ -556,7 +556,25 @@ where
                             continue;
                         }
                     };
-                    let label = format!("udp/{}", room.service);
+                    // **A datagram has no refusal to carry**, so one to a name the room's log
+                    // shows is no UDP share is refused here, at once, and said to this node's
+                    // operator (PRD-001 R23), rather than dialled and dropped (V030-25).
+                    let stated_udp = crate::tunnel::udp::is_udp(&room.service);
+                    let why = match room.share {
+                        crate::node::resolver::ShareState::Absent => Some("shares no service"),
+                        crate::node::resolver::ShareState::Stated if !stated_udp => {
+                            Some("shares it over TCP, not UDP")
+                        }
+                        _ => None,
+                    };
+                    if let Some(why) = why {
+                        refused(Refused(format!("{name}:{port}/udp: its sharer {why} by that name")));
+                        continue;
+                    }
+                    let label = format!(
+                        "udp/{}",
+                        crate::node::channel::service_name(&room.service)
+                    );
                     let Some(guard) = flows.admit(room.host, &label) else { continue };
                     let (tx, rx) = tokio::sync::mpsc::channel(udp::CLIENT_QUEUE);
                     let (dialer, relay, refused) =

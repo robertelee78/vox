@@ -14,13 +14,12 @@ Not built: no race against kernel TCP (TC-2). The cases under "Known limits" are
 
 ## Context
 
-PRD-001 R41 says a Vox tunnel must not throttle the network it runs over. The decider's standing
-direction for throughput is *"as fast as possible, while still retaining our other goals/security"*.
+PRD-001 R41 says a Vox tunnel must not throttle the network it runs over. Throughput is to be as
+high as possible without giving up any other goal or any security property.
 
 Cubic reads every lost packet as congestion and cuts its rate. On a link that loses packets for other
 reasons, such as Wi-Fi interference, the cut is wrong: the tunnel slows down on a network that still
-has capacity. BBR fixes random loss, but it cost about 70% on a clean LAN (2026-09-25, quinn 0.11
-BBRv1 and noq 1.3 BBRv3). A move to noq's stack made no difference to throughput. No single controller
+has capacity. BBR fixes random loss, but it is much slower than Cubic on a clean LAN. No single controller
 wins on every link, so Vox moves each connection between controllers as the path's signals change.
 
 Prior art: TCP Westwood and TCP Veno, which tell random loss from congestion loss; Antelope (ICNP 2021;
@@ -267,21 +266,16 @@ design behaves on them is unknown.
   - TB-3's application-limited guard: a mutant without it stayed green on the 6% paused arm.
   - SG-5 and SG-6: whether removing either would make Vox faster on a gated arm is unmeasured.
 - **L-12 (congestion misread as random loss).** Loss differentiation can misread congestion as
-  random loss, and Vox then takes a competing flow's share. This is accepted under SP-4. It was
-  measured on c4 (`eb15a78c`):
-  - on the 1-BDP congested link, Vox carried 192.9 Mbit/s and the Cubic flow 3.1 (62.2×);
-  - on the LAN-like link, 361.8 against 22.0 (16.4×).
-
-  The likely cause, not traced: TS-2 counts losses with a queue, so a congested link's overflow
-  losses take Vox up the tiers. A tier-3 stay on a congested path also takes competing flows' share
+  random loss, and Vox then takes a competing flow's share. This is accepted under SP-4. The likely
+  cause, not traced: TS-2 counts losses with a queue, so a congested link's overflow losses take Vox
+  up the tiers. A tier-3 stay on a congested path also takes competing flows' share
   for as long as it lasts.
 - **L-13 (the comparison is softer than kernel TCP).** The comparison flow has no HyStart, no PRR and
   no RACK, and quinn paces from the window. A kernel TCP with RACK and PRR is likely to do somewhat
   better on a lossy link, so "2× the Cubic flow" is likely softer than "2× kernel TCP". This is
   unmeasured.
 - **L-14 (calibration under load).** R41's 1 Gbit/s LAN link often cannot calibrate on a machine
-  doing ordinary work: its weakest calibration window read 78.8%, 75.6% and 82.5% at load 38–66,
-  where each needs 95%. The clean LAN-like arm (PR-8) runs at 400 Mbit/s for this reason.
+  doing ordinary work, where each calibration window needs 95%. The clean LAN-like arm (PR-8) runs at 400 Mbit/s for this reason.
 
 ## Consequences
 
@@ -297,8 +291,7 @@ design behaves on them is unknown.
 
 ADR-011 (transport substrate; its "Throughput (R41)" raises the flow-control windows, which this ADR
 does not concern), ADR-018 (proof from the user's vantage; heavy proofs opt-in). PRD-001 R41.
-Rejected alternatives, as measured: BBRv1 as the default, a move to noq for BBRv3, and the noq stack on
-its own (evidence branches `agentcomms/exp-bbr`, `agentcomms/exp-noq` and `agentcomms/exp-noq-cubic`).
+Rejected alternatives: BBRv1 as the default, a move to noq for BBRv3, and the noq stack on its own.
 Prior art:
 - Antelope, <http://www.eecs.qmul.ac.uk/~tysong/files/ICNP21.pdf> and
   <https://dl.acm.org/doi/10.1109/TNET.2022.3220225>;

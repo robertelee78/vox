@@ -35,9 +35,8 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
 ### Interface models
 
 - **T-1. Per-stream forward and SOCKS, primary.**
-  - A node MUST offer `vox forward`, which forwards one local port to one member's service named by
-    its `service.node.room.vox` address only (ADR-017 12.11; the separate room, member and service
-    arguments are to be removed), and
+  - A node MUST offer `vox forward <service>.<node>.<room>.vox [<local>]`, which forwards one local
+    port to the service that address names, and
     `vox up`, a SOCKS5 proxy that resolves `.vox` names (ADR-017 decision 5). Only
     `service.node.room.vox` connects; `node.room.vox` and `room.vox` resolve to nothing (ADR-017).
   - Both MUST work without privilege.
@@ -75,7 +74,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   the room's sealed store (`SEG_SERVICES`), at most `MAX_SERVICES` (64) per room.
 - **T-8. Advertisements.** A service advertisement MUST NOT be posted as cleartext on the replicated
   log (ADR-008). If advertised, it MUST be sealed to exactly the host's explicitly approved readers in
-  that room (ADR-017, third revision: consent-bound services), per recipient like an SKDM (ADR-006),
+  that room (ADR-017 decision 3: consent-bound services), per recipient like an SKDM (ADR-006),
   as a `ServiceAdvertisement` (ADR-008 tag `0x000F`), delivered over each reader's pairwise channel
   (ADR-004) or as a log entry sealed to that audience. A member the host has not approved MUST NOT be
   able to read one. A requester MUST resolve a service only by decrypting the advertisements it can
@@ -83,7 +82,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   and re-publish its advertisement. Status: the struct and the sealing exist in `tunnel::service` with no caller. A
   member learns another's service tags out of band, and closing that is ADR-017 M17.4.
 - **T-9. Accountability.** Tunnel session establishment SHOULD be recorded as a signed event in
-  attributable rooms (ADR-009). Status: not built; no entry type exists.
+  rooms; every room is attributable, since every entry is composite-signed (ADR-008 LS-8). Status: not built; no entry type exists.
 - **T-10. SSH certificate authority, optional.** A Vox-issued OpenSSH certificate authority MAY be
   built later, under its own ADR. It is not a requirement here. `tunnel::sshca` is an unwired seam.
   "`ssh` over Vox" means forwarding to a real `sshd`, which authenticates its users as it always does.
@@ -99,9 +98,11 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
   genuinely bulk transfers SHOULD use separate streams, or separate connections for true QoS
   (ADR-011). Status: priority is planned, not built; nothing on the tunnel path sets a stream
   priority.
-- **T-12. UDP.** A UDP service MUST be tunneled as `udp/<port>`: a datagram flow bound to its tunnel
-  stream after the same gate (ADR-022 decision 6, M22.3/M22.4). This covers `vox serve 53/udp`,
-  `vox forward <service>.<node>.<room>.vox 53/udp <port>` and SOCKS5 `UDP ASSOCIATE` in `vox up`.
+- **T-12. UDP.** A UDP service MUST be shared as `vox serve <name>=<port>/udp` and tunneled as a
+  datagram flow bound to its tunnel stream after the same gate (ADR-022 decision 6, M22.3/M22.4).
+  The dialler names only the address (`vox forward <name>.<node>.<room>.vox [<local>]`, or SOCKS5
+  `UDP ASSOCIATE` in `vox up`); that the service is UDP comes from the share, and the host's gate
+  looks it up as `udp/<name>`.
 - **T-13. The request names its room (M16.1).** A tunnel request MUST be `[channel_id, service_tag]`,
   and the host MUST resolve services per `(room, tag)`. A host MUST answer an unauthorized peer, an
   unknown room, an unknown service and a failed local connect with the same `TunnelStatus::Denied`,
@@ -149,9 +150,7 @@ The model is Tor's hidden service: the overlay decides **reach**, and the carrie
     restarts MUST reach the new process within V210-57's 10 s host-restart bound. Status: planned,
     until #360 (V210-141) and #321 merge. **Known limit until then:** the first connection after a
     host restart can wait out QUIC's idle timeout on the dialer's stale connection, about 60 s;
-    tracked as V210-141 (#360). Note: 1.25–1.26 s was measured on V210-141's unlanded branch
-    (`75e110d8`, on #321's unlanded `7fecc49d`), not on either integrate branch, with its proof
-    `tunnel_honesty_proof::a_restarted_host_is_reached_again_promptly_by_a_forward_and_by_a_proxy`.
+    tracked as V210-141 (#360).
 
 ### Loopback
 
@@ -247,7 +246,7 @@ proven when the decider runs `sudo scripts/family-lan-proof.sh`. Linux is not bu
 ## Related ADRs
 
 ADR-001 (scope), ADR-002 (identity), ADR-006 (sender keys), ADR-007 (consent), ADR-008 (log and
-tags), ADR-009 (attribution), ADR-011 (transport), ADR-012 (reachability), ADR-014 (macOS client),
+tags), ADR-008 (attribution: every entry signed), ADR-011 (transport), ADR-012 (reachability), ADR-014 (macOS client),
 ADR-017 (room-bound services), ADR-022 (datagram flows and the app API).
 
 ## Engineering Mantra

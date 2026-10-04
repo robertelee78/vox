@@ -458,8 +458,8 @@ impl RelayWorld {
         (ok, t0.elapsed(), out, err)
     }
 
-    /// Start the guest's `vox forward` to the host's service, on `[::1]`; returns the local
-    /// address it bound.
+    /// Start the guest's `vox forward <service>.<host fp>.<room>.vox` to the host's service, on
+    /// `[::1]`; returns the local address it bound.
     pub fn forward(&mut self) -> SocketAddr {
         self.forward_with_anchors(&[])
     }

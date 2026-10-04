@@ -2,18 +2,18 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted by the decider, 2026-09-25. Built on integrate/v0.3.0 (M23.1–M23.6), except
+**Status**: Accepted. Built on integrate/v0.3.0 (M23.1–M23.6), including `vox room admin` and
+leaving and ending a room (RL-8, with the lifecycle tags `0x0019`–`0x001B`, ADR-008 LS-21), except
 where a requirement says otherwise. Not built: a room created with a retention (RL-2.1), the
-`vox status` line for a room with no always-on member (RL-4.9), pruning a key-package once its
-recipient acknowledges it (RL-4.7), and `vox room admin` (RL-2.1). On this tree the retention check
-is still the `policy` capability, whose removal is V030-32 (#380).
+`vox status` line for a room with no always-on member (RL-4.9), and pruning a key-package once its
+recipient acknowledges it (RL-4.7).
 **Date**: 2026-09-24
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: log, ordering, retention, sender-keys, anchors
 
 ## Context
 
-The decider's answers of 2026-09-24 (PRD-001) set the room's lifecycle:
+PRD-001 sets the room's lifecycle:
 
 - **R1:** a room has no lifetime limit on the number of messages.
 - **R6–R10:** history is kept forever by default; the room's creator or admin may make messages
@@ -27,9 +27,7 @@ The decider's answers of 2026-09-24 (PRD-001) set the room's lifecycle:
 - **R33–R34:** any always-on node can be an anchor, and an anchor stores nothing for rooms it is not
   a member of.
 
-Before this ADR, a room's order was arrival order, retention could not be switched on, old sender
-keys were kept, keys travelled only on direct pairwise streams, and anchors kept a ciphertext log of
-rooms they were not in. Each skeleton costs about 3.5 KB (a 3,373-byte composite signature), so a
+Each skeleton costs about 3.5 KB (a 3,373-byte composite signature), so a
 million-message room holds about 3.5 GB of skeletons after every body has expired.
 
 ## Requirements
@@ -68,12 +66,12 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
 - **RL-2.1. The room's policy.** The room's retention MUST be the ADR-007 policy-update `ttl`: `0`
   means forever, any other value is disappearing after that many seconds. A room MUST default to
   forever (R6). Only the room's creator, or an admin the creator delegated with `vox room admin`,
-  MAY set it (V030-32). The UI MUST offer 1 hour, 1 week, 1 month or a custom value (`vox room
+  MAY set it (ADR-007 G-6). The UI MUST offer 1 hour, 1 week, 1 month or a custom value (`vox room
   retention <room> 1h|1w|1m|<secs>|forever`, where `1m` is a month). A non-admin's change MUST be
   refused, saying that the change is the admin's (`Fault::NotAdmin`).
-  *Status:* built, with the check on the `policy` capability (the creator). Planned: `vox room admin`
-  (V030-13, #319); the capability's removal (V030-32, #380); a room created with a retention
-  (creation writes `ttl` 0, and `vox room retention` sets it after).
+  *Status:* built, the check being the `policy` capability that the creator and a delegated admin
+  hold (ADR-007 G-5). Not built: a room created with a retention (creation writes `ttl` 0, and
+  `vox room retention` sets it after).
 - **RL-2.2. The node's policy.** A node's own retention MUST be local configuration (the `retention`
   file in its config directory), per room or as a default. A member MAY set a lower retention for
   its own node only; it MUST NOT raise the room's retention for its node.
@@ -96,13 +94,10 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
   stay in the store file as freed pages, readable only with that room's key on that node; store
   compaction (`Profile::compact_store`) has no caller.
 - **RL-2.9.** Claims and work items are entries like any other and MUST expire with a disappearing
-  room. In the decider's words (2026-09-25): "The agent communication is not meant to be a source of
-  truth for anything — it's just a communications coordination layer. The source of truth is the
-  accountability skill and GitHub."
+  room. Vox MUST NOT be treated as the record of work: agent comms coordinates, and the work's
+  progress is recorded in GitHub through the accountability skill (ADR-020 §5).
 
 ### Decision 3. Skeleton growth: checkpoints (R1)
-
-Decided 2026-09-25: build checkpoints now (M23.6).
 
 - **RL-3.1. Only the author checkpoints, and only its own feed.** A checkpoint MUST be the payload of
   an ordinary signed entry in the author's own feed (struct tag `0x0016`, `vox/checkpoint/v1`, body
@@ -207,7 +202,7 @@ Decided 2026-09-25: build checkpoints now (M23.6).
   ceremony. A room made by vox before v0.3.0 MUST be refused when opened, with a plain reason that
   says to make the room again (`Fault::RoomFromBeforeV030`, `node/api.rs`).
 
-### Leaving and ending a room (decider, 2026-10-03)
+### Leaving and ending a room
 
 - **RL-8.1. Leave.** `vox room leave` MUST post the node's presence statement (`0x0015`, `here` =
   false), take the node's records off boards with a signed member withdraw (`0x001A`), and MUST
@@ -274,7 +269,7 @@ Each proof drives the shipped `vox` binary and has a mutation that turns it red 
    checkpoint follows a quiet room; an expired backlog is checkpointed without another prune.
    `crates/vox-tui/tests/checkpoint_proof.rs`.
 
-The F12 delivery proofs stay as proofs of the direct path:
+The ADR-004 O2–O4 delivery proofs stay as proofs of the direct path:
 `crates/vox-tui/tests/room_of_three_keys_proof.rs`, `cross_process_join_proof.rs`,
 `trust_before_join_proof.rs`.
 
@@ -294,14 +289,6 @@ The F12 delivery proofs stay as proofs of the direct path:
   (#65).
 - **M23.5** Delete the anchor log (decision 6). Built.
 - **M23.6** Checkpoints (decision 3). Built.
-
-Fixed since the old text, with evidence:
-- A non-admin's refused retention change printed "the other side refused": `Fault::NotAdmin`
-  (601580e6).
-- `key_package_proof`'s setup lost a sync between two live members in about 3 runs of 10, because a
-  member's session with a member that was down held the room: 896f28a2 (#159).
-- Trusting a member whose node was down stopped the trusting node answering, so an owed grant could
-  not be released: a60e1862.
 
 ## Consequences
 

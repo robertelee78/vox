@@ -51,8 +51,23 @@ pub struct ServiceRoom {
     pub channel_id: Digest32,
     /// The member sharing the service.
     pub host: Digest32,
-    /// The service's name, as its sharer gave it.
+    /// The service's tag, as the host's gate looks it up: its name, or `udp/<name>` for a
+    /// service its sharer stated is UDP (ADR-022 decision 6).
     pub service: String,
+    /// What the room's log says of the share (PRD-001 R23: a refusal is immediate).
+    pub share: ShareState,
+}
+
+/// What this node's copy of a room's log says of the share an address names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareState {
+    /// The log carries it.
+    Stated,
+    /// The room has synced since this node joined it, and its log carries no such share: the
+    /// address leads nowhere, and a forward says so at once.
+    Absent,
+    /// The room has not synced since this node joined it: the statement may still be on its way.
+    NotYetKnown,
 }
 
 /// One room this machine holds, as naming needs it.
@@ -62,8 +77,10 @@ struct NamedRoom {
     label: String,
     /// Its current members.
     members: Vec<Digest32>,
-    /// The services its log says are shared: `(sharer, name)`.
-    shares: Vec<(Digest32, String)>,
+    /// Whether it has synced since this node joined it.
+    synced: bool,
+    /// The services its log says are shared: `(sharer, name, udp)`.
+    shares: Vec<(Digest32, String, bool)>,
 }
 
 /// The `.vox` names this machine can resolve.
@@ -113,13 +130,18 @@ impl VoxResolver {
         room.members = members.to_vec();
     }
 
+    /// Record whether `channel_id` has synced since this node joined it.
+    pub fn set_synced(&mut self, channel_id: Digest32, synced: bool) {
+        self.rooms.entry(channel_id).or_default().synced = synced;
+    }
+
     /// Record that `host` shares `name` in `channel_id`, so its fingerprint resolves.
-    pub fn add_share(&mut self, channel_id: Digest32, host: Digest32, name: &str) {
+    pub fn add_share(&mut self, channel_id: Digest32, host: Digest32, name: &str, udp: bool) {
         self.rooms
             .entry(channel_id)
             .or_default()
             .shares
-            .push((host, name.to_owned()));
+            .push((host, name.to_owned(), udp));
     }
 
     /// Name a trusted identity, as this node's keyring does.
@@ -180,27 +202,38 @@ impl VoxResolver {
         }
         let channel_id = self.room(room)?;
         let host = self.node(node, room, &channel_id)?;
-        let service = self.service(service, &channel_id, &host);
+        let (service, stated) = self.service(service, &channel_id, &host);
+        let share = if stated {
+            ShareState::Stated
+        } else if self.rooms.get(&channel_id).is_some_and(|r| r.synced) {
+            ShareState::Absent
+        } else {
+            ShareState::NotYetKnown
+        };
         Ok(ServiceRoom {
             channel_id,
             host,
             service,
+            share,
         })
     }
 
-    /// The service a `<service>` label names: a share's name when it is that share's
-    /// fingerprint, else the label as the name. Whether the host offers it is the host's to say.
-    fn service(&self, label: &str, channel_id: &Digest32, host: &Digest32) -> String {
-        if let Ok(fp) = b32_decode(label, "vox service") {
-            if let Some((_, name)) = self.rooms.get(channel_id).and_then(|r| {
-                r.shares
-                    .iter()
-                    .find(|(h, n)| h == host && service_fingerprint(channel_id, h, n) == fp)
-            }) {
-                return name.clone();
-            }
+    /// The service a `<service>` label names, as the tag the host's gate looks it up by: a
+    /// share's name when the label is that share's name or fingerprint (`udp/<name>` for a UDP
+    /// share), else the label as the name; and whether the log states it. Whether the host offers
+    /// it is the host's to say.
+    fn service(&self, label: &str, channel_id: &Digest32, host: &Digest32) -> (String, bool) {
+        let fp = b32_decode(label, "vox service").ok();
+        let share = self.rooms.get(channel_id).and_then(|r| {
+            r.shares.iter().find(|(h, n, _)| {
+                h == host && (n == label || fp == Some(service_fingerprint(channel_id, h, n)))
+            })
+        });
+        match share {
+            Some((_, name, true)) => (format!("udp/{name}"), true),
+            Some((_, name, false)) => (name.clone(), true),
+            None => (label.to_owned(), false),
         }
-        label.to_owned()
     }
 
     fn room(&self, label: &str) -> Result<Digest32, String> {

@@ -4,8 +4,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status:** accepted. Built in `crates/vox-core/src/governance/` (M6), `node::channel`, `node::trust` and
 `node::actor` (ADR-016 M14.5, ADR-017 M17.6, M17.14, M18.1, ADR-020 M19.2), except:
-- The genesis service grant, `bind:`/`dial:` and `ServiceGrantExclusion` (`governance/servicegrant.rs`)
-  are removed under R44 (#94); the strict member cap (G-22) is V030-30 (#366).
+- Admission once every online member agrees (G-22) is not built: V030-30 (#366). The cap itself is built.
 - G-10's golden-vector suite does not exist on this tree, and the known gaps listed at the end are open.
 
 **Date:** 2026-06-19
@@ -45,11 +44,11 @@ only room governance is who sets the room's retention. This builds on identity (
   certificate MUST carry `policy` only, never `admin` (#319). The creator or an admin MAY end the room
   for everyone (`vox room end`, a room-lifecycle fact `0x0019`); every member's node then deletes it
   (ADR-023 RL-8.2).
-- **G-6.** The only governance act MUST be setting the room's retention (the policy-update `ttl`), and
-  only the creator or an admin it delegated MAY do it. The capabilities are `admin` and `policy`; every
+- **G-6.** The only governance acts MUST be setting the room's retention (the policy-update `ttl`) and
+  ending the room (G-5), and only the creator or an admin it delegated MAY do either. The capabilities are `admin` and `policy`; every
   other capability token (`delegate`, `invite`, `passphrase-rotate`, `#role`, `bind:`, `dial:`) MUST be
   refused as unknown. Policy updates beyond retention, passphrase rotation, invite modes and the
-  capability lattice are removed (#380; `bind:`/`dial:` under #94, see Status).
+  capability lattice are removed, as are `bind:` and `dial:` (PRD-001 R44).
 - **G-7.** A member that is not an admin MAY set a lower retention for its own node only, for one room;
   it MUST NOT set a retention higher than the room's. A node's retention value above the room's MUST be
   ignored (the effective retention is the shorter of the two, ADR-010 AR-30), with a warning (#380).
@@ -68,8 +67,8 @@ only room governance is who sets the room's retention. This builds on identity (
   - consent grant (`0x0004`): `{ target_id(composite fpr), skdm_ref(32 B hash of the SKDM delivered over
     ADR-004), history_mode_at_grant }`; the SKDM itself travels in the pairwise session;
   - consent revocation (`0x0005`): `{ target_id(composite fpr), new_chain_id }`;
-  - policy update (`0x0006`): `{ ttl }`. **Planned (#380):** it still also carries `history_mode` and
-    `min_suite` (raise-only) on this tree.
+  - policy update (`0x0006`): `{ ttl }`. The wire layout keeps the `history_mode` and `min_suite`
+    presence flags, always written as absent; an update carrying either MUST be refused.
 
 ### §"Canonical encoding & evaluator"
 
@@ -106,6 +105,9 @@ only room governance is who sets the room's retention. This builds on identity (
      empty plaintext, so the responder gains a sending chain and receives no key and no grant.
   3. Each member `A` decides whether `N` reads `A`, by trusting `N`. Until `A` does, `A`'s messages stay
      unreadable to `N`. `N`'s view fills in monotonically, per sender.
+- **G-15a. Release at admission.** When a joiner is already in a member's trust keyring, that member
+  MUST release its sender key to the joiner when it admits the join, not on a later tick: the room is
+  forward-only, so anything sealed before the release would stay unreadable to the joiner for good.
 - **G-16.** A grant MUST record what it released (`history_mode_at_grant`): the granting owner's choice
   per grant (ADR-006 S-18), never another member's history.
 - **G-17.** Log authorship and read authority MUST stay separate: `admit_author` records a verified key
@@ -172,14 +174,6 @@ only room governance is who sets the room's retention. This builds on identity (
 - The golden-vector suite is in-process Rust assertions, not language-neutral fixtures with pinned bytes
   (the "two independent implementations" gate needs the latter). Since V29-17 (`df850734`) there is no
   suite at all (G-10).
-- Role-tag ABAC is not evaluated, `Invite` has no wire encoding, and any `delegate`-holder may revoke any
-  delegation: each goes with the capabilities #380 removes; only the creator removes an admin under #319.
-
-Fixed since:
-- Joining released the joiner's sender key to the member that answered (M17.6).
-- `NodeCommand::Consent` released a key without a keyring entry: removed; a key goes only to a trusted
-  member, checked in the core (V210-148, `bb1481b1`; proof `no_consent_without_a_ring_entry_proof.rs`).
-- `Untrust` was forward-looking only and did not change the lock (M17.14, `8894b2b2`).
 
 ## Consequences
 

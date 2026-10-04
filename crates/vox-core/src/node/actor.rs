@@ -49,7 +49,7 @@ use crate::node::status::PublishCause;
 use crate::pairwise::init_message::InitialMessage;
 use crate::transport::quic::VoxConnection;
 
-/// A pairwise session this node opened (ADR-021 F12).
+/// A pairwise session this node opened (ADR-004 O2, O3).
 #[derive(Debug, Clone)]
 struct Initiated {
     /// The hello that lets the peer accept it; `None` for a session opened on the join
@@ -61,7 +61,7 @@ struct Initiated {
     hello_delivered: bool,
 }
 
-/// **Which of two competing sessions for one pair both ends keep** (ADR-021 F12): the
+/// **Which of two competing sessions for one pair both ends keep** (ADR-004 O2): the
 /// one opened by the lower fingerprint. Two members that opened a session to each other
 /// at the same moment each hold their own; both apply this rule and so keep the same
 /// one. `existing_mine` says whether the session already held was opened by `me`; the
@@ -289,6 +289,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
             .map(|(tag, addr)| (tag.clone(), *addr))
             .collect(),
         shares: ch.shares(),
+        synced: ch.is_settled(),
         equivocations: ch.equivocations(),
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
@@ -977,7 +978,7 @@ enum NetEvent {
         /// The member.
         peer: Digest32,
     },
-    /// A hello offered again with an `Open` behind it (ADR-021 F12) could not be written: it is
+    /// A hello offered again with an `Open` behind it (ADR-004 O3) could not be written: it is
     /// offered again.
     ReopenUndelivered {
         /// The room.
@@ -1711,7 +1712,7 @@ enum AfterWrite {
         /// The `Node::delivery_epoch` it was counted in flight in (V210-88).
         epoch: u64,
     },
-    /// The stream offered a hello again with an `Open` behind it (ADR-021 F12).
+    /// The stream offered a hello again with an `Open` behind it (ADR-004 O3).
     Reopen,
 }
 
@@ -3575,7 +3576,7 @@ pub struct Node {
     /// tick does not send it another. Without it, a pair that could not converge was sent a key
     /// once a tick for as long as both ran: 560 refusals in 3 minutes, measured.
     key_backoff: BTreeMap<(Digest32, Digest32), (u32, u64)>,
-    /// Set when this node adopted a peer's session over its own (ADR-021 F12): what it owes that
+    /// Set when this node adopted a peer's session over its own (ADR-004 O3): what it owes that
     /// peer goes out as soon as the stream that carried the hello is answered, not on the tick.
     redeliver_now: bool,
     /// Per `(room, member)`: a member that has just handed over a generation new to us, so is
@@ -3606,7 +3607,7 @@ pub struct Node {
     /// re-establishes a session on the next join or key exchange.
     sessions: BTreeMap<(Digest32, Digest32), crate::pairwise::session::Session>,
     /// The sessions in [`Self::sessions`] that **this node opened**, and whether the
-    /// peer has been sent the hello that lets it accept them (ADR-021 F12).
+    /// peer has been sent the hello that lets it accept them (ADR-004 O2, O3).
     ///
     /// Two members can open a session to each other at the same moment — both
     /// auto-consent when they trust each other, and each finds no session and opens
@@ -6309,23 +6310,12 @@ impl Node {
                 // told a person reaching a host directly that they were using an anchor. An anchor
                 // is one this node was given (`--anchor`, the anchors file) or a room names that is
                 // not one of its members.
-                let anchor = self.anchors.get(&peer).is_some()
-                    || self
-                        .room_anchors
-                        .values()
-                        .any(|set| set.get(&peer).is_some());
                 if let Some(net) = self.net.as_ref() {
-                    net.manager().note(
-                        peer,
-                        if anchor {
-                            "connected to this anchor"
-                        } else {
-                            "connected to this room host's board"
-                        }
-                        .to_owned(),
-                    );
+                    net.manager().note(peer, self.board_note(&peer).to_owned());
                 }
                 self.anchor_ids.insert(peer);
+                // In the view at once, for a client subscribing after this note went (#407).
+                self.publish().await;
                 // A new connection may be to a board that restarted and lost what it held: what it
                 // holds is learnt again from the round below, before an address names it (V210-96).
                 self.on_board.retain(|(_, b)| *b != peer);
@@ -7281,7 +7271,7 @@ impl Node {
         if let Some(net) = self.net.as_ref() {
             net.policy().forget_joiner(&peer);
         }
-        // **Consent at admission, not on the tick** (ADR-021 F12). A room is ForwardOnly:
+        // **Consent at admission, not on the tick** (ADR-007 G-15a). A room is ForwardOnly:
         // a newcomer reads only what is sealed after the key is released to it. With the
         // joiner already in this node's trust ring, leaving the release to the next tick
         // opened a window in which anything this node posted was unreadable to the
@@ -10610,7 +10600,7 @@ impl Node {
             if self.accepted_hello.get(&key) == Some(&hello_hash) {
                 return true;
             }
-            // **Two sessions for one pair** (ADR-021 F12). Keep the one both ends will
+            // **Two sessions for one pair** (ADR-004 O2). Keep the one both ends will
             // keep. It used to keep whichever it held, and so did the peer — each kept its
             // own, and neither could open the key the other sent.
             let me = self.profile.as_ref().map(|p| p.fingerprint());
@@ -10690,7 +10680,7 @@ impl Node {
     }
 
     /// Forget that `peer` holds this identity's current sender key in `channel_id`, so
-    /// the next re-key round delivers it again (ADR-021 F12).
+    /// the next re-key round delivers it again (ADR-004 O4).
     async fn forget_delivery(&mut self, channel_id: &Digest32, peer: &Digest32) {
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
@@ -10708,7 +10698,7 @@ impl Node {
 
     /// File the session a join just established — `mine` when this node was the joiner,
     /// which opened it — applying the same rule as [`Self::accept_hello`] when a session
-    /// for that pair already exists (ADR-021 F12).
+    /// for that pair already exists (ADR-004 O2).
     ///
     /// A join can race an auto-consent: the member answering a join may, on its own
     /// tick, have already opened a session to the joiner from its bundle record, because
@@ -10763,7 +10753,7 @@ impl Node {
     }
 
     /// Offer this node's hello again to every peer that kept a competing session
-    /// (ADR-021 F12), with the empty ratchet message behind it that gives the peer a
+    /// (ADR-004 O3), with the empty ratchet message behind it that gives the peer a
     /// sending direction — so it adopts the session both ends will keep even when this
     /// node owes it nothing else.
     async fn deliver_reopens(&mut self) {
@@ -12859,8 +12849,9 @@ impl Node {
         let view = self.view_tx.borrow().clone();
         for room in &view.open_channels {
             names.add_room(room.channel_id, &room.local_name, &room.members);
+            names.set_synced(room.channel_id, room.synced);
             for share in &room.shares {
-                names.add_share(room.channel_id, share.host, &share.name);
+                names.add_share(room.channel_id, share.host, &share.name, share.udp);
             }
         }
         for (fp, petname) in self.trust.iter() {
@@ -13561,6 +13552,7 @@ impl Node {
             relayed_peers: Vec::new(),
             connected: 0,
             connected_peers: Vec::new(),
+            boards_connected: Vec::new(),
             relaying: 0,
         });
     }
@@ -13702,6 +13694,7 @@ impl Node {
             relaying,
             connected: connected_peers.len(),
             connected_peers,
+            boards_connected: self.boards_connected(),
         };
         (view, read)
     }
@@ -13715,6 +13708,32 @@ impl Node {
         shown.relayed_peers != relayed_peers
             || shown.relaying != relaying
             || shown.connected_peers != connected_peers
+            || shown.boards_connected != self.boards_connected()
+    }
+
+    /// What is said of a connection to the board `peer`: an anchor is one this node was given
+    /// (`--anchor`, the anchors file) or a room names that is not one of its members; any other
+    /// board is a room host's own (V210-107).
+    fn board_note(&self, peer: &Digest32) -> &'static str {
+        let anchor = self.anchors.get(peer).is_some()
+            || self
+                .room_anchors
+                .values()
+                .any(|set| set.get(peer).is_some());
+        if anchor {
+            "connected to this anchor"
+        } else {
+            "connected to this room host's board"
+        }
+    }
+
+    /// The boards this node holds an open connection to now, each with [`Self::board_note`].
+    fn boards_connected(&self) -> Vec<(Digest32, String)> {
+        self.anchors_up
+            .iter()
+            .filter(|(_, conn)| conn.quinn().close_reason().is_none())
+            .map(|(peer, _)| (*peer, self.board_note(peer).to_owned()))
+            .collect()
     }
 
     /// The peers the connection manager holds a connection to, in fingerprint order.

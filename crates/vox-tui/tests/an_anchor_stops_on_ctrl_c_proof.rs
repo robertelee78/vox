@@ -76,7 +76,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use world::{after_label, args, echo_service, vox_once, VoxProc, World, IDENTITY};
+use world::{after_label, args, echo_service, reap_daemon, vox_once, VoxProc, World, IDENTITY};
 
 /// How many anchors are signalled. On the unfixed code 13 of 20 missed the signal, so ten that all
 /// stop is not luck.
@@ -496,6 +496,10 @@ fn stops_cleanly_at_its_prompt(w: &World, verb: &str, (name, flag, code): (&str,
 
 /// `vox daemon` on the profile at `dir`, holding the world's room; returns once it says so.
 fn daemon(w: &World, dir: &Path, pass_file: &Path) -> VoxProc {
+    // The client verbs before this one auto-started this root's daemon, which lingers a moment
+    // after its last client (ADR-026 L-8). Left running, this `vox daemon` would hand its node to
+    // it (D-1) instead of holding the room itself.
+    reap_daemon(dir);
     let mut d = VoxProc::spawn(
         "daemon",
         dir,

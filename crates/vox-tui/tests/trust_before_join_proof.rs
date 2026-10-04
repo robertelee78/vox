@@ -1,6 +1,6 @@
 //! **Trust is decided once, not per room**: a real `vox node` anchor and two real `vox daemon`s.
 //!
-//! ## 1. ADR-021 F12 — a joiner reads what the room's host posts the moment the join returns,
+//! ## 1. ADR-007 G-15a — a joiner reads what the room's host posts the moment the join returns,
 //! when the host already trusted it
 //!
 //! A room is ForwardOnly (ADR-006): a newcomer reads only what is sealed after a key

@@ -454,6 +454,9 @@ pub struct ChannelDetail {
     pub services: Vec<(String, std::net::SocketAddr)>,
     /// The services shared in this channel by every member, as its log says (V030-25).
     pub shares: Vec<crate::node::channel::Share>,
+    /// Whether this node has completed the room's first sync since joining it (V210-164): until
+    /// then its log may not yet hold what the room's members have written, shares included.
+    pub synced: bool,
     /// The members this node holds back for equivocating in this room (V210-63): each
     /// `(author, seq)` at which two different messages signed by that author were seen.
     pub equivocations: Vec<(Digest32, u64)>,
@@ -530,6 +533,10 @@ pub struct NodeView {
     /// Those peers, in fingerprint order: which of a room's members this node reaches now
     /// (V210-82).
     pub connected_peers: Vec<Digest32>,
+    /// The anchors and room hosts' boards this node holds a connection to now, each with the note
+    /// said when it was made ("connected to this anchor"): what a client that subscribes after the
+    /// connection was made is told first, since it missed the note itself.
+    pub boards_connected: Vec<(Digest32, String)>,
     /// Every channel this node's **board** holds a genesis for — the channels it
     /// anchors, whether or not it is a member — in channelID order. What an anchor
     /// can say about itself: which rooms it serves and how many members it knows of
@@ -1159,7 +1166,7 @@ impl Fault {
                 "something was written in the room from this node after the leave, so it is in the room again\n       run `vox room leave` again to leave"
             }
             Fault::NotAServiceRoom => {
-                "that room offers no service by name, so it has no .vox name to resolve\n       reach a member's service with `vox forward <room> <member> <port>` instead"
+                "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service by its address, `vox forward <service>.<node>.<room>.vox`"
             }
             Fault::AboveRoomRetention => {
                 "a member may keep this room's messages for less time than the room does, never longer\n       ask the room's creator or an admin (`vox room admin list`) to change the room's retention"

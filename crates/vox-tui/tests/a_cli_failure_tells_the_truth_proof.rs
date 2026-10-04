@@ -236,6 +236,21 @@ fn daemon_pid_of(dir: &std::path::Path) -> u32 {
         .unwrap_or_else(|| panic!("PRODUCT (staging): no daemon holds {}", dir.display()))
 }
 
+/// A process this proof froze with SIGSTOP, continued when this drops — however the proof ends,
+/// so a red never leaves a stopped process (a daemon that is not this proof's child included).
+struct Frozen(u32);
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        signal("CONT", self.0);
+    }
+}
+
+/// SIGSTOP `pid`, with a guard that continues it; `None` if the signal could not be sent.
+fn freeze(pid: u32) -> Option<Frozen> {
+    signal("STOP", pid).then_some(Frozen(pid))
+}
+
 fn signal(sig: &str, pid: u32) -> bool {
     Command::new("kill")
         .args([&format!("-{sig}"), &pid.to_string()])
@@ -458,10 +473,8 @@ fn a_cli_failure_tells_the_truth() {
     let (host_pid, late_pid) = (daemon_pid_of(&host_dir), late.child.id());
     // The host is suspended, so the join waits on it and is still being worked on a second
     // after it is asked.
-    assert!(
-        signal("STOP", host_pid),
-        "APPARATUS (5): could not SIGSTOP the host"
-    );
+    let _frozen_1 =
+        freeze(host_pid).unwrap_or_else(|| panic!("APPARATUS (5): could not SIGSTOP the host"));
     let mut join = Proc::spawn(
         "late join",
         &late_dir,
@@ -487,10 +500,8 @@ fn a_cli_failure_tells_the_truth() {
             join.stderr()
         );
     }
-    assert!(
-        signal("STOP", late_pid),
-        "APPARATUS (5): could not SIGSTOP the late joiner's daemon"
-    );
+    let _frozen_2 = freeze(late_pid)
+        .unwrap_or_else(|| panic!("APPARATUS (5): could not SIGSTOP the late joiner's daemon"));
     let mid_bound = Duration::from_secs(45);
     let ended = join.exit_within(mid_bound);
     assert!(
@@ -554,10 +565,8 @@ fn a_cli_failure_tells_the_truth() {
     let gone_pid = gone.child.id();
     // As in (5): the host is suspended, so the join is still being worked on when its own node
     // is killed. A kill, not a suspension: the connection ends, it does not go quiet.
-    assert!(
-        signal("STOP", host_pid),
-        "APPARATUS (7): could not SIGSTOP the host"
-    );
+    let _frozen_3 =
+        freeze(host_pid).unwrap_or_else(|| panic!("APPARATUS (7): could not SIGSTOP the host"));
     let mut join = Proc::spawn(
         "gone join",
         &gone_dir,
@@ -654,10 +663,8 @@ fn a_cli_failure_tells_the_truth() {
 
     // ---- (2) a suspended node: `vox status` and an attach end, and say so ----
     let pid = joiner.child.id();
-    assert!(
-        signal("STOP", pid),
-        "APPARATUS (2): could not SIGSTOP the daemon"
-    );
+    let _frozen_4 =
+        freeze(pid).unwrap_or_else(|| panic!("APPARATUS (2): could not SIGSTOP the daemon"));
     let status = vox(&joiner_dir, &["status"], "", bound);
     let list = vox(&joiner_dir, &["room", "list"], "", bound);
     assert!(
@@ -1098,10 +1105,8 @@ fn a_connect_stopped_by_a_signal_says_why() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(
-        signal("STOP", daemon_pid_of(&host_dir)),
-        "APPARATUS: `kill -STOP` the host failed"
-    );
+    let _frozen_5 = freeze(daemon_pid_of(&host_dir))
+        .unwrap_or_else(|| panic!("APPARATUS: `kill -STOP` the host failed"));
 
     let host12 = &host_fp[..12];
     let stops = [

@@ -48,11 +48,10 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
 - **AR-10.** The Argon2id profile MUST be at least 256 MiB, at least 3 passes, with a per-room random 128-bit salt. The floor MUST be enforced at compile time against the production profile (`ADR_MIN_M_COST_KIB`, `ADR_MIN_T_COST`, a `const` assertion). A production build MUST NOT be able to construct or resolve a profile below it. A reduced profile MAY exist under `cfg(test)` only. A cheaper profile for any non-test consumer MUST be a recorded, feature-gated decision, and MUST NOT be a change to `from_id`.
 - **AR-11.** A wrap and a vault MUST record their KDF profile id, so the parameters can be raised later by re-wrapping. An unknown stored profile id MUST fail as `AtRestUnlockFailed`, the same as a wrong factor or tampering, on every unlock path. Only a structurally malformed encoding is `MalformedAtRest`.
 
-### Passphrase rotation interaction
+### The SEK and the room passphrase
 
-- **AR-12.** A SEK MUST be independent of the room passphrase's value. Rotating the passphrase MUST NOT re-encrypt the store.
-- **AR-13.** On rotation, an online device MUST re-wrap its existing SEK under the new `factor_pass` and delete the old wrap.
-- **AR-14.** An offline device keeps its old wrap until it returns, rejoins (ADR-005), re-wraps and deletes the old wrap. There is no remote re-wrap. A revoked device's stale wrap MUST NOT yield new-epoch content keys, which come only on rejoin (ADR-006).
+- **AR-12.** A SEK MUST be independent of the room passphrase's value. A room's passphrase is never
+  rotated (ADR-007 G-21), so a SEK's wrap under `factor_pass` stays valid for the room's life.
 
 ### App-lock and memory hygiene
 
@@ -90,7 +89,7 @@ R-numbers are PRD-001's.
 
 - **AR-27 (R6).** A room's retention MUST default to forever.
 - **AR-28 (R7).** A room's retention MUST be its ADR-007 policy-update `ttl`, set with `vox room retention <room> 1h|1w|1m|<secs>|forever`.
-  - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). **Planned:** `vox room admin` is V030-13 (#319); on this tree the check is the `policy` capability, which V030-32 (#380) keeps only as far as admin and retention need.
+  - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). *Built:* the check is the `policy` capability, which the creator holds and a delegated admin's certificate carries (ADR-007 G-5).
   - A member MAY set a lower retention for its own node only (AR-29); it MUST NOT raise a room's retention for its node.
   - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history. Under ADR-026 that is the passphrase of the node the request resolves to.
   - **Planned:** a genesis carries `ttl` 0 (forever) at creation; a room's retention is set only after it is created.
