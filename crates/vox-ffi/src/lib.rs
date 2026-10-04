@@ -391,7 +391,7 @@ impl VoxNode {
                         None => return,
                         Some(EventStreamItem::Event(NodeEvent::NewEntry { .. })) => {}
                         Some(EventStreamItem::Event(other)) => {
-                            listener.on_notice(format!("{other:?}"));
+                            listener.on_notice(other.words());
                         }
                         Some(EventStreamItem::Lagged(n)) => listener.on_notice(format!(
                             "missed {n} events; read the rooms again for what is current"

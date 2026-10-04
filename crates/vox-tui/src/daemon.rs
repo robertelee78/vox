@@ -164,7 +164,8 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             if let Some(signal) = attach_foreground(args, &account, &rt, &mut stop, &router, node)?
             {
                 // A stop while it asked for a passphrase ends it at once, as it always has.
-                // The timeout is made inside the runtime: made outside, its timer has no reactor.
+                // The timeout is made inside the runtime: built outside it, it panicked with "there
+                // is no reactor running", so a stop at the prompt crashed instead of stopping.
                 let _ = rt.block_on(async {
                     tokio::time::timeout(shutdown_patience(), router.stop_all()).await
                 });
@@ -567,6 +568,35 @@ fn already_running(
         }
     };
     let socket = account.socket();
+    // **The daemon that holds the lock may not be serving yet** (D-1): daemons started together
+    // race, and the winner takes the lock before it binds the account socket. A loser waits for
+    // the socket to answer, as a client starting a daemon does (S-2), before handing its node
+    // over; it said "nothing is listening on the control socket" and exited.
+    let answering = rt.block_on(async {
+        let t0 = std::time::Instant::now();
+        loop {
+            if DaemonClient::open(&socket).await.is_ok() {
+                return true;
+            }
+            if t0.elapsed() >= crate::daemon_client::START_WITHIN {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    if !answering {
+        return Err(AppError::Refused {
+            code: 1,
+            message: format!(
+                "a daemon holds the account lock for {}, but nothing answered on {} within {} s; \
+                 its log is {}",
+                account.data_root.display(),
+                socket.display(),
+                crate::daemon_client::START_WITHIN.as_secs(),
+                account.log_file().display()
+            ),
+        });
+    }
     let held = rt.block_on(async {
         if let Some(keep) = keep_source(args) {
             let mut d = DaemonClient::open(&socket)

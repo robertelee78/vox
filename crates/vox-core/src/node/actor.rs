@@ -14188,7 +14188,10 @@ async fn agree_round(
     }
 }
 
-fn fault_of(e: &Error) -> Fault {
+/// The [`Fault`] a person is told for `e`: one mapping, shared by the actor and by a client verb
+/// that does the same work itself (`vox id` making an identity, ADR-026 C-5).
+#[must_use]
+pub fn fault_of(e: &Error) -> Fault {
     match e {
         // A ladder that tried every rung and got nowhere is unreachable, not an internal
         // fault: falling through to `Internal` made the join walk stop after one responder.

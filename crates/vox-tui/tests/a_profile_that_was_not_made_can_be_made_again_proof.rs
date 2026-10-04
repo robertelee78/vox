@@ -396,6 +396,45 @@ fn a_vault_that_cannot_be_written_is_named_and_leaves_nothing() {
     );
 }
 
+/// **A temporary file an earlier attempt left does not stand in the way** (#399): a failed or
+/// killed `vox id` can leave `vault.tmp` behind, and the next `vox id` must make the identity
+/// anyway — with the file a crash leaves, and with one of another mode. Mutant: the vault write
+/// not clearing its old temporary file.
+#[test]
+#[ignore = "real binaries and production Argon2id; the release gate runs it"]
+fn a_temporary_file_left_by_an_earlier_attempt_does_not_block_the_next() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let p = Profile::new(tmp.path(), "leftover-tmp");
+    std::fs::create_dir_all(p.dir()).expect("APPARATUS: cannot make the node directory");
+    let left = p.dir().join("vault.tmp");
+    std::fs::write(&left, b"half of an earlier vault").expect("APPARATUS: cannot stage vault.tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&left, std::fs::Permissions::from_mode(0o444))
+            .expect("APPARATUS: cannot set vault.tmp's mode");
+    }
+    let o = p.vox(&["id"]);
+    eprintln!(
+        "[proof] with a leftover vault.tmp, vox id ok={}: {}{}",
+        o.ok,
+        o.stdout.trim(),
+        o.stderr.trim()
+    );
+    assert!(
+        o.ok && o.stdout.trim().len() == 52,
+        "PRODUCT: a vault.tmp left by an earlier attempt kept `vox id` from making the identity: {}",
+        o.stderr.trim()
+    );
+    assert!(
+        !left.exists() && p.dir().join("vault.cbor").exists(),
+        "PRODUCT: after `vox id` the leftover vault.tmp is still there or no vault was written; \
+         the profile holds {:?}",
+        p.listing()
+    );
+}
+
 /// `vox id` under the test interposer, with every flush of `dir` failing with `EIO`. Returns
 /// success, stderr, and whether the vault's rename landed and a flush of `dir` failed after it.
 #[cfg(target_os = "macos")]
