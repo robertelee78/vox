@@ -615,3 +615,91 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
         a.log()
     );
 }
+
+/// #408: **an agent's hook never waits without a bound.** A node's detach waits for the secret
+/// work it is doing (here a room seal staged to take 25 s, ADR-026 L-3). A hook that asks for the
+/// node meanwhile is answered within its bound, about 10 s, saying in one line that the node is
+/// still detaching and this turn reads nothing, and exits so the turn goes on.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn a_hook_is_answered_within_its_bound_while_its_node_detaches() {
+    const SEAL_MS: u64 = 25_000;
+    const HOOK_BOUND: Duration = Duration::from_secs(10);
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let knob = ("VOX_TEST_SECRET_WORK_DELAY_MS", SEAL_MS.to_string());
+    let run = |args: &[&str], stdin: &str| {
+        let mut child = a
+            .cmd(args)
+            .env(knob.0, &knob.1)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    // Attached by hand (which starts the daemon, with the knob): the unlock is held too.
+    let (ok, out, err) = run(&["node", "attach", "agent"], "");
+    assert!(
+        ok,
+        "APPARATUS: vox node attach agent: {out}{err}\nlog:\n{}",
+        a.log()
+    );
+    let pid = a
+        .lock_pid()
+        .expect("PRODUCT (staging): no daemon holds the lock");
+    std::thread::scope(|s| {
+        // A seal in flight, then the detach that waits for it.
+        let seal = s.spawn(|| {
+            run(
+                &[
+                    "room",
+                    "create",
+                    "--node",
+                    "agent",
+                    "--passphrase-file",
+                    "-",
+                    "--name",
+                    "r",
+                ],
+                ROOM_PASS,
+            )
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        let detach = s.spawn(|| run(&["node", "detach", "agent"], ""));
+        std::thread::sleep(Duration::from_secs(1));
+        let t0 = Instant::now();
+        let (ok, out, err) = a.hook("agent", "s-1", "UserPromptSubmit");
+        let took = t0.elapsed();
+        eprintln!(
+            "[proof] the hook during the detach answered in {:.2} s (exit ok={ok}): {}",
+            took.as_secs_f64(),
+            out.trim()
+        );
+        assert!(
+            ok && took <= HOOK_BOUND + Duration::from_secs(1),
+            "PRODUCT: an agent's hook waited {:.2} s on a node that is detaching; its bound is \
+             {} s (#408)\nstdout: {out}\nstderr: {err}\nlog:\n{}",
+            took.as_secs_f64(),
+            HOOK_BOUND.as_secs(),
+            a.log()
+        );
+        assert!(
+            out.contains("node agent is still detaching; this turn reads nothing"),
+            "PRODUCT: the hook's one line does not say the node is still detaching: {out}"
+        );
+        let (_, _, _) = seal.join().unwrap();
+        let (dok, dout, derr) = detach.join().unwrap();
+        assert!(dok, "PRODUCT (staging): the detach failed: {dout}{derr}");
+    });
+    stop_pid(pid);
+}

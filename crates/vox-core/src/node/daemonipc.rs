@@ -70,6 +70,7 @@ const T_REF_BAD_NAME: u64 = 4304;
 const T_REF_FAILED: u64 = 4305;
 const T_REF_STOPPING: u64 = 4306;
 const T_REF_NODE_IN_USE: u64 = 4307;
+const T_REF_STILL_DETACHING: u64 = 4308;
 
 // Small enums.
 const STATE_DETACHED: u64 = 0;
@@ -302,7 +303,18 @@ pub enum Refusal {
         /// The node.
         node: NodeName,
     },
+    /// The node is detaching, and its stop did not finish within the daemon's bound for a
+    /// request to wait on it ([`DETACHING_PATIENCE`]): a secret work it was doing still holds it.
+    StillDetaching {
+        /// The node.
+        node: NodeName,
+    },
 }
+
+/// The longest a request waits for a node that is detaching before it is refused
+/// ([`Refusal::StillDetaching`]): a detach waits for the node's secret work, however long that
+/// takes (ADR-026 L-3), and nothing asking for the node may wait without a bound with it.
+pub const DETACHING_PATIENCE: std::time::Duration = std::time::Duration::from_secs(8);
 
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -322,6 +334,11 @@ impl std::fmt::Display for Refusal {
             Self::NodeInUse { node } => write!(
                 f,
                 "another vox is still running as node {node}; stop it, then try again"
+            ),
+            Self::StillDetaching { node } => write!(
+                f,
+                "node {node} is still detaching (its stop waits for work it was doing); try \
+                 again once it has"
             ),
         }
     }
@@ -545,6 +562,9 @@ fn put_refusal(e: &mut Encoder, r: &Refusal) {
         Refusal::NodeInUse { node } => {
             e.array(2).uint(T_REF_NODE_IN_USE).text(node.as_str());
         }
+        Refusal::StillDetaching { node } => {
+            e.array(2).uint(T_REF_STILL_DETACHING).text(node.as_str());
+        }
     }
 }
 
@@ -567,6 +587,7 @@ fn refusal(d: &mut Decoder<'_>) -> Result<Refusal> {
         },
         (T_REF_STOPPING, 1) => Refusal::Stopping,
         (T_REF_NODE_IN_USE, 2) => Refusal::NodeInUse { node: name(d, w)? },
+        (T_REF_STILL_DETACHING, 2) => Refusal::StillDetaching { node: name(d, w)? },
         _ => return Err(Error::MalformedIpc("ipc refusal tag")),
     })
 }
@@ -1168,6 +1189,7 @@ mod tests {
             },
             Refusal::Stopping,
             Refusal::NodeInUse { node: n("a") },
+            Refusal::StillDetaching { node: n("a") },
         ];
         let mut all = vec![
             DaemonFrame::Hello {
