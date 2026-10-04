@@ -8389,27 +8389,36 @@ impl Node {
             .trusted_at(target)
     }
 
-    /// Stamp a new trust decision for `fingerprint` in the consent order and mark where every
-    /// open room's sender key stands at it (V210-45). The stamp is floored by every open room's
-    /// newest generation, so a lost or rolled-back counter cannot make one of them look minted
-    /// after this decision.
-    async fn stamp_trust_decision(&mut self, fingerprint: Digest32) {
-        let Some(profile) = self.profile.as_ref() else {
-            return;
-        };
-        let Ok(signer) = profile.signer() else {
-            return;
-        };
+    /// Draw `fingerprint`'s place in the consent order for a new trust decision and persist it
+    /// (V210-45): what [`Self::trust_decision`] reads. Floored by every open room's newest
+    /// generation, so a lost or rolled-back counter cannot make one of them look minted after
+    /// this decision. `None` if it could not be drawn: the decision then entitles to no history,
+    /// narrower and never wider.
+    async fn draw_trust_stamp(
+        &mut self,
+        fingerprint: Digest32,
+    ) -> Option<crate::node::consent_order::Stamp> {
+        let profile = self.profile.as_ref()?;
+        let signer = profile.signer().ok()?;
         let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
         let mut floor = 0u64;
         for ch in &shared {
             floor = floor.max(ch.lock().await.newest_mint_seq());
         }
-        let Ok(decision) =
-            crate::node::consent_order::stamp_trust(profile.store(), signer, fingerprint, floor)
-        else {
+        crate::node::consent_order::stamp_trust(profile.store(), signer, fingerprint, floor).ok()
+    }
+
+    /// Mark where every open room's sender key stands at `fingerprint`'s trust decision, drawn by
+    /// [`Self::draw_trust_stamp`] (V210-45).
+    async fn mark_trust_decision(
+        &mut self,
+        fingerprint: Digest32,
+        decision: crate::node::consent_order::Stamp,
+    ) {
+        let Some(profile) = self.profile.as_ref() else {
             return;
         };
+        let shared: Vec<_> = self.channels.values().map(Arc::clone).collect();
         // **One commit for every room** (#189): each room marks and seals under its own lock,
         // and the write happens once, after, with no room's lock held. A commit per room made
         // `vox trust add` cost one durable commit per open room on the actor, about 7 s at
@@ -8575,6 +8584,29 @@ impl Node {
         petname: &str,
         history: crate::node::trust::HistoryGrant,
     ) -> Outcome {
+        match self.profile.as_ref().map(Profile::signer) {
+            None => return Outcome::Failed(Fault::NoIdentity),
+            Some(Err(e)) => return Outcome::Failed(fault_of(&e)),
+            Some(Ok(_)) => {}
+        }
+        let newly = !self.trust.is_trusted(&fingerprint);
+        let mut next = self.trust.clone();
+        if let Err(e) = next.trust_with(fingerprint, petname, history) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        // **The decision's place in the consent order is drawn before the trust is saved**
+        // (V210-45, V210-88). Drawn after, a crash between the two left a trusted member with no
+        // place, read on the restart as a decision from before the order was kept: its key was
+        // released from wherever the sender stood when the consent at last went out, and every
+        // post made since the restart was lost to it. Drawn first, a crash before the save leaves
+        // a place for an identity not trusted, which counts for nothing and is drawn again by
+        // the next trust; a crash after it leaves both, and each room marks the decision as it
+        // reopens, before anything is posted there.
+        let decision = if newly {
+            self.draw_trust_stamp(fingerprint).await
+        } else {
+            None
+        };
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -8582,11 +8614,6 @@ impl Node {
             Ok(s) => s,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
-        let newly = !self.trust.is_trusted(&fingerprint);
-        let mut next = self.trust.clone();
-        if let Err(e) = next.trust_with(fingerprint, petname, history) {
-            return Outcome::Failed(fault_of(&e));
-        }
         // Persist BEFORE adopting it: a keyring that consented but did not survive
         // a restart would silently re-consent on every boot.
         if let Err(e) = next.save(profile.store(), signer) {
@@ -8603,13 +8630,12 @@ impl Node {
                 let _ = locks.save(profile.store(), signer);
             }
         }
-        if newly {
-            // The decision's place in the consent order, and where each open room's sender
-            // key stands at it (V210-45). A rename is the same decision and keeps its place.
-            // Nothing else runs on the actor in between, so no post is sealed between the
-            // stamp and the marks. A failure here narrows what the member will read and
-            // never widens it, so it does not undo the trust.
-            self.stamp_trust_decision(fingerprint).await;
+        if let Some(decision) = decision {
+            // Where each open room's sender key stands at the decision (V210-45). A rename is
+            // the same decision and keeps its place. Nothing else runs on the actor in between,
+            // so no post is sealed between the place and the marks. A failure here narrows what
+            // the member will read and never widens it, so it does not undo the trust.
+            self.mark_trust_decision(fingerprint, decision).await;
         }
         // The reacher sets are a join of the ring with each room's author set, so both
         // inputs must push. Immediately, not on the tick: a stream parked open across
