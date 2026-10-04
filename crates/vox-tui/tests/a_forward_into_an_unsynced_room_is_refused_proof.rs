@@ -20,7 +20,9 @@
 //! "shares no service", and that is `CANNOT MEASURE`, not a pass.
 //!
 //! **Mutation that must turn it red:** `share_refusal` answering `None` for a room not yet synced,
-//! so the forward goes ahead with the name as given — red as `PRODUCT: … was forwarded`.
+//! so the forward goes ahead with the name as given. With the host stopped, the guess then fails to
+//! reach it, and the proof is red as `PRODUCT: a forward into a room not yet synced must be refused
+//! saying so`; were the host up, it would be red as `PRODUCT: … was forwarded`.
 
 #![cfg(unix)]
 
