@@ -34,14 +34,25 @@
 //! `~/.codex/auth.json` — Codex's own sign-in, nothing else from `~/.codex` — mode 0600, copied
 //! in just before the turns and removed after them, however the test ends.
 //!
-//! **A refresh would sign the operator out.** Codex refreshes its ChatGPT token once its
-//! `last_refresh` is eight days old, and a refresh rotates the refresh token: done on the copy,
-//! the operator's own file would hold a spent one. So the proof refuses to start when the
-//! sign-in is within an hour of that age, and after each turn reports, by comparison alone, if
-//! Codex rewrote the copy.
+//! **A refresh inside the copy never strands the operator's sign-in.** A refresh rotates the
+//! refresh token, so a refresh done on the copy would leave the operator's own file holding a
+//! spent one. Codex does not refresh on `last_refresh`'s age alone (0.160.0 ran a turn on a
+//! nine-day-old one without refreshing), so the age is not a reason to refuse. Instead, when a
+//! turn's copy is removed — after the turn, or as a panic unwinds — its bytes are compared with
+//! what was copied in: if Codex rewrote it, and the operator's `~/.codex/auth.json` is still
+//! byte for byte what was copied, the new sign-in is written back (a temporary file in
+//! `~/.codex`, mode 0600, flushed, then renamed over it); if the operator's file changed
+//! meanwhile it is left as it is, and the run says so loudly. Each turn says "Codex rotated its
+//! sign-in; the operator's file was updated" or "unchanged". The file's contents are never
+//! printed. A run killed by a signal (the watchdog's abort, SIGTERM) runs no destructor: its
+//! copy is unlinked by the signal handler, and a rotation made in that turn is not written back.
+//!
+//! **No hook of the operator's runs.** `CODEX_HOME` is inside the root and holds only the
+//! `hooks.json` under test, so `~/.codex/hooks.json` is never read; every turn's output is
+//! checked not to name the operator's `~/.codex` at all.
 //!
 //! **A dry run stops before Codex.** With `VOX_PROOF_STOP_BEFORE_CODEX=1` the proof does its
-//! setup, the sign-in's age check, the node, daemon, room and codeword, both homes, and the
+//! setup, the node, daemon, room and codeword, both homes, and the
 //! sandbox's canary probe, then stops before the first thing that starts Codex (`vox agent trust
 //! codex`, which runs Codex's app-server) and before the sign-in is copied anywhere. It says
 //! `STOPPED BEFORE CODEX` and passes.
@@ -116,12 +127,6 @@ fn dry_run() -> bool {
     std::env::var("VOX_PROOF_STOP_BEFORE_CODEX").is_ok_and(|v| v == "1")
 }
 
-/// Whether a Codex sign-in last refreshed at `refreshed` (Unix seconds) is too close to Codex's
-/// eight-day refresh at `now` to run a turn: within an hour of it, or past it.
-fn too_close_to_refresh(refreshed: u64, now: u64) -> bool {
-    now.saturating_sub(refreshed) >= 8 * 86_400 - 3_600
-}
-
 fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(VOX)
         .args(args)
@@ -181,6 +186,92 @@ fn codex_install() -> (PathBuf, PathBuf) {
         .unwrap_or_else(|| panic!("APPARATUS: codex's binary has no release directory"))
         .to_path_buf();
     (bin, release)
+}
+
+/// **A turn's copy of the operator's sign-in, and what becomes of it** (see the module doc): when
+/// dropped — after the turn, or as a panic unwinds — a copy Codex rewrote is written back to the
+/// operator's file if that file is still what was copied, then the copy is removed. Never prints
+/// the sign-in.
+struct CodexSignIn {
+    copy: Option<oc_sandbox::Credential>,
+    copy_path: PathBuf,
+    operator: PathBuf,
+    copied: Vec<u8>,
+    /// What happened, once the copy is gone.
+    outcome: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+}
+
+impl CodexSignIn {
+    fn copy(operator: &Path, to: &Path, copied: &[u8]) -> Self {
+        Self {
+            copy: Some(oc_sandbox::Credential::copy_file(operator, to)),
+            copy_path: to.to_path_buf(),
+            operator: operator.to_path_buf(),
+            copied: copied.to_vec(),
+            outcome: std::rc::Rc::default(),
+        }
+    }
+
+    /// Write `bytes` over the operator's file: a temporary file beside it, mode 0600, flushed,
+    /// renamed over it, and the directory flushed.
+    fn write_back(&self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let dir = self
+            .operator
+            .parent()
+            .ok_or_else(|| std::io::Error::other("the operator's file has no directory"))?;
+        let tmp = dir.join(format!(".auth.json.vox-proof-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        let written = f.write_all(bytes).and_then(|()| f.sync_all());
+        drop(f);
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &self.operator)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        std::fs::File::open(dir)?.sync_all()
+    }
+}
+
+impl Drop for CodexSignIn {
+    fn drop(&mut self) {
+        let now = std::fs::read(&self.copy_path).ok();
+        let said = match now {
+            Some(b) if b != self.copied => {
+                if std::fs::read(&self.operator).ok().as_deref() == Some(self.copied.as_slice()) {
+                    match self.write_back(&b) {
+                        Ok(()) => {
+                            "Codex rotated its sign-in; the operator's file was updated".to_owned()
+                        }
+                        Err(e) => {
+                            let s = format!(
+                                "Codex rotated its sign-in, and writing it back to the operator's \
+                                 ~/.codex/auth.json FAILED ({e}): that file may hold a spent \
+                                 refresh token; run `codex login status`"
+                            );
+                            eprintln!("[proof] !!! {s}");
+                            s
+                        }
+                    }
+                } else {
+                    let s = "Codex rotated its sign-in, but the operator's ~/.codex/auth.json \
+                             changed while the turn ran, so it was LEFT AS IT IS: it may hold a \
+                             spent refresh token; run `codex login status`"
+                        .to_owned();
+                    eprintln!("[proof] !!! {s}");
+                    s
+                }
+            }
+            Some(_) => "unchanged".to_owned(),
+            None => "the copy was gone before it could be compared".to_owned(),
+        };
+        drop(self.copy.take());
+        *self.outcome.borrow_mut() = Some(said);
+    }
 }
 
 /// One isolated Codex: its `CODEX_HOME`, `HOME` and `TMPDIR`, all under the run's root.
@@ -286,21 +377,6 @@ fn trust_status(codex: &Path, h: &CodexHome, path: &str, data: &Path, cfg: &Path
     statuses[0].clone()
 }
 
-/// Seconds since the Unix epoch of an RFC 3339 UTC timestamp, by the system's `date`.
-fn epoch_of(stamp: &str) -> u64 {
-    let head = stamp
-        .get(..19)
-        .unwrap_or_else(|| panic!("APPARATUS: Codex's last_refresh is not a timestamp: {stamp:?}"));
-    let out = Command::new("/bin/date")
-        .args(["-j", "-u", "-f", "%Y-%m-%dT%H:%M:%S", head, "+%s"])
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run date: {e}"));
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .unwrap_or_else(|e| panic!("APPARATUS: date did not parse {head:?}: {e}"))
-}
-
 /// Every file under `dir`, recursively, read as text and joined: Codex's session logs.
 fn session_logs(dir: &Path) -> String {
     let mut out = String::new();
@@ -353,40 +429,15 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
     }
     let (codex, codex_release) = codex_install();
 
-    // ---- the sign-in: present, and far enough from a refresh ----
+    // ---- the sign-in: present ----
     let real_home = watchdog::temp_home::real_home()
         .unwrap_or_else(|| panic!("APPARATUS: HOME is unset, so Codex's sign-in cannot be found"));
     let auth_src = real_home.join(".codex/auth.json");
     let auth_bytes = std::fs::read(&auth_src).unwrap_or_else(|_| {
         panic!("CANNOT MEASURE: no ~/.codex/auth.json, so no Codex turn can run; sign in to Codex")
     });
-    let auth: serde_json::Value = serde_json::from_slice(&auth_bytes)
+    let _: serde_json::Value = serde_json::from_slice(&auth_bytes)
         .unwrap_or_else(|_| panic!("APPARATUS: ~/.codex/auth.json is not JSON"));
-    if let Some(stamp) = auth["last_refresh"].as_str() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|e| panic!("APPARATUS: the clock is before 1970: {e}"))
-            .as_secs();
-        let refreshed = epoch_of(stamp);
-        let age = now.saturating_sub(refreshed);
-        println!(
-            "[proof] Codex's sign-in was last refreshed {}h ago",
-            age / 3600
-        );
-        // A dry run starts no Codex and copies no sign-in, so it says the refusal and goes on.
-        if dry_run() && too_close_to_refresh(refreshed, now) {
-            println!(
-                "[proof] a live run would refuse here now: the sign-in is within an hour of \
-                 Codex's eight-day refresh, or past it"
-            );
-        }
-        assert!(
-            dry_run() || !too_close_to_refresh(refreshed, now),
-            "CANNOT MEASURE: Codex's sign-in is within an hour of its eight-day refresh; a refresh \
-             inside the sandbox would rotate the operator's token. Run any Codex turn yourself \
-             first, then this proof"
-        );
-    }
 
     // ---- the run's root: short, so the node's socket sits in its profile ----
     std::fs::create_dir_all("/private/tmp/vc")
@@ -563,7 +614,8 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
     // ---- one turn in each home ----
     let turn = |h: &CodexHome, name: &str| -> Turn {
         let auth = h.codex_home.join("auth.json");
-        let credential = oc_sandbox::Credential::copy_file(&auth_src, &auth);
+        let credential = CodexSignIn::copy(&auth_src, &auth, &auth_bytes);
+        let signin = std::rc::Rc::clone(&credential.outcome);
         let last = h.tmp.join("last-message.txt");
         let mut cmd = h.command(Path::new("/usr/bin/sandbox-exec"), &path, &data, &cfg);
         cmd.arg("-f")
@@ -591,11 +643,10 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         let out = cmd
             .output()
             .unwrap_or_else(|e| panic!("APPARATUS: cannot run codex exec: {e}"));
-        // Compared, never printed: did Codex rewrite its sign-in (a refresh)?
-        let rewritten = std::fs::read(&auth)
-            .map(|b| b != auth_bytes)
-            .unwrap_or(true);
+        // Compared, never printed: did Codex rewrite its sign-in (a refresh)? Written back to the
+        // operator's file if it did, as the copy is removed.
         drop(credential);
+        let signin = signin.borrow().clone().unwrap_or_default();
         assert!(
             !auth.exists(),
             "APPARATUS: the sandbox's copy of auth.json was not removed"
@@ -617,17 +668,26 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         std::fs::write(root.join(format!("{name}.out")), &said)
             .unwrap_or_else(|e| panic!("APPARATUS: cannot keep the turn's output: {e}"));
         println!(
-            "[proof] {name} turn: exit {:?} after {:.1}s; answer {:?}; auth.json copy rewritten by \
-             Codex: {rewritten}; copy removed",
+            "[proof] {name} turn: exit {:?} after {:.1}s; answer {:?}; the sign-in: {signin}; copy \
+             removed",
             out.status.code(),
             started.elapsed().as_secs_f64(),
             answer.trim()
         );
         assert!(
-            !rewritten,
-            "APPARATUS: Codex rewrote its sign-in inside the sandbox (a token refresh). The \
-             operator's ~/.codex/auth.json may hold a spent refresh token: run `codex login \
-             status` before anything else"
+            signin == "unchanged" || signin.ends_with("the operator's file was updated"),
+            "APPARATUS: {signin}"
+        );
+        // **No hook of the operator's ran** (module doc): nothing the turn said names their
+        // `~/.codex`, where Codex would have read their `hooks.json`.
+        let theirs = real_home.join(".codex").display().to_string();
+        let named = said.contains(&theirs);
+        println!("[proof] {name} turn: the operator's ~/.codex named in its output: {named}");
+        assert!(
+            !named,
+            "APPARATUS: the {name} turn read the operator's ~/.codex (its output names it), so \
+             its hooks.json may have run: {}",
+            evidence(&said, &theirs).unwrap_or_default()
         );
         let low = said.to_ascii_lowercase();
         if !out.status.success()
@@ -680,18 +740,4 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         t.answer.trim()
     );
     println!("[proof] trusted turn: the model answered with the codeword {codeword}");
-}
-
-/// The refusal near Codex's token refresh, at its edges: a sign-in refreshed 8 days less 61
-/// minutes ago runs; 8 days less 59 minutes, 8 days, and later, refuse. Pure arithmetic; no
-/// Codex, no model.
-#[test]
-fn a_sign_in_within_an_hour_of_its_refresh_is_refused() {
-    let now = 2_000_000_000;
-    let day = 86_400;
-    assert!(!too_close_to_refresh(now - (8 * day - 61 * 60), now));
-    assert!(too_close_to_refresh(now - (8 * day - 59 * 60), now));
-    assert!(too_close_to_refresh(now - 8 * day, now));
-    assert!(too_close_to_refresh(now - 9 * day, now));
-    assert!(!too_close_to_refresh(now, now));
 }
