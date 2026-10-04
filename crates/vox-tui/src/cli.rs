@@ -1860,7 +1860,9 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let anchors = match args.anchor_set_lenient() {
+            // Of the node just resolved, which an empty data root makes: `paths()` would refuse to
+            // choose one there, and `vox node` must start (ADR-026 N-5).
+            let anchors = match args.anchor_set_lenient_at(&paths) {
                 Ok((a, None)) => a,
                 // An anchor may run with no anchor of its own, but it says why it has none.
                 Ok((a, Some(unusable))) => {
