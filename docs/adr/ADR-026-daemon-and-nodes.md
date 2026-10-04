@@ -144,7 +144,9 @@ network presence from the start: there is no interim design with one socket per 
   attach it.
 - **C-6.** Passphrases MAY travel over the socket (attach, keyring changes): the OS account is the
   boundary (ADR-001). They MUST be carried in zeroizing buffers end to end. A passphrase taken from
-  an environment variable MUST be resolved in the client, never by the daemon.
+  an environment variable MUST be resolved in the client, never by the daemon. A foreground
+  `vox daemon` attaching its own foreground node is that node's client: it MAY read
+  `VOX_IDENTITY_PASSPHRASE` for that node only, never for a node another client asks it to attach.
 - **C-7.** The socket MUST offer what the TUI needs as a client: open and close of a closed room,
   per-node status, attach and detach. *Not built (with S-4).*
 
