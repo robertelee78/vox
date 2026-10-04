@@ -530,7 +530,9 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
             "2M",
             "--socks5-hostname",
             &bob_proxy.to_string(),
-            &format!("http://alice.files.vox:{port}/big.bin"),
+            // `<service>.<node>.<room>.vox`: a node's name alone resolves to nothing (PRD-001
+            // R20), and the share's service is named by its port.
+            &format!("http://{port}.alice.files.vox:{port}/big.bin"),
         ])
         .output()
         .expect("APPARATUS: run curl");
