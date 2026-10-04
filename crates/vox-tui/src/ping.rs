@@ -216,7 +216,8 @@ fn describe(s: &serde_json::Value) -> String {
         Some("gone") => {
             "its wake endpoint is gone; it reads at its next turn, if it has one".to_owned()
         }
-        other => format!("reach {other:?}"),
+        Some(other) => format!("its reach is \"{other}\", which this vox does not know"),
+        None => "it did not say how it is reached".to_owned(),
     };
     let read = match s["last_read_ms"].as_u64() {
         Some(ms) if ms > 0 => format!("last read {}", ago_ms(ms)),
