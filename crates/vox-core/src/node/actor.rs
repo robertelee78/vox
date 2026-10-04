@@ -8937,13 +8937,37 @@ impl Node {
         let channels: Vec<Digest32> = self.channels.keys().copied().collect();
         let mut asked_for = asked_for;
         for channel_id in channels {
-            let owed = {
+            let (owed, waits) = {
                 let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
                     continue;
                 };
-                let owed = shared.lock().await.owed_consents(&trusted);
-                owed
+                let ch = shared.lock().await;
+                let owed = ch.owed_consents(&trusted);
+                // **A consent the person just asked for that cannot go yet is said, with why**
+                // (#335). It was left out of what is owed in silence, so a `vox trust add` whose
+                // key could not go — this node has not synced the room since it joined, or has
+                // not admitted the member — read as one that dialled and found nobody: no dial
+                // and no word.
+                let waits = asked_for.filter(|t| !owed.contains(t)).and_then(|t| {
+                    if !ch.is_settled() {
+                        Some((t, "this node has not synced the room since it joined, so writes nothing there yet"))
+                    } else if !ch.is_author(&t) && ch.me() != t {
+                        Some((t, "this node has not admitted it to the room yet, so holds no key of its to check"))
+                    } else {
+                        None
+                    }
+                });
+                (owed, waits)
             };
+            if let (Some((t, why)), Some(net)) = (waits, self.net.as_ref()) {
+                net.manager().note(
+                    t,
+                    format!(
+                        "its consent in room {} waits: {why}; it goes once that changes",
+                        crate::node::network::short_id(channel_id)
+                    ),
+                );
+            }
             for target in owed {
                 // `consent` emits `Consented` on success; a failure here is a peer
                 // that is not reachable yet, which the next tick retries.
