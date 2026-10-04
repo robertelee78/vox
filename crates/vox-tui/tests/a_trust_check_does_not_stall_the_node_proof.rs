@@ -1,17 +1,20 @@
 //! **V210-26 — checking the identity passphrase never stalls the node**, through the shipped
 //! `vox` binary.
 //!
-//! Every `vox trust add/list/remove` asks the daemon to verify the identity passphrase, and
-//! that is production Argon2id: ~0.3 s of CPU. It ran on the node's actor, which serves every
+//! A keyring change (`vox trust add`, `vox trust remove`) past the keyring window asks the
+//! daemon to verify the identity passphrase again (V210-159; a read such as `vox trust list` never
+//! does since ADR-026: the passphrase is given once at attach), and that is production Argon2id:
+//! ~0.3 s of CPU. It ran on the node's actor, which serves every
 //! command and event in turn, so for as long as it ran nothing else on the node was served —
 //! a post, a read, a sync. It now runs on a blocking thread and answers from there.
 //!
 //! What this measures, on alice's daemon: `vox room post` then `vox room read` until the
 //! post is readable, timed end to end, first with the node otherwise idle and then while
-//! four `vox trust list`s run back to back against the same daemon. With the check on the
+//! four checkers each add and remove a trusted stranger back to back against the same daemon,
+//! every change past the window (`VOX_TEST_KEYRING_WINDOW_SECS=0`), so every one is checked. With the check on the
 //! actor, each post waits behind whatever checks are queued ahead of it.
 //!
-//! **Then a flood:** 32 `vox trust list`s at once with a wrong passphrase — a wrong one costs
+//! **Then a flood:** 32 `vox trust add`s at once with a wrong passphrase — a wrong one costs
 //! the same Argon2id as a right one, so nothing can refuse it early. A check off the actor
 //! and unbounded is one 256 MiB derivation per request, which is how an agent session running
 //! model-authored code could take the node, or the machine, down. So checks share
@@ -37,14 +40,24 @@ optional_proof::not_run!(a_trust_check_does_not_stall_posts_and_reads_on_the_sam
 
 #[path = "support/room.rs"]
 mod support;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+/// Every keyring change past the window, so every one checks the passphrase (V210-159).
+const KNOB: &str = "VOX_TEST_KEYRING_WINDOW_SECS";
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use support::Worker;
+
+/// A stranger's fingerprint for a checked keyring change: 32 bytes of `seed`, as text.
+fn stranger(seed: u8) -> String {
+    vox_core::node::link::b32_encode(&[seed; 32])
+}
 
 /// Resident memory of `pid`, in bytes.
 fn rss(pid: u32) -> u64 {
@@ -105,7 +118,11 @@ fn stats(label: &str, v: &[Duration]) -> (Duration, Duration) {
 #[test]
 #[ignore = "two networked nodes with production Argon2id; optional, run it in release"]
 fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
+    test_knobs::require(&[KNOB]);
     watchdog::arm();
+    // Inherited by every daemon this proof starts: a window of 0 s, so each change is checked.
+    // Set before any thread of this test starts, and read only by child processes.
+    std::env::set_var(KNOB, "0");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -129,15 +146,40 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
     let stop = Arc::new(AtomicBool::new(false));
     let checks = Arc::new(AtomicUsize::new(0));
     let loaded: Vec<Duration> = std::thread::scope(|scope| {
-        for _ in 0..CHECKERS {
+        for c in 0..CHECKERS {
             let (stop, checks, pass) = (stop.clone(), checks.clone(), pass.clone());
+            // A stranger of its own per checker, added and removed in turn: two checked changes.
+            let stranger = stranger(u8::try_from(c).expect("APPARATUS: few checkers"));
             scope.spawn(move || {
+                let mut add = true;
                 while !stop.load(Ordering::SeqCst) {
-                    let o = alice.vox(
-                        None,
-                        &["trust", "list", "--identity-passphrase-file", &pass],
-                    );
-                    assert!(o.ok, "PRODUCT (staging): trust list: {o:?}");
+                    let o = if add {
+                        alice.vox(
+                            None,
+                            &[
+                                "trust",
+                                "add",
+                                &stranger,
+                                "--name",
+                                &format!("s{c}"),
+                                "--identity-passphrase-file",
+                                &pass,
+                            ],
+                        )
+                    } else {
+                        alice.vox(
+                            None,
+                            &[
+                                "trust",
+                                "remove",
+                                &stranger,
+                                "--identity-passphrase-file",
+                                &pass,
+                            ],
+                        )
+                    };
+                    assert!(o.ok, "PRODUCT (staging): a checked keyring change: {o:?}");
+                    add = !add;
                     checks.fetch_add(1, Ordering::SeqCst);
                 }
             });
@@ -177,20 +219,29 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
         .expect("APPARATUS: write a staging file");
     let base_rss = rss(daemon);
     let done = Arc::new(AtomicUsize::new(0));
+    let flood_stranger = stranger(0xF0);
     let (peak, flood_posts) = std::thread::scope(|scope| {
         for _ in 0..FLOOD {
-            let (done, wrong) = (done.clone(), wrong.clone());
+            let (done, wrong, flood_stranger) =
+                (done.clone(), wrong.clone(), flood_stranger.clone());
             scope.spawn(move || {
                 let o = alice.vox(
                     None,
                     &[
                         "trust",
-                        "list",
+                        "add",
+                        &flood_stranger,
+                        "--name",
+                        "flood",
                         "--identity-passphrase-file",
                         wrong.to_str().expect("APPARATUS: a path that is not UTF-8"),
                     ],
                 );
-                assert!(!o.ok, "PRODUCT: a wrong passphrase must be refused: {o:?}");
+                assert!(
+                    !o.ok,
+                    "PRODUCT: a keyring change past the window with a wrong passphrase must be \
+                     refused: {o:?}"
+                );
                 done.fetch_add(1, Ordering::SeqCst);
             });
         }

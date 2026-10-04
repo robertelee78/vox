@@ -22,8 +22,13 @@ use std::time::{Duration, Instant};
 
 #[path = "layout.rs"]
 mod layout;
+
+#[path = "attach.rs"]
+pub mod attach;
 #[allow(unused_imports)] // not every includer uses every item
-pub use layout::{daemon_lock, find_named, node_dir, reap_daemon, Reaper, DEFAULT_NODE};
+pub use layout::{
+    daemon_lock, find_named, kill_daemon, node_dir, reap_daemon, Reaper, DEFAULT_NODE,
+};
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const IDENTITY: &str = "identity passphrase";
@@ -309,8 +314,42 @@ impl Drop for VoxProc {
     }
 }
 
-/// Run a one-shot `vox` verb to completion.
+/// [`vox_once`] for a one-shot verb that needs the default node attached (ADR-026 L-2), run
+/// before anything of the proof's own holds it: attached for the verb, then detached, and the
+/// daemon that attach started gone, so the proof's next `vox serve` or `vox daemon` starts the
+/// data root's daemon with its own `--listen` and `--anchor`.
+pub fn vox_once_attached(data: &Path, args: &[String]) -> (bool, String, String) {
+    attach::Root::at(data, IDENTITY).attached(DEFAULT_NODE, || vox_once(data, args))
+}
+
+/// The verbs that refuse a node no daemon holds (ADR-026 L-2, ruled): a person attaches the node
+/// first.
+const NEEDS_ATTACHED: &[&str] = &[
+    "room", "trust", "status", "service", "share", "app", "tunnel", "doctor",
+];
+
+/// Run a one-shot `vox` verb to completion — **as a person runs it since ADR-026 L-2**: a verb
+/// that needs its node attached, run while no daemon holds this data root, runs with the node
+/// attached by `vox node attach` and let go after (`attach::Root::attached`), so a daemon the
+/// proof starts next is the one that runs. With a daemon holding the root it runs as it is.
 pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
+    let needs = args
+        .first()
+        .is_some_and(|v| NEEDS_ATTACHED.contains(&v.as_str()));
+    if !needs {
+        return vox_once_plain(data, args);
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match attach::needs(data, &argv) {
+        Some(node) => {
+            attach::Root::at(data, IDENTITY).attached(&node, || vox_once_plain(data, args))
+        }
+        None => vox_once_plain(data, args),
+    }
+}
+
+/// [`vox_once`] exactly as given, attaching nothing.
+pub fn vox_once_plain(data: &Path, args: &[String]) -> (bool, String, String) {
     let out = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", data)
@@ -763,7 +802,7 @@ impl World {
         let guest_fp = fingerprint(&guest_dir, "guest");
         let host_fp = fingerprint(&host_dir, "host");
         if trusted {
-            let (ok, out, err) = vox_once(
+            let (ok, out, err) = vox_once_attached(
                 &host_dir,
                 &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
             );
@@ -887,6 +926,9 @@ impl World {
             // Reaped by the drop; say so rather than assume it (ADR-018 §6).
             eprintln!("[test] host `vox serve` pid {pid} killed and reaped");
         }
+        // `vox serve` is a client (ADR-026 S-3): its node runs in the host's daemon, which is what
+        // stops when a host goes away. Stopped cleanly, by the pid in its lock.
+        reap_daemon(&self.host_dir);
         let pass_file = self.tmp.path().join("daemon-passphrases");
         std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", self.passphrase))
             .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
@@ -920,26 +962,26 @@ impl World {
         format!("{}.{}.{}.vox", self.service_port, self.host_fp, self.room)
     }
 
-    /// `vox forward <room> <host> <service> 127.0.0.1:0` from `dir`, where `service` is a tag (`22`) or a
-    /// port spec (`53/udp` is the service `udp/53`) — returning it and the address it bound.
-    /// (The `vox forward <room>.vox <service> <local>` shape this used is withdrawn (V030-25);
-    /// `vox forward <service>.<node>.<room>.vox` needs a node already holding the profile.)
+    /// `vox forward <name>.<host>.<room>.vox 127.0.0.1:0` from `dir`, where `spec` is the
+    /// service as served (`22`, or `53/udp` for the UDP service named `53`) — returning it and the
+    /// address it bound. The guest's node holds the room already; the forward attaches it to the
+    /// guest's daemon (starting one) as a held verb (ADR-026 L-7).
     pub fn forward_service(&self, name: &str, dir: &Path, spec: &str) -> (VoxProc, SocketAddr) {
-        // From a file, never argv (V210-72: a room passphrase on the command line is refused).
-        let pass_file = dir.join(format!("{name}.room.pass"));
-        std::fs::write(&pass_file, &self.passphrase)
-            .unwrap_or_else(|e| panic!("APPARATUS: could not write {}: {e}", pass_file.display()));
+        let service = spec.split('/').next().unwrap_or(spec);
+        self.forward_named(name, dir, service)
+    }
+
+    /// `vox forward <service>.<host>.<room>.vox 127.0.0.1:0`, and the address it says it bound
+    /// ("vox: forwarding <addr> to …").
+    fn forward_named(&self, name: &str, dir: &Path, service: &str) -> (VoxProc, SocketAddr) {
+        let address = format!("{service}.{}.{}.vox", self.host_fp, self.room);
         let mut fwd = VoxProc::spawn(
             name,
             dir,
             &args(&[
                 "forward",
-                &self.room,
-                &self.host_fp,
-                spec,
+                &address,
                 "127.0.0.1:0",
-                "--passphrase-file",
-                &utf8(&pass_file),
                 "--anchor",
                 &self.guest_anchor,
                 "--listen",
@@ -947,14 +989,9 @@ impl World {
             ]),
         );
         let line = fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+            l.starts_with("vox: forwarding ")
         });
-        let bound: SocketAddr = line
-            .split_whitespace()
-            .nth(1)
-            .expect("an address")
-            .parse()
-            .expect("a socket address");
+        let bound = address_in(&mut fwd, &line, 2);
         (fwd, bound)
     }
 
@@ -981,35 +1018,15 @@ impl World {
         (up, bound)
     }
 
-    /// `vox forward <room> <host> <port>` from `dir`; returns it and the address it bound.
+    /// `vox forward <port>.<host>.<room>.vox` from `dir`; returns it and the address it bound.
     pub fn forward(&self, name: &str, dir: &Path) -> (VoxProc, SocketAddr) {
         self.forward_port(name, dir, self.service_port)
     }
 
-    /// [`World::forward`] to `port` on the host, which need not be a port it offers.
+    /// [`World::forward`] to the service named `port` on the host, which need not be one it
+    /// offers.
     pub fn forward_port(&self, name: &str, dir: &Path, port: u16) -> (VoxProc, SocketAddr) {
-        let mut fwd = VoxProc::spawn(
-            name,
-            dir,
-            &args(&[
-                "forward",
-                &self.room,
-                &self.host_fp,
-                &port.to_string(),
-                "127.0.0.1:0",
-                "--passphrase-file",
-                &self.passphrase_file(),
-                "--anchor",
-                &self.guest_anchor,
-                "--listen",
-                "127.0.0.1:0",
-            ]),
-        );
-        let line = fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
-        });
-        let bound = address_in(&mut fwd, &line, 1);
-        (fwd, bound)
+        self.forward_named(name, dir, &port.to_string())
     }
 }
 

@@ -50,7 +50,7 @@ async fn rooms_of(
     match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -235,7 +235,7 @@ pub(crate) async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Resul
     {
         Ok(Frame::Ok) => Ok(()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -287,7 +287,7 @@ async fn members_of(
     match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => Ok(members),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -601,7 +601,7 @@ pub async fn post_cmd(
         {
             Ok(Frame::Consents { outbound, inbound }) => (outbound, inbound),
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         // When each last posted as an agent: the room's structured posts, by author.
@@ -1180,7 +1180,7 @@ pub async fn order(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -1200,7 +1200,7 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -1377,7 +1377,7 @@ pub async fn tail(
                 Frame::Error { .. } if read_to.is_some() => {
                     coord::read_all(&mut lookup, channel_id, None).await?
                 }
-                other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+                other => return Err(crate::client::unexpected(&other)),
             };
             if let Some(r) = rows.last() {
                 read_to = Some(r.entry_hash);
@@ -1623,6 +1623,31 @@ fn outcome_json(o: Option<&Outcome>) -> serde_json::Value {
         Some(Outcome::Conflict { group }) => {
             serde_json::json!({"conflict": group.iter().map(claim::b32).collect::<Vec<_>>()})
         }
+    }
+}
+
+/// What a claim-protocol post did, as a sentence: never the outcome's debug form (R36).
+fn outcome_words(o: Option<&Outcome>) -> String {
+    match o {
+        None => "this node has not folded the post yet, so what it did is not known".into(),
+        Some(Outcome::Applied) => "it was applied".into(),
+        Some(Outcome::Lost) => {
+            "another session holds the resource, or it is reserved for someone else".into()
+        }
+        Some(Outcome::NoEffect(why)) => (*why).to_owned(),
+        Some(Outcome::Invalid(why)) => format!("the post was not valid: {why}"),
+        Some(Outcome::OtherVersion(s)) => format!(
+            "the post is stamped {}, a claim-protocol version this vox does not fold",
+            s.token()
+        ),
+        Some(Outcome::Duplicate { of }) => format!(
+            "it repeats post {}, which was already applied",
+            claim::b32(of)
+        ),
+        Some(Outcome::Conflict { group }) => format!(
+            "{} posts share its operation id and disagree, so none of them has any effect",
+            group.len()
+        ),
     }
 }
 
@@ -2004,7 +2029,7 @@ async fn agreement(
         {
             Ok(Frame::Agreement { report }) => report,
             Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-            Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
             Err(e) => return Err(AppError::Usage(e.to_string())),
         };
         // The node compared its posts as they were when it answered; these must be the same ones.
@@ -2100,7 +2125,13 @@ pub async fn release_resource(
     let (ok, said) = match &done.outcome {
         Some(Outcome::Applied) => (true, format!("released {resource}")),
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not released: {why}")),
-        other => (false, format!("{resource} was not released: {other:?}")),
+        other => (
+            false,
+            format!(
+                "{resource} was not released: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(&done, claim::RELEASE, resource, opts, ok, &said)
 }
@@ -2145,7 +2176,7 @@ pub async fn service_add(
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -2177,7 +2208,7 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot remove {tag:?}: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -2206,7 +2237,7 @@ pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
             "cannot list that room's services: {reason}"
         ))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -2275,7 +2306,10 @@ pub async fn handoff_resource(
         ),
         (Some(Outcome::Applied), _) => (true, format!("{resource} was handed off and has since moved on")),
         (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not handed off: {why}")),
-        (other, _) => (false, format!("{resource} was not handed off: {other:?}")),
+        (other, _) => (
+            false,
+            format!("{resource} was not handed off: {}", outcome_words(other.as_ref())),
+        ),
     };
     report(&done, claim::HANDOFF, resource, opts, ok, &said)
 }
@@ -2305,7 +2339,13 @@ pub async fn decline_resource(
     let (ok, said) = match &done.outcome {
         Some(Outcome::Applied) => (true, format!("declined {resource}; it is free")),
         Some(Outcome::NoEffect(why)) => (false, format!("{resource} was not declined: {why}")),
-        other => (false, format!("{resource} was not declined: {other:?}")),
+        other => (
+            false,
+            format!(
+                "{resource} was not declined: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(
         &done,
@@ -2378,7 +2418,13 @@ pub async fn renew_resource(
             format!("renewed {resource} until {}", millis_as_time(*e)),
         ),
         (Some(Outcome::NoEffect(why)), _) => (false, format!("{resource} was not renewed: {why}")),
-        (other, _) => (false, format!("{resource} was not renewed: {other:?}")),
+        (other, _) => (
+            false,
+            format!(
+                "{resource} was not renewed: {}",
+                outcome_words(other.as_ref())
+            ),
+        ),
     };
     report(&done, claim::RENEW, resource, opts, ok, &said)
 }
@@ -2412,7 +2458,7 @@ pub async fn board(
         {
             vox_core::node::ipc::Frame::Count { n, last } => (n, last),
             vox_core::node::ipc::Frame::Error { reason } => return Err(AppError::Usage(reason)),
-            other => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            other => return Err(crate::client::unexpected(&other)),
         }
     } else {
         (0, None)
@@ -2661,7 +2707,7 @@ pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Res
             // The message named a permission nobody can hold and an admin nobody has.
             return Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")));
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     }
 
@@ -2831,7 +2877,7 @@ pub async fn get_file(
     let rows = match client.read_rows(channel_id, None).await {
         Ok(Frame::Rows { rows }) => rows,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
@@ -3081,7 +3127,7 @@ async fn collect_offer(
                  may not have trusted this identity"
             )))
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
@@ -3478,7 +3524,7 @@ pub async fn join(
                 "this node already holds {name}; nothing was changed{}",
                 crate::tunnel_cli::join_detail(&reason)
             ))),
-            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => Err(crate::client::unexpected(&other)),
             Err(e) => Err(AppError::Usage(e.to_string())),
         };
     }
@@ -3508,7 +3554,7 @@ pub async fn join(
                 None => format!("cannot join: {reason}"),
             },
         )),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3582,9 +3628,7 @@ pub async fn create(
                             "the room was created, but its idle end was not set: {reason}"
                         )))
                     }
-                    Ok(other) => {
-                        return Err(AppError::Usage(format!("unexpected reply: {other:?}")))
-                    }
+                    Ok(other) => return Err(crate::client::unexpected(&other)),
                     Err(e) => return Err(AppError::Usage(e.to_string())),
                 }
             }
@@ -3592,7 +3636,7 @@ pub async fn create(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3678,7 +3722,7 @@ pub async fn retention(
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("cannot set retention: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3706,7 +3750,7 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3777,7 +3821,7 @@ pub async fn trust_add(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(e),
     }
 }
@@ -3796,7 +3840,7 @@ pub async fn trust_rename(
     let entries = match client.trusted("").await {
         Ok(Frame::Trusted { entries }) => entries,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let ids: Vec<Digest32> = entries.iter().map(|(id, _)| *id).collect();
@@ -3824,7 +3868,7 @@ pub async fn trust_rename(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(e),
     }
 }
@@ -3851,7 +3895,7 @@ pub async fn trust_remove(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(e),
     }
 }
@@ -3872,7 +3916,7 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3954,7 +3998,7 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(Frame::Error { reason }) => {
             Err(AppError::Usage(format!("{which} was not left: {reason}")))
         }
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -3977,7 +4021,7 @@ pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot end: {reason}"))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -4004,7 +4048,7 @@ pub async fn admin(
                 Ok(())
             }
             Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-            Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+            Ok(other) => Err(crate::client::unexpected(&other)),
             Err(e) => Err(AppError::Usage(e.to_string())),
         };
     }
@@ -4025,7 +4069,7 @@ pub async fn admin(
     let members = match client.request(&Request::Roster { channel_id }).await {
         Ok(Frame::Members { members }) => members,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     let member = resolve_prefix(member, &members)?;
@@ -4049,7 +4093,7 @@ pub async fn admin(
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!(
             "cannot {action} the admin: {reason}"
         ))),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }

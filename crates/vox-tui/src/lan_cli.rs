@@ -818,16 +818,19 @@ pub async fn up_held(
     let (mut stream, _) = vox_core::node::ipc::open_as(&held.at)
         .await
         .map_err(|e| crate::client::said(&held.at, e))?;
+    // Both paths are used by the daemon, whose working directory is not this command's: a
+    // relative one is made absolute here, where it was typed.
+    let absolute = |p: std::path::PathBuf| {
+        if p.is_absolute() {
+            p
+        } else {
+            std::env::current_dir().map_or(p.clone(), |d| d.join(&p))
+        }
+    };
     let request = LanRequest {
         channel_id,
-        helper: args.helper_socket.clone(),
-        stats_file: args.stats_file.clone().map(|p| {
-            if p.is_absolute() {
-                p
-            } else {
-                std::env::current_dir().map_or(p.clone(), |d| d.join(&p))
-            }
-        }),
+        helper: absolute(args.helper_socket.clone()),
+        stats_file: args.stats_file.clone().map(absolute),
         allow: args.allow.iter().copied().collect(),
     };
     vox_core::node::ipc::write_frame(&mut stream, &request.to_bytes()).await?;

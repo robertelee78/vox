@@ -55,6 +55,10 @@ where
                     crate::app::say(format_args!("vox: stopped by {}", signal.name()));
                     crate::app::say(format_args!("vox: stopping"));
                     Ok(())
+                } else if waiting.held() {
+                    // A held client (`vox up`, `vox forward`, `vox lan up`): stopped as a client
+                    // is, 128 + the signal's number, saying which signal (V210-108).
+                    Err(crate::app::AppError::stopped_by(signal))
                 } else {
                     Err(waiting.stopped_by(signal))
                 };
@@ -789,9 +793,9 @@ enum AgentCmd {
     /// no hook command and loads JavaScript plugins, so it gets a plugin file.
     ///
     /// ```text
-    /// vox agent plugin opencode > ~/.config/opencode/plugin/vox.js
-    /// vox agent plugin claude            # merge into ~/.claude/settings.json
-    /// vox agent plugin codex             # merge into Codex's hooks.json
+    /// vox agent plugin opencode --node opencode-mbp > ~/.config/opencode/plugin/vox.js
+    /// vox agent plugin claude --node claude-mbp   # merge into ~/.claude/settings.json
+    /// vox agent plugin codex --node codex-mbp     # merge into Codex's hooks.json
     /// ```
     ///
     /// The integration goes to stdout so it can be redirected or piped through
@@ -1636,25 +1640,32 @@ enum Cmd {
     ///
     /// Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Node(AnchorArgs),
-    /// Run this profile's node without a terminal, so agent sessions can attach
-    /// (ADR-020 §12).
+    /// Run this data root's daemon in the foreground: the machine's Vox presence, which the
+    /// nodes in this data root attach to (ADR-026).
     ///
-    /// The TUI is the only other thing that serves the agent-comms control socket,
-    /// and it needs a terminal and locks the node when that terminal goes away. A
-    /// `vox node` is an anchor: it holds no room and can read nothing. This is the
-    /// third shape — an unlocked node holding this profile's rooms, serving the
-    /// socket, with nothing attached to a tty.
+    /// There is one daemon per data root (`VOX_DATA_DIR`). It holds the one UDP port, the
+    /// control socket every other `vox` command talks to (`<data root>/.daemon/vox.sock`) and
+    /// the nodes that are attached. It is not a node itself and can run with none attached.
+    /// A node is an identity; while attached it runs in full, and it stops only when it is
+    /// detached (`vox node detach`) or the daemon stops.
     ///
-    /// At a terminal it asks for the identity passphrase, without echo, and serves once
-    /// it is typed. Otherwise it takes it from `VOX_IDENTITY_PASSPHRASE`, or
-    /// `--passphrase-file`, or stdin:
+    /// With `--node`, or when the data root holds exactly one node, that node is attached in
+    /// the foreground once its passphrase is given: from `--passphrase-file`, else
+    /// `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal without echo, else read from
+    /// stdin:
     ///
     /// ```text
-    /// echo 'my passphrase' | vox daemon
+    /// echo 'my passphrase' | vox daemon --node alice
     /// ```
     ///
-    /// Unlike the TUI it does not lock on SIGHUP: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each
-    /// stops it cleanly.
+    /// `--keep` attaches that node again whenever the daemon starts. When a daemon already runs
+    /// for this data root, a `vox daemon --node <name>` attaches the node to it instead.
+    ///
+    /// You rarely need to start it by hand: `vox serve`, `connect`, `up`, `forward`,
+    /// `lan up`, `vox node attach` and the TUI start one in the background when none runs, and
+    /// that one exits when it has no node and no client left. One started here runs until
+    /// stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each detaches every node cleanly
+    /// and stops it.
     Daemon(DaemonArgs),
     /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
     ///
@@ -1853,7 +1864,9 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let anchors = match args.anchor_set_lenient() {
+            // Of the node just resolved, which an empty data root makes: `paths()` would refuse to
+            // choose one there, and `vox node` must start (ADR-026 N-5).
+            let anchors = match args.anchor_set_lenient_at(&paths) {
                 Ok((a, None)) => a,
                 // An anchor may run with no anchor of its own, but it says why it has none.
                 Ok((a, Some(unusable))) => {
@@ -2325,6 +2338,11 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // An old layout moves first (ADR-026 F-3), as for every verb.
+            if let Err(e) = vox_core::node::layout::migrate(&account, Some(&node)) {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             let paths = match account.node_paths(&node) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2473,16 +2491,9 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let hook = format!("vox agent hook --node {node}");
             match args.harness.to_ascii_lowercase().as_str() {
                 "opencode" => {
-                    print!(
-                        "{}",
-                        crate::agent_hook::OPENCODE_PLUGIN.replace(
-                            "agent hook --format",
-                            &format!("agent hook --node {node} --format")
-                        )
-                    );
+                    print!("{}", crate::agent_hook::opencode_plugin(&node));
                     eprintln!(
                     "vox: save that as ${{XDG_CONFIG_HOME:-~/.config}}/opencode/plugin/vox.js, and install the skill \
                      beside it: {}\n     The plugin drains every room the node holds.",
@@ -2501,15 +2512,12 @@ pub fn run() -> ExitCode {
                     // `UserPromptSubmit` drains the room; `Stop` records that a turn ended, so an
                     // unread reply can be announced to an idle session; `SessionEnd` removes the
                     // session's registration (V030-20).
-                    print!(
-                        "{}",
-                        crate::agent_hook::CLAUDE_HOOKS
-                            .replace("\"vox agent hook\"", &format!("\"{hook}\""))
-                    );
+                    print!("{}", crate::agent_hook::claude_settings(&node));
                     eprintln!(
                         "vox: merge that into ~/.claude/settings.json (user scope, so a session \
-                     opened in any repository hears its rooms), and install the skill beside \
-                     it: {}\n     The hook drains every room the node holds.",
+                     opened in any repository hears its rooms; `env` names the node every `vox` \
+                     the agent runs acts as), and install the skill beside it: {}\n     The \
+                     hook drains every room the node holds.",
                         skill_install("claude", skill_dir("claude").unwrap_or_default())
                     );
                     ExitCode::SUCCESS
@@ -2518,15 +2526,12 @@ pub fn run() -> ExitCode {
                 // lists a bare `{ "command": … }` entry as no hook at all, so the room never
                 // drained (V210-169).
                 "codex" => {
-                    println!(
-                        "{{\n  \"hooks\": {{\n    \"UserPromptSubmit\": [\n      {{\n        \
-                     \"hooks\": [\n          {{ \"type\": \"command\", \"command\": \
-                     \"{hook}\", \"async\": false }}\n        ]\n      }}\n    ]\n  \
-                     }}\n}}"
-                    );
+                    print!("{}", crate::agent_hook::codex_hooks(&node));
                     eprintln!(
                     "vox: merge that into Codex's hooks.json, then run `vox agent trust codex` \
-                     — Codex runs a hook only once it is trusted.\n     `async` MUST be false: \
+                     — Codex runs a hook only once it is trusted.\n     Codex sets no \
+                     environment for its shell from here: pass `--node {node}` to every `vox` \
+                     the agent runs.\n     `async` MUST be false: \
                      an async hook's output is observed and discarded, so the room would \
                      drain into nothing.\n     The hook drains every room the node holds.\n     \
                      Vox never interrupts a Codex session: an urgent message to one waits \
@@ -2617,7 +2622,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let waiting = crate::tunnel_cli::Waiting::server();
+            let waiting = crate::tunnel_cli::Waiting::client();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
                 if args.passphrase.is_some() {
@@ -2669,7 +2674,7 @@ pub fn run() -> ExitCode {
                 .local
                 .clone()
                 .unwrap_or_else(|| "127.0.0.1:0".to_owned());
-            let waiting = crate::tunnel_cli::Waiting::server();
+            let waiting = crate::tunnel_cli::Waiting::client();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
                 crate::tunnel_cli::forward_named(
@@ -2704,7 +2709,7 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let waiting = crate::tunnel_cli::Waiting::server();
+            let waiting = crate::tunnel_cli::Waiting::client();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
                 crate::lan_cli::up_held(&paths, &a, &steps).await

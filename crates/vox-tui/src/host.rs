@@ -63,10 +63,6 @@ pub struct Defaults {
     pub listen: String,
     /// How long a node's stop may take before it is left (the daemon's shutdown patience).
     pub patience: Duration,
-    /// Also serve each attached node's own control socket (`nodes/<name>/node.sock`), as the
-    /// clients before ADR-026's account socket expect. **Interim**: removed once every client
-    /// speaks to the account socket (#406, ADR-026 C-1 says per-node sockets MUST NOT exist).
-    pub node_sockets: bool,
 }
 
 /// The daemon's router. Cheap to clone; every clone is the same router.
@@ -121,8 +117,6 @@ struct Attached {
     /// Turned `true` when its actor has ended, however.
     ended: watch::Receiver<bool>,
     fingerprint: Option<Digest32>,
-    /// The node's own control socket, while [`Defaults::node_sockets`] says to serve one.
-    _node_socket: Option<vox_core::node::ipc::IpcServer>,
 }
 
 /// How a node is wanted, and so how its attach counts.
@@ -727,7 +721,7 @@ impl Router {
                 },
                 other => failed(format!("could not unlock its identity: {other}")),
             };
-            stop_actor(&handle, ended.clone(), self.inner.defaults.patience).await;
+            stop_actor_fully(&handle, ended.clone()).await;
             return Err(refusal);
         }
         for line in rooms {
@@ -743,17 +737,6 @@ impl Router {
             self.inner.defaults.anchor_specs.clone(),
         );
         let fingerprint = handle.view().identity.map(|i| i.fingerprint);
-        let node_socket = if self.inner.defaults.node_sockets {
-            match vox_core::node::ipc::bind(handle.clone(), &paths) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    stop_actor(&handle, ended.clone(), self.inner.defaults.patience).await;
-                    return Err(failed(format!("control socket: {e}")));
-                }
-            }
-        } else {
-            None
-        };
         Ok(Box::new(Attached {
             handle,
             paths,
@@ -766,7 +749,6 @@ impl Router {
             detached: watch::channel(false).0,
             ended,
             fingerprint,
-            _node_socket: node_socket,
         }))
     }
 
@@ -809,7 +791,20 @@ impl Router {
         if let Some(tasks) = a.tasks.take() {
             tasks.stop().await;
         }
-        if !stop_actor(&a.handle, a.ended.clone(), self.inner.defaults.patience).await {
+        // **A detach is done only when the node's actor has ended** (ADR-026 L-3): its keys
+        // wiped, its store closed, its directory lock let go. A secret work still running (a room
+        // sealed, a passphrase derived) holds the actor's stop until it ends, and a detach that
+        // gave up after a patience freed the slot with the room's passphrase still in memory. So
+        // there is no cutoff here; the slot stays `Detaching`, an attach of the node waits for it,
+        // and the daemon answers every other request meanwhile. Only the daemon's own stop is
+        // bounded (S-1, V210-93): the process leaves then, and its memory with it.
+        let stopped = if matches!(cause, DetachCause::DaemonStopping) {
+            stop_actor(&a.handle, a.ended.clone(), self.inner.defaults.patience).await
+        } else {
+            stop_actor_fully(&a.handle, a.ended.clone()).await;
+            true
+        };
+        if !stopped {
             self.inner.unfinished_stop.store(true, Ordering::SeqCst);
         }
         let forget_keep = matches!(cause, DetachCause::Requested) && a.keep.is_some();
@@ -893,6 +888,14 @@ enum Step {
     WaitDetach(watch::Receiver<bool>),
     NotAttached,
     Mine(watch::Sender<Option<Result<(), Refusal>>>),
+}
+
+/// Stop a node's actor and wait for its task to end, however long what it is doing takes.
+async fn stop_actor_fully(handle: &NodeHandle, mut ended: watch::Receiver<bool>) {
+    if !*ended.borrow() {
+        let _ = handle.apply(NodeCommand::Shutdown).await;
+    }
+    let _ = ended.wait_for(|e| *e).await;
 }
 
 /// Stop a node's actor within `patience`, and wait (within it) for its task to end, so its store
@@ -1134,7 +1137,6 @@ mod tests {
                 anchor_specs: Vec::new(),
                 listen: String::new(),
                 patience: Duration::from_secs(5),
-                node_sockets: false,
             },
         )
     }

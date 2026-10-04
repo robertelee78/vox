@@ -24,6 +24,10 @@
 //!   `notify = off` (the node has no settings file of its own);
 //! - this build's `vox node` says the same anchor fingerprint for `anchor` and for `both-anchor`.
 //!
+//! A second test meets the same data root with **this build's `vox daemon`** first (ADR-026 §10
+//! proof 10, through the real daemon): it says it moved `default` and split `both`'s key, runs
+//! `default` as v0.2.9's identity with its room listed, and the rest is asserted as above.
+//!
 //! The previous release failing to stage the scene is `CANNOT MEASURE`.
 //!
 //! **Mutation.** The migration moving only directories with a vault: `anchor` stays where it was,
@@ -62,6 +66,9 @@ fn cmd(exe: &Path, root: &Root, profile: &str, argv: &[&str]) -> Command {
         .env("VOX_DATA_DIR", &root.data)
         .env("VOX_CONFIG_DIR", &root.cfg)
         .env("VOX_PROFILE", profile)
+        // This build names a node by `VOX_NODE` (ADR-026 C-3); the previous release reads only
+        // `VOX_PROFILE`.
+        .env("VOX_NODE", profile)
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ROOM_PASSPHRASE")
@@ -210,9 +217,33 @@ fn free_udp_port() -> u16 {
         .port()
 }
 
+/// Which command of this build meets the old data root first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum First {
+    /// `vox id`, a one-shot verb.
+    Id,
+    /// `vox daemon`, the account's daemon, which moves the data root under its lock at its start
+    /// (ADR-026 F-3, ADR-026 §10 proof 10).
+    Daemon,
+}
+
 #[test]
 #[ignore = "fetches the previous release and runs real daemons with production Argon2id; run it in release"]
 fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_settings() {
+    migrate(First::Id);
+}
+
+/// The same data root, met first by the account's daemon: it says what it moved, runs `default`
+/// as itself with v0.2.9's room listed, and everything lands where the verb's move puts it.
+/// Mutation: the daemon not moving the data root at its start (`migrate_held` skipped): `default`
+/// is a new identity and the room is gone.
+#[test]
+#[ignore = "fetches the previous release and runs real daemons with production Argon2id; run it in release"]
+fn the_daemon_moves_the_previous_releases_profiles_into_nodes() {
+    migrate(First::Daemon);
+}
+
+fn migrate(first: First) {
     watchdog::arm();
     let old = previous_release();
     let new = Path::new(VOX);
@@ -306,18 +337,33 @@ fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_sett
     );
 
     // ---- this build, first command: the data root moves ----
-    let (said, moved) = ok("PRODUCT", new, &root, "default", &["id"], "");
-    println!("[proof] this build's first `vox id` said:\n{moved}");
-    let got = said.lines().next().unwrap_or_default().trim().to_owned();
-    assert_eq!(
-        got, fp_default,
-        "PRODUCT: default's fingerprint changed across the move"
-    );
-    assert_eq!(
-        fingerprint("PRODUCT", new, &root, "both"),
-        fp_both,
-        "PRODUCT: both's vault fingerprint changed across the move"
-    );
+    if first == First::Id {
+        let (said, moved) = ok("PRODUCT", new, &root, "default", &["id"], "");
+        println!("[proof] this build's first `vox id` said:\n{moved}");
+        // Each move said once (#399): one line per directory, never two.
+        let told = |what: &str| moved.lines().filter(|l| l.contains(what)).count();
+        for (what, name) in [
+            ("/default to ", "default"),
+            ("/anchor to ", "anchor"),
+            ("/both to ", "both"),
+        ] {
+            assert_eq!(
+                told(what),
+                1,
+                "PRODUCT: `vox id` must say once that it moved {name}; it said:\n{moved}"
+            );
+        }
+        assert_eq!(
+            told("anchor key is now node both-anchor"),
+            1,
+            "PRODUCT: `vox id` must say once that both's anchor key became a node; it said:\n{moved}"
+        );
+        let got = said.lines().next().unwrap_or_default().trim().to_owned();
+        assert_eq!(
+            got, fp_default,
+            "PRODUCT: default's fingerprint changed across the move"
+        );
+    }
 
     // ---- its rooms and the account's settings ----
     let mut d = Proc::start(
@@ -326,20 +372,59 @@ fn profiles_of_the_previous_release_become_nodes_keeping_identity_rooms_and_sett
         "default",
         &[
             "daemon",
+            "--node",
+            "default",
             "--listen",
             "127.0.0.1:0",
             "--passphrase-file",
             &pass,
         ],
     );
-    d.wait_for("PRODUCT", "its control socket", |l| {
-        l.contains("control socket")
+    // The node is attached once the daemon says its identity: since ADR-026 the account's
+    // control socket is announced before the foreground node attaches.
+    d.wait_for("PRODUCT", "its identity", |l| {
+        l.starts_with("vox daemon: identity ")
     });
     let rooms = ok("PRODUCT", new, &root, "default", &["room", "list"], "").0;
     let notify = d.wait_for("PRODUCT", "that notifications are off", |l| {
         l.contains("notifications off")
     });
+    if first == First::Daemon {
+        // The daemon met the old layout first: it moved it, said so, and runs `default` as the
+        // identity v0.2.9 made.
+        let ran_as = d.wait_for("PRODUCT", "its identity", |l| {
+            l.starts_with("vox daemon: identity ")
+        });
+        let moved = d.wait_for("PRODUCT", "that it moved default", |l| {
+            l.starts_with("vox daemon: moved ") && l.ends_with("to node default")
+        });
+        let split = d.wait_for("PRODUCT", "that both's anchor key became a node", |l| {
+            l.contains("node both's anchor key is now node both-anchor")
+        });
+        println!("[proof] the daemon said: {moved} / {split} / {ran_as}");
+        // Each move said once (#399): by the daemon, in its words, not a second time beside it.
+        let all = d.said();
+        let count = |pred: &dyn Fn(&str) -> bool| all.lines().filter(|l| pred(l)).count();
+        let moves_of_default = count(&|l| l.contains("moved ") && l.contains("default"));
+        let splits = count(&|l| l.contains("anchor key is now node both-anchor"));
+        assert!(
+            moves_of_default == 1 && splits == 1,
+            "PRODUCT: every move must be said once; the daemon said the move of default \
+             {moves_of_default} times and the split of both {splits} times:\n{all}"
+        );
+        assert_eq!(
+            ran_as.trim_start_matches("vox daemon: identity ").trim(),
+            fp_default,
+            "PRODUCT: the daemon runs default as another identity than v0.2.9 made:\n{}",
+            d.said()
+        );
+    }
     d.stop();
+    assert_eq!(
+        fingerprint("PRODUCT", new, &root, "both"),
+        fp_both,
+        "PRODUCT: both's vault fingerprint changed across the move"
+    );
     println!("[proof] this build's daemon lists:\n{rooms}\nand says: {notify}");
     assert!(
         rooms.contains(&room),

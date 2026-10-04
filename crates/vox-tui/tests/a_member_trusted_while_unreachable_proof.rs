@@ -285,8 +285,7 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
             Some(bob_dir),
             Some(&bob_dir.join("cfg")),
         )
-        .expect("APPARATUS: bob's profile paths")
-        .socket_file();
+        .expect("APPARATUS: bob's profile paths");
         let carol = vox_core::node::link::b32_decode(&fps[2], "carol")
             .expect("PRODUCT (staging): carol's `vox id` printed no fingerprint");
         let sink = Arc::clone(&key_events);
@@ -297,7 +296,7 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
                 .build()
                 .expect("APPARATUS: a runtime for bob's event watch");
             rt.block_on(async move {
-                let Ok(mut c) = vox_core::node::ipc::IpcClient::open(&sock).await else {
+                let Ok(mut c) = world::attach::paths_client(&sock).await else {
                     return;
                 };
                 if c.subscribe().await.is_err() {

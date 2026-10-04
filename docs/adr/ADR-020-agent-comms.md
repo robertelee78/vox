@@ -5,7 +5,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Status**: Accepted. Built on integrate/v0.3.0, except where a requirement says **Not built**
 or **Planned**. **Decided 2026-10-03, not built (#397, ADR-026):** the account's one daemon hosts
 every node, an agent's hooks act only as their `--node`, and the control socket moves to
-`.daemon/vox.sock` (2.1, 6.10, 6.11, 7.4, 7.6–7.8, 8.5, 11.5 and §12 say how); until it is built,
+`.daemon/vox.sock` (6.11, 7.4, 7.6–7.8, 11.5 and §12 say how; 2.1, 6.10 and 8.5 are built); until it is built,
 each profile runs its own daemon and socket. The code is `crates/vox-agentcomms` (envelope, claims, operation ids, version
 gate), `crates/vox-tui/src/{agent_hook,wake,room_cli,coord,app,codex_trust}.rs` (the drain hook,
 the wake, the `vox room` and `vox agent` verbs, `vox daemon`), `crates/vox-tui/assets/agent-skill.md`
@@ -59,7 +59,7 @@ caps are the only loop guards that provably terminate.
 
 - **2.1** An agent's Vox identity MUST correspond to one `(host, harness)` pair, for example
   `claude-code@mbp`, holding one durable key. Its node is hosted by the system's daemon (§12,
-  ADR-016). *Decided, not built (ADR-026 N-6):* the skill pack's setup creates the agent's node
+  ADR-016). *Built (ADR-026 N-6; #405, #408):* the skill pack's setup creates the agent's node
   (`vox node create <harness>-<host>`) and installs its hooks as `vox agent hook --node <name>`; a
   hook MUST act only as that node, and MUST refuse without `--node`, never falling back to another
   node. An agent MUST NOT use a person's node: each agent is its own node, one per (host, harness).
@@ -228,7 +228,11 @@ they are not a defence against one that lies.
   - the cursor is per session, written after emitting, and moves only past what was shown;
   - a cursor the node no longer holds restarts from the room's first message and the injection MUST
     say so;
-  - a message whose body has not arrived ("not received yet") is not injected and is never a cursor.
+  - a message whose body has not arrived ("not received yet") is not injected and is never a cursor;
+  - coordination traffic not for this session (`status`, `hello`, `bye`, `working`, `blocked`,
+    `result`, `failed`, `accept`, `decline`, `ack`, the claim protocol, `ping`, `pong`) MUST be
+    counted in one line per room, not shown (V030-18): a `--type status` post is counted, not shown,
+    in the per-turn read. A row addressed to this node, or answering this session, is shown in full.
 - **6.7** The drain MUST skip a session's own posts only when both the author fingerprint and
   `from` match this session (ADR-021 §7, F8).
 - **6.8 (V030-15).** A wake MUST be an announce-only notice: how many urgent messages and replies
@@ -257,7 +261,7 @@ they are not a defence against one that lies.
 - **6.10** Idle comes from the harness: Claude Code's `Stop` hook records idle and `SessionEnd`
   removes the registration, both through `vox agent hook`, printing nothing; `UserPromptSubmit`
   records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook activity MUST count
-  as idle. *Decided, not built (ADR-026 L-2, L-3, D-3):* session registration and unregistration
+  as idle. *Built (ADR-026 L-2, L-3, D-3; #404, #405):* session registration and unregistration
   move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly. A
   registered session is a holder of its node; when `SessionEnd` unregisters the last holder of a node
   attached implicitly, the daemon detaches it, atomically with the unregister.
@@ -335,10 +339,11 @@ they are not a defence against one that lies.
   way Codex's "trust all" does (app-server `hooks/list`, then `config/batchWrite` of
   `trusted_hash`), and re-grant it when the entry changes. "Vox's entry" MUST be an exact grammar:
   bare `vox` or, as written and never resolved, the canonical path of this binary; then `agent
-  hook`; then only `--room`, `--session`, `--profile` (plain values) and `--format`; no shell
+  hook`; then exactly one `--node`, and only `--room`, `--session` (plain values) and `--format`
+  besides; no shell
   metacharacter. `--data-dir`/`--config-dir` MUST be refused. Another tool's entry, and an entry
   tampered into anything else, MUST be left untrusted. Not proved: that a trusted hook then fires in
-  a live Codex turn (#169). *Decided, not built (ADR-026):* `--node` replaces `--profile` in this
+  a live Codex turn (#169). *Built (ADR-026; #408):* `--node` replaces `--profile` in this
   grammar, and is required.
 
 ### 9. Flood and loop control

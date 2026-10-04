@@ -89,9 +89,9 @@ impl Account {
         )
     }
 
-    /// Make node `name` with an identity, as a person does: `vox --profile <name> id`.
+    /// Make node `name` with an identity, as a person does: `vox id --node <name>`.
     fn make_node(&self, name: &str) -> String {
-        let (ok, out, err) = self.run(&["id", "--profile", name], "");
+        let (ok, out, err) = self.run(&["id", "--node", name], "");
         assert!(ok, "APPARATUS: vox id for {name}: {out}{err}");
         out.trim().to_owned()
     }
@@ -210,7 +210,7 @@ fn make_room(a: &Account, node: &str) -> String {
         &[
             "room",
             "create",
-            "--profile",
+            "--node",
             node,
             "--passphrase-file",
             "-",
@@ -220,7 +220,7 @@ fn make_room(a: &Account, node: &str) -> String {
         ROOM_PASS,
     );
     assert!(ok, "APPARATUS: room create on {node}: {out}{err}");
-    let (ok, list, err) = a.run(&["room", "list", "--profile", node], "");
+    let (ok, list, err) = a.run(&["room", "list", "--node", node], "");
     assert!(ok, "APPARATUS: room list on {node}: {err}");
     list.lines()
         .find_map(|l| l.split_whitespace().next().map(str::to_owned))
@@ -256,7 +256,7 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
         &[
             "room",
             "post",
-            "--profile",
+            "--node",
             "a",
             &room,
             "this holds BOOM-MARKER",
@@ -269,13 +269,13 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
         Duration::from_secs(20),
         |l| l.starts_with("vox daemon: node a detached (its actor panicked"),
     );
-    let (b_ok, b_out, b_err) = a.run(&["room", "list", "--profile", "b"], "");
+    let (b_ok, b_out, b_err) = a.run(&["room", "list", "--node", "b"], "");
     assert!(
         b_ok,
         "PRODUCT: node b stopped answering after node a's panic: {b_out}{b_err}\ndaemon:\n{}",
         d.said()
     );
-    let (a_ok, _, _) = a.run(&["room", "list", "--profile", "a"], "");
+    let (a_ok, _, _) = a.run(&["room", "list", "--node", "a"], "");
     assert!(
         !a_ok,
         "PRODUCT: node a still answers after its actor panicked"
@@ -339,7 +339,7 @@ fn two_hooks_start_one_daemon_attach_once_and_the_last_end_detaches() {
             next.1,
             next.2
         );
-        let (ok, _, err) = a.run(&["room", "list", "--profile", "agent"], "");
+        let (ok, _, err) = a.run(&["room", "list", "--node", "agent"], "");
         assert!(
             ok,
             "PRODUCT: round {round}: the node is not attached with session s-2 registered: \
@@ -439,6 +439,179 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
     assert!(
         wait_until(Duration::from_secs(10), || !alive(pid)),
         "PRODUCT: the auto-started daemon with no node and no client did not exit\nlog:\n{}",
+        a.log()
+    );
+}
+
+/// ADR-026 D-2: a daemon runs with zero nodes. On an empty data root, `vox daemon` with stdin
+/// closed and no passphrase anywhere starts, asks for nothing, and answers on the account socket.
+#[test]
+#[ignore = "real binaries; run in release"]
+fn a_daemon_on_an_empty_root_starts_with_no_node() {
+    watchdog::arm();
+    let a = Account::new();
+    let out = a.data.with_extension("empty.out");
+    let f = std::fs::File::create(&out).unwrap();
+    let mut child = a
+        .cmd(&["daemon"])
+        .env_remove("VOX_IDENTITY_PASSPHRASE")
+        .stdin(Stdio::null())
+        .stdout(f.try_clone().unwrap())
+        .stderr(f)
+        .spawn()
+        .unwrap();
+    let said = || std::fs::read_to_string(&out).unwrap_or_default();
+    let up = wait_until(Duration::from_secs(20), || {
+        said().contains("vox daemon: control socket")
+    });
+    let exited = child.try_wait().ok().flatten();
+    assert!(
+        up && exited.is_none(),
+        "PRODUCT: on an empty data root `vox daemon` must start with no node (ADR-026 D-2); it \
+         exited {exited:?} saying:\n{}",
+        said()
+    );
+    // A client finds it answering on the account socket: `--detach` starts nothing when one
+    // answers.
+    let (ok, stdout, stderr) = a.run(&["daemon", "--detach"], "");
+    assert!(
+        ok && stdout.contains("already running"),
+        "PRODUCT: the daemon with no node does not answer on the account socket: \
+         {stdout}{stderr}\ndaemon:\n{}",
+        said()
+    );
+    assert!(
+        child.try_wait().ok().flatten().is_none(),
+        "PRODUCT: the daemon with no node stopped on its own:\n{}",
+        said()
+    );
+    stop_pid(child.id());
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "PRODUCT: the daemon with no node did not stop cleanly on SIGTERM ({status}):\n{}",
+        said()
+    );
+}
+
+/// ADR-026 L-3: a detach is done only when the node's keys are wiped and its directory let go.
+/// A room seal still working (staged to take 12 s) holds the node's stop; the last session's
+/// `SessionEnd`, which detaches the node, answers only after the seal ends, never at the daemon's
+/// 5 s stop patience, and the daemon answers other clients meanwhile.
+#[cfg(feature = "test-knobs")]
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn a_detach_answers_only_after_the_seal_in_flight_ends() {
+    const SEAL_MS: u64 = 12_000;
+    watchdog::arm();
+    let a = Account::new();
+    a.make_node("agent");
+    let knob = ("VOX_TEST_SECRET_WORK_DELAY_MS", SEAL_MS.to_string());
+    let run = |args: &[&str], stdin: &str| {
+        let mut child = a
+            .cmd(args)
+            .env(knob.0, &knob.1)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _ = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let hook = |event: &str| {
+        run(
+            &["agent", "hook", "--node", "agent"],
+            &format!(r#"{{"hook_event_name":"{event}","session_id":"s-1"}}"#),
+        )
+    };
+    // The session attaches the node (its unlock is held by the knob too).
+    let (ok, out, err) = hook("UserPromptSubmit");
+    assert!(
+        ok && !out.contains("could not read your rooms"),
+        "PRODUCT (staging): the hook did not attach its node: {out}{err}\nlog:\n{}",
+        a.log()
+    );
+    let pid = a
+        .lock_pid()
+        .expect("PRODUCT (staging): no daemon holds the lock");
+    std::thread::scope(|s| {
+        let seal = s.spawn(|| {
+            let r = run(
+                &[
+                    "room",
+                    "create",
+                    "--node",
+                    "agent",
+                    "--passphrase-file",
+                    "-",
+                    "--name",
+                    "r",
+                ],
+                ROOM_PASS,
+            );
+            (r, Instant::now())
+        });
+        // The seal has started.
+        std::thread::sleep(Duration::from_secs(1));
+        let t0 = Instant::now();
+        let probe = s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(500));
+            let t = Instant::now();
+            let r = a.run(&["daemon", "--detach"], "");
+            (r, t.elapsed())
+        });
+        let end = hook("SessionEnd");
+        let ended_at = Instant::now();
+        let took = t0.elapsed();
+        let ((created, made_at), (probe_r, probe_took)) =
+            (seal.join().unwrap(), probe.join().unwrap());
+        eprintln!(
+            "[proof] SessionEnd (the detach) answered after {:.2} s; the seal's room create ok={}; \
+             a client probe answered in {:.3} s; the create said {:?}",
+            took.as_secs_f64(),
+            created.0,
+            probe_took.as_secs_f64(),
+            created.2.trim()
+        );
+        assert!(
+            end.0,
+            "PRODUCT (staging): the SessionEnd hook failed: {end:?}"
+        );
+        assert!(
+            took >= Duration::from_millis(SEAL_MS - 3_000) && made_at <= ended_at,
+            "PRODUCT: the detach answered after {:.2} s, before the {} s seal in flight ended \
+             (room create ok={}), so the room's passphrase could still be in the daemon's memory \
+             (ADR-026 L-3)\nlog:\n{}",
+            took.as_secs_f64(),
+            SEAL_MS / 1000,
+            created.0,
+            a.log()
+        );
+        assert!(
+            probe_r.0
+                && probe_r.1.contains("already running")
+                && probe_took < Duration::from_secs(3),
+            "PRODUCT: while a node detached, the daemon stopped answering other clients: \
+             {probe_r:?} after {probe_took:?}"
+        );
+    });
+    assert!(
+        a.log()
+            .lines()
+            .any(|l| l.starts_with("vox daemon: node agent detached (its last holder went)")),
+        "PRODUCT: the detach was not said\nlog:\n{}",
+        a.log()
+    );
+    // Idle now: the daemon the hook started leaves.
+    assert!(
+        wait_until(Duration::from_secs(10), || !alive(pid)),
+        "PRODUCT: the daemon did not leave once idle\nlog:\n{}",
         a.log()
     );
 }

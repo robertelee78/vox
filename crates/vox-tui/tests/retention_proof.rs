@@ -34,6 +34,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -237,7 +240,9 @@ fn pair(tmp: &Path) -> (PathBuf, PathBuf) {
         fps.push(out.trim().to_owned());
     }
     for (dir, fp) in [(&a, &fps[1]), (&b, &fps[0])] {
-        let (ok, _, err) = vox(dir, &["trust", "add", fp, "--name", "peer"], None);
+        let (ok, _, err) = attach::Root::at(dir, IDENTITY).ensure("default", || {
+            vox(dir, &["trust", "add", fp, "--name", "peer"], None)
+        });
         assert!(ok, "PRODUCT (staging): vox trust add: {err}");
     }
     (a, b)
@@ -510,8 +515,7 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
         Some(alice.as_path()),
         Some(&alice.join("cfg")),
     )
-    .expect("APPARATUS: alice's profile paths")
-    .socket_file();
+    .expect("APPARATUS: alice's profile paths");
     let rendered = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     {
@@ -522,11 +526,9 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
                 .build()
                 .expect("APPARATUS: the subscriber's runtime");
             rt.block_on(async move {
-                let mut client = vox_core::node::ipc::IpcClient::open(&sock)
-                    .await
-                    .unwrap_or_else(|e| {
-                        panic!("PRODUCT (staging): alice's node refused the subscriber: {e}")
-                    });
+                let mut client = attach::paths_client(&sock).await.unwrap_or_else(|e| {
+                    panic!("PRODUCT (staging): alice's node refused the subscriber: {e}")
+                });
                 client.subscribe().await.unwrap_or_else(|e| {
                     panic!("PRODUCT (staging): alice's node refused the event subscription: {e}")
                 });

@@ -36,8 +36,11 @@
 //! answered, but not one payload byte peer to peer — or the emulator leaks and this proof reports
 //! APPARATUS.
 //!
-//! **The mutation that must turn it red:** drop the punch rung from `NodeNet::upgrade` (no
-//! coordinator is asked). The pair is answered over the circuit and never reaches a direct path.
+//! **The mutation that must turn it red:** no punch fires at all (`coordstream::execute_punch`
+//! returning at once). The pair is answered over the circuit and never reaches a direct path
+//! (measured: 10 of 10 never within 10 s, every request answered over the circuit in under
+//! 250 ms). Dropping only `NodeNet::upgrade`'s punch rung no longer does: the reach's own
+//! dial-back punch (`NodeNet::reach`) still takes the pair direct.
 //!
 //! **What it found.** On integrate/v0.2.10 39c3884 no sample ever punched: the anchor, on a
 //! dual-stack socket, reports the host's view of the guest as `::ffff:127.0.0.1:…`, and the host's
@@ -117,6 +120,19 @@ impl NatWorld {
         let anchor_port = free_in_both_families();
         let nats = TwoNats::start(kind, anchor_port);
         let advertise = format!("{},{}", nats.anchor_for_host, nats.anchor_for_guest);
+        // Each data root's node, made as a person makes one (ADR-026: every verb is a client of
+        // its data root's daemon, and a node exists before it is used).
+        for (dir, name) in [
+            (&anchor_dir, "anchor"),
+            (&host_dir, "default"),
+            (&guest_dir, "default"),
+        ] {
+            let (ok, out, err) = vox_once(dir, &args(&["node", "create", name]));
+            assert!(
+                ok,
+                "PRODUCT (staging): vox node create {name}: {out}\n{err}"
+            );
+        }
         let mut anchor = VoxProc::spawn_env(
             "anchor",
             &anchor_dir,
@@ -140,11 +156,6 @@ impl NatWorld {
         let (ok, host_fp, err) = vox_once(&host_dir, &args(&["id"]));
         let host_fp = host_fp.trim().to_owned();
         assert!(ok, "PRODUCT (staging): vox id (host): {err}");
-        let (ok, out, err) = vox_once(
-            &host_dir,
-            &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
-        );
-        assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
         let service_port = echo_service();
         let mut host = VoxProc::spawn(
             "host",
@@ -170,6 +181,12 @@ impl NatWorld {
             &host.expect_line("passphrase", |l| l.starts_with("passphrase ")),
             "passphrase",
         );
+        // Trusted through the host's daemon, which `vox serve` started.
+        let (ok, out, err) = vox_once(
+            &host_dir,
+            &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
+        );
+        assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
         let t0 = Instant::now();
         let (ok, out, err) = vox_once(
             &guest_dir,
@@ -208,6 +225,17 @@ impl NatWorld {
     }
 
     fn up(&self, name: &str) -> (VoxProc, SocketAddr, Instant) {
+        // **Cold: the guest's daemon starts afresh, on a port of its own, given explicitly**, so
+        // each sample is a new process behind a new NAT mapping. `vox up` is a client of the
+        // guest's daemon (ADR-026), so the one left from the join or the last sample is stopped
+        // first, and this `vox up` starts the next. Asked for port 0, a daemon binds the port its
+        // data root kept (V210-167, ADR-012 N-42): every sample then came from the same inside
+        // address as the join, so its NAT mapping — and the host NAT's filter for it — were the
+        // ones the join had already opened, the pair went direct with nothing dropped, and this
+        // proof's own check said the filter was not in the way. An explicit port is bound as given
+        // and not recorded.
+        stop_daemon(&self.guest_dir);
+        let listen = format!("[::1]:{}", fresh_v6_port());
         let mut up = VoxProc::spawn(
             name,
             &self.guest_dir,
@@ -221,7 +249,7 @@ impl NatWorld {
                 "--anchor",
                 &self.guest_spec,
                 "--listen",
-                "[::1]:0",
+                &listen,
             ]),
         );
         let line = up.expect_line("the proxy's bound address", |l| l.starts_with("vox up on "));
@@ -260,6 +288,53 @@ fn free_in_both_families() -> u16 {
         }
     }
     panic!("APPARATUS: no UDP port was free in both families in 64 tries");
+}
+
+/// Stop the daemon of the data root `dir`, if one runs: SIGTERM to the PID its lock names (a
+/// process this proof's own verbs started), then wait up to 15 s for the lock to be free.
+fn stop_daemon(dir: &std::path::Path) {
+    let lock = dir.join(".daemon/lock");
+    let Some(pid) = std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while alive() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !alive() || std::thread::panicking(),
+        "APPARATUS: the daemon of {} (pid {pid}) did not stop within 15 s",
+        dir.display()
+    );
+}
+
+impl Drop for NatWorld {
+    fn drop(&mut self) {
+        // The daemons the verbs started go with the world, by their own PIDs.
+        stop_daemon(&self.guest_dir);
+        stop_daemon(&self._tmp.path().join("host"));
+    }
+}
+
+/// A UDP port on `[::1]` free now, for one sample's `vox up`.
+fn fresh_v6_port() -> u16 {
+    UdpSocket::bind("[::1]:0")
+        .and_then(|s| s.local_addr())
+        .unwrap_or_else(|e| panic!("APPARATUS: bind a UDP socket on [::1]:0: {e}"))
+        .port()
 }
 
 fn interrupt(p: &mut VoxProc) {
@@ -423,7 +498,7 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
             },
             direct_at.map_or_else(|| "NEVER".to_owned(), |_| format!("{d:?}"))
         );
-        if direct_at.is_none() {
+        if direct_at.is_none() || filtered == 0 {
             // Say which side sent what, so a red names its cause rather than a timeout.
             let ev: Vec<_> = w
                 .nats
@@ -437,14 +512,19 @@ fn a_first_hole_punched_connection_completes_in_under_two_seconds() {
                     .count()
             };
             eprintln!(
-                "[proof] sample {i} never punched: host → guest {} delivered / {} dropped; guest → \
+                "[proof] sample {i} ({}): host → guest {} delivered / {} dropped; guest → \
                  host {} delivered / {} dropped",
+                if direct_at.is_none() {
+                    "never punched"
+                } else {
+                    "direct with nothing dropped"
+                },
                 count(true, true),
                 count(true, false),
                 count(false, true),
                 count(false, false)
             );
-            for e in ev.iter().take(12) {
+            for e in ev.iter().take(40) {
                 eprintln!(
                     "[proof]   +{:?} {} {} → {} {} ({} B)",
                     e.at.duration_since(ready),

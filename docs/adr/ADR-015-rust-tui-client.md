@@ -4,9 +4,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: implemented in part, `crates/vox-tui` on integrate/v0.3.0. The `vox` binary, its live TUI over
 the embedded node, the network verbs and install/update are built. Each requirement below is marked
-*Built* or *Planned*, or says which part is built. **Decided 2026-10-03, not built (#397, ADR-026):**
-the TUI and every verb become clients of the account's one daemon (1.2, 9.1, 9.4, 12.1, 16.4–16.6
-say how); until it is built the TUI embeds the node.
+*Built* or *Planned*, or says which part is built. Under ADR-026 every verb is a client of the
+account's one daemon (built); the TUI still embeds and locks its node (1.2, 11.2–11.3 and 9.1 are
+not built for it).
 **Date**: 2026-06-20
 **Deciders**: Robert E. Lee
 **Tags**: client, tui, rust, terminal, ratatui, verification, consent-ui, distribution
@@ -173,11 +173,11 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 11.2. Lock MUST zeroize the room SEKs, the in-memory identity root (generate path) and the decrypted
       view models, and MUST require the identity vault and each room's passphrase again. For a
       `gpg-agent` key, Vox MUST clear only its own derived material. *Built for the generate path.*
-      *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* 11.2–11.4 are removed: the TUI is a daemon client with no node
+      *Not built (ADR-026 N-2):* 11.2–11.4 are removed: the TUI is a daemon client with no node
       lock. A node's secrets are wiped when it detaches (ADR-026 L-3).
 11.3. The TUI MUST lock after 5 minutes idle (the default) and on `SIGHUP` or a dropped connection. The
       lock MUST be configurable, including off, with a direct warning. *The 5-minute idle lock, `:lock`
-      and `SIGHUP` are built; configuring them is planned.* *Decided, not built (ADR-026 N-2, ruling of 2026-10-03):* the idle lock, `:lock` and the
+      and `SIGHUP` are built; configuring them is planned.* *Not built (ADR-026 N-2):* the idle lock, `:lock` and the
       `SIGHUP` lock go; `SIGHUP` stops the TUI cleanly and leaves its node attached.
 11.4. The node MUST track every task it hands a signer handle to and abort them all when it locks,
       before it drops the prekey ring, so no task outlives the lock holding the identity. *Built
@@ -193,9 +193,9 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
 12.1. Paths MUST be XDG-conformant: data under `$XDG_DATA_HOME/vox/` (macOS: `~/Library/Application
       Support/vox`), with per-identity profiles in separate directories. Precedence MUST be CLI flags,
       then environment (`VOX_PROFILE`, `VOX_DATA_DIR`, `VOX_CONFIG_DIR`), then config, then defaults.
-      *Built, except the config file (12.4).* *Decided, not built (ADR-026 C-3, F-1):* `--profile`
-      and `VOX_PROFILE` are replaced by `--node` and `VOX_NODE`, with no alias; nodes live in
-      `<data root>/nodes/<name>/`.
+      *Built, except the config file (12.4).* `--profile` and `VOX_PROFILE` are replaced by
+      `--node` and `VOX_NODE`, with no alias; nodes live in `<data root>/nodes/<name>/` (ADR-026
+      C-3, F-1; `two_nodes_are_clients_of_one_daemon_proof`).
 12.2. Store files MUST be mode `0600` and directories `0700`. *Built.*
 12.3. Logs and panic reports MUST NOT contain plaintext, keys, passphrases or seeds. *Built for the UI
       types.*

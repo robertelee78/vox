@@ -293,7 +293,12 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     )
     .expect("APPARATUS: resolve a profile's paths");
     let mut reader = rt
-        .block_on(IpcClient::open(&bob_paths.socket_file()))
+        .block_on(IpcClient::open_at(
+            &vox_core::node::ipc::NodeSocket::one_shot(
+                bob_paths.account().socket(),
+                vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: a node name"),
+            ),
+        ))
         .expect("PRODUCT: attach to bob's node");
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms

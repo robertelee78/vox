@@ -356,7 +356,7 @@ impl NetPresence {
         Ok((
             endpoint,
             Some(format!(
-                "this node's port {port} is not free ({why}), so it listens on port {now} this run"
+                "port {port} is not free ({why}), so it listens on port {now} this run"
             )),
         ))
     }

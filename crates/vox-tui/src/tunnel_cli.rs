@@ -343,6 +343,10 @@ pub struct Waiting {
     /// A server's verb (`vox serve`): being stopped is how it ends, so a stop is a clean exit, not
     /// an error (V210-108).
     serves: bool,
+    /// A held client verb (`vox up`, `vox forward`, `vox lan up`): it runs until stopped too, but
+    /// it is a client, so a stop says `stopped by <SIGNAL>` and exits 128 + the signal's number
+    /// (V210-108).
+    held: bool,
 }
 
 impl Waiting {
@@ -356,7 +360,28 @@ impl Waiting {
             outcome,
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
             serves: false,
+            held: false,
         })
+    }
+
+    /// [`Waiting::new`] for a held client verb (`vox up`, `vox forward`, `vox lan up`): see
+    /// [`Waiting::held`].
+    #[must_use]
+    pub fn client() -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome: "it was running",
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: false,
+            held: true,
+        })
+    }
+
+    /// Whether this is a held client verb, whose stop is `stopped by <SIGNAL>`, 128 + n.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.held
     }
 
     /// [`Waiting::new`] for a server's verb, which runs until it is stopped: a stop is its normal
@@ -369,6 +394,7 @@ impl Waiting {
             outcome: "it was serving",
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
             serves: true,
+            held: false,
         })
     }
 
@@ -828,8 +854,12 @@ fn ok_or(reply: vox_core::error::Result<Frame>, doing: &str) -> Result<(), AppEr
     match reply {
         Ok(Frame::Ok) => Ok(()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("{doing}: {reason}"))),
+        Ok(Frame::NodeDetached { node }) => Err(AppError::Usage(format!(
+            "{doing}: node {node} was detached from the vox daemon while it waited"
+        ))),
         Ok(other) => Err(AppError::Usage(format!(
-            "{doing}: unexpected reply {other:?}"
+            "{doing}: {}",
+            crate::client::unexpected(&other)
         ))),
         Err(e) => Err(AppError::Usage(format!("{doing}: {e}"))),
     }
@@ -840,7 +870,7 @@ async fn room_ids(client: &mut IpcClient) -> Result<Vec<Digest32>, AppError> {
     match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => Ok(rooms.into_iter().map(|r| r.0).collect()),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
-        Ok(other) => Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
 }
@@ -967,7 +997,7 @@ pub async fn serve(
         Ok(Frame::Error { reason }) => {
             return Err(AppError::Usage(format!("cannot mint an address: {reason}")))
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     waiting.on("the vox daemon to stop");
@@ -1093,7 +1123,7 @@ pub async fn connect(
                 "node {node} was detached from the vox daemon while it joined"
             )))
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     }
     let channel_id = vox_core::node::link::InviteLink::parse(url)
@@ -1154,14 +1184,30 @@ pub async fn up(
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
     println!("Ctrl-C to stop");
     waiting.on("the vox daemon to stop");
+    // **What the node says about its reaches is said here too** (PRD-001 R23, R36): a path that
+    // stays relayed, a peer that cannot be reached, a refusal's reason. The proxy's own notes say
+    // which name matched nothing; the node's events say what happened to the connection it made.
+    let mut events = crate::client::events(&held.at).await.ok();
     let closed = crate::client::hold_until_closed(&mut held.client);
     tokio::pin!(closed);
     loop {
+        let event = async {
+            match events.as_mut() {
+                Some(e) => e.next().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             why = &mut closed => return Err(why),
             note = up.next_note() => match note {
                 Some(note) => eprintln!("vox: {note}"),
                 None => return Err((&mut closed).await),
+            },
+            ev = event => match ev {
+                Ok(Some(Frame::Event(ev))) => say_if_it_explains_a_failure(&ev),
+                Ok(Some(_)) => {}
+                // The subscription ends with the node; the holding connection says why.
+                Ok(None) | Err(_) => events = None,
             },
         }
     }
@@ -1176,7 +1222,7 @@ pub(crate) async fn open_named_room(
     let rooms = match client.rooms().await {
         Ok(Frame::Rooms { rooms }) => rooms,
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
     if rooms.is_empty() {
@@ -1260,10 +1306,16 @@ pub async fn forward_named(
                 },
             ));
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
-    eprintln!("vox: bound in {} ms", first_attempt.elapsed().as_millis());
+    // The daemon binds the forward only once it has reached the host (#215), so this is how long
+    // reaching it took: said as it always was, with the host and the one request it took.
+    eprintln!(
+        "vox: reached {} in {} ms (1 attempt)",
+        short(&host),
+        first_attempt.elapsed().as_millis()
+    );
     println!(
         "vox: forwarding {bound} to {service} on {name} ({})",
         short(&host)

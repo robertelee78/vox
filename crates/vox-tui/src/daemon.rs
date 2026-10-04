@@ -20,7 +20,7 @@ use vox_core::node::daemonipc::{
     AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, Refusal, UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
-use vox_core::node::paths::{Account, NodeName, DEFAULT_PROFILE};
+use vox_core::node::paths::{Account, NodeName};
 use zeroize::Zeroizing;
 
 use crate::app::{
@@ -151,17 +151,34 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 .map_err(|e| AppError::Usage(e.to_string()))?;
         }
     }
+    // **The daemon's one presence** (ADR-026 D-3, ADR-012 N-41–N-45): one socket and endpoint
+    // for every node it attaches, on the data root's kept port (`.daemon/port`), with the relay
+    // limits of `.daemon/config`.
+    let limits = vox_core::node::circuitstream::RelayLimits::read(&account.daemon_config_file())
+        .map_err(AppError::Usage)?;
+    let presence = rt
+        .block_on(async {
+            let (shared, moved) = vox_core::node::presence::NetPresence::bind_kept(
+                args.profile.listen,
+                &account.port_file(),
+                None,
+            )?;
+            if let Some(moved) = moved {
+                eprintln!("vox daemon: {moved}");
+            }
+            Ok::<_, vox_core::error::Error>(vox_core::node::presence::NetPresence::start(shared))
+        })
+        .map_err(|e| AppError::Usage(format!("listen on {}: {e}", args.profile.listen)))?;
+    presence.ledger().set_limits(limits);
     let router = Router::new(
         account.clone(),
         rt.handle().clone(),
         Defaults {
-            bind: listen_once(args.profile.listen),
+            bind: shared_presence(&presence),
             anchors,
             anchor_specs: args.profile.anchors.clone(),
             listen: args.profile.listen.to_string(),
             patience: shutdown_patience(),
-            // Every client speaks to the account socket (#406): no node serves one of its own.
-            node_sockets: false,
         },
     );
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
@@ -197,11 +214,22 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             if let Some(signal) = attach_foreground(args, &account, &rt, &mut stop, &router, node)?
             {
                 // A stop while it asked for a passphrase ends it at once, as it always has.
-                let _ = rt.block_on(tokio::time::timeout(shutdown_patience(), router.stop_all()));
+                // The timeout is made inside the runtime: built outside it, it panicked with "there
+                // is no reactor running", so a stop at the prompt crashed instead of stopping.
+                let _ = rt.block_on(async {
+                    tokio::time::timeout(shutdown_patience(), router.stop_all()).await
+                });
                 rt.shutdown_background();
                 say(format_args!("vox daemon: stopped by {}", signal.name()));
                 return Ok(());
             }
+        }
+        None if !args.as_detached && account.nodes_on_disk().is_empty() => {
+            eprintln!(
+                "vox daemon: no node here yet, so it runs with none; nodes attach to it as they \
+                 are made and used"
+            );
+            println!("vox daemon: control socket {}", account.socket().display());
         }
         None if !args.as_detached => {
             let nodes = account.nodes_on_disk();
@@ -248,7 +276,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             () = idle => None,
         }
     });
-    stop_daemon(rt, &router, signal)
+    stop_daemon(rt, &router, &presence, signal)
 }
 
 /// The node `vox daemon` was named (C-3's first step): `--node` / `VOX_NODE`, or a `--profile`
@@ -260,39 +288,26 @@ fn named_node(args: &DaemonArgs) -> Result<Option<NodeName>, AppError> {
         .transpose()
 }
 
-/// The foreground node (C-3): the named one, else the only node on disk, else `default` when
-/// there is none (its attach then says to make an identity), else none.
+/// The foreground node (C-3): the named one, else the only node on disk, else none. **A daemon
+/// runs with zero nodes** (ADR-026 D-2): an empty data root, or several nodes and none named,
+/// starts it with none, and nothing is asked for; a passphrase is read only for a node it attaches.
 fn resolve(account: &Account, named: Option<NodeName>) -> Option<NodeName> {
     if named.is_some() {
         return named;
     }
     let mut on_disk = account.nodes_on_disk();
     match on_disk.len() {
-        0 => NodeName::parse(DEFAULT_PROFILE).ok(),
         1 => on_disk.pop(),
         _ => None,
     }
 }
 
-/// Where each node binds: the daemon's `--listen` for the first node attached, and the same
-/// address on a port of its own for every later one. **Interim** until the daemon's one shared
-/// presence (ADR-026 D-3, #403) replaces it.
-fn listen_once(listen: std::net::SocketAddr) -> crate::host::BindFor {
-    let owner: Arc<Mutex<Option<NodeName>>> = Arc::default();
-    Arc::new(move |node: &NodeName| {
-        let mut o = owner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let addr = match o.as_ref() {
-            None => {
-                *o = Some(node.clone());
-                listen
-            }
-            Some(first) if first == node => listen,
-            Some(_) => std::net::SocketAddr::new(listen.ip(), 0),
-        };
-        Some(Bind::Addr(addr))
-    })
+/// Where each node binds: **the daemon's one presence**, for every node (ADR-026 D-3). Every
+/// attached node is answered at the same ip:port, by the identity exchange; none binds a socket of
+/// its own.
+fn shared_presence(presence: &Arc<vox_core::node::presence::NetPresence>) -> crate::host::BindFor {
+    let presence = Arc::clone(presence);
+    Arc::new(move |_: &NodeName| Some(Bind::Shared(Arc::clone(&presence))))
 }
 
 /// Write this daemon's pid into the lock file, so a person (or a proof) can see which process
@@ -325,6 +340,14 @@ fn attach_foreground(
     router: &Router,
     node: &NodeName,
 ) -> Result<Option<crate::app::StopSignal>, AppError> {
+    // Named and not here: refused before any passphrase is asked for.
+    if !account.nodes_on_disk().contains(node) {
+        return Err(AppError::Usage(format!(
+            "there is no node {node} here, so there is nothing to attach.\n\
+             \x20      Make one:  vox node create {node}\n\
+             \x20      Then start the daemon again."
+        )));
+    }
     let interactive = args.passphrase_file.is_none()
         && daemon_env_passphrase().is_none()
         && io::IsTerminal::is_terminal(&io::stdin());
@@ -421,6 +444,7 @@ fn refusal_words(r: &Refusal, account: &Account, node: &NodeName) -> String {
 fn stop_daemon(
     rt: tokio::runtime::Runtime,
     router: &Router,
+    presence: &vox_core::node::presence::NetPresence,
     signal: Option<crate::app::StopSignal>,
 ) -> Result<(), AppError> {
     let why = signal.map_or_else(|| "request".to_owned(), |s| s.name().to_owned());
@@ -429,9 +453,13 @@ fn stop_daemon(
     }
     let patience = shutdown_patience();
     let finished = rt.block_on(async {
-        tokio::time::timeout(patience + Duration::from_millis(500), router.stop_all())
-            .await
-            .unwrap_or(false)
+        let finished =
+            tokio::time::timeout(patience + Duration::from_millis(500), router.stop_all())
+                .await
+                .unwrap_or(false);
+        // Every node is detached: the presence goes, and with it the port mapping (N-43).
+        presence.close().await;
+        finished
     });
     // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync
     // session runs on one.
@@ -498,6 +526,35 @@ fn already_running(
         }
     };
     let socket = account.socket();
+    // **The daemon that holds the lock may not be serving yet** (D-1): daemons started together
+    // race, and the winner takes the lock before it binds the account socket. A loser waits for
+    // the socket to answer, as a client starting a daemon does (S-2), before handing its node
+    // over; it said "nothing is listening on the control socket" and exited.
+    let answering = rt.block_on(async {
+        let t0 = std::time::Instant::now();
+        loop {
+            if DaemonClient::open(&socket).await.is_ok() {
+                return true;
+            }
+            if t0.elapsed() >= crate::daemon_client::START_WITHIN {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    if !answering {
+        return Err(AppError::Refused {
+            code: 1,
+            message: format!(
+                "a daemon holds the account lock for {}, but nothing answered on {} within {} s; \
+                 its log is {}",
+                account.data_root.display(),
+                socket.display(),
+                crate::daemon_client::START_WITHIN.as_secs(),
+                account.log_file().display()
+            ),
+        });
+    }
     let held = rt.block_on(async {
         if let Some(keep) = keep_source(args) {
             let mut d = DaemonClient::open(&socket)
@@ -518,7 +575,7 @@ fn already_running(
                 DaemonFrame::Refused(r) => {
                     return Err(AppError::Usage(refusal_words(&r, account, &node)))
                 }
-                other => return Err(AppError::Usage(format!("unexpected answer: {other:?}"))),
+                other => return Err(crate::client::unexpected_daemon(&other)),
             }
         }
         let client = IpcClient::open_node(
