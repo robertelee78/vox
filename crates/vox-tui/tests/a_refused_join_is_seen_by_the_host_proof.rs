@@ -240,7 +240,7 @@ fn judge(red: &mut Vec<String>, where_: &str, text: &str, bob: &Person) {
     println!("[proof] {where_}: {line:?}");
     if line.is_empty() || !line.contains(&short) {
         red.push(format!(
-            "PRODUCT: {where_} does not say alice's node refused bob's join (wanted {SAID:?} \
+            "PRODUCT: {where_} does not say the host refused bob's join (wanted {SAID:?} \
              naming {short}): {text:?}"
         ));
     }
