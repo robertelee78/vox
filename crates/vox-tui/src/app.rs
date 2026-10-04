@@ -33,7 +33,6 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
-use vox_core::node::actor::Node;
 use vox_core::node::api::{NodeCommand, Secret};
 use vox_core::node::paths::Paths;
 
