@@ -139,21 +139,32 @@ impl Drop for Reaper {
     }
 }
 
+/// The pid of the daemon that holds data root `data`'s lock (the first token of
+/// `<data>/.daemon/lock`), or `None` when no daemon holds it. Since ADR-026 a held verb is a
+/// client: a proof that freezes or stops "the host" signals this pid, not the verb's own.
+pub fn daemon_pid(data: &Path) -> Option<u32> {
+    let path = daemon_lock(data);
+    let file = std::fs::File::open(&path).ok()?;
+    if lock_is_free(&file) {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|p| *p > 0)
+}
+
 /// **Crash** the daemon of data root `data`: SIGKILL to the pid in its held lock, and wait until the
 /// lock is free — a host machine losing power, where [`reap_daemon`] is a clean stop. Since
 /// ADR-026 a held verb (`vox serve`, `vox connect`, …) is a client, and stopping it leaves its
 /// node running in the daemon; a proof that means "the host went away" stops the daemon. Returns
 /// the pid it killed, if a daemon held the lock.
 pub fn kill_daemon(data: &Path) -> Option<i32> {
-    let path = daemon_lock(data);
-    let file = std::fs::File::open(&path).ok()?;
-    if lock_is_free(&file) {
-        return None;
-    }
-    let pid = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| t.split_whitespace().next()?.parse::<i32>().ok())
-        .and_then(rustix::process::Pid::from_raw)?;
+    let file = std::fs::File::open(daemon_lock(data)).ok()?;
+    let pid = daemon_pid(data).and_then(|p| rustix::process::Pid::from_raw(p.cast_signed()))?;
     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     let t0 = Instant::now();
     while t0.elapsed() < REAP_GRACE && !lock_is_free(&file) {

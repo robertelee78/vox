@@ -12,6 +12,11 @@
 //! guest's `vox forward` names the anchor through a port forward the proof owns
 //! (`support/port_forward.rs`) that holds every datagram towards the anchor for
 //! [`ANCHOR_DELAY`]: its anchor connection takes longer to come than its first reach does to begin.
+//! Under one daemon per data root (ADR-026) the join's daemon would still hold the guest's node,
+//! its anchor connection and its circuit to the host, so it is stopped by its pid first: the
+//! forward starts the daemon afresh and attaches a node that has nothing connected yet. And the
+//! guest's log holds the host's share before that (`vox service list`), or the forward would
+//! wait for a sync with a member, whose own reach brings the anchor connection up first.
 //!
 //! **Asserted.** The premise first: the forward's first reach found nobody to carry its circuit —
 //! it says it waited for a dial under way, or it says it could not reach the host because no peer
@@ -31,7 +36,9 @@
 //! **The mutations that must turn it red, as PRODUCT:** delete the wait for a dial under way in
 //! `NodeNet::reach_ladder` — the first attempt fails with nobody to carry it, and the forward reaches
 //! the host on its second; or make a circuit with no direct rung sit out the head start
-//! (`direct_failed` starting `false`) — the circuit is asked about 500 ms into the reach.
+//! (`direct_failed` starting `false`) — the circuit is asked about 500 ms into the reach; or ask
+//! the coordinator for this node's observed address inline, before the dial-back and the circuit
+//! are started (V030-22 as first written) — the circuit is asked one anchor round trip late.
 
 #![cfg(unix)]
 
@@ -63,6 +70,8 @@ const ANCHOR_DELAY: Duration = Duration::from_millis(100);
 /// How soon, once the anchor answered, a reach with no direct rung must ask it for a circuit. The
 /// head start it must not sit out is 500 ms; a prompt ask is a few ms.
 const ASK_WITHIN: u128 = 50;
+/// How long the guest's node, joined and running, may take to sync the host's share.
+const SHARE_SYNCED_WITHIN: Duration = Duration::from_secs(60);
 /// What a reach says when it fails for want of a helper.
 const NOBODY: &str = "no peer is connected to carry a circuit";
 
@@ -76,6 +85,43 @@ fn a_forward_whose_anchor_is_still_being_dialled_reaches_on_its_first_attempt() 
         ok,
         "CANNOT MEASURE: the guest could not join over the relay ({took:?}).\n{out}\n{err}"
     );
+    // `vox forward` resolves its name from the room's log first (V030-25): until the guest's log
+    // holds the host's share, it waits for a sync with a member, and that sync's own reach takes
+    // the anchor connection up before the forward's reach begins. So the share is synced while
+    // the join's daemon runs, as a person's node does once it has been in the room a moment.
+    // Attached for the whole wait, so one node syncs (a one-shot `vox service list` on its own
+    // would attach a fresh node for each look and detach it again).
+    world::attach::Root::at(&w.guest_dir, world::IDENTITY).attach(world::DEFAULT_NODE);
+    let listed = format!("  {}.", w.service);
+    let t0 = std::time::Instant::now();
+    let mut said = String::new();
+    while !said.contains(&listed) && t0.elapsed() < SHARE_SYNCED_WITHIN {
+        let (_, out, err) =
+            world::vox_once(&w.guest_dir, &world::args(&["service", "list", &w.room]));
+        said = format!("{out}{err}");
+        if !said.contains(&listed) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    // The guest's own node, joined and running, syncing its room: vox's step, so not reaching it
+    // is the product's (a reach that fails for want of a helper instead of waiting for the dial
+    // under way fails this sync too, and backs it off past the bound).
+    assert!(
+        said.contains(&listed),
+        "PRODUCT (staging): the guest's node, joined and running, never synced the host's share \
+         `{}` within {SHARE_SYNCED_WITHIN:?} (`vox service list`): {said}",
+        w.service
+    );
+    eprintln!(
+        "[proof] the guest's log held the host's share {:.1}s after its join",
+        t0.elapsed().as_secs_f64()
+    );
+    // The join's daemon still holds the guest's node, its anchor connection and the circuit to
+    // the host (ADR-026): a forward started now is a client of it and reaches in 0 ms, with
+    // nothing being dialled. Stopped by its pid, the forward below starts the guest's daemon
+    // afresh: the node it attaches holds the share already, so the forward reaches at once,
+    // while that node's dial to its anchor, through the slow path only, is still under way.
+    world::reap_daemon(&w.guest_dir);
     let slow = PortForward::start(SocketAddr::from(([127, 0, 0, 1], w.anchor.port())), true);
     slow.set_delay(ANCHOR_DELAY);
     let anchor_fp = w
@@ -160,8 +206,11 @@ fn a_forward_whose_anchor_is_still_being_dialled_reaches_on_its_first_attempt() 
     );
     assert!(
         asked.0 <= ASK_WITHIN,
-        "PRODUCT: with no direct rung, the reach sat out the direct head start before asking the \
-         anchor for its circuit ({} ms, over {ASK_WITHIN} ms): {}\nforward:\n{said}",
+        "PRODUCT: the reach asked the anchor for its circuit late, {} ms into the reach (over \
+         {ASK_WITHIN} ms): with no direct rung and its helper connected, the ask must come at once, \
+         not after anything the reach waits for first (the direct head start, or a round trip \
+         to the anchor such as the dial-back's ask for this node's observed address): {}\n\
+         forward:\n{said}",
         asked.0,
         asked.1
     );

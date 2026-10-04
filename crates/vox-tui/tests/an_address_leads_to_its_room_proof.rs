@@ -809,13 +809,30 @@ fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
         "address",
     );
     let passphrase = passphrase_of(&mut host);
+    // Every daemon this arm starts is stopped by its pid when it ends, however it ends.
+    let _reaper = world::Reaper(vec![
+        anchor_dir.clone(),
+        host_dir.clone(),
+        guest_dir.clone(),
+    ]);
     // The anchor takes the room — genesis, the host's bundle and its address record.
     std::thread::sleep(Duration::from_secs(3));
+    // `vox serve` is a client (ADR-026): the host's node runs in the host's daemon, which renews
+    // its address record and answers dials. Freezing `vox serve` froze neither, so the board
+    // still held the address and the host answered at once. The host is its daemon.
+    let pid = world::daemon_pid(&host_dir).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT (staging): `vox serve` printed its address but no daemon holds the host's \
+             data root.\nhost:\n{}",
+            host.transcript()
+        )
+    });
+    // The guest's node attached before the host is frozen, so its identity unlock (production
+    // Argon2id, in its daemon) is behind it and `vox connect` reads the board at once; `vox id`
+    // no longer unlocks, so it cannot time this.
     let t_unlock = Instant::now();
-    let (ok, _, err) = vox_once(&guest_dir, &args(&["id"]));
-    assert!(ok, "PRODUCT (staging): `vox id` (guest) failed: {err}");
+    world::attach::Root::at(&guest_dir, world::IDENTITY).attach(world::DEFAULT_NODE);
     let unlock = t_unlock.elapsed();
-    let pid = host.child.id();
     signal(pid, "STOP");
     // Past the record's 8 s life from its last renewal: the anchor's board holds no address for
     // the host, and still holds the room.
@@ -840,12 +857,12 @@ fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
             )
         })
     };
-    // Resumed once the guest has read the board: after its identity unlock (production Argon2id,
-    // timed on the guest's own `vox id` below, which unlocks the same way) and a margin. Resumed
-    // earlier, the host republishes its address before the guest reads the board, and the staging
-    // is lost (seen in debug, where the unlock takes 10 s and more). Its dial to the frozen host
-    // waits up to the 30 s a dial is given, so a later resume costs nothing but time.
-    std::thread::sleep(unlock.mul_f64(1.5) + Duration::from_millis(2500));
+    // Resumed once the guest has read the board, a margin after its `vox connect` began: its node
+    // is already attached, so nothing but the board read comes first. Resumed earlier, the host
+    // republishes its address before the guest reads the board, and the staging is lost. Its dial
+    // to the frozen host waits up to the 30 s a dial is given, so a later resume costs nothing but
+    // time.
+    std::thread::sleep(Duration::from_millis(2500));
     signal(pid, "CONT");
     let t = Instant::now();
     let (joined, out, err) = guest
@@ -853,9 +870,9 @@ fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
         .unwrap_or_else(|_| panic!("APPARATUS: the guest's `vox connect` thread panicked"));
     let steps: Vec<&str> = err.lines().filter(|l| l.contains("join got in")).collect();
     eprintln!(
-        "[proof] arm F: the host was frozen {:.1}s (the guest's unlock takes {:.1}s); the guest's \
-         join {} {:.2}s after it resumed; its steps: {steps:?}",
-        11.0 + unlock.mul_f64(1.5).as_secs_f64() + 2.5,
+        "[proof] arm F: the host's daemon was frozen {:.1}s (the guest's attach took {:.1}s); the \
+         guest's join {} {:.2}s after it resumed; its steps: {steps:?}",
+        11.0 + 2.5,
         unlock.as_secs_f64(),
         if joined { "got in" } else { "failed" },
         t.elapsed().as_secs_f64()
