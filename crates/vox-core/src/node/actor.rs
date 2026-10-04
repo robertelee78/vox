@@ -2068,6 +2068,12 @@ fn test_hold_room_from_anchors(me: &Digest32, channel_id: &Digest32) -> bool {
 #[cfg(feature = "test-knobs")]
 pub const TEST_SECRET_WORK_DELAY_ENV: &str = "VOX_TEST_SECRET_WORK_DELAY_MS";
 
+/// **For proofs only.** When set, every room this node reopens by itself at unlock fails to
+/// reopen, with the reason this says, so a proof can see that the reason is said (#412). Not
+/// compiled in without the `test-knobs` feature.
+#[cfg(feature = "test-knobs")]
+pub const TEST_REOPEN_FAILS_ENV: &str = "VOX_TEST_REOPEN_FAILS";
+
 /// Run `work`, which holds a secret, on a blocking thread, and hold a read guard of `secret_work`
 /// until it is done and its result handed over; `None` if the thread panicked.
 ///
@@ -12048,6 +12054,10 @@ impl Node {
                         Err(e) => return Err(Some(e.to_string())),
                     }
                     let sek = crate::atrest::sek::Sek::from_bytes(sek);
+                    #[cfg(feature = "test-knobs")]
+                    if let Ok(why) = std::env::var(TEST_REOPEN_FAILS_ENV) {
+                        return Err(Some(why));
+                    }
                     ChannelState::open_with_sek(&store, &id, sek, &passphrase, me, now)
                         .map_err(|e| Some(e.to_string()))
                 })

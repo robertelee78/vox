@@ -39,6 +39,9 @@ mod attach;
 #[path = "support/syscalls.rs"]
 mod syscalls;
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
+
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::UdpSocket;
@@ -142,7 +145,12 @@ fn daemon_given(
         .open(dir.join(format!("daemon-{tag}.err")))
         .expect("APPARATUS: open a log file");
     let listen = format!("127.0.0.1:{port}");
-    let mut cmd = command(dir, &["daemon", "--listen", &listen, "--anchor", anchor]);
+    // No anchor given ("") is a daemon with none, as a person runs one on its own.
+    let mut argv = vec!["daemon", "--listen", &listen];
+    if !anchor.is_empty() {
+        argv.extend(["--anchor", anchor]);
+    }
+    let mut cmd = command(dir, &argv);
     for (k, v) in extra {
         cmd.env(k, v);
     }
@@ -683,4 +691,64 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
         "PRODUCT: the host never read what alice posted once she joined the closed room again"
     );
     drop(alice_daemon);
+}
+
+/// **A room the daemon does not reopen says why** (#412): a remembered room whose reopen fails
+/// is held closed, and the daemon's log names it and what refused it — a closed room with no word
+/// was one nobody could tell how to get back. The failure is driven by `VOX_TEST_REOPEN_FAILS`
+/// (test-knobs only), which makes every reopen fail with the reason it carries. Mutation: the note
+/// not sent; the room is closed and the log silent.
+#[test]
+#[ignore = "a real vox daemon, production Argon2id; CI runs it in release"]
+fn a_room_that_does_not_reopen_says_why() {
+    test_knobs::require(&["VOX_TEST_REOPEN_FAILS"]);
+    watchdog::arm_for_debug_total(Duration::from_millis(300_000), 2);
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let alice = tmp.path().join("alice");
+    std::fs::create_dir_all(alice.join("cfg")).expect("APPARATUS: create a staging directory");
+    let (ok, _, err) = vox(&alice, &["id"], None);
+    assert!(ok, "PRODUCT (staging): vox id: {err}");
+    let port = free_udp_port();
+    let first = daemon(&alice, port, "", "alice", &[]);
+    attached(&alice, "alice");
+    let (ok, _, err) = vox(
+        &alice,
+        &["room", "create", "--passphrase-file", "-", "--name", "r"],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): vox room create: {err}");
+    let room = attached(&alice, "alice")
+        .split_whitespace()
+        .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(str::to_owned)
+        .expect("PRODUCT (staging): no room id in alice's `room list`");
+    drop(first);
+
+    let why = "the test knob refused it";
+    let knob = std::path::PathBuf::from(why);
+    let _second = daemon(
+        &alice,
+        port,
+        "",
+        "alice",
+        &[("VOX_TEST_REOPEN_FAILS", &knob)],
+    );
+    let listed = attached(&alice, "alice");
+    let said = std::fs::read_to_string(alice.join("daemon-alice.err")).unwrap_or_default();
+    let note = said
+        .lines()
+        .find(|l| l.contains("did not reopen") && l.contains(&room[..12]))
+        .map(str::to_owned);
+    println!(
+        "[proof] the room is listed closed: {}; the daemon said: {note:?}",
+        listed.contains("[closed]")
+    );
+    assert!(
+        listed.contains("[closed]"),
+        "PRODUCT (staging): the room reopened although its reopen was made to fail:\n{listed}"
+    );
+    assert!(
+        note.as_deref().is_some_and(|n| n.contains(why)),
+        "PRODUCT: a room that did not reopen was not named in the daemon's log with why:\n{said}"
+    );
 }
