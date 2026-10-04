@@ -976,14 +976,37 @@ impl DaemonClient {
     /// greeting, greets with another protocol, or greets with something that is not a daemon's
     /// hello (a node of protocol 8 or before).
     pub async fn open(path: &std::path::Path) -> Result<Self> {
+        Self::open_noting(path, None).await
+    }
+
+    /// [`DaemonClient::open`], calling `waiting` once if the daemon has not greeted within
+    /// [`crate::node::profile::LOCK_PATIENCE`], so the caller can say so where its user will see it.
+    ///
+    /// **A wait for the daemon is never silent** (V210-100, ADR-026): a daemon busy migrating or
+    /// attaching a node, or one stopped (Ctrl-Z), takes the connection and greets only when it can;
+    /// a client that waited with nothing on the screen looked hung, for up to
+    /// [`crate::node::ipc::ANSWER_WITHIN`].
+    ///
+    /// # Errors
+    /// As [`DaemonClient::open`].
+    pub async fn open_noting(path: &std::path::Path, waiting: Option<fn()>) -> Result<Self> {
         use crate::error::IpcHandshake;
         use crate::node::ipc::{connect_own, read_frame, silent, ANSWER_WITHIN, PROTOCOL_VERSION};
-        let (stream, hello) = tokio::time::timeout(ANSWER_WITHIN, async {
+        let greeted = tokio::time::timeout(ANSWER_WITHIN, async {
             let mut stream = connect_own(path).await?;
             let hello = read_frame(&mut stream).await?;
             Ok::<_, Error>((stream, hello))
-        })
-        .await
+        });
+        tokio::pin!(greeted);
+        let (stream, hello) = tokio::select! {
+            out = &mut greeted => out,
+            () = tokio::time::sleep(crate::node::profile::LOCK_PATIENCE), if waiting.is_some() => {
+                if let Some(say) = waiting {
+                    say();
+                }
+                greeted.await
+            }
+        }
         .map_err(|_| silent())??;
         let Some(hello) = hello else {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
