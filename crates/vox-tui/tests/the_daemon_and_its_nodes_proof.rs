@@ -422,14 +422,46 @@ fn a_kept_node_and_its_room_come_back_after_a_restart() {
 fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
     watchdog::arm();
     let a = Account::new();
+    // **Both clients start a daemon, and one start loses** (D-1): each daemon holds the lock 1.5 s
+    // before it serves (a test knob), so both clients find no socket and start one, and the
+    // loser's daemon exits saying another is running while the winner serves nothing yet. The
+    // losing client must wait for the winner's socket (S-2), not report a failed start. Unstaged,
+    // the winner bound its socket before the loser looked, and a client that gave up passed.
+    let start = || {
+        let out = a
+            .cmd(&["daemon", "--detach"])
+            .env("VOX_TEST_DAEMON_SERVE_DELAY_MS", "1500")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: spawn vox daemon --detach: {e}"));
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let barrier = std::sync::Barrier::new(2);
     let (one, two) = std::thread::scope(|s| {
-        let one = s.spawn(|| a.run(&["daemon", "--detach"], ""));
-        let two = s.spawn(|| a.run(&["daemon", "--detach"], ""));
+        let one = s.spawn(|| {
+            barrier.wait();
+            start()
+        });
+        let two = s.spawn(|| {
+            barrier.wait();
+            start()
+        });
         (one.join().unwrap(), two.join().unwrap())
     });
     assert!(
         one.0 && two.0,
-        "PRODUCT: a client's start failed: {one:?} {two:?}\nlog:\n{}",
+        "PRODUCT: two clients started a daemon together and one start lost the lock; that client \
+         must wait for the winner's socket (ADR-026 S-2), not fail: {one:?} {two:?}\nlog:\n{}",
+        a.log()
+    );
+    assert!(
+        a.log().contains("a daemon is already running"),
+        "CANNOT MEASURE: no daemon start lost the race (both clients found a socket, or only one \
+         started a daemon), so a losing client's wait was not exercised: {one:?} {two:?}\nlog:\n{}",
         a.log()
     );
     let pid = a.lock_pid().expect("PRODUCT: no daemon holds the lock");

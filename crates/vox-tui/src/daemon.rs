@@ -316,6 +316,14 @@ pub(crate) fn take_account(
             patience: shutdown_patience(),
         },
     );
+    // Staged in proofs only: the window in which a daemon holds the lock and serves nothing yet.
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_SERVE_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms).min(TEST_SERVE_DELAY_MAX));
+    }
     // Unlike the TUI, a failure here is fatal: serving this socket is the whole job.
     let socket = rt
         .block_on(async {
@@ -383,6 +391,19 @@ fn shared_presence(presence: &Arc<vox_core::node::presence::NetPresence>) -> cra
     let presence = Arc::clone(presence);
     Arc::new(move |_: &NodeName| Some(Bind::Shared(Arc::clone(&presence))))
 }
+
+/// The test-only variable that holds a daemon between taking the account lock and serving the
+/// account socket, in milliseconds. **Test-only: for proofs; no shipped build reads it**
+/// (V210-105). Daemons started together race, and the winner takes the lock before it binds the
+/// socket (D-1); a proof stages that window wide, so a client whose own start lost the race is
+/// seen waiting for the winner's socket (S-2) every time, not by chance. At most
+/// [`TEST_SERVE_DELAY_MAX`], well inside a client's start bound.
+#[cfg(feature = "test-knobs")]
+const TEST_SERVE_DELAY_ENV: &str = "VOX_TEST_DAEMON_SERVE_DELAY_MS";
+
+/// The longest [`TEST_SERVE_DELAY_ENV`] holds a daemon.
+#[cfg(feature = "test-knobs")]
+const TEST_SERVE_DELAY_MAX: Duration = Duration::from_secs(5);
 
 /// Write this daemon's pid into the lock file, so a person (or a proof) can see which process
 /// holds it.
