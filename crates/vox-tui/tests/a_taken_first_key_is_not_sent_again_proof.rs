@@ -423,7 +423,7 @@ fn taken_first_key_after(halt: Halt) {
     drop(conn);
     drop(endpoint);
     stop(victim, halt);
-    let _victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
+    let mut victim = daemon("victim", &victim_dir, &victim_listen, &spec, &pass_file);
     let (_endpoint, conn) = connect(&rt);
     let after = answer_as_mallory(&rt, Arc::clone(&conn), Instant::now());
     std::thread::sleep(WATCH);
@@ -472,7 +472,8 @@ fn taken_first_key_after(halt: Halt) {
         owed >= 1,
         "PRODUCT (staging): a key the restarted victim owed mallory (it re-trusted her) did not reach \
          her within {FIRST_KEY_WITHIN:?}, so its key-delivery path never reached her and \"no key \
-         sent again\" measures nothing"
+         sent again\" measures nothing. The restarted victim's daemon said:\n{}",
+        victim.transcript()
     );
     drop(anchor.child.kill());
 }
