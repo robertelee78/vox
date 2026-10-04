@@ -42,8 +42,15 @@ pub async fn ensure_daemon(
     anchors: &[String],
 ) -> Result<Daemon, AppError> {
     let socket = account.socket();
-    if DaemonClient::open(&socket).await.is_ok() {
-        return Ok(Daemon::Running);
+    match DaemonClient::open_noting(&socket, Some(crate::client::say_daemon_waiting)).await {
+        Ok(_) => return Ok(Daemon::Running),
+        // **A daemon that took the connection and has not greeted is running**: busy, or stopped
+        // (Ctrl-Z). Starting another would only meet its lock (D-1) and wait out the start bound
+        // silently; this says what it is, and how to go on.
+        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Silent { .. })) => {
+            return Err(AppError::Usage(format!("{e}")))
+        }
+        Err(_) => {}
     }
     let log_path = account.log_file();
     vox_core::node::paths::create_private_dir(&account.daemon_dir())

@@ -32,14 +32,16 @@ import os, signal, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, is_attached, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, TAG, MODE, HOLDER = sys.argv[1:8]
 HOLDER = int(HOLDER)
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
 TUI_NOTICE = "waiting: another vox holds this profile open"
 CLI_ONLY = ("vox: waiting", "resume it", "Ctrl-Z")
-CLI_WAITING = "vox: waiting: another vox holds this profile open"
+# What `vox tui` says on the terminal, before it takes the screen, while the daemon has not greeted
+# it (ADR-026: the daemon is moving or attaching the node).
+CLI_WAITING = "vox: waiting: the vox daemon here has not answered yet"
 PAIRS = {"│": "│", "┌": "┐", "└": "┘"}
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -88,8 +90,9 @@ try:
     answered = ("another vox created", "done", "unlocked", "holds this profile", "error",
                 "wrong", "could not")
     if MODE == "startup":
-        # The holder has the profile before this TUI opens it, so the TUI waits at its start,
-        # before it takes the screen: the wait is said as a CLI verb says it, on the terminal.
+        # The holder is the daemon, stopped while it moves and attaches the node: the TUI waits for
+        # its greeting at its start, before it takes the screen, and says so as a CLI verb does, on
+        # the terminal.
         stage("wait at start-up")
         t0 = time.time()
         if tui.until(lambda: CLI_WAITING in tui.text(), 15, step=0.2):
@@ -99,20 +102,23 @@ try:
             print(f"{TAG} NOTICE none: {tui.text().strip()[:300]}")
         stage("resume the holder")
         resume()
-        if not tui.until(lambda: "unlock" in tui.text().lower(), 120):
-            print(f"{TAG} RED: PRODUCT: the TUI never showed its unlock prompt:\n{tui.text()}")
+        # Its node attached by the daemon already, or attaching: the TUI uses it, or asks for its
+        # passphrase once (ADR-026 N-2).
+        if not tui.until(lambda: "attach node" in tui.text().lower() or is_attached(status()), 120):
+            print(f"{TAG} RED: PRODUCT: the TUI never showed its node, nor asked to attach it:\n"
+                  f"{tui.text()}")
             sys.exit(1)
         tui.pump(1)
         check_screen()
-        stage("unlock")
-        before = status()
-        tui.key(IDPASS + "\r", 0.5)
-        if tui.until(lambda: status() != before and any(w in status() for w in answered), 180):
+        if "attach node" in tui.text().lower():
+            stage("attach")
+            tui.key(IDPASS + "\r", 0.5)
+        if tui.until(lambda: is_attached(status()), 180):
             code = 0
             print(f"{TAG} AFTER: {status()}")
         else:
             code = 1
-            print(f"{TAG} RED: PRODUCT: no answer to the unlock; the screen:\n{tui.text()}")
+            print(f"{TAG} RED: PRODUCT: its node never showed attached; the screen:\n{tui.text()}")
     else:
         stage("prompt")
         if not tui.until(lambda: "create identity" in tui.text().lower(), 60):

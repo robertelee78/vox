@@ -42,7 +42,8 @@ def is_attached(text):
     `node <name>  ·  attached: …`, where a node not attached reads `node <name> (not attached)`.
     There is no locked state any more (N-2): this is what "unlocked" was."""
     import re
-    return re.search(r"node [a-z0-9._-]+  ·  attached: ", text) is not None
+    # Any run of spaces: a driver may read the status bar with its spacing collapsed.
+    return re.search(r"node [a-z0-9._-]+\s+·\s+attached: ", text) is not None
 
 
 class Hung(Exception):

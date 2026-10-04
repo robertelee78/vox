@@ -461,7 +461,7 @@ pub(crate) fn test_pause(env: &str, what: &str) {
 pub const PROFILE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a vox waits for another one's profile lock before saying that it is waiting.
-const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+pub const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Take the profile directory's lock before opening its store, and hold it for as long as the
 /// store is open (V210-100). **Every vox that opens a profile's store takes it first**: a
