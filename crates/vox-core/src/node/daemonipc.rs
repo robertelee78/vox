@@ -389,8 +389,10 @@ pub enum DaemonFrame {
     Refused(Refusal),
     /// The nodes a [`DaemonRequest::Nodes`] asked for.
     Nodes(Vec<NodeInfo>),
-    /// The node a [`DaemonRequest::Attach`] attached.
-    Attached(NodeInfo),
+    /// The node a [`DaemonRequest::Attach`] attached, and what attaching it said when this request
+    /// attached it (a skipped anchors line, a node carrying on with no anchor), for the client to
+    /// print in the person's own terminal (PRD-001 R23, R36). Empty when it was attached already.
+    Attached(NodeInfo, Vec<String>),
     /// A daemon request succeeded and carries nothing further.
     Ok,
     /// What a [`DaemonRequest::SessionEnd`] did: whether the session was registered, and whether
@@ -828,9 +830,10 @@ impl DaemonFrame {
                 e.array(2).uint(T_NODES);
                 put_infos(&mut e, v);
             }
-            DaemonFrame::Attached(i) => {
-                e.array(2).uint(T_ATTACHED_INFO);
+            DaemonFrame::Attached(i, notes) => {
+                e.array(3).uint(T_ATTACHED_INFO);
                 put_info(&mut e, i);
+                put_texts(&mut e, notes);
             }
             DaemonFrame::Ok => {
                 e.array(1).uint(T_DAEMON_OK);
@@ -903,7 +906,9 @@ impl DaemonFrame {
             },
             (T_REFUSED, 2) => DaemonFrame::Refused(refusal(&mut d)?),
             (T_NODES, 2) => DaemonFrame::Nodes(infos(&mut d)?),
-            (T_ATTACHED_INFO, 2) => DaemonFrame::Attached(info(&mut d)?),
+            (T_ATTACHED_INFO, 3) => {
+                DaemonFrame::Attached(info(&mut d)?, texts(&mut d, "ipc attached notes")?)
+            }
             (T_DAEMON_OK, 1) => DaemonFrame::Ok,
             (T_SESSION_ENDED, 3) => DaemonFrame::SessionEnded {
                 was_registered: flag(&mut d, "ipc session ended registered")?,
@@ -1221,7 +1226,8 @@ mod tests {
                 info("a", NodeState::Detached),
                 info("b", NodeState::Detaching),
             ]),
-            DaemonFrame::Attached(info("a", NodeState::Attached)),
+            DaemonFrame::Attached(info("a", NodeState::Attached), Vec::new()),
+            DaemonFrame::Attached(info("a", NodeState::Attached), vec!["a note".into()]),
             DaemonFrame::Ok,
             DaemonFrame::SessionEnded {
                 was_registered: true,

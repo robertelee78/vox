@@ -329,6 +329,12 @@ impl DaemonCore {
         };
         match opened {
             Ok(Ok(conn)) => {
+                // What attaching the node said (a skipped anchors line, carrying on with no
+                // anchor), in the TUI's notice line: the daemon writes it only to its log (R23).
+                let notes = conn.client.attach_notes().to_vec();
+                if !notes.is_empty() {
+                    self.notice = Some(notes.join("; "));
+                }
                 self.conn = Some(conn);
                 self.has_identity = true;
                 self.asked = None;

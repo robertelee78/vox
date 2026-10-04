@@ -302,11 +302,28 @@ impl Router {
         rooms: Vec<Zeroizing<String>>,
         anchors: Vec<String>,
     ) -> Result<NodeInfo, Refusal> {
+        self.attach_noting(node, passphrase, keep, rooms, anchors)
+            .await
+            .map(|(info, _)| info)
+    }
+
+    /// [`Self::attach`], with what attaching the node said when this call attached it.
+    ///
+    /// # Errors
+    /// As [`Self::attach`].
+    pub async fn attach_noting(
+        &self,
+        node: &NodeName,
+        passphrase: Option<Zeroizing<String>>,
+        keep: Option<KeepSource>,
+        rooms: Vec<Zeroizing<String>>,
+        anchors: Vec<String>,
+    ) -> Result<(NodeInfo, Vec<String>), Refusal> {
         let g = self
             .want(node, Want::Explicit(keep), passphrase, rooms, anchors)
             .await?;
         self.write_attach_file(None);
-        Ok(g.info)
+        Ok((g.info, g.notes))
     }
 
     /// Grant a connection's `Use` (C-2), attaching the node implicitly when the `Use` holds it.
@@ -1098,8 +1115,11 @@ impl Dispatch for Router {
                 keep,
                 rooms,
                 anchors,
-            } => match self.attach(&node, passphrase, keep, rooms, anchors).await {
-                Ok(info) => DaemonFrame::Attached(info),
+            } => match self
+                .attach_noting(&node, passphrase, keep, rooms, anchors)
+                .await
+            {
+                Ok((info, notes)) => DaemonFrame::Attached(info, notes),
                 Err(r) => refused(r),
             },
             DaemonRequest::Detach { node } => {
@@ -1129,7 +1149,7 @@ impl Dispatch for Router {
                     .session_register(&node, record, passphrase, anchors)
                     .await
                 {
-                    Ok(info) => DaemonFrame::Attached(info),
+                    Ok(info) => DaemonFrame::Attached(info, Vec::new()),
                     Err(r) => refused(r),
                 }
             }
