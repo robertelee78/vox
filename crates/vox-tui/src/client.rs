@@ -455,7 +455,15 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
              here.\n\x20      Run `vox id` again to see the identity it made."
                 .into(),
         )),
-        Err(e) => Err(e.into()),
+        // Said as the node said it when it made identities itself: the identity file, the store,
+        // or another vox holding the node, in plain words with what to do — never the raw path
+        // error ("profile path write the identity file: …").
+        Err(e) => match vox_core::node::actor::fault_of(&e) {
+            f @ (vox_core::node::api::Fault::IdentityFileUnwritable
+            | vox_core::node::api::Fault::Storage
+            | vox_core::node::api::Fault::ProfileBusy) => Err(AppError::Usage(f.to_string())),
+            _ => Err(e.into()),
+        },
     }
 }
 
