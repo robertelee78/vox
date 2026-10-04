@@ -365,7 +365,8 @@ impl ForwardedWorld {
     /// used, and the world is not the one its proofs measure (V210-105).
     pub fn new(forward_open: bool) -> Self {
         use crate::world::{
-            after_label, args, echo_service, fingerprint, mkdir, vox_once, VoxProc,
+            after_label, args, echo_service, fingerprint, mkdir, vox_once, vox_once_attached,
+            VoxProc,
         };
         crate::test_knobs::require(&["VOX_TEST_ADVERTISE"]);
         let tmp = crate::world::tempdir();
@@ -381,7 +382,7 @@ impl ForwardedWorld {
 
         let guest_fp = fingerprint(&guest_dir, "guest");
         let host_fp = fingerprint(&host_dir, "host");
-        let (ok, out, err) = vox_once(
+        let (ok, out, err) = vox_once_attached(
             &host_dir,
             &args(&["trust", "add", &guest_fp, "--name", "the guest"]),
         );

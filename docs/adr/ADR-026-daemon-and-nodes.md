@@ -199,7 +199,8 @@ network presence from the start: there is no interim design with one socket per 
   ```
 - **F-2.** A node's setting MUST be read from `nodes/<name>/config/<file>`; when that file is missing,
   from the same file in the account's config directory. The daemon's own settings (listen, metrics,
-  relay limits) MUST be read from `.daemon/config`.
+  relay limits) MUST be read from `.daemon/config`; the relay limits are `relay-circuits` and
+  `relay-circuits-per-asker` (ADR-012 N-45).
 - **F-3. Migration** MUST run on the first start of the new daemon, and MUST land before the daemon
   split, on its own:
   - every `<data root>/<name>/` holding `vault.cbor`, `node-identity.key` or `store.redb` MUST move to

@@ -309,6 +309,9 @@ fine, sans anchor".
   R33).
   - The daemon MUST keep one relay circuit ledger, and the relay limits (`MAX_RELAYED_CIRCUITS`,
     `MAX_CIRCUITS_PER_ASKER`) MUST apply per daemon, configured in `.daemon/config`.
+  - `.daemon/config` MUST name them `relay-circuits = N` and `relay-circuits-per-asker = N`
+    (defaults 64 and 4 when absent); a value that is not a whole number MUST stop the daemon with
+    an error naming the key.
   - Boards MUST be per node: each node keeps its own board store, with its own capacities.
 - **N-46.** Each attached node MUST publish its own address record, naming the daemon's shared
   ip:port. Nodes on one machine are therefore visibly co-hosted (an accepted cost, ADR-026).

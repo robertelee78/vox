@@ -929,7 +929,8 @@ fn an_agent_wake_is_attributed_and_claims_and_loops_are_bounded() {
         alice,
         "alice-s",
         r,
-        &["--type", "status"],
+        // An `ask`, shown in full; a `status` is counted, not shown (V030-18).
+        &["--type", "ask"],
         "SANITIZE-MARKER",
     );
     until(

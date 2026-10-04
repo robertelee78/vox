@@ -204,7 +204,7 @@ pub async fn share(
                 "cannot offer port {tag}: {reason}"
             )))
         }
-        Ok(other) => return Err(AppError::Usage(format!("unexpected reply: {other:?}"))),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     }
     let env = {
