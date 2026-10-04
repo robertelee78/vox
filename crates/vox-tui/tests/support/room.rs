@@ -200,7 +200,31 @@ impl Worker {
         self.vox_bin_env(bin, session, &[], args, stdin)
     }
 
+    /// As a person runs it since ADR-026 L-2: a verb that needs this worker's node attached, run
+    /// while no daemon holds its data root, runs with the node attached by `vox node attach` and
+    /// let go after.
     fn vox_bin_env(
+        &self,
+        bin: &str,
+        session: Option<&str>,
+        env: &[(&str, &str)],
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Out {
+        match attach::needs(&self.data, args).filter(|_| bin == VOX) {
+            Some(node) => attach::Root {
+                data: self.data.clone(),
+                cfg: self.cfg.clone(),
+                passphrase: ID_PASS.to_owned(),
+            }
+            .attached(&node, || {
+                self.vox_bin_env_plain(bin, session, env, args, stdin)
+            }),
+            None => self.vox_bin_env_plain(bin, session, env, args, stdin),
+        }
+    }
+
+    fn vox_bin_env_plain(
         &self,
         bin: &str,
         session: Option<&str>,

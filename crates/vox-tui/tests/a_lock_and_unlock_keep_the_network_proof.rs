@@ -28,6 +28,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
@@ -61,7 +64,19 @@ impl Drop for Daemon {
     }
 }
 
-fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
+fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let verb: Vec<&str> = args.to_vec();
+    match attach::needs(dir, &verb) {
+        Some(node) => {
+            attach::Root::at(dir, IDENTITY).attached(&node, || vox_plain(dir, args, stdin))
+        }
+        None => vox_plain(dir, args, stdin),
+    }
+}
+
+fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
     cmd.args(args)
         .env("VOX_DATA_DIR", dir)

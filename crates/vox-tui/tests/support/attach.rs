@@ -204,3 +204,27 @@ pub async fn paths_client(
         Err(e) => Err(format!("the daemon's socket did not answer: {e}")),
     }
 }
+
+/// The verbs that refuse a node no daemon holds (ADR-026 L-2, ruled).
+pub const NEEDS_ATTACHED: &[&str] = &[
+    "room", "trust", "status", "service", "share", "app", "tunnel", "doctor",
+];
+
+/// The node to attach before running `argv` in data root `data` the way a person must since
+/// ADR-026 L-2 — its `--node`, else `default` — or `None`: the verb needs no attached node, a daemon
+/// already holds the root, or there is no such node (the verb then says so itself).
+pub fn needs(data: &Path, argv: &[&str]) -> Option<String> {
+    if !argv.first().is_some_and(|v| NEEDS_ATTACHED.contains(v)) {
+        return None;
+    }
+    let root = Root::at(data, "");
+    if root.daemon_running() {
+        return None;
+    }
+    let node = argv
+        .windows(2)
+        .find(|w| w[0] == "--node")
+        .map_or("default", |w| w[1])
+        .to_owned();
+    data.join("nodes").join(&node).exists().then_some(node)
+}

@@ -192,7 +192,19 @@ const BOUND: Duration = Duration::from_secs(8);
 /// red says how late each read was, or that it never came.
 const WATCH: Duration = Duration::from_secs(16);
 
+/// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no
+/// daemon holds the data root, runs with the node attached by `vox node attach` and let go after.
 fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+    let verb: Vec<&str> = args.to_vec();
+    match world::attach::needs(dir, &verb) {
+        Some(node) => {
+            world::attach::Root::at(dir, IDPASS).attached(&node, || vox_plain(dir, args, stdin))
+        }
+        None => vox_plain(dir, args, stdin),
+    }
+}
+
+fn vox_plain(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(VOX)
         .args(args)
         .env("VOX_DATA_DIR", dir)
