@@ -194,10 +194,14 @@ pub fn resolve_node(
     if let Some(name) = named.map(str::trim).filter(|n| !n.is_empty()) {
         return NodeName::parse(name);
     }
-    if let [only] = attached_now(account).as_slice() {
+    // An anchor's headless node is no person's or agent's: it holds no room and reads nothing, so
+    // a verb acting as a node never picks it unnamed (ADR-026 N-5).
+    let person = |n: &NodeName| !is_headless(account, n);
+    let attached: Vec<NodeName> = attached_now(account).into_iter().filter(person).collect();
+    if let [only] = attached.as_slice() {
         return Ok(only.clone());
     }
-    let on_disk = account.nodes_on_disk();
+    let on_disk: Vec<NodeName> = account.nodes_on_disk().into_iter().filter(person).collect();
     match on_disk.as_slice() {
         [only] => Ok(only.clone()),
         [] if creates => NodeName::parse(DEFAULT_PROFILE),
@@ -215,6 +219,13 @@ pub fn resolve_node(
     }
 }
 
+/// Whether `node` is headless: a key file and no vault, an anchor's.
+fn is_headless(account: &Account, node: &NodeName) -> bool {
+    let dir = account.node_dir(node);
+    !dir.join(vox_core::node::paths::VAULT_FILE).is_file()
+        && dir.join(vox_core::node::headless::IDENTITY_FILE).is_file()
+}
+
 /// The node `vox node` runs as an anchor (ADR-026 N-5, C-3 for an anchor): the one named; else the
 /// only headless node on disk, the one an earlier `vox node` made; else the only node on disk
 /// (whose anchor key is then `<name>-anchor`, beside a vault); else `default` on an empty data
@@ -227,11 +238,7 @@ pub fn anchor_paths_of(args: &NodeArgs) -> vox_core::error::Result<Paths> {
     let headless: Vec<NodeName> = account
         .nodes_on_disk()
         .into_iter()
-        .filter(|n| {
-            let dir = account.node_dir(n);
-            !dir.join(vox_core::node::paths::VAULT_FILE).is_file()
-                && dir.join(vox_core::node::headless::IDENTITY_FILE).is_file()
-        })
+        .filter(|n| is_headless(&account, n))
         .collect();
     let name = match (args.node.as_deref().map(str::trim), headless.as_slice()) {
         (Some(n), _) if !n.is_empty() => NodeName::parse(n)?,
@@ -455,8 +462,7 @@ async fn identity_for_attach(
 }
 
 /// The passphrase an existing node is attached with: given (`--identity-passphrase-file`,
-/// `VOX_IDENTITY_PASSPHRASE`), else asked at a terminal, else none — the empty passphrase a node
-/// made without one opens with (V030-36); for any other the daemon's refusal says it was wrong.
+/// `VOX_IDENTITY_PASSPHRASE`), else asked at a terminal, else refused, saying how to give one.
 ///
 /// # Errors
 /// The refused flag, or a file that cannot be read.
@@ -467,10 +473,9 @@ pub fn attach_passphrase(
     if let Some(p) = crate::tunnel_cli::identity_passphrase_given(flag, file)? {
         return Ok(Zeroizing::new(p));
     }
-    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return crate::tunnel_cli::ask_identity_passphrase().map(Zeroizing::new);
-    }
-    Ok(Zeroizing::new(String::new()))
+    // Asked at a terminal; with none, refused at once saying how to give it (V210-165). An
+    // identity made with no passphrase is given one as an empty file or an empty variable.
+    crate::tunnel_cli::ask_identity_passphrase().map(Zeroizing::new)
 }
 
 /// Create a node's identity in its directory (C-5): the vault and the store, sealed under

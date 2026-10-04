@@ -2546,6 +2546,15 @@ pub fn run() -> ExitCode {
         // is offered again whenever the node attaches (V030-06), and the room it is offered in is
         // one the node holds open. Nothing here opens a room or asks for a passphrase.
         Cmd::Service(sub) => {
+            let given = match &sub {
+                ServiceCmd::Add(a) => a.room.passphrase.as_ref(),
+                ServiceCmd::Remove(r) => r.room.passphrase.as_ref(),
+                ServiceCmd::List(_) => None,
+            };
+            if let Err(e) = crate::tunnel_cli::refuse_disclosed_room_passphrase(given) {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             let profile = match &sub {
                 ServiceCmd::Add(a) => &a.room.profile,
                 ServiceCmd::Remove(r) => &r.room.profile,
@@ -2606,6 +2615,12 @@ pub fn run() -> ExitCode {
         // owner check is the boundary.
         Cmd::Trust(sub) => run_trust_over_socket(sub),
         Cmd::Up(args) => {
+            if let Err(e) =
+                crate::tunnel_cli::refuse_disclosed_room_passphrase(args.passphrase.as_ref())
+            {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             let paths = match args.profile.paths() {
                 Ok(p) => p,
                 Err(e) => {
@@ -2616,13 +2631,6 @@ pub fn run() -> ExitCode {
             let waiting = crate::tunnel_cli::Waiting::server();
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
-                if args.passphrase.is_some() {
-                    return Err(AppError::Usage(format!(
-                        "--passphrase is refused: a command line is readable by every process on \
-                         this machine. {}",
-                        crate::tunnel_cli::GIVE_ROOM_PASSPHRASE
-                    )));
-                }
                 let room_pp = match &args.passphrase_file {
                     Some(f) => {
                         let text = crate::tunnel_cli::passphrase_file_text(f)?;
@@ -2687,6 +2695,12 @@ pub fn run() -> ExitCode {
             }
         },
         Cmd::Lan(LanCmd::Up(a)) => {
+            if let Err(e) =
+                crate::tunnel_cli::refuse_disclosed_room_passphrase(a.room.passphrase.as_ref())
+            {
+                eprintln!("vox: {e}");
+                return ExitCode::FAILURE;
+            }
             // Asked before the node is touched: without a helper nothing here can work, and a
             // refusal should leave nothing behind.
             if !crate::lan_cli::helper_reachable(&a.helper_socket) {
