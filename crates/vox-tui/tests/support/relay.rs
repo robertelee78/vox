@@ -478,15 +478,11 @@ impl RelayWorld {
 
     fn spawn_forward(&mut self, spec: &str, extra: &[&str]) -> SocketAddr {
         let listen = self.guest_net().0;
-        let passphrase_file = self.passphrase_file();
+        let name = self.hostname();
         let mut list = vec![
             "forward",
-            &self.room,
-            &self.host_fp,
-            &self.service,
+            &name,
             "127.0.0.1:0",
-            "--passphrase-file",
-            &passphrase_file,
             "--anchor",
             spec,
             "--listen",
@@ -498,9 +494,9 @@ impl RelayWorld {
         }
         let mut fwd = VoxProc::spawn("forward", &self.guest_dir, &args(&list));
         let line = fwd.expect_line("the forward's bound address", |l| {
-            l.starts_with("vox: 127.0.0.1:") && l.contains('→')
+            l.starts_with("vox: forwarding 127.0.0.1:")
         });
-        let at = address_in(&mut fwd, &line, 1);
+        let at = address_in(&mut fwd, &line, 2);
         self.fwd = Some(fwd);
         at
     }
