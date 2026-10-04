@@ -178,12 +178,12 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
                             ],
                         )
                     };
-                    // Checked either way: made, or — with a 0 s window and four checks racing,
-                    // one passing may not restart the window for another — refused after its
-                    // passphrase was checked. Anything else is not the load this proof needs.
+                    // Made, every time: the right passphrase was given. A refusal here ("needs
+                    // your identity passphrase again") is a check that passed and did not count —
+                    // two checks racing to restart the window — a lost event, PRODUCT.
                     assert!(
-                        o.ok || o.stderr.contains("needs your identity passphrase again"),
-                        "PRODUCT (staging): a checked keyring change: {o:?}"
+                        o.ok,
+                        "PRODUCT: a keyring change given the right passphrase was refused: {o:?}"
                     );
                     add = !add;
                     checks.fetch_add(1, Ordering::SeqCst);

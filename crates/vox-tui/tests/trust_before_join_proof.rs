@@ -43,6 +43,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -95,7 +98,26 @@ impl Member {
             .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: a non-UTF-8 temp path"))
     }
 
+    /// A verb as a person runs it since ADR-026 L-2: one that needs this member's node attached,
+    /// run while no daemon holds its data root, runs with the node attached by `vox node attach`
+    /// and let go after.
     fn vox(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+        match attach::needs(&self.data, args) {
+            Some(node) => {
+                let pass = std::fs::read_to_string(&self.pass)
+                    .unwrap_or_else(|e| panic!("APPARATUS: read {}: {e}", self.pass.display()));
+                attach::Root {
+                    data: self.data.clone(),
+                    cfg: self.cfg.clone(),
+                    passphrase: pass.lines().next().unwrap_or_default().to_owned(),
+                }
+                .attached(&node, || self.vox_plain(args, stdin))
+            }
+            None => self.vox_plain(args, stdin),
+        }
+    }
+
+    fn vox_plain(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
         let mut cmd = Command::new(VOX);
         cmd.args(args)
             .env("VOX_DATA_DIR", &self.data)
