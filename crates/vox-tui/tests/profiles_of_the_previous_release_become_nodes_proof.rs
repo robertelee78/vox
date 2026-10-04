@@ -65,7 +65,9 @@ fn cmd(exe: &Path, root: &Root, profile: &str, argv: &[&str]) -> Command {
     c.args(argv)
         .env("VOX_DATA_DIR", &root.data)
         .env("VOX_CONFIG_DIR", &root.cfg)
+        // v0.2.9 names its profile by VOX_PROFILE; this build names its node by VOX_NODE.
         .env("VOX_PROFILE", profile)
+        .env("VOX_NODE", profile)
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ROOM_PASSPHRASE")

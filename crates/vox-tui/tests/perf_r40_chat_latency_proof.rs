@@ -40,6 +40,9 @@ optional_proof::not_run!(r40_a_message_between_two_online_nodes_arrives_in_under
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/attach.rs"]
+mod attach;
+
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -299,7 +302,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     )
     .expect("APPARATUS: resolve a profile's paths");
     let mut reader = rt
-        .block_on(IpcClient::open(&bob_paths.socket_file()))
+        .block_on(attach::paths_client(&bob_paths))
         .expect("PRODUCT: attach to bob's node");
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms

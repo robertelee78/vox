@@ -114,6 +114,16 @@ impl Root {
         out
     }
 
+    /// Run `f`, a one-shot verb, with `node` attached: as it is when a daemon already holds this
+    /// data root (the proof's own `vox daemon`), else attached for it and let go after.
+    pub fn ensure<T>(&self, node: &str, f: impl FnOnce() -> T) -> T {
+        if self.daemon_running() {
+            f()
+        } else {
+            self.attached(node, f)
+        }
+    }
+
     /// Whether a process holds the data root's daemon lock.
     pub fn daemon_running(&self) -> bool {
         let Ok(file) = std::fs::File::open(self.data.join(".daemon").join("lock")) else {
@@ -127,5 +137,70 @@ impl Root {
             Err(std::fs::TryLockError::WouldBlock) => true,
             Err(std::fs::TryLockError::Error(_)) => false,
         }
+    }
+}
+
+/// The data root's account socket (`<data>/.daemon/vox.sock`, or the short fallback a long path
+/// takes), as the shipped client computes it: every client reaches a node through it since the
+/// per-node socket went (ADR-026 C-1, C-2).
+pub fn account_socket(data: &Path) -> PathBuf {
+    vox_core::node::paths::Account::of(Some(data), Some(&data.join("cfg")))
+        .unwrap_or_else(|e| panic!("APPARATUS: the account of {}: {e}", data.display()))
+        .socket()
+}
+
+/// A control-socket client acting as node `node` of the data root `data`, through the daemon's
+/// account socket, never attaching it (a one-shot verb's `Use`): what `vox room …` sends its
+/// requests on. `Err` says why the daemon could not be reached or refused the node.
+pub async fn node_client(
+    data: &Path,
+    node: &str,
+) -> Result<vox_core::node::ipc::IpcClient, String> {
+    client_at(&account_socket(data), node).await
+}
+
+/// [`node_client`] on the account socket at `socket` (as a daemon names it in "vox daemon:
+/// control socket …").
+pub async fn client_at(
+    socket: &Path,
+    node: &str,
+) -> Result<vox_core::node::ipc::IpcClient, String> {
+    use vox_core::node::daemonipc::{AttachMode, UseNode};
+    let name = vox_core::node::paths::NodeName::parse(node)
+        .map_err(|e| format!("APPARATUS: node name {node:?}: {e}"))?;
+    let using = UseNode {
+        node: name,
+        attach: AttachMode::No,
+        passphrase: None,
+        anchors: Vec::new(),
+    };
+    match vox_core::node::ipc::IpcClient::open_node(socket, using).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(refused)) => Err(format!("the daemon refused node {node}: {refused:?}")),
+        Err(e) => Err(format!("the daemon's socket did not answer: {e}")),
+    }
+}
+
+/// [`node_client`] for the node `paths` resolves: its data root's account socket, as that node.
+pub async fn paths_client(
+    paths: &vox_core::node::paths::Paths,
+) -> Result<vox_core::node::ipc::IpcClient, String> {
+    use vox_core::node::daemonipc::{AttachMode, UseNode};
+    let name = paths
+        .profile_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("APPARATUS: no node name in {}", paths.profile_dir.display()))?;
+    let using = UseNode {
+        node: vox_core::node::paths::NodeName::parse(name)
+            .map_err(|e| format!("APPARATUS: node name {name:?}: {e}"))?,
+        attach: AttachMode::No,
+        passphrase: None,
+        anchors: Vec::new(),
+    };
+    match vox_core::node::ipc::IpcClient::open_node(&paths.account().socket(), using).await {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(refused)) => Err(format!("the daemon refused node {name}: {refused:?}")),
+        Err(e) => Err(format!("the daemon's socket did not answer: {e}")),
     }
 }

@@ -32,9 +32,6 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[path = "support/layout.rs"]
-mod layout;
-
 use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -60,14 +57,30 @@ fn room_list(dir: &Path) -> (bool, String) {
     )
 }
 
-/// A fresh data root and where its default node's control socket goes
-/// (`<data>/nodes/default/node.sock`).
+/// A fresh data root holding node `default` (made by `vox id`), and where the data root's
+/// account socket goes (`<data>/.daemon/vox.sock`, ADR-026 C-1): every verb reaches its node
+/// through it.
 fn profile() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let sock_dir = layout::node_dir(&tmp.path().join("d"), layout::DEFAULT_NODE);
-    std::fs::create_dir_all(&sock_dir).expect("APPARATUS: create a staging directory");
-    std::fs::create_dir_all(tmp.path().join("c")).expect("APPARATUS: create a staging directory");
-    let sock = sock_dir.join("node.sock");
+    let (data, cfg) = (tmp.path().join("d"), tmp.path().join("c"));
+    std::fs::create_dir_all(&cfg).expect("APPARATUS: create a staging directory");
+    let made = Command::new(VOX)
+        .args(["id"])
+        .env("VOX_DATA_DIR", &data)
+        .env("VOX_CONFIG_DIR", &cfg)
+        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
+        .output()
+        .expect("APPARATUS: run vox id");
+    assert!(
+        made.status.success(),
+        "PRODUCT (staging): vox id: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let sock = vox_core::node::paths::Account::of(Some(&data), Some(&cfg))
+        .expect("APPARATUS: the account")
+        .socket();
+    std::fs::create_dir_all(sock.parent().expect("APPARATUS: a socket has a directory"))
+        .expect("APPARATUS: create the socket's directory");
     (tmp, sock)
 }
 

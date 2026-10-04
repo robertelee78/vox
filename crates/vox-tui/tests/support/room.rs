@@ -28,6 +28,9 @@ use vox_core::node::paths::Paths;
 
 #[path = "layout.rs"]
 mod layout;
+
+#[path = "attach.rs"]
+mod attach;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
 
@@ -788,14 +791,12 @@ pub fn resource<'a>(board: &'a serde_json::Value, r: &str) -> Option<&'a serde_j
 /// Post raw text straight onto the control socket, as a peer speaking the protocol
 /// does — for writing exactly what another, older or foreign, binary would write.
 pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
-    let mut c = vox_core::node::ipc::IpcClient::open(&w.paths.socket_file())
-        .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "CANNOT MEASURE: the harness could not open {}'s control socket: {e}",
-                w.name
-            )
-        });
+    let mut c = attach::paths_client(&w.paths).await.unwrap_or_else(|e| {
+        panic!(
+            "CANNOT MEASURE: the harness could not open {}'s control socket: {e}",
+            w.name
+        )
+    });
     match c
         .request(&vox_core::node::ipc::Request::Post {
             channel_id: cid,

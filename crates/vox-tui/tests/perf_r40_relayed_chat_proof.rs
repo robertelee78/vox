@@ -293,7 +293,7 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     )
     .expect("APPARATUS: resolve a profile's paths");
     let mut reader = rt
-        .block_on(IpcClient::open(&bob_paths.socket_file()))
+        .block_on(world::attach::paths_client(&bob_paths))
         .expect("PRODUCT: attach to bob's node");
     let channel_id = match rt.block_on(reader.rooms()) {
         Ok(Frame::Rooms { rooms }) => rooms

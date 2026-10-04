@@ -1414,7 +1414,7 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
     )
     .expect("APPARATUS: resolve the guest's paths");
     let mut client = rt
-        .block_on(vox_core::node::ipc::IpcClient::open(&paths.socket_file()))
+        .block_on(world::attach::paths_client(&paths))
         .unwrap_or_else(|e| panic!("PRODUCT: the guest's TUI serves no control socket: {e}"));
     let room = match rt.block_on(client.rooms()) {
         Ok(vox_core::node::ipc::Frame::Rooms { rooms }) => rooms
