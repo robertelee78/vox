@@ -4310,7 +4310,7 @@ impl ChannelState {
 
     /// Set every governance entry's causal predecessors from the log itself (ADR-007 G-23, G-25,
     /// #380): the governance entries that happened before it through its signed `seen` and feed
-    /// links ([`Dag::happened_before`]), the same on every node that holds them.
+    /// links (as [`Dag::happened_before`] reads them), the same on every node that holds them.
     ///
     /// **Not what this node held when the entry arrived.** A synced entry was given this node's
     /// governance heads as its past, so an entry another member wrote without seeing one of them
@@ -4320,13 +4320,35 @@ impl ChannelState {
     /// Removal wins only over what is concurrent; concurrency read from arrival order is not
     /// concurrency.
     fn refresh_gov_preds(dag: &Dag, gov_entries: &mut [GovEntry]) {
-        let hashes: Vec<Digest32> = gov_entries.iter().map(|g| g.entry_hash).collect();
+        let govs: std::collections::HashSet<Digest32> =
+            gov_entries.iter().map(|g| g.entry_hash).collect();
+        // One walk down each entry's past, not one ancestry question per pair: a room of a few
+        // hundred governance entries asked the second N² times, each a walk of its own, and a
+        // newcomer's first sync of one took seconds.
         for g in gov_entries.iter_mut() {
-            g.causal_predecessors = hashes
-                .iter()
-                .copied()
-                .filter(|h| *h != g.entry_hash && dag.happened_before(h, &g.entry_hash))
-                .collect();
+            let mut preds = BTreeSet::new();
+            let mut seen: std::collections::HashSet<Digest32> = std::collections::HashSet::new();
+            let mut stack = vec![g.entry_hash];
+            while let Some(h) = stack.pop() {
+                let Some(entry) = dag.get_by_hash(&h) else {
+                    continue;
+                };
+                let sk = &entry.skeleton;
+                let parents = sk
+                    .seen
+                    .iter()
+                    .copied()
+                    .chain((sk.seq > 1).then_some(sk.prev_hash));
+                for p in parents {
+                    if seen.insert(p) {
+                        if govs.contains(&p) {
+                            preds.insert(p);
+                        }
+                        stack.push(p);
+                    }
+                }
+            }
+            g.causal_predecessors = preds;
         }
     }
 
