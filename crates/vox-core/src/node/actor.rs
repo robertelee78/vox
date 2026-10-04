@@ -2156,6 +2156,58 @@ fn test_lose_hello(me: &Digest32, room: &Digest32) -> bool {
     }
 }
 
+/// The test-only variable that makes a node **supersede a connection once it carries
+/// datagrams**: it dials the peer again where it reached it, files the new connection as the
+/// primary and retires the old, which keeps carrying its flows (see
+/// [`crate::node::net::ConnectionManager::file_superseding`]). Read only in a build with the
+/// `test-knobs` feature (V210-105); what `vox status` must then still report (R35).
+#[cfg(feature = "test-knobs")]
+pub const TEST_SUPERSEDE_CARRYING_ENV: &str = "VOX_TEST_SUPERSEDE_CARRYING";
+
+/// [`TEST_SUPERSEDE_CARRYING_ENV`]'s task: once per connection, off the actor.
+#[cfg(feature = "test-knobs")]
+fn spawn_test_supersede(net: Arc<NodeNet>, tx: mpsc::Sender<NetEvent>, clock: Clock) {
+    let net = Arc::downgrade(&net);
+    tokio::spawn(async move {
+        let mut done: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+        loop {
+            ticker.tick().await;
+            let Some(net) = net.upgrade() else {
+                break;
+            };
+            let manager = net.manager();
+            for (peer, conn) in manager.primaries() {
+                let d = conn.datagram_stats();
+                if d.sent + d.delivered == 0 || !done.insert(conn.serial()) {
+                    continue;
+                }
+                let at = conn.quinn().remote_address();
+                if manager.endpoint().is_circuit(at) {
+                    continue;
+                }
+                let dialled = crate::nat::reachability::connect_direct(
+                    Arc::clone(manager.endpoint()),
+                    &[at],
+                    peer,
+                    clock(),
+                )
+                .await;
+                if let Ok(fresh) = dialled {
+                    // Said on stderr, so a proof can tell the staging happened.
+                    eprintln!(
+                        "vox: test-knob: superseded the connection to {} that carries datagrams",
+                        crate::node::link::b32_encode(&peer)
+                    );
+                    let fresh = manager.file_superseding(fresh);
+                    done.insert(fresh.serial());
+                    spawn_stream_loop(Arc::clone(&net), fresh, tx.clone());
+                }
+            }
+        }
+    });
+}
+
 /// Serve a filed connection and announce it. `false` when the actor has gone away.
 async fn serve_filed(
     net: &Arc<NodeNet>,
@@ -4770,6 +4822,14 @@ impl Node {
                     manager.tend_liveness();
                 }
             });
+        }
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_SUPERSEDE_CARRYING_ENV).is_some() {
+            spawn_test_supersede(
+                Arc::clone(&net),
+                self.net_tx.clone(),
+                Arc::clone(&self.clock),
+            );
         }
         // The configured anchors are dialled at once, each on its own task: they are
         // where this node's records go and the helpers its ladder climbs through, and

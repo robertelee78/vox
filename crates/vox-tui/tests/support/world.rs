@@ -1307,7 +1307,7 @@ pub fn read_to_end_within(s: &mut TcpStream, within: Duration) -> (Vec<u8>, Endi
 
 /// The last `n` lines of the daemon log of the data root `dir` (`.daemon/log`), or why there are
 /// none.
-fn log_tail(dir: &Path, n: usize) -> String {
+pub fn log_tail(dir: &Path, n: usize) -> String {
     match std::fs::read_to_string(dir.join(".daemon").join("log")) {
         Ok(text) => {
             let lines: Vec<&str> = text.lines().collect();
