@@ -71,9 +71,6 @@ optional_proof::not_run!(a_long_room_is_read_in_time_proportional_to_its_length)
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[path = "support/layout.rs"]
-mod layout;
-
 #[path = "support/world.rs"]
 mod world;
 
@@ -561,7 +558,7 @@ fn a_long_room_is_read_in_time_proportional_to_its_length() {
     // The TUI was a client: the daemon it started holds the data root until it goes idle, and the
     // TUI driver may have killed it by its pid. Stopped by the pid in its lock, so the daemon
     // started here takes the lock and is the one that runs.
-    layout::reap_daemon(&data);
+    world::reap_daemon(&data);
     let mut restarted = VoxProc::spawn("alice", &data, &daemon_args);
     let deadline = Instant::now() + SETUP;
     loop {
