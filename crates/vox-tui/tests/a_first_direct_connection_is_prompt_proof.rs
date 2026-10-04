@@ -481,6 +481,10 @@ fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, Str
 /// (`[::1]`), so a dial-back cannot help either. Asserted: the forward reached the host, dave asked
 /// for **no** circuit to it, and the anchor carried none from the forward's start. Without the board
 /// read, the reach knows no address, its dial-back fails, and it bridges.
+///
+/// Since ADR-026 dave's join leaves his node running in a daemon that learns the host's record, so
+/// the node the forward reaches with is a fresh one: dave's node is attached on `[::1]` until his
+/// log holds the host's share, then that daemon is stopped by its pid.
 #[test]
 #[ignore = "production Argon2id + a real PoW, a third member staged; run in release"]
 fn a_node_reads_the_board_before_bridging() {
@@ -489,6 +493,36 @@ fn a_node_reads_the_board_before_bridging() {
     watchdog::arm();
     let mut w = ForwardedWorld::new(true);
     let (dave, _dave_fp) = anchor_only_guest(&w, "dave");
+    let _reaper = world::Reaper(vec![dave.clone()]);
+    // **Under one daemon per data root** (ADR-026) the join's daemon kept dave's node running, and
+    // it learned the host's record from the board while it ran: a forward started then is its
+    // client, finds the record held, and reads no board (CANNOT MEASURE on 8faf006a, twice). So the
+    // forward gets a node of its own, started afresh. First, though, dave's log must hold the
+    // host's share (`vox service list`), or the forward waits for a sync with the host, whose own
+    // reach reads the board before the forward subscribes to hear it. Attached on `[::1]` like his
+    // forward, through the anchor only, for the wait; then that daemon is stopped by its pid.
+    attach_on(&dave, &w.anchor.v6_spec, "[::1]:0");
+    let listed = format!("  {}.", w.service_port);
+    let t0 = std::time::Instant::now();
+    let mut seen = String::new();
+    while !seen.contains(&listed) && t0.elapsed() < Duration::from_secs(60) {
+        let (_, out, err) = world::vox_once(&dave, &args(&["service", "list", &w.room]));
+        seen = format!("{out}{err}");
+        if !seen.contains(&listed) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    assert!(
+        seen.contains(&listed),
+        "PRODUCT (staging): dave's node, joined and running, never synced the host's share `{}` \
+         within 60 s (`vox service list`): {seen}",
+        w.service_port
+    );
+    world::reap_daemon(&dave);
+    assert!(
+        world::daemon_pid(&dave).is_none(),
+        "APPARATUS: dave's daemon still holds his data root after it was stopped by its pid"
+    );
     let mark = w.anchor.mark();
     let mut fwd = VoxProc::spawn(
         "dave-forward",
@@ -544,6 +578,49 @@ fn a_node_reads_the_board_before_bridging() {
             "did not say it read the board"
         },
         w.anchor.proc.transcript()
+    );
+}
+
+/// `vox node attach default --passphrase-file - --listen <listen> --anchor <anchor>` on the data
+/// root `dir`, starting its daemon there: `PRODUCT (staging)` if it fails.
+fn attach_on(dir: &std::path::Path, anchor: &str, listen: &str) {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new(world::VOX)
+        .args([
+            "node",
+            "attach",
+            world::DEFAULT_NODE,
+            "--passphrase-file",
+            "-",
+            "--listen",
+            listen,
+            "--anchor",
+            anchor,
+        ])
+        .env("VOX_DATA_DIR", dir)
+        .env("VOX_CONFIG_DIR", dir.join("cfg"))
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_LISTEN")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: spawn `vox node attach`: {e}"));
+    let _ = child
+        .stdin
+        .take()
+        .expect("APPARATUS: a piped stdin")
+        .write_all(format!("{}\n", world::IDENTITY).as_bytes());
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: wait for `vox node attach`: {e}"));
+    assert!(
+        out.status.success(),
+        "PRODUCT (staging): `vox node attach` in {} failed: {}{}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
