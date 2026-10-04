@@ -75,7 +75,7 @@
 //! `read_frame`'s EOF inside a body mapped back to `MalformedIpc("ipc read body")` — the tail says
 //! "malformed control-socket message"; (5)
 //! `IpcClient::request` without `while_answering` — the join is still running at 45 s; (6)
-//! `serve_control_socket(..)?`, a bind failure fatal again — `vox serve` exits 1 at once; (7)
+//! the daemon's socket refusal not echoed to its log — no path or reason said; (7)
 //! `IpcClient::request`'s end-of-stream mapped back to `MalformedIpc("ipc closed before reply")` —
 //! the join says "malformed control-socket message".
 
@@ -769,7 +769,9 @@ fn a_cli_failure_tells_the_truth() {
 /// so the daemon is always part-way through a frame when it is killed.
 const BIG: usize = 32;
 
-/// (6) A holder whose control socket cannot be bound runs on, and says why.
+/// (6) A daemon whose control socket cannot be bound says so, and its holder fails, saying why.
+/// (Before ADR-026 the holder ran on without a socket of its own; the account socket is now the
+/// only way any verb reaches a node, so there is nothing to run on.)
 #[test]
 #[ignore = "real vox processes, production Argon2id and a real PoW; CI runs it in release"]
 fn a_holder_runs_without_its_control_socket() {
@@ -800,7 +802,6 @@ fn a_holder_runs_without_its_control_socket() {
     std::fs::write(&squat, "not a directory\n").expect("APPARATUS: harness step failed");
     let tmpdir = format!("{}/", blocked_tmp.display());
     let env = [("TMPDIR", tmpdir.as_str())];
-    let mut held = 0usize;
 
     let anchor = Proc::spawn(
         "anchor",
@@ -839,96 +840,43 @@ fn a_holder_runs_without_its_control_socket() {
         "",
         &env,
     );
-    // Its lines, or its exit.
+    // Since ADR-026 the account socket is how every verb reaches its node, so a daemon that cannot
+    // bind it serves nobody: `vox serve` starts one, which refuses the squatted directory, and
+    // `vox serve` ends within the daemon's start bound saying it did not start and where its log
+    // is; that log, or what it echoes, names the socket's path and why.
     let t0 = Instant::now();
-    let printed = loop {
-        if host.stdout().iter().any(|l| l.starts_with("passphrase")) {
-            break true;
+    let ended = loop {
+        if let Some(status) = host.child.try_wait().expect("APPARATUS: harness: wait") {
+            break Some(status);
         }
-        if host
-            .child
-            .try_wait()
-            .expect("APPARATUS: harness: wait")
-            .is_some()
-            || t0.elapsed() > quick
-        {
-            break false;
+        if t0.elapsed() > quick {
+            break None;
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    // Still serving a moment after it printed them.
-    std::thread::sleep(Duration::from_secs(2));
-    let running = host
-        .child
-        .try_wait()
-        .expect("APPARATUS: harness: wait")
-        .is_none();
     let err = host.stderr();
+    let log = std::fs::read_to_string(host_dir.join(".daemon").join("log")).unwrap_or_default();
     eprintln!(
-        "[vox serve, socket blocked] printed={printed} running={running}: {}",
-        err.trim().replace('\n', " / ")
+        "[vox serve, socket blocked] ended={ended:?}: {} / log: {}",
+        err.trim().replace('\n', " / "),
+        log.trim().replace('\n', " / ")
     );
     assert!(
-        printed && running,
-        "PRODUCT (6) `vox serve` must keep serving when its control socket cannot be bound; \
-         printed={printed} running={running}; stderr:\n{err}"
-    );
-    let warned = |said: &str| {
-        said.contains("control socket unavailable")
-            && said.contains(&squat.display().to_string())
-            && said.contains("not a directory owned by you")
-    };
-    assert!(
-        warned(&err),
-        "PRODUCT (6) `vox serve` must say the control socket is unavailable, where and why: {err}"
-    );
-    held += 1;
-
-    let field = |label: &str| {
-        host.expect_out(label, |l| l.starts_with(label))
-            .strip_prefix(label)
-            .expect("APPARATUS: harness step failed")
-            .trim()
-            .to_owned()
-    };
-    let (address, passphrase) = (field("address"), field("passphrase"));
-    let pass_file = guest_dir.join("room-pass");
-    std::fs::write(&pass_file, format!("{passphrase}\n")).expect("APPARATUS: harness step failed");
-    let (ok, said, took) = must(
-        "vox connect",
-        vox_env(
-            &guest_dir,
-            &[
-                "connect",
-                &address,
-                "--passphrase-file",
-                pass_file.to_str().expect("APPARATUS: harness step failed"),
-                "--anchor",
-                &spec,
-                "--listen",
-                "127.0.0.1:0",
-            ],
-            "",
-            // A join, so the same proof-of-work tail as the joins above.
-            Duration::from_secs(240),
-            &env,
-        ),
-    );
-    eprintln!(
-        "[vox connect, socket blocked] ok={ok} in {:.1}s: {}",
-        took.as_secs_f64(),
-        said.trim().replace('\n', " / ")
+        ended.is_some_and(|s| !s.success()),
+        "PRODUCT (6) `vox serve` whose daemon cannot bind its socket must fail within \
+         {quick:?}, not serve or wait: ended={ended:?}; stderr:\n{err}"
     );
     assert!(
-        ok && said.contains("joined."),
-        "PRODUCT (6) `vox connect` must join when its control socket cannot be bound: {said}"
+        (err.contains("did not start") || err.contains("stopped as it started"))
+            && err.contains("log"),
+        "PRODUCT (6) `vox serve` must say the daemon did not start and name its log: {err}"
     );
+    let said = format!("{err}\n{log}");
     assert!(
-        warned(&said),
-        "PRODUCT (6) `vox connect` must say the control socket is unavailable, where and why: {said}"
+        said.contains(&squat.display().to_string())
+            && said.contains("not a directory owned by you"),
+        "PRODUCT (6) the daemon must say where its control socket could not go and why: {said}"
     );
-    held += 1;
-
     // What stood where the directory should be was never used.
     let left = std::fs::symlink_metadata(&squat).map(|m| m.file_type().is_file());
     assert!(
@@ -939,11 +887,7 @@ fn a_holder_runs_without_its_control_socket() {
         squat.display()
     );
     drop(service);
-    eprintln!("[proof] {held} holders ran without their control socket");
-    assert_eq!(
-        held, 2,
-        "APPARATUS: {held} holders were counted, not the 2 this test stages (serve, connect)"
-    );
+    drop(guest_dir);
 }
 
 // ---- V210-85 (#277): a `vox connect` stopped by a signal says why ------------------------------
@@ -1580,7 +1524,7 @@ fn a_connect_stopped_at_a_passphrase_prompt_says_why() {
         Some(&room_file),
         "identity passphrase: ",
         ("HUP", "SIGHUP", 129),
-        "this profile's identity passphrase",
+        "this node's identity passphrase",
     );
 
     // Ctrl-C typed at the prompt is a key on a raw terminal, not a signal: the prompt's own "no".

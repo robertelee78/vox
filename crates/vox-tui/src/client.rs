@@ -284,10 +284,20 @@ pub fn name_of(paths: &Paths) -> Result<NodeName, AppError> {
 /// # Errors
 /// As [`name_of`].
 pub fn one_shot(paths: &Paths) -> Result<NodeSocket, AppError> {
-    Ok(NodeSocket::one_shot(
-        paths.account().socket(),
-        name_of(paths)?,
-    ))
+    Ok(NodeSocket {
+        waiting: Some(say_daemon_waiting),
+        ..NodeSocket::one_shot(paths.account().socket(), name_of(paths)?)
+    })
+}
+
+/// What a verb says on stderr, once, when the daemon has not greeted it within a second.
+pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answered yet — it may \
+     be busy (moving or attaching a node) or stopped (Ctrl-Z, which goes on once resumed); this \
+     waits up to 10 s";
+
+/// Say [`DAEMON_WAITING`]: a verb waiting on the daemon is never silent (V210-100).
+pub fn say_daemon_waiting() {
+    eprintln!("{DAEMON_WAITING}");
 }
 
 /// A connection to `at` as its node, with each way it can fail said for a person: no daemon, a
@@ -431,8 +441,15 @@ pub async fn hold(
             passphrase,
             anchors: args.anchor_specs(),
         },
+        waiting: Some(say_daemon_waiting),
     };
     let client = open(&at).await?;
+    // What attaching the node said (a skipped anchors line, carrying on with no anchor), in the
+    // person's own terminal as well as the daemon's log (R23, R36): the daemon this verb started
+    // writes only to `<data root>/.daemon/log`.
+    for note in client.attach_notes() {
+        eprintln!("vox: {note}");
+    }
     let me = client.me();
     Ok(Held {
         client,
@@ -497,7 +514,16 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
     // The node's own clock, a test step included (V210-64): an identity made here is stamped as
     // the node making it would have stamped it.
     let now = (vox_core::time::clock_with_test_skew())();
-    match vox_core::node::profile::Profile::create(paths.clone(), passphrase.as_bytes(), now) {
+    // **A wait is said, once, after a second** (V210-100): another vox making this node's identity
+    // holds its directory, and one stopped (Ctrl-Z) holds it until resumed; this one waiting with
+    // nothing on the screen looked hung.
+    match vox_core::node::profile::Profile::create_noting(
+        paths.clone(),
+        passphrase.as_bytes(),
+        now,
+        vox_core::atrest::sek::Argon2Profile::default(),
+        &crate::tunnel_cli::say_waiting,
+    ) {
         // **Its prekey ring is made with it**, as the node making an identity makes it, so the
         // ring's age is the identity's (V210-77): what a node attaching later keeps up, not
         // something it makes afresh.
@@ -507,6 +533,16 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
             vox_core::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now)?;
             Ok(p.fingerprint())
         }
+        // Waited the whole patience and the holder is still not done: say what holds it and how to
+        // find it, never to stop a node — the holder may only be slow, or stopped.
+        Err(Error::ProfileBusy) => Err(AppError::Usage(format!(
+            "another vox is still using this node's directory, and only one at a time may hold \
+             it.\n\x20      It is a command that has not finished (a slow one, or one stopped, \
+             e.g. with Ctrl-Z, which goes on once resumed), or the vox daemon, which holds an \
+             attached node until it detaches.\n\x20      To see which process it is: lsof {}\n\
+             \x20      Run this command again once it is done.",
+            paths.profile_dir.display()
+        ))),
         Err(Error::Profile(why)) if why.contains("already exists") => Err(AppError::Usage(
             "another vox created this node's identity at the same time; nothing was created \
              here.\n\x20      Run `vox id` again to see the identity it made."
@@ -692,7 +728,12 @@ pub async fn node_attach(
         })
         .await
     {
-        Ok(DaemonFrame::Attached(info)) => {
+        Ok(DaemonFrame::Attached(info, notes)) => {
+            // What attaching it said, in this terminal: the daemon `vox node attach` started
+            // writes only to its log (R23, R36).
+            for note in &notes {
+                eprintln!("vox: {note}");
+            }
             println!("vox: node {} attached{}", info.name, kept(&info));
             Ok(())
         }

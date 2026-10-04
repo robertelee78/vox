@@ -46,9 +46,10 @@ REFUSALS = (
     "this room has ended",
     "you left this room",
     "joined a moment ago",
-    "channel is not open",
+    "this room is not open",
     "internal error",
-    "could not save",
+    "could not write this node's files",
+    "could not be written",
     "not connected",
     "locked — :unlock",
 )

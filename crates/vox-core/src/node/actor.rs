@@ -3457,6 +3457,9 @@ pub struct Node {
     /// is refused once [`keyring_window`] has passed since (V210-159). Shared, because a check
     /// passes on a blocking thread.
     passphrase_entered_at: Arc<std::sync::atomic::AtomicU64>,
+    /// Set while a [`NodeCommand::Proved`] keyring change is applied: its passphrase was just
+    /// checked, so the keyring window does not apply to it (V210-159).
+    keyring_change_proved: bool,
     /// The join exchanges running right now, both sides of them, the room creations sealing
     /// their key (V210-76), and the identity-passphrase checks (V210-94).
     ///
@@ -3971,6 +3974,7 @@ impl Node {
             join_slots: crate::node::joinslots::JoinSlots::new(JOINS_IN_FLIGHT),
             verify_slots: Arc::new(tokio::sync::Semaphore::new(VERIFIES_IN_FLIGHT)),
             passphrase_entered_at: Arc::default(),
+            keyring_change_proved: false,
             join_tasks: tokio::task::JoinSet::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
@@ -4461,6 +4465,28 @@ impl Node {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
             }
+            // A change whose passphrase was just checked: made, and the window starts again. Not
+            // through the window: with the window restarted by the check, a change could still
+            // find it passed — another check's restart having won, or the clock having moved on
+            // between the check and the change — and refuse the passphrase it had just been given.
+            NodeCommand::Proved { change } => {
+                if !matches!(
+                    *change,
+                    NodeCommand::Trust { .. }
+                        | NodeCommand::TrustWith { .. }
+                        | NodeCommand::Rename { .. }
+                        | NodeCommand::Untrust { .. }
+                ) {
+                    return Outcome::Failed(Fault::Internal);
+                }
+                if self.profile.as_ref().is_some_and(Profile::is_unlocked) {
+                    self.note_passphrase_entered();
+                }
+                self.keyring_change_proved = true;
+                let outcome = self.handle(*change).await;
+                self.keyring_change_proved = false;
+                outcome
+            }
             // Only an unlocked node asks for the passphrase again. One with no identity or a
             // locked one falls through, and says that: a passphrase would not make the change.
             NodeCommand::Trust { .. }
@@ -4468,6 +4494,7 @@ impl Node {
             | NodeCommand::Rename { .. }
             | NodeCommand::Untrust { .. }
                 if self.profile.as_ref().is_some_and(Profile::is_unlocked)
+                    && !self.keyring_change_proved
                     && !self.passphrase_entered_recently() =>
             {
                 Outcome::Failed(Fault::PassphraseNeeded)
@@ -6324,6 +6351,7 @@ impl Node {
                 }
                 puts.extend(self.withdrawn.values().cloned());
                 Self::put_withdraws(&conn, puts);
+                self.read_anchor_boards(Some(peer)).await;
             }
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
@@ -9474,6 +9502,58 @@ impl Node {
             }
             self.discover_rooms.extend(self.channels.keys().copied());
             self.sched_all = true;
+            self.read_anchor_boards(None).await;
+        }
+    }
+
+    /// **Read the boards of the anchors this node is connected to**, for every room naming them
+    /// ([`exchange_boards`]), each on a task of its own: `only` for one anchor that just
+    /// connected, or every connected one on the tick. A member of the room is not read here: its
+    /// board is read in every sync session with it.
+    async fn read_anchor_boards(&self, only: Option<Digest32>) {
+        let (Some(net), Some(store)) = (
+            self.net.as_ref().map(Arc::clone),
+            self.profile.as_ref().map(Profile::store_handle),
+        ) else {
+            return;
+        };
+        let now = self.now();
+        for (cid, shared) in &self.channels {
+            let (anchors, known) = {
+                let ch = shared.lock().await;
+                let anchors: Vec<Digest32> = ch
+                    .anchors()
+                    .nodes()
+                    .iter()
+                    .map(|a| a.id)
+                    .filter(|a| !ch.is_member(a))
+                    .filter(|a| only.is_none_or(|o| o == *a))
+                    .collect();
+                (anchors, ch.epoch())
+            };
+            for anchor in anchors {
+                let Some(conn) = self
+                    .anchors_up
+                    .get(&anchor)
+                    .filter(|c| c.quinn().close_reason().is_none())
+                    .map(Arc::clone)
+                else {
+                    continue;
+                };
+                let (net, store, shared, cid) = (
+                    Arc::clone(&net),
+                    Arc::clone(&store),
+                    Arc::clone(shared),
+                    *cid,
+                );
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(
+                        SETUP_PATIENCE,
+                        exchange_boards(&net, &conn, &shared, &store, cid, known, now),
+                    )
+                    .await;
+                });
+            }
         }
     }
 
@@ -9599,53 +9679,9 @@ impl Node {
                     // the budgets).
                     let setup = async {
                         if let Some(pstore) = admit_store {
-                            if let Ok(set) = net.fetch_channel(&conn, &cid, known).await {
-                                admitted_authors = admit_board_records(
-                                    shared,
-                                    &pstore,
-                                    &set.bundles,
-                                    ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                                    now,
-                                    Some(&net),
-                                )
-                                .await;
-                                // What the peer's board holds is filed on this node's own, so its board
-                                // carries the whole membership it knows. Bundles go first: they carry
-                                // the key an address record is verified with (M15.2a). Mirroring to the
-                                // anchors follows on the actor when `SyncDone` lands, because that needs
-                                // channel state.
-                                for wire in set
-                                    .bundles
-                                    .iter()
-                                    .map(MemberBundleRecord::to_wire)
-                                    .chain(set.members.iter().map(RendezvousRecord::to_wire))
-                                {
-                                    let _ = net.publish_local(&wire);
-                                }
-                                // **And the other way: what this node's board holds that the peer's
-                                // lacks.** A member who joined through this node is on this node's
-                                // board and no other, and the peer learned of it only when *it* next
-                                // read this board, on its own periodic sync: 24–28 s for a third
-                                // member to see a new one, measured. Offered here, a push that follows
-                                // a join carries the newcomer to every connected member at once.
-                                // Best-effort: a refusal (a record the peer's board already holds
-                                // newer) costs nothing, and the peer's own sync still reads this board.
-                                let missing = net.board_records_missing_from(&cid, known, &set);
-                                if !missing.is_empty() {
-                                    if let Ok(mut client) =
-                                        crate::nat::service::RendezvousClient::open(&conn).await
-                                    {
-                                        for wire in &missing {
-                                            if let Err(e) = client.put(wire).await {
-                                                if !matches!(e, Error::RendezvousRejected(_)) {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        client.finish();
-                                    }
-                                }
-                            }
+                            admitted_authors =
+                                exchange_boards(&net, &conn, shared, &pstore, cid, known, now)
+                                    .await;
                         }
                     };
                     let _ = tokio::time::timeout(SETUP_PATIENCE, setup).await;
@@ -11663,12 +11699,16 @@ impl Node {
                 let _slot = slot;
                 match verifier.verify(&passphrase) {
                     Ok(()) => {
+                        // Restarted unless a lock zeroed it meanwhile, and never moved back: of
+                        // several checks passing at once, each leaves it at least at its own
+                        // time, whichever wrote first (a compare-exchange against the value at
+                        // the start lost to the first, and left the window where it was).
                         if entered_before != 0 {
-                            let _ = entered_at.compare_exchange(
-                                entered_before,
-                                clock().max(1),
+                            let now = clock().max(1);
+                            let _ = entered_at.fetch_update(
                                 std::sync::atomic::Ordering::Relaxed,
                                 std::sync::atomic::Ordering::Relaxed,
+                                |at| (at != 0).then_some(at.max(now)),
                             );
                         }
                         Outcome::Done
@@ -13790,6 +13830,72 @@ impl crate::node::up::Names for NodeNames {
     ) -> std::result::Result<crate::node::resolver::ServiceRoom, String> {
         self.resolve(name).await
     }
+}
+
+/// **Exchange `conn`'s board for room `cid` with this node's** (ADR-008, ADR-016): read the
+/// members it knows and admit them, file its records on this node's board, and offer it the
+/// records this node's board holds that it lacks. Returns the authors admitted.
+///
+/// Run at the start of every outbound sync session, and with each anchor of the room this node is
+/// connected to ([`Node::read_anchor_boards`]). An anchor runs no sync session (ADR-023 RL-6.2),
+/// but its board is the one place a member that restarted learns where the others are and the
+/// bundles it opens pairwise sessions with: its own board starts empty. Without this a restarted
+/// member could release no key to a member it had not synced with since (#410:
+/// a_taken_first_key_is_not_sent_again's positive control, after the anchor stopped being a sync
+/// partner).
+async fn exchange_boards(
+    net: &NodeNet,
+    conn: &crate::transport::quic::VoxConnection,
+    shared: &tokio::sync::Mutex<ChannelState>,
+    pstore: &crate::node::store::Store,
+    cid: Digest32,
+    known: u64,
+    now: u64,
+) -> usize {
+    let Ok(set) = net.fetch_channel(conn, &cid, known).await else {
+        return 0;
+    };
+    let admitted_authors = admit_board_records(
+        shared,
+        pstore,
+        &set.bundles,
+        ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+        now,
+        Some(net),
+    )
+    .await;
+    // What the peer's board holds is filed on this node's own, so its board carries the whole
+    // membership it knows. Bundles go first: they carry the key an address record is verified
+    // with (M15.2a). Mirroring to the anchors follows on the actor when `SyncDone` lands, because
+    // that needs channel state.
+    for wire in set
+        .bundles
+        .iter()
+        .map(MemberBundleRecord::to_wire)
+        .chain(set.members.iter().map(RendezvousRecord::to_wire))
+    {
+        let _ = net.publish_local(&wire);
+    }
+    // **And the other way: what this node's board holds that the peer's lacks.** A member who
+    // joined through this node is on this node's board and no other, and the peer learned of it
+    // only when *it* next read this board, on its own periodic sync: 24–28 s for a third member to
+    // see a new one, measured. Offered here, a push that follows a join carries the newcomer to
+    // every connected member at once. Best-effort: a refusal (a record the peer's board already
+    // holds newer) costs nothing, and the peer's own sync still reads this board.
+    let missing = net.board_records_missing_from(&cid, known, &set);
+    if !missing.is_empty() {
+        if let Ok(mut client) = crate::nat::service::RendezvousClient::open(conn).await {
+            for wire in &missing {
+                if let Err(e) = client.put(wire).await {
+                    if !matches!(e, Error::RendezvousRejected(_)) {
+                        break;
+                    }
+                }
+            }
+            client.finish();
+        }
+    }
+    admitted_authors
 }
 
 /// Admit as many board records as their M17.6 evidence allows, to a fixpoint.

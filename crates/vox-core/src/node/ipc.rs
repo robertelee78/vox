@@ -2802,6 +2802,13 @@ async fn serve_requests(
         let intent = Held::intent(&request);
         let reply = tokio::select! {
             reply = serve_request(handle, request) => reply,
+            // **A client that hangs up mid-request is noticed then, not when the request ends**
+            // (ADR-026 L-3): a `vox connect` stopped during its join kept its connection — and the
+            // hold it carries on its node — until the join finished, so an implicit node's detach,
+            // and the goodbye its connections owe their peers, waited on a join nobody wanted.
+            // The request is abandoned; what it started in the node goes on, or stops with the
+            // node.
+            () = subscriber_gone(&stream) => return Ok(()),
             () = node_detached(&mut watch) => {
                 if let Some(b) = gone(&node) {
                     let _ = write_frame(&mut stream, &b).await;
@@ -2830,6 +2837,10 @@ pub struct Lease {
     pub hold: Option<Box<dyn std::any::Any + Send + Sync>>,
     /// A request the daemon serves itself, beyond the node's vocabulary, if it has one.
     pub extension: Option<std::sync::Arc<dyn Extension>>,
+    /// What attaching the node said, when this `Use` attached it ([`DaemonFrame::Using`]).
+    ///
+    /// [`DaemonFrame::Using`]: crate::node::daemonipc::DaemonFrame::Using
+    pub notes: Vec<String>,
 }
 
 /// A request the daemon's own build serves on a node's connection, beyond what this crate knows:
@@ -3004,10 +3015,12 @@ pub async fn serve_node(mut stream: UnixStream, lease: Lease) -> Result<()> {
         detached,
         hold,
         extension,
+        notes,
     } = lease;
     let using = crate::node::daemonipc::DaemonFrame::Using {
         node: node.clone(),
         me: handle.view().identity.map(|i| i.fingerprint),
+        notes,
     };
     let wrote = write_frame(&mut stream, &using.to_bytes()).await;
     let mut held = Held::default();
@@ -3075,12 +3088,43 @@ async fn verify_operator(
 /// one is checked too, and a match counts as the passphrase entered, opening the window; a
 /// mismatch is "none given", not a wrong passphrase. Without that, an identity with no
 /// passphrase could never change its keyring once the window had passed.
-async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
+///
+/// Answers whether the passphrase was proved: a proved change is made as
+/// [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved), which the window does not
+/// refuse.
+async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<bool, Frame> {
     if passphrase.is_empty() {
-        let _ = verify_operator(handle, passphrase).await;
-        return Ok(());
+        return Ok(verify_operator(handle, passphrase).await.is_ok());
     }
-    verify_operator(handle, passphrase).await
+    verify_operator(handle, passphrase).await.map(|()| true)
+}
+
+/// **For proofs only.** When set, a keyring change whose passphrase was just proved waits this
+/// many milliseconds between the check and the change, which stands for a daemon too busy to
+/// make it at once, past the keyring window. Nothing a person runs sets it; unset, nothing
+/// changes. Not compiled in without the `test-knobs` feature.
+#[cfg(feature = "test-knobs")]
+pub const TEST_PROVED_CHANGE_DELAY_ENV: &str = "VOX_TEST_PROVED_CHANGE_DELAY_MS";
+
+/// `change`, as [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved) when its
+/// passphrase was just proved.
+async fn proved_if(
+    proved: bool,
+    change: crate::node::api::NodeCommand,
+) -> crate::node::api::NodeCommand {
+    if !proved {
+        return change;
+    }
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_PROVED_CHANGE_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    crate::node::api::NodeCommand::Proved {
+        change: Box::new(change),
+    }
 }
 
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
@@ -3150,16 +3194,22 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             full_history,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::TrustWith {
-                    fingerprint: target,
-                    petname,
-                    history: if full_history {
-                        crate::node::trust::HistoryGrant::Full
-                    } else {
-                        crate::node::trust::HistoryGrant::Now
-                    },
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::TrustWith {
+                            fingerprint: target,
+                            petname,
+                            history: if full_history {
+                                crate::node::trust::HistoryGrant::Full
+                            } else {
+                                crate::node::trust::HistoryGrant::Now
+                            },
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3192,10 +3242,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Untrust {
-                    fingerprint: target,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Untrust {
+                            fingerprint: target,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3210,11 +3266,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Rename {
-                    fingerprint: target,
-                    petname,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Rename {
+                            fingerprint: target,
+                            petname,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3962,6 +4024,8 @@ pub struct IpcClient {
     /// The node this connection acts as on the daemon's socket (ADR-026 C-2), which a check on a
     /// waiting request names in its own `Use`; `None` for a node's own socket.
     node: Option<crate::node::paths::NodeName>,
+    /// What attaching the node said, when this connection's `Use` attached it.
+    notes: Vec<String>,
 }
 
 /// Where a client of the daemon reaches its node (ADR-026 C-2): the account's one socket, and the
@@ -3973,6 +4037,10 @@ pub struct NodeSocket {
     pub path: PathBuf,
     /// What each connection opens with.
     pub using: crate::node::daemonipc::UseNode,
+    /// Called once if the daemon has not greeted within a second
+    /// ([`crate::node::daemonipc::DaemonClient::open_noting`]); the caller says the wait where its
+    /// user sees it.
+    pub waiting: Option<fn()>,
 }
 
 impl std::fmt::Debug for NodeSocket {
@@ -3998,6 +4066,7 @@ impl NodeSocket {
                 passphrase: None,
                 anchors: Vec::new(),
             },
+            waiting: None,
         }
     }
 
@@ -4005,7 +4074,10 @@ impl NodeSocket {
     /// opens, and every connection after the first of a held verb, whose first holds it.
     #[must_use]
     pub fn attached_only(&self) -> Self {
-        Self::one_shot(self.path.clone(), self.using.node.clone())
+        Self {
+            waiting: self.waiting,
+            ..Self::one_shot(self.path.clone(), self.using.node.clone())
+        }
     }
 }
 
@@ -4017,8 +4089,18 @@ impl NodeSocket {
 /// As [`crate::node::daemonipc::DaemonClient::open`]; [`IpcHandshake::Refused`], in the daemon's
 /// words, when it refuses the `Use`; [`IpcHandshake::NotHello`] for any other answer.
 pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> {
+    open_as_noting(at).await.map(|(s, me, _)| (s, me))
+}
+
+/// [`open_as`], with what attaching the node said when this `Use` attached it.
+///
+/// # Errors
+/// As [`open_as`].
+pub async fn open_as_noting(
+    at: &NodeSocket,
+) -> Result<(UnixStream, Option<Digest32>, Vec<String>)> {
     use crate::node::daemonipc::{DaemonClient, DaemonFrame, Opening};
-    let DaemonClient { mut stream, .. } = DaemonClient::open(&at.path).await?;
+    let DaemonClient { mut stream, .. } = DaemonClient::open_noting(&at.path, at.waiting).await?;
     // Wiped once sent: it may carry the identity passphrase (C-6).
     let opening = zeroize::Zeroizing::new(Opening::Use(at.using.clone()).to_bytes());
     if let Err(e) = write_frame(&mut stream, &opening).await {
@@ -4029,7 +4111,7 @@ pub async fn open_as(at: &NodeSocket) -> Result<(UnixStream, Option<Digest32>)> 
         return Err(hung_up(&at.path).await);
     };
     match DaemonFrame::from_bytes(&answer)? {
-        DaemonFrame::Using { me, .. } => Ok((stream, me)),
+        DaemonFrame::Using { me, notes, .. } => Ok((stream, me, notes)),
         DaemonFrame::Refused(r) => Err(Error::Ipc(IpcHandshake::Refused {
             reason: r.to_string(),
         })),
@@ -4134,11 +4216,12 @@ impl IpcClient {
             return Err(Error::Ipc(IpcHandshake::ClosedBeforeHello));
         };
         match DaemonFrame::from_bytes(&answer)? {
-            DaemonFrame::Using { me, node } => Ok(Ok(Self {
+            DaemonFrame::Using { me, node, notes } => Ok(Ok(Self {
                 stream,
                 me,
                 path: path.to_owned(),
                 node: Some(node),
+                notes,
             })),
             DaemonFrame::Refused(r) => Ok(Err(r)),
             _ => Err(Error::Ipc(IpcHandshake::NotHello)),
@@ -4189,6 +4272,7 @@ impl IpcClient {
             me,
             path: path.to_owned(),
             node: None,
+            notes: Vec::new(),
         })
     }
 
@@ -4197,13 +4281,21 @@ impl IpcClient {
     /// # Errors
     /// As [`open_as`].
     pub async fn open_at(at: &NodeSocket) -> Result<Self> {
-        let (stream, me) = open_as(at).await?;
+        let (stream, me, notes) = open_as_noting(at).await?;
         Ok(Self {
             stream,
             me,
             path: at.path.clone(),
             node: Some(at.using.node.clone()),
+            notes,
         })
+    }
+
+    /// What attaching the node said, when this connection's `Use` attached it: for a verb that
+    /// holds a session to print in the person's own terminal (PRD-001 R23, R36).
+    #[must_use]
+    pub fn attach_notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// Send one request and read its answer.

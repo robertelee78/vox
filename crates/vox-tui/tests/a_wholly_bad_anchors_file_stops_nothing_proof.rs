@@ -22,7 +22,8 @@
 //!   why, and that it carries on.
 //! - alice's `vox daemon` **starts** (answers `vox room list`) and says it carries on; she
 //!   `vox room create`s a room, posts in it, and `vox room invite`s.
-//! - bob **`vox connect`s** with that address and the room passphrase, and exits 0.
+//! - bob **`vox connect`s** with that address and the room passphrase, and exits 0, saying in his
+//!   own terminal what the attach of his node said (the daemon it started logs it too).
 //! - bob's `vox daemon` starts, and bob **reads alice's post** with `vox room read` — the room
 //!   reached him directly, with no anchor anywhere.
 //! - bob's **`vox tui`** unlocks, opens the room and closes it (`tests/pty/tui_close_room.py`).
@@ -45,7 +46,10 @@
 //!
 //! **The mutation that must turn it red:** the daemon's attach (`host.rs`) dropping what the
 //! anchors file skipped again, as it did from the daemon re-architecture until #410: the trust
-//! arm turns red as PRODUCT, nothing having said the file. And for the
+//! arm turns red as PRODUCT, nothing having said the file. And `client::hold` no longer printing
+//! the attach's notes: bob's `vox connect` arm turns red as PRODUCT, his terminal told nothing.
+//! And `vox node attach` no longer printing the notes its answer carries: the node-attach arm turns
+//! red as PRODUCT. And for the
 //! "waits on" half: `vox tui` sleeping before it draws when its anchors file names no usable
 //! anchor must turn the TUI arm red as PRODUCT, not CANNOT MEASURE. And for the last arm: the
 //! `BoardUnreachable` advice saying "the anchor could not be reached … check `vox node`" again
@@ -305,6 +309,50 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         );
     }
 
+    // ---- `vox node attach` says it in the person's terminal ----------------------------------
+    // The daemon it starts writes only to its log, so the attach's notes come back in its answer
+    // and `vox node attach` prints them (R23, R36).
+    let (ok, out, err) = world::vox_once_plain(
+        &alice,
+        &args(&["node", "attach", "default", "--passphrase-file", &pass]),
+    );
+    let said = format!("{out}{err}");
+    println!(
+        "[proof] vox node attach: exit ok {ok}; said it carries on in the terminal: {}",
+        carries_on(&said, &alice_file)
+    );
+    assert!(
+        ok && carries_on(&said, &alice_file),
+        "PRODUCT: `vox node attach` with an anchors file that names no usable anchor must attach \
+         the node and say, in the terminal, the file, both lines and that it carries on; it \
+         exited ok={ok} and said:\n{said}"
+    );
+    let (ok, out, err) = world::vox_once_plain(&alice, &args(&["node", "detach", "default"]));
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox node detach default`: {out}{err}"
+    );
+    // The daemon that attach started exits once it holds no node (ADR-026 L-8); the steps below
+    // start their own, so wait for it to go.
+    let gone = Instant::now() + Duration::from_secs(15);
+    while std::fs::read_to_string(alice.join(".daemon").join("lock"))
+        .ok()
+        .and_then(|p| p.trim().parse::<u32>().ok())
+        .is_some_and(|pid| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    {
+        assert!(
+            Instant::now() < gone,
+            "PRODUCT (staging): the daemon `vox node attach` started did not exit once its node \
+             was detached"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     // ---- an anchors file that cannot be read as text stops nothing either -----------------------
     // It was an error that named neither the file nor why ("profile path read: anchors file"),
     // and every verb, `vox id` included, refused on it (ac-ver302's verdict on 3b790e64).
@@ -401,18 +449,23 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
         "bob-connect",
     );
     let status = connect.exited_within(CONNECT_WITHIN);
-    let said = format!("{}{}", connect.said(), daemon_log(&bob, at));
+    // **In bob's own terminal** (R23, R36): the daemon `vox connect` started writes only to its
+    // log, so the verb that attached the node prints what the attach said.
+    let said = connect.said();
+    let logged = daemon_log(&bob, at);
     println!(
-        "[proof] bob's vox connect: exited {status:?} after {:?}; it or the daemon it started said \
-         it carries on: {}",
+        "[proof] bob's vox connect: exited {status:?} after {:?}; said it carries on in his \
+         terminal: {}; the daemon it started logged it: {}",
         t0.elapsed(),
-        carries_on(&said, &bob_file)
+        carries_on(&said, &bob_file),
+        carries_on(&logged, &bob_file)
     );
     assert!(
         status.is_some_and(|s| s.success()) && carries_on(&said, &bob_file),
         "PRODUCT: bob's `vox connect` to alice, who is directly reachable, with an anchors file \
-         that names no usable anchor, must join (exit 0), and it or the daemon it started must say \
-         it carries on; it exited {status:?} within {CONNECT_WITHIN:?}; they said:\n{said}"
+         that names no usable anchor, must join (exit 0) and say in his terminal that it carries \
+         on; it exited {status:?} within {CONNECT_WITHIN:?} and said:\n{said}\nthe daemon it \
+         started logged:\n{logged}"
     );
     drop(connect);
 

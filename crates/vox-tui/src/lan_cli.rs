@@ -134,10 +134,78 @@ impl DeviceRequest {
     }
 }
 
-/// Whether a helper is answering on `socket`.
-#[must_use]
-pub fn helper_reachable(socket: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket).is_ok()
+/// What `vox lan up` sends to ask whether a helper is there, before the node does any work.
+pub const HELLO: &str = "hello";
+
+/// The first words of a helper's answer to [`HELLO`]; its protocol version follows.
+pub const HELPER_SAYS: &str = "vox lan helper";
+
+/// The protocol this helper speaks: [`HELPER_SAYS`] `1`.
+pub const HELPER_PROTOCOL: u32 = 1;
+
+/// How long a helper has to answer [`HELLO`]: it answers at once, so a socket that says nothing
+/// in this time is not one.
+const HELLO_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether a helper is answering on `socket`: it must answer [`HELLO`] as a helper. `Err` says
+/// what to do: [`no_helper`] when nothing listens there, and the socket named when something that
+/// is not a helper does.
+///
+/// A connection alone was the check, so anything listening on that path passed it, and `vox lan
+/// up` then waited 30 s for a device that never came (#75's review). Asking for the helper's own
+/// words refuses a wrong socket at once.
+///
+/// # Errors
+/// As above.
+pub fn helper_answers(socket: &Path) -> Result<(), String> {
+    use std::io::{BufRead as _, Write as _};
+    let Ok(mut s) = std::os::unix::net::UnixStream::connect(socket) else {
+        return Err(no_helper(socket));
+    };
+    let not_one = |why: String| {
+        format!(
+            "{} answers, but not as a vox LAN helper ({why}). Is another program using that \
+             path? Start the helper on a path of its own with\n\n    sudo vox lan helper \
+             --socket <path>\n\nand give `vox lan up` the same --helper-socket.",
+            socket.display()
+        )
+    };
+    let _ = s.set_read_timeout(Some(HELLO_WITHIN));
+    let _ = s.set_write_timeout(Some(HELLO_WITHIN));
+    if let Err(e) = s.write_all(format!("{HELLO}\n").as_bytes()) {
+        return Err(not_one(format!("it would not take a line: {e}")));
+    }
+    let mut line = String::new();
+    match std::io::BufReader::new(&s).read_line(&mut line) {
+        Ok(_) if line.starts_with(HELPER_SAYS) => {
+            let version = line[HELPER_SAYS.len()..].trim();
+            if version == HELPER_PROTOCOL.to_string() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the LAN helper on {} speaks protocol {version:?}, and this vox speaks \
+                     {HELPER_PROTOCOL}: start the helper from this vox (sudo {} lan helper)",
+                    socket.display(),
+                    std::env::current_exe()
+                        .map_or_else(|_| "vox".to_owned(), |p| p.display().to_string())
+                ))
+            }
+        }
+        Ok(0) => Err(not_one("it closed without a word".into())),
+        Ok(_) => Err(not_one(format!("it said {:?}", line.trim()))),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(not_one(format!(
+                "it said nothing within {} s",
+                HELLO_WITHIN.as_secs()
+            )))
+        }
+        Err(e) => Err(not_one(format!("reading its answer: {e}"))),
+    }
 }
 
 /// What `vox lan up` says when there is no helper to ask: how to start one.
@@ -372,14 +440,14 @@ mod mac {
         Ok(done)
     }
 
-    /// Serve one connection: `Ok(None)` for one that asked nothing.
+    /// Serve one connection: `Ok(None)` for one that asked for no device.
     ///
-    /// **A connection that closes unasked is a check, not a request.** `vox lan up` first
-    /// connects and closes, to say at once that no helper is running rather than after the
-    /// node has done its work ([`super::helper_reachable`]). By the time the helper took that
-    /// connection the client had gone, and macOS refuses `setsockopt` on such a socket with
-    /// `EINVAL`: the helper logged `refused: Invalid argument (os error 22)` once per `vox lan
-    /// up`, ahead of its real request, which then succeeded (#75, the decider's run).
+    /// **`hello` is answered, and not logged.** `vox lan up` first asks whether a helper is
+    /// there ([`super::helper_answers`]), before the node does any work; the helper answers
+    /// with its name and protocol, and that is all. **A connection that closes unasked** is
+    /// served silently too: by the time the helper takes it the client has gone, and macOS
+    /// refuses `setsockopt` on such a socket with `EINVAL`, which the helper once logged as
+    /// `refused: Invalid argument (os error 22)` (#75, the decider's run).
     fn serve_one(
         stream: &std::os::unix::net::UnixStream,
         owner: nix::unistd::Uid,
@@ -400,6 +468,13 @@ mod mac {
             .read_line(&mut line)
             .map_err(|e| format!("reading the request: {e}"))?;
         if got == 0 {
+            return Ok(None);
+        }
+        if line.trim() == super::HELLO {
+            let _ = std::io::Write::write_all(
+                &mut &*stream,
+                format!("{} {}\n", super::HELPER_SAYS, super::HELPER_PROTOCOL).as_bytes(),
+            );
             return Ok(None);
         }
         let req = DeviceRequest::parse(&line)?;
@@ -857,7 +932,17 @@ impl vox_core::node::ipc::Extension for LanUp {
                 return;
             };
             let said = tx.clone();
+            // **The daemon says it too** (R36): what a LAN said goes to its `vox lan up`, and to
+            // the daemon's own log, so a LAN whose client is gone still left a trace of how far it
+            // got (#75: a root run's `vox lan up` exited saying nothing, its LAN's interface made).
+            let who = handle
+                .view()
+                .identity
+                .map(|i| vox_core::node::link::b32_encode(&i.fingerprint)[..12].to_owned())
+                .unwrap_or_default();
+            let tag = who.clone();
             let say = move |line: String| {
+                eprintln!("vox daemon: {tag}: {line}");
                 let _ = said.send(line_frame(T_LAN_SAID, &line));
             };
             // The LAN lives exactly as long as the client's connection.
@@ -875,8 +960,14 @@ impl vox_core::node::ipc::Extension for LanUp {
                 stop,
             )
             .await;
-            if let Err(e) = out {
-                let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+            match out {
+                Ok(()) => eprintln!(
+                    "vox daemon: {who}: a LAN stopped: its `vox lan up` closed its connection"
+                ),
+                Err(e) => {
+                    eprintln!("vox daemon: {who}: a LAN could not run: {e}");
+                    let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+                }
             }
             drop(say);
             drop(tx);

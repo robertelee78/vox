@@ -43,7 +43,12 @@ impl Account {
     fn new() -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("vd")
-            .tempdir_in("/private/tmp")
+            // Short, for the socket path: macOS's /private/tmp, else /tmp (Linux).
+            .tempdir_in(if Path::new("/private/tmp").is_dir() {
+                "/private/tmp"
+            } else {
+                "/tmp"
+            })
             .unwrap();
         let data = tmp.path().join("d");
         let cfg = tmp.path().join("c");
@@ -702,4 +707,135 @@ fn a_hook_is_answered_within_its_bound_while_its_node_detaches() {
         assert!(dok, "PRODUCT (staging): the detach failed: {dout}{derr}");
     });
     stop_pid(pid);
+}
+
+/// One hook turn run as a harness runs it, with its output also on descriptors 3 and 4 (what a
+/// harness's pipe that reaches the hook without close-on-exec looks like), read to its end.
+/// `Some(stdout)` once its stdout and stderr both closed within `within`, `None` if they did not.
+fn hook_read_to_end(a: &Account, session: &str, within: Duration) -> (Option<String>, Child) {
+    use std::io::Read as _;
+    let input = format!(r#"{{"hook_event_name":"UserPromptSubmit","session_id":"{session}"}}"#);
+    // The hook through the shell, so its stdout and stderr are also on 3 and 4, inherited.
+    let template = a.cmd(&[]);
+    let mut sh = Command::new("/bin/sh");
+    sh.args(["-c", r#"exec "$0" agent hook --node agent 3>&1 4>&2"#, VOX])
+        .env_clear();
+    for (k, v) in template.get_envs() {
+        if let Some(v) = v {
+            sh.env(k, v);
+        }
+    }
+    let mut child = sh
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: spawn the hook through sh");
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out.read_to_string(&mut s);
+        let _ = tx.send((0, s));
+    });
+    std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s);
+        let _ = tx2.send((1, s));
+    });
+    let deadline = Instant::now() + within;
+    let (mut stdout, mut stderr) = (None, None);
+    while stdout.is_none() || stderr.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((0, s)) => stdout = Some(s),
+            Ok((_, s)) => stderr = Some(s),
+            Err(_) => return (None, child),
+        }
+    }
+    (stdout, child)
+}
+
+/// ADR-026 S-2, #405: **a daemon a hook starts keeps none of the hook's descriptors.** Two hooks
+/// at once, five times, each run as a harness runs one and read to the end of its output, while
+/// one of them starts the daemon. Each hook's output closes when the hook exits, though the daemon
+/// it started runs on, and the daemon holds no pipe.
+#[test]
+#[ignore = "real binaries with production Argon2id; run in release"]
+fn a_hooks_output_closes_while_the_daemon_it_started_runs() {
+    watchdog::arm();
+    for round in 1..=5 {
+        let a = Account::new();
+        a.make_node("agent");
+        let results = std::thread::scope(|s| {
+            let one = s.spawn(|| hook_read_to_end(&a, "s-1", Duration::from_secs(40)));
+            let two = s.spawn(|| hook_read_to_end(&a, "s-2", Duration::from_secs(40)));
+            [one.join().unwrap(), two.join().unwrap()]
+        });
+        let pid = a.lock_pid();
+        let lsof = pid
+            .map(|p| {
+                Command::new("lsof")
+                    .args(["-n", "-P", "-p", &p.to_string()])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let pipes: Vec<&str> = lsof
+            .lines()
+            .filter(|l| l.contains("PIPE") || l.contains(" pipe"))
+            .collect();
+        let mut closed = true;
+        for (i, (got, mut child)) in results.into_iter().enumerate() {
+            match got {
+                Some(out) => {
+                    let _ = child.wait();
+                    assert!(
+                        !out.contains("could not read your rooms"),
+                        "PRODUCT (staging): round {round}, hook {}: {out}",
+                        i + 1
+                    );
+                }
+                None => {
+                    closed = false;
+                    eprintln!(
+                        "[proof] round {round}: hook {}'s output did not close in 40 s",
+                        i + 1
+                    );
+                    let _ = child.kill();
+                }
+            }
+        }
+        println!(
+            "[proof] round {round}: both hooks' output closed: {closed}; daemon {pid:?} holds {} \
+             pipe(s)",
+            pipes.len()
+        );
+        if let Some(p) = pid {
+            if !closed || !pipes.is_empty() {
+                stop_pid(p);
+            }
+        }
+        assert!(
+            closed && pipes.is_empty(),
+            "PRODUCT: round {round}: a daemon a hook started holds the hook's descriptors, so a \
+             harness reading its hook to the end waits for the daemon (#405). Its pipes:\n{}\n\
+             log:\n{}",
+            pipes.join("\n"),
+            a.log()
+        );
+        for s in ["s-1", "s-2"] {
+            let _ = a.hook("agent", s, "SessionEnd");
+        }
+        if let Some(p) = pid {
+            assert!(
+                wait_until(Duration::from_secs(15), || !alive(p)),
+                "PRODUCT (staging): round {round}: the daemon did not leave once idle"
+            );
+        }
+    }
 }

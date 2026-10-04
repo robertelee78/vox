@@ -12,16 +12,16 @@
 //! **What must hold, for each holder** — a host's `vox serve` (the room-making verbs' path) and a
 //! guest's `vox forward` (the tunnel verbs' path):
 //!
-//! 1. a second one-shot verb on the held profile is refused, with the message;
-//! 2. the control socket the message names **exists and is a socket**;
-//! 3. the remedy it names **works**: `vox room list` succeeds while the holder runs, through
-//!    that socket, and lists the room the holder has open; and `vox status --json` answers;
+//! 1–2. (withdrawn: since ADR-026 a second holder is another client of the node the daemon
+//!    holds, so there is no second opener to refuse, and the control socket is the account's;)
+//! 3. the one-shot verbs **work**: `vox room list` succeeds while the holder runs, through the
+//!    daemon, and lists the room the holder has open; and `vox status --json` answers;
 //! 4. the steps `vox serve` prints **work while it runs** (V210-83): "ask them for `vox id`,
 //!    then run `vox trust add <fingerprint>`" and "`vox trust list` shows who you have decided
 //!    about". Both are run against each holder, and the one trusted must then be listed.
 //!
-//! Mutation: not binding the control socket for the one-shot verbs (`serve_control_socket` never
-//! called) turns (2), (3) and (4) red for both holders.
+//! Mutation: the daemon refusing a one-shot verb's `Use` of a node a held verb attached
+//! (treating it as unattached) turns (3) and (4) red for both holders.
 
 #![cfg(unix)]
 
@@ -34,47 +34,17 @@ mod world;
 #[path = "support/relay.rs"]
 mod relay;
 
-use std::os::unix::fs::FileTypeExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use relay::{RelayWorld, Split};
 use world::{args, vox_once};
 
 /// Everything wrong with how `dir`'s profile answers while something holds it.
 fn check_holder(holder: &str, dir: &Path, room: &str, stranger: &str, failures: &mut Vec<String>) {
-    // 1. a second process on the held profile is refused, with the message.
-    let (ok, out, err) = vox_once(dir, &args(&["serve", "9=9", "--listen", "127.0.0.1:0"]));
-    let said = format!("{out}{err}");
-    eprintln!(
-        "[{holder}] a second `vox serve` says: ok={ok}: {}",
-        said.trim()
-    );
-    if ok || !said.contains("already running for this profile") {
-        failures.push(format!(
-            "{holder}: a second verb was not refused as busy: ok={ok}: {said}"
-        ));
-        return;
-    }
-    let Some(socket) = said
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Its control socket is "))
-        .map(|s| PathBuf::from(s.trim()))
-    else {
-        failures.push(format!(
-            "{holder}: the message names no control socket: {said}"
-        ));
-        return;
-    };
-    // 2. the socket it names exists, and is a socket.
-    let is_socket = std::fs::metadata(&socket).is_ok_and(|m| m.file_type().is_socket());
-    eprintln!("[{holder}] {} is a socket: {is_socket}", socket.display());
-    if !is_socket {
-        failures.push(format!(
-            "{holder}: the control socket it names, {}, is not there",
-            socket.display()
-        ));
-    }
-    // 3. the remedy it names works, through the running node.
+    // (1)–(2) withdrawn: since ADR-026 a second holder is another client of the same node, not
+    // a second opener to refuse (the daemon is the one opener, D-1), and the one control socket
+    // is the account's.
+    // 3. the one-shot verbs answer, through the daemon that holds the node for the holder.
     let (ok, out, err) = vox_once(dir, &args(&["room", "list"]));
     eprintln!(
         "[{holder}] `vox room list`: ok={ok}: {}{}",

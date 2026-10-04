@@ -115,7 +115,8 @@ try:
     chosen = after[0]
     tui.key("x", 1)
     said = f"tunnel {chosen} "
-    gone = "was closed by a person in the TUI"
+    # The TUI closes it through its node in the daemon, which words it from the node's side.
+    gone = "was closed by a person on this side"
     if not tui.until(lambda: any(said in r and gone in r for r in tui.display()), 20, 0.25):
         cue("red", f"{chosen}\n{tui.text()}")
         print(f"{TAG} RED: after `x`, the TUI never said tunnel {chosen} {gone!r}:\n{tui.text()}")

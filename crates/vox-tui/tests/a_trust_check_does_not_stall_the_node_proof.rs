@@ -178,7 +178,13 @@ fn a_trust_check_does_not_stall_posts_and_reads_on_the_same_node() {
                             ],
                         )
                     };
-                    assert!(o.ok, "PRODUCT (staging): a checked keyring change: {o:?}");
+                    // Made, every time: the right passphrase was given. A refusal here ("needs
+                    // your identity passphrase again") is a check that passed and did not count —
+                    // two checks racing to restart the window — a lost event, PRODUCT.
+                    assert!(
+                        o.ok,
+                        "PRODUCT: a keyring change given the right passphrase was refused: {o:?}"
+                    );
                     add = !add;
                     checks.fetch_add(1, Ordering::SeqCst);
                 }

@@ -178,7 +178,7 @@ pub struct ViewModel {
 /// an error can never carry plaintext, a key, or a passphrase into the UI/logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiError {
-    /// Wrong channel passphrase on join.
+    /// Wrong room passphrase on join.
     WrongPassphrase,
     /// The identity opened, but what it sealed in the store would not (V210-40).
     SealedUnreadable,
@@ -221,7 +221,8 @@ pub enum UiError {
     TooLong,
     /// The trust keyring holds its maximum number of identities.
     KeyringFull,
-    /// Persisting to the store failed; reopen the channel.
+    /// A write to this node's files failed for a reason the TUI has no fault for. A fault that
+    /// names its file is shown in its own words instead (`live::failed`).
     Storage,
     /// The tunnel to close is no longer open (V030-11).
     NoSuchTunnel,
@@ -293,7 +294,7 @@ impl UiError {
             }
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
-            UiError::EpochMismatch => "channel epoch changed (passphrase rotated) — re-syncing",
+            UiError::EpochMismatch => "the room's passphrase was changed — re-syncing",
             UiError::MissingConsent => "you'll see this member once they consent to you",
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",
@@ -306,7 +307,7 @@ impl UiError {
                 "another vox is still running as this node — stop it, then try again"
             }
             UiError::NotAttached => "this node is not attached — :attach and give its passphrase",
-            UiError::ChannelNotOpen => "channel is not open — select it and enter its passphrase",
+            UiError::ChannelNotOpen => "this room is not open — select it and enter its passphrase",
             UiError::TooLong => "too long",
             // The cap in force (#85), as `Fault::KeyringFull` names it.
             UiError::KeyringFull => {
@@ -318,11 +319,11 @@ impl UiError {
                     )
                 })
             }
-            UiError::Storage => "could not save — reopen the channel",
+            UiError::Storage => "could not write this node's files — check free disk space, and that the data directory is writable",
             UiError::NotConsented => "nothing to revoke — this member was never consented to",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NoSuchTunnel => "that tunnel is no longer open",
-            UiError::Refused => "refused — check the channel passphrase",
+            UiError::Refused => "refused — check the room passphrase",
             UiError::NotNetworked => "this node is not on the network",
             UiError::AddressInUse => {
                 "a local port it needs is held by another program — pick another --listen"
