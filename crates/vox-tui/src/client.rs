@@ -258,10 +258,11 @@ pub fn said(at: &NodeSocket, e: Error) -> AppError {
     let node = &at.using.node;
     let path = at.path.display();
     AppError::Usage(match e {
-        Error::Ipc(IpcHandshake::Unreachable { .. }) => format!(
+        // The cause stays named (#191): the OS's reason the connect failed, beside the socket.
+        Error::Ipc(IpcHandshake::Unreachable { reason }) => format!(
             "no vox daemon is running for this data root, so node {node} is not attached.\n\
              \x20      Start one:  vox daemon      (or `vox node attach {node}`)\n\
-             \x20      Socket: {path}"
+             \x20      Socket: {path} ({reason})"
         ),
         Error::Ipc(IpcHandshake::Refused { reason }) => reason,
         Error::Ipc(h @ IpcHandshake::ClosedBeforeHello) => {

@@ -15,7 +15,7 @@
 //! three ways, on the words a person reads:
 //!
 //! 1. a **stale socket** (bound, then its listener gone): no vox daemon is running for this data
-//!    root, and how to start one;
+//!    root, how to start one, and the OS reason ("Connection refused");
 //! 2. a socket that **closes before greeting**: it accepted, "the node closed the connection before
 //!    greeting", and that it may be stopping;
 //! 3. a daemon on **another protocol**: "speaks a different control protocol", both protocol
@@ -148,6 +148,8 @@ fn a_failed_attach_says_why_in_a_persons_words() {
         &[
             "no vox daemon is running for this data root",
             "Start one:  vox daemon",
+            // The cause, named (#191): the OS's reason the connect failed.
+            "Connection refused",
         ],
         &internal,
     );
