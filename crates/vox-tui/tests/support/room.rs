@@ -631,15 +631,22 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
             ],
             Some(ROOM_PASS),
         );
+        // The joiner's own daemon too: under ADR-026 the join runs there, not in `vox room join`,
+        // which only asks for it — what it said of the steps it took and what each member answered
+        // is the half of the story the host cannot tell.
+        let joiner_err = tmp.join(format!("{}.daemon.err", w.name));
         assert!(
             o.ok,
             "PRODUCT: {} could not join the room: `vox room join` was refused after {:?} \
-             (exit {:?}).\nstdout:\n{}\nstderr:\n{}\nthe host {}'s daemon stderr:\n{}",
+             (exit {:?}).\nstdout:\n{}\nstderr:\n{}\nthe joiner {}'s daemon stderr:\n{}\nthe \
+             host {}'s daemon stderr:\n{}",
             w.name,
             t.elapsed(),
             o.code,
             o.stdout.trim(),
             o.stderr.trim(),
+            w.name,
+            read_log(&joiner_err),
             workers[0].name,
             read_log(&host_err)
         );
