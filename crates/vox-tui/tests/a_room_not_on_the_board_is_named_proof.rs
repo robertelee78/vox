@@ -22,14 +22,21 @@
 //! 1. **A mistyped room id.** A host `vox serve`s a room through anchor A. One character of the
 //!    room id is changed to another base32 digit, and a guest joins with that address: it parses,
 //!    reaches A (up, holding the real room), and A has nothing for it.
-//! 2. **An unpublished room.** Anchor A and the host are stopped — both hold the room, and the
-//!    address names both as boards — and the guest joins with the real address and its own anchor
-//!    B, which never had the room.
+//! 2. **A host that goes offline as it is read.** Anchor A is stopped, and the guest joins with the
+//!    real address and its own anchor B, which never had the room; while its read of the host is
+//!    held (a test knob on the host), the host's `vox serve` ends and its daemon stops the node.
+//!    Found on 8faf006a (#406): that moment, reached by chance, was reported as "the room's host
+//!    answered, then its connection closed … run the join again", though the host had gone
+//!    offline and B had nothing for the room.
+//! 3. **An unpublished room.** Anchor A and the host are both gone — both held the room, and the
+//!    address names both as boards — and the guest joins again the same way.
 //!
-//! Asserted in both: the join fails; the reason names the board reached and the room; the advice
+//! Asserted in each: the join fails; the reason names the board reached and the room; the advice
 //! names both causes (not published yet, host must be online; or a wrong room id) and never says
-//! the address is fine; and the old "will not parse" advice is gone. Mutation: returning
-//! `Fault::BadLink` for a board without the room turns it red.
+//! the address is fine; and the old "will not parse" advice is gone. Mutations: returning
+//! `Fault::BadLink` for a board without the room turns it red; so does taking a host that went
+//! offline as it was read for one that answered and closed (`went_offline` ignored in
+//! `Joiner::a_board_with_the_room`), in case 2.
 
 #![cfg(unix)]
 
@@ -38,6 +45,8 @@ mod watchdog;
 
 #[path = "support/world.rs"]
 mod world;
+
+use std::time::{Duration, Instant};
 
 use world::{after_label, args, echo_service, vox_once, VoxProc};
 
@@ -77,7 +86,9 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
     }
 
     // The room exists, and anchor A holds it: `vox serve` publishes before it prints the address.
-    let mut host = VoxProc::spawn(
+    // The host's daemon holds each board read it serves for a while (a test knob), so case 2 can
+    // stop the host while a join's read of it is in flight.
+    let mut host = VoxProc::spawn_env(
         "host",
         &host_dir,
         &args(&[
@@ -88,6 +99,10 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
             "--listen",
             "127.0.0.1:0",
         ]),
+        &[(
+            HOLD_BOARD_READ_ENV,
+            &HOLD_BOARD_READ.as_millis().to_string(),
+        )],
     );
     let room = after_label(
         &host.expect_line("room", |l| l.starts_with("room ")),
@@ -122,17 +137,81 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
     let said = join(&guest_dir, &wrong, &passphrase, &spec_a);
     assert_names_both_causes(&said, &board_a, &wrong_room, "a mistyped room id");
 
-    // ---- Case 2: the room is real, and nowhere the guest can reach holds it ----
+    // ---- Case 2: the host goes offline while the join reads it ----
     //
-    // Every board that holds the room goes away — anchor A, and the host itself, which the
+    // Anchor A goes away, so the boards up are the host and the guest's anchor B, which never had
+    // the room; the join reaches the host first (the address names it before B). While its read
+    // of the host is held, the host's `vox serve` ends: its daemon stops the node, which closes
+    // the connection the read is on. Found on 8faf006a (#406): a daemon finishing a node's stop
+    // after its last client went was reached by a join in that moment, and the join said "the
+    // room's host answered, then its connection closed … run the join again", with B saying it
+    // had nothing for the room. The host had gone offline, which is what leaves a room
+    // unpublished where a joiner looks: a board not reached.
+    drop(anchor_a);
+    let room12: String = room.chars().take(12).collect();
+    let before = world::log_tail(&host_dir, usize::MAX).lines().count();
+    let read_held = |since: usize| {
+        world::log_tail(&host_dir, usize::MAX)
+            .lines()
+            .skip(since)
+            .any(|l| l.contains("vox: test: holding a board read from"))
+    };
+    let (said, stopped_in_time) = std::thread::scope(|s| {
+        let joining = s.spawn(|| join(&guest_dir, &address, &passphrase, &spec_b));
+        let held = wait_for(Duration::from_secs(40), || read_held(before));
+        let t = Instant::now();
+        drop(host);
+        let detached = wait_for(Duration::from_secs(20), || {
+            world::log_tail(&host_dir, 40).contains("node default detached")
+        });
+        let stopped_in_time = held && detached && t.elapsed() < HOLD_BOARD_READ;
+        (
+            joining
+                .join()
+                .expect("APPARATUS: the join's thread panicked"),
+            stopped_in_time,
+        )
+    });
+    assert!(
+        stopped_in_time,
+        "CANNOT MEASURE: the host did not stop while the join's read of it was held ({} ms): the \
+         read was not seen held, or the host's node was not detached in time; the host's daemon \
+         log:\n{}\nthe join said:\n{said}",
+        HOLD_BOARD_READ.as_millis(),
+        world::log_tail(&host_dir, 40)
+    );
+    assert_names_both_causes(
+        &said,
+        &board_b,
+        &room12,
+        "a host gone offline as it was read",
+    );
+
+    // ---- Case 3: the room is real, and nowhere the guest can reach holds it ----
+    //
+    // Every board that holds the room has gone away — anchor A, and the host itself, which the
     // address also names as a board — and the one the guest can reach never had it. The host
     // being offline is also the field case: it is what leaves a room unpublished where a joiner
     // looks.
-    drop(anchor_a);
-    drop(host);
-    let room12: String = room.chars().take(12).collect();
     let said = join(&guest_dir, &address, &passphrase, &spec_b);
     assert_names_both_causes(&said, &board_b, &room12, "an unpublished room");
+}
+
+/// The host's test knob that holds each board read it serves, and for how long: long enough for
+/// the proof to see the hold and stop the host inside it.
+const HOLD_BOARD_READ_ENV: &str = "VOX_TEST_HOLD_BOARD_READ_MS";
+const HOLD_BOARD_READ: Duration = Duration::from_secs(8);
+
+/// Whether `ok` holds within `limit`, asking every 50 ms.
+fn wait_for(limit: Duration, mut ok: impl FnMut() -> bool) -> bool {
+    let t = Instant::now();
+    while t.elapsed() < limit {
+        if ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    ok()
 }
 
 /// `vox connect` the profile at `dir` with `address`, and everything it said.

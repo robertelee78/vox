@@ -1170,6 +1170,22 @@ pub async fn connect(
             },
         }
     };
+    // **What the join did, said** (#192): the node raises its steps before it answers, so they
+    // are in the subscription already; said as `join got in — <steps>` or `join did not get in —
+    // <steps>`, with anything else that explains a wait. **Whether it got in or not** (#406): a
+    // failed join returned on its answer, and its steps, still on their way in the subscription,
+    // were never said.
+    if following && !said_steps {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, steps.next()).await {
+            if let Frame::Event(ev) = frame {
+                say_if_it_explains_a_failure(&ev);
+                if matches!(ev, NodeEvent::JoinSteps { .. }) {
+                    break;
+                }
+            }
+        }
+    }
     match reply {
         Ok(Frame::Ok) => {}
         // The node sends the outcome's name, with its steps and what each responder said; turn
@@ -1191,20 +1207,6 @@ pub async fn connect(
         }
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
-    }
-    // **What the join did, said** (#192): the node raises its steps before it answers, so they
-    // are in the subscription already; said as `join got in — <steps>`, with anything else that
-    // explains a wait.
-    if following && !said_steps {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, steps.next()).await {
-            if let Frame::Event(ev) = frame {
-                say_if_it_explains_a_failure(&ev);
-                if matches!(ev, NodeEvent::JoinSteps { .. }) {
-                    break;
-                }
-            }
-        }
     }
     let channel_id = vox_core::node::link::InviteLink::parse(url)
         .map_err(|e| AppError::Usage(format!("joined, but the address no longer reads: {e}")))?

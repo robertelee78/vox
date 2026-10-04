@@ -86,6 +86,14 @@ impl std::fmt::Debug for SharedPolicy {
 #[cfg(feature = "test-knobs")]
 pub const TEST_ADVERTISE_ENV: &str = "VOX_TEST_ADVERTISE";
 
+/// Test-only: hold every board read this node serves (a rendezvous stream) this many milliseconds
+/// before answering it, saying so on stderr when it starts — so a proof can stop the node while a
+/// joiner's read of it is in flight, which a stopping host otherwise does only by chance (#406).
+/// **For proofs; nothing in a real deployment sets it.** Unset, empty or unparsable is no hold.
+/// Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_HOLD_BOARD_READ_ENV: &str = "VOX_TEST_HOLD_BOARD_READ_MS";
+
 /// How long a reach gives its direct dial before it asks any peer to carry a circuit (V210-122).
 ///
 /// **500 ms, not 250** (#321, attempt 3). A direct dial's first answer cannot come before the peer
@@ -800,6 +808,18 @@ impl NodeNet {
                 // (`nat::source::Source`). A relayed peer's address is this node's own mux handle,
                 // so it is known by identity instead.
                 let source = crate::nat::source::Source::of_conn(conn);
+                #[cfg(feature = "test-knobs")]
+                if let Some(ms) = std::env::var(TEST_HOLD_BOARD_READ_ENV)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                {
+                    eprintln!(
+                        "vox: test: holding a board read from {} for {ms}ms \
+                         ({TEST_HOLD_BOARD_READ_ENV})",
+                        short_id(peer)
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
                 self.service.serve_stream(peer, source, send, recv).await?;
                 Ok(Inbound::ServedRendezvous { peer })
             }
