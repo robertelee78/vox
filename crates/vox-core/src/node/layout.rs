@@ -59,14 +59,37 @@ pub fn anchor_name_of(name: &NodeName) -> Result<NodeName> {
 /// is locked or written when nothing needs moving. `starting` is the node about to run, whose old
 /// port `.daemon/port` takes first.
 ///
+/// The account lock is waited for, and the layout looked at again on every try: of two vox
+/// started together on an old data root, the first moves it and may then start the daemon, which
+/// holds the lock for its whole life (D-1); the second finds the layout moved and goes on.
+///
 /// # Errors
 /// [`Error::Path`] naming the directory and what to do, when an older vox holds a directory,
-/// a directory's name is not a node name, its new place is taken, or a file cannot be moved.
+/// a directory's name is not a node name, its new place is taken, or a file cannot be moved;
+/// or when another vox holds the account lock past
+/// [`PROFILE_PATIENCE`](crate::node::profile::PROFILE_PATIENCE) with the old layout still there.
 pub fn migrate(account: &Account, starting: Option<&NodeName>) -> Result<MigrationReport> {
-    if old_profiles(account).is_empty() && unsplit(account).is_empty() {
-        return Ok(MigrationReport::default());
-    }
-    let _lock = account.lock()?;
+    let started = std::time::Instant::now();
+    let _lock = loop {
+        if old_profiles(account).is_empty() && unsplit(account).is_empty() {
+            return Ok(MigrationReport::default());
+        }
+        if let Some(lock) = account.try_lock()? {
+            break lock;
+        }
+        if started.elapsed() >= crate::node::profile::PROFILE_PATIENCE {
+            return Err(Error::Path {
+                op: "take the account lock",
+                detail: format!(
+                    "another vox has held {} for {} s, and this data root is still in the layout \
+                     of a vox before v0.3.0; stop that vox, then run this again",
+                    account.lock_file().display(),
+                    crate::node::profile::PROFILE_PATIENCE.as_secs()
+                ),
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     let report = migrate_held(account, starting)?;
     // Said once, here, by the verb that met the old layout; the daemon, which migrates through
     // [`migrate_held`], says it in its own words (ADR-026 F-3).
