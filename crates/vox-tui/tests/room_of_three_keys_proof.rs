@@ -27,6 +27,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/attach.rs"]
+mod attach;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -227,32 +229,41 @@ fn every_member_eventually_reads_every_other(order: [&'static str; 2]) {
     ];
     let fps: Vec<String> = members.iter().map(Member::fingerprint).collect();
     for (i, m) in members.iter().enumerate() {
-        for (j, other) in members.iter().enumerate() {
-            if i == j {
-                continue;
+        // Trust is a one-shot verb: its node is attached for it and let go after, before the
+        // member's own daemon starts (ADR-026 L-2).
+        let root = attach::Root {
+            data: m.data.clone(),
+            cfg: m.cfg.clone(),
+            passphrase: ID_PASS.trim_end_matches('\n').to_owned(),
+        };
+        root.attached("default", || {
+            for (j, other) in members.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                if mutate == "carol-never-trusts-bob" && m.name == "carol" && other.name == "bob" {
+                    eprintln!("[mutation] carol never trusts bob");
+                    continue;
+                }
+                let (ok, _, err) = m.vox(
+                    &[
+                        "trust",
+                        "add",
+                        &fps[j],
+                        "--name",
+                        other.name,
+                        "--identity-passphrase-file",
+                        m.pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
+                    ],
+                    None,
+                );
+                assert!(
+                    ok,
+                    "PRODUCT (staging): {} could not trust {}: {err}",
+                    m.name, other.name
+                );
             }
-            if mutate == "carol-never-trusts-bob" && m.name == "carol" && other.name == "bob" {
-                eprintln!("[mutation] carol never trusts bob");
-                continue;
-            }
-            let (ok, _, err) = m.vox(
-                &[
-                    "trust",
-                    "add",
-                    &fps[j],
-                    "--name",
-                    other.name,
-                    "--identity-passphrase-file",
-                    m.pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
-                ],
-                None,
-            );
-            assert!(
-                ok,
-                "PRODUCT (staging): {} could not trust {}: {err}",
-                m.name, other.name
-            );
-        }
+        });
     }
     let _daemons: Vec<Proc> = members
         .iter()
