@@ -53,21 +53,6 @@ pub struct ServiceRoom {
     pub host: Digest32,
     /// The service's name, as its sharer gave it.
     pub service: String,
-    /// Whether the share carries datagrams (ADR-022): its tag is then `udp/<name>`.
-    pub udp: bool,
-}
-
-impl ServiceRoom {
-    /// The tag the host offers it under: `udp/<name>` for a UDP share (ADR-022 decision 6),
-    /// else its name. What a forward asks the host for.
-    #[must_use]
-    pub fn tag(&self) -> String {
-        if self.udp {
-            format!("udp/{}", self.service)
-        } else {
-            self.service.clone()
-        }
-    }
 }
 
 /// One room this machine holds, as naming needs it.
@@ -77,8 +62,8 @@ struct NamedRoom {
     label: String,
     /// Its current members.
     members: Vec<Digest32>,
-    /// The services its log says are shared: `(sharer, name, udp)`.
-    shares: Vec<(Digest32, String, bool)>,
+    /// The services its log says are shared: `(sharer, name)`.
+    shares: Vec<(Digest32, String)>,
 }
 
 /// The `.vox` names this machine can resolve.
@@ -129,12 +114,12 @@ impl VoxResolver {
     }
 
     /// Record that `host` shares `name` in `channel_id`, so its fingerprint resolves.
-    pub fn add_share(&mut self, channel_id: Digest32, host: Digest32, name: &str, udp: bool) {
+    pub fn add_share(&mut self, channel_id: Digest32, host: Digest32, name: &str) {
         self.rooms
             .entry(channel_id)
             .or_default()
             .shares
-            .push((host, name.to_owned(), udp));
+            .push((host, name.to_owned()));
     }
 
     /// Name a trusted identity, as this node's keyring does.
@@ -195,39 +180,27 @@ impl VoxResolver {
         }
         let channel_id = self.room(room)?;
         let host = self.node(node, room, &channel_id)?;
-        let (service, udp) = self.service(service, &channel_id, &host);
+        let service = self.service(service, &channel_id, &host);
         Ok(ServiceRoom {
             channel_id,
             host,
             service,
-            udp,
         })
     }
 
     /// The service a `<service>` label names: a share's name when it is that share's
     /// fingerprint, else the label as the name. Whether the host offers it is the host's to say.
-    ///
-    /// **And whether it carries datagrams** (ADR-022): a UDP share is offered under `udp/<name>`,
-    /// and a forward to it must be a UDP forward. Read from the share the host's log holds, by
-    /// name or by fingerprint; a name the log does not hold is taken as a stream.
-    fn service(&self, label: &str, channel_id: &Digest32, host: &Digest32) -> (String, bool) {
-        let shares = self
-            .rooms
-            .get(channel_id)
-            .map(|r| r.shares.as_slice())
-            .unwrap_or_default();
+    fn service(&self, label: &str, channel_id: &Digest32, host: &Digest32) -> String {
         if let Ok(fp) = b32_decode(label, "vox service") {
-            if let Some((_, name, udp)) = shares
-                .iter()
-                .find(|(h, n, _)| h == host && service_fingerprint(channel_id, h, n) == fp)
-            {
-                return (name.clone(), *udp);
+            if let Some((_, name)) = self.rooms.get(channel_id).and_then(|r| {
+                r.shares
+                    .iter()
+                    .find(|(h, n)| h == host && service_fingerprint(channel_id, h, n) == fp)
+            }) {
+                return name.clone();
             }
         }
-        let udp = shares
-            .iter()
-            .any(|(h, n, udp)| h == host && n.as_str() == label && *udp);
-        (label.to_owned(), udp)
+        label.to_owned()
     }
 
     fn room(&self, label: &str) -> Result<Digest32, String> {

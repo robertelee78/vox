@@ -81,9 +81,7 @@ pub async fn serve(stream: &mut UnixStream, handle: &NodeHandle, req: NameReques
                         .uint(T_RESOLVED)
                         .bytes(&room.channel_id)
                         .bytes(&room.host)
-                        // The tag the host offers it under, so a forward to a UDP share is a
-                        // UDP forward (ADR-022 decision 6).
-                        .text(&room.tag());
+                        .text(&room.service);
                     e.finish()
                 }
                 Err(why) => error(why),
