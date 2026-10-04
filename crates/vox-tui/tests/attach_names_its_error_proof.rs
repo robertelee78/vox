@@ -11,16 +11,15 @@
 //! the raw error was not enough either: the handshake failures read "malformed identity bundle:
 //! ipc protocol version", which names a problem that does not exist.
 //!
-//! What it asserts, for `vox room list` against three sockets that each fail one way, on the
-//! words a person reads:
+//! What it asserts, for `vox room list` against the data root's account socket (ADR-026 C-1) failing
+//! three ways, on the words a person reads:
 //!
-//! 1. a **stale socket** (bound, then its listener gone): "nothing is listening on it", the OS
-//!    reason, and that the node may have stopped;
-//! 2. a socket that **closes before greeting**: "the node closed the connection before
-//!    greeting";
-//! 3. a node on **another protocol**: "speaks a different control protocol", both protocol
-//!    numbers, and "update one of them" — and *not* that the node may have stopped, which is
-//!    false there.
+//! 1. a **stale socket** (bound, then its listener gone): no vox daemon is running for this data
+//!    root, and how to start one;
+//! 2. a socket that **closes before greeting**: it accepted, "the node closed the connection before
+//!    greeting", and that it may be stopping;
+//! 3. a daemon on **another protocol**: "speaks a different control protocol", both protocol
+//!    numbers, and "update one of them" — and *not* that it may be stopping, which is false there.
 //!
 //! No message may say "identity bundle", and each exits non-zero.
 //!
@@ -84,11 +83,23 @@ fn profile() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, sock)
 }
 
-/// Serve one connection on `sock` with `answer`, on a thread.
-fn serve_once(sock: &Path, answer: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static) {
+/// Serve every connection on `sock` with `answer`, on a thread — holding the data root's daemon lock
+/// (`<socket's dir>/lock`) meanwhile, as a daemon does, so a client takes what answers there for
+/// the daemon and reaches it.
+fn serve_once(sock: &Path, answer: impl Fn(std::os::unix::net::UnixStream) + Send + 'static) {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(sock.with_file_name("lock"))
+        .expect("APPARATUS: the daemon lock");
+    lock.try_lock().expect("APPARATUS: take the daemon lock");
     let l = UnixListener::bind(sock).expect("APPARATUS: bind a socket");
+    // Every connection the same way: a client may look at the daemon's greeting (to resolve its
+    // node) before it opens the connection it sends its request on.
     std::thread::spawn(move || {
-        if let Ok((s, _)) = l.accept() {
+        let _held = lock;
+        for s in l.incoming().map_while(Result::ok) {
             answer(s);
         }
     });
@@ -132,10 +143,11 @@ fn a_failed_attach_says_why_in_a_persons_words() {
     check(
         "stale socket",
         stale.path(),
+        // Since ADR-026 a refused connect means no daemon holds the data root: said as that,
+        // with how to start one.
         &[
-            "nothing is listening on it",
-            "Connection refused",
-            "may have stopped",
+            "no vox daemon is running for this data root",
+            "Start one:  vox daemon",
         ],
         &internal,
     );
@@ -146,7 +158,10 @@ fn a_failed_attach_says_why_in_a_persons_words() {
     check(
         "closed before greeting",
         closed.path(),
-        &["the node closed the connection before greeting"],
+        &[
+            "accepted, but the node closed the connection before greeting",
+            "may be stopping",
+        ],
         &internal,
     );
 
@@ -168,7 +183,7 @@ fn a_failed_attach_says_why_in_a_persons_words() {
     let mine = format!("this vox is protocol {PROTOCOL_VERSION}");
     let theirs = format!("the node is protocol {}", PROTOCOL_VERSION + 1);
     let mut unsaid = internal.to_vec();
-    unsaid.push("may have stopped");
+    unsaid.push("may be stopping");
     check(
         "other protocol",
         other.path(),
