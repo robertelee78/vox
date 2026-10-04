@@ -128,7 +128,7 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
         })
         .collect();
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
-        "node {} · Channels (Enter: open · : command)",
+        "node {} · Rooms (Enter: open · : command)",
         vm.node
     )));
     frame.render_widget(list, area);
@@ -198,7 +198,7 @@ fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
 
 fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiState) {
     let Some(channel) = vm.active.as_ref() else {
-        let p = Paragraph::new("No channel open").block(Block::default().borders(Borders::ALL));
+        let p = Paragraph::new("No room open").block(Block::default().borders(Borders::ALL));
         frame.render_widget(p, area);
         return;
     };

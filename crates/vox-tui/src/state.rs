@@ -43,15 +43,9 @@ impl PromptKind {
         match self {
             PromptKind::Attach => &["identity passphrase"],
             PromptKind::CreateIdentity => &["new identity passphrase", "confirm passphrase"],
-            PromptKind::CreateChannel => {
-                &["channel name", "channel passphrase", "confirm passphrase"]
-            }
-            PromptKind::OpenChannel => &["channel passphrase"],
-            PromptKind::JoinChannel => &[
-                "invite link (vox://…)",
-                "channel name",
-                "channel passphrase",
-            ],
+            PromptKind::CreateChannel => &["room name", "room passphrase", "confirm passphrase"],
+            PromptKind::OpenChannel => &["room passphrase"],
+            PromptKind::JoinChannel => &["invite link (vox://…)", "room name", "room passphrase"],
         }
     }
 
@@ -73,9 +67,9 @@ impl PromptKind {
         match self {
             PromptKind::Attach => "Attach node",
             PromptKind::CreateIdentity => "Create identity",
-            PromptKind::CreateChannel => "Create channel",
-            PromptKind::OpenChannel => "Open channel",
-            PromptKind::JoinChannel => "Join channel",
+            PromptKind::CreateChannel => "Create room",
+            PromptKind::OpenChannel => "Open room",
+            PromptKind::JoinChannel => "Join room",
         }
     }
 }
@@ -481,7 +475,7 @@ impl UiState {
             PromptKind::CreateChannel => {
                 let name = p.fields[0].trim().to_owned();
                 if name.is_empty() {
-                    self.status_message = Some("channel name is required".into());
+                    self.status_message = Some("room name is required".into());
                     self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateChannel, None));
                     return Action::Redraw;
                 }
@@ -503,7 +497,7 @@ impl UiState {
                 let link = p.fields[0].trim().to_owned();
                 let name = p.fields[1].trim().to_owned();
                 if link.is_empty() || name.is_empty() {
-                    self.status_message = Some("a link and a channel name are required".into());
+                    self.status_message = Some("a link and a room name are required".into());
                     let mut again = Prompt::new(PromptKind::JoinChannel, None);
                     again.fields[0] = Zeroizing::new(link);
                     self.mode = Mode::Prompt(again);

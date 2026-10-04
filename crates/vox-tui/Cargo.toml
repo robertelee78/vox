@@ -80,6 +80,11 @@ getrandom.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
 
+# A daemon a client starts closes every descriptor it inherited past stdio (ADR-026 S-2), with
+# nix's safe `close`, so `#![forbid(unsafe_code)]` holds on Linux too.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]
 # The at-rest floor proof re-derives the vault key the binary wrote, independently of

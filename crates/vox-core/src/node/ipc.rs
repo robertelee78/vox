@@ -2371,10 +2371,19 @@ pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10
 /// The error for a node that closed the connection before replying (V210-101): never "malformed",
 /// since nothing arrived to be malformed. A fresh connection, bounded, tells a node that is gone
 /// from one that ended this request itself.
+///
+/// **Running means greeting, not accepting**: a process being killed closes its connections and
+/// its listening socket in whatever order the kernel takes, and a connect in between lands in the
+/// backlog of a listener about to close. Measured: a daemon SIGKILLed mid-request was reported
+/// "still running". Only a hello read back counts.
 pub async fn hung_up(path: &Path) -> Error {
     let still_running = matches!(
-        tokio::time::timeout(ANSWER_WITHIN, connect_own(path)).await,
-        Ok(Ok(_))
+        tokio::time::timeout(ANSWER_WITHIN, async {
+            let mut s = connect_own(path).await?;
+            read_frame(&mut s).await
+        })
+        .await,
+        Ok(Ok(Some(_)))
     );
     Error::Ipc(IpcHandshake::HungUp { still_running })
 }
@@ -3072,12 +3081,43 @@ async fn verify_operator(
 /// one is checked too, and a match counts as the passphrase entered, opening the window; a
 /// mismatch is "none given", not a wrong passphrase. Without that, an identity with no
 /// passphrase could never change its keyring once the window had passed.
-async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<(), Frame> {
+///
+/// Answers whether the passphrase was proved: a proved change is made as
+/// [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved), which the window does not
+/// refuse.
+async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<bool, Frame> {
     if passphrase.is_empty() {
-        let _ = verify_operator(handle, passphrase).await;
-        return Ok(());
+        return Ok(verify_operator(handle, passphrase).await.is_ok());
     }
-    verify_operator(handle, passphrase).await
+    verify_operator(handle, passphrase).await.map(|()| true)
+}
+
+/// **For proofs only.** When set, a keyring change whose passphrase was just proved waits this
+/// many milliseconds between the check and the change, which stands for a daemon too busy to
+/// make it at once, past the keyring window. Nothing a person runs sets it; unset, nothing
+/// changes. Not compiled in without the `test-knobs` feature.
+#[cfg(feature = "test-knobs")]
+pub const TEST_PROVED_CHANGE_DELAY_ENV: &str = "VOX_TEST_PROVED_CHANGE_DELAY_MS";
+
+/// `change`, as [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved) when its
+/// passphrase was just proved.
+async fn proved_if(
+    proved: bool,
+    change: crate::node::api::NodeCommand,
+) -> crate::node::api::NodeCommand {
+    if !proved {
+        return change;
+    }
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var(TEST_PROVED_CHANGE_DELAY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+    crate::node::api::NodeCommand::Proved {
+        change: Box::new(change),
+    }
 }
 
 /// One page of a collection reply: entries in id order, strictly after `after`, at most
@@ -3147,16 +3187,22 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             full_history,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::TrustWith {
-                    fingerprint: target,
-                    petname,
-                    history: if full_history {
-                        crate::node::trust::HistoryGrant::Full
-                    } else {
-                        crate::node::trust::HistoryGrant::Now
-                    },
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::TrustWith {
+                            fingerprint: target,
+                            petname,
+                            history: if full_history {
+                                crate::node::trust::HistoryGrant::Full
+                            } else {
+                                crate::node::trust::HistoryGrant::Now
+                            },
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3189,10 +3235,16 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Untrust {
-                    fingerprint: target,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Untrust {
+                            fingerprint: target,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
@@ -3207,11 +3259,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             identity_passphrase,
         } => match verify_given(handle, identity_passphrase).await {
             Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::Rename {
-                    fingerprint: target,
-                    petname,
-                })
+            Ok(proved) => match handle
+                .apply(
+                    proved_if(
+                        proved,
+                        crate::node::api::NodeCommand::Rename {
+                            fingerprint: target,
+                            petname,
+                        },
+                    )
+                    .await,
+                )
                 .await
             {
                 crate::node::api::Outcome::Done => Frame::Ok,
