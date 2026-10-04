@@ -343,6 +343,10 @@ pub struct Waiting {
     /// A server's verb (`vox serve`): being stopped is how it ends, so a stop is a clean exit, not
     /// an error (V210-108).
     serves: bool,
+    /// A held client verb (`vox up`, `vox forward`, `vox lan up`): it runs until stopped too, but
+    /// it is a client, so a stop says `stopped by <SIGNAL>` and exits 128 + the signal's number
+    /// (V210-108).
+    held: bool,
 }
 
 impl Waiting {
@@ -356,7 +360,28 @@ impl Waiting {
             outcome,
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
             serves: false,
+            held: false,
         })
+    }
+
+    /// [`Waiting::new`] for a held client verb (`vox up`, `vox forward`, `vox lan up`): see
+    /// [`Waiting::held`].
+    #[must_use]
+    pub fn client() -> std::sync::Arc<Self> {
+        let now = Instant::now();
+        std::sync::Arc::new(Self {
+            started: now,
+            outcome: "it was running",
+            now: std::sync::Mutex::new((String::from("the verb to start"), now)),
+            serves: false,
+            held: true,
+        })
+    }
+
+    /// Whether this is a held client verb, whose stop is `stopped by <SIGNAL>`, 128 + n.
+    #[must_use]
+    pub fn held(&self) -> bool {
+        self.held
     }
 
     /// [`Waiting::new`] for a server's verb, which runs until it is stopped: a stop is its normal
@@ -369,6 +394,7 @@ impl Waiting {
             outcome: "it was serving",
             now: std::sync::Mutex::new((String::from("the verb to start"), now)),
             serves: true,
+            held: false,
         })
     }
 
