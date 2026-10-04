@@ -13225,7 +13225,14 @@ impl Node {
                 };
                 let relayed = crate::node::net::path_class(endpoint, &conn)
                     == crate::node::net::PathClass::Relayed;
-                let datagrams = conn.datagram_stats();
+                // **Every connection to the peer that still carries traffic** (R35): a flow stays
+                // on the connection it began on when a better path displaces it, and the
+                // displaced one is retired, not closed, until that traffic is done. Counting only
+                // the primary said no datagram moved while a flow carried thousands.
+                let mut datagrams = conn.datagram_stats();
+                for retired in net.manager().retiring_to(peer) {
+                    add_stats(&mut datagrams, &retired.datagram_stats());
+                }
                 add_stats(&mut report.datagrams, &datagrams);
                 report.peers.push(PeerStatus {
                     id: *peer,

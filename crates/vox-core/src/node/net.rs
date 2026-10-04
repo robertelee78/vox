@@ -562,6 +562,17 @@ impl ConnectionManager {
         lock(&self.conns).get(peer).is_some_and(|c| is_live(c))
     }
 
+    /// The live connections to `peer` a better path displaced, which still carry what was already on
+    /// them (a tunnel, a datagram flow), **looking only**, like [`Self::holds`].
+    #[must_use]
+    pub fn retiring_to(&self, peer: &Digest32) -> Vec<Arc<VoxConnection>> {
+        lock(&self.retiring)
+            .iter()
+            .filter(|(c, _)| c.peer_id() == *peer && is_live(c))
+            .map(|(c, _)| Arc::clone(c))
+            .collect()
+    }
+
     /// The live connection held for `peer`, **looking only**, like [`Self::holds`].
     #[must_use]
     pub fn held(&self, peer: &Digest32) -> Option<Arc<VoxConnection>> {
