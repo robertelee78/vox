@@ -489,39 +489,64 @@ else
 fi
 
 # ---- 3. mDNS ----
+# Carol is judged by her LAN's counters, not her socket. On one Mac the kernel also hands a
+# packet sent on one utun to a matching socket on another, without any LAN carrying it (see 4);
+# what Vox delivered to carol is what her LAN wrote into her interface (to_os) and took from a
+# peer (from_peers). On separate machines the socket would be the evidence too.
 say "3. mDNS: query vox-lan-proof.local on alice, responder on bob, carol listening"
+B0=$(counter bob from_peers); CT0=$(counter carol to_os); CP0=$(counter carol from_peers)
 "${PROBE[@]}" mdns-respond "$IF_bob" "$V4_bob" 12 >"$WORK/mdns-respond.json" &
-PIDS+=($!)
+MDNS_BOB=$!
+PIDS+=("$MDNS_BOB")
 "${PROBE[@]}" mdns-listen "$IF_carol" "$V4_carol" 12 >"$WORK/mdns-carol.json" &
-PIDS+=($!)
+MDNS_CAROL=$!
+PIDS+=("$MDNS_CAROL")
 sleep 1
 Q=$(probe mdns-query "$IF_alice" "$V4_alice" 8)
-sleep 4
-echo "alice's query: $Q; bob's responder: $(cat "$WORK/mdns-respond.json"); carol heard: $(cat "$WORK/mdns-carol.json")"
+# Both listeners write their file when their 12 s are up: read them only then.
+wait "$MDNS_BOB" "$MDNS_CAROL" 2>/dev/null
+sleep 1 # the stats file is written twice a second
+DB=$(($(counter bob from_peers) - B0))
+DCT=$(($(counter carol to_os) - CT0)); DCP=$(($(counter carol from_peers) - CP0))
+echo "alice's query: $Q; bob's responder: $(cat "$WORK/mdns-respond.json"); bob's LAN +$DB from peers"
+echo "carol's LAN: +$DCT written to her interface, +$DCP from peers; (same-host note) carol's socket: $(cat "$WORK/mdns-carol.json")"
 GOT=$(echo "$Q" | "$PY" -c "import json,sys; print('$V4_bob' in json.load(sys.stdin)['answers'])")
-HEARD=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["heard"])' "$WORK/mdns-carol.json" 2>/dev/null || echo "?")
-if [[ $GOT == True && $HEARD == 0 ]]; then
-    pass "mdns: alice resolved vox-lan-proof.local to bob's $V4_bob; carol heard 0 packets"
+if [[ $GOT == True && $DB -ge 1 && $DCT == 0 && $DCP == 0 ]]; then
+    pass "mdns: alice resolved vox-lan-proof.local to bob's $V4_bob through bob's LAN (+$DB); carol's LAN delivered 0"
 else
-    fail "mdns: answer from bob: $GOT; carol heard: $HEARD"
+    fail "mdns: answer from bob: $GOT, bob's LAN +$DB; carol's LAN delivered $DCT (from peers $DCP)"
 fi
 
 # ---- 4. broadcast ----
+# **Same-host broadcast loopback.** macOS hands a broadcast sent on alice's utun to every local
+# socket bound to a matching port and address, IP_BOUND_IF or not: carol's socket gets alice's
+# broadcast straight from the kernel, with no LAN involved (the decider's run: carol's socket
+# 10/10, her LAN's from_peers and to_os 0). Between separate machines that cannot happen. So the
+# claim is the LAN counters: bob's LAN took the broadcast from alice and wrote it into bob's
+# interface, and carol's LAN wrote nothing. The socket counts are printed as a same-host note.
 say "4. UDP broadcast to $BCAST from alice; bob and carol listening"
+BP0=$(counter bob from_peers); BT0=$(counter bob to_os)
+CT0=$(counter carol to_os); CP0=$(counter carol from_peers)
 "${PROBE[@]}" udp-listen "$IF_bob" 47020 6 "vox-bcast" >"$WORK/bcast-bob.json" &
-PIDS+=($!)
+BC_BOB=$!
+PIDS+=("$BC_BOB")
 "${PROBE[@]}" udp-listen "$IF_carol" 47020 6 "vox-bcast" >"$WORK/bcast-carol.json" &
-PIDS+=($!)
+BC_CAROL=$!
+PIDS+=("$BC_CAROL")
 sleep 1
 probe udp-send "$IF_alice" "$V4_alice" "$BCAST" 47020 10 "vox-bcast" >/dev/null
-sleep 5
+wait "$BC_BOB" "$BC_CAROL" 2>/dev/null
+sleep 1 # the stats file is written twice a second
+DBP=$(($(counter bob from_peers) - BP0)); DBT=$(($(counter bob to_os) - BT0))
+DCT=$(($(counter carol to_os) - CT0)); DCP=$(($(counter carol from_peers) - CP0))
 BB=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/bcast-bob.json")
 BC=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["got"])' "$WORK/bcast-carol.json")
-echo "bob got $BB/10, carol got $BC/10"
-if [[ $BB -ge 9 && $BC == 0 ]]; then
-    pass "broadcast: bob got $BB/10, carol 0"
+echo "bob's LAN: +$DBP from peers, +$DBT written to his interface; carol's LAN: +$DCP from peers, +$DCT written"
+echo "(same-host note) sockets: bob got $BB/10, carol got $BC/10"
+if [[ $DBP -ge 9 && $DBT -ge 9 && $BB -ge 9 && $DCT == 0 && $DCP == 0 ]]; then
+    pass "broadcast: bob's LAN carried $DBP/10 from alice into his interface; carol's LAN delivered 0"
 else
-    fail "broadcast: bob $BB/10, carol $BC"
+    fail "broadcast: bob's LAN +$DBP from peers, +$DBT written, socket $BB/10; carol's LAN delivered $DCT (from peers $DCP)"
 fi
 
 # ---- 5. the untrusted member ----
