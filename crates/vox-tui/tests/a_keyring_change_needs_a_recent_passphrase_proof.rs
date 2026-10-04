@@ -17,10 +17,19 @@
 //!   with a wrong passphrase is refused; one with the right passphrase succeeds;
 //! - past the window again, `vox trust remove --identity-passphrase-file` succeeds.
 //!
+//! **A change given the right passphrase is always made.** Every change whose passphrase was just
+//! checked waits [`PROVED_DELAY`], longer than [`WINDOW`], between the check and the change
+//! (`VOX_TEST_PROVED_CHANGE_DELAY_MS`): the window the check restarted is gone by the time the
+//! change is made, as it is when several checks pass at once and race to restart it, or when the
+//! clock moves on between the check and the change. The right-passphrase changes of 3 and 4 must
+//! still succeed.
+//!
 //! The TUI has no keyring change to prompt for: it trusts and untrusts nobody, so there is nothing
 //! of it to drive here.
 //!
-//! Mutation: no window check in the node — red, PRODUCT (the change past the window is made).
+//! Mutations: no window check in the node — red, PRODUCT (the change past the window is made). A
+//! change given the right passphrase put through the window like one given none — red, PRODUCT
+//! (it is refused as needing the passphrase it was given).
 
 #![cfg(unix)]
 
@@ -47,6 +56,11 @@ const KNOB: &str = "VOX_TEST_KEYRING_WINDOW_SECS";
 const WINDOW: Duration = Duration::from_secs(6);
 /// How long a refused change may take to be refused: at once.
 const ANSWERS_WITHIN: Duration = Duration::from_secs(10);
+/// Every change whose passphrase was just checked waits this long between the check and the
+/// change (`VOX_TEST_PROVED_CHANGE_DELAY_MS`): past [`WINDOW`], so the change finds the window the
+/// check restarted already gone, and must be made anyway.
+const PROVED_DELAY: Duration = Duration::from_secs(8);
+const DELAY_KNOB: &str = "VOX_TEST_PROVED_CHANGE_DELAY_MS";
 
 fn vox_cmd(dir: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(VOX);
@@ -62,7 +76,8 @@ fn vox_cmd(dir: &Path, args: &[&str]) -> Command {
 }
 
 /// A command with stdin open and unwritten and no terminal, as an agent's harness runs it:
-/// (succeeded, what it said). Red past [`ANSWERS_WITHIN`].
+/// (succeeded, what it said). Red past [`ANSWERS_WITHIN`] (plus [`PROVED_DELAY`], which a
+/// change given its passphrase waits by design).
 fn run(cmd: &mut Command) -> (bool, String) {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -77,10 +92,13 @@ fn run(cmd: &mut Command) -> (bool, String) {
     let mut child = cmd.spawn().expect("APPARATUS: spawn vox");
     let held = child.stdin.take();
     while child.try_wait().expect("APPARATUS: wait").is_none() {
-        if t0.elapsed() > ANSWERS_WITHIN {
+        if t0.elapsed() > ANSWERS_WITHIN + PROVED_DELAY {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("PRODUCT: a trust command was still waiting after {ANSWERS_WITHIN:?}");
+            panic!(
+                "PRODUCT: a trust command was still waiting after {:?}",
+                ANSWERS_WITHIN + PROVED_DELAY
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -135,7 +153,7 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Fram
             .await
             .unwrap_or_else(|e| panic!("CANNOT MEASURE: the control socket did not answer: {e}"));
         tokio::time::timeout(
-            ANSWERS_WITHIN,
+            ANSWERS_WITHIN + PROVED_DELAY,
             client.request(&Request::Trust {
                 target,
                 petname: petname.to_owned(),
@@ -152,7 +170,7 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Fram
 #[test]
 fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     watchdog::arm();
-    test_knobs::require(&[KNOB]);
+    test_knobs::require(&[KNOB, DELAY_KNOB]);
     let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
     let needed_first = needed.lines().next().unwrap_or_default();
     let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
@@ -166,6 +184,7 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     let mut daemon = vox_cmd(&alice, &["daemon", "--listen", "127.0.0.1:0"])
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
         .env(KNOB, WINDOW.as_secs().to_string())
+        .env(DELAY_KNOB, PROVED_DELAY.as_millis().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
