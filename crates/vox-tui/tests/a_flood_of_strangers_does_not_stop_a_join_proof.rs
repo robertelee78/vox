@@ -162,6 +162,15 @@ fn join(dir: &std::path::Path, link: &str, name: &str) -> (bool, Duration, Strin
     (ok, t0.elapsed(), format!("{out}{err}"))
 }
 
+/// A UDP port free on both families: one taken on IPv4 alone would make a `[::]` bind land
+/// elsewhere for IPv4 (a dual-stack collision).
+fn free_dual_port() -> u16 {
+    std::net::UdpSocket::bind("[::]:0")
+        .and_then(|s| s.local_addr())
+        .expect("APPARATUS: bind a dual-stack socket")
+        .port()
+}
+
 #[test]
 #[ignore = "real vox processes with production Argon2id, a flood and two real joins; run in release"]
 fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
@@ -175,8 +184,12 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     let pass_file = tmp.path().join("identity.pass");
     std::fs::write(&pass_file, format!("{IDENTITY}\n")).expect("APPARATUS: write a staging file");
 
-    let anchor_port = free_port();
-    let (_anchor, spec) = hostile::anchor(&anchor_dir, &format!("127.0.0.1:{anchor_port}"));
+    let anchor_port = free_dual_port();
+    // **The flood and the joiner come from two sources** (ADR-011 requirement 34 limits `ASK`s
+    // per source): the anchor and the victim listen on both families, every stand-in dials them
+    // at `::1`, and the real joiner reaches them at `127.0.0.1`. A flood from the joiner's own
+    // address would spend the joiner's rate as well, which is no part of what this proves.
+    let (_anchor, spec) = hostile::anchor(&anchor_dir, &format!("[::]:{anchor_port}"));
     let anchor_id = vox_core::node::link::b32_decode(
         spec.split('@').next().expect("PRODUCT: an anchor spec"),
         "anchor fingerprint",
@@ -184,15 +197,21 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
     .expect("PRODUCT: the anchor's fingerprint");
     let victim_id = fingerprint(&victim_dir);
     fingerprint(&joiner_dir);
-    let victim_port = free_port();
-    let _victim = daemon("victim", &victim_dir, victim_port, &spec, &pass_file);
+    let victim_port = free_dual_port();
+    let _victim = hostile::daemon_on(
+        "victim",
+        &victim_dir,
+        &format!("[::]:{victim_port}"),
+        &spec,
+        &pass_file,
+    );
     let (room, link) = create_room(&victim_dir, "first", ROOM_PASS);
     // The anchor holds the room once the victim has published it there.
     std::thread::sleep(Duration::from_secs(3));
-    let victim_addr = format!("127.0.0.1:{victim_port}")
+    let victim_addr = format!("[::1]:{victim_port}")
         .parse()
         .expect("APPARATUS: a socket address the proof wrote");
-    let anchor_addr = format!("127.0.0.1:{anchor_port}")
+    let anchor_addr = format!("[::1]:{anchor_port}")
         .parse()
         .expect("APPARATUS: a socket address the proof wrote");
 

@@ -276,13 +276,19 @@ pub fn fingerprint(data: &Path) -> Digest32 {
 
 /// Start `vox daemon` on `127.0.0.1:port` for `data` and wait until it answers.
 pub fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> VoxProc {
+    daemon_on(name, data, &format!("127.0.0.1:{port}"), spec, pass_file)
+}
+
+/// [`daemon`] listening on `listen`: `[::]:port` takes both families, so stand-ins can dial it
+/// from `::1` while a real joiner reaches it at `127.0.0.1`, two sources.
+pub fn daemon_on(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &Path) -> VoxProc {
     let p = VoxProc::spawn(
         name,
         data,
         &args(&[
             "daemon",
             "--listen",
-            &format!("127.0.0.1:{port}"),
+            listen,
             "--anchor",
             spec,
             "--passphrase-file",

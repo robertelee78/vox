@@ -494,9 +494,9 @@ pub fn attach_passphrase(
 /// # Errors
 /// If the identity exists already, or cannot be written.
 pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+    // The node's own clock, a test step included (V210-64): an identity made here is stamped as
+    // the node making it would have stamped it.
+    let now = (vox_core::time::clock_with_test_skew())();
     match vox_core::node::profile::Profile::create(paths.clone(), passphrase.as_bytes(), now) {
         Ok(p) => Ok(p.fingerprint()),
         Err(Error::Profile(why)) if why.contains("already exists") => Err(AppError::Usage(
