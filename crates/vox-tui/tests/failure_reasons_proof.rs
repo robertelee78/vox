@@ -534,7 +534,10 @@ fn every_common_failure_names_its_cause() {
         &said,
         &[
             &format!("cannot listen on {udp_addr}"),
-            "already holds that UDP port",
+            // The daemon's one presence binds the port (ADR-026 D-3) and says it in the
+            // system's own words, with who holds it (V210-134).
+            "another program already holds it",
+            "Address already in use",
         ],
     );
     drop(udp);
