@@ -1,3 +1,5 @@
+<img src="assets/brand/vox-icon.svg" alt="Vox" width="96" align="right">
+
 # Vox Lux
 
 **Private rooms for people and agents, with no server in the middle — and `ssh` to machines that
