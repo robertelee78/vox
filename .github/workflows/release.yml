@@ -85,22 +85,26 @@ jobs:
           name: x86_64-unknown-linux-gnu
           path: dist/*
 
+  # ADR-014 M-27: the one macOS job. It builds `vox` and Vox.app for aarch64-apple-darwin only
+  # (the Intel macOS target is not built at all, M-26a), signs `vox`, puts that signed binary in
+  # the app at Contents/Helpers/vox, signs the app inside-out, notarizes and staples it, and
+  # packages both. One job, so neither artifact can exist without the other.
   build-darwin-arm64:
     needs: [ci-passed]
     runs-on: macos-latest
-    timeout-minutes: 75  # includes waiting on Apple's notary service
+    timeout-minutes: 120  # two notary submissions, each waited on
     # Holds the Apple credentials. A fork or a pull request cannot reach them, so it cannot
     # produce a release artifact — which is the point: there is no unsigned fallback.
     environment: apple-release
+    env:
+      # A decision, not a rustc default: macOS 13 is the floor SMAppService needs, and it is one
+      # floor for vox and the app (ADR-014 M-26a). The signers assert it held.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        env:
-          # A decision, not a rustc default: see scripts/sign_notarize_release.sh. Both macOS
-          # artifacts must claim the same floor, and it must be one vox actually supports.
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: |
           cargo build --release --bin vox
           strip target/release/vox
@@ -110,7 +114,7 @@ jobs:
       # Signing happens AFTER `strip` — strip rewrites the Mach-O and invalidates any earlier
       # signature — and BEFORE packaging, so the release record's digest covers the signed
       # bytes. The signer emits its own proof receipts (ADR-018).
-      - name: Developer ID sign and notarize
+      - name: Developer ID sign and notarize vox
         env:
           APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
           APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
@@ -126,46 +130,20 @@ jobs:
           signed="$RUNNER_TEMP/vox-signed-aarch64-apple-darwin"
           scripts/sign_notarize_release.sh \
             target/release/vox "$signed" "$VERSION" aarch64-apple-darwin \
-            "$APPLE_CODESIGN_IDENTIFIER" 11.0
+            "$APPLE_CODESIGN_IDENTIFIER" "$MACOSX_DEPLOYMENT_TARGET"
           echo "SIGNED_DIR=$signed" >>"$GITHUB_ENV"
+          echo "VERSION=$VERSION" >>"$GITHUB_ENV"
 
-      - name: Package release assets
+      # Built ad hoc signed, with each target's entitlements embedded; the Developer ID signature
+      # is applied below, inside-out, keeping those entitlements.
+      - name: Build Vox.app
         run: |
           set -euo pipefail
-          scripts/package-release.sh "$SIGNED_DIR/vox-aarch64-apple-darwin" aarch64-apple-darwin
-          cp "$SIGNED_DIR"/apple-proof-*.json dist/
+          app=$(scripts/build-macos-app.sh "$RUNNER_TEMP/app-build")
+          scripts/assemble-macos-app.sh "$app" "$SIGNED_DIR/vox-aarch64-apple-darwin" \
+            "$RUNNER_TEMP/app-assembled/Vox.app" "$VERSION" "$MACOSX_DEPLOYMENT_TARGET"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: aarch64-apple-darwin
-          path: dist/*
-
-  build-darwin-x64:
-    needs: [ci-passed]
-    runs-on: macos-latest
-    timeout-minutes: 75  # includes waiting on Apple's notary service
-    environment: apple-release
-    steps:
-      - uses: actions/checkout@v4
-        # rust-toolchain.toml pins the channel; the extra target is added explicitly because
-        # the file does not list targets.
-      - run: rustup target add x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        env:
-          # See the arm64 job. rustc would otherwise default this target to 10.12.
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
-        run: |
-          cargo build --release --target x86_64-apple-darwin --bin vox
-          strip target/x86_64-apple-darwin/release/vox
-          ls -lh target/x86_64-apple-darwin/release/vox
-          vtool -show-build target/x86_64-apple-darwin/release/vox | grep -E "platform|minos"
-
-      # See the arm64 job. Note additionally that `strip` on a cross-built x86_64 binary
-      # removes its ad-hoc signature entirely, so signing is what makes the Intel package
-      # runnable at all.
-      - name: Developer ID sign and notarize
+      - name: Developer ID sign, notarize and staple Vox.app
         env:
           APPLE_DEVELOPER_ID_APPLICATION: ${{ vars.APPLE_DEVELOPER_ID_APPLICATION }}
           APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 }}
@@ -177,26 +155,28 @@ jobs:
           APPLE_CODESIGN_IDENTIFIER: ${{ vars.APPLE_CODESIGN_IDENTIFIER }}
         run: |
           set -euo pipefail
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          signed="$RUNNER_TEMP/vox-signed-x86_64-apple-darwin"
-          scripts/sign_notarize_release.sh \
-            target/x86_64-apple-darwin/release/vox "$signed" "$VERSION" x86_64-apple-darwin \
-            "$APPLE_CODESIGN_IDENTIFIER" 11.0
-          echo "SIGNED_DIR=$signed" >>"$GITHUB_ENV"
+          signed_app="$RUNNER_TEMP/app-signed-aarch64-apple-darwin"
+          scripts/sign_notarize_app.sh \
+            "$RUNNER_TEMP/app-assembled/Vox.app" "$signed_app" "$VERSION" aarch64-apple-darwin \
+            us.vox.app "$APPLE_CODESIGN_IDENTIFIER" "$MACOSX_DEPLOYMENT_TARGET"
+          echo "SIGNED_APP_DIR=$signed_app" >>"$GITHUB_ENV"
 
       - name: Package release assets
         run: |
           set -euo pipefail
-          scripts/package-release.sh "$SIGNED_DIR/vox-x86_64-apple-darwin" x86_64-apple-darwin
-          cp "$SIGNED_DIR"/apple-proof-*.json dist/
+          scripts/package-release.sh "$SIGNED_DIR/vox-aarch64-apple-darwin" aarch64-apple-darwin
+          scripts/package-release.sh "$SIGNED_APP_DIR/Vox-$VERSION-aarch64-apple-darwin.zip" \
+            aarch64-apple-darwin app
+          cp "$SIGNED_DIR"/apple-proof-aarch64-apple-darwin.json dist/
+          cp "$SIGNED_APP_DIR"/apple-proof-app-aarch64-apple-darwin.json dist/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: x86_64-apple-darwin
+          name: aarch64-apple-darwin
           path: dist/*
 
   publish:
-    needs: [build-linux-x64, build-darwin-arm64, build-darwin-x64]
+    needs: [build-linux-x64, build-darwin-arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -215,51 +195,20 @@ jobs:
           # install.sh resolve through releases/latest/download/, and the `proof-<triple>.json`
           # record whose digest is deliberately wrong (ADR-018 §3: it is what makes the
           # updater's mismatch refusal provable without breaking anybody's stable channel).
-          # Plus install.sh itself, so a pinned copy travels with every release.
+          # On macOS also Vox.app, with its own records (ADR-014 M-27). Plus install.sh itself,
+          # so a pinned copy travels with every release.
           mkdir -p release
-          cp artifacts/*/vox-* artifacts/*/stable-*.json artifacts/*/proof-*.json release/
-          # ADR-018: the signing proof travels with the artifact it describes.
-          cp artifacts/*/apple-proof-*.json release/
+          cp artifacts/*/* release/
           cp install.sh release/install.sh
           VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           TAG="${GITHUB_REF_NAME}"
           if [ "${TAG}" != "v${VERSION}" ]; then
             echo "ERROR: tag ${TAG} does not match the workspace version ${VERSION}"; exit 1
           fi
-          # Every record must carry this version, or `vox update` would resolve the wrong tag.
-          for r in release/stable-*.json release/proof-*.json; do
-            grep -q "\"version\":\"${VERSION}\"" "$r" || { echo "ERROR: $r is not for ${VERSION}"; cat "$r"; exit 1; }
-          done
-          # Three targets, so three of each.
-          for pat in 'release/vox-*' 'release/stable-*.json' 'release/proof-*.json'; do
-            n=$(ls $pat | grep -cv '\.sha256$')
-            [ "$n" = 3 ] || { echo "ERROR: expected 3 of $pat, found $n"; ls -l release; exit 1; }
-          done
-          # Two macOS targets, so two signing proofs — and each MUST say Accepted for the
-          # version being published. A missing proof is a macOS binary nobody can show was
-          # notarized, which is exactly the "absent evidence reads as success" failure
-          # ADR-018 §3 forbids.
-          n=$(ls release/apple-proof-*.json | wc -l | tr -d ' ')
-          [ "$n" = 2 ] || { echo "ERROR: expected 2 Apple signing proofs, found $n"; ls -l release; exit 1; }
-          for r in release/apple-proof-*.json; do
-            jq -e --arg v "${VERSION}" '
-              .kind == "vox.apple-release-proof"
-              and .version == $v
-              and .signing.authority == "Developer ID Application"
-              and .signing.hardened_runtime == true
-              and .signing.secure_timestamp == true
-              and .notarization.status == "Accepted"
-              and .verification.codesign == "accepted"
-              and .verification.online_notarization == "accepted"
-              and .verification.notary_ticket_cdhash_matches == true
-            ' "$r" >/dev/null || { echo "ERROR: $r does not attest a notarized ${VERSION}"; cat "$r"; exit 1; }
-          done
-          # The record's digest must describe the *signed* bytes that shipped.
-          for t in aarch64-apple-darwin x86_64-apple-darwin; do
-            want=$(jq -er .asset.sha256 "release/apple-proof-${t}.json")
-            got=$(jq -er .sha256 "release/stable-${t}.json")
-            [ "$want" = "$got" ] || { echo "ERROR: ${t}: release record digest ${got} is not the signed binary ${want}"; exit 1; }
-          done
+          # Exactly a release's assets, every receipt attesting a notarized build of this
+          # version, every record's digest its receipt's, and vox and Vox.app together or not at
+          # all (ADR-015 17.19, ADR-014 M-27, ADR-028 I-3).
+          scripts/check-release-assets.sh release "${VERSION}"
           ls -l release
 
       - name: Create GitHub Release
