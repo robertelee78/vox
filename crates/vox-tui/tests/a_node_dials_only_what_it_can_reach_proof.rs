@@ -69,6 +69,26 @@
 //! **The mutation that must turn it red:** the vendored quinn-udp's Apple branch back to
 //! `IP_RECVDSTADDR` (`vendor/quinn-udp/src/unix.rs`, "Vox:"): the guest's join fails with "the
 //! room's host did not answer".
+//!
+//! ## #414 — a node on a routable IPv6 address does not dial `[::1]`
+//!
+//! **The staging.** A `vox serve` host bound to `[::]` (every address, both families), and a guest
+//! bound to this box's routable IPv6 address (global or unique-local, from the interface list). The guest can send to `[::1]`, but the host can never answer it
+//! from there: the kernel refuses `::1` as the source of a datagram to a non-loopback address, so
+//! such a dial can only time out. Two joins, by links naming the host at `[::1]` (the link's
+//! places written by the proof, at the host's port: a host bound to `[::1]` names that one):
+//!
+//! 1. with the host's routable IPv6 address beside it: the guest joins;
+//! 2. with `[::1]` alone: the guest is told at once, within [`TOLD_WITHIN`], that its socket
+//!    cannot send to any address the link gives, not, after waiting out the board's 30 s, that
+//!    the host "did not answer" a question it never asked.
+//!
+//! Where the box has no routable IPv6 address there is nothing to stage, and the run says CANNOT
+//! MEASURE.
+//!
+//! **The mutation that must turn it red:** `nat::reachability::can_send_to` letting a socket on a
+//! non-loopback IPv6 address dial loopback (the old `!l.is_loopback() || t.ip().is_loopback()`):
+//! join 2 waits out the dial and says the host did not answer.
 
 #![cfg(unix)]
 
@@ -104,6 +124,9 @@ const WATCH_223: Duration = Duration::from_secs(60);
 /// How long #223's host is left to publish its discovered endpoints before the guest looks them up.
 const PUBLISH_SETTLE: Duration = Duration::from_secs(15);
 const PAYLOAD: usize = 4 * 1024;
+/// How long a guest that can dial none of a link's addresses may take to say so: a refusal, not a
+/// dial's timeout.
+const TOLD_WITHIN: Duration = Duration::from_secs(10);
 
 /// Every `ip:port` / `[ip]:port` token a line names.
 fn addresses_named(line: &str) -> Vec<SocketAddr> {
@@ -511,5 +534,166 @@ fn a_host_on_every_address_answers_from_the_one_it_was_reached_at() {
          answered from 127.0.0.1 (after {:?}).\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
         t0.elapsed(),
         host.transcript()
+    );
+}
+
+/// An IPv6 address of this box that is neither loopback nor link-local and that carries traffic:
+/// a global or unique-local address, read from the interface list (`ifconfig` on macOS, `ip -6
+/// addr` on Linux). A box with no IPv6 default route still has one if a network gave it one.
+fn routable_v6() -> Option<std::net::Ipv6Addr> {
+    let out = if cfg!(target_os = "macos") {
+        std::process::Command::new("/sbin/ifconfig").output()
+    } else {
+        std::process::Command::new("ip")
+            .args(["-6", "addr"])
+            .output()
+    }
+    .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|w| w.split('/').next()?.parse::<std::net::Ipv6Addr>().ok())
+        .find(|ip| {
+            !ip.is_loopback()
+                && !ip.is_unicast_link_local()
+                && !ip.is_unspecified()
+                && ip.to_ipv4_mapped().is_none()
+                && loops_back(*ip)
+        })
+}
+
+/// Whether a datagram from `ip` to a socket on `[::]`, at `ip`, arrives, and its answer comes back:
+/// an address this box carries traffic on. Measured on macOS, a cellular `ipsec0` address took
+/// neither, so a staging there measured the interface, not vox.
+fn loops_back(ip: std::net::Ipv6Addr) -> bool {
+    let (Ok(rx), Ok(tx)) = (UdpSocket::bind("[::]:0"), UdpSocket::bind((ip, 0))) else {
+        return false;
+    };
+    let (Ok(at), Ok(()), Ok(())) = (
+        rx.local_addr(),
+        rx.set_read_timeout(Some(Duration::from_secs(1))),
+        tx.set_read_timeout(Some(Duration::from_secs(1))),
+    ) else {
+        return false;
+    };
+    let mut buf = [0u8; 8];
+    tx.send_to(b"there", SocketAddr::new(IpAddr::V6(ip), at.port()))
+        .is_ok()
+        && rx
+            .recv_from(&mut buf)
+            .is_ok_and(|(_, from)| rx.send_to(b"back", from).is_ok())
+        && tx.recv_from(&mut buf).is_ok()
+}
+
+#[test]
+#[ignore = "production Argon2id + a real PoW; run in release"]
+fn a_node_on_a_routable_ipv6_address_does_not_dial_v6_loopback() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let Some(routable) = routable_v6() else {
+        panic!(
+            "CANNOT MEASURE (precondition not met): this box has no routable IPv6 address for the \
+             guest to bind"
+        );
+    };
+    let host_dir = tmp.path().join("host");
+    std::fs::create_dir_all(host_dir.join("cfg")).expect("APPARATUS: create a staging directory");
+    let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
+    let service_port = echo_service();
+    let mut host = VoxProc::spawn(
+        "host",
+        &host_dir,
+        &args(&[
+            "serve",
+            &format!("web={service_port}"),
+            "--listen",
+            "[::]:0",
+        ]),
+    );
+    let address = after_label(
+        &host.expect_line("address", |l| l.starts_with("address ")),
+        "address",
+    );
+    let passphrase = after_label(
+        &host.expect_line("passphrase", |l| l.starts_with("passphrase ")),
+        "passphrase",
+    );
+    let (base, query) = address
+        .split_once('?')
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the host's link has no query: {address}"));
+    // The host's port, from its loopback entry: one dual-stack socket holds it on both families.
+    // A host on `[::]` names its IPv4 addresses; the IPv6 places are written here, as a host bound
+    // to `[::1]` names its own (#223).
+    let port = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("b=/ip4/127.0.0.1/udp/"))
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): the host on [::] names no 127.0.0.1 address in its link: \
+                 {address}"
+            )
+        })
+        .to_owned();
+    // The host's `a=` first: a link's places follow the member they belong to.
+    let host_a = query
+        .split('&')
+        .find(|p| p.starts_with("a="))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the host's link names no member: {address}"));
+    let rest: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.starts_with("a=") && !p.starts_with("b="))
+        .collect();
+    let link = |places: &[String]| {
+        let mut q = vec![host_a.to_owned()];
+        q.extend(places.iter().map(|p| format!("b={p}")));
+        q.extend(rest.iter().map(|p| (*p).to_owned()));
+        format!("{base}?{}", q.join("&"))
+    };
+    let loopback = format!("/ip6/::1/udp/{port}");
+    let reachable = format!("/ip6/{routable}/udp/{port}");
+    let join = |name: &str, places: &[String]| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging directory");
+        let (ok, _, err) = vox_once(&dir, &args(&["id"]));
+        assert!(ok, "PRODUCT (staging): vox id ({name}): {err}");
+        let t0 = Instant::now();
+        let (ok, out, err) = vox_once(
+            &dir,
+            &args(&[
+                "connect",
+                &link(places),
+                "--passphrase-file",
+                &world::room_pass_file(&dir, &passphrase),
+                "--listen",
+                &format!("[{routable}]:0"),
+            ]),
+        );
+        (ok, format!("{out}{err}"), t0.elapsed())
+    };
+
+    // 1. `[::1]` and a place the guest can reach: it joins by the second.
+    let (ok, said, took) = join("guest1", &[loopback.clone(), reachable]);
+    eprintln!(
+        "[proof] guest on [{routable}], link [::1] + [{routable}]: joined {ok} after {took:?}"
+    );
+    assert!(
+        ok,
+        "PRODUCT: a guest on [{routable}] given [::1] and [{routable}] did not join (after \
+         {took:?}):\n{said}\nhost:\n{}",
+        host.transcript()
+    );
+    // 2. `[::1]` alone: told at once that the host cannot be reached from here.
+    let (ok, said, took) = join("guest2", &[loopback]);
+    let first = said.lines().next().unwrap_or_default().to_owned();
+    eprintln!(
+        "[proof] guest on [{routable}], link [::1] alone: joined {ok} after {took:?}: {first}"
+    );
+    let told_why = said.contains("cannot send to any address the link gives");
+    eprintln!("[proof] what the guest was told:\n{}", said.trim());
+    assert!(
+        !ok && took <= TOLD_WITHIN && told_why,
+        "PRODUCT: a guest on [{routable}] given only [::1], which it can never be answered at, must \
+         be told so within {TOLD_WITHIN:?}; it {} after {took:?}:\n{said}",
+        if ok { "joined" } else { "gave up" }
     );
 }
