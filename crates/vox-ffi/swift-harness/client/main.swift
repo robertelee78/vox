@@ -11,6 +11,15 @@
 //                           read back at once, are that post
 //   (waits for a line on stdin: the peer now trusts it and has posted)
 //   GOT <text>              a message arrived through the event listener
+//   (waits for a line on stdin: the peer now shares a service in the room)
+//   SHARED <address> <by> <kind>
+//                           one per service the peer shares, as `services` lists it, once the
+//                           room's log has brought the peer's share (up to 120 s)
+//   (waits for a line on stdin: the proof has compared the list with `vox service list`)
+//   BOUND <ip:port>         `forward` to the first shared address bound there
+//   (waits for a line on stdin: the bound address, once the proof has been through the forward)
+//   STOPPED                 `stopForward` stopped it
+//   STATUS <json>           `status`: the node's report, on one line
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -66,7 +75,29 @@ do {
 
     // The proof trusts this identity on the peer and posts there, then says go.
     _ = readLine()
-    // Hold on until the proof has its answer about the event stream.
+    // Once the proof has its answer about the event stream, the peer shares a service.
+    _ = readLine()
+    var shared: [SharedService] = []
+    let until = Date().addingTimeInterval(120)
+    while Date() < until {
+        shared = try await client.services(room: room).shared.filter { $0.by != "you" }
+        if !shared.isEmpty { break }
+        try await Task.sleep(nanoseconds: 250_000_000)
+    }
+    for s in shared {
+        say("SHARED \(s.address) \(s.by) \(s.kind)")
+    }
+    guard let first = shared.first else {
+        say("ERROR the peer's share was never listed")
+        exit(1)
+    }
+    _ = readLine()
+    say("BOUND \(try await client.forward(address: first.address, local: ""))")
+    let bound = readLine() ?? ""
+    try await client.stopForward(local: bound)
+    say("STOPPED")
+    let report = try await client.status()
+    say("STATUS \(report.replacingOccurrences(of: "\n", with: " "))")
     _ = readLine()
     await client.close()
     say("CLOSED")
