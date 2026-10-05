@@ -559,7 +559,7 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
          get` said (ok {stopped_get_ok}): {stopped_get_said}"
     );
     assert!(
-        left_ended && !after_leave_ok,
+        left_ended && gone(after_leave_ok, &after_leave_said, "notes.txt"),
         "PRODUCT: leaving the room must end the share (ended {left_ended}); bob's `vox room get` \
          after alice left said (ok {after_leave_ok}): {after_leave_said}"
     );
