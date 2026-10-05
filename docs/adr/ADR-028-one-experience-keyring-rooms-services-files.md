@@ -6,10 +6,12 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
 **Tags**: ux, tui, macos, keyring, rooms, services, files, look, install
-**Related**: ADR-001, ADR-005, ADR-007, ADR-008, ADR-014, ADR-015, ADR-016, ADR-017, ADR-020, ADR-023, ADR-026, ADR-027
+**Related**: ADR-001, ADR-005, ADR-007, ADR-008, ADR-014, ADR-015, ADR-016, ADR-017, ADR-020, ADR-021, ADR-023, ADR-026, ADR-027
 **Inputs**: [docs/ux/v040-ux-research.md](../ux/v040-ux-research.md) and the decider's answers in
 [docs/ux/v040-ux-interview-decisions.md](../ux/v040-ux-interview-decisions.md) (2026-10-03, 2026-10-04,
-2026-10-05).
+2026-10-05); the website's app study (`voxlux.us` `src/components/Experience.astro`); the session
+grid of Bromure's agent-coding interface (`/opt/bromure/Sources/AgentCoding`, `RoomStage.swift`,
+`AgentSessions.swift`) as a reference for W-2–W-4.
 
 ## Context
 
@@ -218,18 +220,56 @@ named: read records, the room's shared name, the decision record and the token f
 - **L-7.** App type MUST be SF Pro for text, SF Mono (`monospacedSystemFont`) for fingerprints,
   addresses, commands and uppercase eyebrow labels, and Inter Display (SIL OFL 1.1, bundled) at
   800–900 weight for large headings.
-- **L-8.** Security state MUST be stated in words. Decorative locks, code rain, "access granted" and
-  any glitch effect on security state MUST NOT be used.
+- **L-8.** Security state MUST be stated in words. Decorative locks, code rain, green-on-black,
+  "access granted" and any glitch effect MUST NOT be used.
+- **L-8a.** The standard is mastery, not costume (the decider: "dead sexy hacker style — something
+  Neo would use"): dense and precise, keyboard-first, instant, and quiet until something needs the
+  person. Every view MUST be fully usable from the keyboard, with a command palette (`:` in the
+  TUI, ⌘K in the app) and a key for "next thing that needs you". Live facts (path, latency, bytes
+  verified, who read what) MUST be shown as information, not decoration.
 - **L-9.** Each node MUST have fingerprint art derived from its fingerprint (a 5×5 mosaic of split
   triangles), always shown beside the grouped text, never instead of it.
 - **L-10.** The Vox mark MUST be a faceted V of five planes with one accent glint at the vertex.
 
-### 9. The app's shell (input to the ADR-014 rewrite)
+### 9. Layout
+
+The website's app study (`voxlux.us`, `src/components/Experience.astro`) is the baseline
+structure for both clients; the TUI renders the same regions in text.
+
+- **W-1.** The window MUST have: a sidebar with the acting node (alias, attached state), the rooms,
+  and the nodes on this machine (each `attached` or `detached`); the room's timeline with service
+  cards and file offers inline; an inspector with the members and their trust glyphs (L-4); and a
+  status bar with the node, its peers and the keyring window (K-9). Keyring and Services MUST be
+  views of the same window, not separate windows.
+- **W-2.** The sidebar MUST group rooms by what they need from the person, with counts: **needs
+  you** (a message addressed to this node unread, urgent first), **active** (new messages, or a
+  member holding a claim), and **quiet**. A key MUST move to the next room that needs the person.
+- **W-3.** A room whose members include agents' nodes MUST offer a **lanes** view: one column per
+  member, each that member's posts in this room (a filter of the room's own timeline, not a second
+  record), headed by its alias, trust glyph and one state chip. The state MUST be derived only from
+  what the room already carries:
+  - **Needs you**: a message from it addressed to this node, unread, or its latest `ask` or
+    `blocked` addressed to this node unanswered;
+  - **Working**: it holds a claim (ADR-021 §4) and its latest work post is `working` or `accept`;
+  - **Ready**: a session of it announced itself (`hello`) and it holds no claim;
+  - **Done**: its latest work post is `result`, or it released its claim;
+  - **Away**: no session announced, or its node not connected.
+  Each lane MUST show what changed since the person last looked (`read by` and new posts) and fold
+  coordination traffic into one counted line (ADR-020 6.6).
+- **W-4.** Under the lanes, the room's composer MUST carry a **To:** selector of members (written as
+  fingerprints into `to`, ADR-020 4.6) and an urgent switch (ADR-020 4.5). There MUST be no hidden
+  coordinator: the composer posts as this node, into this room, like any message.
+- **W-5.** "Add to room" MUST show the room link with a copy action and a reminder to send the
+  passphrase another way; a node joins only by its own `vox room join` (ADR-005 J-1). The client
+  MUST NOT join, trust or act for another node.
+- **W-6.** A client MUST NOT show an agent's tool calls, thoughts or turn-by-turn activity: Vox is
+  not a mirror of agent activity (ADR-020, Non-goals). Progress stays on the GitHub issue (ADR-021).
+
+### 10. The app's shell (input to the ADR-014 rewrite)
 
 - **A-1.** The app MUST be native SwiftUI/AppKit over the daemon's control socket (ADR-026 S-4).
   Electron and Tauri MUST NOT be used.
-- **A-2.** The window MUST have three columns: rooms; the timeline; an inspector holding the member
-  or keyring card and the room's services with their copy commands.
+- **A-2.** The window MUST follow W-1: sidebar, timeline, inspector, status bar.
 - **A-3.** A menu bar extra, opt-in, MUST show the node's state and keyring window, rooms with
   messages addressed to it, services shared to it with copy buttons, its own shares with stop, and
   live tunnels.
@@ -237,7 +277,7 @@ named: read records, the room's shared name, the decision record and the token f
 - **A-5.** On macOS the user-level `vox daemon` MUST be registered as a login item with
   `SMAppService`, so it runs before the app opens.
 
-### 10. Install and update
+### 11. Install and update
 
 - **I-1.** Vox.app MUST be signed with the Developer ID and notarized, like `vox` (ADR-015 17.16).
 - **I-2.** On macOS the one-line `install.sh` MUST install Vox.app as well as `vox`, from the same
@@ -249,7 +289,7 @@ named: read records, the room's shared name, the decision record and the token f
   other.
 - **I-4.** On Linux, install and update MUST be unchanged.
 
-### 11. Out of scope
+### 12. Out of scope
 
 Calls (v0.5.0) and the iOS app (v0.4.1).
 
@@ -301,6 +341,11 @@ Each line below is amended as stated. Where code already matches, the ADR text i
    part shared too (the node's own chosen label), which would be a new concept?
 3. **Who sees read records** (RR-2): sealed under the reader's sender key, only members the reader
    trusts see its reads. Accept, or post them readable by every member?
+
+## Fixes outside this repository
+
+- `voxlux.us` `src/components/Experience.astro`, address anatomy: `family` is labelled "your room
+  alias"; under S-1 it is the room's shared name. The labels "your node alias" and the rest stay.
 
 ## Consequences
 
