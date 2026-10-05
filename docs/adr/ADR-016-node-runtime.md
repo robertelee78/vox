@@ -225,7 +225,7 @@ These are known and not fixed. Each stays until it is fixed, with the fixing com
 
 | # | Defect or limit | Where | Tracked |
 |---|---|---|---|
-| D1 | An anchor tracks epoch 0 only, so an epoch change would not be carried on its board. No operation advances a room's epoch (ADR-007 G-21), so this has no effect until one does. | `node/anchor.rs:123`, `:154` | #356 |
+| D1 | Fixed. An anchor's own copy of a room tracked epoch 0 only. ADR-023 M23.5 (8e912563) deleted that copy: an anchor holds only board records, each signed by its member for the `(room, epoch)` it is in, and serves whatever epoch members publish. A removal re-keys inside the epoch. Proved by `a_room_rekeyed_keeps_its_relayed_members_in_step_proof`: after a re-key, a member reached only through an anchor reads at once and a later joiner through the anchor gets in. | `node/anchor.rs` (deleted) | #356 |
 | D2 | Member→anchor sessions are proved on a relayed path on loopback only. Whether the `sync failed: transport` seen in the deleted `node_m15_anchor_gate` occurs behind real NATs is not measured. | — | untracked |
 | D4 | ADR-008's golden-vector obligation is unmet, including for `0x0012`: no golden-vector test exists. | ADR-008 | open, awaiting the decider (V030-29 question 19) |
 | L1 | A first `ssh` into a fresh room can wait up to `HOST_PATIENCE` (300 s). | `node/up.rs:214` | limit, by design |

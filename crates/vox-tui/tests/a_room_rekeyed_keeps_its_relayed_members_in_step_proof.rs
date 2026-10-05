@@ -21,6 +21,11 @@
 //!   of his join.
 //! - Every node reports the same epoch for the room, before and after the re-key (`vox status
 //!   --json`).
+//!
+//! **Mutant:** the re-key is not delivered to a member reached over a relay (in
+//! `Node::deliver_rekeys_for` (vox-core `node/actor.rs`), a target whose connection is relayed is skipped): carol never
+//! gets alice's new generation, and this goes red as PRODUCT at "carol … must read every post alice
+//! made after the re-key".
 
 #![cfg(unix)]
 
