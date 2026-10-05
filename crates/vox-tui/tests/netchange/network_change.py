@@ -52,6 +52,11 @@ place: `route change` moved its gateway and left it the old source (`rt_ifa`), s
 read A after the move, the network had not changed in the one way vox reads, and the run judged
 the product on a scene it had not staged.
 
+**No other proof runs while the macOS staging is in place**: its aliases and host route change every
+vox's routable address on the machine, so the driver holds every slot of the shared
+`run-slot.sh` queue from before the first change until after the last is undone, on every way
+out, signals included.
+
 **Every staged step is checked from the OS's own view** before any claim is judged, and quoted:
 the addresses the OS shows, the route to 192.0.2.1, and the source a connected UDP probe to it
 gets (what `local_route_ips` reads). A before the move, B after it, A gone: anything else is
@@ -184,6 +189,120 @@ def staged(when, probe, present, absent):
 
 UNDO = []
 
+# ---- the box, held while the macOS staging is in place ----
+# Its lo0 aliases and its host route to 192.0.2.1 change the routable address of every vox on the
+# machine: `local_route_ips` reads the source of a probe to 192.0.2.1. A proof running beside it saw
+# "the network changed" and went red. So, from before the first change until after the last is
+# undone, no other proof may run: the driver holds every run slot of the shared `run-slot.sh`
+# (the queue every proof run takes a slot from, timing proofs included), as its exclusive mode
+# does, counting a slot its own caller holds as its own. Linux stays inside its own namespace and
+# takes nothing.
+HELD = []
+BOX_TICKET = []
+
+def coord():
+    """The shared slots' directory and count, as `~/vox-coord/run-slot.sh` names them; None where
+    this machine has no shared queue."""
+    try:
+        text = open(os.path.expanduser("~/vox-coord/run-slot.sh")).read()
+    except OSError:
+        return None, 0
+    d = re.search(r"^S=(\S+)", text, re.M)
+    n = re.search(r"VOX_RUN_SLOTS:-(\d+)", text)
+    return (d.group(1) if d else None), int(os.environ.get("VOX_RUN_SLOTS", n.group(1) if n else 6))
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def owner(slot):
+    try:
+        return int(open(f"{slot}/pid").read().strip())
+    except (OSError, ValueError):
+        return None
+
+def ancestors():
+    """This process and its ancestors: the `run-slot.sh` that started this proof holds a slot."""
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        up = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        if not up.isdigit():
+            break
+        pid = int(up)
+    return pids
+
+def take_the_box():
+    import glob, shutil
+    base, n = coord()
+    if base is None:
+        print(f"{TAG} no shared run-slot queue on this machine (~/vox-coord/run-slot.sh): nothing to hold", flush=True)
+        return
+    slots, tickets = f"{base}/run.slots", f"{base}/run.tickets"
+    os.makedirs(slots, exist_ok=True)
+    os.makedirs(tickets, exist_ok=True)
+    name = f"{time.time_ns()}000000-X-{os.getpid()}"
+    BOX_TICKET.append(f"{tickets}/{name}")
+    open(BOX_TICKET[0], "w").close()
+    mine, began, said = ancestors(), time.time(), 0.0
+    print(f"{TAG} waiting to hold all {n} run slots, so no other proof runs while the staging changes this machine's routes", flush=True)
+    while True:
+        for s in glob.glob(f"{slots}/slot*"):
+            o = owner(s)
+            if o is None or not alive(o):
+                shutil.rmtree(s, ignore_errors=True)
+        for t in glob.glob(f"{tickets}/*"):
+            pid = t.rsplit("-", 1)[-1]
+            if pid.isdigit() and not alive(int(pid)):
+                os.remove(t)
+        if not os.path.exists(BOX_TICKET[0]):
+            open(BOX_TICKET[0], "w").close()
+        if sorted(os.listdir(tickets))[:1] == [name]:
+            for i in range(1, n + 1):
+                try:
+                    os.mkdir(f"{slots}/slot{i}")
+                except FileExistsError:
+                    continue
+                open(f"{slots}/slot{i}/pid", "w").write(f"{os.getpid()}\n")
+                open(f"{slots}/slot{i}/cmd", "w").write("network_change.py: holding the box for the macOS staging\n")
+                HELD.append(f"{slots}/slot{i}")
+            others = [s for s in glob.glob(f"{slots}/slot*") if s not in HELD and owner(s) not in mine]
+            if not others:
+                break
+        if time.time() - said >= 30:
+            said = time.time()
+            print(f"{TAG} still waiting for the run slots after {time.time() - began:.0f} s", flush=True)
+        time.sleep(2)
+    os.remove(BOX_TICKET[0])
+    BOX_TICKET.clear()
+    print(f"{TAG} holding every run slot after {time.time() - began:.0f} s; no other proof runs until the staging is undone", flush=True)
+
+def release_the_box():
+    import shutil
+    for s in HELD:
+        if owner(s) == os.getpid():
+            shutil.rmtree(s, ignore_errors=True)
+    HELD.clear()
+    for t in BOX_TICKET:
+        try:
+            os.remove(t)
+        except OSError:
+            pass
+    BOX_TICKET.clear()
+
+def interrupted(signum, _frame):
+    # A stop by signal runs the same cleanup as any other end: routes, aliases, the slots.
+    raise KeyboardInterrupt(f"signal {signum}")
+
+import signal
+signal.signal(signal.SIGTERM, interrupted)
+signal.signal(signal.SIGINT, interrupted)
+
 def env(w):
     e = {k: os.environ[k] for k in ("PATH", "TMPDIR") if k in os.environ}
     e.update(HOME=f"{S}/{w}", VOX_DATA_DIR=f"{S}/{w}/data", VOX_CONFIG_DIR=f"{S}/{w}/cfg")
@@ -210,6 +329,8 @@ def log(w):
     return open(f"{S}/{w}.err").read()
 
 try:
+    if not LINUX:
+        take_the_box()
     setup()
     staged("before the move", "10.77.0.2", ["10.77.0.2", "10.99.0.2"], ["10.88.0.2"])
     for w in ("d", "p"):
@@ -345,9 +466,13 @@ except subprocess.TimeoutExpired as t:
 except Exception:
     print(f"{TAG} APPARATUS: driver crashed: {traceback.format_exc()}", flush=True)
     code = 2
+except KeyboardInterrupt as k:
+    print(f"{TAG} APPARATUS: stopped ({k}); the staging is undone", flush=True)
+    code = 2
 finally:
     for cmd in reversed(UNDO):
         subprocess.run(cmd, capture_output=True)
+    release_the_box()
     for p in PROCS:
         if p.poll() is None:
             p.terminate()
