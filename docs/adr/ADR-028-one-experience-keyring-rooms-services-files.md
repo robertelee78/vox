@@ -9,7 +9,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Related**: ADR-001, ADR-005, ADR-007, ADR-008, ADR-014, ADR-015, ADR-016, ADR-017, ADR-020, ADR-021, ADR-023, ADR-026, ADR-027
 **Inputs**: [docs/ux/v040-ux-research.md](../ux/v040-ux-research.md) and the decider's answers in
 [docs/ux/v040-ux-interview-decisions.md](../ux/v040-ux-interview-decisions.md) (2026-10-03, 2026-10-04,
-2026-10-05); the website's app study (`voxlux.us` `src/components/Experience.astro`); the session
+2026-10-05, including the answers to this ADR's first draft's open questions); the website's app study (`voxlux.us` `src/components/Experience.astro`); the session
 grid of Bromure's agent-coding interface (`/opt/bromure/Sources/AgentCoding`, `RoomStage.swift`,
 `AgentSessions.swift`) as a reference for W-2–W-4.
 
@@ -83,10 +83,13 @@ named: read records, the room's shared name, the decision record and the token f
   log as a signed governance entry, and the causally last statement by an admin MUST win, as
   retention does (ADR-023 RL-2.1). Per-member room aliases MUST NOT exist.
 - **R-2.** A room name MUST be one DNS label: 1–63 characters of `[a-z0-9-]`, not starting or
-  ending with `-`, case-folded to lower case, because it is the room part of every service address
-  (§4 S-1).
+  ending with `-`, case-folded to lower case, because it is the room part of the readable form of
+  every service address (§4 S-1).
 - **R-3.** A node MUST refuse to create a room, or to join one, whose shared name equals the name
-  of a room it already holds, and say which room holds the name.
+  of a room it already holds, and say which room holds the name. When a rename by a room's creator
+  or admin gives a room the same name as another room on a node, that node, and only that node,
+  MUST show every room involved by its room ID instead of its name, in every view and in readable
+  addresses, until the clash is gone; it MUST say why once.
 - **R-4.** The verb that prints a room's link MUST be `vox room link` (built in v0.3.0) and `:link`
   in the TUI. A room link MUST NOT expire; it stops working only when the room is ended (ADR-023
   RL-8.2). The link and the passphrase MUST be presented as two things sent two ways.
@@ -107,9 +110,25 @@ named: read records, the room's shared name, the decision record and the token f
 
 ### 4. Services
 
-- **S-1.** The room part of `service.node.room.vox` MUST be the room's shared name (R-1). The
-  node part MUST stay the viewer's alias for the sharing node, or its fingerprint (ADR-017 12.2).
-  The service part is unchanged.
+- **S-1.** A service address MUST travel in its **canonical** form, every part an identifier:
+  `<service id>.<node fingerprint>.<room id>.vox`, where:
+  - the service id is the service's fingerprint (ADR-017 12.2), `SHA-256("vox/service-fingerprint/v1"
+    ‖ room id ‖ sharer fingerprint ‖ name)`, base32 as `b32_encode` writes it (52 characters), so it
+    is stable for as long as the sharer keeps that name in that room;
+  - the node part is the sharing node's fingerprint (52 characters);
+  - the room part is the room's ID (52 characters).
+  Each label is 52 characters (at most 63) and the whole address is 162 characters (at most 253).
+  Copy actions, pasted text, messages, agent hooks and `--json` output MUST carry the canonical
+  form, so an address means the same on every member's machine.
+- **S-1a.** Each client MUST render an address in its **readable** form, part by part:
+  `<service name>.<the viewer's alias for the node, or its short fingerprint>.<the room's shared
+  name>.vox`, for example `nas-ssh.nas.family.vox`. Wherever a readable part is ambiguous on this
+  node (an alias clash, K-4; a room-name clash, R-3), that part MUST be shown in its canonical form.
+  A canonical address inside a message MUST be shown readable.
+- **S-1b.** Every place that takes an address (`vox forward`, the `.vox` proxy, the clients'
+  inputs) MUST accept both forms. A readable address typed on this node MUST be translated to the
+  canonical form with this node's own aliases and room names; a readable part that names nothing,
+  or more than one thing, MUST be refused with a sentence saying which (ADR-017 12.5).
 - **S-2.** A share MUST record the service's kind in its `0x0018` statement (ADR-017 12.8): `ssh`,
   `http`, `https`, `dns`, or plain `tcp` or `udp`. The kind MUST be detected, never typed by the
   sharer and never guessed from the port number or the service name:
@@ -119,7 +138,11 @@ named: read records, the room's shared name, the decision record and the token f
     SSH banner, an HTTP response, a TLS handshake or a DNS answer;
   - anything not identified MUST be recorded as `tcp` or `udp`.
 - **S-3.** For every service a member can see, both clients and `vox service list` MUST offer
-  ready-to-copy commands for its kind, with the viewer's own address filled in: for `ssh`,
+  ready-to-copy commands for its kind. What is shown MUST use the readable address (S-1a); what is
+  copied MUST use the canonical address (S-1), so the command works when pasted on any member's
+  machine. `vox service list` MUST print each share's readable address with its canonical address
+  beneath it, and `vox service list --json` and the copy actions MUST give the canonical one. The
+  commands are: for `ssh`,
   `ssh USER@ADDRESS`, a `vox forward ADDRESS 127.0.0.1:PORT` pair and an `~/.ssh/config` block; for
   `http`/`https`, a browser URL through the proxy and a forward; for `tcp`/`udp`, a forward. Each
   MUST show what it needs and whether it holds: the sharer trusts this node, this node is
@@ -340,7 +363,11 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-015 14.1 | "verification, consent and Block render as colour, glyph and label" | Trust renders as glyph, weight and label (E-6, L-4) |
 | ADR-016 NR-17a | "A room's local name MUST live only in its sealed manifest" | The room's shared name lives on the log (R-1) |
 | ADR-017 5.1–5.2, 5.5 | `vox up` runs the proxy | The daemon runs it while a node is attached; `vox up` reports it (S-5) |
-| ADR-017 12.2, 12.3, 12.10 | Room part is the viewer's alias; `vox serve` prints fingerprints in the room place | Room part is the shared room name (S-1); node part unchanged |
+| ADR-017 12.1 | "Only `service.node.room.vox` MUST connect" | The canonical form `<service id>.<node fingerprint>.<room id>.vox` and the readable form both connect (S-1, S-1b) |
+| ADR-017 12.2 | "The node and room parts MUST be the resolving client's own aliases, or the fingerprints" | Canonical: fingerprint and room ID; readable: the viewer's alias and the room's shared name (S-1, S-1a) |
+| ADR-017 12.3 | Rendered with the viewer's aliases or fingerprints | Rendered readable; the canonical form is what is copied and sent (S-1a, S-3) |
+| ADR-017 12.9 | `vox service list` renders addresses as 12.3 | Readable with the canonical beneath it; `--json` canonical (S-3) |
+| ADR-017 12.10 | `vox serve` prints fingerprints in the node and room places | Prints the canonical address and the readable one (S-1, S-1a) |
 | ADR-017 12.8 | Statement carries name, transport, shared or withdrawn | Also the detected kind (S-2) |
 | ADR-020 3.10 | "Not built" | Built by read records (§6) |
 | ADR-020 4.9a, last sentence | "It MUST NOT say a reply is overdue: a node cannot see another node's reads" | A node sees the reads it can open (RR-3); still no "overdue" claim |
@@ -352,27 +379,18 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-020 11.2 | The receiver pulls when asked | Pulled automatically when addressed to this node or to no one, from a keyring member (F-3) |
 | ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
 
-## Open for the decider
-
-1. A **room rename** that reaches a member already holding another room of the new name (R-3
-   governs only create and join): refuse it locally and keep the old name on that node, or show
-   both with a suffix?
-2. **Pasteable addresses**: S-1 makes the room part shared, but the node part is still each
-   viewer's alias, so an address pasted between two people may not resolve. Keep, or make the node
-   part shared too (the node's own chosen label), which would be a new concept?
-3. **Who sees read records** (RR-2): sealed under the reader's sender key, only members the reader
-   trusts see its reads. Accept, or post them readable by every member?
-
 ## Fixes outside this repository
 
 - `voxlux.us` `src/components/Experience.astro`, address anatomy: `family` is labelled "your room
-  alias"; under S-1 it is the room's shared name. The labels "your node alias" and the rest stay.
+  alias"; under S-1a it is the room's shared name. The anatomy should also show that what is copied
+  is the canonical form, `<service id>.<node fingerprint>.<room id>.vox` (S-1, S-3).
 
 ## Consequences
 
 - One vocabulary and one set of flows across the CLI, the TUI and the app.
 - Read records add one small entry per reader per room every few seconds of reading, and expose to
-  trusted members when each message was seen.
+  trusted members, and only to them (RR-2, RR-3), when each message was seen.
+- Copied commands carry 162-character canonical addresses: long, but the same on every machine.
 - The daemon holds file offers and the proxy for as long as a node is attached.
 - Every member keyring-trusted by a sharer pulls an unaddressed share at once, so a large
   unaddressed share costs every such member its size in transfer and disk until it expires.
