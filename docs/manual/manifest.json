@@ -2,17 +2,17 @@
   "schemaVersion": 1,
   "pages": [
     { "slug": "index", "path": "README.md", "title": "Vox user manual", "description": "Choose a task, find a symptom, and use the instructions for your version.", "appliesTo": "all" },
-    { "slug": "install", "path": "install.md", "title": "Install and update", "description": "Install through voxlux.us, verify your version, and understand update and removal boundaries.", "appliesTo": "v0.2.10" },
-    { "slug": "first-room", "path": "first-room.md", "title": "Your first shared room", "description": "Create two identities, exchange trust, and verify a message in both directions.", "appliesTo": "v0.2.10" },
+    { "slug": "install", "path": "install.md", "title": "Install and update", "description": "Install through voxlux.us, verify your version, upgrade from v0.2.10, and understand update and removal boundaries.", "appliesTo": "v0.3.0" },
+    { "slug": "first-room", "path": "first-room.md", "title": "Your first shared room", "description": "Make a node, create and join a room, exchange trust, and verify a message in both directions.", "appliesTo": "v0.3.0" },
     { "slug": "concepts", "path": "concepts.md", "title": "How Vox fits together", "description": "Nodes, rooms, local names, directional trust, services, and the limits of encryption.", "appliesTo": "all" },
-    { "slug": "keyring", "path": "keyring.md", "title": "Identity and keyring", "description": "Compare fingerprints, choose local aliases, and understand what trusting or removing a node changes.", "appliesTo": "v0.2.10" },
-    { "slug": "rooms", "path": "rooms.md", "title": "Rooms and messages", "description": "Create, join, read, post, follow, and leave a room without confusing membership with trust.", "appliesTo": "v0.2.10" },
-    { "slug": "services", "path": "services.md", "title": "Reach a shared service", "description": "Share a local TCP port, reach it through Vox, and determine whether an anchor is needed.", "appliesTo": "v0.2.10" },
-    { "slug": "files", "path": "files.md", "title": "Send and receive files", "description": "Offer a file live, verify its bytes, and recover from unavailable or interrupted transfers.", "appliesTo": "v0.2.10" },
-    { "slug": "agents", "path": "agents.md", "title": "Agent communications", "description": "Connect an existing agent session, verify delivery, and coordinate ownership without confusing it with progress.", "appliesTo": "v0.2.10" },
-    { "slug": "troubleshooting", "path": "troubleshooting.md", "title": "Troubleshooting by symptom", "description": "Start with the exact symptom, then check evidence, apply a safe fix, and confirm recovery.", "appliesTo": "v0.2.10" },
-    { "slug": "reference", "path": "reference.md", "title": "Commands and local state", "description": "Find the right help, select the correct profile, and understand paths, passphrases, and exit status.", "appliesTo": "v0.2.10" },
+    { "slug": "keyring", "path": "keyring.md", "title": "Identity and keyring", "description": "Manage your nodes, compare fingerprints, choose local aliases, and understand what trusting or removing a node changes.", "appliesTo": "v0.3.0" },
+    { "slug": "rooms", "path": "rooms.md", "title": "Rooms and messages", "description": "Create, join, read, post, follow, set retention, leave and end a room without confusing membership with trust.", "appliesTo": "v0.3.0" },
+    { "slug": "services", "path": "services.md", "title": "Reach a shared service", "description": "Share a named local service, reach it by its .vox address, and determine whether an anchor is needed.", "appliesTo": "v0.3.0" },
+    { "slug": "files", "path": "files.md", "title": "Send and receive files", "description": "Offer a file or folder live, verify its bytes, and recover from unavailable or interrupted transfers.", "appliesTo": "v0.3.0" },
+    { "slug": "agents", "path": "agents.md", "title": "Agent communications", "description": "Give an agent its own node, verify delivery, and coordinate ownership without confusing it with progress.", "appliesTo": "v0.3.0" },
+    { "slug": "troubleshooting", "path": "troubleshooting.md", "title": "Troubleshooting by symptom", "description": "Start with the exact symptom, then check evidence, apply a safe fix, and confirm recovery.", "appliesTo": "v0.3.0" },
+    { "slug": "reference", "path": "reference.md", "title": "Commands and local state", "description": "Find the right help, select the correct node, and understand paths, passphrases, and exit status.", "appliesTo": "v0.3.0" },
     { "slug": "getting-help", "path": "getting-help.md", "title": "Get help safely", "description": "Prepare a useful report without publishing your secrets, messages, or private topology.", "appliesTo": "all" },
-    { "slug": "development", "path": "development.md", "title": "Development version guide", "description": "Keep rearch/v030 node-based commands and diagnostics separate from the released profile-based CLI.", "appliesTo": "development" }
+    { "slug": "development", "path": "development.md", "title": "Coming from v0.2.10", "description": "What changed from v0.2.10: nodes instead of profiles, named services and the new room, trust and agent commands.", "appliesTo": "v0.3.0" }
   ]
 }

@@ -1,6 +1,6 @@
 # Install and update
 
-Applies to: v0.2.10. The installer may select a later published release; check the resulting
+Applies to: v0.3.0. The installer may select a later published release; check the resulting
 version and its release notes before using version-specific instructions.
 
 ## Install
@@ -68,6 +68,20 @@ Vox process when it is safe to interrupt its rooms and services. Agent coordinat
 participants to run the same Vox version; update the group deliberately, not one worker in
 the middle of a claim.
 
+## Upgrading from v0.2.10
+
+v0.3.0 changes how identities are stored and selected. The first v0.3.0 command run against a
+v0.2.10 data root moves each profile to a node of the same name and says so, for example
+`vox: moved …/data/family to …/data/nodes/family (from v0.3.0 each node lives under nodes/)`.
+The node keeps its identity: `vox id` prints the same fingerprint as before. Commands then take
+`--node` instead of `--profile`; [Coming from v0.2.10](development.md) lists every change.
+
+Rooms are not carried over. A room made by v0.2.10 is refused when v0.3.0 opens it, because
+its message format changed: make the room again with `vox room create` and share its new link.
+The move takes the profile's whole directory, keyring included, as it is. Stop every v0.2.10
+Vox process before the first v0.3.0 command, and update every member and agent of a room
+together: rooms do not carry across the two versions.
+
 ## Roll back the binary
 
 ```sh
@@ -75,7 +89,8 @@ vox update --rollback
 ```
 
 This restores the binary retained by the updater. It is **not a state-directory rollback**,
-and does not guarantee that an older binary understands data migrated by a newer one. Read
+and does not guarantee that an older binary understands data migrated by a newer one: v0.2.10
+does not look for nodes under `nodes/`, where v0.3.0 moved them. Read
 the target release's compatibility notes before crossing a format or major command-surface
 change. Do not open valuable state with a guessed older executable.
 
@@ -99,5 +114,7 @@ room state, and deleting it is not recoverable through a central Vox account. Se
 Follow [Your first shared room](first-room.md). If installation fails, keep the exact error and
 use [Get help safely](getting-help.md); never paste signing bypasses or secrets into a retry.
 
-Source: [v0.2.10 installer](https://github.com/robertelee78/vox/blob/8d95a381f14d6bbb45f714d75f64e57d2f5dbf96/install.sh)
-and [update implementation](https://github.com/robertelee78/vox/blob/8d95a381f14d6bbb45f714d75f64e57d2f5dbf96/crates/vox-tui/src/update.rs).
+Source: [installer](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/install.sh),
+[update implementation](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/update.rs),
+[profile-to-node move](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-core/src/node/layout.rs)
+and [the pre-v0.3.0 room refusal](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-core/src/node/api.rs).

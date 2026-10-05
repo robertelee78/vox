@@ -1,7 +1,7 @@
 # How Vox fits together
 
-Applies to: the shared product model. Commands and lifecycle details differ by release; use
-the task chapter matching your installed version.
+Applies to: the shared product model. Commands and lifecycle details differ by release; the
+task chapters describe v0.3.0.
 
 ## A node is an identity
 
@@ -9,14 +9,17 @@ A node has cryptographic keys and a fingerprint. It is not a username at a provi
 a synonym for a physical device. Your person's identity and an agent's identity are different
 nodes. Losing identity data is not solved by asking a central operator to reset an account.
 
-Released v0.2.10 selects local identity state with `--profile`. The development architecture
-can attach several nodes to one daemon and selects actions with `--node`. Do not substitute
-one flag for the other without checking your version.
+In v0.3.0 one daemon per data root hosts every node on the machine, and each node runs in full
+while it is attached. A command names the node it acts as with `--node`; with only one node
+attached, it acts as that one. v0.2.10's `--profile` is gone; see
+[Coming from v0.2.10](development.md).
 
 ## A room is a shared space
 
-A room's messages are kept and replicated by its members' nodes. An invitation identifies
-the room; the room passphrase is sent separately. A two-person conversation is a room too.
+A room's messages are kept and replicated by its members' nodes; no server holds a copy. A
+room link (`vox://…`) finds the room; the room passphrase is sent separately, by another way.
+A room is usually made for one purpose: members come and go, leaving deletes it from that
+node, and its creator or an admin can end it, which deletes it on every member's node. A two-person conversation is a room too.
 There is no username directory to search for a stranger or central inbox guaranteeing that
 messages arrive while every member is offline.
 
@@ -44,9 +47,11 @@ local label. Use the selector your version's command help accepts.
 
 ## A service is an offer, not a public tunnel
 
-A node can offer a local service to a room. Reach depends on shared room membership and the
-host's trust decision. A Vox service address is not a public web link and does not install
-global DNS. The local proxy or forward bridges your ordinary tool into Vox.
+A node can share a named local service with a room. Reach depends on shared room membership
+and the host's trust decision. Each member reaches it as `service.node.room.vox`, where the node
+and room parts are that member's own names for them, so two members may see different
+addresses for the same service. It is not a public web link and does not install global DNS.
+The local proxy (`vox up`) or a forward (`vox forward`) bridges your ordinary tool into Vox.
 
 A file announcement is a message; its bytes are fetched from a live offer. Seeing the
 announcement does not prove that the sender is still serving the bytes.
@@ -69,6 +74,7 @@ with the intended person or agent is still a human trust decision.
 
 Continue with [Your first shared room](first-room.md) or [Get help safely](getting-help.md).
 
-Sources: [foundation and limits](https://github.com/robertelee78/vox/blob/8d95a381f14d6bbb45f714d75f64e57d2f5dbf96/docs/adr/ADR-001-vox-foundation-vision-threat-model-and-principles.md),
-[released trust commands](https://github.com/robertelee78/vox/blob/8d95a381f14d6bbb45f714d75f64e57d2f5dbf96/crates/vox-tui/src/cli.rs),
-and [development daemon and node model](https://github.com/robertelee78/vox/blob/2d8385d4f90891c96843f32d6d002bc1b69aac1e/docs/adr/ADR-026-daemon-and-nodes.md).
+Sources: [foundation and limits](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-001-vox-foundation-vision-threat-model-and-principles.md),
+[v0.3.0 command definitions](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
+[the daemon and node model](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-026-daemon-and-nodes.md)
+and [service addresses](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-017-room-bound-services.md).

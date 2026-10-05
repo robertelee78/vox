@@ -1,76 +1,97 @@
 # Send and receive files
 
-Applies to: v0.2.10. Both nodes need the same room open on a running daemon/TUI and appropriate
-trust. Examples use the `family` profile.
+Applies to: v0.3.0. Both nodes need to be attached, members of the room, and appropriately
+trusted. Examples act as the only attached node; with several, add `--node NAME`.
+
+A file in Vox is never uploaded anywhere. The sender's node serves it, the room carries an
+announcement with its name, size and SHA-256, and a receiver fetches it while the sender is
+still serving it.
 
 ## Offer one file
 
 The sender runs:
 
 ```sh
-vox room send --profile family ROOM_ID ./report.pdf
+vox room send ROOM_ID ./report.pdf
 ```
 
-Vox hashes the file, starts a room-bound offer, and posts an announcement carrying its name,
-size and SHA-256. **Keep this command running** while people fetch it. The announcement can
-remain in the room after the bytes stop being available; it is not a server-hosted attachment.
+Vox hashes the file, starts a room-bound offer, and posts an announcement. It prints the size,
+the SHA-256 and the command a receiver uses, for example `collect it with: vox room get ROOM_ID
+report.pdf`. **Keep this command running** while people fetch it: Ctrl-C stops the offer, and
+the announcement stays in the room. It is not a server-hosted attachment.
 
 Check the file before sharing it. Its contents are available to the room members permitted
 by your trust, not just one person mentioned in an accompanying message. Do not modify the
 source file during the offer; re-offer deliberately when the content changes.
+
+## Offer a folder, or a file for a limited time
+
+```sh
+vox share ROOM_ID ./photos --count 1
+vox share ROOM_ID ./report.pdf --for 2h
+```
+
+`vox share` serves a file, or a folder as one tar file named after it (`photos.tar`), over HTTP
+on a room-bound service. It stops after `--count` completed fetches, after `--for` (`90s`, `10m`,
+`2h`), or on Ctrl-C, and says how many fetches it served. Members fetch it with `vox room get`,
+or through `vox up` with the `curl` line it prints.
 
 ## Receive and verify
 
 The receiver reads the announcement, then runs:
 
 ```sh
-vox room get --profile family ROOM_ID report.pdf --dir ./incoming
+vox room get ROOM_ID report.pdf --dir ./incoming
 ```
 
-The selector can be the announced name, a SHA-256 prefix or a service tag. If names collide,
-use the more specific identifier from the offer. Do not assume similarly named files from
-different authors are interchangeable.
+The selector can be the announced name (`photos.tar` for a shared folder), a SHA-256 prefix or a
+service tag. If names collide, use the more specific identifier from the offer. Do not assume
+similarly named files from different authors are interchangeable.
 
-Without `--dir` or `--out`, Vox uses the profile's configured downloads location, or
+Without `--dir` or `--out`, Vox uses the node's configured downloads location, or
 `~/Downloads`. The sender's filename is made safe for local placement. In a destination
-directory, an existing name causes a numbered alternative, rather than replacement.
+directory, an existing name causes a numbered alternative, such as `report (1).pdf`, rather
+than replacement.
 
 For an exact destination:
 
 ```sh
-vox room get --profile family ROOM_ID report.pdf --out ./incoming/final-report.pdf
+vox room get ROOM_ID report.pdf --out ./incoming/final-report.pdf
 ```
 
-That exact path must not already exist. `--out` refuses an existing destination; it does not
-overwrite it. Choose another path instead of deleting a valuable file to satisfy the example.
+That exact path must not already exist. `--out` refuses an existing destination with
+`already exists; vox room get never overwrites a file`. Choose another path instead of deleting
+a valuable file to satisfy the example.
 
 Vox writes to a hidden temporary `.part` file and exposes the destination only after the
-received size **and** SHA-256 match the signed announcement. Confirm the command reports
-success and names the saved file. A hash match establishes that these are the announced
-bytes, not that a document is harmless to open. Apply ordinary caution to executable files,
-macros and unfamiliar formats.
+received size **and** SHA-256 match the signed announcement. Success reads, for example,
+`./incoming/report.pdf (18 bytes) verified`. A hash match establishes that these are the
+announced bytes, not that a document is harmless to open. Apply ordinary caution to executable
+files, macros and unfamiliar formats.
 
 ## Stop an offer
 
-The sender stops the foreground `room send` with Ctrl-C. Vox withdraws the offer. People who
+The sender stops `room send` or `share` with Ctrl-C. Vox withdraws the offer. People who
 already downloaded it retain their copy; withdrawal is not remote erasure.
 
-Do not promise automatic serving after the command exits. Development discussions about
-daemon-held attachments are not a feature of this released workflow.
+Do not promise automatic serving after the command exits. In this release an offer lasts only
+as long as its command runs; files are not shown inline and are not fetched automatically.
 
 ## Recover from an unavailable or bad transfer
 
-- An old announcement can outlive its offer. Ask the sender whether the original offer is
-  still running, and to re-offer if appropriate.
+- An old announcement can outlive its offer. Fetching it then fails; in this release the
+  message is a connection error such as `reading the reply: Connection reset by peer`, not a
+  plain "the offer is gone". Ask the sender whether the offer is still running, and to re-offer
+  if appropriate.
 - Missing trust and unavailable serving can both prevent reach. Check the named identities
   and room before deciding it is a network fault.
 - A stalled, truncated, oversized or mismatched transfer is refused. Do not use a partial
   file or disable verification. Confirm the sender's source and live offer, then fetch again.
-- This chapter does not promise resumable transfers or folders. The released entry point
-  here is `vox room send` for a file, not development `vox share` for a directory.
+- This release does not resume an interrupted transfer; fetch again from the start.
 
 If it repeats, use [file troubleshooting](troubleshooting.md#the-file-is-unavailable-or-fails-verification)
 and [safe reporting](getting-help.md). Keep file contents out of a public report unless you
 have deliberately made a harmless reproduction file.
 
-Source: [released file exchange implementation](https://github.com/robertelee78/vox/blob/8d95a381f14d6bbb45f714d75f64e57d2f5dbf96/crates/vox-tui/src/room_cli.rs).
+Source: [v0.3.0 file exchange implementation](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/room_cli.rs)
+and [share](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/share_cli.rs).
