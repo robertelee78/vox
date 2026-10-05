@@ -1032,6 +1032,9 @@ pub enum Fault {
     /// The room is over: its creator ended it, or its idle end ran out (V030-08). It takes no
     /// new message.
     RoomEnded,
+    /// This identity has left the room (V210-164): nothing more of its is written there, not even
+    /// a read record, which would undo the leave.
+    RoomLeft,
     /// Only the room's creator may do that — end the room (or an admin it delegated), or choose
     /// its idle end (V030-08).
     NotCreator,
@@ -1201,6 +1204,9 @@ impl Fault {
             Fault::RoomEnded => {
                 "this room has ended — its creator or an admin ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       this node deletes it once it has passed the end on"
             }
+            Fault::RoomLeft => {
+                "you left this room, so nothing more of yours is written to it"
+            }
             Fault::NotCreator => {
                 "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
             }
@@ -1341,6 +1347,7 @@ fault_names!(
     NotAdmin,
     AboveRoomRetention,
     RoomEnded,
+    RoomLeft,
     NotCreator,
     NotAnAdmin,
     NotRoomCreator,

@@ -14332,8 +14332,19 @@ impl Node {
     /// Note that `entries` of a room were shown to this node's person or drained into its agent's
     /// turn (ADR-028 RR-1), and post a read record for them if one is due (RR-2).
     async fn mark_read(&mut self, channel_id: &Digest32, entries: Vec<Digest32>) -> Outcome {
-        if !self.channels.contains_key(channel_id) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        // A room that is over takes no record (one after a leave would undo it, V210-164), so
+        // the client is told and asks no more: it is not left to retry what can never be posted.
+        {
+            let ch = shared.lock().await;
+            if ch.ended((self.millis_clock)()).is_some() {
+                return Outcome::Failed(Fault::RoomEnded);
+            }
+            if ch.has_left(&ch.me()) {
+                return Outcome::Failed(Fault::RoomLeft);
+            }
         }
         if !entries.is_empty() {
             self.reads_pending

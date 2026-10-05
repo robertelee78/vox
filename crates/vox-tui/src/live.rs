@@ -38,7 +38,7 @@ use vox_core::node::daemonipc::{
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::paths::{Account, NodeName};
-use vox_core::node::snapshot::NodeSnapshot;
+use vox_core::node::snapshot::{NodeSnapshot, OpenRoomSnap};
 use zeroize::Zeroizing;
 
 use crate::app::CoreHandle;
@@ -125,6 +125,10 @@ pub struct DaemonCore {
     timeline: Option<Timeline>,
     /// The messages already told to the node as shown (ADR-028 RR-1).
     marked: std::collections::BTreeSet<Digest32>,
+    /// The last time the node did not take what the room on screen showed, and what the room was
+    /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
+    /// ever, for a room that is over.
+    mark_refused: Option<MarkRefused>,
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -149,6 +153,19 @@ struct Timeline {
     stale: bool,
     /// The projection, and what it was projected with.
     projected: Option<Projected>,
+}
+
+/// The least time between two asks to record what a room showed, after the node did not take one.
+const MARK_RETRY: Duration = Duration::from_secs(3);
+
+/// A [`DaemonCore::shown`] the node did not take.
+struct MarkRefused {
+    channel_id: Digest32,
+    at: Instant,
+    /// The room as it was then: its rows and the node's detail of it.
+    room: (usize, Option<OpenRoomSnap>),
+    /// The room is over (ended, or left): nothing it shows is recorded again.
+    over: bool,
 }
 
 /// What the node says of this node's own recent messages in the room on screen (ADR-028 R-6).
@@ -290,6 +307,7 @@ impl DaemonCore {
             notice: None,
             timeline: None,
             marked: std::collections::BTreeSet::new(),
+            mark_refused: None,
             ended: None,
             stop,
         };
@@ -1244,6 +1262,21 @@ impl CoreHandle for DaemonCore {
         if new.is_empty() {
             return;
         }
+        // A refusal is not asked again every frame: only once the room has changed, and
+        // `MARK_RETRY` has passed, and never for a room that is over.
+        let room = (
+            self.timeline.as_ref().map_or(0, |t| t.rows.len()),
+            self.snapshot
+                .open
+                .iter()
+                .find(|o| o.channel_id == cid)
+                .cloned(),
+        );
+        if let Some(r) = self.mark_refused.as_ref().filter(|r| r.channel_id == cid) {
+            if r.over || r.room == room || r.at.elapsed() < MARK_RETRY {
+                return;
+            }
+        }
         let Some(conn) = self.conn.as_mut() else {
             return;
         };
@@ -1252,9 +1285,23 @@ impl CoreHandle for DaemonCore {
             entries: new.clone(),
         };
         match until_stopped(&self.rt, &self.stop, conn.client.request(&request)) {
-            Some(Ok(Frame::Ok)) => self.marked.extend(new),
+            Some(Ok(Frame::Ok)) => {
+                self.marked.extend(new);
+                self.mark_refused = None;
+            }
             Some(Ok(Frame::NodeDetached { .. })) => self.detached(),
-            // Not taken this time (a room not synced yet, say): asked again with the next frame.
+            Some(Ok(Frame::Error { reason })) => {
+                let over = matches!(
+                    Fault::from_explanation(&reason),
+                    Some(Fault::RoomEnded | Fault::RoomLeft)
+                );
+                self.mark_refused = Some(MarkRefused {
+                    channel_id: cid,
+                    at: Instant::now(),
+                    room,
+                    over,
+                });
+            }
             Some(Ok(_)) | None => {}
             Some(Err(e)) => {
                 self.ended

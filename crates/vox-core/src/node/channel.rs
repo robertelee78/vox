@@ -5931,11 +5931,20 @@ impl ChannelState {
     }
 
     /// Of `shown`, the entries a read record of this identity's should name: rows of the timeline
-    /// (not a body still owed, not a read record), written by someone else, and not named by a
-    /// record of its own already (RR-2: "since its last record").
+    /// (not a body still owed), written by someone else, and not named by a record of its own
+    /// already (RR-2: "since its last record").
+    ///
+    /// **Never a read record** (the decider): a record that named another's record would be read
+    /// in turn, and named by a record of that member's, and so on — two nodes answering each
+    /// other's records every 5 seconds for as long as both are open, a storm nobody sees but
+    /// whose cost every member pays in storage and traffic. A record's hash is refused here,
+    /// whatever a client says it showed, besides never being a row to show.
     #[must_use]
     pub fn unrecorded_reads(&self, me: &Digest32, shown: &[Digest32]) -> Vec<Digest32> {
-        let shown: BTreeSet<&Digest32> = shown.iter().collect();
+        let shown: BTreeSet<&Digest32> = shown
+            .iter()
+            .filter(|h| !self.read_records.contains_key(*h))
+            .collect();
         self.timeline
             .iter()
             .filter(|r| r.author != *me && shown.contains(&r.entry_hash))
