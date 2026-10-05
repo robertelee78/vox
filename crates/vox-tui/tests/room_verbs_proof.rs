@@ -629,7 +629,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
             &out,
             "vox: no longer trusting",
             &[],
-            "     no live session with it was open",
+            "     cut: none was open",
             ""
         ),
         "PRODUCT: `vox trust remove` must say what it is to stop, then what it did, naming the \
