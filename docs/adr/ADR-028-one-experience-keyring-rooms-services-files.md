@@ -1,0 +1,313 @@
+# ADR-028: One Experience — Keyring, Rooms, Services and Files, in the TUI and the App
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
+
+**Status**: Proposed for v0.4.0. Nothing in this ADR is built unless a requirement says so.
+**Date**: 2026-10-05
+**Deciders**: Robert E. Lee
+**Tags**: ux, tui, macos, keyring, rooms, services, files, look, install
+**Related**: ADR-001, ADR-005, ADR-007, ADR-008, ADR-014, ADR-015, ADR-016, ADR-017, ADR-020, ADR-023, ADR-026, ADR-027
+**Inputs**: [docs/ux/v040-ux-research.md](../ux/v040-ux-research.md) and the decider's answers in
+[docs/ux/v040-ux-interview-decisions.md](../ux/v040-ux-interview-decisions.md) (2026-10-03, 2026-10-04,
+2026-10-05).
+
+## Context
+
+v0.4.0 is the native macOS app (ADR-014, to be rewritten) beside the TUI (ADR-015). Both are
+clients of the daemon (ADR-026 S-4). Vox has only rooms, nodes, trust and services; this ADR
+defines how a person sees and uses them, once, for both clients, and amends the ADR lines the
+decider's answers overrule. It adds no concept beyond those four, except the four the decider
+named: read records, the room's shared name, the decision record and the token file.
+
+## Requirements
+
+### 1. One experience
+
+- **E-1.** The TUI and the app MUST present one model: the keyring (who this node trusts), rooms
+  (where its members talk and share), and services and files (what is reachable through a room).
+  A task MUST take the same steps and the same words in both clients.
+- **E-2.** The words MUST be: node, fingerprint, keyring, alias, room, room link, passphrase,
+  service, address, file, trust, untrust. "Contact", "channel", "invite", "consent", "safety code",
+  "verified" and "block" MUST NOT appear in what either client or the CLI says.
+- **E-3.** There MUST be no contacts list, no directory and no separate 1:1 path (ADR-001): a
+  direct message is a two-member room.
+- **E-4.** Each client MUST act as exactly one node, the one it was opened with. The TUI and the
+  app MUST refuse to post, trust or share as any other node, including an agent's node on the same
+  machine. Other nodes on the machine appear only as members of rooms this node shares with them.
+- **E-5.** Every action that changes access MUST state its effect in words before it acts and
+  report what it did after: trusting (which rooms and services it covers, now and later),
+  untrusting (what stops, what was already read, which live sessions were cut), leaving, ending,
+  retention, sharing and stopping a share.
+- **E-6.** Every state MUST be shown by a glyph and a word, never by colour alone (ADR-015 14.1
+  as amended in §9).
+
+### 2. Identity and keyring
+
+- **K-1.** A node's identity MUST be shown as its **fingerprint**: the full 52-character base32
+  string, grouped for reading, with its QR code and fingerprint art (§8 L-9) beside it. `vox id`
+  MUST keep printing the bare fingerprint alone on stdout.
+- **K-2.** There MUST be exactly one trust state: **in my keyring**, or not. There MUST be no
+  "verified", "unverified", TOFU or "key changed" state. A different key is a different node.
+- **K-3.** Adding a fingerprint to the keyring MUST ask for an alias, and the alias MUST be
+  changeable later (`vox trust rename`). Wherever a node is named — author, member, recipient,
+  service address, notification, decision record — a node in the keyring MUST be shown by its
+  alias and any other node by a short fingerprint marked "not in keyring".
+- **K-4.** Addressing MUST accept `@alias` in the composer; the client MUST write the whole
+  fingerprint into `to` (ADR-020 4.6). Two members whose aliases are equal or differ only in case
+  MUST be shown with a fingerprint suffix.
+- **K-5.** Trust MUST be reachable where it matters, with the same action in both clients: on a
+  message from a node not in the keyring, on a member in the member pane, on a join, and on a
+  service or file the node cannot reach because the sharer does not trust it. Comparing a
+  fingerprint MUST offer scan (app), paste, and grouped text; a mismatch MUST be its own action
+  that says not to trust the node.
+- **K-6.** Removing a node from the keyring ("untrust") MUST be the only way to stop reading and
+  being read by it (ADR-007 G-21). There MUST be no separate block.
+- **K-7.** When a node joins a room, each member's client MUST say which of this node's trusted
+  members trust the newcomer, from the consent grants on the log (ADR-007 G-9), for example
+  `K2M9·Q7RT joined. ann trusts it.` This MUST NOT add it to anyone's keyring.
+- **K-8.** There MUST be no identity backup. Onboarding MUST say plainly that a lost machine means
+  a new node, which the people who trust the old one untrust.
+- **K-9.** The keyring window (ADR-026 N-2, 30 minutes) MUST be visible where the person works:
+  the TUI status bar and the app's menu bar extra MUST show whether a keyring change will ask for
+  the passphrase, for example `keyring open 23m`.
+- **K-10.** The app MAY store a node's identity passphrase in the macOS Keychain, opt-in per node,
+  off by default. The prompt MUST say that anyone who can unlock this Mac's login keychain can then
+  attach the node.
+
+### 3. Rooms
+
+- **R-1.** A room MUST have one **shared name** that every member sees, set at creation and
+  changeable only by its creator or an admin (ADR-007 G-5). The name MUST be stated on the room's
+  log as a signed governance entry, and the causally last statement by an admin MUST win, as
+  retention does (ADR-023 RL-2.1). Per-member room aliases MUST NOT exist.
+- **R-2.** A room name MUST be one DNS label: 1–63 characters of `[a-z0-9-]`, not starting or
+  ending with `-`, case-folded to lower case, because it is the room part of every service address
+  (§4 S-1).
+- **R-3.** A node MUST refuse to create a room, or to join one, whose shared name equals the name
+  of a room it already holds, and say which room holds the name.
+- **R-4.** The verb that prints a room's link MUST be `vox room link` (built in v0.3.0) and `:link`
+  in the TUI. A room link MUST NOT expire; it stops working only when the room is ended (ADR-023
+  RL-8.2). The link and the passphrase MUST be presented as two things sent two ways.
+- **R-5.** Joining MUST show the who-reads-whom state per member right away (trusted in each
+  direction, waiting for the other side, not in keyring), and say what each person still has to
+  do.
+- **R-6.** Under each message it sent, a client MUST show who has read it, by alias: `read by ann,
+  bea`. A message no member has read MUST show where it is: `only on this machine` or `on N of M
+  members' nodes`.
+- **R-7.** Retention changes MUST appear in the timeline as one line saying who set what and that
+  older messages were removed. The room header MUST always show the retention.
+- **R-8.** Unread MUST have three levels per room: addressed to this node (from `to`), new, and
+  coordination traffic (counted only, ADR-020 6.6). A key MUST jump to the next room with a message
+  addressed to this node.
+- **R-9.** A reply MUST quote one level (the message named by `re`), and selecting the quote MUST
+  jump to it. There MUST be no thread pane.
+- **R-10.** Notifications MUST be grouped by room and MUST hide message text by default.
+
+### 4. Services
+
+- **S-1.** The room part of `service.node.room.vox` MUST be the room's shared name (R-1). The
+  node part MUST stay the viewer's alias for the sharing node, or its fingerprint (ADR-017 12.2).
+  The service part is unchanged.
+- **S-2.** A share MUST record the service's kind in its `0x0018` statement (ADR-017 12.8): `ssh`,
+  `http`, `https`, `dns`, or plain `tcp` or `udp`. The kind MUST be detected, never typed by the
+  sharer and never guessed from the port number or the service name:
+  - for an endpoint on the sharing machine, from the listening process (its command name, read
+    with `lsof` on macOS and `ss` on Linux) and a probe;
+  - for an endpoint on another machine (for example `192.168.1.20:22`), by a probe on the wire: an
+    SSH banner, an HTTP response, a TLS handshake or a DNS answer;
+  - anything not identified MUST be recorded as `tcp` or `udp`.
+- **S-3.** For every service a member can see, both clients and `vox service list` MUST offer
+  ready-to-copy commands for its kind, with the viewer's own address filled in: for `ssh`,
+  `ssh USER@ADDRESS`, a `vox forward ADDRESS 127.0.0.1:PORT` pair and an `~/.ssh/config` block; for
+  `http`/`https`, a browser URL through the proxy and a forward; for `tcp`/`udp`, a forward. Each
+  MUST show what it needs and whether it holds: the sharer trusts this node, this node is
+  attached, the proxy is running, the sharer is online. Copy MUST use the system clipboard in the
+  app and OSC 52 in the TUI, and the command MUST also be printed.
+- **S-4.** Sharing MUST be one step in both clients: the client MUST list the services listening
+  on this machine with their process names, suggest a name, and before sharing show the address
+  members will use and name who in the room can and cannot reach it (ADR-017 4.2). A share of an
+  endpoint bound to every interface, or of a well-known sensitive port, MUST be warned about first.
+- **S-5.** The daemon MUST run the `.vox` SOCKS5 proxy (ADR-017 §5) while any node is attached, on
+  `127.0.0.1:1080` unless configured otherwise. `vox up` MUST NOT start a second proxy; it MUST
+  report the running one and print the `ssh` configuration block.
+
+### 5. Files
+
+- **F-1.** Dropping, pasting or attaching a file or folder in a room MUST be the whole of sharing
+  it: the client hands it to the daemon, which hashes it, serves it on a room-bound service and
+  posts the announcement (ADR-020 11.3). No foreground process is needed.
+- **F-2.** The daemon MUST serve an attached file until its announcement expires under the room's
+  retention, the sharer stops it, the sharer leaves the room, or the room ends. When it stops, every
+  receiver's client MUST treat the offer as gone, and a node whose retention removes the
+  announcement MUST delete its received copy's thumbnail and preview.
+- **F-3.** An image announcement MUST carry a thumbnail of at most 16 KB, a BlurHash and the image's
+  dimensions inside the encrypted message, so a reader sees a preview while the sharer is offline.
+- **F-4.** A message carrying a URL MUST carry a link card (title, description, an image of at most
+  16 KB) fetched once by the **sender's** node and placed in the encrypted message. A reader's node
+  MUST NOT contact the linked site.
+- **F-5.** A receiver's node MUST pull automatically only from sharers in its keyring, and only
+  within per-room rules whose default is images up to 10 MB; everything else MUST show as an offer
+  card with name, size, sharer and whether the sharer is online. Every pull MUST be verified
+  (ADR-020 11.4) before it is shown or saved.
+- **F-6.** The TUI MUST show images inline where the terminal supports it (kitty, iTerm2, sixel,
+  then half-blocks), only after verification; the app MUST show them inline and offer Quick Look.
+- **F-7.** A shared folder MUST be pulled on demand. Its announcement MUST carry a file list with
+  each file's hash and size; pulling it again MUST fetch only new or changed files, and an
+  interrupted pull MUST resume. The sharer's folder is the source; there MUST be no two-way or
+  automatic sync.
+
+### 6. Read records
+
+- **RR-1.** A node MUST post a read record when a message is shown to its person (the message is on
+  screen in the focused room in either client) or, for an agent's node, when its hook drains the
+  message into the agent's turn (ADR-020 6.6). There MUST be no opt-out and no distinction by kind
+  of node.
+- **RR-2.** A read record MUST be a content entry in the reader's own feed, sealed under the
+  reader's sender key like any message, listing the entry hashes read since its last record.
+  Records MUST be batched (at most one per room per 5 seconds). They expire with the room's
+  retention.
+- **RR-3.** A client MUST compute `read by …` (R-6) from the read records it can open. A member
+  whose read records this node cannot open (it does not trust this node) MUST NOT be shown as
+  having read or not read.
+- **RR-4.** A read record MUST NOT be shown as a message, counted as unread, injected into an
+  agent's context, or wake anyone.
+
+### 7. Decision record
+
+- **D-1.** Each node MUST keep a local record of what it decided: every refusal and every change of
+  access (a refused join, dial, circuit or tunnel; a trust added or removed; a share stopped; a
+  session cut), one event per decision with its time, what was asked, by whom (fingerprint and
+  alias), what was decided, and why.
+- **D-2.** The record MUST hold no message text, file name or content, passphrase, key or token. It
+  MUST be stored under the node's directory (`nodes/<name>/decisions/<YYYY-MM-DD>.jsonl`, mode
+  `0600`), kept 14 days, and never sent anywhere.
+- **D-3.** `vox status` MUST name the most recent refusals; the TUI and the app MUST show the record
+  as a timeline.
+
+### 8. Look
+
+- **L-1.** One token file MUST define every colour, type and motion value. The TUI MUST read it at
+  build time and the app's Swift asset catalogue MUST be generated from it; neither MUST hard-code
+  a value the file defines.
+- **L-2.** The default and only theme for v0.4.0 MUST be dark, with these values:
+
+  | Token | Hex | 256 | 16 |
+  |---|---|---|---|
+  | bg.base | `#0c0d0f` | 233 | default bg |
+  | bg.raised | `#131417` | 233 | default bg |
+  | bg.panel | `#16171a` | 234 | default bg |
+  | bg.overlay | `#1c1d21` | 234 | black |
+  | line.hair | `#26272b` | 235 | bright black |
+  | text.primary | `#f0ece4` | 255 | default fg |
+  | text.secondary | `#a8a299` | 247 | default fg |
+  | text.muted | `#85807a` | 244 | bright black |
+  | accent (ice) | `#5ec8ff`, hover `#8fdbff`, deep `#2fa8f0` | 81 | bright cyan |
+  | attention | `#f2b33d` with ▲ | 215 | yellow |
+  | danger | `#ff5f3a` with ✕ | 203 | bright red |
+
+- **L-3.** The accent MUST mean only focus or "live" (a peer connecting, a key arriving, a transfer
+  verifying, a share going live). It MUST NOT mark trust, danger or decoration.
+- **L-4.** Trust MUST be shown by glyph and weight: a node in the keyring in text.primary bold with
+  `⇄` (each trusts the other) or `→` (only this node trusts it); not in keyring in text.secondary
+  with `·` and the words "not in keyring". ASCII fallbacks: `<>`, `->`, `.`.
+- **L-5.** The TUI MUST detect truecolour, then 256, then 16 colours, and honour `NO_COLOR`.
+  Motion MUST be at most 3 frames in the TUI, off over SSH and slow links, and in the app MUST
+  respect Reduce Motion, Reduce Transparency and Increase Contrast.
+- **L-6.** The app MUST draw content on bg.base, not the system background, and MAY use the system
+  glass material only on the navigation layer (sidebar, toolbar, menu bar extra).
+- **L-7.** App type MUST be SF Pro for text, SF Mono (`monospacedSystemFont`) for fingerprints,
+  addresses, commands and uppercase eyebrow labels, and Inter Display (SIL OFL 1.1, bundled) at
+  800–900 weight for large headings.
+- **L-8.** Security state MUST be stated in words. Decorative locks, code rain, "access granted" and
+  any glitch effect on security state MUST NOT be used.
+- **L-9.** Each node MUST have fingerprint art derived from its fingerprint (a 5×5 mosaic of split
+  triangles), always shown beside the grouped text, never instead of it.
+- **L-10.** The Vox mark MUST be a faceted V of five planes with one accent glint at the vertex.
+
+### 9. The app's shell (input to the ADR-014 rewrite)
+
+- **A-1.** The app MUST be native SwiftUI/AppKit over the daemon's control socket (ADR-026 S-4).
+  Electron and Tauri MUST NOT be used.
+- **A-2.** The window MUST have three columns: rooms; the timeline; an inspector holding the member
+  or keyring card and the room's services with their copy commands.
+- **A-3.** A menu bar extra, opt-in, MUST show the node's state and keyring window, rooms with
+  messages addressed to it, services shared to it with copy buttons, its own shares with stop, and
+  live tunnels.
+- **A-4.** Quitting the app MUST detach its node, as quitting the TUI does (ADR-026 S-4).
+- **A-5.** On macOS the user-level `vox daemon` MUST be registered as a login item with
+  `SMAppService`, so it runs before the app opens.
+
+### 10. Install and update
+
+- **I-1.** Vox.app MUST be signed with the Developer ID and notarized, like `vox` (ADR-015 17.16).
+- **I-2.** On macOS the one-line `install.sh` MUST install Vox.app as well as `vox`, from the same
+  release, verifying the app's signature and notarization as it verifies the binary's
+  (ADR-015 17.12–17.13). It MUST install the app to `/Applications` when writable, else to
+  `~/Applications`, and say where.
+- **I-3.** `vox update` and the app's own update offer MUST run the same updater and MUST update
+  `vox` and Vox.app together, to one version. A release MUST NOT be applied to one without the
+  other.
+- **I-4.** On Linux, install and update MUST be unchanged.
+
+### 11. Out of scope
+
+Calls (v0.5.0) and the iOS app (v0.4.1).
+
+## Superseded and amended lines
+
+Each line below is amended as stated. Where code already matches, the ADR text is to follow.
+
+| ADR line | Was | Now |
+|---|---|---|
+| ADR-005 J-1 | "`vox room invite` prints the room's link" | `vox room link` (R-4; already built) |
+| ADR-005 J-6 | "The invite link (`vox://…`)" | "The room link" (E-2) |
+| ADR-014 2.2 | Secure Enclave may hold only the unlock factor | Keychain may also hold the passphrase, opt-in per node (K-10) |
+| ADR-014 2.5, 2.7 | Required identity backup; restore via self-channel | No backup (K-8) |
+| ADR-014 2.6 | Explicit identity selection; per-channel pseudonymous identity | One node per client (E-4) |
+| ADR-014 3.2–3.5 | Invite QR; consent wording; per-channel local name; nickname bound to a verified key | Room link (R-4); trust wording (E-2); shared room name (R-1); alias (K-3) |
+| ADR-014 3.6 | Nicknames and verification synced across shared-root devices | Removed: one identity per device (ADR-001) |
+| ADR-014 §4 (4.1–4.5) | Safety code; verified / TOFU / key-changed states | Fingerprint and one trust state (K-1, K-2, K-5) |
+| ADR-014 §5 (5.1–5.6) | Per-sender consent prompts, three states, Block | Keyring trust and untrust (K-2, K-6) |
+| ADR-014 9.1 | Background LaunchAgent | Daemon as a login item (A-5) |
+| ADR-015 3.1 | Room "MAY have a local name"; member pane shows "nickname, verification, consent" | Shared name (R-1); alias and trust (K-3, L-4) |
+| ADR-015 4.1–4.4 | Safety-code QR and digits; verification states; prompts | Fingerprint compare (K-1, K-5); one state (K-2) |
+| ADR-015 5.4 | Required verified backup | No backup (K-8) |
+| ADR-015 5.5 | Explicit identity selection; pseudonymous identity | One node per client (E-4) |
+| ADR-015 5.6 | Shown as a safety code | Shown as a fingerprint (K-1) |
+| ADR-015 6.4 | "The invite QR" | The room link QR (R-4) |
+| ADR-015 6.5 | "until members consent" | "until members trust you" (E-2) |
+| ADR-015 §7 (7.1–7.5) | Consent states, `:show`/`:hide`, Block | Removed (K-2, K-6) |
+| ADR-015 8.2 | Files via `vox room send`/`get` | F-1–F-7 |
+| ADR-015 9.1 | "acts as the node the person picks (`:node <name>`)" | Acts only as the node it was opened with (E-4) |
+| ADR-015 14.1 | "verification, consent and Block render as colour, glyph and label" | Trust renders as glyph, weight and label (E-6, L-4) |
+| ADR-016 NR-17a | "A room's local name MUST live only in its sealed manifest" | The room's shared name lives on the log (R-1) |
+| ADR-017 5.1–5.2, 5.5 | `vox up` runs the proxy | The daemon runs it while a node is attached; `vox up` reports it (S-5) |
+| ADR-017 12.2, 12.3, 12.10 | Room part is the viewer's alias; `vox serve` prints fingerprints in the room place | Room part is the shared room name (S-1); node part unchanged |
+| ADR-017 12.8 | Statement carries name, transport, shared or withdrawn | Also the detected kind (S-2) |
+| ADR-020 3.10 | "Not built" | Built by read records (§6) |
+| ADR-020 4.9a, last sentence | "It MUST NOT say a reply is overdue: a node cannot see another node's reads" | A node sees the reads it can open (RR-3); still no "overdue" claim |
+| ADR-020 11.1 | "File bytes MUST NOT enter the log" | Except a thumbnail and a link card of at most 16 KB each inside the encrypted message (F-3, F-4) |
+| ADR-020 11.6 | Share ends after `--count`, `--for` or ^C | The daemon serves until expiry, stop, leave or end (F-2) |
+| ADR-020 11.6 | A folder served as one tar | A file list with hashes, incremental and resumable (F-7) |
+| ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
+
+## Open for the decider
+
+1. A **room rename** that reaches a member already holding another room of the new name (R-3
+   governs only create and join): refuse it locally and keep the old name on that node, or show
+   both with a suffix?
+2. **Pasteable addresses**: S-1 makes the room part shared, but the node part is still each
+   viewer's alias, so an address pasted between two people may not resolve. Keep, or make the node
+   part shared too (the node's own chosen label), which would be a new concept?
+3. **Who sees read records** (RR-2): sealed under the reader's sender key, only members the reader
+   trusts see its reads. Accept, or post them readable by every member?
+
+## Consequences
+
+- One vocabulary and one set of flows across the CLI, the TUI and the app.
+- Read records add one small entry per reader per room every few seconds of reading, and expose to
+  trusted members when each message was seen.
+- The daemon holds file offers and the proxy for as long as a node is attached.
+- Thumbnails and link cards put up to 32 KB of non-text bytes into a message; the sender's node
+  contacts the linked site.
+- The release carries two signed artifacts on macOS, updated as one.
