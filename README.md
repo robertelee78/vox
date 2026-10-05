@@ -366,3 +366,9 @@ completion. Start with ADR-001, then the ADR for the area you want to work on.
 ## License
 
 [MIT](LICENSE) © Robert E. Lee
+
+### Third-party
+
+- **Inter Display** (`apps/macos/Vox/Fonts/InterDisplay-ExtraBold.otf`), the app's heading face, is
+  © The Inter Project Authors and licensed under the SIL Open Font License 1.1
+  (`apps/macos/Vox/Fonts/OFL.txt`). It is Inter 4.1's file, unmodified.
