@@ -386,6 +386,104 @@ async fn pinhole_with(
     })
 }
 
+/// A UDP socket connected to `server`, of its family, so the OS picks the source address and
+/// only the server's datagrams are read.
+async fn connected(server: SocketAddr) -> Result<UdpSocket> {
+    let bind: SocketAddr = if server.is_ipv6() {
+        (Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let socket = UdpSocket::bind(bind)
+        .await
+        .map_err(|_| Error::PortMappingFailed("port-map: socket bind failed"))?;
+    socket
+        .connect(server)
+        .await
+        .map_err(|_| Error::PortMappingFailed("port-map: connect failed"))?;
+    Ok(socket)
+}
+
+/// **Renew a held mapping at the server that granted it** (ADR-012 N-55): the same request again,
+/// asking for `lifetime_secs`. A PCP mapping and a pinhole carry the nonce they were created
+/// with, which a server in RFC 6887's Simple Threat Model requires (§11.3) — a renewal under a
+/// fresh nonce is refused `NOT_AUTHORIZED`. Retransmissions are the same bytes, so the same nonce
+/// (§8.1.1). NAT-PMP renews by its own request again; a UPnP lease is renewed by a discovery.
+///
+/// # Errors
+/// [`Error::PortMappingFailed`] when the server does not answer, refuses, or grants nothing.
+pub async fn renew(held: &PortMapping, lifetime_secs: u32) -> Result<PortMapping> {
+    let server = held
+        .server
+        .ok_or(Error::PortMappingFailed("renew: no server"))?;
+    let protocol = Protocol::Udp;
+    match held.method {
+        Method::Pcp => {
+            let nonce = held
+                .nonce
+                .ok_or(Error::PortMappingFailed("renew: no PCP nonce"))?;
+            let socket = connected(server).await?;
+            let client_ip = match socket.local_addr() {
+                Ok(SocketAddr::V4(v4)) => *v4.ip(),
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let req = pcp::encode_map_request(
+                &nonce,
+                protocol,
+                client_ip,
+                held.internal_port,
+                held.external_port,
+                lifetime_secs,
+            );
+            let resp = exchange(&socket, &req, "pcp: renewal not answered").await?;
+            let m = pcp::parse_map_response(&resp, &nonce, protocol, held.internal_port)?;
+            if m.lifetime_secs == 0 {
+                return Err(Error::PortMappingFailed("pcp: renewal granted nothing"));
+            }
+            Ok(PortMapping {
+                external_port: m.external_port,
+                external_ip: m.external_ipv4().map(IpAddr::V4).or(held.external_ip),
+                lifetime_secs: m.lifetime_secs,
+                ..*held
+            })
+        }
+        Method::NatPmp => {
+            let socket = connected(server).await?;
+            let req = natpmp::encode_map_request(
+                protocol,
+                held.internal_port,
+                held.external_port,
+                lifetime_secs,
+            );
+            let resp = exchange(&socket, &req, "nat-pmp: renewal not answered").await?;
+            let m = natpmp::parse_map_response(&resp, protocol, held.internal_port)?;
+            if m.lifetime_secs == 0 {
+                return Err(Error::PortMappingFailed("nat-pmp: renewal granted nothing"));
+            }
+            Ok(PortMapping {
+                external_port: m.external_port,
+                lifetime_secs: m.lifetime_secs,
+                ..*held
+            })
+        }
+        Method::PcpV6Pinhole => {
+            let (Some(nonce), Some(IpAddr::V6(client_ip))) = (held.nonce, held.asked_for) else {
+                return Err(Error::PortMappingFailed("renew: pinhole without nonce"));
+            };
+            pinhole_with(
+                server,
+                protocol,
+                client_ip,
+                held.internal_port,
+                lifetime_secs,
+                nonce,
+            )
+            .await
+        }
+        Method::UpnpIgd => Err(Error::PortMappingFailed("renew: UPnP renews by discovery")),
+    }
+}
+
 /// Convenience: build a [`SocketAddr`] for the standard gateway port 5351 from a
 /// gateway IP (RFC 6886/6887).
 #[must_use]

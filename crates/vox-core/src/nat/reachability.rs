@@ -250,24 +250,46 @@ pub async fn advertise_endpoints(
     // The two families' gateway work runs at once: each is a few seconds of
     // retransmissions against candidates that may not answer, and they are
     // independent. Serialising them would double the wait for a dual-stack host.
+    //
+    // **A held mapping is renewed, not raced for again** (N-55): one still leased for the same
+    // address goes back to the server that granted it, with its own nonce; only a family holding
+    // none (or holding one for an address the machine no longer uses) runs the race, which draws
+    // new nonces.
+    let renewable = |v6_family: bool, addr: Option<IpAddr>| {
+        leased
+            .iter()
+            .find(|m| {
+                mapping_is_v6(m) == v6_family
+                    && m.method != Method::UpnpIgd
+                    && m.lifetime_secs > 0
+                    && m.server.is_some()
+                    && addr.is_some()
+                    && m.asked_for == addr
+            })
+            .copied()
+    };
+    let renew_v6 = renewable(true, v6.map(IpAddr::V6));
+    let renew_v4 = renewable(false, v4.map(IpAddr::V4));
     let ((pinhole, ask_v6), (mapped, ask_v4)) = tokio::join!(
         async {
-            match v6 {
-                Some(a) => pinhole_any(a, bound_port).await,
-                None => (None, GatewayAsk::default()),
+            match (renew_v6, v6) {
+                (Some(m), _) => renew_one(&m).await,
+                (None, Some(a)) => pinhole_any(a, bound_port).await,
+                (None, None) => (None, GatewayAsk::default()),
             }
         },
         async {
-            match v4 {
-                Some(a) => map_port_any(a, bound_port).await,
-                None => (None, GatewayAsk::default()),
+            match (renew_v4, v4) {
+                (Some(m), _) => renew_one(&m).await,
+                (None, Some(a)) => map_port_any(a, bound_port).await,
+                (None, None) => (None, GatewayAsk::default()),
             }
         },
     );
 
     let held_v4 = leased
         .iter()
-        .find(|m| m.method != crate::nat::portmap::Method::PcpV6Pinhole)
+        .find(|m| !mapping_is_v6(m))
         .filter(|_| v4.is_some());
     let list = compose_endpoints(bound, v6, v4, mapped.as_ref().or(held_v4));
     let asks = GatewayAsks {
@@ -275,6 +297,21 @@ pub async fn advertise_endpoints(
         ipv6: ask_v6,
     };
     (list, pinhole.into_iter().chain(mapped).collect(), asks)
+}
+
+/// Whether a mapping is the IPv6 pinhole rather than the IPv4 mapping.
+fn mapping_is_v6(m: &PortMapping) -> bool {
+    m.method == Method::PcpV6Pinhole
+}
+
+/// Renew `held` at its own server (N-55), and say so as the family's ask (N-54).
+async fn renew_one(held: &PortMapping) -> (Option<PortMapping>, GatewayAsk) {
+    let asked = held.server.iter().map(ToString::to_string).collect();
+    let won = crate::nat::portmap::renew(held, PORT_MAP_LIFETIME_SECS)
+        .await
+        .ok();
+    let ask = GatewayAsk::of(asked, won.as_ref());
+    (won, ask)
 }
 
 /// Whether a socket bound to `bound` receives datagrams sent to `ip`: any address of its family
