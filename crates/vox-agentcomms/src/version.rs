@@ -59,7 +59,7 @@ impl Stamp {
         match self {
             Stamp::Match => mine.to_owned(),
             Stamp::Other(v) => crate::envelope::shown(v, crate::envelope::SHOWN_NAME),
-            Stamp::Missing => "no version (a vox that predates ADR-021)".to_owned(),
+            Stamp::Missing => "no version (a vox older than v0.2.9, which stamps none)".to_owned(),
             // Quoted and cut: the stamp is the author's text, printed into every
             // coordinating session's context (V210-123).
             Stamp::Unknown(v) => format!(

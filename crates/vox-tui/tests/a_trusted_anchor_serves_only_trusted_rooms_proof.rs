@@ -126,7 +126,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         said.lines().next().unwrap_or_default()
     );
     assert!(
-        said.contains("serving only rooms made by the 1 identity this profile trusts"),
+        said.contains("serving only rooms made by the 1 identity this node trusts"),
         "PRODUCT (staging): `vox node --serve trusted` did not say it serves only trusted rooms: {said}"
     );
     let anchor_id = vox_core::node::link::b32_decode(

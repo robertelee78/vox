@@ -453,8 +453,7 @@ pub async fn post_cmd(
         Some(bad) => {
             return Err(AppError::Usage(format!(
                 "{bad} is not a work reference: use <scheme>:<id>, the scheme \
-                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-] \
-                 (ADR-021 §3)",
+                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-]",
                 vox_agentcomms::envelope::MAX_WORK_ID
             )))
         }
@@ -1746,12 +1745,12 @@ fn resource_of(resource: Option<&str>, work: Option<&str>) -> Result<String, App
     match (resource, work) {
         (Some(r), Some(w)) if r != w => Err(AppError::Usage(format!(
             "the resource {r:?} and --work {w:?} differ; a claim on a work item uses the \
-             reference as its resource (ADR-021 §2)"
+             reference as its resource"
         ))),
         (_, Some(w)) if !vox_agentcomms::envelope::is_valid_work(w) => {
             Err(AppError::Usage(format!(
                 "--work {w:?} is not a work reference: use <scheme>:<id>, the scheme \
-                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-] (ADR-021 §3)",
+                 [a-z][a-z0-9-]{{0,15}} and the id 1–{} of [A-Za-z0-9._~/#:-]",
                 vox_agentcomms::envelope::MAX_WORK_ID
             )))
         }
@@ -3098,6 +3097,12 @@ async fn collect_offer(
         }
     };
 
+    // **Why a transfer failed is the node's to say** (ADR-020 11.8): followed from before the
+    // forward opens, so its refusal is not missed.
+    let mut events = match crate::client::one_shot(paths) {
+        Ok(at) => crate::client::events(&at).await.ok(),
+        Err(_) => None,
+    };
     let bound = match client
         .request(&Request::Forward {
             channel_id,
@@ -3127,7 +3132,7 @@ async fn collect_offer(
             return Err(AppError::Usage(format!(
                 "cannot reach the offer: {reason} — the sender may have stopped serving it, or \
                  may not have trusted this identity"
-            )))
+            )));
         }
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -3139,7 +3144,49 @@ async fn collect_offer(
             local: bound.clone(),
         })
         .await;
-    result
+    match result {
+        // **An offer its sharer no longer serves is gone, and is said to be** (ADR-020 11.8): the
+        // announcement stays on the log, the bytes were live only while it was shared. A transfer
+        // the sharer refused says that, not the socket's error ("Connection reset by peer"). One
+        // that sent the wrong bytes says that, whatever the node said.
+        Err(e) if !e.to_string().contains("announced") => match events.as_mut() {
+            Some(ev) => Err(why_not_collected(ev, offer).await.unwrap_or(e)),
+            None => Err(e),
+        },
+        other => other,
+    }
+}
+
+/// What the node said about a transfer of `offer` that failed, within a moment of it: the
+/// sharer refused it (it no longer serves the offer: this node reads the announcement, so the
+/// sharer trusted it), or could not be reached. `None` if it said neither.
+async fn why_not_collected(events: &mut IpcClient, offer: &Offer) -> Option<AppError> {
+    use vox_core::node::api::NodeEvent;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while let Ok(Ok(Some(frame))) = tokio::time::timeout_at(deadline, events.next()).await {
+        let Frame::Event(NodeEvent::ProxyRefused { reason }) = frame else {
+            continue;
+        };
+        if !reason.contains(&offer.tag) {
+            continue;
+        }
+        let who = crate::ident::name_of(&offer.author);
+        return Some(AppError::Usage(if reason.contains("the host refused") {
+            format!(
+                "the offer of {} is gone: {who} no longer serves it. The announcement stays in \
+                 the room, but the file is served only while {who} shares it; ask them to share \
+                 it again",
+                offer.name
+            )
+        } else {
+            format!(
+                "the offer of {} cannot be collected now: {who} could not be reached ({reason}). \
+                 The file is served only while {who} is online and sharing it",
+                offer.name
+            )
+        }));
+    }
+    None
 }
 
 /// Where a collected file is to land.

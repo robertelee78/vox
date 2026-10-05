@@ -354,6 +354,12 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     std::thread::sleep(Duration::from_millis(200));
     let share_said = share.transcript();
 
+    // **A late collector is told the offer is gone** (ADR-020 11.8): the announcement stays on the
+    // log, the bytes were live. The share has ended (above: it stopped after `--count 2`, and
+    // withdrew its service before it exited), and bob, who reads the announcement, asks again.
+    let (late_ok, late_said) = bob.run(&["room", "get", &room, "report.bin"]);
+    eprintln!("[proof] bob's get after the share ended (ok {late_ok}): {late_said}");
+
     // A folder, as one tar.
     let mut folder_share = VoxProc::spawn(
         "alice share folder",
@@ -408,6 +414,20 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     assert!(
         ended.is_some_and(|s| s.success()) && share_said.contains("fetched 2 time(s)"),
         "the share must stop by itself after --count 2"
+    );
+    assert!(
+        ended.is_some_and(|s| s.success()),
+        "CANNOT MEASURE: the share did not end, so a late collector was not staged: share ended \
+         {ended:?}"
+    );
+    assert!(
+        !late_ok
+            && late_said.contains("the offer of report.bin is gone")
+            && late_said.contains("no longer serves it")
+            && !late_said.contains("reset by peer"),
+        "PRODUCT: a collector of an offer whose share has ended must be told the offer is gone \
+         (ADR-020 11.8), not a transport error; bob's `vox room get` said (ok {late_ok}): \
+         {late_said}"
     );
     assert!(tar_ok, "the folder share must be collectable");
     for entry in [

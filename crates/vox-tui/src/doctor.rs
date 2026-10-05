@@ -111,7 +111,13 @@ pub async fn doctor(paths: &Paths, room: Option<&str>, json: bool) -> Result<(),
             checks.push(fail(
                 "node",
                 e.to_string(),
-                "start this profile's node: `vox daemon` (or `vox tui`)",
+                format!(
+                    "attach this node: `vox node attach {}` (it starts the daemon if none runs)",
+                    paths
+                        .profile_dir
+                        .file_name()
+                        .map_or_else(|| "<node>".into(), |n| n.to_string_lossy())
+                ),
             ));
             None
         }
