@@ -7,7 +7,9 @@ attaching the node said (a skipped anchors line, "carrying on with no anchor") i
 TUI's screen, where a person would read it.
 
 Prints `<tag> ATTACHED`, then `<tag> SAID: <text>` with the TUI's bottom rows joined (its status
-bar, its notice line), and `<tag> SCREEN:` with the whole screen. Exit 0 = the TUI attached its node
+bar, its notice line), `<tag> COLOURS: base=<hex> accent_cells=<n>` with the background of the
+screen's top-left cell and how many cells are drawn in `<accent hex>` (the 7th argument, from the
+token file; the terminal declares truecolour), and `<tag> SCREEN:` with the whole screen. Exit 0 = the TUI attached its node
 and the screen was read; 1 = the TUI failed (`<tag> RED: PRODUCT: <what>`, with its screen: no
 attach prompt, never attached) or the driver hung (`HUNG at <stage>`: `vox_pty.py`, V210-54); 2 =
 apparatus, the driver's own machinery only (pyte missing). The caller judges the words. The TUI is
@@ -20,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, is_attached, pyte, stage  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, TAG = sys.argv[1:6]
+ACCENT = (sys.argv[6] if len(sys.argv) > 6 else "").lower().lstrip("#")
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "180"))
 if pyte is None:
     print(f"{TAG} APPARATUS: pyte is not importable (install it, or set VOX_PYTE_PATH)")
@@ -27,7 +30,7 @@ if pyte is None:
 arm(BUDGET, TAG)
 
 env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "USER") if k in os.environ}
-env.update(VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG, TERM="xterm-256color")
+env.update(VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG, TERM="xterm-256color", COLORTERM="truecolor")
 
 code = 2
 tui = None
@@ -51,6 +54,15 @@ try:
     print(f"{TAG} ATTACHED")
     tui.pump(2)
     print(f"{TAG} SAID: {bottom()}")
+    buf = tui.screen.buffer
+    base = buf[0][0].bg
+    accent_cells = sum(
+        1
+        for y in range(tui.screen.lines)
+        for cell in buf[y].values()
+        if ACCENT and (cell.fg == ACCENT or cell.bg == ACCENT)
+    )
+    print(f"{TAG} COLOURS: base={base} accent_cells={accent_cells}")
     print(f"{TAG} SCREEN:\n{tui.text()}")
     code = 0
     tui.key(":q\r", 1)

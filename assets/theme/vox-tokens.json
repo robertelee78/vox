@@ -1,0 +1,31 @@
+{
+  "schema": "vox-tokens/1",
+  "theme": "dark",
+  "color": {
+    "bg.base":        { "hex": "#0c0d0f", "xterm256": 233, "ansi16": "default-bg" },
+    "bg.raised":      { "hex": "#131417", "xterm256": 233, "ansi16": "default-bg" },
+    "bg.panel":       { "hex": "#16171a", "xterm256": 234, "ansi16": "default-bg" },
+    "bg.overlay":     { "hex": "#1c1d21", "xterm256": 234, "ansi16": "black" },
+    "line.hair":      { "hex": "#26272b", "xterm256": 235, "ansi16": "bright-black" },
+    "text.primary":   { "hex": "#f0ece4", "xterm256": 255, "ansi16": "default-fg" },
+    "text.secondary": { "hex": "#a8a299", "xterm256": 247, "ansi16": "default-fg" },
+    "text.muted":     { "hex": "#85807a", "xterm256": 244, "ansi16": "bright-black" },
+    "accent":         { "hex": "#5ec8ff", "xterm256": 81,  "ansi16": "bright-cyan" },
+    "accent.hover":   { "hex": "#8fdbff", "xterm256": 117, "ansi16": "bright-cyan" },
+    "accent.deep":    { "hex": "#2fa8f0", "xterm256": 39,  "ansi16": "cyan" },
+    "attention":      { "hex": "#f2b33d", "xterm256": 215, "ansi16": "yellow" },
+    "danger":         { "hex": "#ff5f3a", "xterm256": 203, "ansi16": "bright-red" }
+  },
+  "type": {
+    "app.text":    { "family": "SF Pro",        "system": "body",       "weight": 400 },
+    "app.mono":    { "family": "SF Mono",       "system": "monospaced", "weight": 400 },
+    "app.eyebrow": { "family": "SF Mono",       "system": "monospaced", "weight": 600, "tracking": 0.12, "uppercase": true, "size": 11 },
+    "app.heading": { "family": "Inter Display", "bundled": "InterDisplay-ExtraBold.otf", "weight": 800, "tracking": -0.02 }
+  },
+  "motion": {
+    "tui.max_frames": 3,
+    "tui.frame_ms": 16,
+    "app.spring_response_ms": 200,
+    "app.spring_damping": 1.0
+  }
+}

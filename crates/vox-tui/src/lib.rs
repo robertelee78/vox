@@ -39,6 +39,7 @@ pub mod share_cli;
 pub mod shell;
 pub mod state;
 pub mod status_cli;
+pub mod theme;
 pub mod tunnel_cli;
 pub mod ui;
 pub mod update;
