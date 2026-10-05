@@ -115,6 +115,9 @@ pub struct ChannelSummary {
     pub unread: usize,
     /// Unread coordination traffic (presence, progress, claims), counted only: the third level.
     pub coordination: usize,
+    /// What the room needs from the person, which group the sidebar lists it under (ADR-028 W-2,
+    /// #511).
+    pub group: vox_agentcomms::attention::RoomGroup,
     /// Channel reachability.
     pub reachability: Reachability,
 }
@@ -175,6 +178,8 @@ pub struct ViewModel {
     /// How many seconds a keyring change still goes without the identity passphrase, or `None`
     /// when the next one will ask for it (ADR-028 K-9).
     pub keyring_open_secs: Option<u64>,
+    /// Every node on this machine, by name, and whether it is attached (ADR-028 W-1, #511).
+    pub machine_nodes: Vec<(String, bool)>,
     /// Whether `mlock` is in effect; `false` surfaces the documented zeroize-only
     /// degradation warning (ADR-015 memory-protection honesty).
     pub mlock_active: bool,

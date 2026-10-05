@@ -81,10 +81,26 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
         ])
         .split(area);
 
-    match ui.screen {
-        Screen::ChannelList => render_channel_list(frame, chunks[0], vm, ui),
-        Screen::Channel => render_channel(frame, chunks[0], vm, ui),
-        Screen::Tunnels => render_tunnels(frame, chunks[0], vm, ui),
+    // The window's regions (ADR-028 W-1, #511): the sidebar beside the room, its timeline and its
+    // inspector; the tunnels view has the window to itself.
+    if ui.screen == Screen::Tunnels {
+        render_tunnels(frame, chunks[0], vm, ui);
+    } else {
+        let regions = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(sidebar_cols(chunks[0].width)),
+                Constraint::Min(1),
+            ])
+            .split(chunks[0]);
+        render_sidebar(frame, regions[0], vm, ui);
+        if ui.screen == Screen::Channel {
+            render_channel(frame, regions[1], vm, ui);
+        } else {
+            let p = Paragraph::new("No room open — Enter opens the room selected in the sidebar")
+                .block(Block::default().borders(Borders::ALL));
+            frame.render_widget(p, regions[1]);
+        }
     }
     render_status_bar(frame, chunks[1], vm);
     frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), chunks[2]);
@@ -127,47 +143,90 @@ fn render_prompt(frame: &mut Frame, area: Rect, p: &Prompt) {
     frame.render_widget(widget, overlay);
 }
 
-fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
-    let items: Vec<ListItem> = vm
-        .channels
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let marker = if i == ui.selected_channel {
-                "▶ "
-            } else {
-                "  "
-            };
-            // The three unread levels (ADR-028 R-8, #484): to this node first.
-            let levels: Vec<String> = [
-                (c.to_you > 0).then(|| format!("to you {}", c.to_you)),
-                (c.unread > 0).then(|| format!("{} new", c.unread)),
-                (c.coordination > 0).then(|| format!("{} coordination", c.coordination)),
-            ]
-            .into_iter()
-            .flatten()
-            .collect();
-            let unread = if levels.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", levels.join(" · "))
-            };
-            let lock = if c.open { "" } else { " 🔒" };
-            ListItem::new(format!(
-                "{marker}{}{lock}{unread}  [{}]",
-                c.local_name,
-                reachability_label(c.reachability)
-            ))
-        })
+/// The sidebar's width for a window `width` columns wide: 30 % of it, at least 28 columns and at
+/// most 48, where a room row with its unread levels and its reachability fits; the timeline keeps
+/// the most room.
+fn sidebar_cols(width: u16) -> u16 {
+    (width * 30 / 100).clamp(28, 48)
+}
+
+/// The inspector's width beside a room: 48 columns, where a member named by its 26-character
+/// fingerprint and "(not in keyring)", and the longest trust label under it, fit; half the room's
+/// area where that is less.
+fn inspector_cols(width: u16) -> u16 {
+    48.min(width / 2)
+}
+
+/// **The sidebar** (ADR-028 W-1, W-2, #511): the node this TUI acts as and whether it is attached;
+/// the rooms, grouped by what they need from the person, each group with its count; and every node
+/// on this machine, attached or detached. Beside an open room as beside the list; it holds the
+/// focus (L-3) and names its keys only while the list is the pane in use.
+fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
+    let mut items: Vec<ListItem> = vec![ListItem::new(format!(
+        "node {} · {}",
+        vm.node,
+        if vm.attached {
+            "attached"
+        } else {
+            "not attached"
+        }
+    ))];
+    let mut group = None;
+    for (i, c) in vm.channels.iter().enumerate() {
+        if group != Some(c.group) {
+            group = Some(c.group);
+            let n = vm.channels.iter().filter(|o| o.group == c.group).count();
+            items.push(
+                ListItem::new(format!("{} ({n})", c.group.label()))
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+            );
+        }
+        let marker = if i == ui.selected_channel {
+            "▶ "
+        } else {
+            "  "
+        };
+        // The three unread levels (ADR-028 R-8, #484): to this node first.
+        let levels: Vec<String> = [
+            (c.to_you > 0).then(|| format!("to you {}", c.to_you)),
+            (c.unread > 0).then(|| format!("{} new", c.unread)),
+            (c.coordination > 0).then(|| format!("{} coordination", c.coordination)),
+        ]
+        .into_iter()
+        .flatten()
         .collect();
-    let title = format!(
-        "node {} · Rooms (Enter: open · Ctrl-N: next room to you · : command)",
-        vm.node
-    );
-    // The room list is the screen's one pane, so it holds the focus (ADR-028 L-3).
-    let list = List::new(items).block(focus_block(
-        Block::default().borders(Borders::ALL).title(title),
-    ));
+        let unread = if levels.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", levels.join(" · "))
+        };
+        let lock = if c.open { "" } else { " 🔒" };
+        items.push(ListItem::new(format!(
+            "{marker}{}{lock}{unread}  [{}]",
+            c.local_name,
+            reachability_label(c.reachability)
+        )));
+    }
+    if !vm.machine_nodes.is_empty() {
+        items.push(
+            ListItem::new("nodes on this machine")
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        );
+        for (name, attached) in &vm.machine_nodes {
+            items.push(ListItem::new(format!(
+                "  {name}  {}",
+                if *attached { "attached" } else { "detached" }
+            )));
+        }
+    }
+    let listing = ui.screen == Screen::ChannelList;
+    let title = if listing {
+        "Rooms (Enter: open · Ctrl-N: next room to you · : command)"
+    } else {
+        "Rooms"
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let list = List::new(items).block(if listing { focus_block(block) } else { block });
     frame.render_widget(list, area);
 }
 
@@ -242,7 +301,10 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(inspector_cols(area.width)),
+        ])
         .split(area);
 
     let body = Layout::default()

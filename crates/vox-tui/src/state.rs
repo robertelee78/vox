@@ -217,6 +217,10 @@ pub struct UiState {
     pub mode: Mode,
     /// Selected channel index in the home list.
     pub selected_channel: usize,
+    /// The room selected, **by identity** (#511): the sidebar groups rooms by what they need, so
+    /// an unread re-sorts it, and a position would then name another room. Each frame finds its
+    /// index again ([`UiState::settle`]).
+    pub selected_room: Option<Digest32>,
     /// The member selected in the member pane, **by identity** (V210-82): the pane is in
     /// fingerprint order, so a join re-sorts it, and a position would then name someone else.
     /// `None` until the pane first has a member (see [`UiState::settle`]).
@@ -244,6 +248,7 @@ impl Default for UiState {
             focus: Focus::Timeline,
             mode: Mode::Normal,
             selected_channel: 0,
+            selected_room: None,
             selected_member: None,
             timeline_scroll: 0,
             status_message: None,
@@ -265,6 +270,18 @@ impl UiState {
     /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
     /// draws and the member a command acts on are one member, held by identity from then on.
     pub fn settle(&mut self, vm: &ViewModel) {
+        match self
+            .selected_room
+            .and_then(|id| vm.channels.iter().position(|c| c.channel_id == id))
+        {
+            Some(i) => self.selected_channel = i,
+            None => {
+                self.selected_channel = self
+                    .selected_channel
+                    .min(vm.channels.len().saturating_sub(1));
+                self.selected_room = vm.channels.get(self.selected_channel).map(|c| c.channel_id);
+            }
+        }
         if self.screen == Screen::Tunnels {
             if self
                 .selected_tunnel
@@ -316,6 +333,7 @@ impl UiState {
             return match next {
                 Some(i) => {
                     self.selected_channel = i;
+                    self.selected_room = vm.channels.get(i).map(|c| c.channel_id);
                     self.open_selected(vm)
                 }
                 None => Action::Redraw,
@@ -568,6 +586,8 @@ impl UiState {
                 let len = vm.channels.len();
                 if len > 0 {
                     self.selected_channel = step(self.selected_channel, len);
+                    self.selected_room =
+                        vm.channels.get(self.selected_channel).map(|c| c.channel_id);
                 }
             }
             Screen::Tunnels => {

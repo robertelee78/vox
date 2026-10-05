@@ -21,7 +21,7 @@ import os, re, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pane as pane_of, pyte, stage  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
 # Sized for the debug build, whose joins grind their proof of work for a minute or more each (40-58 s
@@ -141,9 +141,9 @@ try:
     tui.key("\r", 2)
     tui.key("\t", 1)   # timeline -> composer
     tui.key("\t", 1)   # composer -> members
-    # The members pane is the right-hand column; read every row of it from the emulated screen.
+    # The members pane, found by its title; read every row of it from the emulated screen.
     def members():
-        return [row[100:] if len(row) > 100 else "" for row in tui.display()]
+        return pane_of(tui.display(), "Members")
     want_carol = fp["carol"][:26]
     def seen():
         txt = "\n".join(members())
@@ -152,7 +152,7 @@ try:
     tui.until(seen, 30, 1)
     pane = [r.rstrip() for r in members() if r.strip()]
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
-    print(f"{TAG} members pane (cols 100+):")
+    print(f"{TAG} members pane:")
     for r in pane:
         print(f"  |{r}")
     txt = "\n".join(pane)
