@@ -1,6 +1,6 @@
 # Send and receive files
 
-Applies to: v0.3.0. Both nodes need to be attached, members of the room, and appropriately
+Applies to: v0.3.1. Both nodes need to be attached, members of the room, and appropriately
 trusted. Examples act as the only attached node; with several, add `--node NAME`.
 
 A file in Vox is never uploaded anywhere. The sender's node serves it, the room carries an
@@ -93,5 +93,5 @@ If it repeats, use [file troubleshooting](troubleshooting.md#the-file-is-unavail
 and [safe reporting](getting-help.md). Keep file contents out of a public report unless you
 have deliberately made a harmless reproduction file.
 
-Source: [v0.3.0 file exchange implementation](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/room_cli.rs)
-and [share](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/share_cli.rs).
+Source: [file exchange implementation](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/room_cli.rs)
+and [share](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/share_cli.rs).

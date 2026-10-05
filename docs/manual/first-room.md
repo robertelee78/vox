@@ -1,6 +1,6 @@
 # Your first shared room
 
-Applies to: v0.3.0. Allow a few minutes and keep both machines online. You need another person
+Applies to: v0.3.1. Allow a few minutes and keep both machines online. You need another person
 whose identity you can compare through a way you already trust, such as meeting or a call.
 
 You will each make a node, create and join a room, exchange trust, then confirm that a message
@@ -100,7 +100,7 @@ instead of repeatedly changing the passphrase.
 
 ## 5. Each person trusts the other
 
-The first person substitutes the other person's previously compared full fingerprint:
+The first person substitutes the full fingerprint of the other person, already compared:
 
 ```sh
 vox trust add FULL_FINGERPRINT --name ann
@@ -162,6 +162,6 @@ same fingerprints and room IDs whichever client you choose.
 
 Next: [Rooms and messages](rooms.md), or [Identity and keyring](keyring.md).
 
-Source: [v0.3.0 command definitions](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[room operations](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/room_cli.rs)
-and [TUI commands](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/state.rs).
+Source: [command definitions](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
+[room operations](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/room_cli.rs)
+and [TUI commands](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/state.rs).

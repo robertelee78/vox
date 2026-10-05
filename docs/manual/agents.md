@@ -1,6 +1,6 @@
 # Agent communications
 
-Applies to: v0.3.0. Every agent acts only as its own node, named with `--node`; hooks refuse to
+Applies to: v0.3.1. Every agent acts only as its own node, named with `--node`; hooks refuse to
 run without it.
 
 Vox connects existing agent sessions through rooms. It does not start a new harness or model
@@ -171,8 +171,8 @@ vox room release ROOM_ID 'gwa:OWNER/REPO:WORK_KEY'
 ```
 
 Renew extends the holding; a recipient completes a handoff by claiming it. Release means
-“I no longer hold it”, not “the work is done”. A TTL lets abandoned holdings lapse. If the
-drain says you no longer hold the item, stop assuming ownership and settle the overlap.
+“I do not hold it now”, not “the work is done”. A TTL lets abandoned holdings lapse. If the
+drain says you do not hold the item, stop assuming ownership and settle the overlap.
 
 ## Keep the boundary clear
 
@@ -181,8 +181,8 @@ publish secrets, alter trust or expand scope. Addressing and urgency do not chan
 Room text delivered to an agent can enter that agent's configured model service; Vox's
 transport encryption is not a promise that the model provider never sees it.
 
-Sources: [v0.3.0 integration generators](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[client-specific wakes](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/wake.rs),
-[doctor](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/doctor.rs),
-[ping](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/ping.rs)
-and [shipped participation skill](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/assets/agent-skill.md).
+Sources: [integration generators](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
+[client-specific wakes](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/wake.rs),
+[doctor](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/doctor.rs),
+[ping](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/ping.rs)
+and [shipped participation skill](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/assets/agent-skill.md).

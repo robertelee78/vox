@@ -7,6 +7,7 @@ not a chapter in the public navigation manifest. Source inspection is not an exe
 
 | Label | Exact source revision | Use |
 |---|---|---|
+| v0.3.1 | `bf6dfcdbee65e82a4683400baa94dd62fc8532d6` (built on macOS and on Linux) | Task chapters from v0.3.1 (#425), the v0.3.1 command check |
 | v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8`; review fixes at `c142ddd3293bfd1273cfd5737a673bcceb93dfc9` and `vox room link` at `d01c2c767c9ae295d1ed9aabdf66b73838c8f266` (each built, rechecked) | Task chapters, troubleshooting, the v0.3.0 command check |
 | Released v0.2.10 | `8d95a381f14d6bbb45f714d75f64e57d2f5dbf96` | History only: the earlier edition and the profile-to-node move check; the manual no longer describes it |
 | `rearch/v030` | `2d8385d4f90891c96843f32d6d002bc1b69aac1e` | Superseded label: an ancestor of the v0.3.0 baseline, which ships it |
@@ -43,7 +44,35 @@ later parser or implementation may invalidate both an example and its troublesho
 | agents: `--node` required, plugin output, hook registration and implicit attach | `crates/vox-tui/src/cli.rs` (`AgentHookArgs`, `AgentPluginArgs`); `crates/vox-tui/src/agent_hook.rs:1137-1180` |
 | agents: wakes per client, doctor, ping | `crates/vox-tui/src/wake.rs`; `crates/vox-tui/src/doctor.rs`; `crates/vox-tui/src/ping.rs` |
 | agents: claim exit codes | `vox room claim --help`; `vox room post --help` (`--op`, exit 4) |
+| troubleshooting / services: network change noticed and said (v0.3.1) | `crates/vox-core/src/nat/netwatch.rs` (`summary`); `crates/vox-core/src/node/status.rs` (`network_changed`); `crates/vox-core/src/node/net.rs` (probe after a change); ADR-012 N-49–N-58 |
+| reference: `gateway` in status, mapping renewal and deletion at stop (v0.3.1) | `crates/vox-tui/src/status_cli.rs` (gateway); `crates/vox-core/src/nat/portmap.rs` (method names); `crates/vox-core/src/node/presence.rs` (deletion at stop) |
+| install: containers, root refusal, receive buffer (v0.3.1) | `crates/vox-core/src/error.rs` (`Root`); `crates/vox-core/src/transport/quic.rs` (`UDP_SOCKET_BUFFER`, `mtu_ceiling_for`, the buffer line) |
 | reference: paths, data root layout, passphrase input, daemon passphrase-file lines | `crates/vox-core/src/node/paths.rs`; ADR-026 F-1; `crates/vox-tui/src/app.rs:870-1020` |
+
+## v0.3.1 command check
+
+Run on 2026-10-05 for #425 with `vox 0.3.1` built at `bf6dfcdb` (`cargo build --release --bin
+vox`, no features): on macOS, and on Linux (built on io.loveathome.us, x86_64, and run there and on
+a second Linux host). Every process had scratch `VOX_DATA_DIR` and `VOX_CONFIG_DIR`; no personal
+state was opened; no `sudo`. Addresses below are scratch or placeholders.
+
+| Manual claim | Where and how | Observed |
+|---|---|---|
+| The first room, room link, trust, receipt both ways, a service by address, end (unchanged commands still hold) | macOS, two data roots | `vox: node robertgpt attached`; `no rooms`; `vox: created family`; `room link` → the `vox://…` link and `send the passphrase another way than this address (in person, a call, a different app)`; `vox: joined family`; the trust sentences as quoted; B read `… robertGPT hello from robertGPT`, A read `… ann hello back from ann`; `web.robertgpt.family.vox  by robertgpt`; `forwarding 127.0.0.1:18098 to web on web.robertgpt.family.vox`, curl returned the page; `ended … for everyone`, B `no rooms` |
+| `vox status` gateway section | macOS, behind a home router | `gateway` / `ipv4  next hop 192.168.1.1 via en0` / `asked 192.168.1.1:5351, 192.0.0.9:5351: PCP answered at 192.168.1.1:5351` / `ipv6  no default route` / `no gateway asked`; `--json`: `"gateway":{"ipv4":{"next_hop":{…},"asked":[…],"answered":{"address":"192.168.1.1:5351","rung":"PCP","external":"PUBLIC_IP:53277","lifetime":7200},"renewal":false},"ipv6":{…}}` and `"network_changed":null` |
+| Mappings deleted when the daemon stops | macOS: `vox node detach` of the only node, so the background daemon stopped | daemon log: `vox daemon: deleted the port mapping UDP 53277 at 192.168.1.1:5351 (PCP)` / `vox daemon: stopped` |
+| A network change is noticed and said | Linux, inside `unshare --user --net --map-current-user --keep-caps` (no sudo): a dummy link with 10.9.0.1 and a default route, a node attached, then a second dummy link with 10.9.1.7 and the default route moved to it | within 6 s the daemon log said `vox: the network changed: addresses came: 10.9.1.7; went: 10.9.0.1; IPv4 default route 10.9.0.254 → 10.9.1.254; this node now advertises /ip4/10.9.1.7/udp/55525, /ip4/127.0.0.1/udp/55525, and republished 0 room(s) to its board and its anchors`; `vox status --json` → `"network_changed":{"at":1791211286,"change":"the network changed: addresses came: 10.9.1.7; went: 10.9.0.1; IPv4 default route 10.9.0.254 → 10.9.1.254"}`. The redial of connected peers and the probe line (`… did not answer a probe after the network changed; closed, and dialled again`) are from source (`node/net.rs`), not exercised: the namespace had no peer |
+| A client run as root is told at once | Linux, `unshare --user --map-root-user` (uid 0 in the namespace) | `vox room list` → `vox: this is running as root (uid 0), and the vox daemon refuses every control connection from root, so nothing run as root can use it. Run vox as an ordinary user: in a container, set a non-root USER (for example `podman run --user 1000 …`). Socket: …` (exit 1) |
+| `vox daemon` will not start as root | same | `vox: vox daemon will not run as root (uid 0): it admits no control connection from root, so a daemon run as root could serve nobody. Run vox as an ordinary user: …` (exit 1) |
+| The short-buffer line | Linux host with `net.core.rmem_max = 212992` | daemon log: `vox: UDP receive buffer 416 KiB: path-MTU ceiling 1452 bytes, not 8192 — the OS granted a smaller receive buffer than 8192-byte datagrams need (on Linux, raise net.core.rmem_max to at least 4 MiB)` |
+| No line with a 4 MiB limit | macOS (default); a Linux host with `net.core.rmem_max = 4194304` | no `UDP receive buffer` line in the daemon log on macOS |
+| Podman on macOS | `podman machine ssh podman-machine-default 'sysctl net.core.rmem_max'`; a container's `/proc/sys/net/core/rmem_max` | `net.core.rmem_max = 4194304`; `4194304`. Whether this is that VM's default or was set on it was not determined |
+
+Not exercised: a real switch of Wi-Fi networks (the change was staged in a network namespace);
+the throughput cost of a small buffer, which is the decider's measurement for R41a (#218), not
+this check; `sysctl -w` and `/etc/sysctl.d` themselves (they need root on the host, and the
+manual's checks never use sudo). All processes were stopped (`vox node detach`, or by recorded
+PID) and none remained on any host.
 
 ## v0.3.0 command check
 

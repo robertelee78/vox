@@ -1,6 +1,6 @@
 # Rooms and messages
 
-Applies to: v0.3.0. The `vox room` commands ask an attached node through the daemon; they do not
+Applies to: v0.3.1. The `vox room` commands ask an attached node through the daemon; they do not
 attach one. Examples act as the only attached node; with several, add `--node robertgpt`.
 `ROOM_ID` is copied from `vox room list`.
 
@@ -165,6 +165,6 @@ no new message in the room, passes the end on, and deletes the room, and the ser
 it stop. Warn the members first. An ended room cannot be joined again; make a new one. Members
 may still hold copies they made.
 
-Source: [v0.3.0 room commands and their arguments](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[room read, join, retention and leave behavior](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/room_cli.rs)
-and [room lifecycle](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-023-room-lifecycle.md).
+Source: [room commands and their arguments](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
+[room read, join, retention and leave behavior](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/room_cli.rs)
+and [room lifecycle](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-023-room-lifecycle.md).

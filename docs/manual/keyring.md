@@ -1,6 +1,6 @@
 # Identity and keyring
 
-Applies to: v0.3.0. Examples act as the node `robertgpt`. With one node attached, commands act
+Applies to: v0.3.1. Examples act as the node `robertgpt`. With one node attached, commands act
 as it; with several, add `--node robertgpt`.
 
 ## Your nodes
@@ -97,13 +97,13 @@ vox trust list
 ```
 
 Vox reports `your sender key is rotated and everyone still trusted is re-keyed`. Verify the
-fingerprint no longer appears in your keyring, and inspect any affected service or conversation
+fingerprint is absent from `vox trust list`, and inspect any affected service or conversation
 from the other side if you need operational confirmation. Do not run this as an experiment on a
 family member's or production agent's identity.
 
 For passphrases and paths, see [Commands and local state](reference.md). For a one-way
 conversation, see [the trust troubleshooting entry](troubleshooting.md#we-joined-but-cannot-read-each-other).
 
-Source: [v0.3.0 trust and node commands](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[the 30-minute keyring window](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-core/src/node/actor.rs)
-and [TUI state wording](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/ui.rs).
+Source: [trust and node commands](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
+[the 30-minute keyring window](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-core/src/node/actor.rs)
+and [TUI state wording](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/ui.rs).

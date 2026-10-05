@@ -1,6 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to: v0.3.0. Check `vox --version` first: the fixes here are for the version they name.
+Applies to: v0.3.1. Check `vox --version` first: the fixes here are for the version they name.
 
 ## Before changing anything
 
@@ -196,7 +196,7 @@ broken signature from this placeholder alone.
 
 **Fix:** restore the relevant peers' availability and let the node request the body. Do not
 reset identity, change trust indiscriminately or use the placeholder as a `--since` cursor.
-If the body is no longer available, do not promise a central server can recover it.
+If no member holds the body, do not promise a central server can recover it.
 
 **Verify:** the placeholder is replaced by the received message, or the actual retention
 state explains its removal. If it persists despite a reachable holder, report the exact
@@ -231,20 +231,37 @@ If it still fails, report the last successful step and exact refusal, not a gene
 
 ## Peers cannot find me after a network change
 
-**Meaning:** v0.3.0 does not notice when the machine changes network, such as moving from home
-Wi-Fi to a hotspot, and off Linux it does not read the default route. Peers can go on trying the
-addresses the daemon published before the change. Detecting changes is planned for v0.3.1; this
-release does not do it.
+**What Vox does:** when the machine's addresses or default route change, such as moving from home
+Wi-Fi to a hotspot, the daemon hears it from the operating system and acts within seconds. It
+writes one line to its log (`.daemon/log` in the data root, or the terminal of a `vox daemon` you
+started there), for example:
 
-**Check:** `vox status` on both sides: is the peer `connected`, and by which path?
+```text
+vox: the network changed: addresses came: 10.9.1.7; went: 10.9.0.1; IPv4 default route 10.9.0.254 → 10.9.1.254; this node now advertises /ip4/10.9.1.7/udp/55525, /ip4/127.0.0.1/udp/55525, and republished 0 room(s) to its board and its anchors
+```
 
-**Fix:** if peers stay unreachable after the change, restart the daemon: it learns and publishes
-its addresses when it starts. A `vox daemon` you run in a terminal: Ctrl-C it and start it again.
-A daemon started in the background exits once no node is attached and no client is connected:
-detach each node with `vox node detach NAME`, stop any `up`, `forward`, `serve` or agent session
-holding one, then attach again. A restart interrupts every node's rooms, services and agent
-delivery while it happens. This remedy follows from the source and was not exercised by the
-manual's v0.3.0 check.
+It forgets the outside addresses it had seen, asks the router for its port mappings again,
+publishes each attached node's new addresses to its rooms' boards and anchors, and dials its
+peers and anchors again. A connection that does not answer after the change is closed and dialled
+again. `vox status --json` names the last change under `network_changed`, with its time (`at`)
+and the same sentence (`change`); it is `null` when there has been none since the daemon started.
+There is nothing to restart.
+
+**Check:** if a peer still cannot reach you after a minute:
+
+- `vox status --json`: is `network_changed` the change you expected? If it is `null`, the
+  daemon did not count a change: only a change of routable addresses or of the default route
+  counts.
+- `vox status`: under `gateway`, did a router answer (see
+  [reading status](reference.md#output-cursors-and-status))? Behind a new NAT with no mapping
+  answered, a peer that is also behind NAT can reach you only through an anchor; see
+  [when an anchor is needed](services.md#when-an-anchor-is-needed).
+- `vox status` on both sides: is the peer `connected`, and by which path, `direct` or relayed?
+- A VPN, a firewall or a captive portal on the new network can block UDP; check it the way you
+  would for any other program.
+
+**Fix:** restore what the checks name: sign in to the captive portal, allow UDP, or give both
+sides an anchor they can reach. Do not delete the node or change trust to cure a network fault.
 
 **Verify:** the peer shows `connected` in `vox status` and a new message arrives.
 
@@ -309,9 +326,9 @@ retrying the same operation. Do not reuse it for different content.
 Record progress on the GitHub issue, not by manufacturing a successful room outcome. If
 uncertainty persists, report the named reason and sanitized board state.
 
-Sources: [v0.3.0 node selection and attach messages](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/client.rs),
-[join diagnostics](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/tunnel_cli.rs),
-[room and file diagnostics](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/room_cli.rs),
-[the daemon](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/daemon.rs),
-[wake behavior](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/wake.rs)
-and [network-change work for v0.3.1](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-012-nat-traversal-and-reachability.md).
+Sources: [node selection and attach messages](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/client.rs),
+[join diagnostics](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/tunnel_cli.rs),
+[room and file diagnostics](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/room_cli.rs),
+[the daemon](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/daemon.rs),
+[wake behavior](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/wake.rs)
+and [network changes](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-012-nat-traversal-and-reachability.md).

@@ -8,7 +8,7 @@ changed, and recover when it does not.
 
 ## Start with your version
 
-Run `vox --version`. The task chapters here describe **v0.3.0**, in which one daemon hosts
+Run `vox --version`. The task chapters here describe **v0.3.1**, in which one daemon hosts
 your nodes and every command names the node it acts as.
 
 The manual follows the source repository. A newer manual revision is not evidence that a new
@@ -17,15 +17,15 @@ website edition.
 
 ## Make your first connection
 
-1. [Install and update](install.md).
+1. [Install and update](install.md), including what a container host needs.
 2. Follow [Your first shared room](first-room.md) with someone you already know.
 3. Read [How Vox fits together](concepts.md) when you want to understand the model.
 
 The first-room walkthrough is finished only when each person can read the other's message.
 A successful local post or join is not enough.
 
-The [v0.3.0 command check](https://github.com/robertelee78/vox/blob/main/docs/manual-evidence.md#v030-command-check)
-records the commands in these chapters run against the v0.3.0 binary in isolated, same-host
+The [command check](https://github.com/robertelee78/vox/blob/main/docs/manual-evidence.md#v031-command-check)
+records the commands in these chapters run against the v0.3.1 binary in isolated, same-host
 data roots. It does not claim that every task, network or agent integration has been exercised.
 
 ## Find a task
