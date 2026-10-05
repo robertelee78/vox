@@ -27,13 +27,13 @@
 //! acknowledged, then closes its connections. With that bound equal to the daemon's 5 s
 //! patience, a stop that waited out an unacknowledged tail ran into the patience: the daemon
 //! printed that its node did not stop within 5s and left with its ordered stop cut short. Staging, all real processes: Alice and Bob are `vox daemon`s in one room; Alice
-//! shares a [`FILE_BYTES`]-byte file (under a tunnel's window) with `vox share`, and her daemon,
-//! which serves it, is then frozen (SIGSTOP); Bob starts `vox room get`; once Bob's `vox status`
-//! lists the tunnel, Bob's daemon is frozen, and only then does Alice's go on, so the whole file
-//! goes out with nothing acknowledged and Alice's tunnel finishes its stream with the tail
-//! unacknowledged, every time; then Alice's daemon gets SIGINT. (Freezing Bob at the collector's first bytes, as this did,
-//! staged the scene on 1 attempt in 4 on a fast machine: the rest of the file had already been
-//! acknowledged.)
+//! offers a local server of the proof's own with `vox service add` that sends [`FILE_BYTES`] bytes
+//! (under a tunnel's window) unasked, as `vox room send` did; Bob runs `vox forward` to it. Alice's
+//! daemon is frozen (SIGSTOP); the proof connects to Bob's forward; once Bob's `vox status` lists
+//! the tunnel, Bob's daemon is frozen, and only then does Alice's go on, so the whole payload goes
+//! out with nothing acknowledged and Alice's tunnel finishes its stream with the tail
+//! unacknowledged, every time; then Alice's daemon gets SIGINT. (A `vox share` cannot stage it:
+//! it answers an HTTP request, which must cross from Bob's daemon before either can be held.)
 //! Asserted: it exits within [`PATIENCE`], never says it gave up, and reports the stop as a
 //! success (it says "stopped by SIGINT" and exits 0, as a service manager expects of a service it
 //! stopped). The node's worst-case stop is budgeted under the patience, each wait named
@@ -41,7 +41,7 @@
 //! lead, 0.6 s for the closes to leave; 4.45 s against 5 s); this scene spends the tail's wait and,
 //! with Bob frozen, the goodbye's and the flush's too. Preconditions (else the
 //! attempt is staged again, up to [`ATTEMPTS`] times, then `PRODUCT (staging)`, since each is vox's doing): Alice's
-//! daemon read the whole file (its descriptor of it stands at the file's end), the collector did
+//! daemon took the whole payload from the server, the collector did
 //! not have it, and the stop took at least [`WAITED`] (a tail acknowledged before the stop
 //! makes it immediate). Mutations: `STOP_ACK_BOUND` back at 5 s — the daemon exits after about
 //! 5.04 s saying it did not finish stopping: red; the goodbye's patience past the budget (2.5 s,
@@ -324,8 +324,8 @@ fn a_daemon_stops_on_sigterm_even_when_its_peers_have_vanished() {
     eprintln!("[shutdown] {remaining} processes remain");
 }
 
-/// Less than a tunnel's 16 MiB stream window, so the whole file leaves Alice's `vox room send`
-/// with Bob frozen.
+/// Less than a tunnel's 16 MiB stream window, so the whole payload leaves Alice's daemon with Bob
+/// frozen.
 const FILE_BYTES: usize = 12 << 20;
 /// `vox daemon`'s `SHUTDOWN_PATIENCE`.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -373,58 +373,6 @@ fn spawn_member(m: &Member, args: &[&str], out: &Path) -> Kid {
     Kid(child)
 }
 
-fn bytes_in(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(Result::ok)
-                .filter_map(|e| e.metadata().ok())
-                .map(|m| m.len())
-                .sum()
-        })
-        .unwrap_or(0)
-}
-
-/// How far `pid`'s open descriptors of `name` have read, from the shipped `lsof`; `None` when
-/// `lsof` listed no descriptor of `pid` at all (so it saw nothing, not a closed file).
-fn read_offsets(pid: u32, name: &str) -> Option<Vec<u64>> {
-    let out = Command::new("lsof")
-        .args([
-            "-n",
-            "-P",
-            "-o",
-            "-o",
-            "0",
-            "-a",
-            "-p",
-            &pid.to_string(),
-            "-F",
-            "fon",
-        ])
-        .output()
-        .expect("APPARATUS: run lsof");
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (mut offset, mut offsets, mut listed) = (None, Vec::new(), false);
-    for line in text.lines() {
-        if let Some(o) = line.strip_prefix('o') {
-            offset = o
-                .strip_prefix("0t")
-                .and_then(|d| d.parse().ok())
-                .or_else(|| {
-                    o.strip_prefix("0x")
-                        .and_then(|h| u64::from_str_radix(h, 16).ok())
-                });
-        } else if let Some(n) = line.strip_prefix('n') {
-            if n.ends_with(name) {
-                offsets.extend(offset);
-            }
-        } else if line.starts_with('f') {
-            offset = None;
-            listed = true;
-        }
-    }
-    listed.then_some(offsets)
-}
-
 /// One staging. `None` when a precondition did not hold; else how long Alice's daemon took to
 /// exit after SIGINT, and what it said.
 /// Stage the unacknowledged tail and stop Alice's daemon, started with `env`; staged when the stop
@@ -443,80 +391,114 @@ fn attempt(
     let bob_d = bob.daemon(None);
     let room = alice.create("pair");
     bob.join(&alice.invite(&room), "pair");
-    let mut rb = bob.reader();
-    let cb = rb.room(&room);
 
-    let name = "tail.bin";
-    let file = root.join(format!("{n}-{name}"));
+    // **What Alice serves sends unasked**, as `vox room send` did: a local server of the proof's
+    // own, offered with `vox service add`, that writes the whole payload to the connection the
+    // moment Alice's daemon opens it, then ends its side, as a finished transfer does. A
+    // `vox share` cannot stage this: it answers an HTTP request, which must cross from Bob's daemon
+    // before either daemon can be held. The tunnel, the daemons and the stop are all the product's.
+    let server = std::net::TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the server");
+    let local = server
+        .local_addr()
+        .expect("APPARATUS: the server's address");
+    let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
-        let mut f = std::fs::File::create(&file).expect("APPARATUS: create the offered file");
-        let chunk: Vec<u8> = (0..1 << 20)
-            .map(|i: u32| (i.wrapping_mul(7).wrapping_add(n as u32) % 251) as u8)
-            .collect();
-        for _ in 0..FILE_BYTES >> 20 {
-            f.write_all(&chunk)
-                .expect("APPARATUS: write the offered file");
-        }
+        let written = Arc::clone(&written);
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = server.accept() else {
+                return;
+            };
+            let chunk: Vec<u8> = (0..1 << 16)
+                .map(|i: u32| (i.wrapping_mul(7).wrapping_add(n as u32) % 251) as u8)
+                .collect();
+            for _ in 0..FILE_BYTES >> 16 {
+                if sock.write_all(&chunk).is_err() {
+                    return;
+                }
+                written.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            }
+            // All of it: the stream finishes, as a transfer does, with its tail still in flight.
+            let _ = sock.shutdown(std::net::Shutdown::Write);
+            let _ = sock.read_to_end(&mut Vec::new());
+        });
     }
-    let (ok, shared, err) = alice.vox(
-        &[
-            "share",
-            &room,
-            file.to_str().expect("APPARATUS: a UTF-8 path"),
-        ],
-        None,
-    );
+    let (ok, said, err) = alice.vox(&["service", "add", &room, "tail", &local.to_string()], None);
     assert!(
         ok,
-        "PRODUCT (staging): Alice's `vox share` failed: {shared}{err}"
+        "PRODUCT (staging): Alice's `vox service add` failed: {said}{err}"
     );
-    let tag = shared
-        .lines()
-        .find_map(|l| l.split(" as ").nth(1).map(|t| t.trim().to_owned()))
-        .unwrap_or_else(|| panic!("PRODUCT: `vox share` never named its share's tag: {shared}"));
-    let offered = format!("{n}-{name}");
+    // Bob forwards to it once the share of it has reached him.
     let t0 = Instant::now();
-    while !rb.texts(cb).iter().any(|t| t.contains(&offered)) {
-        assert!(
-            t0.elapsed() < Duration::from_secs(60),
-            "PRODUCT (staging): Bob never read the share"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+    while !bob
+        .vox(&["service", "list", &room], None)
+        .1
+        .lines()
+        .any(|l| l.contains("tail."))
+    {
+        if t0.elapsed() >= Duration::from_secs(60) {
+            eprintln!("[proof] attempt {n}: not staged: Bob never listed Alice's service");
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
-    // Alice's daemon serves the file, and is held still until Bob's daemon is frozen: nothing it
-    // sends can be acknowledged before the stop, whatever the machine's speed. The collector's
-    // request waits in its socket meanwhile.
-    alice_d.signal("-STOP");
-    let dir = root.join(format!("get{n}"));
-    std::fs::create_dir_all(&dir).expect("APPARATUS: create the download directory");
-    let get_out = root.join(format!("get{n}.out"));
-    let _get = spawn_member(
+    let fwd_out = root.join(format!("fwd{n}.out"));
+    let _fwd = spawn_member(
         &bob,
-        &[
-            "room",
-            "get",
-            &room,
-            &offered,
-            "--out",
-            dir.join(&offered)
-                .to_str()
-                .expect("APPARATUS: a UTF-8 path"),
-        ],
-        &get_out,
+        &["forward", "tail.alice.pair.vox", "127.0.0.1:0"],
+        &fwd_out,
     );
+    let t0 = Instant::now();
+    let bound = loop {
+        let text = std::fs::read_to_string(&fwd_out).unwrap_or_default();
+        if let Some(addr) = text
+            .lines()
+            .find_map(|l| l.strip_prefix("vox: forwarding "))
+            .and_then(|l| l.split_whitespace().next())
+        {
+            break addr.to_owned();
+        }
+        if t0.elapsed() >= Duration::from_secs(60) {
+            eprintln!(
+                "[proof] attempt {n}: not staged: Bob's `vox forward` never said where it \
+                 listens: {text}{}",
+                std::fs::read_to_string(fwd_out.with_extension("err")).unwrap_or_default()
+            );
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Alice's daemon is held still until Bob's daemon is frozen: nothing it sends can be
+    // acknowledged before the stop, whatever the machine's speed.
+    alice_d.signal("-STOP");
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let _collector = {
+        let held = Arc::clone(&held);
+        let mut sock = std::net::TcpStream::connect(&bound)
+            .expect("PRODUCT (staging): connect to the forward");
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 1 << 16];
+            while let Ok(got) = sock.read(&mut buf) {
+                if got == 0 {
+                    return;
+                }
+                held.fetch_add(got as u64, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+    };
     // The tunnel is up when Bob's own `vox status` lists it (V210-81).
     let t1 = Instant::now();
     loop {
         let listed = bob.status()["tunnels"].as_array().is_some_and(|rows| {
             rows.iter()
-                .any(|t| t["service"].as_str() == Some(tag.as_str()) && t["direction"] == "out")
+                .any(|t| t["service"].as_str() == Some("tail") && t["direction"] == "out")
         });
         if listed {
             break;
         }
         if t1.elapsed() >= Duration::from_secs(30) {
             eprintln!(
-                "[proof] attempt {n}: not staged: Bob's `vox status` did not list the tunnel to                  {tag} while Alice's daemon was held"
+                "[proof] attempt {n}: not staged: Bob's `vox status` did not list the tunnel to \
+                 tail while Alice's daemon was held"
             );
             alice_d.signal("-CONT");
             return None;
@@ -526,19 +508,14 @@ fn attempt(
     // Nothing Alice sends from here on is acknowledged; then her daemon goes on.
     bob_d.signal("-STOP");
     alice_d.signal("-CONT");
-    let held = bytes_in(&dir);
-    // Alice's daemon writes the whole file into the tunnel: under a tunnel's window, so nothing
-    // holds it back with Bob frozen. It keeps the file open until the collector closes, so its
-    // descriptor's offset says how far it read.
+    let held = held.load(std::sync::atomic::Ordering::SeqCst);
+    // Alice's daemon takes the whole payload into the tunnel: under a tunnel's window, so nothing
+    // holds it back with Bob frozen.
     std::thread::sleep(Duration::from_secs(3));
-    let (read, open): (u64, &str) = match read_offsets(alice_d.pid(), &offered) {
-        Some(offsets) if offsets.is_empty() => (0, "not open"),
-        Some(offsets) => (offsets.into_iter().max().unwrap_or(0), "open"),
-        None => (0, "not listed"),
-    };
+    let read = written.load(std::sync::atomic::Ordering::SeqCst);
     eprintln!(
-        "[proof] attempt {n}: Alice's daemon read {read} of {FILE_BYTES} (its file {open}); the \
-         collector held {held} at the freeze"
+        "[proof] attempt {n}: Alice's daemon took {read} of {FILE_BYTES}; the collector held \
+         {held} at the freeze"
     );
     if read < FILE_BYTES as u64 || held >= FILE_BYTES as u64 {
         eprintln!("[proof] attempt {n}: not staged");
