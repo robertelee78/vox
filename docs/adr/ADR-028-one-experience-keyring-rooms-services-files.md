@@ -46,8 +46,9 @@ named: read records, the room's shared name, the decision record and the token f
 ### 2. Identity and keyring
 
 - **K-1.** A node's identity MUST be shown as its **fingerprint**: the full 52-character base32
-  string, grouped for reading, with its QR code and fingerprint art (§8 L-9) beside it. `vox id`
-  MUST keep printing the bare fingerprint alone on stdout.
+  string, grouped for reading, with its fingerprint art (§8 L-9) beside it. `vox id` MUST keep
+  printing the bare fingerprint alone on stdout. Showing a fingerprint as a QR code is v0.4.1,
+  with the iOS app.
 - **K-2.** There MUST be exactly one trust state: **in my keyring**, or not. There MUST be no
   "verified", "unverified", TOFU or "key changed" state. A different key is a different node.
 - **K-3.** Adding a fingerprint to the keyring MUST ask for an alias, and the alias MUST be
@@ -60,8 +61,8 @@ named: read records, the room's shared name, the decision record and the token f
 - **K-5.** Trust MUST be reachable where it matters, with the same action in both clients: on a
   message from a node not in the keyring, on a member in the member pane, on a join, and on a
   service or file the node cannot reach because the sharer does not trust it. Comparing a
-  fingerprint MUST offer scan (app), paste, and grouped text; a mismatch MUST be its own action
-  that says not to trust the node.
+  fingerprint MUST offer paste or typing, and grouped text; a mismatch MUST be its own action that
+  says not to trust the node. Scanning a fingerprint is v0.4.1, with the iOS app.
 - **K-6.** Removing a node from the keyring ("untrust") MUST be the only way to stop reading and
   being read by it (ADR-007 G-21). There MUST be no separate block.
 - **K-7.** When a node joins a room, each member's client MUST say which of this node's trusted
