@@ -152,6 +152,7 @@ struct Timeline {
 struct Projected {
     me: Option<Digest32>,
     trusted: Vec<(Digest32, String)>,
+    read_by: Vec<(Digest32, Vec<Digest32>)>,
     len: usize,
     rows: std::sync::Arc<Vec<MessageView>>,
 }
@@ -809,9 +810,24 @@ impl DaemonCore {
         &mut self,
         me: Option<Digest32>,
         trusted: &[(Digest32, String)],
+        read_by: &[(Digest32, Vec<Digest32>)],
     ) -> std::sync::Arc<Vec<MessageView>> {
         let Some(t) = self.timeline.as_mut() else {
             return std::sync::Arc::default();
+        };
+        let readers = |r: &MessageRow| -> String {
+            if me != Some(r.author) {
+                return String::new();
+            }
+            let Some((_, who)) = read_by.iter().find(|(e, _)| *e == r.entry_hash) else {
+                return String::new();
+            };
+            let mut names: Vec<String> = who
+                .iter()
+                .map(|fp| crate::ident::member_name(trusted, fp))
+                .collect();
+            names.sort();
+            names.join(", ")
         };
         let view_of = |r: &MessageRow| MessageView {
             author: r.author,
@@ -835,9 +851,15 @@ impl DaemonCore {
                 crate::agent_hook::words(&r.text)
             }),
             late: r.late,
+            read_by: readers(r),
         };
         match t.projected.as_mut() {
-            Some(p) if p.me == me && p.trusted.as_slice() == trusted && p.len <= t.rows.len() => {
+            Some(p)
+                if p.me == me
+                    && p.trusted.as_slice() == trusted
+                    && p.read_by.as_slice() == read_by
+                    && p.len <= t.rows.len() =>
+            {
                 if p.len < t.rows.len() {
                     std::sync::Arc::make_mut(&mut p.rows)
                         .extend(t.rows[p.len..].iter().map(view_of));
@@ -850,6 +872,7 @@ impl DaemonCore {
                 t.projected = Some(Projected {
                     me,
                     trusted: trusted.to_vec(),
+                    read_by: read_by.to_vec(),
                     len: t.rows.len(),
                     rows: std::sync::Arc::clone(&rows),
                 });
@@ -890,10 +913,10 @@ impl DaemonCore {
                 reachability: reachability(&c.channel_id),
             })
             .collect();
-        let timeline = self
-            .active
-            .filter(|cid| snap.open.iter().any(|d| d.channel_id == *cid))
-            .map(|_| self.project_timeline(me, &snap.trusted));
+        let timeline = self.active.and_then(|cid| {
+            let room = snap.open.iter().find(|d| d.channel_id == cid)?;
+            Some(self.project_timeline(me, &snap.trusted, &room.read_by))
+        });
         let active = self.active.and_then(|cid| {
             snap.open
                 .iter()

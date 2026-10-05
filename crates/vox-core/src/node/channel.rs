@@ -567,6 +567,10 @@ pub struct Rendered {
 /// that expires slowly is not filled with checkpoints.
 pub const CHECKPOINT_EVERY: usize = 32;
 
+/// How many of this node's own newest messages in a room a client is told the readers of (ADR-028
+/// R-6): more than a screen holds, and a bound on what every snapshot of the node carries.
+pub const READ_BY_SHOWN: usize = 128;
+
 /// How many owed bodies (V030-10) one sync session asks a peer for at most. The rest are asked of
 /// the next session: a peer that stripped a long run is not asked for all of it at once.
 pub const MAX_OWED_ASKED: usize = 256;
@@ -5801,6 +5805,27 @@ impl ChannelState {
             .get(entry)
             .map(|r| r.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// [`Self::read_by`] for this identity's own newest [`READ_BY_SHOWN`] messages here, those
+    /// anyone is known to have read, oldest first: what a client shows under each message it sent
+    /// (ADR-028 R-6).
+    #[must_use]
+    pub fn read_by_own(&self) -> Vec<(Digest32, Vec<Digest32>)> {
+        let me = self.me();
+        let mut out: Vec<(Digest32, Vec<Digest32>)> = self
+            .timeline
+            .iter()
+            .rev()
+            .filter(|r| r.author == me)
+            .take(READ_BY_SHOWN)
+            .filter_map(|r| {
+                let readers = self.read_by(&r.entry_hash);
+                (!readers.is_empty()).then_some((r.entry_hash, readers))
+            })
+            .collect();
+        out.reverse();
+        out
     }
 
     /// Of `shown`, the entries a read record of this identity's should name: rows of the timeline

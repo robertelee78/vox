@@ -65,6 +65,10 @@ pub struct MessageView {
     /// It arrived after rows below it had already been shown: a member who was offline,
     /// or a sync that caught up (ADR-023 decision 1). Shown in its true place, marked.
     pub late: bool,
+    /// Under a message this node sent, who has read it, by this node's names for them, as the
+    /// read records it can open say (ADR-028 R-6, RR-3): `ann, bea`; empty when it knows of no
+    /// reader. A member that does not trust this node is never here, read or not.
+    pub read_by: String,
 }
 
 impl MessageView {

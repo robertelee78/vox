@@ -21,6 +21,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
             whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
             "← in-only" for Carol, though nothing comes in from her);
+  readby    under a message Bob posts, his TUI says nothing of readers until Alice's agent drains it
+            into its turn, and then says exactly "read by alice": from the read record Alice's node
+            posted, which Bob can open because she trusts him. Carol, who cannot read Bob, is
+            named neither as having read it nor as not (ADR-028 R-6, RR-3, #505);
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
@@ -315,6 +319,41 @@ try:
     carol_label = label_of("carol")[0]
     claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
+
+    stage("readby")
+    p = run("bob", "room", "post", room, "r-001 read me")
+    if p.returncode != 0: product(f"bob's `vox room post` while his TUI is open failed: {p.stderr.strip()}")
+    if not tui.until(lambda: has(timeline(), "r-001"), 30, 1):
+        product("bob's `vox tui` never showed his own post r-001 within 30 s")
+    def under(key):
+        """The timeline row under the one holding `key`, bare of the pane's border."""
+        rows = [r[:112] for r in tui.display()]
+        for i, r in enumerate(rows):
+            if key in r:
+                return bare(rows[i + 1]) if i + 1 < len(rows) else ""
+        return None
+    # Nobody has read it yet: nothing is said of readers.
+    tui.pump(3)
+    before = under("r-001")
+    # Alice's agent drains it into its turn; the drain is bounded per turn, so turns are taken
+    # until r-001 is in one. Carol's agent drains too, though Bob's posts are not hers to read.
+    told = False
+    for _ in range(20):
+        h = run("alice", "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+                "--session", "alice-reader")
+        if "r-001" in h.stdout:
+            told = True
+            break
+        if not h.stdout.strip():
+            break
+    if not told: product(f"alice's agent was never told bob's r-001 by `vox agent hook`: {h.stdout[-300:]!r} {h.stderr.strip()!r}")
+    run("carol", "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+        "--session", "carol-reader")
+    tui.until(lambda: (under("r-001") or "").startswith("read by"), 30, 1)
+    tui.pump(3)
+    after = under("r-001")
+    claim("readby", not (before or "").startswith("read by") and after == "read by alice",
+          f"under r-001 before alice's drain: {before!r}; after it: {after!r}")
 
     stage("words")
     # Before `unknown`, whose short answers leave the line under the status bar one row again.
