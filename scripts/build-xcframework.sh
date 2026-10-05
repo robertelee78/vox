@@ -5,22 +5,34 @@
 #   scripts/build-xcframework.sh            # -> target/xcframework/
 #   OUT=/some/dir scripts/build-xcframework.sh
 #
-# Slices: aarch64-apple-ios (devices), aarch64-apple-ios-sim (Apple-silicon simulators),
-# and one macOS slice holding aarch64 and x86_64. Each is a static library: an app links
-# the node in, nothing is loaded at run time.
+#   XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh   # the macOS slice only
 #
-# Needs the four Rust targets (`rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-# aarch64-apple-darwin x86_64-apple-darwin`) and Xcode's command-line tools.
+# Slices: aarch64-apple-ios (devices), aarch64-apple-ios-sim (Apple-silicon simulators),
+# and aarch64-apple-darwin. Each is a static library: an app links the node in, nothing is
+# loaded at run time. There is no Intel macOS slice: on macOS Vox supports Apple Silicon
+# on macOS 13 or later only (ADR-014 M-26a). With XCFRAMEWORK_SLICES=macos only the macOS
+# slice is built, which is all Vox.app links (the release job needs no iOS target).
+#
+# Needs those Rust targets (`rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+# aarch64-apple-darwin`, or only the last for the macOS slice) and Xcode's command-line
+# tools.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-$ROOT/target/xcframework}"
 PROFILE=release
-TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin x86_64-apple-darwin)
+case "${XCFRAMEWORK_SLICES:-all}" in
+    all) TARGETS=(aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin) ;;
+    macos) TARGETS=(aarch64-apple-darwin) ;;
+    *)
+        echo "build-xcframework: XCFRAMEWORK_SLICES is all or macos, not ${XCFRAMEWORK_SLICES}" >&2
+        exit 1
+        ;;
+esac
 # The iOS floor. Rust's own default for the ios targets is older; state it once, here,
 # so the objects and the xcframework agree.
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
 
 cd "$ROOT"
 installed="$(rustup target list --installed)"
@@ -37,7 +49,7 @@ for t in "${TARGETS[@]}"; do
 done
 
 rm -rf "$OUT"
-mkdir -p "$OUT/swift" "$OUT/headers" "$OUT/macos"
+mkdir -p "$OUT/swift" "$OUT/headers"
 
 # The bindings come from the built library itself (UniFFI's library mode), so they cannot
 # drift from what was compiled.
@@ -54,16 +66,11 @@ cp "$OUT/swift/vox_ffiFFI.h" "$OUT/headers/"
 # An xcframework's headers directory carries a `module.modulemap` by that exact name.
 cp "$OUT/swift/vox_ffiFFI.modulemap" "$OUT/headers/module.modulemap"
 
-lipo -create \
-    "target/aarch64-apple-darwin/$PROFILE/libvox_ffi.a" \
-    "target/x86_64-apple-darwin/$PROFILE/libvox_ffi.a" \
-    -output "$OUT/macos/libvox_ffi.a"
-
-xcodebuild -create-xcframework \
-    -library "target/aarch64-apple-ios/$PROFILE/libvox_ffi.a" -headers "$OUT/headers" \
-    -library "target/aarch64-apple-ios-sim/$PROFILE/libvox_ffi.a" -headers "$OUT/headers" \
-    -library "$OUT/macos/libvox_ffi.a" -headers "$OUT/headers" \
-    -output "$OUT/VoxFFI.xcframework"
+libraries=()
+for t in "${TARGETS[@]}"; do
+    libraries+=(-library "target/$t/$PROFILE/libvox_ffi.a" -headers "$OUT/headers")
+done
+xcodebuild -create-xcframework "${libraries[@]}" -output "$OUT/VoxFFI.xcframework"
 
 echo "build-xcframework: $OUT/VoxFFI.xcframework"
 echo "build-xcframework: Swift bindings in $OUT/swift/vox_ffi.swift"
