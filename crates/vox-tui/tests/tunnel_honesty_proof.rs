@@ -1773,6 +1773,9 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
     watchdog::arm();
     let (port, accepted) = counting_echo_service();
     let mut w = World::new(port, true);
+    // The share probed the service (ADR-028 S-2) before `vox serve` printed its room: those
+    // connections carried no session, so the count starts after them.
+    let probed = accepted.load(std::sync::atomic::Ordering::SeqCst);
     // `vox trust remove` asks the running node, which `vox serve` does not answer (it serves
     // no control socket); a daemon holding the same room does.
     w.restart_host_as_daemon();
@@ -1782,7 +1785,7 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
 
     // Step 1: a live session, as `ssh user@<service>.<node>.<room>.vox` holds one.
     let mut s = live_session(&mut up, at, &name, port);
-    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst) - probed;
     assert_eq!(
         dialled, 1,
         "PRODUCT (staging): the service counted {dialled} connections for one session, so it cannot \
@@ -1852,7 +1855,7 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
         "PRODUCT: vox up must say the host refused the CONNECT; it said:\n{}",
         up.transcript()
     );
-    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst) - probed;
     assert_eq!(
         dialled, 1,
         "PRODUCT: the host dialled its service for a guest it no longer trusts — the service \
@@ -1867,6 +1870,9 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     watchdog::arm();
     let (port, accepted) = counting_echo_service();
     let w = World::new(port, true);
+    // The share probed the service (ADR-028 S-2) before `vox serve` printed its room: those
+    // connections carried no session, so the count starts after them.
+    let probed = accepted.load(std::sync::atomic::Ordering::SeqCst);
 
     // A second, real room on the same anchor, hosted by someone who trusts this guest and
     // offers a service that counts connections. The guest never joins it: that is the only
@@ -1906,6 +1912,8 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
         other_room, w.room,
         "PRODUCT (staging): the other host's `vox serve` printed this world's room"
     );
+    // Its share probed its service too, before that room line.
+    let other_probed = other_accepted.load(std::sync::atomic::Ordering::SeqCst);
     // The unjoined room's service by its full address: the only `.vox` form that resolves
     // anywhere (V030-25), so a refusal is about the room, not the shape of the name.
     let other_name = format!("{other_port}.{other_fp}.{other_room}.vox");
@@ -1917,7 +1925,7 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
     // be a proxy that reaches nothing.
     let s = live_session(&mut up, at, &w.service_host(), port);
     let _ = s.shutdown(std::net::Shutdown::Both);
-    let joined = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    let joined = accepted.load(std::sync::atomic::Ordering::SeqCst) - probed;
     assert_eq!(
         joined, 1,
         "PRODUCT (staging): the joined room's service counted {joined} connections for one session"
@@ -1965,8 +1973,8 @@ fn a_vox_name_for_a_room_never_joined_is_refused_at_the_proxy_and_nothing_is_dia
         up.transcript()
     );
     let (mine, theirs) = (
-        accepted.load(std::sync::atomic::Ordering::SeqCst),
-        other_accepted.load(std::sync::atomic::Ordering::SeqCst),
+        accepted.load(std::sync::atomic::Ordering::SeqCst) - probed,
+        other_accepted.load(std::sync::atomic::Ordering::SeqCst) - other_probed,
     );
     assert_eq!(
         (mine, theirs),
