@@ -1581,6 +1581,12 @@ pub enum NodeEvent {
         /// What happened, for the operator.
         note: String,
     },
+    /// The machine's network changed (ADR-012 N-52): which addresses came and went, which default
+    /// routes moved, and what this node republished. Said once per change.
+    NetworkChanged {
+        /// The change and what was done about it, in one line.
+        summary: String,
+    },
     /// More peers dialled this node at once than it runs handshakes for, and the ones past the
     /// cap waited for a slot or were refused (V210-86): said once per burst, when none is left
     /// waiting, so an operator can see a burst was absorbed, or how many were turned away.
@@ -1874,6 +1880,7 @@ impl NodeEvent {
                 format!("connection to {} — {note}", short(peer))
             }
             NodeEvent::NodeNote { note } => note.clone(),
+            NodeEvent::NetworkChanged { summary } => summary.clone(),
             NodeEvent::HandshakesQueued {
                 waited, refused, ..
             } => format!(

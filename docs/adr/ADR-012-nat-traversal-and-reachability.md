@@ -6,9 +6,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 the reachability ladder run in the node (`crates/vox-core/src/nat/`,
 `crates/vox-core/src/node/{network,net,coordstream,circuitstream,presence}.rs`,
 `crates/vox-core/src/transport/mux.rs`), and the daemon owns the machine's one presence (N-41–N-48).
-Not built: a DHT (N-31). UPnP-IGD has not yet been checked against a real router (N-14). Not built,
-for v0.3.1: network-change detection, gateway discovery off Linux, and the PCP mapping lifecycle
-(N-49–N-58).
+Not built: a DHT (N-31). UPnP-IGD has not yet been checked against a real router (N-14). Built in
+v0.3.1: network-change detection and the action on it (N-49–N-52). Not built, for v0.3.1: gateway
+discovery off Linux and the PCP mapping lifecycle (N-53–N-57).
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, ipv6, port-mapping, relay, anchor
@@ -321,7 +321,10 @@ proved: it needs a gateway.
 
 ### Network change and the mapping lifecycle (v0.3.1)
 
-Not built. Found by an outside review (2026-10-04) and confirmed in code at integrate `3d5263cf`:
+N-49–N-52 are built in v0.3.1 (`nat::netwatch`, `NetPresence::changed`, `close_stranded`);
+proof: `a_network_change_is_noticed_and_acted_on_proof` on Linux, and its opt-in macOS form.
+N-53–N-57 are not built. Found by an outside review (2026-10-04) and confirmed in code at integrate
+`3d5263cf`:
 
 - Nothing listens for the operating system's network changes. `NetPresence::rediscover`
   (`presence.rs:390`) has no caller. The publish side runs at the presence's start, at a mapping's
@@ -348,16 +351,19 @@ Not built. Found by an outside review (2026-10-04) and confirmed in code at inte
   previous ones. Events that change neither MUST NOT start N-51.
 - **N-51.** On a real change the daemon MUST, at once and in this order:
   - discard every observed (reflexive) address (`refresh_observed`);
-  - run the publish side (`rediscover`), dropping mappings held for an internal address the machine
-    no longer has (RFC 6887 §11.5);
+  - drop mappings held for an internal address the machine no longer has (RFC 6887 §11.5), and
+    advertise the new routable addresses at once (`routable_endpoints`), with no gateway work;
   - publish every attached node's address record to its own board and to every anchor, without
     waiting for the record's renewal;
-  - redial every peer connected through a connection this end accepted, and every anchor. QUIC
-    lets only the dialling end migrate (RFC 9000 §9), so an accepted connection does not survive
-    the move.
+  - probe every connection this end accepted, and every anchor's, and close and redial each one
+    that does not answer within the probe's patience (`close_stranded`). QUIC lets only the
+    dialling end migrate (RFC 9000 §9), so an accepted connection on an address that went does
+    not survive the move; one that answers did, and is kept;
+  - then run the full publish side (`rediscover`), gateway work included.
 - **N-52.** The daemon MUST say each real change once in its log and to every attached client:
   which addresses came and went, which default routes changed, and what was republished
-  (`NodeEvent::NetworkChanged`). `vox status --json` MUST name the time of the last change.
+  (`NodeEvent::NetworkChanged`). `vox status --json` MUST name the last change, its time and what
+  it was (`network_changed: {at, change}`).
 
 #### Finding the gateway
 
@@ -389,11 +395,12 @@ Not built. Found by an outside review (2026-10-04) and confirmed in code at inte
 - **N-58.** Each of N-49–N-57 MUST have a real-binary proof that a person could repeat:
   - **Network change (N-49–N-52).** A peer holds a connection to a daemon, and the daemon's machine
     gains an address and loses the one in use, staged as a real interface change. On Linux this is
-    an unprivileged network namespace (`unshare --user --net`). On macOS it is an alias added to
-    and removed from an interface, an opt-in heavy proof the operator runs with privileges. The
-    daemon MUST say the change, and `vox status --json` MUST show the new advertised addresses
-    within 2 s of the change. The peer MUST read a post sent after the change within 5 s, not after
-    `SILENCE_IS_DEATH`.
+    an unprivileged network namespace (`unshare --user --net`) with dummy interfaces. On macOS it is
+    `lo0` aliases and a host route to the probe address, an opt-in heavy proof the operator runs
+    with privileges. The daemon MUST say the change once within 1 s, and `vox status --json` MUST
+    show the new advertised addresses within 2 s of the change. With nothing sent, the daemon MUST
+    hold a new connection to the peer within 3 s, and the peer MUST read a post sent after the
+    change within 5 s, not after `SILENCE_IS_DEATH` (`a_network_change_is_noticed_and_acted_on_proof`).
   - **Gateway (N-53, N-54).** `vox status --json` on macOS and on Linux MUST name the same IPv4 and
     IPv6 default next hops that `route -n get default` and `route -n get -inet6 default` (or `ip
     route`, `ip -6 route`) print.

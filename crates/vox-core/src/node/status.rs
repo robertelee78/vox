@@ -177,6 +177,9 @@ pub struct StatusReport {
     pub identity: Option<Digest32>,
     /// Whether it is on the network.
     pub networked: bool,
+    /// When the machine's network last changed, unix seconds, and the change in one line
+    /// (ADR-012 N-52); `None` if it has not since the daemon started.
+    pub network_changed: Option<(u64, String)>,
     /// Where it listens.
     pub listening: Vec<String>,
     /// Its open rooms.
@@ -316,6 +319,14 @@ impl StatusReport {
             self.identity.map_or("null".into(), |d| q(&b32_encode(&d)))
         );
         let _ = write!(j, "\"networked\":{},", self.networked);
+        let _ = write!(
+            j,
+            "\"network_changed\":{},",
+            self.network_changed.as_ref().map_or_else(
+                || "null".to_owned(),
+                |(at, said)| format!("{{\"at\":{at},\"change\":{}}}", q(said))
+            )
+        );
         let _ = write!(
             j,
             "\"listening\":[{}],",

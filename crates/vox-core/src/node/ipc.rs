@@ -202,6 +202,8 @@ const T_PUBLISH_CURED: u64 = 2091;
 const T_CONNECTION_NOTE: u64 = 2092;
 /// `NodeEvent::NodeNote` (V210-167). Additive, away from the tags beside it.
 const T_NODE_NOTE: u64 = 2392;
+/// `NodeEvent::NetworkChanged` (ADR-012 N-52). Additive, away from the tags beside it.
+const T_NETWORK_CHANGED: u64 = 3149;
 /// `NodeEvent::HandshakesQueued` (V210-86). Additive, away from the tags beside it.
 const T_HANDSHAKES_QUEUED: u64 = 2186;
 /// `NodeEvent::AddressWithheld` (V210-96). Additive, away from the sequential range and the tags
@@ -1627,6 +1629,9 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
         NodeEvent::NodeNote { note } => {
             e.array(2).uint(T_NODE_NOTE).text(note);
         }
+        NodeEvent::NetworkChanged { summary } => {
+            e.array(2).uint(T_NETWORK_CHANGED).text(summary);
+        }
         NodeEvent::RetentionAboveRoom {
             channel_id,
             node,
@@ -2164,6 +2169,12 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             note: d
                 .text()
                 .map_err(|_| Error::MalformedIpc("ipc node note"))?
+                .to_owned(),
+        },
+        (T_NETWORK_CHANGED, 2) => NodeEvent::NetworkChanged {
+            summary: d
+                .text()
+                .map_err(|_| Error::MalformedIpc("ipc network changed"))?
                 .to_owned(),
         },
         (T_PUBLISH_CURED, 3) => NodeEvent::PublishCured {
