@@ -61,8 +61,8 @@
 //! `tests/pty/opencode_wake.py` (the screen read through `pyte`); this asserts what it saw:
 //!
 //! 1. the session's own drain registered it with the daemon as **OpenCode, reachable** (the
-//!    plugin's wake socket) — a plain `opencode` has no listener of its own, and before F17 it
-//!    registered as `unknown`;
+//!    plugin's wake socket), as `vox agent doctor --json` lists it — a plain `opencode` has no
+//!    listener of its own, and before F17 it registered as `unknown`;
 //! 2. the message addressed to someone else **never reaches the screen** while the turn runs;
 //! 3. the one addressed to this agent **reaches the screen mid-turn**, before the tool ends;
 //! 4. and the tool that was running **still runs to its end** (its output reaches the screen):
@@ -662,11 +662,14 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         seen("WAKE"),
         seen("TURN")
     );
+    // As `vox agent doctor --json` lists the session: its harness, and whether its wake endpoint
+    // (the plugin's socket) answers.
     if let Some(registered) = seen("REGISTERED") {
         assert!(
-            registered.starts_with("opencode /") && registered.ends_with("wake.sock"),
+            registered == "opencode: its wake endpoint answers",
             "PRODUCT (1): a plain `opencode` must register as OpenCode, reachable through the \
-             plugin's wake socket; its drain registered {registered:?}"
+             plugin's wake socket; `vox agent doctor` lists {registered:?}{}",
+            plugin_diag("registration")
         );
     }
     if let Some(other) = seen("OTHER") {

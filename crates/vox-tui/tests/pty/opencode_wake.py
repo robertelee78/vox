@@ -14,8 +14,11 @@ What a person does, in order:
    carol --urgent`), then an urgent one addressed to **bobby**.
 
 The screen is read through pyte, as the person sees it. Prints, each on its own line:
-- `<tag> REGISTERED: <harness> <endpoint>` — the wake channel the session's drain recorded with
-  the daemon (`<data_dir>/<profile>/sessions/*.json`, those not there before it opened);
+- `<tag> REGISTERED: <harness>: <how it is woken>` — the session its drain registered with the
+  daemon, as the product lists it (`vox agent doctor --json`, its `session <id>` checks, those not
+  there before it opened): `opencode: its wake endpoint answers` for a session the plugin's wake
+  socket reaches; `REGISTERED: none` when the turn ran and no session registered, which the caller
+  judges;
 - `<tag> OTHER: shown|absent` — whether the message addressed to carol reached the screen before
   the one addressed to bobby was posted;
 - `<tag> WAKE: shown mid-turn|shown after the turn|absent` — whether the wake for the message
@@ -46,9 +49,11 @@ terminal (SIGHUP), and three more plain `opencode`s are opened, each with no tur
 - `<tag> NODIR: <where>` — the plugin made no wake directory, where one was due; the driver
   stops there, and the caller judges it as the product's.
 
-Exit 0 = it ran to the end, or to a NODIR (the caller judges the lines); 2 = apparatus (pyte missing, the TUI
-never drew, the turn never started, a post failed); 1 = the driver hung (`HUNG at <stage>`,
-`vox_pty.py`). OpenCode is stopped by its PID, with bounded waits.
+Exit 0 = it ran to the end, or to a NODIR or `REGISTERED: none` (the caller judges the lines); 2 =
+apparatus (pyte missing, the TUI never drew, the turn never started, a post or `vox agent doctor`
+failed); 1 = the driver hung (`HUNG at <stage>`, `vox_pty.py`) or could not reap OpenCode. Every
+line the driver says of itself is APPARATUS; what the product did, it reports and the caller judges.
+OpenCode is stopped by its PID, with bounded waits.
 """
 import glob, json, os, re, shutil, signal, subprocess, sys, time
 
@@ -114,18 +119,36 @@ def post(to, body):
         sys.exit(2)
 
 
+def sessions():
+    """Every session registered on the daemon's node, as `vox agent doctor --json` lists it (it
+    only reads, and wakes no one): {session: (harness, how it is woken)}. Asked of the product, not
+    read from its files, whose layout is the product's to change (it moved under `nodes/`, and a
+    glob of the old place found nothing)."""
+    out = subprocess.run(
+        [VOX, "agent", "doctor", "--json"],
+        env={**{k: v for k, v in env.items() if not k.startswith("VOX_")},
+             "VOX_DATA_DIR": DATA, "VOX_CONFIG_DIR": CFG},
+        capture_output=True, text=True, timeout=60)
+    try:
+        checks = json.loads(out.stdout)["checks"]
+    except (ValueError, KeyError):
+        print(f"{TAG} APPARATUS: `vox agent doctor --json` gave no checks (exit {out.returncode}): "
+              f"{out.stderr.strip()}")
+        sys.exit(2)
+    found = {}
+    for c in checks:
+        sid = c.get("check", "")
+        if not sid.startswith("session "):
+            continue
+        detail = c.get("detail", "")
+        found[sid[len("session "):]] = (detail.split(" ", 1)[0], detail.rsplit("; ", 1)[-1])
+    return found
+
+
 def registered():
-    """The wake channels the daemon's profile holds for sessions this driver did not find there:
-    (harness, endpoint, session) for each."""
-    regs = []
-    for path in sorted(set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json"))) - BEFORE):
-        try:
-            with open(path) as f:
-                r = json.load(f)
-            regs.append((r.get("harness", ""), r.get("endpoint", ""), r.get("session", "")))
-        except (OSError, ValueError):
-            pass
-    return regs
+    """The sessions registered since this driver started: (harness, how it is woken, session)
+    for each."""
+    return [(h, how, sid) for sid, (h, how) in sorted(sessions().items()) if sid not in BEFORE]
 
 
 # A message's envelope as `vox room post` writes it, rather than its words.
@@ -206,7 +229,7 @@ class NoDir(Exception):
     """The plugin made no wake directory: the product's failure, reported as `NODIR`."""
 
 
-BEFORE = set(glob.glob(os.path.join(DATA, "*", "sessions", "*.json")))  # earlier sessions
+BEFORE = set(sessions())  # earlier sessions
 code = 2
 tui = None
 try:
@@ -223,13 +246,19 @@ try:
     tui.key(f"Use the bash tool to run exactly `sleep {SLEEP}; echo SLEPT-$((6*7))`, then reply "
             "with just OK.", 1)
     tui.key("\r", 1)
-    if not tui.until(lambda: f"sleep {SLEEP}" in flat() and registered(), 90):
-        print(f"{TAG} APPARATUS: the turn never started, or its drain never ran "
-              f"(registrations: {registered()})")
+    if not tui.until(lambda: f"sleep {SLEEP}" in flat(), 90):
+        print(f"{TAG} APPARATUS: the turn never started (the model never ran its tool)")
         print(f"{TAG} SCREEN:\n{tui.text()}")
         sys.exit(2)
+    # The turn runs, so its drain ran: whether that registered the session is the product's, and
+    # the caller judges it.
+    tui.until(lambda: registered(), 30)
     regs = registered()
-    print(f"{TAG} REGISTERED: " + "; ".join(f"{h} {e}" for h, e, _ in regs))
+    if not regs:
+        print(f"{TAG} REGISTERED: none")
+        print(f"{TAG} SCREEN:\n{tui.text()}")
+        sys.exit(0)
+    print(f"{TAG} REGISTERED: " + "; ".join(f"{h}: {how}" for h, how, _ in regs))
     t_turn = time.time()
 
     stage("post an urgent message addressed to someone else")
@@ -344,6 +373,6 @@ except Hung as h:
 finally:
     disarm()
     if tui is not None and not tui.stop():
-        print(f"{TAG} RED: opencode (pid {tui.pid}) outlived SIGKILL and could not be reaped")
+        print(f"{TAG} APPARATUS: opencode (pid {tui.pid}) outlived SIGKILL and could not be reaped")
         code = 1
 sys.exit(code)

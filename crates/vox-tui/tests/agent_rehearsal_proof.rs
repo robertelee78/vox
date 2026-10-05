@@ -353,8 +353,17 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     }
 
     // ---- the operator speaks, as a person, in plain prose ----
-    let assignment = r#"{"v":1,"type":"assign","to":["alice"],"body":"port the wire codec to the new envelope format","data":{"resource":"port-the-codec"}}"#;
-    let o = alice.vox(None, &["room", "post", &room, assignment]);
+    // Addressed to alice's node by its whole fingerprint, as `vox room roster` prints it: an
+    // envelope's `to` names nodes, and a name is the reader's own, which only `--to` resolves.
+    let assignment = serde_json::json!({
+        "v": 1,
+        "type": "assign",
+        "to": [vox_core::node::link::b32_encode(&alice.fp)],
+        "body": "port the wire codec to the new envelope format",
+        "data": {"resource": "port-the-codec"},
+    })
+    .to_string();
+    let o = alice.vox(None, &["room", "post", &room, &assignment]);
     assert!(
         o.ok,
         "PRODUCT: the operator could not post the assignment: {o:?}"
