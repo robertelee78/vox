@@ -76,8 +76,12 @@ is what a person offers. A tunnel is how bytes reach it.
   service bound before the approval, and a room the approved node joins later.
 - **3.3 Membership grants no reach.** Joining a room, holding its passphrase, paying its proof of
   work, being admitted as an author on any board, or answering someone's join MUST NOT confer reach.
-- **3.4 Every consent is a human act (M17.6).** Consent is per pair and per direction. Each grant
-  MUST be caused by a keyring entry, made by a person. In particular:
+- **3.4 Every consent is the operator's act (M17.6).** Consent is per pair and per direction. Each
+  grant MUST be caused by a keyring entry that the node's operator made (`vox trust add`). The
+  operator is any process running as the node's user, a person at a terminal or an agent acting for
+  them; Vox MUST NOT tell the two apart, because a process running as the user already holds what
+  the user holds. A trust add or remove MUST need the identity passphrase again when it was last
+  entered more than 30 minutes ago (V210-159). Nothing else causes a grant. In particular:
   - `join` MUST NOT release this node's sender key to the responder. The responder's sending chain
     comes from `PairwiseFrame::Open`, an empty sealed message that carries no key and no grant.
   - A member bundle record MUST carry an `Admission` (`Creator`, or `Witnessed(JoinWitness)`, struct
@@ -301,7 +305,7 @@ Proved by `crates/vox-tui/tests/a_service_is_reached_only_by_its_address_proof.r
 
 ## Consequences
 
-- Reading and reaching are one decision, and every such decision is an explicit human act. Nothing
+- Reading and reaching are one decision, and every such decision is an explicit act of the node's operator. Nothing
   new is minted, stored or sealed for authorization.
 - Host and guest need to share a room first. A joiner is readable by nobody until it approves
   someone.
