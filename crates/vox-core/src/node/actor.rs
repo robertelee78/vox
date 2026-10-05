@@ -13416,6 +13416,15 @@ impl Node {
             app: self.app.stats(),
             udp_flows: self.udp_flows.snapshot(),
             tunnel_stuck_after: self.stuck_after,
+            // The default routes, as the operating system says them now (N-53).
+            gateway: crate::node::status::GatewayStatus {
+                ipv4: crate::node::status::GatewayFamily {
+                    next_hop: crate::nat::portmap::gateway::default_hop(false),
+                },
+                ipv6: crate::node::status::GatewayFamily {
+                    next_hop: crate::nat::portmap::gateway::default_hop(true),
+                },
+            },
             ..StatusReport::default()
         };
         for room in &view.open_channels {

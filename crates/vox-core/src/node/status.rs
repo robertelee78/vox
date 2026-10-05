@@ -166,6 +166,36 @@ pub struct ForwardStatus {
     pub local: SocketAddr,
 }
 
+/// The machine's gateways (ADR-012 N-53, N-54), for IPv4 and IPv6.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GatewayStatus {
+    /// IPv4.
+    pub ipv4: GatewayFamily,
+    /// IPv6.
+    pub ipv6: GatewayFamily,
+}
+
+/// One family's gateway: the default route's next hop, as the operating system says it (N-53).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GatewayFamily {
+    /// The next hop and the interface it leaves by; `None` with no default route of the family.
+    pub next_hop: Option<crate::nat::portmap::gateway::Hop>,
+}
+
+impl GatewayFamily {
+    fn to_json(&self) -> String {
+        let hop = self.next_hop.as_ref().map_or("null".to_owned(), |h| {
+            format!(
+                "{{\"address\":{},\"interface\":{},\"index\":{}}}",
+                q(&h.addr.to_string()),
+                h.interface.as_deref().map_or("null".to_owned(), q),
+                h.index
+            )
+        });
+        format!("{{\"next_hop\":{hop}}}")
+    }
+}
+
 /// Everything `vox status` shows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatusReport {
@@ -197,6 +227,8 @@ pub struct StatusReport {
     pub anchors: Vec<AnchorStatus>,
     /// What needs looking at.
     pub unhealthy: Vec<Unhealthy>,
+    /// The machine's gateways, per address family (ADR-012 N-53, N-54).
+    pub gateway: GatewayStatus,
     /// How long this node gives a tunnel whose bytes wait before closing it as stuck (V030-11):
     /// its own setting, not the process's (ADR-026 P-1). Said in the JSON's
     /// `tunnel_stuck_after`, by [`SyncBook::sections_json`].
@@ -320,6 +352,12 @@ impl StatusReport {
             j,
             "\"listening\":[{}],",
             list(self.listening.iter().map(|s| q(s)))
+        );
+        let _ = write!(
+            j,
+            "\"gateway\":{{\"ipv4\":{},\"ipv6\":{}}},",
+            self.gateway.ipv4.to_json(),
+            self.gateway.ipv6.to_json()
         );
         let _ = write!(
             j,

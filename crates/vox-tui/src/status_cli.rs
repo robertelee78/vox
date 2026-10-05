@@ -156,6 +156,21 @@ fn render(v: &Value) -> String {
         "  relaying {} circuit(s) for others",
         v.get("relaying").and_then(Value::as_u64).unwrap_or(0)
     );
+    // The machine's gateways, as its routing table names them (ADR-012 N-53).
+    let _ = writeln!(o, "\ngateway");
+    for family in ["ipv4", "ipv6"] {
+        let g = &v["gateway"][family];
+        let hop = &g["next_hop"];
+        let said = if hop.is_null() {
+            "no default route".to_owned()
+        } else {
+            match hop.get("interface").and_then(Value::as_str) {
+                Some(i) => format!("next hop {} via {i}", s(hop, "address")),
+                None => format!("next hop {}", s(hop, "address")),
+            }
+        };
+        let _ = writeln!(o, "  {family}  {said}");
+    }
     // **One listing of tunnels** (V210-81): each live tunnel once, from the node's one list,
     // whichever way it was opened. A forward is listed apart: it is a door, not a tunnel.
     let _ = writeln!(o, "\ntunnels");
