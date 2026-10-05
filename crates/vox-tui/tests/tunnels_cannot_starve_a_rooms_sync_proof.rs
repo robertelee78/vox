@@ -1,18 +1,19 @@
 //! V210-81 (#272) — **two tunnels whose far end stopped reading cannot starve the room's sync
 //! between the same two nodes, in either direction**, through the shipped binary.
 //!
-//! Alice and Bob are real `vox daemon`s in one room, reading each other. Alice offers a large file
-//! with `vox room send`. Both tunnels of each arm ride the one QUIC connection that also carries
+//! Alice and Bob are real `vox daemon`s in one room, reading each other. Alice shares a large file
+//! with `vox share`, and her daemon serves it. Both tunnels of each arm ride the one QUIC connection that also carries
 //! the room's sync between Alice and Bob.
 //!
 //! - **Download arm** (the tunnels fill Bob's receive window, the dialing side's): Bob starts two
 //!   `vox room get`s of the file, and each is frozen (`SIGSTOP`) as soon as its first bytes land.
 //!   A frozen collector stops reading its local socket, so Bob's daemon stops reading each
 //!   tunnel's QUIC stream, and each stream's receive window fills with bytes nobody reads.
-//! - **Upload arm** (the tunnels fill Alice's receive window, the host's): Alice's `vox room send`
-//!   is frozen, so it reads nothing its tunnels carry. This test asks Bob's daemon for a forward
-//!   to the offer over Bob's control socket, exactly as `vox room get` does, opens two
-//!   connections through it and writes into both until they stop taking bytes.
+//! - **Upload arm** (the tunnels fill Alice's receive window, the host's): the share's server reads
+//!   a request's head (at most 16 KiB) and nothing after it, so it reads nothing more its tunnels
+//!   carry. This test asks Bob's daemon for a forward to the share over Bob's control socket,
+//!   exactly as `vox room get` does, opens two connections through it and writes into both until
+//!   they stop taking bytes.
 //! - **Cap arm** (one member's tunnels past [`TUNNELS_PER_PEER`]): with the upload arm's two still
 //!   held, Bob opens more connections through the same forward until his connection to Alice
 //!   carries 16 tunnels, all stalled, then [`EXTRA`] more; then he runs `vox room get` of the
@@ -39,7 +40,7 @@
 //! ## Preconditions (else CANNOT MEASURE)
 //! The control posts all arrived within [`BOUND`]. In the download arm, both collectors received
 //! bytes before they were frozen and neither had the whole file. In each arm, **the tunnels took
-//! the window**: the writing end stopped advancing (Alice's `vox room send` stopped reading the
+//! the window**: the writing end stopped advancing (Alice's daemon stopped reading the shared
 //! file, or this test's writes stopped being taken) while more than the defect's whole connection
 //! window (2 × `STREAM_WINDOW`) had been written and not read. A writer that cannot advance is
 //! held by flow control, so the reading side's windows are full. In the cap arm, both rounds of writes
@@ -392,24 +393,32 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
                 .expect("APPARATUS: write the offered file");
         }
     }
-    let send_out = root.join("send.out");
-    let send = spawn_vox(
-        &alice,
+    // `vox share` returns once Alice's daemon serves the file (ADR-028 F-2).
+    let (ok, said, err) = alice.vox(
         &[
-            "room",
-            "send",
+            "share",
             &room,
             file.to_str().expect("APPARATUS: a UTF-8 path"),
         ],
-        &send_out,
+        None,
     );
+    assert!(
+        ok,
+        "PRODUCT (staging): Alice's `vox share` failed: {said}{err}"
+    );
+    let tag = said
+        .lines()
+        .find_map(|l| l.split(" as ").nth(1))
+        .map(str::trim)
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox share` never printed its share's tag (\"… as <tag>\"): {said:?}")
+        })
+        .to_owned();
     let offered = Instant::now();
     while !rb.texts(cb).iter().any(|t| t.contains("big.bin")) {
         assert!(
             offered.elapsed() < Duration::from_secs(60),
-            "PRODUCT (staging): Bob never read Alice's offer\nsend: {}\n{}",
-            std::fs::read_to_string(&send_out).unwrap_or_default(),
-            std::fs::read_to_string(send_out.with_extension("err")).unwrap_or_default()
+            "PRODUCT (staging): Bob never read Alice's share"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -461,17 +470,18 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
         "APPARATUS, CANNOT MEASURE: the proof's file was too small; a collector had all of it \
          when frozen: {held:?}"
     );
-    let send_pid = send.0.id();
-    let offsets = stalled(|| read_offsets(send_pid, "big.bin"));
+    // Alice's daemon serves each collector from a descriptor of its own.
+    let alice_pid = alice_d.pid();
+    let offsets = stalled(|| read_offsets(alice_pid, "big.bin"));
     let read: u64 = offsets.iter().flatten().sum();
     let unread = read.saturating_sub(held.iter().sum());
     eprintln!(
-        "[proof] download arm: the sender stopped reading the file at {offsets:?}; {unread} bytes \
+        "[proof] download arm: Alice's daemon stopped reading the file at {offsets:?}; {unread} bytes \
          written and not read (the window counts as taken from {TAKEN})"
     );
     assert!(
         offsets.as_ref().is_some_and(|o| o.len() == 2) && unread >= TAKEN,
-        "APPARATUS, CANNOT MEASURE: the download tunnels did not take the window: the sender's reads \
+        "APPARATUS, CANNOT MEASURE: the download tunnels did not take the window: Alice's daemon's reads \
          {offsets:?}, {unread} bytes unread of the {TAKEN} needed"
     );
 
@@ -481,19 +491,7 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     }
     drop(gets);
 
-    // The upload arm: Alice's side reads nothing its tunnels carry.
-    send.signal("-STOP");
-    let said = std::fs::read_to_string(&send_out).unwrap_or_default();
-    let tag = said
-        .lines()
-        .find_map(|l| l.split(" as ").nth(1))
-        .map(str::trim)
-        .unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: `vox room send` never printed its offer's tag (\"… as <tag>\"): {said:?}"
-            )
-        })
-        .to_owned();
+    // The upload arm: Alice's side reads nothing its tunnels carry past a request's head.
     // Bob has already read the offer above, so a missing author here is the control-socket read.
     let host = rb.author_of(cb, "big.bin").unwrap_or_else(|| {
         panic!("APPARATUS: Bob's control-socket read found no row naming big.bin, already read")
@@ -514,9 +512,8 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     );
     let upload = phase(&alice, &bob, &mut ra, &mut rb, ca, cb, &room, "upload");
 
-    // The cap arm: Bob opens tunnels to the frozen sender until his connection to Alice carries
-    // all it may, then more.
-    let alice_pid = alice_d.pid();
+    // The cap arm: Bob opens tunnels to the share until his connection to Alice carries all it
+    // may, then more.
     let cap = TUNNELS_PER_PEER as usize;
     let (more_socks, more) = writers(&bound, cap - written.len());
     let at_cap = stalled(|| loads(&written).into_iter().chain(loads(&more)).collect());
@@ -620,7 +617,6 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
     for sock in socks.iter().chain(&more_socks).chain(&extra_socks) {
         let _ = sock.shutdown(Shutdown::Both);
     }
-    send.signal("-CONT");
 
     eprintln!(
         "[proof] cap arm: Alice's status names {tag} on {alice_said} line(s) and {alice_named} \

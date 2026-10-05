@@ -2198,7 +2198,7 @@ pub async fn service_add(
 /// The one-shot form opens the profile itself, which redb refuses while a daemon holds it
 /// — and a running host is exactly when removing a service matters, because that is when
 /// it is carrying sessions the removal must cut (PRD-001 R22). The request is the one
-/// `vox room send` already makes when its offer ends; it only ever narrows what is exposed.
+/// daemon makes when a share ends; it only ever narrows what is exposed.
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the service was not offered.
@@ -2629,220 +2629,15 @@ pub async fn board(
 // 0. Verifying against a hash the sender signed turns that into a loud failure.
 
 /// The envelope type an offer is announced with.
-pub(crate) const FILE: &str = "file";
+pub(crate) const FILE: &str = vox_core::node::shares::FILE;
 
-/// Read a file and return its SHA-256 and length.
-pub(crate) fn digest_file(path: &std::path::Path) -> Result<(String, u64), AppError> {
-    use sha2::{Digest as _, Sha256};
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| AppError::Usage(format!("opening {}: {e}", path.display())))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = std::io::Read::read(&mut f, &mut buf)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        total += n as u64;
-    }
-    Ok((hex(&hasher.finalize()), total))
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
+fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
     }
     s
-}
-
-/// How long a stopped `vox room send` waits for its daemon to withdraw the offer: as long as
-/// `vox daemon` gives its own node to stop.
-const REMOVE_SERVICE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// `vox room send` — offer a file to a room and announce it.
-///
-/// Runs until interrupted: the bytes are served live, so stopping this stops the
-/// offer. Every member that collects it gets the same file.
-///
-/// # Errors
-/// If the node cannot be reached, the room is unknown, the file cannot be read, or
-/// the node refuses to offer the service.
-pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Result<(), AppError> {
-    // Every stop signal, not Ctrl-C alone (V210-108): SIGTERM and SIGHUP ended the offer on the
-    // spot, leaving it on the node. Taken first, so a stop sent while the offer is being made is
-    // not the default action's silent death; the loop below acts on it.
-    let interrupted = crate::app::stop_requested("vox room send");
-    let (sha256, size) = digest_file(path)?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_owned());
-    // The tag names the content and **this offer**: `file-<16 hex of the SHA-256>-<16 hex of
-    // randomness>`. It was the content alone, so two offers of the same file shared one
-    // service, and whichever ended first withdrew the other's while it still ran (V210-72):
-    // the daemon withdraws an offer by its tag when the connection that made it closes.
-    let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce)
-        .map_err(|e| AppError::Usage(format!("no randomness for the offer's tag: {e}")))?;
-    let tag = format!("file-{}-{}", &sha256[..16], hex(&nonce));
-
-    let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
-
-    // A listener that hands the file to whoever connects, for as long as we run.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|e| AppError::Usage(format!("cannot listen locally: {e}")))?;
-    let local = listener
-        .local_addr()
-        .map_err(|e| AppError::Usage(format!("cannot read the local address: {e}")))?;
-
-    match client
-        .request(&Request::AddService {
-            channel_id,
-            service_tag: tag.clone(),
-            local: local.to_string(),
-            persist: false,
-        })
-        .await
-    {
-        Ok(Frame::Ok) => {}
-        Ok(Frame::Error { reason }) => {
-            // Not "needs bind:<tag>, which the room's admin grants": that capability was
-            // deleted in ADR-017's third revision — offering a port of your own machine
-            // is not the room's business — and `add_service` stopped checking it at M17.7.
-            // The message named a permission nobody can hold and an admin nobody has.
-            return Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")));
-        }
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    }
-
-    // A `dial:` grant per member used to be issued here, "so it works under either
-    // model". There is one model: reach is the host's trust keyring (M17.7), and the
-    // capability has not been consulted since. The loop wrote a governance fact per
-    // member per offer onto the room's log, which nothing read — and it kept the
-    // withdrawn model alive in the one verb a person uses most.
-
-    let env = {
-        let mut e = Envelope::new(FILE, &format!("offering {name} ({size} bytes)"));
-        e.data = serde_json::json!({
-            "name": name,
-            "size": size,
-            "sha256": sha256,
-            "tag": tag,
-        });
-        e
-    };
-    post(paths, room, Some(&env.to_text())).await?;
-
-    println!("vox: offering {name} ({size} bytes) as {tag}");
-    println!("     sha256 {sha256}");
-    println!(
-        "     collect it with: vox room get {} {name}",
-        &room_of_label(channel_id)
-    );
-    println!("     Ctrl-C stops the offer; the announcement stays on the log");
-
-    let path = path.to_owned();
-    // Every transfer in flight, and the word to stop them: a stopped offer ends each one with a
-    // reset, never a clean close (see below).
-    let (stop, stopping) = tokio::sync::watch::channel(false);
-    let mut transfers = tokio::task::JoinSet::new();
-    // One stop listener for the whole loop, taken above: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    tokio::pin!(interrupted);
-    let signal = loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let Ok((sock, _)) = accepted else { continue };
-                while transfers.try_join_next().is_some() {}
-                transfers.spawn(serve_file(path.clone(), sock, stopping.clone()));
-            }
-            signal = &mut interrupted => break signal,
-        }
-    };
-    crate::app::say(format_args!("vox: no longer offering {tag}"));
-    // Bounded: a daemon that does not answer (stopped, wedged) left this waiting for ever, and
-    // a stop that only SIGKILL could end. Its sessions are reset below either way.
-    let removed = tokio::time::timeout(
-        REMOVE_SERVICE_PATIENCE,
-        client.request(&Request::RemoveService {
-            channel_id,
-            service_tag: tag,
-        }),
-    )
-    .await;
-    if removed.is_err() {
-        eprintln!(
-            "vox: the daemon did not answer within {}s; stopping anyway — the offer's transfers \
-             are reset, and there is nothing left for it to serve",
-            REMOVE_SERVICE_PATIENCE.as_secs()
-        );
-    }
-    // Then reset what is still in flight, and wait for the resets to leave before exiting:
-    // an exit would close these sockets gracefully.
-    let _ = stop.send(true);
-    let _ = tokio::time::timeout(
-        vox_core::tunnel::session::DRAIN_BOUND + std::time::Duration::from_secs(1),
-        async { while transfers.join_next().await.is_some() {} },
-    )
-    .await;
-    Err(AppError::stopped_by(signal))
-}
-
-/// Send the file at `path` to one collector's connection, and close it cleanly only if all of
-/// it was sent.
-///
-/// **Any other ending is a reset** — the offer stopped (`stopping`), or the file could not be
-/// read. A clean close says "that was all of it", so a transfer cut short that way reached the
-/// collector as a clean, truncated end (V210-81): when `vox room send` was stopped, its exit
-/// closed each connection gracefully, and that close could reach the collector before the
-/// node's own cut of the session did.
-async fn serve_file(
-    path: std::path::PathBuf,
-    mut sock: tokio::net::TcpStream,
-    mut stopping: tokio::sync::watch::Receiver<bool>,
-) {
-    use tokio::io::AsyncWriteExt as _;
-    // `std::fs` because this workspace's tokio has no `fs` feature, and widening a dependency
-    // for one CLI verb is the wrong trade. The reads are chunked, so a large file is not held
-    // in memory.
-    let whole = {
-        let send = async {
-            let Ok(mut f) = std::fs::File::open(&path) else {
-                return false;
-            };
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                match std::io::Read::read(&mut f, &mut buf) {
-                    Ok(0) => return sock.flush().await.is_ok(),
-                    Ok(n) => {
-                        if sock.write_all(&buf[..n]).await.is_err() {
-                            return false;
-                        }
-                    }
-                    Err(_) => return false,
-                }
-            }
-        };
-        tokio::select! {
-            whole = send => whole,
-            _ = stopping.wait_for(|stop| *stop) => false,
-        }
-    };
-    if !whole {
-        vox_core::tunnel::session::abort_after_drain(sock).await;
-    }
-}
-
-fn room_of_label(channel_id: Digest32) -> String {
-    b32_encode(&channel_id).chars().take(12).collect()
 }
 
 /// An offer read off the room's log.
@@ -2852,7 +2647,8 @@ struct Offer {
     size: u64,
     sha256: String,
     tag: String,
-    /// Served over HTTP (`vox share`) rather than as raw bytes (`vox room send`).
+    /// Served over HTTP, as `vox share` serves; an announcement without it is answered with the
+    /// raw bytes.
     http: bool,
 }
 
@@ -2895,7 +2691,7 @@ pub async fn get_file(
 
     // Newest first: re-offering a file supersedes. But **an offer that has ended does not
     // hide one that is still served** (V210-84): each offer has a tag of its own, so the newest
-    // match may be one whose `vox room send` has stopped while an older offer of the same file
+    // match may be one whose share has stopped while an older offer of the same file
     // still runs. So the older offers are tried in turn — but only those of **the same file
     // from the same member** as the newest match: same author, same SHA-256. A fallback to
     // anything else would hand over a different file that only shares a name.

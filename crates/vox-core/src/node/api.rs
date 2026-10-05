@@ -799,8 +799,8 @@ pub enum NodeCommand {
         /// What the service is, as detected before it was offered (ADR-028 S-2,
         /// [`crate::node::probe::detect`]): said to the room with the share.
         kind: crate::governance::share::ServiceKind,
-        /// Whether the offer outlives this node's run. `false` for an offer that lasts
-        /// only as long as the process that made it (`vox room send`, V210-72).
+        /// Whether the offer outlives this node's run. `false` for an offer that lasts only as
+        /// long as what made it: a client's connection (V210-72), or a file share.
         persist: bool,
     },
     /// Stop offering a service.

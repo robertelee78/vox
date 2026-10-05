@@ -11,7 +11,7 @@
 //! proof on the v0.3.0 line.)
 //!
 //! What this drives, as people would: alice and bob, real `vox daemon`s behind a real `vox node`
-//! anchor, in one room. Alice offers a file (`vox room send`); once bob can see the offer, alice's
+//! anchor, in one room. Alice shares a file (`vox share`); once bob can see the offer, alice's
 //! node is killed (`SIGKILL`, so nothing tells bob), and bob waits out the 30 s the node takes to
 //! recognise a silent connection as dead — so the fetch dials afresh, as it would after any real
 //! absence. Then bob runs `vox room get`, and **while it dials**, bob posts to the room through
@@ -397,19 +397,21 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
     }
 
     // ---- alice offers a file; bob sees the offer; alice's node goes, unannounced ----
-    let offer = alice.spawn(&[
-        "room",
-        "send",
+    let (ok, shared, err) = alice.vox(&[
+        "share",
         &room,
         source.to_str().expect("APPARATUS: a UTF-8 temp path"),
     ]);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox share` failed: {shared}{err}"
+    );
     until(
         &bob,
         "the announcement to reach bob",
         &["room", "read", &room],
         |o| o.contains("artifact.bin"),
     );
-    drop(offer);
     drop(alice.daemon.take()); // SIGKILL, reaped: its QUIC close never leaves
     std::thread::sleep(SILENCE);
 

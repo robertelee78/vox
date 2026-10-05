@@ -607,6 +607,13 @@ impl Paths {
             .join(format!("{}.json", sanitize(session)))
     }
 
+    /// `<profile_dir>/shares`: a record of each share this node serves, and a folder share's
+    /// archive (ADR-028 F-2).
+    #[must_use]
+    pub fn shares_dir(&self) -> PathBuf {
+        self.profile_dir.join("shares")
+    }
+
     /// The directory holding every session's wake channel.
     #[must_use]
     pub fn session_dir(&self) -> PathBuf {
