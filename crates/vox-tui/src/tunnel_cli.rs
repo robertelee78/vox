@@ -1104,7 +1104,9 @@ pub async fn serve(
     println!("room       {}", b32_encode(&channel_id));
     println!("address    {url}");
     println!("passphrase {}", passphrase.as_str());
-    println!("           ^ send this by a different channel than the address");
+    println!(
+        "           ^ send this another way than the address (in person, a call, a different app)"
+    );
     println!();
     // The address with the fingerprints in the node and room places: what any member can use
     // as printed, or with its own aliases for this node and this room (V030-25).

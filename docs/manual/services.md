@@ -31,8 +31,8 @@ vox serve ssh=22
 ```
 
 `serve` creates a room, shares `127.0.0.1:22` in it as `ssh`, and keeps running. It prints the
-room ID, the room link, a generated room passphrase (`^ send this by a different channel than the
-address`) and the address the service answers on, with fingerprints in the node and room places.
+room ID, the room link, a generated room passphrase (`^ send this another way than the address (in
+person, a call, a different app)`) and the address the service answers on, with fingerprints in the node and room places.
 Send the link and the passphrase separately. Protect this output: it includes the room passphrase.
 Several shares can be named at once, such as `vox serve ssh=22 dns=53/udp`; `--at` names a local
 endpoint other than `127.0.0.1:PORT`, and `--name` sets your local name for the new room (default

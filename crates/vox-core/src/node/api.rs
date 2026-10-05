@@ -1102,7 +1102,7 @@ impl Fault {
             }
             Fault::SealedUnreadable => {
                 "the identity passphrase is right, but this node's trust keyring, pending \
-                 consents or prekey ring will not open under it\n       the store was altered, \
+                 trust grants or prekey ring will not open under it\n       the store was altered, \
                  or copied from another identity's profile"
             }
             Fault::ShuttingDown => "the node is shutting down",
@@ -1138,7 +1138,7 @@ impl Fault {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
             }
             Fault::NotConsented => {
-                "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
+                "there is nothing to withdraw: that identity was never trusted, or already is not"
             }
             Fault::NotTrusted => {
                 "that identity is not in your trust keyring, so it is given no key to read you\n       run `vox trust add <fingerprint>` if you mean it to read you"

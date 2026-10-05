@@ -778,15 +778,15 @@ fn manifest_bytes(genesis: &Genesis, local_name: &str, created: u64, epoch: u64)
 fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 5 {
-        return Err(Error::MalformedAtRest("channel manifest arity"));
+        return Err(Error::MalformedAtRest("room manifest arity"));
     }
     if d.uint()? != MANIFEST_VERSION {
-        return Err(Error::MalformedAtRest("channel manifest version"));
+        return Err(Error::MalformedAtRest("room manifest version"));
     }
     let genesis = Genesis::from_wire(d.bytes()?)?;
     let name = d.text()?;
     if name.len() > MAX_LOCAL_NAME_LEN {
-        return Err(Error::SizeLimitExceeded("channel local name"));
+        return Err(Error::SizeLimitExceeded("room local name"));
     }
     let name = name.to_owned();
     let created = d.uint()?;
@@ -996,27 +996,27 @@ fn parse_delivered(bytes: &[u8]) -> Result<BTreeMap<Digest32, u64>> {
 fn parse_services(bytes: &[u8]) -> Result<BTreeMap<String, SocketAddr>> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
-        return Err(Error::MalformedAtRest("channel services arity"));
+        return Err(Error::MalformedAtRest("room services arity"));
     }
     if d.uint()? != SERVICES_VERSION {
-        return Err(Error::MalformedAtRest("channel services version"));
+        return Err(Error::MalformedAtRest("room services version"));
     }
     let n = d.array()?;
     if n > MAX_SERVICES {
-        return Err(Error::SizeLimitExceeded("channel services"));
+        return Err(Error::SizeLimitExceeded("room services"));
     }
     let mut out = BTreeMap::new();
     for _ in 0..n {
         if d.array()? != 2 {
-            return Err(Error::MalformedAtRest("channel service tuple arity"));
+            return Err(Error::MalformedAtRest("room service tuple arity"));
         }
         let tag = d.text()?.to_owned();
         let addr: SocketAddr = d
             .text()?
             .parse()
-            .map_err(|_| Error::MalformedAtRest("channel service address"))?;
+            .map_err(|_| Error::MalformedAtRest("room service address"))?;
         if tag.is_empty() || tag.len() > crate::tunnel::session::MAX_SERVICE_TAG_LEN {
-            return Err(Error::MalformedAtRest("channel service tag length"));
+            return Err(Error::MalformedAtRest("room service tag length"));
         }
         out.insert(tag, addr);
     }
@@ -1036,33 +1036,33 @@ pub(crate) fn authors_bytes(authors: &BTreeMap<Digest32, CompositePublicKey>) ->
 pub(crate) fn parse_authors(bytes: &[u8]) -> Result<BTreeMap<Digest32, CompositePublicKey>> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
-        return Err(Error::MalformedAtRest("channel authors arity"));
+        return Err(Error::MalformedAtRest("room authors arity"));
     }
     if d.uint()? != AUTHORS_VERSION {
-        return Err(Error::MalformedAtRest("channel authors version"));
+        return Err(Error::MalformedAtRest("room authors version"));
     }
     let n = d.array()?;
     if n > AUTHORS_HARD_LIMIT {
-        return Err(Error::SizeLimitExceeded("channel authors"));
+        return Err(Error::SizeLimitExceeded("room authors"));
     }
     let mut out = BTreeMap::new();
     for _ in 0..n {
         if d.array()? != 2 {
-            return Err(Error::MalformedAtRest("channel author tuple arity"));
+            return Err(Error::MalformedAtRest("room author tuple arity"));
         }
         let fp: Digest32 = d
             .bytes()?
             .try_into()
-            .map_err(|_| Error::MalformedAtRest("channel author fingerprint"))?;
+            .map_err(|_| Error::MalformedAtRest("room author fingerprint"))?;
         let key_bytes: [u8; crate::hash::COMPOSITE_PUB_LEN] = d
             .bytes()?
             .try_into()
-            .map_err(|_| Error::MalformedAtRest("channel author key length"))?;
+            .map_err(|_| Error::MalformedAtRest("room author key length"))?;
         let key = CompositePublicKey::from_bytes(&key_bytes)?;
         // The stored fingerprint must be the key's own: a swapped pair would admit
         // an identity under another's name.
         if key.fingerprint() != fp {
-            return Err(Error::MalformedAtRest("channel author key/fingerprint"));
+            return Err(Error::MalformedAtRest("room author key/fingerprint"));
         }
         out.insert(fp, key);
     }
@@ -1085,14 +1085,14 @@ fn receivers_bytes(receivers: &BTreeMap<(Digest32, u64), ReceiverChain>) -> Zero
 fn parse_receivers(bytes: &[u8]) -> Result<BTreeMap<(Digest32, u64), ReceiverChain>> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
-        return Err(Error::MalformedAtRest("channel receivers arity"));
+        return Err(Error::MalformedAtRest("room receivers arity"));
     }
     if d.uint()? != RECEIVERS_VERSION {
-        return Err(Error::MalformedAtRest("channel receivers version"));
+        return Err(Error::MalformedAtRest("room receivers version"));
     }
     let n = d.array()?;
     if n > MAX_RECEIVER_CHAINS {
-        return Err(Error::SizeLimitExceeded("channel receiver chains"));
+        return Err(Error::SizeLimitExceeded("room receiver chains"));
     }
     let mut out = BTreeMap::new();
     for _ in 0..n {
@@ -1259,7 +1259,7 @@ impl ChannelState {
         now_secs: u64,
     ) -> Result<(Genesis, Sek)> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
-            return Err(Error::SizeLimitExceeded("channel local name"));
+            return Err(Error::SizeLimitExceeded("room local name"));
         }
         let signer = profile.signer()?;
         let policy = ChannelPolicy {
@@ -1447,12 +1447,12 @@ impl ChannelState {
     ) -> Result<Self> {
         let manifest_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_MANIFEST)?
-            .ok_or(Error::MalformedAtRest("channel manifest missing"))?;
+            .ok_or(Error::MalformedAtRest("room manifest missing"))?;
         let manifest = open_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest_seg)?;
         let (genesis, local_name, created, epoch) = parse_manifest(&manifest)?;
         genesis.verify()?;
         if genesis.channel_id() != *channel_id {
-            return Err(Error::MalformedAtRest("channel manifest genesis mismatch"));
+            return Err(Error::MalformedAtRest("room manifest genesis mismatch"));
         }
 
         // The admitted authors (M14.5). A channel created before this segment
@@ -1975,13 +1975,13 @@ impl ChannelState {
         local_name: &str,
     ) -> Result<()> {
         if local_name.len() > MAX_LOCAL_NAME_LEN {
-            return Err(Error::SizeLimitExceeded("channel local name"));
+            return Err(Error::SizeLimitExceeded("room local name"));
         }
         profile.signer()?;
         genesis.verify()?;
         if genesis.channel_id() != *channel_id {
             return Err(Error::MalformedGovernance(
-                "genesis hash is not the channelID joined with",
+                "genesis hash is not the room id joined with",
             ));
         }
         if profile.store().get_sek_wrap(channel_id)?.is_some() {
@@ -2430,7 +2430,7 @@ impl ChannelState {
         }
         let fresh = true;
         if self.services.len() >= MAX_SERVICES {
-            return Err(Error::SizeLimitExceeded("channel services"));
+            return Err(Error::SizeLimitExceeded("room services"));
         }
         self.services.insert(service_tag.to_owned(), local);
         if persist {
@@ -2615,7 +2615,7 @@ impl ChannelState {
     ) -> Result<Digest32> {
         if self.poisoned {
             return Err(Error::Profile(
-                "channel is poisoned after a failed persist; reopen it",
+                "room is poisoned after a failed persist; reopen it",
             ));
         }
         if !self.settled {
@@ -2624,9 +2624,7 @@ impl ChannelState {
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) {
-            return Err(Error::Profile(
-                "this identity is not an author of the channel",
-            ));
+            return Err(Error::Profile("this identity is not an author of the room"));
         }
         let payload = package.to_wire();
         let skeleton = self.next_skeleton(&me, &payload, now_millis);
@@ -3018,7 +3016,7 @@ impl ChannelState {
     ) -> Result<u64> {
         if self.poisoned {
             return Err(Error::Profile(
-                "channel is poisoned after a failed persist; reopen it",
+                "room is poisoned after a failed persist; reopen it",
             ));
         }
         let store = profile.store();
@@ -3252,14 +3250,14 @@ impl ChannelState {
         let me = self.me();
         if target == me {
             return Err(Error::MalformedGovernance(
-                "an identity cannot revoke its own consent",
+                "an identity cannot withdraw trust in itself",
             ));
         }
         if !MembershipView::new(&self.evaluator)
             .readers_of(&me)
             .contains(&target)
         {
-            return Err(Error::MalformedGovernance("no consent to revoke"));
+            return Err(Error::MalformedGovernance("no trust to withdraw"));
         }
         // Rotate first: the entry names the generation that excludes `target`, so
         // that generation has to exist before the fact is signed.
@@ -4258,7 +4256,7 @@ impl ChannelState {
     ) -> Result<Digest32> {
         if self.poisoned {
             return Err(Error::Profile(
-                "channel is poisoned after a failed persist; reopen it",
+                "room is poisoned after a failed persist; reopen it",
             ));
         }
         if !self.settled {
@@ -4267,9 +4265,7 @@ impl ChannelState {
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) {
-            return Err(Error::Profile(
-                "this identity is not an author of the channel",
-            ));
+            return Err(Error::Profile("this identity is not an author of the room"));
         }
         // Governance is authored on the seconds clock; its place in the order is whole
         // seconds, which only matters against entries it did not see.
@@ -4409,7 +4405,7 @@ impl ChannelState {
     ) -> Result<SyncOutcome> {
         if self.poisoned {
             return Err(Error::Profile(
-                "channel is poisoned after a failed persist; reopen it",
+                "room is poisoned after a failed persist; reopen it",
             ));
         }
         // Per-author heads before the session, so the new entries can be found after.
@@ -4776,7 +4772,7 @@ impl ChannelState {
             let ch = shared.blocking_lock();
             if ch.poisoned {
                 return SessionReport::failed(SyncFailure::Poisoned(
-                    "channel is poisoned after a failed persist; reopen it".to_owned(),
+                    "room is poisoned after a failed persist; reopen it".to_owned(),
                 ));
             }
             ch.epoch
@@ -4818,7 +4814,7 @@ impl ChannelState {
     pub fn accept_skdm(&mut self, store: &Store, skdm: &Skdm, now_secs: u64) -> Result<usize> {
         if self.poisoned {
             return Err(Error::Profile(
-                "channel is poisoned after a failed persist; reopen it",
+                "room is poisoned after a failed persist; reopen it",
             ));
         }
         let author = skdm.body.author_id;
@@ -4835,7 +4831,7 @@ impl ChannelState {
             return Ok(0);
         }
         if self.receivers.len() >= MAX_RECEIVER_CHAINS {
-            return Err(Error::SizeLimitExceeded("channel receiver chains"));
+            return Err(Error::SizeLimitExceeded("room receiver chains"));
         }
         self.receivers.insert(slot, chain);
         self.persist_receivers(store)?;
@@ -5386,11 +5382,11 @@ impl ChannelState {
     pub fn accept_entry(&mut self, store: &Store, entry: Entry, now_secs: u64) -> Result<Accepted> {
         if self.poisoned {
             return Err(Error::Profile(
-                "channel is poisoned after a failed persist; reopen it",
+                "room is poisoned after a failed persist; reopen it",
             ));
         }
         if entry.skeleton.channel_id != self.channel_id {
-            return Err(Error::MalformedGovernance("entry binds another channel"));
+            return Err(Error::MalformedGovernance("entry binds another room"));
         }
         if entry.skeleton.epoch != self.epoch {
             return Err(Error::MalformedGovernance("entry binds another epoch"));
@@ -5561,7 +5557,7 @@ impl ChannelState {
     ) -> Result<&Rendered> {
         if self.poisoned {
             return Err(Error::Profile(
-                "channel is poisoned after a failed persist; reopen it",
+                "room is poisoned after a failed persist; reopen it",
             ));
         }
         if !self.settled {
@@ -5570,9 +5566,7 @@ impl ChannelState {
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self.authors.contains_key(&me) {
-            return Err(Error::Profile(
-                "this identity is not an author of the channel",
-            ));
+            return Err(Error::Profile("this identity is not an author of the room"));
         }
         // An ended room takes no new message (V030-08). The actor says so to the person; this
         // is the backstop. A post while a leave waits to be heard is allowed, and undoes the

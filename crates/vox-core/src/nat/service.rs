@@ -166,7 +166,7 @@ impl RejectReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::NotMember => "rejected: author is not a channel member",
+            Self::NotMember => "rejected: author is not a room member",
             Self::Malformed => "rejected: malformed record",
             Self::Policy => "rejected: policy",
             Self::Capacity => "rejected: capacity",
@@ -178,7 +178,7 @@ impl RejectReason {
     /// Classify a store/parse error.
     fn for_error(err: &Error) -> Self {
         match err {
-            Error::RendezvousRejected("author is not a channel member") => Self::NotMember,
+            Error::RendezvousRejected("author is not a room member") => Self::NotMember,
             Error::RendezvousRejected(s) if s.ends_with("at capacity") => Self::Capacity,
             Error::RendezvousRejected(s) if s.starts_with("non-increasing") => Self::Stale,
             Error::RendezvousRejected(_) => Self::Policy,
@@ -244,7 +244,7 @@ impl RendezvousRequest {
                 let channel_id: Digest32 = d
                     .bytes()?
                     .try_into()
-                    .map_err(|_| Error::MalformedRendezvous("rendezvous get channel_id length"))?;
+                    .map_err(|_| Error::MalformedRendezvous("rendezvous get room id length"))?;
                 let epoch = d.uint()?;
                 let kinds = RecordKinds::from_bits(d.uint()?)?;
                 Self::Get {
@@ -916,7 +916,7 @@ impl RendezvousClient {
                             g.verify()?;
                             if g.channel_id() != *channel_id {
                                 return Err(Error::MalformedRendezvous(
-                                    "rendezvous get: genesis is not this channel's",
+                                    "rendezvous get: genesis is not this room's",
                                 ));
                             }
                             set.genesis = Some(g);

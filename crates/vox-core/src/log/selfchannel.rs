@@ -100,7 +100,7 @@ fn hkdf_expand(ikm: &[u8; SELF_SEED_LEN], info: &[u8], okm: &mut [u8]) -> Result
     // Extract with no salt: the seed is already a high-entropy uniform secret.
     let hk = Hkdf::<Sha256>::new(None, ikm);
     hk.expand(info, okm)
-        .map_err(|_| Error::MalformedBundle("self-channel hkdf expand"))
+        .map_err(|_| Error::MalformedBundle("self-room hkdf expand"))
 }
 
 /// The kind of self-channel entry payload (ADR-008). The self-channel multiplexes
@@ -133,7 +133,7 @@ impl SelfEntryKind {
             1 => Ok(SelfEntryKind::ReceivedSkdm),
             2 => Ok(SelfEntryKind::NicknameState),
             3 => Ok(SelfEntryKind::JoinMaterial),
-            _ => Err(Error::MalformedBundle("self-channel entry kind")),
+            _ => Err(Error::MalformedBundle("self-room entry kind")),
         }
     }
 }
@@ -178,10 +178,10 @@ impl SelfChannelEntry {
     pub fn from_canonical_body(body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
         if d.array()? != 2 {
-            return Err(Error::MalformedBundle("self-channel entry arity"));
+            return Err(Error::MalformedBundle("self-room entry arity"));
         }
         let kind_u8 = u8::try_from(d.uint()?)
-            .map_err(|_| Error::MalformedBundle("self-channel entry kind range"))?;
+            .map_err(|_| Error::MalformedBundle("self-room entry kind range"))?;
         let kind = SelfEntryKind::from_u8(kind_u8)?;
         let data = d.bytes()?.to_vec();
         d.finish()?;
@@ -254,20 +254,20 @@ impl SignedSelfChannelEntry {
     pub fn from_wire(bytes: &[u8]) -> Result<Self> {
         let parsed = parse_frame(bytes)?;
         if parsed.tag != StructTag::SelfChannelEntry {
-            return Err(Error::MalformedBundle("self-channel wrong struct tag"));
+            return Err(Error::MalformedBundle("self-room wrong struct tag"));
         }
         let mut d = Decoder::new(parsed.body);
         if d.array()? != 3 {
-            return Err(Error::MalformedBundle("self-channel wire arity"));
+            return Err(Error::MalformedBundle("self-room wire arity"));
         }
         let kind_u8 = u8::try_from(d.uint()?)
-            .map_err(|_| Error::MalformedBundle("self-channel entry kind range"))?;
+            .map_err(|_| Error::MalformedBundle("self-room entry kind range"))?;
         let kind = SelfEntryKind::from_u8(kind_u8)?;
         let data = d.bytes()?.to_vec();
         let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
             .bytes()?
             .try_into()
-            .map_err(|_| Error::MalformedBundle("self-channel signature length"))?;
+            .map_err(|_| Error::MalformedBundle("self-room signature length"))?;
         d.finish()?;
         let signature = CompositeSignature::from_bytes(&sig_bytes)?;
         Ok(Self {

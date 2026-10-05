@@ -3793,7 +3793,7 @@ pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
             if !note.is_empty() {
                 eprintln!("vox: {note}");
             }
-            eprintln!("vox: send the passphrase by a different channel than this address");
+            eprintln!("vox: send the passphrase another way than this address (in person, a call, a different app)");
             eprintln!("     joining grants nothing — use `vox trust add` to decide who reads you");
             Ok(())
         }

@@ -72,7 +72,7 @@ impl TunnelRequest {
         let channel_id: Digest32 = d
             .bytes()?
             .try_into()
-            .map_err(|_| Error::MalformedTunnel("tunnel request channelID"))?;
+            .map_err(|_| Error::MalformedTunnel("tunnel request room id"))?;
         let service_tag = d.text()?.to_owned();
         d.finish()
             .map_err(|_| Error::MalformedTunnel("tunnel request trailing bytes"))?;

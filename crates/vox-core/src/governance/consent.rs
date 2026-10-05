@@ -79,7 +79,7 @@ impl ConsentGrantBody {
     fn from_canonical_body(body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
         if d.array()? != 6 {
-            return Err(Error::MalformedGovernance("consent-grant arity"));
+            return Err(Error::MalformedGovernance("trust grant arity"));
         }
         let channel_id = take_digest(&mut d)?;
         let epoch = d.uint()?;
@@ -153,11 +153,11 @@ impl ConsentGrant {
     pub fn from_wire(bytes: &[u8]) -> Result<Self> {
         let parsed = parse_frame(bytes)?;
         if parsed.tag != StructTag::ConsentGrant {
-            return Err(Error::MalformedGovernance("consent-grant wrong struct tag"));
+            return Err(Error::MalformedGovernance("trust grant wrong struct tag"));
         }
         let mut d = Decoder::new(parsed.body);
         if d.array()? != 7 {
-            return Err(Error::MalformedGovernance("consent-grant wire arity"));
+            return Err(Error::MalformedGovernance("trust grant wire arity"));
         }
         let channel_id = d.bytes()?.to_vec();
         let epoch = d.uint()?;
@@ -186,7 +186,7 @@ impl ConsentGrant {
     pub fn verify(&self, author_root: &CompositePublicKey) -> Result<()> {
         if author_root.fingerprint() != self.body.author_id {
             return Err(Error::MalformedGovernance(
-                "consent-grant author_id != signer fingerprint",
+                "trust grant author_id != signer fingerprint",
             ));
         }
         author_root.verify(&self.body.signing_input(), &self.signature)
@@ -233,7 +233,7 @@ impl ConsentRevocationBody {
     fn from_canonical_body(body: &[u8]) -> Result<Self> {
         let mut d = Decoder::new(body);
         if d.array()? != 5 {
-            return Err(Error::MalformedGovernance("consent-revocation arity"));
+            return Err(Error::MalformedGovernance("trust withdrawal arity"));
         }
         let channel_id = take_digest(&mut d)?;
         let epoch = d.uint()?;
@@ -300,12 +300,12 @@ impl ConsentRevocation {
         let parsed = parse_frame(bytes)?;
         if parsed.tag != StructTag::ConsentRevocation {
             return Err(Error::MalformedGovernance(
-                "consent-revocation wrong struct tag",
+                "trust withdrawal wrong struct tag",
             ));
         }
         let mut d = Decoder::new(parsed.body);
         if d.array()? != 6 {
-            return Err(Error::MalformedGovernance("consent-revocation wire arity"));
+            return Err(Error::MalformedGovernance("trust withdrawal wire arity"));
         }
         let channel_id = d.bytes()?.to_vec();
         let epoch = d.uint()?;
@@ -331,7 +331,7 @@ impl ConsentRevocation {
     pub fn verify(&self, author_root: &CompositePublicKey) -> Result<()> {
         if author_root.fingerprint() != self.body.author_id {
             return Err(Error::MalformedGovernance(
-                "consent-revocation author_id != signer fingerprint",
+                "trust withdrawal author_id != signer fingerprint",
             ));
         }
         author_root.verify(&self.body.signing_input(), &self.signature)
@@ -341,13 +341,13 @@ impl ConsentRevocation {
 fn take_digest(d: &mut Decoder<'_>) -> Result<Digest32> {
     d.bytes()?
         .try_into()
-        .map_err(|_| Error::MalformedGovernance("consent digest length"))
+        .map_err(|_| Error::MalformedGovernance("trust grant digest length"))
 }
 
 fn parse_sig(bytes: &[u8]) -> Result<CompositeSignature> {
     let arr: [u8; COMPOSITE_SIG_LEN] = bytes
         .try_into()
-        .map_err(|_| Error::MalformedGovernance("consent signature length"))?;
+        .map_err(|_| Error::MalformedGovernance("trust grant signature length"))?;
     CompositeSignature::from_bytes(&arr)
 }
 

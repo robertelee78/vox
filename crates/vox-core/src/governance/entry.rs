@@ -201,7 +201,7 @@ impl GovEntry {
         // 3a. Bind to the expected channel at the log layer.
         if &entry.skeleton.channel_id != expected_channel {
             return Err(Error::MalformedGovernance(
-                "governance entry channelID mismatch",
+                "governance entry room id mismatch",
             ));
         }
         let body = Self::body_bound_to(entry)?;
@@ -235,7 +235,7 @@ impl GovEntry {
         let (body_channel, body_epoch) = body.channel_and_epoch();
         if body_channel != entry.skeleton.channel_id {
             return Err(Error::MalformedGovernance(
-                "governance body channelID disagrees with log entry",
+                "governance body room id disagrees with log entry",
             ));
         }
         if body_epoch != entry.skeleton.epoch {

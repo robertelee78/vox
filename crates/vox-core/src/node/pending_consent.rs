@@ -127,33 +127,35 @@ impl PendingConsents {
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let bad = |what| Error::MalformedAtRest(what);
         let mut d = Decoder::new(b);
-        if d.array().map_err(|_| bad("pending consents"))? != 2 {
-            return Err(bad("pending consents arity"));
+        if d.array().map_err(|_| bad("pending trust grants"))? != 2 {
+            return Err(bad("pending trust grants arity"));
         }
-        if d.uint().map_err(|_| bad("pending consents version"))? != VERSION {
-            return Err(bad("pending consents version"));
+        if d.uint().map_err(|_| bad("pending trust grants version"))? != VERSION {
+            return Err(bad("pending trust grants version"));
         }
         // Rows are read one at a time and nothing is sized from `n`, so a corrupt count
         // allocates nothing; past the bound, rows are read and not kept.
-        let n = d.array().map_err(|_| bad("pending consents len"))?;
+        let n = d.array().map_err(|_| bad("pending trust grants len"))?;
         let mut entries = BTreeMap::new();
         for _ in 0..n {
-            if d.array().map_err(|_| bad("pending consent row"))? != 3 {
-                return Err(bad("pending consent row arity"));
+            if d.array().map_err(|_| bad("pending trust grant row"))? != 3 {
+                return Err(bad("pending trust grant row arity"));
             }
-            let room = Digest32::try_from(d.bytes().map_err(|_| bad("pending consent room"))?)
-                .map_err(|_| bad("pending consent room length"))?;
-            let member = Digest32::try_from(d.bytes().map_err(|_| bad("pending consent member"))?)
-                .map_err(|_| bad("pending consent member length"))?;
-            let skdm = d.bytes().map_err(|_| bad("pending consent key"))?;
+            let room = Digest32::try_from(d.bytes().map_err(|_| bad("pending trust grant room"))?)
+                .map_err(|_| bad("pending trust grant room length"))?;
+            let member =
+                Digest32::try_from(d.bytes().map_err(|_| bad("pending trust grant member"))?)
+                    .map_err(|_| bad("pending trust grant member length"))?;
+            let skdm = d.bytes().map_err(|_| bad("pending trust grant key"))?;
             if skdm.len() > MAX_SKDM {
-                return Err(Error::SizeLimitExceeded("pending consent key"));
+                return Err(Error::SizeLimitExceeded("pending trust grant key"));
             }
             if entries.len() < MAX_PENDING {
                 entries.insert((room, member), Zeroizing::new(skdm.to_vec()));
             }
         }
-        d.finish().map_err(|_| bad("pending consents trailing"))?;
+        d.finish()
+            .map_err(|_| bad("pending trust grants trailing"))?;
         Ok(Self { entries })
     }
 
@@ -173,11 +175,13 @@ impl PendingConsents {
             return Ok(Self::default());
         };
         if blob.len() < NONCE_LEN {
-            return Err(Error::MalformedAtRest("pending consents blob too short"));
+            return Err(Error::MalformedAtRest(
+                "pending trust grants blob too short",
+            ));
         }
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
         let nonce = <[u8; NONCE_LEN]>::try_from(nonce_bytes)
-            .map_err(|_| Error::MalformedAtRest("pending consents nonce"))?;
+            .map_err(|_| Error::MalformedAtRest("pending trust grants nonce"))?;
         let sealed = SealedSegment {
             nonce,
             ciphertext: ciphertext.to_vec(),

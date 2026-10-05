@@ -1410,8 +1410,8 @@ enum TrustCmd {
     /// Trust an identity, node-wide.
     ///
     /// This is the decision the whole model rests on. It is per **identity**, not per
-    /// room: from here on every room this node shares with that key auto-consents to it,
-    /// including rooms made later, **and** that key may reach every service this node
+    /// room: from here on it reads what you post in every room this node shares with that
+    /// key, including rooms made later, **and** that key may reach every service this node
     /// binds to a room they are both in. One act, not one per room.
     Add(TrustAddArgs),
     /// List the identities this node trusts, and what it calls them.
@@ -1459,8 +1459,8 @@ pub struct TrustAddArgs {
     /// and there is a terminal.
     #[arg(long)]
     pub name: Option<String>,
-    /// What each consent to it releases of **your own** messages: `now`,
-    /// the default, from this approval onward; or `full`, everything you still hold a key
+    /// What trusting it releases of **your own** messages: `now`,
+    /// the default, from now on; or `full`, everything you still hold a key
     /// for, so it also reads what you wrote before. Your messages only — nobody else's.
     #[arg(long, value_parser = ["now", "full"], default_value = "now")]
     pub history: String,
