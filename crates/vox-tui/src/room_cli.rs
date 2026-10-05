@@ -3157,8 +3157,9 @@ async fn collect_offer(
 }
 
 /// What the node said about a transfer of `offer` that failed, within a moment of it: the
-/// sharer refused it (it no longer serves the offer: this node reads the announcement, so the
-/// sharer trusted it), or could not be reached. `None` if it said neither.
+/// sharer withdrew it mid-transfer (the transfer's stream was reset; this says why), refused it
+/// (it no longer serves the offer: this node reads the announcement, so the sharer trusted it),
+/// or could not be reached. `None` if it said none of these.
 async fn why_not_collected(events: &mut IpcClient, offer: &Offer) -> Option<AppError> {
     use vox_core::node::api::NodeEvent;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -3170,7 +3171,15 @@ async fn why_not_collected(events: &mut IpcClient, offer: &Offer) -> Option<AppE
             continue;
         }
         let who = crate::ident::name_of(&offer.author);
-        return Some(AppError::Usage(if reason.contains("the host refused") {
+        return Some(AppError::Usage(if reason.contains("withdrew access") {
+            // Reached, and serving it a moment ago: the sharer stopped sharing mid-transfer.
+            format!(
+                "the offer of {} was withdrawn while it was being collected: {who} stopped \
+                 sharing it ({reason}). The file is served only while {who} shares it; ask them \
+                 to share it again",
+                offer.name
+            )
+        } else if reason.contains("the host refused") {
             format!(
                 "the offer of {} is gone: {who} no longer serves it. The announcement stays in \
                  the room, but the file is served only while {who} shares it; ask them to share \

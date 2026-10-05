@@ -6467,7 +6467,12 @@ impl Node {
                 // The fast path failed: what this node owes that member goes into the log,
                 // where an always-on member carries it (ADR-023 decision 4).
                 self.deliver_through_log(peer).await;
-                let _ = self.event_tx.send(NodeEvent::PeerUnreachable { peer, why });
+                // A joiner this node just let in is often gone from where it joined: `vox connect`
+                // joins in a process that then exits, and the node attached after it answers
+                // elsewhere. Said only once its join is past `JOINER_SEAL_GRACE` (#406).
+                if !self.joiner_settling(&peer) {
+                    let _ = self.event_tx.send(NodeEvent::PeerUnreachable { peer, why });
+                }
             }
             NetEvent::UpgradeFailed { peer, reason } => {
                 let _ = self.event_tx.send(NodeEvent::StillRelayed { peer, reason });
@@ -10475,6 +10480,14 @@ impl Node {
         }
         let transport = accept_sync(tokio::runtime::Handle::current(), send, recv);
         self.start_inbound(channel_id, peer, conn, transport);
+    }
+
+    /// Whether `peer` is a joiner this node let in, into any room, whose join is still settling:
+    /// no clean session with it yet, and within [`JOINER_SEAL_GRACE`] (#406).
+    fn joiner_settling(&self, peer: &Digest32) -> bool {
+        self.joins_answered
+            .iter()
+            .any(|((_, p), at)| p == peer && at.elapsed() < JOINER_SEAL_GRACE)
     }
 
     /// Whether a refusal may tell `peer` **why** (#202): it is this room's session partner, or it
