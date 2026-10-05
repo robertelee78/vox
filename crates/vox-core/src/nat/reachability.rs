@@ -157,17 +157,14 @@ pub const MIN_TEST_MAP_LIFETIME_SECS: u32 = 30;
 /// (ADR-012 N-58, the real-router proof). It only ever shortens the request.
 #[must_use]
 pub fn map_lifetime_secs() -> u32 {
+    // Read at each ask, not kept: no process-wide state (ADR-026 P-1). An ask is a discovery or
+    // a renewal, minutes apart, so the read costs nothing.
     #[cfg(feature = "test-knobs")]
+    if let Some(l) = std::env::var(TEST_MAP_LIFETIME_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
     {
-        static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-        if let Some(l) = *ASKED.get_or_init(|| {
-            std::env::var(TEST_MAP_LIFETIME_ENV)
-                .ok()
-                .and_then(|v| v.trim().parse::<u32>().ok())
-                .map(|l| l.clamp(MIN_TEST_MAP_LIFETIME_SECS, PORT_MAP_LIFETIME_SECS))
-        }) {
-            return l;
-        }
+        return l.clamp(MIN_TEST_MAP_LIFETIME_SECS, PORT_MAP_LIFETIME_SECS);
     }
     PORT_MAP_LIFETIME_SECS
 }

@@ -246,24 +246,42 @@ pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome 
     let apply = node.apply(cmd);
     tokio::pin!(apply);
     let mut said = false;
-    loop {
+    let mut open = true;
+    let say = |ev: Option<vox_core::node::actor::EventStreamItem>, said: &mut bool| match ev {
+        Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
+            if !*said {
+                eprintln!("{WAITING_FOR_PROFILE}");
+                *said = true;
+            }
+            true
+        }
+        // Said while the verb waits: the node picks its port as it unlocks (V210-167), and says
+        // why a room it held does not reopen (#412).
+        Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
+            eprintln!("vox: {note}");
+            true
+        }
+        Some(_) => true,
+        // The actor is gone; the apply answers for itself.
+        None => false,
+    };
+    let out = loop {
         tokio::select! {
-            out = &mut apply => return out,
-            ev = events.next(), if !said => match ev {
-                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
-                    eprintln!("{WAITING_FOR_PROFILE}");
-                    said = true;
-                }
-                // Said while the verb waits: the node picks its port as it unlocks (V210-167).
-                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
-                    eprintln!("vox: {note}");
-                }
-                Some(_) => {}
-                // The actor is gone; the apply answers for itself.
-                None => said = true,
-            },
+            out = &mut apply => break out,
+            ev = events.next(), if open => open = say(ev, &mut said),
+        }
+    };
+    // **What the node said before it answered is said too.** Its notes go out before its answer
+    // (an unlock answers once its rooms' reopening is over, and a room that would not reopen is
+    // said before that), and a select that took the answer first left them unread: the daemon's
+    // log then never said why the room stayed closed (#412's proof, red one run in three).
+    while open {
+        match events.try_next() {
+            Some(ev) => open = say(Some(ev), &mut said),
+            None => break,
         }
     }
+    out
 }
 
 /// A `vox serve` spec, `<name>=<port>[/tcp|/udp]`: the port, and the service's tag — its name,
