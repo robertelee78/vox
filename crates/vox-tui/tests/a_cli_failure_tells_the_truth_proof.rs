@@ -984,12 +984,16 @@ fn assert_says_stopped(e: &Ended, case: &str, name: &str, code: i32) {
 
 /// The latest `(members, pending)` the anchor's board line gives for `room12`.
 fn board_counts(anchor: &Proc, room12: &str) -> Option<(usize, usize)> {
-    let tag = format!("board — {room12} ");
+    // `<room>: <m> member(s), <p> pending`, rooms joined by `; ` (#396).
+    let tag = format!("{room12}: ");
     anchor.stdout().iter().rev().find_map(|l| {
-        let rest = l.split_once(&tag)?.1;
-        let (m, rest) = rest.split_once("m/")?;
-        let p = rest.split_once('p')?.0;
-        Some((m.parse().ok()?, p.parse().ok()?))
+        let rest = l.strip_prefix("vox node: board — ")?;
+        let counts = rest.split("; ").find_map(|e| e.strip_prefix(&tag))?;
+        let (m, p) = counts.split_once(", ")?;
+        Some((
+            m.split(' ').next()?.parse().ok()?,
+            p.strip_suffix(" pending")?.parse().ok()?,
+        ))
     })
 }
 

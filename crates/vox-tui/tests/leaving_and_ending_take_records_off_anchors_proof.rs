@@ -1,7 +1,7 @@
 //! V030-14 (#320) — **a leave or an end takes its records off anchors at once**, driven through
 //! the shipped `vox` binary: a real `vox node` anchor and real `vox daemon`s in one room, every
 //! verb a separate `vox` process, and the anchor's board read as its operator reads it — the
-//! `vox node: board — <room> <N>m/…` line it prints whenever what it holds changes.
+//! `vox node: board — <room>: <N> member(s), …` line it prints whenever what it holds changes.
 //!
 //! **Why.** A board holds no log. It kept a room's genesis for good and a member's records until
 //! they lapsed — two hours for an address, seven days for a bundle — and members that still
@@ -48,11 +48,12 @@ fn board_members(out: &std::path::Path, short: &str) -> Option<usize> {
     let line = text.lines().rfind(|l| {
         l.starts_with("vox node: board — ") && !l.contains(" holding ") && !l.contains(" holds ")
     })?;
+    // `<room>: <m> member(s), <p> pending`, rooms joined by `; ` (#396).
     line.trim_start_matches("vox node: board — ")
-        .split(", ")
+        .split("; ")
         .find_map(|entry| {
-            let (id, counts) = entry.split_once(' ')?;
-            (id == short).then(|| counts.split('m').next()?.parse().ok())?
+            let (id, counts) = entry.split_once(": ")?;
+            (id == short).then(|| counts.split(' ').next()?.parse().ok())?
         })
 }
 

@@ -20,7 +20,8 @@
 //! periodic sync, and the proof goes red.
 //!
 //! **And the anchor's operator sees them as members, not as people still waiting to join**
-//! (V210-102, #297). `vox node` prints each room it serves as `<room> <members>m/<pending>p`, and a
+//! (V210-102, #297). `vox node` prints each room it serves as `<room>: <members> member(s), <pending>
+//! pending` (`<room> <m>m/<p>p` before #396), and a
 //! joiner's pre-join record — its announcement that it is waiting to join — lived its full two
 //! hours after the join, so every member who joined in that time was also counted as waiting: a
 //! room of 301 showed `301m/256p`. Once Bob and Carol are in, the anchor's last board line must show
@@ -28,7 +29,7 @@
 //! naming three members not printed in that time is PRODUCT (staging) (the anchor never learned the
 //! room's members, which is not this claim); three members with anyone pending is the product red,
 //! quoting the line. Mutation: a pre-join record kept after its joiner is admitted
-//! (`RendezvousStore::forget_prejoin` a no-op) — the line reads `3m/2p`.
+//! (`RendezvousStore::forget_prejoin` a no-op) — the line reads `3 members, 2 pending`.
 
 #![cfg(unix)]
 
@@ -223,11 +224,12 @@ fn board_entry(anchor_out: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// `(members, pending)` from a board entry `<room> <m>m/<p>p[/<e>e]`.
+/// `(members, pending)` from a board entry `<room>: <m> member(s), <p> pending` (#396).
 fn counts(entry: &str) -> Option<(usize, usize)> {
-    let mut parts = entry.split_whitespace().nth(1)?.split('/');
-    let m = parts.next()?.strip_suffix('m')?.parse().ok()?;
-    let p = parts.next()?.strip_suffix('p')?.parse().ok()?;
+    let (_, counts) = entry.split_once(": ")?;
+    let (m, p) = counts.split_once(", ")?;
+    let m = m.split_whitespace().next()?.parse().ok()?;
+    let p = p.strip_suffix(" pending")?.parse().ok()?;
     Some((m, p))
 }
 

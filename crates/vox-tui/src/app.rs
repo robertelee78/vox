@@ -443,6 +443,20 @@ fn dialable(listening: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// The addresses of `listening` another machine can dial: none on loopback (`127.0.0.0/8`, `::1`).
+fn off_machine(listening: &[String]) -> Vec<String> {
+    listening
+        .iter()
+        .filter(|text| {
+            vox_core::nat::multiaddr::Multiaddr::parse(text)
+                .ok()
+                .and_then(|m| m.socket_addr())
+                .is_none_or(|sa| !sa.ip().to_canonical().is_loopback())
+        })
+        .cloned()
+        .collect()
+}
+
 /// A signal that asks this process to stop, as `stop_requested` resolves to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopSignal {
@@ -630,9 +644,33 @@ pub fn run_node(
                             // paste the specs below.
                             Err(e) => eprintln!("vox node: could not write the anchors file ({e})"),
                         }
-                        println!("vox node: clients on this machine need no --anchor. Elsewhere:");
-                        for addr in &listening {
-                            println!("  {fp}@{addr}");
+                        // **Elsewhere is another machine** (V210-170, #395): the anchors file above
+                        // keeps loopback for clients on this one, but a loopback spec printed for
+                        // copying to another machine is one that cannot reach this anchor.
+                        // A loopback spec is still printed, apart and said for what it is: a profile on
+                        // this machine that reads another anchors file uses it.
+                        let elsewhere = off_machine(&listening);
+                        let here: Vec<&String> =
+                            listening.iter().filter(|a| !elsewhere.contains(a)).collect();
+                        if elsewhere.is_empty() {
+                            println!(
+                                "vox node: clients on this machine need no --anchor. It listens on \
+                                 no address another machine can dial."
+                            );
+                        } else {
+                            println!("vox node: clients on this machine need no --anchor. Elsewhere:");
+                            for addr in &elsewhere {
+                                println!("  {fp}@{addr}");
+                            }
+                        }
+                        if !here.is_empty() {
+                            println!(
+                                "vox node: on this machine only, for a profile that reads another \
+                                 anchors file:"
+                            );
+                            for addr in here {
+                                println!("  {fp}@{addr}");
+                            }
                         }
                         printed = listening;
                     }
@@ -673,20 +711,25 @@ pub fn run_node(
                     // symptom appears on somebody else's node, as a peer that cannot be reached.
                     //
                     // On change, like everything else here, so a settled anchor stays silent.
+                    //
+                    // **In words** (V210-171, #396): `1m/0p` was read cold as "peers", and the line
+                    // exists to be read without the source. The board does not count a room's
+                    // entries, so the line says nothing about them rather than imply none.
                     let board: Vec<String> = view
                         .anchoring
                         .iter()
                         .map(|a| {
                             format!(
-                                "{} {}m/{}p",
+                                "{}: {} member{}, {} pending",
                                 crate::tunnel_cli::short_id_of(&a.channel_id),
                                 a.members,
+                                if a.members == 1 { "" } else { "s" },
                                 a.pending,
                             )
                         })
                         .collect();
                     if board != last_board {
-                        println!("vox node: board — {}", board.join(", "));
+                        println!("vox node: board — {}", board.join("; "));
                         last_board = board;
                     }
                     // **Where the board points each member** (V210-51, #230): the address its live
