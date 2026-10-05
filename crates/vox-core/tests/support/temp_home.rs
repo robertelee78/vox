@@ -9,7 +9,8 @@
 //! ## How
 //! Before `main` runs, while the process has one thread, this module makes a fresh directory
 //! under the system temp dir and points this process's `HOME` and `XDG_*_HOME` there, and
-//! unsets `CODEX_HOME` and `CLAUDE_CONFIG_DIR` (which name an agent's config outside HOME). A
+//! unsets `CODEX_HOME`, `CLAUDE_CONFIG_DIR` and `OPENCODE_CONFIG_DIR` (which name an agent's
+//! config outside HOME) and the variables naming the agent session that runs the proof. A
 //! child inherits its parent's environment, so every child of every proof gets the temporary
 //! HOME by default, through every helper, with no call site to remember. A proof that passes
 //! `HOME` explicitly passes either a directory of its own or `std::env::var("HOME")`, which is
@@ -52,8 +53,23 @@ const XDG: [(&str, &str); 4] = [
 ];
 
 /// Variables that name an agent's config outside HOME: unset, so an agent's config resolves
-/// under the temporary HOME.
-const UNSET: [&str; 2] = ["CODEX_HOME", "CLAUDE_CONFIG_DIR"];
+/// under the temporary HOME. And the variables that name the agent session running the proof, or
+/// how to wake it: unset, so a proof's result never depends on who runs it. Inherited, a `vox`
+/// child posted as the operator's session (its `from`) and answered that session's wakes. A proof
+/// that wants a session sets one on the child.
+const UNSET: [&str; 11] = [
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "OPENCODE_CONFIG_DIR",
+    "VOX_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "VOX_HARNESS",
+    "VOX_OPENCODE_WAKE_SOCKET",
+    "VOX_OPENCODE_WAKE_TOKEN",
+];
 
 /// The sentinel [`check`] has a child write in its HOME.
 const SENTINEL: &str = ".vox-proof-sentinel";
@@ -197,16 +213,21 @@ pub fn check() {
         .args([
             "-c",
             "printf '%s\\n%s\\n' \"$HOME\" \"$XDG_CONFIG_HOME\"; \
-             printf '%s' \"$1\" > \"$HOME/.vox-proof-sentinel\"",
+             printf '%s' \"$1\" > \"$HOME/.vox-proof-sentinel\"; shift; \
+             for v in \"$@\"; do \
+             if eval \"[ -n \\\"\\${$v+x}\\\" ]\"; then printf '%s\\n' \"$v\"; fi; done",
             "sh",
             &nonce,
         ])
+        .args(UNSET)
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot start a child to report its HOME: {e}"));
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut lines = said.lines();
     let (home, cfg) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+    // The names of any of them a child still has; never their values.
+    let kept: Vec<&str> = lines.collect();
     let in_real = real_home()
         .map(|r| r.join(SENTINEL))
         .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t == nonce));
@@ -229,6 +250,11 @@ pub fn check() {
         "APPARATUS: a proof's child has XDG_CONFIG_HOME {cfg:?}, not one under the temporary \
          HOME {}",
         temp.display()
+    );
+    assert!(
+        kept.is_empty(),
+        "APPARATUS: a proof's child still has {kept:?}, which name an agent's config or the \
+         session running the proof"
     );
     let landed = std::fs::read_to_string(temp.join(SENTINEL)).unwrap_or_default();
     assert!(
