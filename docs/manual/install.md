@@ -39,7 +39,7 @@ vox --help
 ```
 
 `command -v` should name the binary you intended to install. The installer runs
-`vox shell-setup`, which adds a marked PATH/completion block to the end of your zsh, bash or fish
+`vox shell-setup`, which adds a marked PATH/completion section to the end of your zsh, bash or fish
 startup file. Open a new shell if the current shell does not see the updated PATH. If several
 Vox binaries exist, select the intended one before diagnosing a version mismatch.
 

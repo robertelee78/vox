@@ -205,7 +205,7 @@ impl Marker {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         {
-            return Err(usage("install marker channel is not canonical"));
+            return Err(usage("the install marker's release line is not canonical"));
         }
         Ok(marker)
     }

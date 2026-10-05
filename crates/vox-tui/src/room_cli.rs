@@ -3356,7 +3356,10 @@ async fn collect(bound: &str, dest: &Destination, offer: &Offer) -> Result<(), A
     let placed = place(&part, dest);
     let _ = std::fs::remove_file(&part);
     let placed = placed?;
-    println!("vox: {} ({total} bytes) verified", placed.display());
+    println!(
+        "vox: {} ({total} bytes) matches its announced SHA-256",
+        placed.display()
+    );
     Ok(())
 }
 

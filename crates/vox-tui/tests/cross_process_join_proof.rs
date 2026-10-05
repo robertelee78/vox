@@ -418,8 +418,8 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         );
     }
     assert!(
-        out.contains("verified"),
-        "PRODUCT: the collector must verify: {out:?}"
+        out.contains("matches its announced SHA-256"),
+        "PRODUCT: the collector must say the file matches its announced SHA-256: {out:?}"
     );
     let got = std::fs::read(&dest).expect("PRODUCT: the collected file");
     assert!(

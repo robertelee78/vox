@@ -5,13 +5,20 @@
 //! `vox status` told people "unknown: not recorded until ADR-023". A person reads none of the
 //! design documents, so a reference to one tells them nothing.
 //!
-//! Asserted, over the help of **every** subcommand (walked from `vox --help`, as clap lists them)
-//! and over what a running node says to `vox status`, `vox status --json`, a room it does not
-//! hold, `vox room link` and `vox serve`:
+//! Asserted, over the help of **every** subcommand (walked from `vox --help`, as clap lists them),
+//! over what a running node says to `vox status`, `vox status --json`, a room it does not hold,
+//! `vox room link` and `vox serve`, and over every screen of `vox tui` on that node (its room
+//! list, a room, its members, `:link`, its tunnels, the `:new` and `:join` prompts and an unknown
+//! command's answer, read off a real terminal):
 //! - no "profile" (the node's old name);
 //! - no "channel" and no "consent": a person has rooms, and trusts a member (#406);
 //! - no "invite": a room has a room link, which `vox room link` prints; `vox room invite` is
 //!   refused as an unknown command (#406);
+//! - none of ADR-028 E-2's other forbidden words, as words: "contact", "safety code", "verified"
+//!   (or "unverified") and "block" (or "unblock"). `blocked` stays: it is a work post's type, an
+//!   agent's word for being stuck, not a person blocking a member;
+//! - no command for contacts, a directory or a one-to-one path (E-3): a direct message is a
+//!   two-member room;
 //! - no reference to a design document (`ADR-…`, `PRD-…`, `V030-…`, `V210-…`, `M17.…`, `(#…)`);
 //! - every example `.vox` address has the one form that connects, `<service>.<node>.<room>.vox`:
 //!   four labels.
@@ -21,10 +28,11 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-use std::io::BufRead;
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "identity passphrase for the wording proof";
@@ -98,6 +106,25 @@ fn faults(text: &str) -> Vec<String> {
         {
             out.push(format!("says \"{w}\": {}", line.trim()));
         }
+        // ADR-028 E-2's other forbidden words, as whole words.
+        let words: Vec<&str> = low.split(|c: char| !c.is_ascii_alphabetic()).collect();
+        if let Some(w) = [
+            "contact",
+            "contacts",
+            "verified",
+            "unverified",
+            "block",
+            "blocks",
+            "unblock",
+        ]
+        .iter()
+        .find(|w| words.contains(*w))
+        {
+            out.push(format!("says \"{w}\": {}", line.trim()));
+        }
+        if low.contains("safety code") {
+            out.push(format!("says \"safety code\": {}", line.trim()));
+        }
         let refs = ["ADR-", "PRD-", "V030-", "V210-", "V29-", "M17.", "(#"];
         if let Some(r) = refs.iter().find(|r| line.contains(**r)) {
             out.push(format!("names a design document ({r}…): {}", line.trim()));
@@ -117,6 +144,126 @@ fn faults(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `vox tui` on a pseudo-terminal, everything it draws replayed into a screen; killed when dropped.
+struct Tui {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    input: Box<dyn Write + Send>,
+    screen: Arc<Mutex<vt100::Parser>>,
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Tui {
+    fn spawn(data: &Path) -> Self {
+        use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 50,
+                cols: 160,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("APPARATUS: open a pty");
+        let mut cmd = CommandBuilder::new(VOX);
+        cmd.args(["tui", "--listen", "127.0.0.1:0"]);
+        cmd.env("VOX_DATA_DIR", data.join("data"));
+        cmd.env("VOX_CONFIG_DIR", data.join("cfg"));
+        cmd.env("TERM", "xterm-256color");
+        for k in ["VOX_NODE", "VOX_ROOM", "VOX_IDENTITY_PASSPHRASE"] {
+            cmd.env_remove(k);
+        }
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("APPARATUS: spawn vox tui");
+        drop(pair.slave);
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("APPARATUS: pty reader");
+        let input = pair.master.take_writer().expect("APPARATUS: pty writer");
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(50, 160, 0)));
+        let sink = Arc::clone(&screen);
+        let master = pair.master;
+        std::thread::spawn(move || {
+            let _master = master;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => sink.lock().unwrap().process(&buf[..n]),
+                }
+            }
+        });
+        Self {
+            child,
+            input,
+            screen,
+        }
+    }
+
+    fn text(&self) -> String {
+        self.screen.lock().unwrap().screen().contents()
+    }
+
+    /// Type `keys`, then wait up to 30 s for the screen to show `want`: the screen it then shows.
+    /// An Esc goes alone, with a pause after it, or the key after it would read as Alt+key.
+    fn after(&mut self, keys: &str, want: &str) -> String {
+        for (i, part) in keys.split('\x1b').enumerate() {
+            if i > 0 {
+                self.input
+                    .write_all(b"\x1b")
+                    .and_then(|()| self.input.flush())
+                    .expect("APPARATUS: type into vox tui");
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            self.input
+                .write_all(part.as_bytes())
+                .and_then(|()| self.input.flush())
+                .expect("APPARATUS: type into vox tui");
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let t = self.text();
+            if t.contains(want) {
+                return t;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT (staging): `vox tui` never showed {want:?} after {keys:?}:\n{t}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Every screen of `vox tui` on the attached node, `(screen, text)`, as a person reaches them.
+fn tui_screens(data: &Path) -> Vec<(String, String)> {
+    let mut tui = Tui::spawn(data);
+    let mut screens = Vec::new();
+    let steps: [(&str, &str, &str); 10] = [
+        ("the room list", "", "words"),
+        ("a room", "\r", "Timeline"),
+        ("its members", "\t\t", "Members [focus]"),
+        (":link", ":link\r", "room link"),
+        ("an unknown command", ":nosuch\r", "unknown command"),
+        ("back to the room list", "\x1b", "Rooms"),
+        ("the tunnels", "t", "Tunnels"),
+        ("back again", "\x1b", "Rooms"),
+        ("the :new prompt", ":new\r", "Create room"),
+        ("the :join prompt", "\x1b:join\r", "Join room"),
+    ];
+    for (name, keys, want) in steps {
+        screens.push((format!("vox tui: {name}"), tui.after(keys, want)));
+    }
+    screens
 }
 
 /// What `vox serve` prints up to the passphrase advice and the line after it: it keeps running,
@@ -238,18 +385,34 @@ fn help_and_messages_name_the_node_and_no_design_document() {
         "PRODUCT: `vox room invite` must be refused as an unknown command, not run: ok {ok}: {said}"
     );
     said_by_node.push(("vox serve web=9".into(), serve_says(tmp.path())));
+    let screens = tui_screens(tmp.path());
     let _ = vox(tmp.path(), &["node", "detach", "a"]);
 
+    // No command keeps contacts, a directory or a one-to-one path (E-3).
+    let paths: Vec<&str> = pages
+        .iter()
+        .filter(|(c, _)| {
+            c.split_whitespace()
+                .any(|w| ["contact", "contacts", "directory", "dm", "direct", "whois"].contains(&w))
+        })
+        .map(|(c, _)| c.as_str())
+        .collect();
+    assert!(
+        paths.is_empty(),
+        "PRODUCT: vox has a command for contacts, a directory or a one-to-one path: {paths:?}"
+    );
+
     let mut all = Vec::new();
-    for (cmd, text) in pages.iter().chain(&said_by_node) {
+    for (cmd, text) in pages.iter().chain(&said_by_node).chain(&screens) {
         for f in faults(text) {
             all.push(format!("{cmd}: {f}"));
         }
     }
     println!(
-        "[proof] {} help pages and {} node answers read; faults: {}",
+        "[proof] {} help pages, {} node answers and {} TUI screens read; faults: {}",
         pages.len(),
         said_by_node.len(),
+        screens.len(),
         all.len()
     );
     assert!(
@@ -269,7 +432,8 @@ fn help_and_messages_name_the_node_and_no_design_document() {
     assert!(
         all.is_empty(),
         "PRODUCT: what vox says must name the node, not the profile, say room and trust, not channel \
-         or consent, name no design document, and \
+         or consent, say none of contact, invite, safety code, verified or block, name no design \
+         document, and \
          give addresses as <service>.<node>.<room>.vox:\n{}",
         all.join("\n")
     );

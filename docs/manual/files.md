@@ -65,7 +65,7 @@ a valuable file to satisfy the example.
 
 Vox writes to a hidden temporary `.part` file and exposes the destination only after the
 received size **and** SHA-256 match the signed announcement. Success reads, for example,
-`./incoming/report.pdf (18 bytes) verified`. A hash match establishes that these are the
+`./incoming/report.pdf (18 bytes) matches its announced SHA-256`. A hash match establishes that these are the
 announced bytes, not that a document is harmless to open. Apply ordinary caution to executable
 files, macros and unfamiliar formats.
 
