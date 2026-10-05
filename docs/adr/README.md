@@ -75,7 +75,7 @@ planned. This is the roll-up.
 | 004 | accepted; built (`pairwise/`) |
 | 005 | accepted; built (`join/`, `node::joinstream`) except where marked |
 | 006 | accepted; built (`group/`) except the known gaps it lists |
-| 007 | accepted; governance is only the creator or an admin setting the room's retention and ending the room, built; the strict member cap (G-22) is not built |
+| 007 | accepted; governance is only the creator or an admin setting the room's retention and ending the room, built; the strict member cap (G-22), built |
 | 008 | accepted; built (`log/`); range reconciliation over the network and the self-channel are planned; golden vectors are open |
 | 009 | **withdrawn** (R43); the deniable code is removed (b0f82185) |
 | 010 | accepted; built (`atrest/`, `node/`) except where marked planned |

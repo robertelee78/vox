@@ -793,13 +793,31 @@ pub(crate) fn fault_named(reason: &str) -> Option<Fault> {
 /// What a daemon's reply to a failed join says after the fault's name: its `steps: …` and
 /// `said: …` lines, each indented under the advice as the house style indents a second line.
 /// Empty when the reply carried none.
+///
+/// **A member is named as this person names it** (V030-30, #366): the node names a member that did
+/// not agree to a newcomer by its whole fingerprint, and each such fingerprint is shown as this
+/// node's name for it, or its short fingerprint where it has none ([`crate::ident::name_of`]).
 pub(crate) fn join_detail(reason: &str) -> String {
     reason
         .lines()
         .skip(1)
         .filter(|l| !l.trim().is_empty())
-        .map(|l| format!("\n       {}", l.trim()))
+        .map(|l| format!("\n       {}", named_members(l.trim())))
         .collect()
+}
+
+/// `line` with each whole fingerprint in it replaced by [`crate::ident::name_of`] of it.
+fn named_members(line: &str) -> String {
+    line.split(' ')
+        .map(|word| {
+            let core = word.trim_end_matches([',', '.', ';', ':', ')']);
+            match b32_decode(core, "") {
+                Ok(fp) => format!("{}{}", crate::ident::name_of(&fp), &word[core.len()..]),
+                Err(_) => word.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// [`short`], reachable from the other CLI modules that report a peer.

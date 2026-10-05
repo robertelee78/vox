@@ -289,6 +289,15 @@ pub enum Inbound {
         /// The stream's receive half.
         recv: RecvStream,
     },
+    /// The peer asks whether a newcomer may take a place in a room (V030-30, #366).
+    Seat {
+        /// The authenticated peer, a member.
+        peer: Digest32,
+        /// The stream's send half.
+        send: SendStream,
+        /// The stream's receive half.
+        recv: RecvStream,
+    },
     /// The peer asks whether this node holds a claim it posted (V210-168).
     Agree {
         /// The authenticated peer, a member.
@@ -827,6 +836,7 @@ impl NodeNet {
             StreamKind::Pairwise => Ok(Inbound::Pairwise { peer, send, recv }),
             StreamKind::Sync => Ok(Inbound::Sync { peer, send, recv }),
             StreamKind::Agree => Ok(Inbound::Agree { peer, send, recv }),
+            StreamKind::Seat => Ok(Inbound::Seat { peer, send, recv }),
             // The exchange is over by the time a stream is dispatched: one more identity stream is
             // a second exchange on one connection, which closes it (ADR-011 requirement 33).
             StreamKind::Identity => {

@@ -140,12 +140,27 @@ only room governance is who sets the room's retention. This builds on identity (
 ### Member cap
 
 - **G-22.** A room MUST NOT exceed its member cap (`MAX_AUTHORS` = 1024). A newcomer MUST be admitted only
-  once every member that is online has agreed. A member that is offline MUST NOT block the join and learns
-  of it when it returns. A join MAY be slow, or fail, while members are slow to answer. **Planned:**
-  V030-30 (#366). Built (V210-128): a join to a full room is refused with the `FULL` frame, exits non-zero
-  and says the room is full; no join reports success unless the joiner was admitted; a member another
-  member admitted is admitted from the board even past the cap, up to `AUTHORS_HARD_LIMIT` (2048), and
-  this is logged.
+  once every member that is online has agreed (V030-30, #366). The member answering a join MUST, before it
+  sends `ACCEPTED`:
+  1. hold a place for the joiner, refusing with `FULL` when its authors reach the cap, or with `TAKEN`
+     when its authors and the places promised and not yet settled fill it;
+  2. ask every other member of the room it holds a connection to, all at once, on a stream typed `seat`
+     (`StreamKind::Seat`), whether the joiner may take a place;
+  3. admit the joiner only if every one of them answered `YES`; otherwise send `ABORT` to each member that
+     said `YES`, free its own place, and refuse the joiner with `FULL`, `TAKEN`, or `NOT_AGREED` naming
+     the member that did not agree.
+- **G-22a.** A member asked MUST count its authors and every place promised and not yet settled, its own
+  and those it promised other members, other than the joiner's own, and answer `FULL` at the cap, `TAKEN`
+  when promises fill what is left, or `YES`, promising the place. A promise MUST count until the joiner is
+  an author on that member, an `ABORT` from the member that asked frees it, or `PROMISE_TTL` (120 s)
+  passes. A stream that ends without `ABORT` MUST NOT free the place.
+- **G-22b.** A member that does not answer within `SEAT_ANSWER_WITHIN` (5 s) MUST fail the join, named.
+  A member the answering member holds no connection to MUST NOT be asked and MUST NOT block the join; it
+  learns of the newcomer when it returns. Anchors that are not members MUST NOT be asked.
+- **G-22c.** Two newcomers asking for the last place at the same moment MAY both be refused `TAKEN`, and
+  each MUST be told to try again. No join MAY report success unless the joiner was admitted.
+- **G-22d.** The only way past the cap MUST be a split: a member another member admitted MUST be admitted
+  from the board even past the cap, up to `AUTHORS_HARD_LIMIT` (2048), and this MUST be logged.
 
 ### §"Conflict resolution"
 
