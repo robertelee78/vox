@@ -194,3 +194,11 @@ secrecy = "0.10"
 # in a length or sequence field is a correctness/security bug, not a perf knob.
 overflow-checks = true
 lto = "thin"
+
+# **quinn-udp, patched for macOS** (#414): on Apple platforms it asked for a reply's source address
+# with an `IP_RECVDSTADDR` control message, which XNU ignores on send, so a node listening on every
+# address answered a peer from the wrong one and the peer dropped it ("the room's host did not
+# answer"). The copy asks with `IP_PKTINFO`, which XNU honours. One hunk in `src/unix.rs`, marked
+# "Vox:"; still so in quinn-udp 0.6.3 and upstream main.
+[patch.crates-io]
+quinn-udp = { path = "vendor/quinn-udp" }

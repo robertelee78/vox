@@ -26,8 +26,9 @@
 //! (`dial_stranded` doing nothing) → `redial` red; a default route's move ignored
 //! (`NetChange::between` comparing the addresses only) → `router` red.
 //!
-//! A `vox` step on the way that fails is `PRODUCT:`; the driver's own failures (no `unshare`, a
-//! crash) are APPARATUS, CANNOT MEASURE, never a pass.
+//! A `vox` step that fails before the move is `PRODUCT (staging):`, after it `PRODUCT:`, each
+//! quoting what vox said; the driver's own failures (no `unshare`, a `sudo` step, a crash) are
+//! APPARATUS, CANNOT MEASURE, never a pass.
 
 #![cfg(unix)]
 
@@ -63,6 +64,15 @@ fn drive() {
         Some(0) => assert!(
             claims.len() == CLAIMS && red.is_empty() && said.contains("netchange PASS"),
             "APPARATUS: the driver exited 0 without {CLAIMS} claims ok and a PASS: {said}"
+        ),
+        // A step before the move failed: the driver's verdict line, not an empty list of claims.
+        Some(1) if claims.is_empty() => panic!(
+            "{}\n{said}",
+            said.lines()
+                .find_map(|l| l
+                    .strip_prefix("netchange ")
+                    .filter(|v| v.starts_with("PRODUCT")))
+                .unwrap_or("PRODUCT (staging): the driver ended red before any claim")
         ),
         Some(1) => panic!(
             "PRODUCT: a move to another network must be noticed and acted on at once; red: \

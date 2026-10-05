@@ -52,6 +52,24 @@
 //! - #223: `NodeNet::refresh_advertised` enumerates the box's addresses for a socket bound to a
 //!   specific address (the old `advertise_endpoints(bound.port())`): the trap receives datagrams.
 
+//!
+//! ## #414 — a host on every address answers from the one it was reached at
+//!
+//! **The staging.** A `vox serve` host bound to `0.0.0.0` (every IPv4 address, as `vox serve`
+//! listens by default), and a guest bound to this box's routable IPv4 address that joins by a link
+//! naming the host at `127.0.0.1` alone, so it dials the host there. The host's answer must leave
+//! from `127.0.0.1`: from any other address the guest's QUIC drops it as from a stranger. The
+//! kernel picks the guest's own address by route unless the host asks for the one the datagram
+//! came to, and macOS ignores quinn-udp's way of asking (`IP_RECVDSTADDR`), so on macOS every join
+//! like it went unanswered: "the room's host did not answer". Where the box has no routable IPv4
+//! address there is nothing to stage, and the run says CANNOT MEASURE.
+//!
+//! **Asserted:** the guest joins.
+//!
+//! **The mutation that must turn it red:** the vendored quinn-udp's Apple branch back to
+//! `IP_RECVDSTADDR` (`vendor/quinn-udp/src/unix.rs`, "Vox:"): the guest's join fails with "the
+//! room's host did not answer".
+
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -410,4 +428,88 @@ fn a_host_bound_to_v6_loopback_advertises_no_address_it_does_not_listen_on() {
     drop(up);
     drop(host);
     drop(trap);
+}
+
+#[test]
+#[ignore = "production Argon2id + a real PoW; run in release"]
+fn a_host_on_every_address_answers_from_the_one_it_was_reached_at() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let (host_dir, guest_dir) = (tmp.path().join("host"), tmp.path().join("guest"));
+    for d in [&host_dir, &guest_dir] {
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
+    }
+    let Some(routable) = route_ip("192.0.2.1:9", "0.0.0.0:0") else {
+        panic!(
+            "CANNOT MEASURE (precondition not met): this box has no routable IPv4 address for the \
+             guest to dial loopback from"
+        );
+    };
+    let (ok, guest_fp, err) = vox_once(&guest_dir, &args(&["id"]));
+    assert!(ok, "PRODUCT (staging): vox id (guest): {err}");
+    let (ok, _, err) = vox_once(&host_dir, &args(&["id"]));
+    assert!(ok, "PRODUCT (staging): vox id (host): {err}");
+    let (ok, out, err) = vox_once(
+        &host_dir,
+        &args(&["trust", "add", guest_fp.trim(), "--name", "the guest"]),
+    );
+    assert!(ok, "PRODUCT (staging): trust add: {out}\n{err}");
+
+    let service_port = echo_service();
+    let mut host = VoxProc::spawn(
+        "host",
+        &host_dir,
+        &args(&[
+            "serve",
+            &format!("web={service_port}"),
+            "--listen",
+            "0.0.0.0:0",
+        ]),
+    );
+    let address = after_label(
+        &host.expect_line("address", |l| l.starts_with("address ")),
+        "address",
+    );
+    let passphrase = after_label(
+        &host.expect_line("passphrase", |l| l.starts_with("passphrase ")),
+        "passphrase",
+    );
+    // The link with the host named at loopback alone: the guest dials it nowhere else.
+    let (base, query) = address
+        .split_once('?')
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the host's link has no query: {address}"));
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|p| !p.starts_with("b=") || p.starts_with("b=/ip4/127.0.0.1/"))
+        .collect();
+    assert!(
+        kept.iter().any(|p| p.starts_with("b=/ip4/127.0.0.1/")),
+        "PRODUCT (staging): the host on 0.0.0.0 names no 127.0.0.1 address in its link: {address}"
+    );
+    let link = format!("{base}?{}", kept.join("&"));
+    let guest_listen = format!("{routable}:0");
+    let t0 = Instant::now();
+    let (ok, out, err) = vox_once(
+        &guest_dir,
+        &args(&[
+            "connect",
+            &link,
+            "--passphrase-file",
+            &world::room_pass_file(&guest_dir, &passphrase),
+            "--listen",
+            &guest_listen,
+        ]),
+    );
+    eprintln!(
+        "[proof] guest on {guest_listen} dialling the host at 127.0.0.1 only: joined {ok} after \
+         {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        ok,
+        "PRODUCT: a guest on {routable} that dialled a host on every address at 127.0.0.1 was never \
+         answered from 127.0.0.1 (after {:?}).\nstdout:\n{out}\nstderr:\n{err}\nhost:\n{}",
+        t0.elapsed(),
+        host.transcript()
+    );
 }

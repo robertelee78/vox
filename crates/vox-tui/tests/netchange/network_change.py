@@ -43,8 +43,9 @@ removes A. Every change is made with `sudo` (the operator's prompt; run `sudo -v
 undone at the end. The machine's own default route and real interfaces are never touched. `vox`
 itself runs as the operator, never as root: a daemon refuses a control connection from uid 0.
 
-Exit 0 = pass, 1 = red, 2 = apparatus or CANNOT MEASURE. A `vox` step on the way that fails is the
-product's red (`PRODUCT:`). Every process is recorded and stopped by PID.
+Exit 0 = pass, 1 = red, 2 = apparatus or CANNOT MEASURE. A `vox` step that fails is the product's
+red: `PRODUCT (staging):` before the move (the scene was not reached, and what vox said is quoted),
+`PRODUCT:` after it. Every process is recorded and stopped by PID.
 """
 import json, os, re, subprocess, sys, tempfile, threading, time, traceback
 
@@ -73,6 +74,7 @@ if LINUX:
 
 TAG = "netchange"
 S = tempfile.mkdtemp(prefix="vox-netchange-")
+MOVED = False  # set at the move: a product red before it is one of the staging's steps
 PROCS = []
 code = 2
 results = {}
@@ -233,6 +235,7 @@ try:
 
     # ---- the move ----
     move()
+    MOVED = True
     moved = time.time()
     # ---- redial: with nothing sent, D holds a new connection to P within 3 s ----
     redialled = until(lambda: held_to_p() not in (None, before), 3, 0.1)
@@ -277,7 +280,7 @@ except Apparatus as a:
     print(f"{TAG} APPARATUS: {a}", flush=True)
     code = 2
 except Product as e:
-    print(f"{TAG} PRODUCT: {e}", flush=True)
+    print(f"{TAG} {'PRODUCT' if MOVED else 'PRODUCT (staging)'}: {e}", flush=True)
     print(f"{TAG} RED", flush=True)
     code = 1
 except subprocess.TimeoutExpired as t:
