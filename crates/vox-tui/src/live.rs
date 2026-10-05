@@ -1102,14 +1102,14 @@ impl CoreHandle for DaemonCore {
                 passphrase,
             } => self.send(Request::Create {
                 local_name,
-                passphrase: secret(&passphrase),
+                passphrase: Zeroizing::new(secret(&passphrase)),
             }),
             Command::OpenChannel {
                 channel_id,
                 passphrase,
             } => self.send(Request::OpenRoom {
                 channel_id,
-                passphrase: secret(&passphrase),
+                passphrase: Zeroizing::new(secret(&passphrase)),
             }),
             Command::CloseTunnel { id } => {
                 let which = vox_core::transport::quic::TunnelSelector {
@@ -1176,7 +1176,7 @@ impl CoreHandle for DaemonCore {
             } => self.send(Request::Join {
                 link,
                 local_name,
-                passphrase: secret(&passphrase),
+                passphrase: Zeroizing::new(secret(&passphrase)),
             }),
             Command::Invite { channel_id } => self.send(Request::Invite { channel_id }),
         }

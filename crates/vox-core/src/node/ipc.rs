@@ -449,14 +449,14 @@ pub enum Request {
         /// A local name for the room; never leaves this device.
         local_name: String,
         /// The room's passphrase, which the link does not carry.
-        passphrase: String,
+        passphrase: zeroize::Zeroizing<String>,
     },
     /// Create a room on this node.
     Create {
         /// A local name for the room; never leaves this device.
         local_name: String,
         /// The room's passphrase.
-        passphrase: String,
+        passphrase: zeroize::Zeroizing<String>,
     },
     /// Mint an invite link for a room.
     ///
@@ -473,7 +473,7 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
         /// The room's passphrase.
-        passphrase: String,
+        passphrase: zeroize::Zeroizing<String>,
     },
     /// Close an open room, wiping its key (ADR-026 C-7).
     CloseRoom {
@@ -495,7 +495,7 @@ pub enum Request {
         /// The petname to file it under.
         petname: String,
         /// The identity passphrase, or empty for none: within the window none is needed.
-        identity_passphrase: String,
+        identity_passphrase: zeroize::Zeroizing<String>,
         /// Whether its consents release this node's full history (PRD-001 R12). On the
         /// wire only when `true`, so an older client's request still decodes.
         full_history: bool,
@@ -508,7 +508,7 @@ pub enum Request {
         /// Seconds a message body is kept; `0` keeps it forever.
         ttl: u64,
         /// The identity passphrase, proving this is the operator and not an agent.
-        identity_passphrase: String,
+        identity_passphrase: zeroize::Zeroizing<String>,
     },
     /// End a room for everyone (V030-08); its creator only.
     End {
@@ -541,7 +541,7 @@ pub enum Request {
         /// Who to stop trusting.
         target: Digest32,
         /// The identity passphrase, or empty for none.
-        identity_passphrase: String,
+        identity_passphrase: zeroize::Zeroizing<String>,
     },
     /// Rename an identity already in the trust keyring, keeping what its consents release
     /// (the history grant, PRD-001 R12). Needs the passphrase as [`Request::Trust`] does: a
@@ -553,13 +553,13 @@ pub enum Request {
         /// The new petname.
         petname: String,
         /// The identity passphrase, or empty for none.
-        identity_passphrase: String,
+        identity_passphrase: zeroize::Zeroizing<String>,
     },
     /// Read the trust keyring: who this node trusts and the name it gave each. A read, so the
     /// node checks no passphrase.
     TrustList {
         /// Carried on the wire and not checked.
-        identity_passphrase: String,
+        identity_passphrase: zeroize::Zeroizing<String>,
         /// The last fingerprint of the previous page, or `None` for the first.
         after: Option<Digest32>,
     },
@@ -1031,7 +1031,7 @@ impl Request {
             (T_TRUST, n @ (4 | 5)) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
-                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 let full_history = n == 5
                     && d.uint()
                         .map_err(|_| Error::MalformedBundle("ipc history"))?
@@ -1041,61 +1041,61 @@ impl Request {
                 Ok(Request::Trust {
                     target,
                     petname,
-                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                    identity_passphrase,
                     full_history,
                 })
             }
             (T_RENAME, 4) => {
                 let target = digest(&mut d)?;
                 let petname = text(&mut d, "ipc petname")?;
-                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::Rename {
                     target,
                     petname,
-                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                    identity_passphrase,
                 })
             }
             (T_RETENTION, 4) => {
                 let channel_id = digest(&mut d)?;
                 let ttl = d.uint().map_err(|_| Error::MalformedBundle("ipc ttl"))?;
-                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
                 Ok(Request::SetRetention {
                     channel_id,
                     ttl,
-                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                    identity_passphrase,
                 })
             }
             (T_UNTRUST, 3) => {
                 let target = digest(&mut d)?;
-                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Untrust {
                     target,
-                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                    identity_passphrase,
                 })
             }
             // The unpaged form, as for `Rooms` above.
             (T_TRUST_LIST, 2) => {
-                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::TrustList {
-                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                    identity_passphrase,
                     after: None,
                 })
             }
             (T_TRUST_LIST, 3) => {
-                let mut identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 let after = optional_digest(&mut d)?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::TrustList {
-                    identity_passphrase: std::mem::take(&mut *identity_passphrase),
+                    identity_passphrase,
                     after,
                 })
             }
@@ -1146,23 +1146,23 @@ impl Request {
             (T_JOIN, 4) => {
                 let link = text(&mut d, "ipc join link")?;
                 let local_name = text(&mut d, "ipc join name")?;
-                let mut passphrase = secret_text(&mut d, "ipc join passphrase")?;
+                let passphrase = secret_text(&mut d, "ipc join passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Join {
                     link,
                     local_name,
-                    passphrase: std::mem::take(&mut *passphrase),
+                    passphrase,
                 })
             }
             (T_CREATE, 3) => {
                 let local_name = text(&mut d, "ipc create name")?;
-                let mut passphrase = secret_text(&mut d, "ipc create passphrase")?;
+                let passphrase = secret_text(&mut d, "ipc create passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Create {
                     local_name,
-                    passphrase: std::mem::take(&mut *passphrase),
+                    passphrase,
                 })
             }
             (T_INVITE, 2) => {
@@ -1173,12 +1173,12 @@ impl Request {
             }
             (T_OPEN_ROOM, 3) => {
                 let channel_id = digest(&mut d)?;
-                let mut passphrase = secret_text(&mut d, "ipc open room passphrase")?;
+                let passphrase = secret_text(&mut d, "ipc open room passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::OpenRoom {
                     channel_id,
-                    passphrase: std::mem::take(&mut *passphrase),
+                    passphrase,
                 })
             }
             (T_CLOSE_ROOM, 2) => {
@@ -1528,7 +1528,7 @@ fn flag(d: &mut Decoder<'_>, what: &'static str) -> Result<bool> {
 
 /// A passphrase field, decoded into a buffer that is wiped when dropped (V210-94): a request that
 /// fails to decode after it is returns an error, and a plain `String` would free a copy unwiped.
-/// Moved out with [`std::mem::take`] once the whole request has decoded.
+/// The decoded [`Request`] keeps it in that buffer, as every client that builds one does.
 fn secret_text(d: &mut Decoder<'_>, what: &'static str) -> Result<zeroize::Zeroizing<String>> {
     Ok(zeroize::Zeroizing::new(text(d, what)?))
 }
@@ -3074,11 +3074,13 @@ async fn plain(handle: &NodeHandle, command: crate::node::api::NodeCommand) -> F
 /// so the node's keyring window starts again (V210-159).
 async fn verify_operator(
     handle: &NodeHandle,
-    passphrase: String,
+    mut passphrase: zeroize::Zeroizing<String>,
 ) -> std::result::Result<(), Frame> {
     match handle
         .apply(crate::node::api::NodeCommand::VerifyPassphrase {
-            passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+            passphrase: crate::node::api::Secret::new(
+                std::mem::take(&mut *passphrase).into_bytes(),
+            ),
         })
         .await
     {
@@ -3110,7 +3112,10 @@ async fn verify_operator(
 /// Answers whether the passphrase was proved: a proved change is made as
 /// [`NodeCommand::Proved`](crate::node::api::NodeCommand::Proved), which the window does not
 /// refuse.
-async fn verify_given(handle: &NodeHandle, passphrase: String) -> std::result::Result<bool, Frame> {
+async fn verify_given(
+    handle: &NodeHandle,
+    passphrase: zeroize::Zeroizing<String>,
+) -> std::result::Result<bool, Frame> {
     if passphrase.is_empty() {
         return Ok(verify_operator(handle, passphrase).await.is_ok());
     }
@@ -3741,7 +3746,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::Join {
             link,
             local_name,
-            passphrase,
+            mut passphrase,
         } => {
             // Subscribe before asking: a failed join's steps and responders' reasons are raised
             // as events just before the outcome is answered, and one emitted between the command
@@ -3751,7 +3756,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .apply(crate::node::api::NodeCommand::JoinChannel {
                     link,
                     local_name,
-                    passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                    passphrase: crate::node::api::Secret::new(
+                        std::mem::take(&mut *passphrase).into_bytes(),
+                    ),
                 })
                 .await
             {
@@ -3800,11 +3807,13 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         Request::Create {
             local_name,
-            passphrase,
+            mut passphrase,
         } => match handle
             .apply(crate::node::api::NodeCommand::CreateChannel {
                 local_name,
-                passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                passphrase: crate::node::api::Secret::new(
+                    std::mem::take(&mut *passphrase).into_bytes(),
+                ),
             })
             .await
         {
@@ -3815,13 +3824,15 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::OpenRoom {
             channel_id,
-            passphrase,
+            mut passphrase,
         } => {
             plain(
                 handle,
                 crate::node::api::NodeCommand::OpenChannel {
                     channel_id,
-                    passphrase: crate::node::api::Secret::new(passphrase.into_bytes()),
+                    passphrase: crate::node::api::Secret::new(
+                        std::mem::take(&mut *passphrase).into_bytes(),
+                    ),
                 },
             )
             .await
@@ -4499,7 +4510,7 @@ impl IpcClient {
         loop {
             match self
                 .request(&Request::TrustList {
-                    identity_passphrase: identity_passphrase.to_owned(),
+                    identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
                     after,
                 })
                 .await?

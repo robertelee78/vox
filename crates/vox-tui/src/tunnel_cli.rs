@@ -1078,7 +1078,7 @@ pub async fn serve(
         held.client
             .request(&Request::Create {
                 local_name: name.to_owned(),
-                passphrase: passphrase.as_str().to_owned(),
+                passphrase: zeroize::Zeroizing::new(passphrase.as_str().to_owned()),
             })
             .await,
         "cannot create the room",
@@ -1263,7 +1263,7 @@ pub async fn connect(
         link: url.to_owned(),
         local_name: name.to_owned(),
         // Canonicalization is the node's, at its one boundary — see `actor::room_passphrase`.
-        passphrase: room_passphrase.to_owned(),
+        passphrase: zeroize::Zeroizing::new(room_passphrase.to_owned()),
     };
     let join = held.client.request(&request);
     tokio::pin!(join);
@@ -1455,7 +1455,7 @@ pub(crate) async fn open_named_room(
         client
             .request(&Request::OpenRoom {
                 channel_id,
-                passphrase: room_passphrase.to_owned(),
+                passphrase: zeroize::Zeroizing::new(room_passphrase.to_owned()),
             })
             .await,
         "cannot open that room",

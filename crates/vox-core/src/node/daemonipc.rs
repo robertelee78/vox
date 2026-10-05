@@ -1306,7 +1306,7 @@ mod tests {
         for r in [
             Request::OpenRoom {
                 channel_id: [3u8; 32],
-                passphrase: "room pass".into(),
+                passphrase: Zeroizing::new("room pass".into()),
             },
             Request::CloseRoom {
                 channel_id: [3u8; 32],
