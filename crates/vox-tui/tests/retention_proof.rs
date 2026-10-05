@@ -33,10 +33,15 @@
 //! of V210-138, a body stripped from a live entry still owed and asked for, is
 //! `a_hostile_entry_does_not_stop_a_room_proof`'s stripped arm.
 //!
+//! **ADR-028 F-5, in proof 4:** each member shares a file and each node pulls the other's. At
+//! alice's minute her copy of bob's share is deleted, and her own share is no longer served, so
+//! bob, who keeps its announcement a week, is told the offer is gone; his copy stays.
+//!
 //! Mutations (each run, each red): the sweep disabled; a reload that refuses a pruned entry; the
 //! node's own retention ignored; the node's retention winning whenever it is set (so a node
 //! keeping more than its room keeps more); the arrival check removed; a payload-less entry set
-//! aside as v0.2.10 did (Withheld, still owed), which turns proof 5 red.
+//! aside as v0.2.10 did (Withheld, still owed), which turns proof 5 red; a pulled copy kept past
+//! its message (red: alice's copy is still there).
 
 #![cfg(unix)]
 
@@ -248,6 +253,33 @@ impl StatusWatch {
     }
 }
 
+/// Where the node at `dir` puts what it pulls from `room` (ADR-028 F-4): `nodes/<node>/files/
+/// <room>/`, named by the room's whole id, which `vox room link` carries.
+fn files_of(dir: &Path, room: &str) -> PathBuf {
+    let (ok, out, err) = vox(dir, &["room", "link", room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
+    let id = out
+        .trim()
+        .strip_prefix("vox://")
+        .and_then(|l| l.split(['?', '/', '@']).next())
+        .filter(|id| id.starts_with(room))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in {out:?}"))
+        .to_owned();
+    dir.join("nodes").join("default").join("files").join(id)
+}
+
+/// Poll until `done` holds, for at most `secs`; whether it did.
+fn within(secs: u64, done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    done()
+}
+
 fn post(dir: &Path, room: &str, text: &str) {
     let (ok, _, err) = vox(dir, &["room", "post", room, text], None);
     assert!(ok, "PRODUCT (staging): vox room post {text:?}: {err}");
@@ -453,6 +485,30 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     assert!(ok, "PRODUCT (staging): vox room retention 1w: {err}");
     println!("{}", out.trim());
 
+    // ---- F-5: a share ends with its message, on the node that keeps a minute ---------------
+    // Each shares a file with the room, and each node pulls the other's by itself (F-3).
+    let mut shared = Vec::new();
+    for (dir, who) in [(&bob, "bob"), (&alice, "alice")] {
+        let file = tmp.path().join(format!("from-{who}.txt"));
+        std::fs::write(&file, format!("{who}'s file, for the room"))
+            .expect("APPARATUS: the file to share");
+        let (ok, out, err) = vox(dir, &["share", &room, file.to_str().unwrap()], None);
+        assert!(ok, "PRODUCT (staging): {who}'s vox share: {out}{err}");
+        shared.push(file);
+    }
+    let shared_at = Instant::now();
+    let alice_copy = files_of(&alice, &room).join("from-bob.txt");
+    let bob_copy = files_of(&bob, &room).join("from-alice.txt");
+    assert!(
+        within(60, || alice_copy.exists() && bob_copy.exists()),
+        "PRODUCT (staging): each node must pull the other's share by itself within 60 s: alice's \
+         copy {} exists {}, bob's {} exists {}",
+        alice_copy.display(),
+        alice_copy.exists(),
+        bob_copy.display(),
+        bob_copy.exists()
+    );
+
     // ---- proof 4: the node prunes at its minute; the other member keeps the week ----------
     for i in 1..=10 {
         post(&bob, &room, &format!("early {i}"));
@@ -482,6 +538,56 @@ fn a_node_keeps_less_than_its_room_and_never_shows_what_arrives_expired() {
     assert_eq!(
         bob_keeps, 10,
         "PRODUCT: the room keeps a week: bob must still show all 10"
+    );
+
+    // **F-5 on the node that keeps a minute**: its copy of bob's share goes with the message, and
+    // the share it made stops being served, so bob, whose node keeps the announcement a week, is
+    // told the offer is gone. bob's own copy of it stays: his message has not expired.
+    let copy_gone = within(20, || !alice_copy.exists());
+    let copy_age = shared_at.elapsed().as_secs();
+    let stopped = within(20, || {
+        let (_, out, _) = vox(&alice, &["share", "list", &room], None);
+        !out.contains("from-alice.txt")
+    });
+    let elsewhere = tmp.path().join("bob-get");
+    let (get_ok, get_out, get_err) = vox(
+        &bob,
+        &[
+            "room",
+            "get",
+            &room,
+            "from-alice.txt",
+            "--dir",
+            elsewhere.to_str().unwrap(),
+        ],
+        None,
+    );
+    let get_said = format!("{get_out}{get_err}");
+    println!(
+        "F-5: alice's copy of bob's share gone {copy_gone} ({copy_age} s after it was shared); \
+         alice stopped serving hers {stopped}; bob's get of it (ok {get_ok}): {}; bob's own copy \
+         still there {}",
+        get_said.trim(),
+        bob_copy.exists()
+    );
+    assert!(
+        copy_gone,
+        "PRODUCT: alice's node keeps a minute, so its pulled copy of bob's share must be deleted \
+         with the message: {} is still there {copy_age} s after it was shared",
+        alice_copy.display()
+    );
+    assert!(
+        !get_ok && get_said.contains("the offer of from-alice.txt is gone"),
+        "PRODUCT: alice's share expired on her node, so she must stop serving it and bob's pull \
+         must be told the offer is gone (alice's share list dropped it: {stopped}); bob's \
+         `vox room get` said (ok {get_ok}): {}",
+        get_said.trim()
+    );
+    assert!(
+        bob_copy.exists(),
+        "PRODUCT: bob's node keeps the room's week, so his copy of alice's share must stay: {} is \
+         gone",
+        bob_copy.display()
     );
 
     // ---- a late arrival of what is already expired here never shows ---------------------

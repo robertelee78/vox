@@ -2672,6 +2672,10 @@ fn hex(bytes: &[u8]) -> String {
 
 /// An offer read off the room's log.
 struct Offer {
+    /// The announcement's entry.
+    entry: Digest32,
+    /// When it was announced, seconds, never later than now.
+    created: u64,
     author: Digest32,
     name: String,
     size: u64,
@@ -2757,6 +2761,12 @@ pub async fn get_file(
             continue;
         }
         let offer = Offer {
+            entry: r.entry_hash,
+            created: (r.created_millis / 1000).min(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
             author: r.author,
             name,
             size,
@@ -2912,6 +2922,7 @@ async fn collect_offer(
     dir: Option<&std::path::Path>,
     out: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
+    let managed = out.is_none() && dir.is_none();
     let dest = match out {
         Some(exact) => {
             if exact.symlink_metadata().is_ok() {
@@ -2984,7 +2995,25 @@ async fn collect_offer(
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
 
-    let result = collect(&bound, &dest, offer).await;
+    let result = collect(&bound, &dest, offer).await.and_then(|placed| {
+        // **A copy in the node's files directory ends with its message** (ADR-028 F-5): it is
+        // recorded so the daemon deletes it then. One the person put elsewhere is theirs.
+        if managed {
+            vox_core::node::pulls::record(
+                paths,
+                &vox_core::node::pulls::Pulled {
+                    room: channel_id,
+                    entry: offer.entry,
+                    path: placed,
+                    created: offer.created,
+                },
+            )
+            .map_err(|e| {
+                AppError::Usage(format!("the file landed, but cannot be recorded: {e}"))
+            })?;
+        }
+        Ok(())
+    });
     let _ = client
         .request(&Request::StopForward {
             local: bound.clone(),
@@ -3086,7 +3115,11 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Stream the offered bytes to a `.part` file beside `dest`, verify them, and only then link
 /// them into place under a name nothing else holds.
-async fn collect(bound: &str, dest: &Destination, offer: &Offer) -> Result<(), AppError> {
+async fn collect(
+    bound: &str,
+    dest: &Destination,
+    offer: &Offer,
+) -> Result<std::path::PathBuf, AppError> {
     let dir = dest.dir();
     // `create_new`, so the temporary file is never somebody else's either.
     let (part, file) = (0..1000)
@@ -3122,7 +3155,7 @@ async fn collect(bound: &str, dest: &Destination, offer: &Offer) -> Result<(), A
         "vox: {} ({total} bytes) matches its announced SHA-256",
         placed.display()
     );
-    Ok(())
+    Ok(placed)
 }
 
 /// Link a verified `.part` into place without replacing anything.
