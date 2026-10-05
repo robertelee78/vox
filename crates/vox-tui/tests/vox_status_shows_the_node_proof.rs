@@ -191,18 +191,21 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
         });
     let guest = w.guest_dir.clone();
     let host = w.host_dir.clone();
+    // The share probed the sink once (ADR-028 S-2), before `vox serve` printed its room: that
+    // datagram never crossed a forward, so the count starts after it.
+    let probed = received.load(Ordering::SeqCst);
 
     // ---- open the UDP flow, the loss still off ----
     let (mut fwd, at) = w.forward_service("udp-forward", &guest, &format!("{sink_port}/udp"));
     let client = UdpSocket::bind("127.0.0.1:0")
         .unwrap_or_else(|e| panic!("APPARATUS: no UDP port for the client: {e}"));
     let deadline = Instant::now() + Duration::from_secs(120);
-    while received.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+    while received.load(Ordering::SeqCst) == probed && Instant::now() < deadline {
         let _ = client.send_to(&0u32.to_be_bytes(), at);
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(
-        received.load(Ordering::SeqCst) > 0,
+        received.load(Ordering::SeqCst) > probed,
         "PRODUCT (staging): no datagram crossed the UDP forward in 120 s.\nthe forward said:\n{}",
         fwd.transcript()
     );

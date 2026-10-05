@@ -430,7 +430,8 @@ pub fn args(list: &[&str]) -> Vec<String> {
 }
 
 /// A real TCP echo service on loopback that **counts every connection it accepts**, so a
-/// proof can say the service was never dialled. Returns its port and the count.
+/// proof can say the service was never dialled. Returns its port and the count. Sharing it
+/// probes it (ADR-028 S-2), so a proof counts from after the share.
 pub fn counting_echo_service() -> (u16, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .unwrap_or_else(|e| panic!("APPARATUS: could not bind the counting echo service: {e}"));

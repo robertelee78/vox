@@ -667,10 +667,13 @@ fn denied(path: PathKind) {
     watchdog::arm();
     let (dns, dns_seen) = dns_responder();
     let mut w = world(vec![format!("{dns}={dns}/udp")], false, path);
+    // The share probed the responder (ADR-028 S-2) before `vox serve` printed its room; only
+    // what arrives after that can be the joiner's.
+    let probed = dns_seen.load(Ordering::Relaxed);
     let guest = w.guest_dir.clone();
     let (mut fwd, at) = w.forward_service("stranger-forward", &guest, &format!("{dns}/udp"));
     let (answer, tries) = dig_until(at, Duration::from_secs(15));
-    let seen = dns_seen.load(Ordering::Relaxed);
+    let seen = dns_seen.load(Ordering::Relaxed) - probed;
     eprintln!(
         "[test] proof 2 ({path:?}): {tries} dig(s), answer {answer:?}, the service saw {seen} \
          packet(s)"
@@ -869,6 +872,9 @@ fn a_lossy_relay_leg_loses_udp_instead_of_stalling_it() {
             Some(addr)
         })),
     });
+    // The share probed the sink (ADR-028 S-2) before `vox serve` printed its room: that
+    // arrival never crossed the forward, so it cannot open the flow.
+    held(&arrivals).clear();
     let guest = w.guest_dir.clone();
     let (_fwd, at) = w.forward_service("forward", &guest, &format!("{sink_port}/udp"));
 
