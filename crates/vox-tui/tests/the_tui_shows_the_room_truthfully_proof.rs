@@ -3,11 +3,17 @@
 //!
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
 //! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks eleven claims, each
+//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks twelve claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
 //!   scrolled, so once a room filled the pane a new message was never seen);
+//! - `hidden`: characters a reader cannot see read as `⟨U+XXXX⟩` escapes in the timeline (#331):
+//!   Alice's tag characters (U+E0068, U+E0069), her word split by U+200B and U+200C, and her stray
+//!   U+200D; her family emoji 👨‍👩‍👧 is drawn whole: no escape on its row, and the TUI wrote the
+//!   cluster to the terminal unbroken, joiners and all. pyte splits a cluster into cells and keeps
+//!   only its first person, so the rest is read from the bytes the TUI wrote, and how a real
+//!   terminal draws the glyph is not seen;
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
 //! - `scrolls`: PageUp brings m-001 into view, and End returns to m-071;
 //! - `clamp`: PageUp well past the oldest line, then one PageDown, shows m-011 first (the scroll
@@ -31,8 +37,8 @@
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
 //! top, a scroll not clamped to the oldest line, every member shown `Trust::Trusted`, a stub command
-//! restored, `SyncStatus` hard-coded (idle, or any one count), or `Reachability`
-//! hard-coded either way. It passes only on the script's PASS with all 11 claims ok.
+//! restored, the message pane's `reveal` removed, `SyncStatus` hard-coded (idle, or any one count), or `Reachability`
+//! hard-coded either way. It passes only on the script's PASS with all 12 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -121,7 +127,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (11 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (12 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -135,8 +141,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (11, 11),
-                "APPARATUS: the driver said PASS without all 11 claims ok: {said}"
+                (12, 12),
+                "APPARATUS: the driver said PASS without all 12 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

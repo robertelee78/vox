@@ -136,6 +136,9 @@ class Tui:
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.bytes = 0
+        # Everything the TUI wrote, as written: for what pyte cannot show, a grapheme cluster
+        # pyte splits across cells or overwrites (#331).
+        self.raw = bytearray()
         self.closed = False
 
     def pump(self, secs):
@@ -153,6 +156,7 @@ class Tui:
                 self.closed = True  # the TUI is gone: nothing more will come
                 return
             self.bytes += len(data)
+            self.raw += data
             self.stream.feed(data)
 
     def key(self, s, wait=1.0):

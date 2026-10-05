@@ -7,6 +7,13 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
 160x50). Each claim prints one `CLAIM <name> ok|RED` line:
 
   newest    the timeline shows the room's newest message (m-070), not its first (m-001);
+  hidden    characters a reader cannot see are shown, not hidden (#331): Alice's tag characters,
+            her zero-width-split word and her stray zero-width joiner each read as ⟨U+XXXX⟩
+            escapes; her family emoji 👨‍👩‍👧 is drawn whole: no escape on its row, and the TUI wrote
+            the cluster to the terminal unbroken, joiners and all. pyte splits a cluster into
+            cells and the TUI's next text overwrites the cells it does not count, so the family's
+            three people are read from the bytes the TUI wrote, not from pyte's cells, and how a
+            real terminal draws the glyph is not seen here;
   follows   a message Alice posts while it is open (m-071) is shown when it arrives;
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
@@ -167,11 +174,21 @@ try:
     for i in range(1, POSTS + 1):
         p = run("alice", "room", "post", room, f"m-{i:03d}")
         if p.returncode != 0: product(f"alice's `vox room post` of m-{i:03d} failed: {p.stderr.strip()}")
+    # Hidden characters (#331), after the numbered posts so the pane shows them with m-070.
+    HIDDEN = {
+        "h-1": "h-1 tags \U000E0068\U000E0069 end",
+        "h-2": "h-2 pa\u200bss\u200cword end",
+        "h-3": "h-3 a\u200db end",
+        "h-4": "h-4 fam \U0001F468\u200d\U0001F469\u200d\U0001F467 end",
+    }
+    for key, text in HIDDEN.items():
+        p = run("alice", "room", "post", room, text)
+        if p.returncode != 0: product(f"alice's `vox room post` of {key} failed: {p.stderr.strip()}")
     stage("bob reads them and lists everyone")
     def bob_ready():
         r = run("bob", "room", "read", room, "--limit", "500")
         ro = run("bob", "room", "roster", room)
-        return (r.returncode == 0 and f"m-{POSTS:03d}" in r.stdout and ro.returncode == 0
+        return (r.returncode == 0 and f"m-{POSTS:03d}" in r.stdout and "h-4" in r.stdout and ro.returncode == 0
                 and fp["alice"] in ro.stdout and fp["carol"] in ro.stdout)
     if not until(bob_ready, 120, 1):
         last = run("bob", "room", "roster", room)
@@ -198,6 +215,32 @@ try:
     t = timeline()
     claim("newest", newest and not has(t, "m-001"),
           f"m-{POSTS:03d} shown: {has(t, f'm-{POSTS:03d}')}; m-001 shown: {has(t, 'm-001')}")
+
+    stage("hidden")
+    def row_of(key):
+        """The timeline row holding `key`, without trailing blanks."""
+        for r in tui.display():
+            if key in r[:112]:
+                return r[:112].rstrip()
+        return None
+    tui.until(lambda: row_of("h-4") is not None, 20, 1)
+    rows = {k: row_of(k) for k in HIDDEN}
+    if any(v is None for v in rows.values()):
+        product(f"bob's `vox tui` does not show every h- message: {rows!r}")
+    want = {
+        "h-1": "tags \u27e8U+E0068\u27e9\u27e8U+E0069\u27e9 end",
+        "h-2": "pa\u27e8U+200B\u27e9ss\u27e8U+200C\u27e9word end",
+        "h-3": "a\u27e8U+200D\u27e9b end",
+    }
+    shown = {k: want[k] in rows[k] for k in want}
+    fam = rows["h-4"]
+    cluster = "\U0001F468\u200d\U0001F469\u200d\U0001F467"
+    written = cluster.encode() in bytes(tui.raw)
+    family_whole = "\u27e8" not in fam and "fam \U0001F468" in fam and " end" in fam
+    claim("hidden", all(shown.values()) and family_whole and written,
+          f"escapes shown: {shown!r}; family row {fam.strip()!r} has no escape: {family_whole}; the "
+          f"TUI wrote the whole cluster with its joiners: {written} (pyte keeps only its first "
+          f"person in the cells; the glyph a real terminal draws is not seen here)")
 
     stage("follows")
     p = run("alice", "room", "post", room, f"m-{POSTS + 1:03d}")
