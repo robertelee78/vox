@@ -279,10 +279,11 @@ fn render_timeline(
         .iter()
         .rev()
         .map(|m| {
-            let body = m
-                .body
-                .clone()
-                .unwrap_or_else(|| UNDECRYPTABLE_MARKER.to_owned());
+            // Characters a reader cannot see are shown as escapes (#331).
+            let body = m.body.as_deref().map_or_else(
+                || UNDECRYPTABLE_MARKER.to_owned(),
+                vox_agentcomms::envelope::reveal,
+            );
             let mut spans = Vec::with_capacity(3);
             if m.late {
                 // In its true place, above rows already read: say so, or it goes unseen.

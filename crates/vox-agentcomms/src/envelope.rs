@@ -45,7 +45,7 @@ pub const SHOWN_NAME: usize = 64;
 
 /// Whether `c` may not appear in a name printed for somebody reading (V210-123): the rule lives in
 /// `vox-text`, which the core shares for what peers say (V210-154).
-pub use vox_text::breaks_lines;
+pub use vox_text::{breaks_lines, cut_revealed, hides, reveal};
 
 /// One character of each kind [`breaks_lines`] refuses, for a proof to forge a name through
 /// each (as `agent_hook::LINE_BREAKS` is for message rows): a sanitiser that stops refusing any

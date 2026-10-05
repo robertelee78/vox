@@ -992,7 +992,8 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
         );
     }
     let mut text = String::with_capacity(r.text.len());
-    for c in r.text.chars() {
+    // Characters a reader cannot see are shown as escapes (#331): `⟨U+E0041⟩`, never nothing.
+    for c in vox_agentcomms::envelope::reveal(&r.text).chars() {
         match c {
             '\n' => text.push_str("\n  | "),
             '\t' => text.push('\t'),
