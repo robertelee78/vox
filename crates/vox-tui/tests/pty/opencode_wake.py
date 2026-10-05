@@ -199,6 +199,11 @@ def quit(t, how):
     if how == "hup":
         t.close()  # the terminal goes away: the kernel hangs up its session
         return reap(t.pid, 15)
+    # **Keys only once the prompt takes them.** A freshly opened `opencode` draws its prompt
+    # ("Ask anything…") while it is still starting, and keys typed then are dropped: `/exit` sent
+    # 3 s after the open left the prompt empty and opencode running, read as "did not exit".
+    t.until(lambda: PROMPT in t.text(), 30)
+    t.pump(1)
     try:
         if how == "ctrl+c":
             t.key("\x03", 1)
@@ -206,10 +211,18 @@ def quit(t, how):
                 t.key("\x03", 1)
         else:
             t.key("/exit", 1)
+            # Typed and not shown: dropped. Typed once more, never twice into one prompt.
+            if "/exit" not in t.text():
+                t.pump(2)
+                t.key("/exit", 1)
             t.key("\r", 1)
     except OSError:
         pass  # its terminal already closed under the key: it is exiting
     return reap(t.pid, 15, t.drain)
+
+
+# What an idle `opencode` prompt shows before anything is typed: its placeholder.
+PROMPT = "Ask anything"
 
 
 def gone(d):
