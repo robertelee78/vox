@@ -345,9 +345,10 @@ Heavy, timing-bound or live-model checks need `--features optional-proofs`; see
 
 ## Status
 
-**v0.3.0** (October 2026). Linux and macOS, as a terminal client, CLI and daemon. Working today:
+**v0.3.1** (October 2026). Linux and macOS, as a terminal client, CLI and daemon. Working today:
 one daemon per data root with any number of nodes; rooms over the real network through the full NAT
-ladder; trust-gated reading; replication and sync; room-bound TCP and UDP services reached as
+ladder, with port mappings renewed and released and a change of network noticed and acted on at
+once; trust-gated reading; replication and sync; room-bound TCP and UDP services reached as
 `<service>.<node>.<room>.vox`, and `ssh` over Vox; `vox share`; the family LAN (macOS); leaving and
 ending rooms, admins and retention; key rotation and per-member revocation; agent comms for Claude
 Code, Codex and OpenCode, each agent its own node.

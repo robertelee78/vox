@@ -3101,7 +3101,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vox-agentcomms"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3110,7 +3110,7 @@ dependencies = [
 
 [[package]]
 name = "vox-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3150,7 +3150,7 @@ dependencies = [
 
 [[package]]
 name = "vox-ffi"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "thiserror 2.0.18",
  "tokio",
@@ -3160,11 +3160,11 @@ dependencies = [
 
 [[package]]
 name = "vox-text"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "vox-tui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm",
  "argon2",
