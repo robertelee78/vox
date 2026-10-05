@@ -4246,31 +4246,6 @@ impl Node {
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
-            // **An upgraded anchor deletes its store file** (ADR-023 decision 6; decider,
-            // 2026-10-02, R45): an anchor kept a ciphertext copy of every room it served in it
-            // until then, and keeps nothing on disk for a room now, so the file goes whole.
-            let store_file = node.paths.store_file();
-            if node.anchor_boards && store_file.is_file() {
-                // The profile's lock first (V210-100), as every other vox on the profile takes
-                // it: nothing else has the store open while it goes.
-                let lock = crate::node::profile::lock_profile(&node.paths, &profile_wait)?;
-                if crate::node::profile::Profile::exists(&node.paths) {
-                    // **Unless a member's vault is here too**: then the store is that member's
-                    // rooms, run as `vox node` on the same data directory. Only the anchor's own
-                    // retired pages go; the member's data is never touched.
-                    crate::node::profile::open_letting_go(|| {
-                        crate::node::store::Store::open(&store_file)
-                    })?
-                    .keep_lock(lock)
-                    .delete_retired_anchor_pages()?;
-                } else {
-                    std::fs::remove_file(&store_file).map_err(|e| Error::Path {
-                        op: "delete the anchor's retired store",
-                        detail: format!("{}: {e}", store_file.display()),
-                    })?;
-                    drop(lock);
-                }
-            }
             node.start_network()?;
         }
         node.publish_initial();
@@ -5075,9 +5050,8 @@ impl Node {
             }
             Bind::Shared(presence) => return Ok((Arc::clone(presence.shared()), None)),
         };
-        // The node's own port, else the data root's (ADR-026 D-3): a node moved from the layout
-        // before v0.3.0 had its `port` file removed, and the migration kept its port in
-        // `.daemon/port`, so it binds where members last saw it.
+        // The node's own port, else the data root's (ADR-026 D-3), so it binds where members last
+        // saw it.
         crate::node::presence::NetPresence::bind_kept(
             addr,
             &self.paths.port_file(),
@@ -14689,10 +14663,6 @@ pub fn fault_of(e: &Error) -> Fault {
             op: crate::node::profile::VAULT_WRITE,
             ..
         } => Fault::IdentityFileUnwritable,
-        Error::Path {
-            op: crate::node::profile::VAULT_REWRITE,
-            ..
-        } => Fault::IdentityFileNotRewritten,
         // Retention is the admin's to set; anyone else is refused, and told why. It was mapped to
         // `Refused`, which reads "the other side refused" — for a check this node made itself,
         // about its own identity, with nobody on any other side (found by the R7 gate).

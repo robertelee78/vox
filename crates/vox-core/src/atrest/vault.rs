@@ -49,27 +49,19 @@ use crate::identity::rng::random_array;
 /// distinct from the SEK wrap's `info` so the two domains never collide.
 const VAULT_KEK_HKDF_INFO: &[u8] = b"vox/identity-vault-wrap/v1";
 
-/// AEAD associated data for a version-1 vault bundle.
-const VAULT_AAD_V1: &[u8] = b"vox/identity-vault-aead/v1";
-
 /// AEAD associated data for a version-2 vault bundle. **The version is bound here** because the
-/// serialized version field sits outside the AEAD: without this, a v2 vault relabelled as v1 would
-/// still open, and v1 is what tells an unlock to migrate the at-rest seals, the one moment a
-/// legacy-sealed blob is read (V210-40, #214).
+/// serialized version field sits outside the AEAD: a vault relabelled with another version does
+/// not open (V210-40, #214).
 const VAULT_AAD_V2: &[u8] = b"vox/identity-vault-aead/v2";
 
-/// Format version of the [`IdentityVault`] serialization this build writes.
-///
-/// - 1: node-wide blobs (trust keyring, pending consents, prekey ring, anchor pages) sealed
-///   from the identity factor, `HKDF(id_proof)`;
-/// - 2: sealed from `self_seed` ([`crate::atrest::seal`]). Unlocking a v1 vault migrates them,
-///   then rewrites the vault as v2.
+/// Format version of the [`IdentityVault`] serialization this build writes and the only one it
+/// reads: the node-wide blobs are sealed from `self_seed` ([`crate::atrest::seal`]). Version 1
+/// was an earlier release's, which this version does not read (#423).
 pub const VAULT_VERSION: u64 = 2;
 
 fn vault_aad(version: u64) -> Result<&'static [u8]> {
     match version {
-        1 => Ok(VAULT_AAD_V1),
-        2 => Ok(VAULT_AAD_V2),
+        VAULT_VERSION => Ok(VAULT_AAD_V2),
         _ => Err(Error::MalformedAtRest("vault version")),
     }
 }

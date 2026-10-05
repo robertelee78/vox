@@ -68,19 +68,12 @@ Vox process when it is safe to interrupt its rooms and services. Agent coordinat
 participants to run the same Vox version; update the group deliberately, not one worker in
 the middle of a claim.
 
-## Upgrading from v0.2.10
+## Data from an earlier release
 
-v0.3.0 changes how identities are stored and selected. The first v0.3.0 command run against a
-v0.2.10 data root moves each profile to a node of the same name and says so, for example
-`vox: moved …/data/family to …/data/nodes/family (from v0.3.0 each node lives under nodes/)`.
-The node keeps its identity: `vox id` prints the same fingerprint as before. Commands then take
-`--node` instead of `--profile`; [Coming from v0.2.10](development.md) lists every change.
-
-Rooms are not carried over. A room made by v0.2.10 is refused when v0.3.0 opens it, because
-its message format changed: make the room again with `vox room create` and share its new link.
-The move takes the profile's whole directory, keyring included, as it is. Stop every v0.2.10
-Vox process before the first v0.3.0 command, and update every member and agent of a room
-together: rooms do not carry across the two versions.
+Vox reads only data in this version's layout. A data directory a release before v0.3.0 wrote is
+refused by every command, saying it is not a Vox data directory this version reads, and is left
+exactly as it was. Start Vox with a new data directory (`--data-dir` or `VOX_DATA_DIR`), or move
+the old one aside; identities and rooms are made again.
 
 ## Roll back the binary
 
@@ -89,8 +82,7 @@ vox update --rollback
 ```
 
 This restores the binary retained by the updater. It is **not a state-directory rollback**,
-and does not guarantee that an older binary understands data migrated by a newer one: v0.2.10
-does not look for nodes under `nodes/`, where v0.3.0 moved them. Read
+and does not guarantee that an older binary reads data a newer one wrote. Read
 the target release's compatibility notes before crossing a format or major command-surface
 change. Do not open valuable state with a guessed older executable.
 

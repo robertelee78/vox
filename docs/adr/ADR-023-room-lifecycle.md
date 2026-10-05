@@ -189,9 +189,8 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
 - **RL-6.2.** The anchor's ciphertext log is removed: there MUST be no anchor log store, no anchor
   sync session, and no `AnchorLog` / `AnchorMeta` pages (segment kinds 6 and 7 stay reserved,
   ADR-016 NR-45).
-- **RL-6.3. Upgrade (M23.5, R45).** An anchor upgraded from a release that kept room pages MUST
-  delete them when it next opens its store. There MUST be no migration and no copy kept. Proof:
-  `crates/vox-tui/tests/an_upgraded_anchor_drops_the_pages_it_kept_proof.rs`.
+- **RL-6.3. No upgrade (M23.5, R45).** There MUST be no upgrade of an anchor store an earlier
+  release wrote, which kept room pages: its data root is refused (ADR-026 F-3).
 - **RL-6.4.** Convergence for members who are never online together MUST come from decision 4 and an
   always-on member. A node that is both an anchor and a member holds the room because it is a
   member.
@@ -258,8 +257,7 @@ Each proof drives the shipped `vox` binary and has a mutation that turns it red 
    says why. Mutations: no package posted; a consent package released from the chain origin.
    `crates/vox-tui/tests/key_package_proof.rs`.
 6. **Anchors hold nothing:** after a full session through a non-member anchor, its data directory
-   holds no store for the room (`key_package_proof.rs` step 5); an upgraded anchor deletes the pages
-   it kept (RL-6.3).
+   holds no store for the room (`key_package_proof.rs` step 5).
 7. **R14 and per-grant history:** after each of two rotations the sender holds one generation; a
    `full` grant reads earlier messages and a `now` grant does not.
    `crates/vox-tui/tests/history_grant_proof.rs`; the unread badge with `--history full`:

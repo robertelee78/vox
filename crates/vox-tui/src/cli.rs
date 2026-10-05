@@ -1311,9 +1311,8 @@ pub struct AnchorArgs {
 }
 
 /// The node `vox node` runs its anchor as. One node is one identity (ADR-026 F-3), so a node
-/// holding a vault keeps its anchor's key in node `<name>-anchor` — where the migration put the
-/// key of a directory that held both — and `--serve trusted` still reads the vault's trust list
-/// from `<name>`. Otherwise the anchor is the named node itself.
+/// holding a vault keeps its anchor's key in node `<name>-anchor`, and `--serve trusted` still
+/// reads the vault's trust list from `<name>`. Otherwise the anchor is the named node itself.
 fn anchor_paths(paths: Paths) -> vox_core::error::Result<Paths> {
     if !paths.vault_file().is_file() {
         return Ok(paths);
@@ -2341,8 +2340,8 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            // An old layout moves first (ADR-026 F-3), as for every verb.
-            if let Err(e) = vox_core::node::layout::migrate(&account, Some(&node)) {
+            // A data root this version does not read is refused first (#423), as for every verb.
+            if let Err(e) = vox_core::node::layout::refuse_old_layout(&account) {
                 eprintln!("vox: {e}");
                 return ExitCode::FAILURE;
             }

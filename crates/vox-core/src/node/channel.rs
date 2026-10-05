@@ -230,13 +230,9 @@ pub const MAX_SERVICES: usize = 64;
 /// Manifest encoding version.
 const MANIFEST_VERSION: u64 = 1;
 /// Plaintext-cache row encoding version.
-/// Version of the plaintext rendering cache. **2 stores the timestamp in milliseconds; 1 stored
-/// seconds.** Same arity, so the two differ only in the discriminant and the unit — see
-/// `node::content` for why the unit changed and why the shape deliberately did not.
+/// Version of the plaintext rendering cache. **2 stores the timestamp in milliseconds**, and is the
+/// only version this build reads: version 1 (seconds) was an earlier release's (#423).
 const CACHE_VERSION: u64 = 2;
-/// Version 1 of the cache, whose timestamp is **seconds**. Still read: these rows are already on
-/// disk, and a cache that refused them would silently blank every existing room's history.
-const CACHE_VERSION_SECONDS: u64 = 1;
 
 /// At-rest version of the admitted-authors segment.
 const AUTHORS_VERSION: u64 = 1;
@@ -1147,12 +1143,9 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
     if d.array()? != 5 {
         return Err(Error::MalformedAtRest("plaintext cache arity"));
     }
-    // Both versions read, and the unit normalised here, so nothing above sees two units.
-    let scale = match d.uint()? {
-        CACHE_VERSION => 1,
-        CACHE_VERSION_SECONDS => 1_000,
-        _ => return Err(Error::MalformedAtRest("plaintext cache version")),
-    };
+    if d.uint()? != CACHE_VERSION {
+        return Err(Error::MalformedAtRest("plaintext cache version"));
+    }
     let entry_hash: Digest32 = d
         .bytes()?
         .try_into()
@@ -1161,7 +1154,7 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
         .bytes()?
         .try_into()
         .map_err(|_| Error::MalformedAtRest("plaintext cache author"))?;
-    let created_millis = d.uint()?.saturating_mul(scale);
+    let created_millis = d.uint()?;
     let text = d.text()?.to_owned();
     d.finish()?;
     Ok(Rendered {

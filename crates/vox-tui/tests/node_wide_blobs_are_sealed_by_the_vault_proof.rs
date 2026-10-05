@@ -15,34 +15,18 @@
 //!
 //! 1. **Fresh profile.** The binary writes all three blobs. The attacker opens none of them; the
 //!    vault's own key opens each (the control that the reader works); the vault is version 2.
-//! 2. **Migration.** The **released v0.2.9 binary**, fetched and checked against its published
-//!    SHA-256, writes a profile. The attacker opens its keyring and prekey ring (the control that
-//!    the attacker's keys are the ones v0.2.9 used). The new binary then unlocks it: `vox trust
-//!    list` still names the trusted member, the room is refused by name as one made before
-//!    v0.3.0 (whose format v0.3.0 does not read: the decider chose to make such rooms again,
-//!    2026-09-29, #226), and the attacker now opens
-//!    nothing.
-//! 3. **No way back.** On the migrated profile, the attacker plants a keyring sealed its way,
-//!    naming "mallory", and relabels the vault as version 1, which is what makes an unlock
-//!    migrate. The binary must never show mallory: the version is bound into the vault's AEAD,
-//!    so the relabelled vault does not open at all.
+//! 2. **No way back.** On that profile, stopped, the attacker plants a keyring sealed its way,
+//!    naming "mallory": no loader tries a key the attacker can compute, so the binary never shows
+//!    mallory, and says the data will not open under a correct passphrase, not that the
+//!    passphrase is wrong. The vault relabelled with another version does not open at all.
 //!
-//! 3a also requires the refusal to say what happened: the passphrase was right and the keyring
-//! would not open under it, not "the passphrase is wrong".
+//! The attacker's keys include the ones releases before v0.3.0 sealed with (`HKDF(id_proof)`),
+//! derived here, in the test. (The arms that migrated a v0.2.9 profile went with that migration,
+//! #423: Vox carries no code for data from earlier releases.)
 //!
-//! 2 also reads the profile's files as raw bytes: none of v0.2.9's old seals may survive the
-//! migration anywhere in them. redb is copy-on-write, so a re-sealed blob's old page stays in the
-//! file unless the store is rewritten (found in verification of #214).
-//!
-//! 2c: a store rewrite that fails stops the migration with the vault still version 1, and the
-//! next unlock completes it.
-//!
-//! Mutations: any one blob sealed with its old key again, or with a key from anything public,
-//! breaks (1); an unlock that does not migrate, or migrates without rewriting the store, breaks
-//! (2) and (2b); one that goes on when the rewrite fails breaks (2c); the vault's version left
-//! out of its AEAD, or a loader that falls back to the old key, breaks (3); the refusal reported
-//! as a wrong passphrase breaks (3a); a pre-v0.3.0 entry reported as a malformed one (an
-//! internal error) breaks (2).
+//! Mutations: any one blob sealed under a key from `id_proof`, or from anything public, breaks
+//! (1); a loader that falls back to such a key breaks (2); the refusal reported as a wrong
+//! passphrase breaks (2); the vault's version left out of its AEAD breaks (2)'s relabelled vault.
 
 #![cfg(unix)]
 
@@ -51,9 +35,6 @@ mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
-
-#[path = "support/previous_release.rs"]
-mod previous_release;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -68,14 +49,13 @@ use vox_core::identity::composite::{CompositePublicKey, CompositeSignature, Root
 use vox_core::node::store::Store;
 use vox_core::node::{pending_consent, prekeys, trust};
 
-use previous_release::{previous_release, PREVIOUS};
 use world::{args, VoxProc, IDENTITY, VOX};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
-/// The vault versions this test's reader knows: v0.2.9's (1) and this build's (2).
-const KNOWN_VAULT_VERSIONS: [u8; 2] = [1, 2];
+/// The vault versions this test's reader knows: this build's (2).
+const KNOWN_VAULT_VERSIONS: [u8; 1] = [2];
 
-// ---- driving a `vox` binary (this build's, or the previous release's) ------------------------
+// ---- driving the `vox` binary --------------------------------------------------------------
 
 fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (bool, String, String) {
     let mut child = Command::new(exe)
@@ -113,7 +93,7 @@ fn vox_with(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> (boo
 
 /// `vox trust list` run as ADR-026 L-2 has a person run it: a one-shot verb acts only on an
 /// attached node, so the node is attached first (`vox node attach default`, which starts the data
-/// root's daemon and unlocks — and so migrates — the identity there), the list is read, and the
+/// root's daemon and unlocks the identity there), the list is read, and the
 /// node is detached again, its daemon gone, before the proof reads the disk. An attach that fails
 /// is the result: the unlock is where a refusal now comes from.
 fn trust_list(exe: &Path, data: &Path) -> (bool, String, String) {
@@ -146,15 +126,6 @@ fn daemon_gone(data: &Path) {
     {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-}
-
-fn trust_list_ok(exe: &Path, data: &Path) -> String {
-    let (good, out, err) = trust_list(exe, data);
-    assert!(
-        good,
-        "PRODUCT: vox trust list (attached) failed: {out}{err}"
-    );
-    out
 }
 
 fn ok(exe: &Path, data: &Path, argv: &[&str], stdin: Option<&str>) -> String {
@@ -226,15 +197,9 @@ fn signal(pid: u32, sig: &str) {
 
 /// Create a room on `host`'s daemon, have `guest` join it, and return the room's id.
 ///
-/// The room passphrase goes on stdin. This build reads it there only when told
-/// (`--passphrase-file -`, v0.2.10); the previous release has no such flag and reads stdin
-/// unasked, so it is given the argv it accepts.
+/// The room passphrase goes on stdin (`--passphrase-file -`).
 fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
-    let from_stdin: &[&str] = if exe == Path::new(VOX) {
-        &["--passphrase-file", "-"]
-    } else {
-        &[]
-    };
+    let from_stdin: &[&str] = &["--passphrase-file", "-"];
     let create = [&["room", "create"][..], from_stdin, &["--name", name]].concat();
     ok(exe, host, &create, Some("room pass"));
     let list = ok(exe, host, &["room", "list"], None);
@@ -282,13 +247,6 @@ impl Disk {
     /// The default node as this build keeps it, `<data>/nodes/default/` (ADR-026 §7).
     fn of(data: &Path) -> Self {
         Self::in_dir(&world::node_dir(data, world::DEFAULT_NODE))
-    }
-
-    /// The default profile as v0.2.9 left it, `<data>/default/`: this build's first run moves it
-    /// to [`Disk::of`]'s place (ADR-026 F-3), so a "before" is read here and an "after" there —
-    /// an "after" read here would find nothing and read clean.
-    fn old(data: &Path) -> Self {
-        Self::in_dir(&data.join(world::DEFAULT_NODE))
     }
 
     fn in_dir(profile: &Path) -> Self {
@@ -414,23 +372,48 @@ fn blobs(disk: &Disk) -> Vec<Blob> {
     out
 }
 
-/// Every key the attacker can compute for `blob`: the ones v0.2.9 sealed with, and the blob's
+/// The key a blob was sealed under before v0.3.0, `HKDF(HKDF(id_proof(context)), info)`: what a
+/// quantum adversary computes from the public key alone. Derived here, in the test; no code for it
+/// is left in vox (#423).
+fn id_proof_key(attacker: &IdProofOnly<'_>, context: &[u8; 32], info: &[u8]) -> Sek {
+    use vox_core::atrest::{IdentityFactor as _, SignatureIdentityFactor};
+    let factor = SignatureIdentityFactor::new(attacker)
+        .factor_id(context)
+        .expect("APPARATUS: the attacker signs as the identity");
+    let mut key = zeroize::Zeroizing::new([0u8; 32]);
+    hkdf::Hkdf::<Sha256>::new(None, factor.as_ref())
+        .expand(info, key.as_mut())
+        .expect("APPARATUS: HKDF of a 32-byte key");
+    Sek::from_bytes(key)
+}
+
+/// The labels releases before v0.3.0 sealed the keyring and the prekey ring under.
+const OLD_TRUST_INFO: &[u8] = b"vox/trust-keyring-sek/v1";
+const OLD_RING_INFO: &[u8] = b"vox/prekey-ring-sek/v1";
+
+/// The old keyring key: over the keyring's context.
+fn old_trust_key(attacker: &IdProofOnly<'_>) -> Sek {
+    id_proof_key(
+        attacker,
+        &Sha256::digest(trust::TRUST_CONTEXT_LABEL).into(),
+        OLD_TRUST_INFO,
+    )
+}
+
+/// Every key the attacker can compute for `blob`: the ones releases before v0.3.0 sealed with, and the blob's
 /// current label expanded over everything public about the identity. The second set catches a
 /// seal whose seed is not secret at all (a verifier's mutant: the seed replaced by a hash of
 /// the fingerprint), which the first set alone would miss.
 fn attacker_keys(blob: &Blob, attacker: &IdProofOnly<'_>) -> Vec<Sek> {
     let (legacy, label) = match blob.what {
-        // v0.2.9 had no pending consents; builds between sealed them under the keyring's key.
-        "trust keyring" => (
-            trust::legacy_trust_sek(attacker).expect("APPARATUS: the attacker's old keyring key"),
-            trust::TRUST_SEK_INFO,
-        ),
+        // Pending consents were sealed under the keyring's key before v0.3.0.
+        "trust keyring" => (old_trust_key(attacker), trust::TRUST_SEK_INFO),
         "pending consents" => (
-            trust::legacy_trust_sek(attacker).expect("APPARATUS: the attacker's old keyring key"),
+            old_trust_key(attacker),
             pending_consent::PENDING_CONSENT_SEK_INFO,
         ),
         "prekey ring" => (
-            prekeys::legacy_ring_sek(attacker).expect("APPARATUS: the attacker's old ring key"),
+            id_proof_key(attacker, &prekeys::ring_channel(), OLD_RING_INFO),
             prekeys::PREKEY_RING_SEK_INFO,
         ),
         other => unreachable!("APPARATUS: the proof names no blob {other:?}"),
@@ -455,38 +438,6 @@ fn attacker_keys(blob: &Blob, attacker: &IdProofOnly<'_>) -> Vec<Sek> {
         keys.push(Sek::from_bytes(key));
     }
     keys
-}
-
-/// How many times each of `needles` occurs anywhere in the files of the profile directory,
-/// read as raw bytes: what an adversary with the disk sees, whatever the database thinks is live.
-fn occurrences(disk: &Disk, needles: &[Vec<u8>]) -> Vec<usize> {
-    let dir = disk
-        .store_file
-        .parent()
-        .expect("APPARATUS: the store has a directory");
-    let files: Vec<Vec<u8>> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("APPARATUS: listing {}: {e}", dir.display()))
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .map(|e| std::fs::read(e.path()).unwrap_or_default())
-        .collect();
-    needles
-        .iter()
-        .map(|n| {
-            files
-                .iter()
-                .map(|f| f.windows(n.len()).filter(|w| *w == n.as_slice()).count())
-                .sum()
-        })
-        .collect()
-}
-
-/// A distinctive run of each blob's ciphertext, to look for in the raw files.
-fn fingerprints_of(blobs: &[Blob]) -> Vec<Vec<u8>> {
-    blobs
-        .iter()
-        .map(|b| b.sealed.ciphertext[..48.min(b.sealed.ciphertext.len())].to_vec())
-        .collect()
 }
 
 fn vault_key(blob: &Blob, signer: &VaultRootSigner) -> Sek {
@@ -532,7 +483,7 @@ fn present(disk: &Disk) -> Vec<&'static str> {
 // ---- the proof ---------------------------------------------------------------------------------
 
 #[test]
-#[ignore = "real vox processes with production Argon2id, and the v0.2.9 release; CI runs it in release"]
+#[ignore = "real vox processes with production Argon2id; CI runs it in release"]
 fn node_wide_blobs_are_sealed_by_the_vault() {
     watchdog::arm();
     let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
@@ -591,294 +542,23 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
     let (theirs, ours) = who_opens(&disk);
     let version = disk.vault().version;
     println!("[proof] fresh profile: vault v{version}; the attacker opens {theirs:?}; the vault's key opens {ours:?}");
+    // The adversary opening anything is the product's fault whatever the reader's control says.
+    assert!(
+        theirs.is_empty(),
+        "PRODUCT: a quantum adversary without the passphrase opens {theirs:?}"
+    );
     assert_eq!(
         ours.len(),
         3,
         "APPARATUS, CANNOT MEASURE: the reader opens only {ours:?} with the vault's own key"
     );
-    assert!(
-        theirs.is_empty(),
-        "PRODUCT: a quantum adversary without the passphrase opens {theirs:?}"
-    );
     assert_eq!(version, 2, "PRODUCT: a fresh vault is not version 2");
 
-    // ---- 2. a profile written by v0.2.9 ---------------------------------------------------
-    let old = previous_release();
-    let (carol, dave) = (dir("carol"), dir("dave"));
-    let dave_fp = ok(&old, &dave, &["id"], None).trim().to_owned();
-    ok(&old, &carol, &["id"], None);
-    ok(
-        &old,
-        &carol,
-        &["trust", "add", &dave_fp, "--name", "dave"],
-        None,
-    );
-    let room = {
-        let (_node, spec) = anchor(&old, &dir("old-anchor"));
-        let _carol_d = daemon(&old, "carol (v0.2.9)", &carol, &spec, &idpass);
-        let _dave_d = daemon(&old, "dave (v0.2.9)", &dave, &spec, &idpass);
-        let room = shared_room(&old, &carol, &dave, "carried");
-        ok(
-            &old,
-            &carol,
-            &["room", "post", &room, "written by v0.2.9"],
-            None,
-        );
-        room
-    };
-    let staged = Disk::old(&carol);
-    let before = present(&staged);
-    let (theirs_before, _) = who_opens(&staged);
-    let version_before = staged.vault().version;
-    println!("[proof] v0.2.9 profile: vault v{version_before}; blobs {before:?}; the attacker opens {theirs_before:?}");
-    assert_eq!(
-        version_before, 1,
-        "APPARATUS, CANNOT MEASURE: {PREVIOUS} did not write a version-1 vault"
-    );
-    for want in ["trust keyring", "prekey ring"] {
-        assert!(
-            theirs_before.contains(&want),
-            "APPARATUS, CANNOT MEASURE: the attacker's keys do not open {PREVIOUS}'s {want}, so they are not \
-             the keys {PREVIOUS} sealed with, and nothing below would mean anything"
-        );
-    }
-
-    let file_facts = |d: &Disk| {
-        use std::os::unix::fs::MetadataExt as _;
-        let m = std::fs::metadata(&d.store_file).unwrap_or_else(|e| {
-            panic!(
-                "PRODUCT: the binary left no store at {}: {e}",
-                d.store_file.display()
-            )
-        });
-        (m.len(), m.ino())
-    };
-    let facts_before = file_facts(&staged);
-    let old_seals = fingerprints_of(&blobs(&staged));
-    let before_scan = occurrences(&staged, &old_seals);
-    assert!(
-        before_scan.iter().all(|n| *n >= 1),
-        "APPARATUS, CANNOT MEASURE: the raw scan does not find {PREVIOUS}'s seals in its own store: {before_scan:?}"
-    );
-
-    let listed = trust_list_ok(&new, &carol);
-    let disk = Disk::of(&carol);
-    // Scanned **at once**: the moment after the migrating unlock is when an adversary could take
-    // the disk, and later writes (the daemon started below) reuse freed pages and would hide old
-    // seals a rewrite-less migration leaves behind. Measured later, a store that was never
-    // rewritten passed this check.
-    let after_scan = occurrences(&disk, &old_seals);
-    let live_scan = occurrences(&disk, &fingerprints_of(&blobs(&disk)));
-    println!(
-        "[store] store.redb (bytes, inode): {facts_before:?} before migration, {:?} after",
-        file_facts(&disk)
-    );
-    let (theirs_after, ours_after) = who_opens(&disk);
-    let version_after = disk.vault().version;
-    let reads = {
-        let (_node, spec) = anchor(&new, &dir("new-anchor"));
-        // v0.2.9 kept no set of open rooms (that is v0.2.10's, #208), so its room is reopened
-        // the way a person running `vox daemon` does: a line with the room's passphrase.
-        let with_room = tmp.path().join("idpass-with-room");
-        std::fs::write(&with_room, format!("{IDENTITY}\n{room} room pass\n"))
-            .expect("APPARATUS: the passphrase file with a room");
-        let carol_d = daemon(&new, "carol", &carol, &spec, &with_room);
-        // v0.3.0 does not read a room written before it (ADR-023 decision 1; the decider chose
-        // "make it again", 2026-09-29, #226): the room line is refused **by that reason**, not
-        // as an internal error, and the room stays closed.
-        let said = |needle: &str| {
-            carol_d
-                .timed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .map(|(_, l)| l.clone())
-                .filter(|l| l.contains(needle))
-                .collect::<Vec<_>>()
-        };
-        let deadline = Instant::now() + TIMEOUT;
-        while said("could not open that room").is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let (read_ok, out, err) = vox_with(&new, &carol, &["room", "read", &room], None);
-        (
-            said("made by vox before v0.3.0").join(" | "),
-            said("a bug in vox").join(" | "),
-            read_ok,
-            format!("{out}{err}"),
-        )
-    };
-    let (refused_by_name, called_a_bug, read_ok, read_said) = reads;
-    println!(
-        "[proof] after this build's first unlock: vault v{version_after}; the attacker opens \
-         {theirs_after:?}; the vault's key opens {ours_after:?}; `trust list` names dave = {}; \
-         the v0.2.9 room is refused as made before v0.3.0: {refused_by_name:?}; called a bug: \
-         {called_a_bug:?}; `room read` succeeded = {read_ok}",
-        listed.contains("dave"),
-    );
-    // What an adversary with the disk reads: the old seals must be gone from the files
-    // themselves, not only from what the database considers live (redb is copy-on-write).
-    println!(
-        "[proof] old seals in the profile's raw files: {before_scan:?} before migration, \
-         {after_scan:?} after; the new seals: {live_scan:?}"
-    );
-    assert!(
-        live_scan.iter().all(|n| *n >= 1),
-        "APPARATUS, CANNOT MEASURE: the raw scan does not find the migrated store's own seals: {live_scan:?}"
-    );
-    assert!(
-        after_scan.iter().all(|n| *n == 0),
-        "PRODUCT: the old seals, openable from the public key, are still on disk after \
-         migration: {after_scan:?} copies"
-    );
-    assert!(
-        listed.contains("dave"),
-        "PRODUCT: the migrated keyring lost dave: {listed}"
-    );
-    assert!(
-        !refused_by_name.is_empty() && called_a_bug.is_empty() && !read_ok,
-        "PRODUCT: a room written before v0.3.0 must be refused by that reason, never as a bug in \
-         vox, and stay closed (#226); `room read` said: {read_said}"
-    );
-    assert_eq!(
-        ours_after.len(),
-        before.len(),
-        "PRODUCT: a blob did not move to the vault's key: {ours_after:?} of {before:?}"
-    );
-    assert!(
-        theirs_after.is_empty(),
-        "PRODUCT: after migration a quantum adversary still opens {theirs_after:?}"
-    );
-    assert_eq!(
-        version_after, 2,
-        "PRODUCT: the migrated vault is still version {version_after}"
-    );
-
-    // ---- 2b. no old seal left in the file ------------------------------------------------------
-    // Whether a replaced page's bytes survive depends on where redb put it: in (2)'s larger
-    // profile the old seals sat in the free region at the file's end, which redb truncates, so a
-    // migration that never rewrote the store still read clean there. This profile is staged as a
-    // v0.2.9 user who trusted someone and started the daemon once, which leaves the old pages
-    // mid-file (as verification of #214 found): here only a rewrite removes them.
-    let (erin, frank) = (dir("erin"), dir("frank"));
-    let frank_fp = ok(&old, &frank, &["id"], None).trim().to_owned();
-    ok(&old, &erin, &["id"], None);
-    ok(
-        &old,
-        &erin,
-        &["trust", "add", &frank_fp, "--name", "frank"],
-        None,
-    );
-    {
-        let (_node, spec) = anchor(&old, &dir("old-anchor-2"));
-        let _erin_d = daemon(&old, "erin (v0.2.9)", &erin, &spec, &idpass);
-    }
-    let small = Disk::old(&erin);
-    let small_before = file_facts(&small);
-    let small_old = fingerprints_of(&blobs(&small));
-    let small_scan_before = occurrences(&small, &small_old);
-    assert!(
-        small_old.len() == 2 && small_scan_before.iter().all(|n| *n >= 1),
-        "APPARATUS, CANNOT MEASURE: {PREVIOUS}'s keyring and ring are not both found in the small profile's \
-         raw files: {} blob(s), {small_scan_before:?}",
-        small_old.len()
-    );
-    trust_list_ok(&new, &erin);
-    let small = Disk::of(&erin);
-    let small_scan_after = occurrences(&small, &small_old);
-    let small_live = occurrences(&small, &fingerprints_of(&blobs(&small)));
-    println!(
-        "[store] the small profile's store.redb (bytes, inode): {small_before:?} before \
-         migration, {:?} after",
-        file_facts(&small)
-    );
-    println!(
-        "[proof] a v0.2.9 user who trusted and ran the daemon once: old seals in the raw files \
-         {small_scan_before:?} before migration, {small_scan_after:?} after; the new seals \
-         {small_live:?}"
-    );
-    assert!(
-        small_live.iter().all(|n| *n >= 1),
-        "APPARATUS, CANNOT MEASURE: the raw scan does not find the small profile's new seals: {small_live:?}"
-    );
-    assert!(
-        small_scan_after.iter().all(|n| *n == 0),
-        "PRODUCT: the old seals, openable from the public key, are still on disk after \
-         migration: {small_scan_after:?} copies"
-    );
-
-    // ---- 2c. a rewrite that fails leaves the profile to migrate again ------------------------
-    // The rewrite writes a new file beside the store and renames it over the old one; the vault
-    // moves to v2 only after that. If the rewrite fails, the vault must stay v1, so the next
-    // unlock repeats the migration: a v2 vault over an un-rewritten store would keep the old
-    // seals on disk for good, since a v2 vault never migrates. The failure staged here is the
-    // new file not being creatable (a directory in its place). A read error on one table, the
-    // case verification of #214 found, cannot be injected from outside the process; that path
-    // (`source_table`: only a missing table is skipped, every other error stops the rewrite
-    // before the rename) is covered by code review only.
-    let (gina, hal) = (dir("gina"), dir("hal"));
-    let hal_fp = ok(&old, &hal, &["id"], None).trim().to_owned();
-    ok(&old, &gina, &["id"], None);
-    ok(
-        &old,
-        &gina,
-        &["trust", "add", &hal_fp, "--name", "hal"],
-        None,
-    );
-    {
-        let (_node, spec) = anchor(&old, &dir("old-anchor-3"));
-        let _gina_d = daemon(&old, "gina (v0.2.9)", &gina, &spec, &idpass);
-    }
-    let blocked = Disk::old(&gina);
-    let gina_old = fingerprints_of(&blobs(&blocked));
-    let mut squatter = blocked.store_file.clone().into_os_string();
-    squatter.push(".rewrite");
-    let squatter = PathBuf::from(squatter);
-    std::fs::create_dir(&squatter).expect("APPARATUS: staging the obstacle");
-    std::fs::write(
-        squatter.join("keep"),
-        b"a directory where the new store would go",
-    )
-    .expect("APPARATUS: staging the obstacle");
-    let inode_before = file_facts(&blocked).1;
-    let (migrated, out, err) = trust_list(&new, &gina);
-    // This build's first run moved the profile, obstacle and all, into `nodes/`.
-    let blocked = Disk::of(&gina);
-    let squatter = {
-        let mut p = blocked.store_file.clone().into_os_string();
-        p.push(".rewrite");
-        PathBuf::from(p)
-    };
-    let (inode_after, version) = (file_facts(&blocked).1, blocked.vault().version);
-    println!(
-        "[proof] the rewrite's new file cannot be created: the migrating unlock succeeded = \
-         {migrated}; store.redb replaced = {}; vault v{version}",
-        inode_after != inode_before
-    );
-    assert!(
-        !migrated && inode_after == inode_before && version == 1,
-        "PRODUCT: a migration whose store rewrite failed went on (vault v{version}): {out}{err}"
-    );
-    std::fs::remove_dir_all(&squatter).expect("APPARATUS: removing the obstacle");
-    let listed = trust_list_ok(&new, &gina);
-    let residue = occurrences(&blocked, &gina_old);
-    let version = blocked.vault().version;
-    println!(
-        "[proof] with the obstacle gone, the next unlock: vault v{version}, `trust list` names hal \
-         = {}, old seals on disk {residue:?}",
-        listed.contains("hal")
-    );
-    assert!(
-        version == 2 && listed.contains("hal") && residue.iter().all(|n| *n == 0),
-        "PRODUCT: the migration did not complete once the rewrite could: vault v{version}, old seals \
-         {residue:?}: {listed}"
-    );
-
-    // ---- 3. no way back to the old keys -------------------------------------------------------
-    // (a) A keyring sealed the attacker's way, under the migrated v2 vault: no loader tries an
-    // old key, so it does not open.
+    // ---- 2. no way back to the old keys -------------------------------------------------------
+    // (a) A keyring sealed the attacker's way, under the v2 vault: no loader tries such a key,
+    // so it does not open.
     plant_mallory(&disk);
-    let (opened, out, err) = trust_list(&new, &carol);
+    let (opened, out, err) = trust_list(&new, &alice);
     println!(
         "[proof] a planted old-key keyring under the v2 vault: `trust list` succeeded = {opened}, \
          names mallory = {}",
@@ -900,14 +580,14 @@ fn node_wide_blobs_are_sealed_by_the_vault() {
         err.contains("will not open under it") && !err.contains("passphrase is wrong"),
         "PRODUCT: a keyring that will not open under a correct passphrase was reported as: {err}"
     );
-    // (b) The same, with the vault relabelled v1, which is what makes an unlock migrate.
+    // (b) The same, with the vault relabelled v1, an earlier release's version: it does not open.
     {
         let mut vault = disk.vault();
         vault.version = 1;
         std::fs::write(&disk.vault_file, vault.to_canonical_vec())
             .expect("APPARATUS: relabelling the vault");
     }
-    let (opened, out, err) = trust_list(&new, &carol);
+    let (opened, out, err) = trust_list(&new, &alice);
     println!(
         "[proof] the same under a vault relabelled v1: `trust list` succeeded = {opened}, names \
          mallory = {}",
@@ -934,8 +614,7 @@ fn plant_mallory(disk: &Disk) {
             .trust([7u8; 32], "mallory")
             .unwrap_or_else(|e| panic!("APPARATUS: the attacker's keyring: {e}"));
         let sealed = seal_segment(
-            &trust::legacy_trust_sek(&attacker)
-                .unwrap_or_else(|e| panic!("APPARATUS: the attacker's old key: {e}")),
+            &old_trust_key(&attacker),
             SegmentKind::Trust,
             trust::TRUST_SEGMENT_ID,
             &planted.to_bytes(),

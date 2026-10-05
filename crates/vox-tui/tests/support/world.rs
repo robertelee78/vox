@@ -66,7 +66,7 @@ impl VoxProc {
         Self::spawn_exe(Path::new(VOX), name, data, args, env)
     }
 
-    /// [`VoxProc::spawn_env`] with another `vox` binary (a previous release, for a migration).
+    /// [`VoxProc::spawn_env`] with the `vox` binary at `exe`.
     pub fn spawn_exe(
         exe: &Path,
         name: &str,

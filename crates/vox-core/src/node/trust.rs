@@ -55,16 +55,12 @@ use crate::atrest::sek::{Sek, NONCE_LEN};
 use crate::atrest::store::{open_segment, seal_segment, SealedSegment, SegmentKind};
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
-use crate::hash::{sha256, Digest32};
+use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::node::store::Store;
 
 /// HKDF label for the keyring's sealing key, taken over `self_seed`.
 pub const TRUST_SEK_INFO: &[u8] = b"vox/trust-keyring-sek/v2";
-
-/// The label a version-1 vault's keyring was sealed under, over the identity factor
-/// (migration only; see [`crate::atrest::seal::legacy`]).
-pub const LEGACY_TRUST_SEK_INFO: &[u8] = b"vox/trust-keyring-sek/v1";
 
 /// Domain-separated context the identity factor is taken over. A fixed value
 /// because the keyring is node-wide: it belongs to no channel.
@@ -76,8 +72,8 @@ pub const TRUST_META_KEY: &str = "trust";
 /// Only slot; the keyring is a single blob.
 pub const TRUST_SEGMENT_ID: u64 = 0;
 
-/// Encoding version of the keyring body. Version 2 adds each identity's history grant;
-/// a version-1 body (no grants) still reads, as "from now on" for everyone.
+/// Encoding version of the keyring body, with each identity's history grant. The only version
+/// this build reads: version 1 (no grants) was an earlier release's (#423).
 const KEYRING_VERSION: u64 = 2;
 
 /// What a consent releases of **this node's own** messages to a trusted identity
@@ -139,11 +135,6 @@ pub const MAX_PETNAME: usize = 64;
 /// The sealing key for this identity's keyring.
 pub fn trust_sek(signer: &dyn RootSigner) -> Result<Sek> {
     crate::atrest::seal::sek(signer, TRUST_SEK_INFO)
-}
-
-/// The key a version-1 vault's keyring was sealed under (migration only).
-pub fn legacy_trust_sek(signer: &dyn RootSigner) -> Result<Sek> {
-    crate::atrest::seal::legacy::sek(signer, &sha256(TRUST_CONTEXT_LABEL), LEGACY_TRUST_SEK_INFO)
 }
 
 /// This node's trusted identities, each with the petname this node calls it.
@@ -285,10 +276,10 @@ impl Keyring {
         let version = d
             .uint()
             .map_err(|_| Error::MalformedAtRest("keyring version"))?;
-        if version != KEYRING_VERSION && version != 1 {
+        if version != KEYRING_VERSION {
             return Err(Error::MalformedAtRest("keyring version"));
         }
-        let row_arity = if version == 1 { 2 } else { 3 };
+        let row_arity = 3;
         let n = d
             .array()
             .map_err(|_| Error::MalformedAtRest("keyring len"))?;

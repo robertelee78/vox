@@ -135,13 +135,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         stop_requested("vox daemon")
     });
     let named = named_node(args)?;
-    let Some(serving) = take_account(
-        &account,
-        &rt,
-        args.profile.listen,
-        &args.profile.anchors,
-        named.as_ref(),
-    )?
+    let Some(serving) = take_account(&account, &rt, args.profile.listen, &args.profile.anchors)?
     else {
         return already_running(args, &account, rt, &mut stop, named);
     };
@@ -254,14 +248,17 @@ pub(crate) struct Serving {
 /// the lock.
 ///
 /// # Errors
-/// The lock or the migration fails, an `--anchor` is malformed, or the socket cannot be bound.
+/// The data root is not one this version reads, the lock fails, an `--anchor` is malformed, or the socket cannot be bound.
 pub(crate) fn take_account(
     account: &Account,
     rt: &tokio::runtime::Runtime,
     listen: std::net::SocketAddr,
     anchor_specs: &[String],
-    named: Option<&NodeName>,
 ) -> Result<Option<Serving>, AppError> {
+    // **A data root this version does not read is refused before the lock is taken** (#423):
+    // the lock and the pid are writes, and a refused root is left exactly as it was.
+    vox_core::node::layout::refuse_old_layout(account)
+        .map_err(|e| AppError::Usage(e.to_string()))?;
     let Some(lock) = account
         .try_lock()
         .map_err(|e| AppError::Usage(e.to_string()))?
@@ -270,15 +267,6 @@ pub(crate) fn take_account(
     };
     let lock = Arc::new(Mutex::new(lock));
     write_pid(&lock);
-    // Under the lock, once: an older layout moves into `nodes/` (F-3).
-    let report = vox_core::node::layout::migrate_held(account, named)
-        .map_err(|e| AppError::Usage(e.to_string()))?;
-    for (from, node) in &report.moved {
-        eprintln!("vox daemon: moved {} to node {node}", from.display());
-    }
-    for (node, anchor) in &report.split {
-        eprintln!("vox daemon: node {node}'s anchor key is now node {anchor}");
-    }
     let mut anchors = vox_core::nat::bootstrap::BootstrapSet::new();
     for spec in anchor_specs {
         if !spec.trim().is_empty() {

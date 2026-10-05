@@ -47,10 +47,8 @@ const SEK_WRAPS: TableDefinition<Digest32, &[u8]> = TableDefinition::new("sek_wr
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const META_SCHEMA: &str = "schema_version";
 
-/// The codes of the anchor's ciphertext copy of a room it was not a member of — its log pages (6)
-/// and its metadata (7) — **retired** with that copy (ADR-023 decision 6, PRD-001 R34, R45). Never
-/// reused, and deleted wherever they are found ([`Store::delete_retired_anchor_pages`]).
-const RETIRED_ANCHOR_CODES: [u8; 2] = [6, 7];
+// Segment codes 6 and 7 (an anchor's ciphertext copy of a room, ADR-023 decision 6) are retired
+// and never reused.
 
 /// Stable on-disk code for a [`SegmentKind`] (part of the key; never reordered).
 const fn kind_code(kind: SegmentKind) -> u8 {
@@ -73,14 +71,6 @@ fn storage<E: std::fmt::Display>(op: &'static str) -> impl FnOnce(E) -> Error {
         detail: e.to_string(),
     }
 }
-
-/// **For proofs only.** When set, [`Store::rewrite_fresh`] waits this many milliseconds between
-/// releasing the old file and renaming the new one over it — the moment no redb lock covers the
-/// profile. The concurrent-migration proof uses it to let a second vox reach that moment. Nothing
-/// a person runs sets it; unset, nothing changes. Not compiled in without the `test-knobs` feature
-/// (V210-105).
-#[cfg(feature = "test-knobs")]
-pub const TEST_REPLACE_PAUSE_ENV: &str = "VOX_TEST_REPLACE_PAUSE_MS";
 
 /// The profile store.
 pub struct Store {
@@ -281,11 +271,6 @@ impl Store {
         }
         // Release the old file, then replace it.
         drop(std::mem::replace(&mut *backing, Backing::Closed));
-        #[cfg(feature = "test-knobs")]
-        super::profile::test_pause(
-            TEST_REPLACE_PAUSE_ENV,
-            "the store is released, not yet replaced",
-        );
         if let Err(e) = std::fs::rename(&fresh_path, &self.path) {
             let _ = std::fs::remove_file(&fresh_path);
             *backing = Backing::Writable(Database::create(&self.path).map_err(open_error)?);
@@ -537,33 +522,6 @@ impl Store {
             out.push(k.value());
         }
         Ok(out)
-    }
-
-    /// Delete every page of the anchor's old ciphertext copy of a room (the retired segment
-    /// codes, 6 and 7): an anchor stores nothing for a room it is not a member
-    /// of (ADR-023 decision 6), and pages an earlier build stored are deleted when it next opens
-    /// the store — where a member's vault shares the anchor's data directory; otherwise the
-    /// anchor deletes the whole file. Returns how many were deleted.
-    pub fn delete_retired_anchor_pages(&self) -> Result<usize> {
-        let txn = self.begin_write()?;
-        let mut deleted = 0;
-        {
-            let mut t = txn.open_table(SEGMENTS).map_err(storage("open segments"))?;
-            let keys: Vec<SegmentKey> = t
-                .iter()
-                .map_err(storage("iterate segments"))?
-                .filter_map(std::result::Result::ok)
-                .map(|(k, _)| k.value())
-                .filter(|(_, kind, _)| RETIRED_ANCHOR_CODES.contains(kind))
-                .collect();
-            for key in keys {
-                if t.remove(key).map_err(storage("delete segment"))?.is_some() {
-                    deleted += 1;
-                }
-            }
-        }
-        txn.commit().map_err(storage("commit"))?;
-        Ok(deleted)
     }
 
     /// Write a public metadata entry (its own durable transaction). Meta holds

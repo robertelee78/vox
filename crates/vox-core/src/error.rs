@@ -475,6 +475,16 @@ pub enum Error {
     #[error("profile: {0}")]
     Profile(&'static str),
 
+    /// A data root this version does not read: it holds a profile folder of a vox before
+    /// v0.3.0 (#423). It is refused before anything is written, and left as it is.
+    #[error("{root} is not a Vox data directory this version reads: {why}")]
+    DataRootNotRead {
+        /// The data root.
+        root: String,
+        /// What in it is not this version's, and what to do.
+        why: String,
+    },
+
     /// A profile/store path could not be resolved or prepared (ADR-016 §Layout):
     /// no home directory, a directory that could not be created with the required
     /// mode, or an I/O failure on the vault file. Carries a static reason plus the

@@ -50,14 +50,8 @@ pub const MAX_RETAINED_ORIGINS: usize = 256;
 
 /// At-rest version of an [`OriginKeyStore`] state blob. Version 3 keeps each generation's
 /// consent-order stamp — value **and** the counter's order id ([`crate::node::consent_order`],
-/// V210-49). Versions 1 (no value) and 2 (a value with no order id) still read, their
-/// generations with no stamp: nothing can say which decision they precede, so they are never
-/// released as history.
+/// V210-49). It is the only version this build reads: 1 and 2 were an earlier release's (#423).
 const ORIGIN_STATE_VERSION: u64 = 3;
-/// The second encoding: a consent-order value without its counter's id.
-const ORIGIN_STATE_VERSION_2: u64 = 2;
-/// The first encoding, without consent-order values.
-const ORIGIN_STATE_VERSION_1: u64 = 1;
 
 /// A retained origin record for one `(channel_id, epoch, chain_id)` generation:
 /// the iteration-0 chain key, the composite Sender-Key signing public key, the
@@ -207,13 +201,11 @@ impl OriginKeyStore {
         if d.array()? != 2 {
             return Err(Error::MalformedBundle("origin store state arity"));
         }
-        let version = d.uint()?;
-        let arity = match version {
-            ORIGIN_STATE_VERSION => 9,
-            ORIGIN_STATE_VERSION_2 => 8,
-            ORIGIN_STATE_VERSION_1 => 7,
-            _ => return Err(Error::MalformedBundle("origin store state version")),
-        };
+        // The one encoding this build reads (#423: versions 1 and 2 were an earlier release's).
+        if d.uint()? != ORIGIN_STATE_VERSION {
+            return Err(Error::MalformedBundle("origin store state version"));
+        }
+        let arity = 9;
         let n = d.array()?;
         if n > MAX_RETAINED_ORIGINS {
             return Err(Error::SizeLimitExceeded("retained origin generations"));
@@ -242,27 +234,19 @@ impl OriginKeyStore {
                 .try_into()
                 .map_err(|_| Error::MalformedBundle("origin record signing_pubkey"))?;
             let created_at = d.uint()?;
-            let mint_seq = match arity {
-                9 => {
-                    let seq = d.uint()?;
-                    let order = d.bytes()?;
-                    if seq == 0 {
-                        None
-                    } else {
-                        Some(Stamp {
-                            seq,
-                            order: order
-                                .try_into()
-                                .map_err(|_| Error::MalformedBundle("origin record order id"))?,
-                        })
-                    }
-                }
-                // A value with no counter id cannot be ordered against any decision.
-                8 => {
-                    d.uint()?;
+            let mint_seq = {
+                let seq = d.uint()?;
+                let order = d.bytes()?;
+                if seq == 0 {
                     None
+                } else {
+                    Some(Stamp {
+                        seq,
+                        order: order
+                            .try_into()
+                            .map_err(|_| Error::MalformedBundle("origin record order id"))?,
+                    })
                 }
-                _ => None,
             };
             records.insert(
                 (channel_id, epoch, chain_id),

@@ -75,7 +75,7 @@ Device seizure and local compromise are in the threat model (ADR-001). The local
   - the consent order (`vox/consent-order-sek/v1`).
 
   These blobs MUST NOT be sealed under the Ed25519 `id_proof`, which a quantum adversary with the public key could compute.
-- **AR-23.** A version-1 vault's blobs, sealed under the identity factor (`vox/prekey-ring-sek/v1`, `vox/trust-keyring-sek/v1`), MAY be read only by the one-time migration (`node::seal_migration`).
+- **AR-23.** No key from the identity factor MUST ever be derived for a node-wide blob. A vault of an earlier version (version 1, whose blobs were sealed under the identity factor) MUST be refused, never migrated (ADR-026 F-3, #423).
 - **AR-24.** The prekey ring MUST be held only while the identity is unlocked and dropped on lock (under ADR-026, while the node is attached, and dropped on detach). A ring sealed to another identity, or tampered with, MUST fail as `AtRestUnlockFailed` and MUST NOT be silently regenerated.
 
 ### Remembered open rooms
@@ -104,7 +104,7 @@ R-numbers are PRD-001's.
 - **AR-32.** An entry's age MUST run from its author's claimed time, clamped to no later than first sight. An entry this node cannot read MUST age from first sight. The first-seen time MUST be kept per entry in a sealed `Index` segment.
 - **AR-33.** On reload, a body-less entry MUST be kept: it verifies and links the feed. A body that arrives already expired MUST be pruned and MUST NOT be rendered.
 - **AR-34.** Retention is honoured by clients, not enforced: a malicious client can keep data. This is stated plainly, not implied to be a guarantee.
-- **AR-35.** An anchor MUST NOT keep pages of a room it is not a member of (ADR-023 decision 6), so retention has nothing to prune there. An anchor upgraded from a release that kept them MUST delete them (ADR-016 NR-46).
+- **AR-35.** An anchor MUST NOT keep pages of a room it is not a member of (ADR-023 decision 6), so retention has nothing to prune there.
 
 ### Gates
 

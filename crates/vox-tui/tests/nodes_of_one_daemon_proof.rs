@@ -9,9 +9,6 @@
 //!    address.** A member on another account joins a room on each, and everyone posts at once.
 //! 3. **Proof 7, from a member's side.** A kept node comes back after a daemon restart at the
 //!    address its member holds, and they read each other again.
-//!
-//! (Migration through the daemon, proof 10, is the second test of
-//! `profiles_of_the_previous_release_become_nodes_proof.rs`.)
 
 #![allow(clippy::unwrap_used)]
 

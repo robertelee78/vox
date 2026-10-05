@@ -42,8 +42,6 @@
 //! signature, and Ed25519's private key falls to such an adversary from the public key
 //! alone. With the disk, that adversary opened the ring, whose ML-KEM prekey secrets
 //! undo the post-quantum half of every handshake recorded against them (V210-40, #214).
-//! A version-1 vault's ring is re-sealed once, on its first unlock
-//! ([`crate::node::seal_migration`]).
 //!
 //! ## Consuming a one-time prekey (ADR-002 one-shot + ADR-004 serverless semantics)
 //! [`PrekeyRing::use_one_time`] moves the prekey out of the pool into a bounded
@@ -95,10 +93,6 @@ pub const PREKEY_RING_CHANNEL_DOMAIN: &str = "vox/prekey-ring-pseudo-channel/v1"
 
 /// HKDF `info` separating the ring key from every other `factor_id` consumer.
 pub const PREKEY_RING_SEK_INFO: &[u8] = b"vox/prekey-ring-sek/v2";
-
-/// The label a version-1 vault's ring was sealed under, over the identity factor (migration
-/// only; see [`crate::atrest::seal::legacy`]).
-pub const LEGACY_PREKEY_RING_SEK_INFO: &[u8] = b"vox/prekey-ring-sek/v1";
 
 /// The ring's segment id within its pseudo-channel (one segment, latest-wins).
 pub const SEG_PREKEY_RING: u64 = 1;
@@ -165,11 +159,6 @@ pub fn ring_channel() -> Digest32 {
 /// The ring's sealing key, from the vault's `self_seed` (see the module docs).
 pub fn ring_sek(signer: &dyn RootSigner) -> Result<Sek> {
     crate::atrest::seal::sek(signer, PREKEY_RING_SEK_INFO)
-}
-
-/// The key a version-1 vault's ring was sealed under (migration only).
-pub fn legacy_ring_sek(signer: &dyn RootSigner) -> Result<Sek> {
-    crate::atrest::seal::legacy::sek(signer, &ring_channel(), LEGACY_PREKEY_RING_SEK_INFO)
 }
 
 /// What [`PrekeyRing::maintain`] did.

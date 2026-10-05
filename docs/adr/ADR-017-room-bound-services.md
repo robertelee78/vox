@@ -172,7 +172,7 @@ is what a person offers. A tunnel is how bytes reach it.
 - **7.1** `vox node` MUST write its own anchor spec to `<config_dir>/anchors`, and every command MUST
   read that file. The file is machine-wide, shared by every profile on the machine. *Decided, not
   built (ADR-026 F-1, F-3):* anchors are a per-node setting in `nodes/<name>/config/anchors`, read from the account's
-  `anchors` file when the node has none (ADR-026 F-2), so migration copies nothing.
+  `anchors` file when the node has none (ADR-026 F-2).
 - **7.2** `--anchor` MUST merge with the file, not replace it.
 - **7.3** The file MUST hold one anchor spec per line (`<fingerprint>@<multiaddr>`, or a host name and
   port). `#` comments and blank lines MUST be skipped. The file MUST be rewritten whole on every

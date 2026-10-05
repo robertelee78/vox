@@ -194,7 +194,7 @@ network presence from the start: there is no interim design with one socket per 
   the same exchange as any other pair. The first piece of work MUST be a real-binary proof that this
   works, including connection loss and redial, before anything else depends on it.
 
-### 7. Files and migration
+### 7. Files, and no migration
 
 - **F-1. Layout.**
   ```
@@ -210,16 +210,16 @@ network presence from the start: there is no interim design with one socket per 
   from the same file in the account's config directory. The daemon's own settings (listen, metrics,
   relay limits) MUST be read from `.daemon/config`; the relay limits are `relay-circuits` and
   `relay-circuits-per-asker` (ADR-012 N-45).
-- **F-3. Migration** MUST run on the first start of the new daemon, and MUST land before the daemon
-  split, on its own:
-  - every `<data root>/<name>/` holding `vault.cbor`, `node-identity.key` or `store.redb` MUST move to
-    `nodes/<name>/`, keeping its identity, rooms and store;
-  - a directory holding both `vault.cbor` and `node-identity.key` MUST be split: the vault node keeps
-    `<name>`, and the headless identity becomes node `<name>-anchor`;
-  - stale `node.sock` and `port` files in moved directories MUST be removed;
-  - config files MUST NOT be copied: F-2's fallback reads the account's files;
-  - `.daemon/port` MUST take the port of the node the daemon starts with, else the first migrated
-    node's, so published address records stay valid.
+- **F-3. No migration.** Vox MUST carry no code that reads, converts or migrates data written by a
+  release before v0.3.0: nobody has run one (decider, 2026-10-04, #423).
+  - A data root holding a profile folder of such a release (`<data root>/<name>/` holding
+    `vault.cbor`, `node-identity.key` or `store.redb`) MUST be refused by every verb, and by the
+    daemon before it takes its lock, with the reason that it is not a Vox data directory this
+    version reads, and MUST be left byte for byte unchanged.
+  - Only this version's formats are read: a vault, keyring, store blob or cache row of an earlier
+    version is refused as malformed, never converted.
+  - One node is one identity: a node holding a vault runs its anchor (`vox node`) as node
+    `<name>-anchor`.
 
 ### 8. Process-wide state
 
@@ -276,8 +276,8 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 9. a hook acts only as its `--node`, and refuses without it
    (`an_agents_wiring_acts_only_as_its_node_proof`); a one-shot verb refuses an unattached node
    (`the_nodes_of_one_daemon_proof`); node names follow N-1a (`the_nodes_of_one_daemon_proof`);
-10. migration moves profiles (a vault node, a headless anchor, and a directory holding both) with
-    identity, rooms and config (`profiles_of_the_previous_release_become_nodes_proof`);
+10. a fresh data root works end to end, and one laid out by a release before v0.3.0 is refused with
+    the reason and left unchanged (`a_data_root_of_an_earlier_release_is_refused_proof`);
 11. a node keeps running in full past the keyring window, and only a keyring change asks for the
     passphrase again (`a_keyring_change_needs_a_recent_passphrase_proof`);
 12. R40 and R42 are re-measured (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,

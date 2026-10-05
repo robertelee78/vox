@@ -24,7 +24,7 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 use crate::atrest::sek::Argon2Profile;
-use crate::atrest::vault::{IdentityVault, VaultRootSigner, VAULT_VERSION};
+use crate::atrest::vault::{IdentityVault, VaultRootSigner};
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::identity::backup::{IdentityBackup, SelfSeed};
@@ -39,10 +39,6 @@ const META_CREATED: &str = "identity_created";
 
 /// The operation a failure to write the vault is reported as, so it is named as the vault's.
 pub const VAULT_WRITE: &str = "write the identity file";
-/// The [`Error::Path`] op of a failed rewrite of an existing identity's vault (the v1 → v2
-/// migration): the identity is still there, in its old file, which is not what
-/// [`VAULT_WRITE`]'s "no identity was made" says.
-pub const VAULT_REWRITE: &str = "rewrite the identity file";
 
 /// An opened profile: sealed vault + store, and the unlocked identity when
 /// unlocked.
@@ -245,12 +241,6 @@ impl Profile {
     /// Unlock with the identity passphrase. A wrong passphrase (or a tampered
     /// vault) is [`Error::AtRestUnlockFailed`]; the profile stays locked.
     ///
-    /// A version-1 vault is migrated here (V210-40), and the migration rewrites the store into a
-    /// new file and renames it over the old one. redb's own lock is on the file, so it lapses
-    /// between the two; a second vox opening the profile at that moment used to migrate the old
-    /// file again and rename its copy over the first one's, losing every row written since
-    /// (V210-100). It cannot now: this profile holds the profile directory's lock from before its
-    /// store was opened ([`lock_profile`]), so no other vox has the store open at all.
     pub fn unlock(&mut self, passphrase: &[u8]) -> Result<()> {
         if self.unlocked.is_some() {
             return Ok(());
@@ -264,46 +254,8 @@ impl Profile {
         }
         // Only now, with the passphrase proved, may the profile be written.
         self.store.make_writable()?;
-        if self.vault.version < VAULT_VERSION {
-            self.migrate_vault(&backup, &signer, passphrase)?;
-        }
         drop(backup);
         self.unlocked = Some(Arc::new(signer));
-        Ok(())
-    }
-
-    /// Bring a version-1 vault's profile up to version 2 (V210-40, #214): re-seal the node-wide
-    /// blobs from `self_seed`, rewrite the store into a fresh file so no page of the old seals
-    /// survives in it, **then** rewrite the vault, whose version is bound into its AEAD.
-    /// In that order a crash between the two is repaired by the next unlock (see
-    /// [`crate::node::seal_migration`]); in the other order it would strand the blobs under
-    /// legacy keys that a v2 vault never tries.
-    fn migrate_vault(
-        &mut self,
-        backup: &IdentityBackup,
-        signer: &VaultRootSigner,
-        passphrase: &[u8],
-    ) -> Result<()> {
-        crate::node::seal_migration::migrate_to_vault_seals(&self.store, signer)?;
-        #[cfg(feature = "test-knobs")]
-        test_pause(TEST_REWRITE_DELAY_ENV, "about to rewrite the store");
-        // The old seals are still in the file's replaced pages until it is rewritten. Before the
-        // vault moves to v2: a crash after the rewrite leaves a v1 vault, whose next unlock
-        // repeats both; a crash after the vault would leave the old pages for good.
-        self.store.rewrite_fresh()?;
-        let profile = Argon2Profile::from_id(self.vault.profile_id)?;
-        let vault = IdentityVault::seal_with_salt(backup, passphrase, profile, &self.vault.salt)?;
-        // Named as the vault's, not the store's: it is the file that could not be written.
-        write_private_file(&self.paths.vault_file(), &vault.to_canonical_vec()).map_err(
-            |e| match e {
-                Error::Path { detail, .. } => Error::Path {
-                    op: VAULT_REWRITE,
-                    detail,
-                },
-                other => other,
-            },
-        )?;
-        self.vault = vault;
         Ok(())
     }
 
@@ -433,14 +385,6 @@ fn read_vault(paths: &Paths) -> Result<IdentityVault> {
     })?;
     IdentityVault::from_canonical_slice(&bytes)
 }
-
-/// **For proofs only.** When set, a migrating unlock waits this many milliseconds after
-/// re-sealing the blobs and before rewriting the store, which stands for a slow disk or a
-/// process descheduled at the worst moment. The concurrent-migration proof uses it to hold a
-/// second vox inside a migration while the first finishes its own. Nothing a person runs sets
-/// it; unset, nothing changes. Not compiled in without the `test-knobs` feature (V210-105).
-#[cfg(feature = "test-knobs")]
-pub const TEST_REWRITE_DELAY_ENV: &str = "VOX_TEST_REWRITE_DELAY_MS";
 
 /// Wait for the milliseconds named by the proof-only variable `env`, saying so on stderr so a
 /// proof can tell the moment has been reached; nothing when it is unset.

@@ -3,9 +3,7 @@
 //!
 //! **The layout is written here from the ADR, not asked of `vox-core`**, so a proof that looks in
 //! a node's directory measures where the product put a file against where the ADR says it goes:
-//! `<data root>/nodes/<name>/` for a node, `<data root>/.daemon/` for the daemon. Before v0.3.0 a
-//! node was `<data root>/<name>/`; a proof that still looked there found nothing — or found
-//! nothing *left*, which read as "deleted" when the migration had only moved it.
+//! `<data root>/nodes/<name>/` for a node, `<data root>/.daemon/` for the daemon.
 //!
 //! Included with `#[path]` by a proof, or by `world.rs`, `room.rs`, `sync_pair.rs` and
 //! `relay.rs`, which is why not every item is used by every includer.

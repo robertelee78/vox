@@ -25,10 +25,9 @@ node attached. An error saying `node robertgpt is not attached` is fixed by
 `vox node attach robertgpt`, not by creating a second identity. With several nodes, name one
 explicitly using `--node`; a refusal listing choices is not a corrupt node.
 
-Your v0.2.10 profiles become nodes of the same name the first time v0.3.0 runs against the data
-root, and keep their fingerprints; see [upgrading](install.md#upgrading-from-v0210). The data
-layout gains `nodes/<name>/` and `.daemon/`; see [local state](reference.md#local-state). There
-is no rollback of that move.
+A v0.2.10 data directory is not read: v0.3.0 refuses it, unchanged; see
+[data from an earlier release](install.md#data-from-an-earlier-release). The data layout is
+`nodes/<name>/` and `.daemon/`; see [local state](reference.md#local-state).
 
 ## Other changed commands
 
@@ -66,5 +65,5 @@ This symptom moved to [Troubleshooting](troubleshooting.md#a-message-says-not-re
 [the agent does not respond](troubleshooting.md#the-agent-does-not-respond).
 
 Sources: [v0.3.0 CLI](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[node client and migration](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/client.rs)
+[node client](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/client.rs)
 and [the daemon and node model](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-026-daemon-and-nodes.md).

@@ -71,14 +71,9 @@ impl NodeArgs {
     /// If neither a flag, the env vars nor `HOME` names a directory.
     pub fn account(&self) -> vox_core::error::Result<Account> {
         let account = Account::of(self.data_dir.as_deref(), self.config_dir.as_deref())?;
-        // **An old layout moves before any node is resolved** (ADR-026 F-3): every client entry
-        // point comes through here, so a data root of the layout before v0.3.0 is found as nodes
-        // by whichever verb a person runs first. A no-op once it has moved.
-        let named = self
-            .node
-            .as_deref()
-            .and_then(|n| vox_core::node::paths::NodeName::parse(n).ok());
-        vox_core::node::layout::migrate(&account, named.as_ref())?;
+        // **A data root not in v0.3.0's layout is refused before any node is resolved** (#423):
+        // every client entry point comes through here, and nothing is written before it.
+        vox_core::node::layout::refuse_old_layout(&account)?;
         Ok(account)
     }
 

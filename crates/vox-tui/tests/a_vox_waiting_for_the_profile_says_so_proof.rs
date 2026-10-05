@@ -5,9 +5,8 @@
 //! stopped (Ctrl-Z, SIGSTOP) while it holds what the other needs:
 //! - **a node's directory**, held while its identity is made (C-5: in the client, `vox id` or the
 //!   TUI's first-run prompt). Another vox making the same node's identity waits for it;
-//! - **the daemon itself**, while it moves an older profile into `nodes/` and attaches it (F-3,
-//!   L-2): it takes a client's connection and greets only once it can. A client waits for its
-//!   greeting.
+//! - **the daemon itself**, while it attaches a node (L-2): it takes a client's connection and
+//!   greets only once it can. A client waits for its greeting.
 //!
 //! Claimed of the vox that waits:
 //! - **It says so, once, after a second**: a CLI verb on stderr; `vox tui` in its own status line
@@ -25,14 +24,13 @@
 //! starts; A is resumed with SIGCONT. Five arms:
 //! 1. **CLI, create**: two `vox id`s on a fresh data root. B says it waits for the node's
 //!    directory; once A has made the identity, B is refused, naming the concurrent creation.
-//! 2. **CLI, migration**: `vox daemon` (A) moves a profile the **released v0.2.9 binary** wrote
-//!    into `nodes/` and attaches it, and is stopped holding it; `vox trust add` (B) says it waits
-//!    for the daemon, and once A is resumed is served: B exits 0, `vox trust list` names the
-//!    trusted identity, and A, stopped afterwards, exits 0.
+//! 2. **CLI, daemon**: `vox daemon` (A) attaches a node this build made, and is stopped holding
+//!    it; `vox trust add` (B) says it waits for the daemon, and once A is resumed is served: B
+//!    exits 0, `vox trust list` names the trusted identity, and A, stopped afterwards, exits 0.
 //! 3. **TUI, create** (`tests/pty/tui_lock_wait.py`): `vox id` holds the node's directory, `vox
 //!    tui` is given a passphrase at its first-run prompt and says it waits in its status line; then
 //!    names the concurrent creation.
-//! 4. **TUI, migration**: as arm 2, with `vox tui` as B. It waits for the daemon before it takes
+//! 4. **TUI, daemon**: as arm 2, with `vox tui` as B. It waits for the daemon before it takes
 //!    the screen and says so on the terminal; once A is resumed the TUI starts, its screen clean,
 //!    and shows its node attached (given the passphrase at its attach prompt if asked).
 //! 5. **CLI, past the patience**: two `vox id`s; A stays stopped until B gives up. B is refused
@@ -42,8 +40,8 @@
 //! Every red names its side: a PRODUCT verdict quotes what the product said or drew; a vox step
 //! of the staging that failed (A never said it holds the lock, `vox id` for arm 5, the TUI driver
 //! saying the TUI failed or hung) is PRODUCT (staging); only the proof's own machinery (a signal
-//! that could not be sent, `lsof` that would not run, the released v0.2.9 binary it stages with,
-//! a driver that stopped for any other reason) is APPARATUS, CANNOT MEASURE.
+//! that could not be sent, `lsof` that would not run, a driver that stopped for any other reason)
+//! is APPARATUS, CANNOT MEASURE.
 //!
 //! Mutations that must turn it red: the notice removed (B waits in silence, arms 1–4: the client's
 //! `create_noting` given no notice, or `open_noting` given none); the notice written to stderr while
@@ -60,9 +58,6 @@ mod pty_driver;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
-#[path = "support/previous_release.rs"]
-mod previous_release;
-
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
@@ -70,7 +65,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
-use previous_release::previous_release;
 use world::{args, vox_once, VoxProc, IDENTITY, VOX};
 
 /// B must say it is waiting within this of starting (its own start-up, then the one-second
@@ -474,7 +468,7 @@ fn tui_arm(label: &str, data: &Path, mode: &str, a_args: &[&str], answer: &[&str
 }
 
 #[test]
-#[ignore = "real vox processes and `vox tui` in a pty, with production Argon2id and the v0.2.9 release; needs pyte (VOX_PYTE_PATH); CI runs it in release"]
+#[ignore = "real vox processes and `vox tui` in a pty, with production Argon2id; needs pyte (VOX_PYTE_PATH); CI runs it in release"]
 fn a_vox_waiting_for_the_profile_says_so() {
     watchdog::arm_for(Duration::from_secs(if cfg!(debug_assertions) {
         2400
@@ -487,30 +481,18 @@ fn a_vox_waiting_for_the_profile_says_so() {
         std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
         d
     };
-    let old = previous_release();
-    let run_old = |data: &Path, argv: &[&str]| {
-        let out = Command::new(&old)
-            .args(argv)
-            .env("VOX_DATA_DIR", data)
-            .env("VOX_CONFIG_DIR", data.join("cfg"))
-            .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-            .output()
-            .expect("APPARATUS: run a process");
-        assert!(
-            out.status.success(),
-            "APPARATUS, CANNOT MEASURE: the v0.2.9 release this proof stages with failed \
-             `vox {argv:?}`: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    };
-    // A profile v0.2.9 wrote, so this build's first unlock of it migrates.
-    let v029 = |name: &str| -> PathBuf {
+    // A node this build made, for the daemon to attach (arms 2 and 4).
+    let made = |name: &str| -> PathBuf {
         let d = dir(name);
-        run_old(&d, &["id"]);
+        let (ok, out, err) = vox_once(&d, &args(&["id"]));
+        assert!(ok, "PRODUCT (staging): `vox id` failed: {out}{err}");
         d
     };
-    let y_fp = run_old(&dir("y"), &["id"]);
+    let y_fp = {
+        let (ok, out, err) = vox_once(&dir("y"), &args(&["id"]));
+        assert!(ok, "PRODUCT (staging): `vox id` failed: {out}{err}");
+        out.trim().to_owned()
+    };
     let mut red = Vec::new();
 
     // ---- 1. CLI, create ---------------------------------------------------------------------
@@ -523,10 +505,10 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &Then::ARefusesB,
     ));
 
-    // ---- 2. CLI, migration: the daemon moves and attaches the node; B's `trust add` waits ----
-    let carol = v029("carol");
+    // ---- 2. CLI, daemon: the daemon attaches the node; B's `trust add` waits ----------------
+    let carol = made("carol");
     red.extend(cli_arm(
-        "cli-migration",
+        "cli-daemon",
         &carol,
         &["daemon", "--listen", "127.0.0.1:0"],
         &["trust", "add", &y_fp, "--name", "y"],
@@ -535,21 +517,21 @@ fn a_vox_waiting_for_the_profile_says_so() {
     ));
     let (ok, listed, err) = vox_once(&carol, &args(&["trust", "list"]));
     println!(
-        "[proof] cli-migration: `vox trust list` afterwards: {}",
+        "[proof] cli-daemon: `vox trust list` afterwards: {}",
         listed.trim()
     );
     assert!(
         ok,
-        "PRODUCT: cli-migration: `vox trust list` afterwards failed: {listed}{err}"
+        "PRODUCT: cli-daemon: `vox trust list` afterwards failed: {listed}{err}"
     );
-    if red.iter().all(|r| !r.contains("cli-migration")) {
+    if red.iter().all(|r| !r.contains("cli-daemon")) {
         for name in ["y"] {
             if !listed
                 .lines()
                 .any(|l| l.trim_end().ends_with(&format!("  {name}")))
             {
                 red.push(format!(
-                    "PRODUCT: cli-migration: `trust add` exited 0, and `trust list` does not \
+                    "PRODUCT: cli-daemon: `trust add` exited 0, and `trust list` does not \
                      name {name}: {listed}"
                 ));
             }
@@ -565,10 +547,10 @@ fn a_vox_waiting_for_the_profile_says_so() {
         &[CONCURRENT],
     ));
 
-    // ---- 4. TUI, migration ------------------------------------------------------------------
+    // ---- 4. TUI, daemon --------------------------------------------------------------------
     red.extend(tui_arm(
-        "tui-migration",
-        &v029("dave"),
+        "tui-daemon",
+        &made("dave"),
         "startup",
         &["daemon", "--listen", "127.0.0.1:0"],
         &["attached: default"],

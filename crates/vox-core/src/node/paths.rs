@@ -7,7 +7,7 @@
 //!   the daemon's (lock, socket, port, log, attach list, settings) and `nodes/<name>/` holds one
 //!   node each — `vault.cbor` or `node-identity.key`, `store.redb`, its own `config/` directory,
 //!   `cursors/` and `sessions/`. A data root in the layout before v0.3.0 (`<data root>/<name>/`)
-//!   is moved by [`crate::node::layout::migrate`] the first time this build resolves a node.
+//!   is refused, unchanged ([`crate::node::layout::refuse_old_layout`], #423).
 //!
 //! Precedence (ADR-015), highest first: explicit override, then the
 //! `VOX_CONFIG_DIR` / `VOX_DATA_DIR` env vars, then the XDG env vars, then the
@@ -77,8 +77,7 @@ pub const DAEMON_DIR: &str = ".daemon";
 pub const NODE_CONFIG_DIR: &str = "config";
 /// The daemon's control socket, in `.daemon/` (ADR-026 C-1).
 pub const DAEMON_SOCKET_FILE: &str = "vox.sock";
-/// The daemon's lock, in `.daemon/` (ADR-026 D-1): held for the daemon's whole life, and by
-/// [`crate::node::layout::migrate`] while it moves directories.
+/// The daemon's lock, in `.daemon/` (ADR-026 D-1): held for the daemon's whole life.
 pub const DAEMON_LOCK_FILE: &str = "lock";
 /// The daemon's log, in `.daemon/` (ADR-026 S-2).
 pub const DAEMON_LOG_FILE: &str = "log";
@@ -361,14 +360,12 @@ impl Paths {
     /// Resolve and create the directories for node `profile`, honoring the ADR-015
     /// precedence. `data_override` / `config_override` are the CLI-flag layer.
     ///
-    /// **The first resolve of this build moves a data root of the layout before v0.3.0**
-    /// ([`crate::node::layout::migrate`], ADR-026 F-3), so whichever verb a person runs first
-    /// after upgrading finds its node where this build keeps it. Until the daemon (ADR-026 §5)
-    /// exists to run it at its start, this is where a profile is first opened.
+    /// **A data root not in v0.3.0's layout is refused** before anything is created
+    /// ([`crate::node::layout::refuse_old_layout`], #423).
     ///
     /// # Errors
-    /// A name that is not a node name ([`NodeName`]), a data root the migration refuses (an
-    /// older vox still running on it), or a directory that cannot be created.
+    /// A name that is not a node name ([`NodeName`]), a data root this version does not read, or
+    /// a directory that cannot be created.
     pub fn resolve(
         profile: &str,
         data_override: Option<&Path>,
@@ -376,7 +373,7 @@ impl Paths {
     ) -> Result<Self> {
         let name = NodeName::parse(profile)?;
         let account = Account::of(data_override, config_override)?;
-        crate::node::layout::migrate(&account, Some(&name))?;
+        crate::node::layout::refuse_old_layout(&account)?;
         account.node_paths(&name)
     }
 
@@ -489,8 +486,7 @@ impl Paths {
         self.profile_dir.join(PORT_FILE)
     }
 
-    /// `<data root>/.daemon/port`: the data root's one port (ADR-026 D-3), which the migration
-    /// fills from the port a node of the old layout bound, so its published address stays valid.
+    /// `<data root>/.daemon/port`: the data root's one port (ADR-026 D-3).
     #[must_use]
     pub fn account_port_file(&self) -> PathBuf {
         self.data_root.join(DAEMON_DIR).join(PORT_FILE)

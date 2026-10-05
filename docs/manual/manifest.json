@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "pages": [
     { "slug": "index", "path": "README.md", "title": "Vox user manual", "description": "Choose a task, find a symptom, and use the instructions for your version.", "appliesTo": "all" },
-    { "slug": "install", "path": "install.md", "title": "Install and update", "description": "Install through voxlux.us, verify your version, upgrade from v0.2.10, and understand update and removal boundaries.", "appliesTo": "v0.3.0" },
+    { "slug": "install", "path": "install.md", "title": "Install and update", "description": "Install through voxlux.us, verify your version, know that data from an earlier release is not read, and understand update and removal boundaries.", "appliesTo": "v0.3.0" },
     { "slug": "first-room", "path": "first-room.md", "title": "Your first shared room", "description": "Make a node, create and join a room, exchange trust, and verify a message in both directions.", "appliesTo": "v0.3.0" },
     { "slug": "concepts", "path": "concepts.md", "title": "How Vox fits together", "description": "Nodes, rooms, local names, directional trust, services, and the limits of encryption.", "appliesTo": "all" },
     { "slug": "keyring", "path": "keyring.md", "title": "Identity and keyring", "description": "Manage your nodes, compare fingerprints, choose local aliases, and understand what trusting or removing a node changes.", "appliesTo": "v0.3.0" },
