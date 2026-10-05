@@ -358,7 +358,7 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     let assignment = serde_json::json!({
         "v": 1,
         "type": "assign",
-        "to": [vox_core::node::link::b32_encode(&alice.fp)],
+        "to": [alice.b32()],
         "body": "port the wire codec to the new envelope format",
         "data": {"resource": "port-the-codec"},
     })
@@ -397,8 +397,19 @@ fn two_agent_sessions_and_an_operator_share_one_room() {
     );
 
     // ---- alice reports a result, as an agent would ----
-    let result = r#"{"v":1,"type":"result","re":"port-the-codec","body":"done: the codec now speaks the envelope format. verification token QUORUM-8812"}"#;
-    let o = alice.vox(None, &["room", "post", &room, result]);
+    // Reported **to bob's node**: a `result` is coordination, and a session's drain shows one only
+    // when it is for that session — addressed to its node, or answering what it posted — and
+    // counts the rest in one line (V030-18). Unaddressed, it reached bob's model only as "1
+    // coordination message(s) from other sessions, not shown (1 result)".
+    let result = serde_json::json!({
+        "v": 1,
+        "type": "result",
+        "re": "port-the-codec",
+        "to": [bob.b32()],
+        "body": "done: the codec now speaks the envelope format. verification token QUORUM-8812",
+    })
+    .to_string();
+    let o = alice.vox(None, &["room", "post", &room, &result]);
     assert!(o.ok, "PRODUCT: alice could not post her result: {o:?}");
     until(
         bob,
