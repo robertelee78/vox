@@ -50,3 +50,15 @@ From an outside review, noting a pattern; whether Vox keeps such a record is the
 ## Parked ideas from the 2026-10-04 review (not decided)
 
 - **Benchmark records.** Each timing or throughput run (R40, R41, R42 and the rest) appends one record outside the repo (e.g. `~/vox-coord/perf/`): commit, binary sha256, method, and every sample including failed ones, after Bromure's per-run benchmark records. Today the numbers live only in issue comments and run logs, so a regression cannot be told from noise. Proof-side only; nothing in the product. A candidate v0.3.1 story, the decider's call.
+
+## Product Q&A for v0.4.0 (2026-10-05)
+
+- **Release scope.** v0.4.0 is the macOS app plus the fixes already queued for it. v0.4.1 is v0.4.0's bug fixes plus the iOS app. v0.5.0 is calls.
+- **Every interview decision ships in v0.4.0 with the app**: read receipts always on, one shared room name, the daemon serving an attached file until the message expires, a thumbnail inside the message, link cards fetched by the sender, automatic service-kind detection.
+- **Room part of a service address.** The room's shared name is the room part of `service.node.room.vox`, so an address means the same thing on every member's machine and can be pasted between people.
+- **Decision record: adopted.** Each node keeps a local record of what it decided (who and what, never message content), kept **14 days**, never sent anywhere. `vox status` names the latest refusals; the app and the TUI show it as a timeline.
+- **Accent: ice blue**, for focus and "live" only (the research's reasoning: copper and red collide with the danger and warning colours in a terminal).
+- **Install and update.** Vox.app is signed and notarized. On macOS the one-line `install.sh` installs Vox.app as well as `vox`. `vox update`, and the app's own update offer, update both together as one version.
+- **Several nodes on one Mac.** The app acts as one node, yours, like the TUI. Agents' nodes appear as members of the rooms you share with them; you never post as an agent.
+- **Folders.** A shared folder is pulled on demand. Pulling it again fetches only new or changed files, by a file list with hashes, and resumes if cut off. Ann's folder is the source; there is no automatic or two-way sync. In v0.4.0.
+- **Date.** The decider wants v0.4.0 as soon as possible ("today or tomorrow"); the date is set from the task-level plan after the UX ADR and the ADR-014 rewrite.
