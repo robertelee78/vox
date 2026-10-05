@@ -6,7 +6,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 the reachability ladder run in the node (`crates/vox-core/src/nat/`,
 `crates/vox-core/src/node/{network,net,coordstream,circuitstream,presence}.rs`,
 `crates/vox-core/src/transport/mux.rs`), and the daemon owns the machine's one presence (N-41–N-48).
-Not built: a DHT (N-31). UPnP-IGD has not yet been checked against a real router (N-14).
+Not built: a DHT (N-31). UPnP-IGD has not yet been checked against a real router (N-14). Not built,
+for v0.3.1: network-change detection, gateway discovery off Linux, and the PCP mapping lifecycle
+(N-49–N-58).
 **Date**: 2026-06-19
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: nat, bootstrap, rendezvous, ipv6, port-mapping, relay, anchor
@@ -72,8 +74,7 @@ relay circuit.
 - **N-13. Rung 2, IPv4 port mapping.** A node SHOULD request one scoped port through PCP (RFC 6887),
   then NAT-PMP (RFC 6886), then UPnP-IGD (M15.1c). It MUST validate each grant. A reply with a zero
   lifetime MUST NOT be taken as a live mapping, and a total failure MUST be reported, never shown as a
-  mapping. Mappings MUST be requested for `PORT_MAP_LIFETIME_SECS` (2 h) and renewed at half the
-  shortest granted lifetime (RFC 6887 §11.2.1).
+  mapping. Mappings MUST be requested for `PORT_MAP_LIFETIME_SECS` (2 h). Renewal is N-55.
 - **N-14. UPnP-IGD client hardening.**
   - The client MUST follow a responder's `LOCATION` only on the responder's own address.
   - It MUST accept only literal IPv4 hosts.
@@ -88,9 +89,8 @@ relay circuit.
   a real router.
 - **N-15. Finding a PCP server.** Candidates MUST be the real default route where the platform
   exposes it, then the IPv4 `.1` convention, then the RFC 7723 anycast addresses `192.0.0.9` and
-  `2001:1::1`. Candidates within a rung, and the IPv4 and IPv6 work, MUST be raced. **Known limit:**
-  the real default route is read only on Linux (`/proc/net/route`, `/proc/net/ipv6_route`).
-  Elsewhere the rung depends on the anycast address being answered.
+  `2001:1::1`. Candidates within a rung, and the IPv4 and IPv6 work, MUST be raced. How the default
+  route is read on each platform is N-53.
 - **N-16. Publish side.** A node MUST advertise, in order: its routable addresses (IPv6 first), then
   any mapped address, then loopback. A node with no dialable address is not broken: it MUST still reach
   out and be reached through a punch or a relay.
@@ -299,7 +299,7 @@ proved: it needs a gateway.
 - **N-42.** The port MUST be kept in `<data root>/.daemon/port` and reused on every start, so the
   address records every node published stay valid.
 - **N-43.** The daemon MUST own the gateway port mapping (N-12–N-14) and the observed (reflexive)
-  address cache. A node's detach MUST NOT unmap; the daemon's stop MUST.
+  address cache. A node's detach MUST NOT unmap; the daemon's stop MUST (N-56).
 - **N-44.** LAN discovery (nearby) MUST run once, in the daemon.
 - **N-45.** Relay circuits (N-19) and board service (N-25–N-33) MUST be executed by the daemon and
   governed per node: a node relays for, and serves the board of, its own rooms' members (PRD-001
@@ -318,6 +318,93 @@ proved: it needs a gateway.
   (ADR-011 requirement 38a). This replaces V210-143's wording, which named the identity found.
 - **N-48.** The hole punch's attempt timeout (`PUNCH_ATTEMPT_TIMEOUT`) MUST be re-measured with the
   identity exchange in place.
+
+### Network change and the mapping lifecycle (v0.3.1)
+
+Not built. Found by an outside review (2026-10-04) and confirmed in code at integrate `3d5263cf`:
+
+- Nothing listens for the operating system's network changes. `NetPresence::rediscover`
+  (`presence.rs:390`) has no caller. The publish side runs at the presence's start, at a mapping's
+  renewal (half of 2 h) and on a failed family's retry (15 s doubling to 600 s). With no mapping
+  granted it never runs again (`presence.rs:583`).
+- Off Linux the default route is not read (`gateway.rs:114-120`, `gateway.rs:202-208`). macOS asks
+  `x.y.z.1`, `192.0.0.9` and UPnP for IPv4, and only `2001:1::1` for the IPv6 pinhole.
+- Each PCP request draws a fresh nonce (`portmap.rs:139`, `portmap.rs:313`), renewals included. A
+  server in the Simple Threat Model rejects a request for an existing mapping with another nonce
+  (RFC 6887 §11.3).
+- No PCP or NAT-PMP mapping is deleted at stop (`presence.rs:513-526` deletes only a permanent UPnP
+  mapping). A raced candidate's unused grant is left to expire (`reachability.rs:355-361`).
+
+#### Detecting a change
+
+- **N-49.** The daemon MUST learn of a change in the machine's interfaces, addresses or default
+  routes from the operating system, not by polling. On macOS it MUST read a `PF_ROUTE` socket
+  (`RTM_NEWADDR`, `RTM_DELADDR`, `RTM_IFINFO`, `RTM_ADD`, `RTM_DELETE`, `RTM_CHANGE`). On Linux it
+  MUST subscribe to rtnetlink (`RTMGRP_LINK`, `RTMGRP_IPV4_IFADDR`, `RTMGRP_IPV6_IFADDR`,
+  `RTMGRP_IPV4_ROUTE`, `RTMGRP_IPV6_ROUTE`). Elsewhere it MUST say once that changes are not
+  detected.
+- **N-50.** Events MUST be coalesced for `NETWORK_SETTLE` (500 ms) after the last one. A change is
+  real only if the routable addresses (`local_route_ips`) or a default route differ from the
+  previous ones. Events that change neither MUST NOT start N-51.
+- **N-51.** On a real change the daemon MUST, at once and in this order:
+  - discard every observed (reflexive) address (`refresh_observed`);
+  - run the publish side (`rediscover`), dropping mappings held for an internal address the machine
+    no longer has (RFC 6887 §11.5);
+  - publish every attached node's address record to its own board and to every anchor, without
+    waiting for the record's renewal;
+  - redial every peer connected through a connection this end accepted, and every anchor. QUIC
+    lets only the dialling end migrate (RFC 9000 §9), so an accepted connection does not survive
+    the move.
+- **N-52.** The daemon MUST say each real change once in its log and to every attached client:
+  which addresses came and went, which default routes changed, and what was republished
+  (`NodeEvent::NetworkChanged`). `vox status --json` MUST name the time of the last change.
+
+#### Finding the gateway
+
+- **N-53.** The default route's next hop MUST be read from the operating system for IPv4 and IPv6
+  on Linux and macOS. Linux reads `/proc/net/route` and `/proc/net/ipv6_route` as today. macOS
+  MUST read the routing table with `sysctl` (`CTL_NET`, `PF_ROUTE`, `NET_RT_DUMP`) or an `RTM_GET`
+  on the `PF_ROUTE` socket. A link-local IPv6 next hop MUST be paired with its interface index.
+- **N-54.** `vox status --json` MUST name, per address family, the gateway candidates asked, which
+  one answered and on which rung (PCP, NAT-PMP, UPnP-IGD, pinhole), or that none did.
+
+#### The mapping lifecycle
+
+- **N-55.** A PCP mapping MUST keep the nonce it was created with for every renewal and for its
+  deletion (RFC 6887 §11.3, §15). Retransmissions MUST use the same nonce (§8.1.1). Nonces MUST
+  differ between PCP servers (§11.2). A new mapping, including one for a new internal address
+  after N-51, MUST draw a new nonce. Renewal MUST be sent at a uniformly random point in 1/2–5/8 of
+  the granted lifetime. After a failure it MUST be retried at 3/4 and then 7/8 of the lifetime,
+  never less than 4 s apart (§11.2.1).
+- **N-56.** When the daemon stops, it MUST delete every timed mapping it holds, best-effort and
+  bounded by `UNMAP_PATIENCE` (2 s) in all:
+  - PCP: a MAP with Requested Lifetime 0 and the mapping's nonce (§15.1);
+  - NAT-PMP: Requested Lifetime 0 and Suggested External Port 0 (RFC 6886 §3.4);
+  - UPnP-IGD: `DeletePortMapping`, as today for permanent leases.
+- **N-57.** A raced candidate's grant that loses to another MUST be deleted as in N-56 as soon as
+  the race ends.
+
+#### Proofs
+
+- **N-58.** Each of N-49–N-57 MUST have a real-binary proof that a person could repeat:
+  - **Network change (N-49–N-52).** A peer holds a connection to a daemon, and the daemon's machine
+    gains an address and loses the one in use, staged as a real interface change. On Linux this is
+    an unprivileged network namespace (`unshare --user --net`). On macOS it is an alias added to
+    and removed from an interface, an opt-in heavy proof the operator runs with privileges. The
+    daemon MUST say the change, and `vox status --json` MUST show the new advertised addresses
+    within 2 s of the change. The peer MUST read a post sent after the change within 5 s, not after
+    `SILENCE_IS_DEATH`.
+  - **Gateway (N-53, N-54).** `vox status --json` on macOS and on Linux MUST name the same IPv4 and
+    IPv6 default next hops that `route -n get default` and `route -n get -inet6 default` (or `ip
+    route`, `ip -6 route`) print.
+  - **Nonce and deletion (N-55–N-57).** A PCP server stand-in that the proof runs and the daemon is
+    pointed at (`test-knobs` gateway override) MUST see every renewal carry the creation nonce. It
+    MUST see a deletion with that nonce when the daemon stops, and a deletion for every losing
+    grant.
+  - **Real router, opt-in heavy proof.** Against the operator's own router: a mapping granted, on
+    the rung `vox status` names; a renewal with a short requested lifetime; and deletion at stop. The
+    deletion is shown by a later MAP with a fresh nonce for the same internal port succeeding where
+    a held mapping would have refused it (§11.3).
 
 ### Limits
 
