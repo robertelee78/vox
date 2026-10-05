@@ -237,6 +237,31 @@ pub async fn advertise_endpoints(
     (list, pinhole.into_iter().chain(mapped).collect())
 }
 
+/// [`advertise_endpoints`] **without its gateway work**: the routable addresses the socket
+/// listens on, any held mapping still leased, and loopback, composed at once. At a change of the
+/// machine's network (ADR-012 N-51) nodes advertise this straight away; the gateway requests,
+/// seconds of retransmissions against candidates that may not answer, follow in a full discovery.
+pub async fn routable_endpoints(bound: SocketAddr, leased: &[PortMapping]) -> EndpointList {
+    let ips: Vec<IpAddr> = local_route_ips()
+        .await
+        .into_iter()
+        .filter(|ip| listens_on(bound, *ip))
+        .collect();
+    let v6 = ips.iter().find_map(|ip| match ip {
+        IpAddr::V6(a) => Some(*a),
+        IpAddr::V4(_) => None,
+    });
+    let v4 = ips.iter().find_map(|ip| match ip {
+        IpAddr::V4(a) => Some(*a),
+        IpAddr::V6(_) => None,
+    });
+    let held_v4 = leased
+        .iter()
+        .find(|m| m.method != crate::nat::portmap::Method::PcpV6Pinhole)
+        .filter(|_| v4.is_some());
+    compose_endpoints(bound, v6, v4, held_v4)
+}
+
 /// Whether a socket bound to `bound` receives datagrams sent to `ip`: any address of its family
 /// when it is bound to a wildcard (the IPv6 wildcard is dual-stack), else only its own address.
 #[must_use]
