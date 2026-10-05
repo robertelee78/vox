@@ -45,7 +45,7 @@ impl PromptKind {
             PromptKind::CreateIdentity => &["new identity passphrase", "confirm passphrase"],
             PromptKind::CreateChannel => &["room name", "room passphrase", "confirm passphrase"],
             PromptKind::OpenChannel => &["room passphrase"],
-            PromptKind::JoinChannel => &["invite link (vox://…)", "room name", "room passphrase"],
+            PromptKind::JoinChannel => &["room link (vox://…)", "room name", "room passphrase"],
         }
     }
 

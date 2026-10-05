@@ -28,13 +28,13 @@ pub fn breaks_lines(c: char) -> bool {
 }
 
 /// `s` as it may be printed where a person or a model reads it: on one line, every character
-/// that could break it replaced with U+FFFD, every character a reader cannot see shown as an
-/// escape ([`reveal`], #331), and cut to `max` bytes with `…` (V210-123), never inside an escape.
+/// that could break or reorder it and every character a reader cannot see shown as an escape,
+/// `⟨U+XXXX⟩` ([`reveal_keeping`], #331), and cut to `max` bytes with `…` (V210-123), never
+/// inside an escape.
 #[must_use]
 pub fn shown(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max) + 3);
-    for c in reveal(s).chars() {
-        let c = if breaks_lines(c) { '\u{fffd}' } else { c };
+    for c in reveal_keeping(s, |_| false).chars() {
         if out.len() + c.len_utf8() > max {
             // An escape opened and not closed is cut whole.
             if let (Some(open), close) = (out.rfind(ESCAPE_OPEN), out.rfind(ESCAPE_CLOSE)) {
@@ -140,7 +140,7 @@ const SUBDIVISION_FLAGS: [&str; 3] = [
 /// text hidden from a person never reaches a model unseen (#331). A literal `⟨` is escaped too,
 /// so an escape cannot be forged by typing one. A zero-width joiner stays where it joins two
 /// emoji (👨‍👩‍👧, 🏳️‍🌈), and the three subdivision flags stay whole; everywhere else it is
-/// escaped. Line breaks and the bidi controls are left to the caller ([`breaks_lines`]).
+/// escaped. Line breaks and the bidi controls are [`reveal_keeping`]'s.
 #[must_use]
 pub fn reveal(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -168,13 +168,37 @@ pub fn reveal(s: &str) -> String {
                 && chars.get(i + 1).is_some_and(|n| pictographic(*n))
         };
         if c == ESCAPE_OPEN || (hides(c) && !joins_emoji) {
-            out.push(ESCAPE_OPEN);
-            out.push_str(&format!("U+{:04X}", u32::from(c)));
-            out.push(ESCAPE_CLOSE);
+            out.push_str(&escape(c));
         } else {
             out.push(c);
         }
         i += 1;
+    }
+    out
+}
+
+/// `c` as a reader is shown it in place of itself: `⟨U+XXXX⟩`, the one style every printer of
+/// room text uses (#331).
+#[must_use]
+pub fn escape(c: char) -> String {
+    format!("{ESCAPE_OPEN}U+{:04X}{ESCAPE_CLOSE}", u32::from(c))
+}
+
+/// [`reveal`], and every character that could break or reorder a line ([`breaks_lines`]: the
+/// controls, the line and paragraph separators, the bidi controls and directional marks) shown as
+/// an [`escape`] too, except those `keep` says the caller lays out itself (a newline it indents, a
+/// tab). **One style for everything hidden or line-breaking** (#331): before this, a bidi override
+/// printed as `\u{202e}` in `vox room read`, as U+FFFD in the hook's drain and as itself in the
+/// TUI, while a zero-width character printed as `⟨U+200B⟩` in all three.
+#[must_use]
+pub fn reveal_keeping(s: &str, keep: impl Fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in reveal(s).chars() {
+        if breaks_lines(c) && !keep(c) {
+            out.push_str(&escape(c));
+        } else {
+            out.push(c);
+        }
     }
     out
 }

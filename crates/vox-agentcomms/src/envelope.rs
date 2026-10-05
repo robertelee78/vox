@@ -45,7 +45,9 @@ pub const SHOWN_NAME: usize = 64;
 
 /// Whether `c` may not appear in a name printed for somebody reading (V210-123): the rule lives in
 /// `vox-text`, which the core shares for what peers say (V210-154).
-pub use vox_text::{breaks_lines, cut_revealed, hides, reveal};
+pub use vox_text::{
+    breaks_lines, cut_revealed, escape, hides, reveal, reveal_keeping, ESCAPE_CLOSE, ESCAPE_OPEN,
+};
 
 /// One character of each kind [`breaks_lines`] refuses, for a proof to forge a name through
 /// each (as `agent_hook::LINE_BREAKS` is for message rows): a sanitiser that stops refusing any
@@ -69,7 +71,7 @@ pub fn is_valid_name(s: &str, max: usize) -> bool {
 }
 
 /// An author-chosen name as it may be printed where a person or a model reads it: on one
-/// line, every character that could break it replaced with U+FFFD, and cut to `max` bytes
+/// line, every character that could break it shown as `⟨U+XXXX⟩`, and cut to `max` bytes
 /// with `…` (V210-123). [`is_valid_name`] refuses such a name on the way in; this is the
 /// second guard, for every printer, so a name that got in some other way still cannot
 /// start a line.

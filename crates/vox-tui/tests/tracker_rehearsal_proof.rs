@@ -549,7 +549,10 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
                 .expect("PRODUCT: a row of vox room read --json has no entry_hash")
                 .to_owned()
         });
-    for (item, to) in [(item1, "w1"), (item2, "w2")] {
+    // Each worker is addressed by its node, as `--to` takes it (a member's fingerprint, or the
+    // reader's own name for it), not by its agent name: w1 runs on alice's node, w2 on bob's.
+    let (w1_node, w2_node) = (alice.b32(), bob.b32());
+    for (item, to) in [(item1, w1_node.as_str()), (item2, w2_node.as_str())] {
         let o = bob.vox_in(
             Some("tracker"),
             &[

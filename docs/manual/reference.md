@@ -1,0 +1,146 @@
+# Commands and local state
+
+Applies to: v0.3.0. This is a map to the real command help, not a substitute for the parser
+in your installed version.
+
+## Find the right help
+
+```sh
+vox --version
+vox --help
+vox node --help
+vox room --help
+vox room join --help
+vox trust --help
+vox service --help
+vox agent --help
+vox man
+```
+
+`vox man` prints a man page generated from the same command definitions as the CLI. Use a
+subcommand's `--help` when checking a particular argument; an example from a different release
+is not an alias for your parser.
+
+| Intent | Entry point | Prerequisite |
+|---|---|---|
+| Make, attach, list or detach a node | `vox node create`, `attach`, `list`, `detach` | Node passphrase, if it has one |
+| Interactive client | `vox` or `vox tui` | Terminal; a client of the daemon |
+| Run the daemon in a terminal | `vox daemon` | Optional: attaching a node starts one |
+| Run an anchor | `vox node` with no subcommand | A headless node; reachable infrastructure |
+| Ask a node about rooms | `vox room list`, `read`, `roster` | The node attached |
+| Inspect runtime | `vox status`, `vox status --json` | The node attached |
+| Change peer trust | `vox trust add`, `rename`, `remove` | Compared fingerprint; passphrase after 30 minutes |
+| List peer trust | `vox trust list` | The node attached |
+| Room lifecycle | `vox room retention`, `admin`, `leave`, `end` | Creator or admin for the room-wide ones |
+| Share a port in a new room | `vox serve NAME=PORT` | Existing local service |
+| Join a service room | `vox connect ROOM_LINK` | Room link and passphrase |
+| Reach services | `vox up`, `vox forward SERVICE.NODE.ROOM.vox` | Host's trust; proxy or forward running |
+| Close live tunnels | `vox tunnel close` | `vox status` lists them |
+| Exchange file bytes | `vox room send`, `vox share`, `vox room get` | Attached node and a live offer |
+| A room's family LAN | `vox lan up` | `sudo vox lan helper` running |
+| Wire a harness | `vox agent plugin`, `skill`, `trust`, `doctor` | `--node` for plugin and hook |
+
+## Select the node
+
+A node is chosen per command, in this order: `--node NAME`, then `VOX_NODE`, then the only
+attached node, then the only node on disk. When none of these settles it, the command refuses
+and lists the nodes; that is not a corrupt node. Name the node explicitly in scripts and agent
+integrations, so nothing acts as your person's node by accident.
+
+Session-holding commands (`serve`, `connect`, `up`, `forward`, `lan up`) and `vox node attach`
+start the daemon in the background when none runs and attach their node. One-shot commands
+(`room`, `status`, `trust`, `share`, `service`) only ask an attached node, and say so when it is
+not: `vox node attach NAME` first.
+
+Data/config selection follows explicit flags, then `VOX_DATA_DIR` / `VOX_CONFIG_DIR`, then
+XDG/platform defaults. Each data root has its own daemon and nodes, so two shells with different
+roots see different nodes even when both say `--node robertgpt`. A command may create
+directories while resolving paths; do not treat a guessed node name as a harmless diagnostic
+probe.
+
+## Local state
+
+On Linux the usual data root is `~/.local/share/vox/`, unless XDG or Vox overrides select
+another. On macOS the default root is `~/Library/Application Support/vox/`. Config uses the
+corresponding XDG/platform config location; it is not necessarily the same root as data on Linux.
+
+Inside the data root:
+
+- `nodes/NAME/` holds one node: identity material such as `vault.cbor`, the room store
+  `store.redb`, and that node's own `config/`, cursors and agent sessions.
+- `.daemon/` holds the daemon's lock, its control socket `vox.sock`, the port it reuses, the list
+  of nodes kept attached (`attach`), its `config`, and `log`, where a daemon started in the
+  background writes its output.
+
+These are not caches to remove when a join is refused. The source creates private
+directories/files on supported Unix systems; still protect the account and machine that can use
+them. Never attach a state directory, vault, passphrase file or unreviewed config to a bug
+report.
+
+## Passphrase input
+
+The identity passphrase protects a node's key material; an empty one is allowed. A room
+passphrase is a separate join factor. At a terminal, use the masked prompt. For an unattended
+command, use its supported passphrase-file option and restrict the file to the intended OS user.
+
+`node create` and `node attach` read the identity passphrase from `--passphrase-file`; `room
+create` and `room join` read the room passphrase from `--passphrase-file`, where `-` selects
+stdin. Without a terminal or that explicit input, they fail rather than wait on an unattended
+prompt. Commands that change the keyring or a room's retention take
+`--identity-passphrase-file`.
+
+To keep a node attached across daemon restarts:
+
+```sh
+vox node attach robertgpt --keep --passphrase-file PATH_TO_PRIVATE_FILE
+```
+
+The daemon then reads that file at each start. A foreground daemon also takes a passphrase file
+with the identity passphrase on its first line. For explicit room selection, each additional
+room line can be the room ID, one space, and that room's passphrase. The named-room form splits
+at the first space; later spaces belong to the room passphrase. The parser also tries a whole
+line as a passphrase for closed rooms before the named form. A schematic file, not literal
+secrets:
+
+```text
+IDENTITY_PASSPHRASE
+ROOM_ID ROOM_PASSPHRASE
+ANOTHER_ROOM_ID ANOTHER_ROOM_PASSPHRASE
+```
+
+Use `vox daemon --node robertgpt --passphrase-file PATH_TO_PRIVATE_FILE` with the intended file,
+owned by your user and readable only by that user. Store it outside shared repositories; do not
+create it by typing secrets into a shell command that remains in history. This format is
+source-reviewed in the daemon parser, not exercised by the manual's command check.
+
+`--identity-passphrase` and room `--passphrase` are intentionally refused: process arguments
+and shell history expose secrets. `VOX_ROOM_PASSPHRASE` is also refused.
+`VOX_IDENTITY_PASSPHRASE` is supported, but an environment can be read by same-user processes and
+inherited by children. A supported mechanism is not a promise that it is equally private.
+
+Do not write a real passphrase into a documentation example, paste it to a model, or capture
+it in a screenshot. Empty passphrases change at-rest/join protection; an example should not
+silently opt you into that choice.
+
+## Output, cursors and status
+
+Room/member selectors can accept unambiguous prefixes where help says so. A `--since` cursor
+uses the full entry hash returned by a successful read; do not shorten it. `--json` selects
+structured output for commands that advertise it; it is not a universal top-level switch.
+
+A nonzero exit status means inspect the command's explanation. Coordination commands have
+the specific [claim status meanings](agents.md#coordinate-ownership-not-a-second-progress-tracker).
+A hook's zero exit is deliberately not a delivery assertion.
+
+`vox status` shows the node's rooms with each member's trust, connection and last sync, its
+peers with their path (`direct` or relayed) and round-trip time, its tunnels, and anything that
+needs attention. When gathering support evidence, use the smallest relevant status excerpt.
+Paths, aliases, peer addresses, session IDs and even public fingerprints can expose private
+relationships.
+
+Source: [v0.3.0 CLI parser](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
+[node selection](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/client.rs),
+[path resolution](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-core/src/node/paths.rs)
+and [the daemon and its files](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-026-daemon-and-nodes.md).
+The [daemon parser](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/app.rs)
+defines the passphrase-file lines.

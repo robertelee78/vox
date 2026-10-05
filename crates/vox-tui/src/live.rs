@@ -453,9 +453,12 @@ impl DaemonCore {
                 self.asked = None;
                 CommandStatus::Done
             }
+            // **The link is the answer** (#406): set only as a notice, it sat under the "done" this
+            // command's own status puts over every notice, and `:invite` showed a person nothing to
+            // give anyone. A room link is no secret: the passphrase travels apart.
             Ok(Frame::Link { url, .. }) => {
-                self.notice = Some(format!("invite link: {url}"));
-                CommandStatus::Done
+                self.notice = Some(format!("room link: {url}"));
+                CommandStatus::Said(format!("room link: {url}"))
             }
             Ok(Frame::Error { reason }) => failed(&reason),
             Ok(_) => CommandStatus::Failed(UiError::Internal),
@@ -543,7 +546,7 @@ impl DaemonCore {
             // and a count are all public facts; nothing here can carry plaintext or key material
             // (ADR-015).
             NodeEvent::InviteLink { url, .. } => {
-                self.notice = Some(format!("invite link: {url}"));
+                self.notice = Some(format!("room link: {url}"));
             }
             NodeEvent::AddressNote { note, .. }
             | NodeEvent::NodeNote { note }
@@ -551,7 +554,7 @@ impl DaemonCore {
                 self.notice = Some(note);
             }
             NodeEvent::AddressWithheld { reason, .. } => {
-                self.notice = Some(format!("no invite link: {reason}"));
+                self.notice = Some(format!("no room link: {reason}"));
             }
             // **A join this node refused, or one that did not complete, is the operator's to
             // see** (#406): a refusal is security-relevant, and the TUI is the client a person
@@ -746,10 +749,11 @@ impl DaemonCore {
             },
             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
             timestamp: r.created_millis / 1_000,
+            // As `vox room read` and the drain show it, a structured post by its words (#406).
             body: Some(if r.owed {
                 vox_core::node::api::NOT_RECEIVED_YET.to_owned()
             } else {
-                r.text.clone()
+                crate::agent_hook::words(&r.text)
             }),
             late: r.late,
         };
