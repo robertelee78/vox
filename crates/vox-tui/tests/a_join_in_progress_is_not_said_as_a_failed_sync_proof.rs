@@ -15,7 +15,9 @@
 //! records a failed session (CANNOT MEASURE otherwise: there was nothing to stay quiet about), and
 //! she then completed one with him.
 //!
-//! **Asserted:** alice's `vox serve` printed no line saying something did not complete.
+//! **Asserted:** alice's `vox serve` printed no line saying something did not complete, and no
+//! line saying it could not reach bob (his `vox connect` exits after the join, so the address it
+//! joined from answers no more).
 //!
 //! **Mutant:** `JOINER_SEAL_GRACE` of 0 s in the actor, red as `PRODUCT: alice's vox serve
 //! reported a failure during an ordinary join`.
@@ -356,11 +358,14 @@ fn a_join_in_progress_is_not_said_as_a_failed_sync() {
     let serve_said = alice.said("serve");
     let failed: Vec<&str> = serve_said
         .lines()
-        .filter(|l| l.contains("did not complete"))
+        .filter(|l| {
+            l.contains("did not complete")
+                || (l.contains("could not reach") && l.contains(&bob_fp[..26]))
+        })
         .collect();
     println!(
         "[proof] {} of alice's sessions with bob failed during his join (last: {}); her vox serve \
-         said {} line(s) of something that did not complete",
+         said {} line(s) of something that did not complete or of bob it could not reach",
         alice_row["failed"],
         alice_row["last_failure"],
         failed.len()
