@@ -281,7 +281,7 @@ is local destination protection, not a transfer failure.
 Use another output path for a collision. Do not salvage or open a failed `.part` as though
 verified; this workflow rejects incomplete/mismatched transfers and removes its partial file.
 
-**Verify:** the command reports `verified` and names the saved file. If repeated attempts fail,
+**Verify:** the command names the saved file and says it `matches its announced SHA-256`. If repeated attempts fail,
 use a harmless reproduction file and record expected/received byte counts, without publishing
 the private file or treating its hash as anonymous.
 

@@ -1766,7 +1766,7 @@ enum Cmd {
     /// trust you.
     ///
     /// It is the whole 52-character base32 fingerprint, on its own line, so it can be
-    /// piped or pasted without editing. Verify it out of band, the way you would a PGP
+    /// piped or pasted without editing. Compare it out of band, the way you would a PGP
     /// fingerprint: nothing registers it and nothing looks it up.
     Id(IdentityArgs),
     /// Decide which identities this node trusts.
@@ -1778,7 +1778,7 @@ enum Cmd {
     /// Put `vox` on PATH and install tab completion for your shell.
     ///
     /// `install.sh` and `vox update` run this for you. It writes the completion script into
-    /// your shell's own autoload directory and maintains one marked block at the end of your
+    /// your shell's own autoload directory and maintains one marked section at the end of your
     /// shell's startup file — at the end, so it wins the PATH race against version managers
     /// that prepend their shims earlier in the same file. Idempotent; `--remove` undoes it
     /// exactly; `VOX_NO_SHELL_SETUP=1` skips it.

@@ -416,8 +416,8 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         "PRODUCT: bob could not collect the file: stdout={out:?} stderr={err:?}"
     );
     assert!(
-        out.contains("verified"),
-        "PRODUCT: `vox room get` did not say it verified the file: {out:?}"
+        out.contains("matches its announced SHA-256"),
+        "PRODUCT: `vox room get` did not say the file matches its announced SHA-256: {out:?}"
     );
     let got = std::fs::read(&dest).unwrap_or_else(|e| {
         panic!(
