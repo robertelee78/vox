@@ -89,8 +89,8 @@ too if you mean it — nobody can recover a room for you.
 
 The [user manual](docs/manual/README.md) has a complete first-room walkthrough, task guides,
 and troubleshooting organised by symptom. Read the same canonical manual at
-[voxlux.us](https://voxlux.us/docs/manual/); released and development instructions are clearly
-separated there.
+[voxlux.us](https://voxlux.us/docs/manual/). It describes v0.3.0, with a page for readers coming
+from v0.2.10.
 
 ### The daemon and your nodes
 
