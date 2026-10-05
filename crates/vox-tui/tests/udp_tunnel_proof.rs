@@ -29,6 +29,10 @@
 //!    small and oversize payloads intact (ADR-022 5.4, `CIRCUIT_DATAGRAM_MAX`). Relayed path
 //!    only.
 //!
+//! 8. **What a share is** (ADR-028 S-2, #489) — `vox serve` says the DNS responder, on a port
+//!    the system picked, is shared as `dns` (over udp), a UDP echo as plain `udp` and a TCP echo as plain
+//!    `tcp`. Mutation: the kind taken from the port (`dns` for 53) turns it red. Direct path only.
+//!
 //! and M22.4's SOCKS5 `UDP ASSOCIATE` in `vox up`: `.vox` destinations only, `FRAG ≠ 0`
 //! dropped, and the association gone with its TCP control connection.
 //!
@@ -402,6 +406,32 @@ fn serves_udp(path: PathKind) {
         path,
     );
     let guest = w.guest_dir.clone();
+
+    // ---- ADR-028 S-2 (#489): each share says what it was detected to be ----
+    // The responder answers a DNS query, on a port the system picked (never 53), so it is
+    // `dns`; the echo on the TCP service's port answers no query, so it is plain `udp`, and its
+    // TCP twin plain `tcp`. Said once, on the direct path: detection does not depend on it.
+    if path == PathKind::Direct {
+        let host = w.host.as_mut().expect("APPARATUS: the world's host runs");
+        let said = host.transcript();
+        let kind_said = |name: &str| {
+            said.lines()
+                .find(|l| l.starts_with("sharing ") && l.contains(&format!(" as {name}.")))
+                .map(str::to_owned)
+        };
+        for (name, kind) in [
+            (dns.to_string(), "(dns/udp)"),
+            (format!("u{dual}"), "(udp)"),
+            (dual.to_string(), "(tcp)"),
+        ] {
+            let line = kind_said(&name);
+            eprintln!("[test] S-2: {name}: {line:?}");
+            assert!(
+                line.as_deref().is_some_and(|l| l.ends_with(kind)),
+                "PRODUCT: `vox serve` must say it shares `{name}` as {kind}; it said {line:?}:\n{said}"
+            );
+        }
+    }
 
     // ---- proof 1: dig through a UDP forward ----
     let (fwd, at) = w.forward_service("forward", &guest, &format!("{dns}/udp"));

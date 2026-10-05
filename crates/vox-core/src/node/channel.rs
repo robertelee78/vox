@@ -54,6 +54,7 @@ use crate::governance::genesis::{ChannelPolicy, Genesis, HistoryMode};
 use crate::governance::membership::{
     issue_consent_grant, issue_consent_revocation, MembershipView,
 };
+use crate::governance::share::ServiceKind;
 use crate::group::history::OriginKeyStore;
 use crate::group::message::GroupMessage;
 use crate::group::skdm::Skdm;
@@ -224,7 +225,7 @@ pub const UNJOINED_HOLD_SECS: u64 = 30 * 24 * 60 * 60;
 /// At-rest version of the delivery-ledger segment.
 const DELIVERED_VERSION: u64 = 1;
 /// Services encoding version.
-const SERVICES_VERSION: u64 = 1;
+const SERVICES_VERSION: u64 = 2;
 /// The most services one channel may offer — a sanity bound on host config.
 pub const MAX_SERVICES: usize = 64;
 /// Manifest encoding version.
@@ -664,6 +665,9 @@ pub struct ChannelState {
     /// The services this node offers in this channel (ADR-013 Bind config, M16.1),
     /// persisted in `SEG_SERVICES` — except those in `transient`.
     services: BTreeMap<String, SocketAddr>,
+    /// What each shared service in `services` was detected to be when it was shared (ADR-028
+    /// S-2), persisted with it, so a share said only once the room settles says the same kind.
+    kinds: BTreeMap<String, ServiceKind>,
     /// The tags in `services` that live only as long as whatever offered them (V210-72): a
     /// `vox room send` offer, withdrawn when its process goes. Never persisted, so a node
     /// that stops while one runs does not come back offering a port nobody serves any more.
@@ -793,7 +797,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
 
 /// The admitted-authors segment: `[version, [[fingerprint, composite_pubkey], …]]`
 /// in fingerprint order (a `BTreeMap`, so the bytes are canonical).
-/// The offered-services segment: `[version, [[tag, addr_text], …]]` in tag order (a
+/// The offered-services segment: `[version, [[tag, addr_text, kind], …]]` in tag order (a
 /// `BTreeMap`, so the bytes are canonical). Addresses are the standard `ip:port`
 /// text, which round-trips exactly.
 /// A service shared in a room (V030-25), as the log says.
@@ -805,6 +809,8 @@ pub struct Share {
     pub name: String,
     /// Whether it carries datagrams (ADR-022).
     pub udp: bool,
+    /// What it is, as its sharer's node detected it (ADR-028 S-2).
+    pub kind: ServiceKind,
 }
 
 /// A service's name from its tag: a UDP service's tag is `udp/<name>` (ADR-022 decision 6), and
@@ -814,11 +820,14 @@ pub fn service_name(service_tag: &str) -> &str {
     service_tag.strip_prefix("udp/").unwrap_or(service_tag)
 }
 
-fn services_bytes(services: &BTreeMap<String, SocketAddr>) -> Vec<u8> {
+fn services_bytes(services: &BTreeMap<String, (SocketAddr, ServiceKind)>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(SERVICES_VERSION).array(services.len());
-    for (tag, addr) in services {
-        e.array(2).text(tag).text(&addr.to_string());
+    for (tag, (addr, kind)) in services {
+        e.array(3)
+            .text(tag)
+            .text(&addr.to_string())
+            .text(kind.as_str());
     }
     e.finish()
 }
@@ -989,7 +998,9 @@ fn parse_delivered(bytes: &[u8]) -> Result<BTreeMap<Digest32, u64>> {
     Ok(out)
 }
 
-fn parse_services(bytes: &[u8]) -> Result<BTreeMap<String, SocketAddr>> {
+type Services = (BTreeMap<String, SocketAddr>, BTreeMap<String, ServiceKind>);
+
+fn parse_services(bytes: &[u8]) -> Result<Services> {
     let mut d = Decoder::new(bytes);
     if d.array()? != 2 {
         return Err(Error::MalformedAtRest("room services arity"));
@@ -1002,8 +1013,9 @@ fn parse_services(bytes: &[u8]) -> Result<BTreeMap<String, SocketAddr>> {
         return Err(Error::SizeLimitExceeded("room services"));
     }
     let mut out = BTreeMap::new();
+    let mut kinds = BTreeMap::new();
     for _ in 0..n {
-        if d.array()? != 2 {
+        if d.array()? != 3 {
             return Err(Error::MalformedAtRest("room service tuple arity"));
         }
         let tag = d.text()?.to_owned();
@@ -1011,13 +1023,16 @@ fn parse_services(bytes: &[u8]) -> Result<BTreeMap<String, SocketAddr>> {
             .text()?
             .parse()
             .map_err(|_| Error::MalformedAtRest("room service address"))?;
+        let kind =
+            ServiceKind::from_word(d.text()?).ok_or(Error::MalformedAtRest("room service kind"))?;
         if tag.is_empty() || tag.len() > crate::tunnel::session::MAX_SERVICE_TAG_LEN {
             return Err(Error::MalformedAtRest("room service tag length"));
         }
+        kinds.insert(tag.clone(), kind);
         out.insert(tag, addr);
     }
     d.finish()?;
-    Ok(out)
+    Ok((out, kinds))
 }
 
 pub(crate) fn authors_bytes(authors: &BTreeMap<Digest32, CompositePublicKey>) -> Vec<u8> {
@@ -1381,6 +1396,7 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            kinds: BTreeMap::new(),
             transient: BTreeSet::new(),
             // This node made the channel, so the genesis names it and nothing else needs
             // to (M17.6).
@@ -1685,13 +1701,13 @@ impl ChannelState {
             None => BootstrapSet::new(),
         };
         // The services this node offers here (ADR-013 M16.1).
-        let services =
+        let (services, kinds) =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_SERVICES)? {
                 Some(seg) => {
                     let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_SERVICES, &seg)?;
                     parse_services(&bytes)?
                 }
-                None => BTreeMap::new(),
+                None => (BTreeMap::new(), BTreeMap::new()),
             };
         // How this node came to be a member here (M17.6). A joined room holds the witness to its
         // join (`SEG_ADMISSION`, written with the room). **A room this node created holds none:
@@ -1795,6 +1811,7 @@ impl ChannelState {
             receivers,
             anchors,
             services,
+            kinds,
             transient: BTreeSet::new(),
             own_admission,
             origins,
@@ -2034,6 +2051,7 @@ impl ChannelState {
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
             services: BTreeMap::new(),
+            kinds: BTreeMap::new(),
             transient: BTreeSet::new(),
             // The join witness the responder signed (M17.6), written with the room above.
             own_admission,
@@ -2289,6 +2307,7 @@ impl ChannelState {
         profile: &Profile,
         service_tag: &str,
         local: SocketAddr,
+        kind: ServiceKind,
         persist: bool,
     ) -> Result<bool> {
         if service_tag.is_empty() || service_tag.len() > crate::tunnel::session::MAX_SERVICE_TAG_LEN
@@ -2319,6 +2338,7 @@ impl ChannelState {
             return Err(Error::SizeLimitExceeded("room services"));
         }
         self.services.insert(service_tag.to_owned(), local);
+        self.kinds.insert(service_tag.to_owned(), kind);
         if persist {
             self.transient.remove(service_tag);
         } else {
@@ -2345,6 +2365,7 @@ impl ChannelState {
             service_name(service_tag),
             crate::tunnel::udp::is_udp(service_tag),
             shared,
+            self.kind_of(service_tag),
         )?;
         self.append_governance(profile, &statement.to_wire(), now_secs)?;
         Ok(())
@@ -2373,6 +2394,15 @@ impl ChannelState {
         Ok(!unsaid.is_empty())
     }
 
+    /// What `service_tag` was detected to be when it was offered (ADR-028 S-2); a tag offered
+    /// with no detection, or no longer offered, is plain `tcp` or `udp`.
+    fn kind_of(&self, service_tag: &str) -> ServiceKind {
+        self.kinds
+            .get(service_tag)
+            .copied()
+            .unwrap_or_else(|| ServiceKind::plain(crate::tunnel::udp::is_udp(service_tag)))
+    }
+
     /// Whether `service_tag` is offered and persisted: a share, not a transient offer.
     #[must_use]
     pub fn is_shared(&self, service_tag: &str) -> bool {
@@ -2384,7 +2414,8 @@ impl ChannelState {
     /// that has left shares nothing.
     #[must_use]
     pub fn shares(&self) -> Vec<Share> {
-        let mut last: BTreeMap<(Digest32, String), (u64, bool, bool)> = BTreeMap::new();
+        let mut last: BTreeMap<(Digest32, String), (u64, bool, bool, ServiceKind)> =
+            BTreeMap::new();
         for g in &self.gov_entries {
             let GovBody::ServiceShare(s) = &g.body else {
                 continue;
@@ -2393,13 +2424,18 @@ impl ChannelState {
                 continue;
             }
             let key = (g.author_id, s.body.name.clone());
-            if last.get(&key).is_none_or(|(seq, _, _)| *seq < g.seq) {
-                last.insert(key, (g.seq, s.body.udp, s.body.shared));
+            if last.get(&key).is_none_or(|(seq, ..)| *seq < g.seq) {
+                last.insert(key, (g.seq, s.body.udp, s.body.shared, s.body.kind));
             }
         }
         last.into_iter()
-            .filter(|((host, _), (_, _, shared))| *shared && !self.has_left(host))
-            .map(|((host, name), (_, udp, _))| Share { host, name, udp })
+            .filter(|((host, _), (_, _, shared, _))| *shared && !self.has_left(host))
+            .map(|((host, name), (_, udp, _, kind))| Share {
+                host,
+                name,
+                udp,
+                kind,
+            })
             .collect()
     }
 
@@ -2408,6 +2444,7 @@ impl ChannelState {
         if self.services.remove(service_tag).is_none() {
             return Ok(false);
         }
+        self.kinds.remove(service_tag);
         self.transient.remove(service_tag);
         self.persist_services(store)?;
         Ok(true)
@@ -2429,7 +2466,13 @@ impl ChannelState {
                     .services
                     .iter()
                     .filter(|(tag, _)| !self.transient.contains(*tag))
-                    .map(|(tag, at)| (tag.clone(), *at))
+                    .map(|(tag, at)| {
+                        let kind =
+                            self.kinds.get(tag).copied().unwrap_or_else(|| {
+                                ServiceKind::plain(crate::tunnel::udp::is_udp(tag))
+                            });
+                        (tag.clone(), (*at, kind))
+                    })
                     .collect(),
             ),
         )?;

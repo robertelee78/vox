@@ -1353,9 +1353,9 @@ pub enum Frame {
         room: String,
         /// `(service tag, local address)`, in the node's order.
         services: Vec<(String, String)>,
-        /// What every member shares in the room (V030-25): `(address, sharer, udp)`, each as
-        /// this node writes it.
-        shared: Vec<(String, String, bool)>,
+        /// What every member shares in the room (V030-25): `(address, sharer, udp, kind)`, each
+        /// as this node writes it, the kind as its sharer's node detected it (ADR-028 S-2).
+        shared: Vec<(String, String, bool, String)>,
     },
 }
 
@@ -1476,8 +1476,12 @@ impl Frame {
                     e.array(2).text(tag).text(local);
                 }
                 e.array(shared.len());
-                for (address, who, udp) in shared {
-                    e.array(3).text(address).text(who).uint(u64::from(*udp));
+                for (address, who, udp, kind) in shared {
+                    e.array(4)
+                        .text(address)
+                        .text(who)
+                        .uint(u64::from(*udp))
+                        .text(kind);
                 }
             }
         }
@@ -1981,7 +1985,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             for _ in 0..count {
                 if d.array()
                     .map_err(|_| Error::MalformedIpc("ipc shared row"))?
-                    != 3
+                    != 4
                 {
                     return Err(Error::MalformedIpc("ipc shared row arity"));
                 }
@@ -1991,7 +1995,8 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .uint()
                     .map_err(|_| Error::MalformedIpc("ipc shared udp"))?
                     != 0;
-                shared.push((address, who, udp));
+                let kind = text(d, "ipc shared kind")?;
+                shared.push((address, who, udp, kind));
             }
             return Ok(Frame::Services {
                 room,
@@ -3658,11 +3663,20 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                     reason: format!("not a local address: {local:?}"),
                 };
             };
+            // A share says what it is (ADR-028 S-2), detected here, off the node's actor; a
+            // transient offer (a file being handed over) is no share and is not probed.
+            let udp = crate::tunnel::udp::is_udp(&service_tag);
+            let kind = if persist {
+                crate::node::probe::detect(local, udp).await
+            } else {
+                crate::governance::share::ServiceKind::plain(udp)
+            };
             match handle
                 .apply(crate::node::api::NodeCommand::AddService {
                     channel_id,
                     service_tag,
                     local,
+                    kind,
                     // Offered over this socket, it lasts as long as the client's connection
                     // (`Held`), and so never outlives this node's run either — unless the client
                     // asked for it kept, as `vox service add` does (V030-06).

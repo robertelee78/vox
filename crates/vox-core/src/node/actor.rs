@@ -1320,8 +1320,9 @@ enum NetEvent {
         now: u64,
         /// The room key and its sealed wrap, or why sealing failed.
         sealed: crate::error::Result<(crate::atrest::sek::Sek, crate::atrest::SekWrap)>,
-        /// For `vox serve`: the one service the room is made for, as (tag, endpoint).
-        service: Option<(String, SocketAddr)>,
+        /// For `vox serve`: the one service the room is made for, as (tag, endpoint, the kind
+        /// detected for it).
+        service: Option<(String, SocketAddr, crate::governance::share::ServiceKind)>,
     },
     /// A room's key was unwrapped and its log re-verified on a blocking thread (the slow part of
     /// opening a room with its passphrase, V210-71): hold the room and answer the command.
@@ -3536,11 +3537,14 @@ impl NodeHandle {
         self.view_rx.clone()
     }
 
-    /// The services shared in an open room (V030-25), each as `(address, sharer, udp)`: its
+    /// The services shared in an open room (V030-25), each as `(address, sharer, udp, kind)`: its
     /// address and its sharer written as **this** node writes them — its own aliases for the
     /// node and the room where it has them, the fingerprints where it has not — or `None` if the
     /// room is not open.
-    pub async fn shared_in(&self, channel_id: Digest32) -> Option<Vec<(String, String, bool)>> {
+    pub async fn shared_in(
+        &self,
+        channel_id: Digest32,
+    ) -> Option<Vec<(String, String, bool, String)>> {
         let detail = self.open_detail(channel_id).await?;
         let (tx, rx) = oneshot::channel();
         self.net_tx.send(NetEvent::Names(tx)).await.ok()?;
@@ -3561,7 +3565,12 @@ impl NodeHandle {
                     } else {
                         names.alias_of(&s.host)
                     };
-                    (names.address_of(&channel_id, &s.host, &s.name), who, s.udp)
+                    (
+                        names.address_of(&channel_id, &s.host, &s.name),
+                        who,
+                        s.udp,
+                        s.kind.as_str().to_owned(),
+                    )
                 })
                 .collect(),
         )
@@ -4914,9 +4923,10 @@ impl Node {
                 channel_id,
                 service_tag,
                 local,
+                kind,
                 persist,
             } => {
-                self.add_service(&channel_id, &service_tag, local, persist)
+                self.add_service(&channel_id, &service_tag, local, kind, persist)
                     .await
             }
             NodeCommand::RemoveService {
@@ -6658,8 +6668,8 @@ impl Node {
                         ) {
                             Ok(ch) => match service {
                                 None => self.finish_create_channel(ch).await,
-                                Some((tag, endpoint)) => {
-                                    self.finish_serve_room(ch, &tag, endpoint).await
+                                Some((tag, endpoint, kind)) => {
+                                    self.finish_serve_room(ch, &tag, endpoint, kind).await
                                 }
                             },
                             Err(e) => Outcome::Failed(fault_of(&e)),
@@ -12525,8 +12535,21 @@ impl Node {
         let reply = AnsweredIfAborted(Some(reply));
         self.reap_join_tasks();
         self.join_tasks.spawn(async move {
-            let sealed =
-                seal_off_actor(&secret_work, &factor_id, sek, seal_passphrase, argon2).await;
+            // What the service is (ADR-028 S-2), detected while the key is sealed.
+            let detect = async {
+                match service {
+                    Some((tag, endpoint)) => {
+                        let udp = crate::tunnel::udp::is_udp(&tag);
+                        let kind = crate::node::probe::detect(endpoint, udp).await;
+                        Some((tag, endpoint, kind))
+                    }
+                    None => None,
+                }
+            };
+            let (sealed, service) = tokio::join!(
+                seal_off_actor(&secret_work, &factor_id, sek, seal_passphrase, argon2),
+                detect
+            );
             let Some(reply) = reply.into_reply() else {
                 return;
             };
@@ -12556,8 +12579,9 @@ impl Node {
         channel: ChannelState,
         tag: &'a str,
         endpoint: SocketAddr,
+        kind: crate::governance::share::ServiceKind,
     ) -> Boxed<'a, Outcome> {
-        Box::pin(self.finish_serve_room_unboxed(channel, tag, endpoint))
+        Box::pin(self.finish_serve_room_unboxed(channel, tag, endpoint, kind))
     }
 
     /// [`Self::finish_serve_room`], unboxed: see [`Boxed`].
@@ -12566,6 +12590,7 @@ impl Node {
         mut channel: ChannelState,
         tag: &str,
         endpoint: SocketAddr,
+        kind: crate::governance::share::ServiceKind,
     ) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -12575,7 +12600,7 @@ impl Node {
         // Offered and said to the room (V030-25) together: a share its members cannot list is
         // half a share.
         if let Err(e) = channel
-            .add_service(profile.store(), profile, tag, endpoint, true)
+            .add_service(profile.store(), profile, tag, endpoint, kind, true)
             .and_then(|_| channel.say_share(profile, tag, true, now))
         {
             // Drop the room rather than keep a half-made one. Nothing outside this
@@ -13453,6 +13478,7 @@ impl Node {
         channel_id: &Digest32,
         service_tag: &str,
         local: std::net::SocketAddr,
+        kind: crate::governance::share::ServiceKind,
         persist: bool,
     ) -> Outcome {
         let Some(profile) = self.profile.as_ref() else {
@@ -13465,7 +13491,7 @@ impl Node {
         let outcome = {
             let mut channel = shared.lock().await;
             channel
-                .add_service(profile.store(), profile, service_tag, local, persist)
+                .add_service(profile.store(), profile, service_tag, local, kind, persist)
                 .and_then(|_| {
                     // A share is said to the room so its members can list it (V030-25); a
                     // transient offer — a file being handed over — is not a share. If it cannot

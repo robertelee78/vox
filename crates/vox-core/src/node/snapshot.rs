@@ -41,7 +41,7 @@ pub struct OpenRoomSnap {
     pub members: Vec<Digest32>,
     /// Who this identity consents to reading it here, in fingerprint order.
     pub consented: Vec<Digest32>,
-    /// What every member shares here: `(sharer, name, udp)`.
+    /// What every member shares here: `(sharer, name, udp, kind)`.
     pub shares: Vec<crate::node::channel::Share>,
     /// The members held back for equivocating: `(author, seq)`.
     pub equivocations: Vec<(Digest32, u64)>,
@@ -132,10 +132,11 @@ impl NodeSnapshot {
             digests(&mut e, &o.consented);
             e.array(o.shares.len());
             for s in &o.shares {
-                e.array(3)
+                e.array(4)
                     .bytes(&s.host)
                     .text(&s.name)
-                    .uint(u64::from(s.udp));
+                    .uint(u64::from(s.udp))
+                    .text(s.kind.as_str());
             }
             e.array(o.equivocations.len());
             for (author, seq) in &o.equivocations {
@@ -213,11 +214,20 @@ impl NodeSnapshot {
             let consented = read_digests(&mut d)?;
             let mut shares = Vec::new();
             for _ in 0..d.array().map_err(bad("ipc snapshot shares"))? {
-                want(&mut d, 3, "ipc snapshot share")?;
+                want(&mut d, 4, "ipc snapshot share")?;
                 let host = digest(&mut d)?;
                 let name = d.text().map_err(bad("ipc snapshot share name"))?.to_owned();
                 let udp = d.uint().map_err(bad("ipc snapshot share udp"))? != 0;
-                shares.push(crate::node::channel::Share { host, name, udp });
+                let kind = crate::governance::share::ServiceKind::from_word(
+                    d.text().map_err(bad("ipc snapshot share kind"))?,
+                )
+                .ok_or(Error::MalformedIpc("ipc snapshot share kind"))?;
+                shares.push(crate::node::channel::Share {
+                    host,
+                    name,
+                    udp,
+                    kind,
+                });
             }
             let mut equivocations = Vec::new();
             for _ in 0..d.array().map_err(bad("ipc snapshot equivocations"))? {
@@ -386,6 +396,7 @@ mod tests {
                     host: [4; 32],
                     name: "web".into(),
                     udp: true,
+                    kind: crate::governance::share::ServiceKind::Dns,
                 }],
                 equivocations: vec![([4; 32], 7)],
             }],
