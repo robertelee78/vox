@@ -1,14 +1,25 @@
-//! PRD-001 R30/R31 — **an app embeds the node**, proved with the shipped artifact driven
-//! the way an app drives it.
+//! PRD-001 R30/R31, ADR-014 M-2–M-6 — **a Swift app uses Vox through VoxFFI**, proved with the
+//! shipped artifact driven the way an app drives it.
 //!
-//! `scripts/build-xcframework.sh` builds `VoxFFI.xcframework` and its Swift bindings; a
-//! Swift program (`crates/vox-ffi/swift-harness/main.swift`) is compiled with `swiftc`
-//! against the macOS slice, so what runs is the static library an app links and the Swift
-//! an app calls — nothing in between. On the other side is a real `vox daemon`, driven by
-//! the real `vox` verbs: its identity is made by `vox id`, and no participant but the
-//! Swift app's embedded node is anything other than the shipped `vox` binary.
+//! `scripts/build-xcframework.sh` builds `VoxFFI.xcframework` and its Swift bindings; two Swift
+//! programs (`crates/vox-ffi/swift-harness/{client,node}/main.swift`) are compiled with `swiftc`
+//! against the macOS slice, so what runs is the static library an app links and the Swift an app
+//! calls — nothing in between. Every other participant is the shipped `vox` binary, driven by the
+//! real `vox` verbs.
 //!
-//! What must hold:
+//! **The macOS app's client** (`VoxClient`, ADR-014 M-2): the Swift program hosts no node. It
+//! reaches the account's real `vox daemon`, attaches a node made by `vox node create` with that
+//! node's passphrase, and acts as it. What must hold:
+//!
+//! 1. It joins a room a peer (a second `vox daemon`, its own data root) created, and its post shows
+//!    in the peer's `vox room read`; read back at once, its own room holds the post: a post is
+//!    answered once the node has it.
+//! 2. A message the peer posts reaches the Swift program **through its listener**.
+//! 3. When the client closes, the daemon detaches the node it attached (`vox node list` says
+//!    `detached`): the app's hold ends with it (M-6).
+//!
+//! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
+//! the node in its own process, against a real `vox daemon`. What must hold:
 //!
 //! 1. The embedded node joins a room the daemon created, and its post shows in the
 //!    daemon's `vox room read`.
@@ -27,7 +38,7 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
@@ -50,6 +61,8 @@ impl Drop for Proc {
 struct Daemon {
     data: PathBuf,
     cfg: PathBuf,
+    /// The identity passphrase its verbs are given.
+    identity: &'static str,
 }
 
 impl Daemon {
@@ -58,7 +71,7 @@ impl Daemon {
         c.args(args)
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
-            .env("VOX_IDENTITY_PASSPHRASE", "daemon identity")
+            .env("VOX_IDENTITY_PASSPHRASE", self.identity)
             .env_remove("VOX_ROOM")
             .env_remove("VOX_ANCHORS");
         c
@@ -89,8 +102,27 @@ impl Daemon {
     }
 }
 
-/// Build the xcframework and the harness, exactly as a person would.
-fn build_harness(out: &Path) -> PathBuf {
+/// The two Swift programs, built once for every test in this binary.
+struct Harnesses {
+    /// `swift-harness/client`: the macOS app's `VoxClient`.
+    client: PathBuf,
+    /// `swift-harness/node`: the iOS app's `VoxNode`.
+    node: PathBuf,
+}
+
+/// Build the xcframework and both harnesses, exactly as a person would, once.
+fn harnesses() -> &'static Harnesses {
+    static BUILT: OnceLock<(tempfile::TempDir, Harnesses)> = OnceLock::new();
+    &BUILT
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let built = build_harnesses(dir.path());
+            (dir, built)
+        })
+        .1
+}
+
+fn build_harnesses(out: &Path) -> Harnesses {
     // The script runs rustup and cargo: they get the operator's toolchain homes. Under the
     // proof's temporary HOME the rustup proxy found no toolchain, downloaded a bare one, and the
     // script refused for want of the iOS targets the operator's toolchain has.
@@ -122,32 +154,39 @@ fn build_harness(out: &Path) -> PathBuf {
         );
     }
     let lib = out.join("VoxFFI.xcframework/macos-arm64");
-    let harness = out.join("harness");
-    let swiftc = Command::new("swiftc")
-        .arg("-O")
-        .arg("-o")
-        .arg(&harness)
-        .arg(root().join("crates/vox-ffi/swift-harness/main.swift"))
-        .arg(out.join("swift/vox_ffi.swift"))
-        .arg("-I")
-        .arg(lib.join("Headers"))
-        .arg("-L")
-        .arg(&lib)
-        .args([
-            "-lvox_ffi",
-            "-framework",
-            "Security",
-            "-framework",
-            "SystemConfiguration",
-        ])
-        .output()
-        .expect("run swiftc");
-    assert!(
-        swiftc.status.success(),
-        "swiftc failed: {}",
-        String::from_utf8_lossy(&swiftc.stderr)
-    );
-    harness
+    let swiftc = |program: &str| {
+        let harness = out.join(format!("{program}-harness"));
+        let swiftc = Command::new("swiftc")
+            .arg("-O")
+            .arg("-o")
+            .arg(&harness)
+            .arg(root().join(format!("crates/vox-ffi/swift-harness/{program}/main.swift")))
+            .arg(out.join("swift/vox_ffi.swift"))
+            .arg("-I")
+            .arg(lib.join("Headers"))
+            .arg("-L")
+            .arg(&lib)
+            .args([
+                "-lvox_ffi",
+                "-framework",
+                "Security",
+                "-framework",
+                "SystemConfiguration",
+            ])
+            .output()
+            .expect("APPARATUS: could not start swiftc");
+        assert!(
+            swiftc.status.success(),
+            "PRODUCT (staging): swiftc refused the {program} harness against the generated \
+             bindings: {}",
+            String::from_utf8_lossy(&swiftc.stderr)
+        );
+        harness
+    };
+    Harnesses {
+        client: swiftc("client"),
+        node: swiftc("node"),
+    }
 }
 
 /// Read a child's stdout on a thread, as lines.
@@ -175,7 +214,7 @@ fn expect(rx: &mpsc::Receiver<String>, seen: &Arc<Mutex<Vec<String>>>, prefix: &
             Ok(line) => {
                 seen.lock().unwrap().push(line.clone());
                 if line.starts_with("ERROR") {
-                    panic!("the harness failed: {line}");
+                    panic!("PRODUCT: a VoxFFI call failed in the Swift program: {line}");
                 }
                 if line.starts_with(prefix) {
                     return line;
@@ -186,9 +225,83 @@ fn expect(rx: &mpsc::Receiver<String>, seen: &Arc<Mutex<Vec<String>>>, prefix: &
         }
     }
     panic!(
-        "the harness never said {prefix:?}; it said: {:?}",
+        "PRODUCT: the Swift program never said {prefix:?} (each line follows a VoxFFI call \
+         answering); it said: {:?}",
         seen.lock().unwrap()
     );
+}
+
+impl Daemon {
+    /// Start a real `vox daemon` on this data root with `stdin` piped in, and wait until its
+    /// control socket is up. Its stdout is kept read for as long as it runs.
+    fn start(&self, stdin: &str) -> (Proc, mpsc::Receiver<String>) {
+        let mut daemon = self
+            .command(&["daemon", "--listen", "127.0.0.1:0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("APPARATUS: could not start vox daemon");
+        daemon
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        let out = lines(daemon.stdout.take().unwrap());
+        let daemon = Proc(daemon);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        expect(&out, &seen, "vox daemon: control socket");
+        (daemon, out)
+    }
+
+    /// A room this daemon's node creates, and its link.
+    fn room(&self) -> (String, String) {
+        self.run(
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "calls",
+            ],
+            "room passphrase\n",
+        );
+        let room = self
+            .run(&["room", "list"], "")
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        let link = self.run(&["room", "link", &room], "").trim().to_owned();
+        (room, link)
+    }
+
+    /// Its node's identity, made by `vox id` as a person setting up a profile would.
+    fn id(&self) -> String {
+        let fp = self.run(&["id"], "").trim().to_owned();
+        assert_eq!(
+            fp.len(),
+            vox_core::node::link::B32_DIGEST_LEN,
+            "PRODUCT: `vox id` must print the whole fingerprint: {fp:?}"
+        );
+        fp
+    }
+
+    /// Wait until this daemon's `vox room read` shows `text`, and return what it showed.
+    fn read_until(&self, room: &str, text: &str) -> String {
+        let until = Instant::now() + TIMEOUT;
+        let mut read = String::new();
+        while Instant::now() < until {
+            read = self.run(&["room", "read", room], "");
+            if read.contains(text) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        read
+    }
 }
 
 /// A `vox app listen` on the daemon whose output is fed straight back into it: an echo.
@@ -226,64 +339,24 @@ fn echo_listener(d: &Daemon, room: &str, label: &str, limit: Option<usize>) -> P
 #[ignore = "builds the xcframework, compiles Swift, runs a real daemon; CI runs it in release on macOS"]
 fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
     let tmp = tempfile::tempdir().unwrap();
-    // Built before the watchdog is armed: the build is four release compiles of the whole
-    // workspace plus the bindings, ten minutes on a CI runner, and the 600 s budget bounds a hung
-    // *proof*, not cargo (#257: the watchdog killed aws-lc-sys's build script mid-compile). The
-    // CI job's own timeout still bounds a build that never ends.
-    let harness = build_harness(&tmp.path().join("build"));
+    // Built before the watchdog is armed: the build is a release compile of the workspace plus
+    // the bindings, minutes on a CI runner, and the 600 s budget bounds a hung *proof*, not cargo
+    // (#257: the watchdog killed aws-lc-sys's build script mid-compile).
+    let harness = &harnesses().node;
     watchdog::arm();
 
-    // The daemon's identity, made by `vox id` as a person setting up a profile would,
-    // then the profile handed to a real `vox daemon`.
+    // The daemon's identity, then the profile handed to a real `vox daemon`.
     let d = Daemon {
         data: tmp.path().join("daemon/data"),
         cfg: tmp.path().join("daemon/cfg"),
+        identity: "daemon identity",
     };
-    let daemon_fp = d.run(&["id"], "").trim().to_owned();
-    assert_eq!(
-        daemon_fp.len(),
-        vox_core::node::link::B32_DIGEST_LEN,
-        "`vox id` must print the whole fingerprint: {daemon_fp:?}"
-    );
-    let mut daemon = d
-        .command(&["daemon", "--listen", "127.0.0.1:0"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    daemon
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"daemon identity\n")
-        .unwrap();
-    let daemon_out = lines(daemon.stdout.take().unwrap());
-    let _daemon = Proc(daemon);
-    let dseen = Arc::new(Mutex::new(Vec::new()));
-    expect(&daemon_out, &dseen, "vox daemon: control socket");
-
-    d.run(
-        &[
-            "room",
-            "create",
-            "--passphrase-file",
-            "-",
-            "--name",
-            "calls",
-        ],
-        "room passphrase\n",
-    );
-    let room = d
-        .run(&["room", "list"], "")
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
-    let link = d.run(&["room", "link", &room], "").trim().to_owned();
+    let daemon_fp = d.id();
+    let (_daemon, _daemon_out) = d.start("daemon identity\n");
+    let (room, link) = d.room();
 
     // The app.
-    let mut app = Command::new(&harness)
+    let mut app = Command::new(harness)
         .args([
             tmp.path().join("app").to_str().unwrap(),
             &link,
@@ -307,15 +380,7 @@ fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
     d.run(&["trust", "add", &app_fp, "--name", "swift"], "");
 
     // (1) The app's post, as the daemon's own `vox room read` shows it.
-    let until = Instant::now() + TIMEOUT;
-    let mut read = String::new();
-    while Instant::now() < until {
-        read = d.run(&["room", "read", &room], "");
-        if read.contains("hello from swift") {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    let read = d.read_until(&room, "hello from swift");
 
     // The daemon's listeners, then the daemon's message, then go.
     let _echo = echo_listener(&d, &room, "echo/v1", Some(1 << 20));
@@ -350,4 +415,112 @@ fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
     );
     assert_eq!(dgrams, "DGRAMS 100", "all 100 datagrams must come back");
     assert_eq!(got, "GOT hello from daemon");
+}
+
+#[test]
+#[ignore = "builds the xcframework, compiles Swift, runs two real daemons; run on macOS by hand"]
+fn a_swift_app_acts_as_a_node_through_the_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Built before the watchdog is armed, as above.
+    let harness = &harnesses().client;
+    watchdog::arm();
+
+    // The peer: another data root, its own `vox daemon`, its node made by `vox id`.
+    let peer = Daemon {
+        data: tmp.path().join("peer/data"),
+        cfg: tmp.path().join("peer/cfg"),
+        identity: "peer identity",
+    };
+    let peer_fp = peer.id();
+    let (_peer_daemon, _peer_out) = peer.start("peer identity\n");
+    let (room, link) = peer.room();
+
+    // The app's data root: its daemon runs first, with no node, then the node is made by
+    // `vox node create`, so nothing but the app attaches it.
+    let mine = Daemon {
+        data: tmp.path().join("app/data"),
+        cfg: tmp.path().join("app/cfg"),
+        identity: "alice identity",
+    };
+    let (_daemon, _daemon_out) = mine.start("");
+    mine.run(&["node", "create", "alice"], "");
+
+    let mut app = Command::new(harness)
+        .args([
+            mine.data.to_str().unwrap(),
+            "alice",
+            "alice identity",
+            &link,
+            "room passphrase",
+            &peer_fp,
+        ])
+        .env("VOX_DATA_DIR", &mine.data)
+        .env("VOX_CONFIG_DIR", &mine.cfg)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("APPARATUS: could not start the Swift program");
+    let mut to_app = app.stdin.take().unwrap();
+    let from_app = lines(app.stdout.take().unwrap());
+    let _app = Proc(app);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+
+    let app_fp = expect(&from_app, &seen, "FP ")[3..].to_owned();
+    let listed = mine.run(&["node", "list"], "");
+    let joined = expect(&from_app, &seen, "JOINED ");
+    let posted = expect(&from_app, &seen, "POSTED ");
+    // The peer decides to trust the app's node, as a person would with `vox trust add`.
+    peer.run(&["trust", "add", &app_fp, "--name", "swift"], "");
+
+    // (1) The app's post, as the peer's own `vox room read` shows it.
+    let read = peer.read_until(&room, "hello from swift");
+    // (2) The peer's message, through the listener.
+    peer.run(&["room", "post", &room, "hello from the peer"], "");
+    writeln!(to_app).unwrap();
+    let got = expect(&from_app, &seen, "GOT hello from the peer");
+    // (3) The app closes; the daemon lets the node go.
+    writeln!(to_app).unwrap();
+    expect(&from_app, &seen, "CLOSED");
+    let until = Instant::now() + TIMEOUT;
+    let mut after = String::new();
+    while Instant::now() < until {
+        after = mine.run(&["node", "list"], "");
+        if after
+            .lines()
+            .any(|l| l.starts_with("alice") && l.contains("detached"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    eprintln!(
+        "{joined}\nwhile attached, `vox node list` said: {listed}{posted}\npeer's read shows the \
+         app's post: {}\n{got}\nafter close, `vox node list` said: {after}all the Swift program \
+         said: {:?}",
+        read.contains("hello from swift"),
+        seen.lock().unwrap()
+    );
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.starts_with("alice") && l.contains("attached") && !l.contains("detached")),
+        "PRODUCT: the app's attach must show in `vox node list` as attached; it said: {listed}"
+    );
+    assert_eq!(
+        posted, "POSTED 1",
+        "PRODUCT: a post answered must be in the room read back at once, exactly once"
+    );
+    assert!(
+        read.contains("hello from swift"),
+        "PRODUCT: the peer must read the app's post: {read}"
+    );
+    assert_eq!(got, "GOT hello from the peer");
+    assert!(
+        after
+            .lines()
+            .any(|l| l.starts_with("alice") && l.contains("detached")),
+        "PRODUCT: once the app closed, its node must be detached; `vox node list` said: {after}"
+    );
 }

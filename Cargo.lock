@@ -3155,7 +3155,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uniffi",
+ "vox-agentcomms",
  "vox-core",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,23 +1,26 @@
-//! **The embedded node, for native apps** (PRD-001 R30/R31, ADR-014).
+//! **Vox for native apps** (PRD-001 R30/R31, ADR-014): two UniFFI objects in one library.
 //!
-//! A phone cannot run a daemon beside an app, so the app runs the node: this crate starts
-//! a Vox node inside the app's own process and exposes what an app needs over UniFFI —
-//! the boundary ADR-014 chose, because it is typed and memory-safe, it speaks Swift's
-//! `async`/`await`, and the same bindings serve macOS and iOS.
+//! - [`VoxClient`] is the macOS app's: a client of the account's vox daemon, as the TUI and every
+//!   `vox` verb are (ADR-014 M-2–M-5). It hosts no node.
+//! - [`VoxNode`] is the iOS app's: a phone cannot run a daemon beside an app, so the app runs the
+//!   node, inside its own process (ADR-026 S-4's exception).
+//!
+//! The boundary is UniFFI, as ADR-014 decided, because it is typed and memory-safe, it speaks
+//! Swift's `async`/`await`, and the same bindings serve macOS and iOS.
 //!
 //! What crosses the boundary, and what does not:
 //!
-//! - **In:** a profile directory, passphrases (consumed by the core and never returned),
-//!   room links, text, labels, bytes for app streams.
-//! - **Out:** fingerprints and room ids as base32 text, rendered messages, event
-//!   notices, and the bytes of app streams and datagrams. **No key material**: signing,
-//!   sealing and unsealing stay inside the core (ADR-014's FFI contract).
+//! - **In:** a data root or profile directory, passphrases (consumed by the core and never
+//!   returned), room links, text, labels, bytes for app streams.
+//! - **Out:** fingerprints and room ids as base32 text, rendered messages, event notices, and the
+//!   bytes of app streams and datagrams. **No key material**: signing, sealing and unsealing stay
+//!   inside the core (ADR-014's FFI contract).
 //!
-//! Every call that waits is `async`, so a UI thread never blocks on the core; the work
-//! runs on the node's own runtime and the foreign side only awaits it. Events arrive
-//! through an [`EventListener`] the app implements.
+//! Every call that waits is `async`, so a UI thread never blocks on the core; the work runs on the
+//! library's own runtime and the foreign side only awaits it. Events arrive through a listener the
+//! app implements ([`ClientListener`], [`EventListener`]).
 //!
-//! **What is not here:** tunnels (`vox up`, forwards, services). An app that wants a
+//! **What [`VoxNode`] does not have:** tunnels (`vox up`, forwards, services). An app that wants a
 //! byte stream to another member's app uses the app API ([`VoxNode::app_open`],
 //! [`VoxNode::app_listen`]) instead.
 
@@ -32,6 +35,12 @@ use vox_core::node::paths::Paths;
 
 uniffi::setup_scaffolding!();
 
+mod client;
+pub use client::{
+    ClientListener, Member, NodeSummary, Passphrase, RoomLink, RoomMessage, RoomSummary,
+    TrustedNode, VoxClient,
+};
+
 /// Anything that went wrong, with the core's reason.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum VoxError {
@@ -39,6 +48,13 @@ pub enum VoxError {
     #[error("{reason}")]
     Failed {
         /// Why, for a person.
+        reason: String,
+    },
+    /// The node this client acted as was detached, so the request was not done; a client must
+    /// not attach it again just to retry (ADR-026 L-3).
+    #[error("{reason}")]
+    Detached {
+        /// What happened, for a person.
         reason: String,
     },
 }

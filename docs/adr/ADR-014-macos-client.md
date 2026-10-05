@@ -49,6 +49,10 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   fingerprints, trust states, addresses, counts and paths. Keys, sender keys and room secrets MUST
   NOT. A passphrase typed in the app MUST go into `VoxClient` at once and MUST NOT be stored by
   Swift, except in the Keychain under ADR-028 K-10.
+  Known limit: in passing a passphrase's bytes from Swift's `Data` to `Passphrase`, UniFFI's
+  generated code copies them into a Swift byte array and a `RustBuffer`, and frees both unwiped;
+  every buffer Rust owns after that (the `Passphrase` object, each request's copy, the encoded
+  frame) is zeroized when dropped.
 - **M-6.** The app MUST act as one node, chosen at first run and shown in the sidebar
   (ADR-028 E-4). It MUST attach that node on launch, with the passphrase from the Keychain when
   stored there (ADR-028 K-10) or else asked for, and MUST detach it on quit (ADR-028 A-4) unless
