@@ -2406,6 +2406,13 @@ async fn seat_round(
                     crate::node::seatstream::SILENT_IS_GONE.as_secs()
                 ));
             }
+            Asked::Refused => {
+                // Not holding the room yet, or not counting this node a member yet: it has
+                // promised nothing this node would miss.
+                said.push(format!(
+                    "{who}: refused the question (not yet in the room there), not counted"
+                ));
+            }
             Asked::Unanswered => {
                 said.push(format!(
                     "{who}: no answer within {}s",

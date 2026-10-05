@@ -211,6 +211,11 @@ pub enum Asked {
     /// acknowledgement: the member is offline, so it is not counted and does not block the join
     /// (the decider, 2026-10-02: an offline member learns of the newcomer when it returns).
     Gone,
+    /// The member's node refused or closed the question at once, before any answer: it does not
+    /// hold the room yet (a newcomer still sealing it refuses every member's stream of this kind),
+    /// or does not count this node a member yet. It has promised nothing this node would miss, so
+    /// it is not counted, like an offline member.
+    Refused,
     /// The connection is heard from, and no answer came within [`SEAT_ANSWER_WITHIN`]: a member
     /// online that did not agree.
     Unanswered,
@@ -246,6 +251,8 @@ pub async fn ask(conn: &VoxConnection, ask: Ask) -> Asked {
                     Err(_) if conn.quinn().close_reason().is_some() || heard() == start => {
                         Asked::Gone
                     }
+                    // Refused or closed before the bound: the node said no to the question itself.
+                    Err(_) if tokio::time::Instant::now() < deadline => Asked::Refused,
                     Err(_) => Asked::Unanswered,
                 };
             }
