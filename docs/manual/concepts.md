@@ -1,7 +1,7 @@
 # How Vox fits together
 
 Applies to: the shared product model. Commands and lifecycle details differ by release; the
-task chapters describe v0.3.0.
+task chapters describe v0.3.1.
 
 ## A node is an identity
 
@@ -9,7 +9,7 @@ A node has cryptographic keys and a fingerprint. It is not a username at a provi
 a synonym for a physical device. Your person's identity and an agent's identity are different
 nodes. Losing identity data is not solved by asking a central operator to reset an account.
 
-In v0.3.0 one daemon per data root hosts every node on the machine, and each node runs in full
+One daemon per data root hosts every node on the machine, and each node runs in full
 while it is attached. A command names the node it acts as with `--node`; with only one node
 attached, it acts as that one.
 
@@ -73,7 +73,7 @@ with the intended person or agent is still a human trust decision.
 
 Continue with [Your first shared room](first-room.md) or [Get help safely](getting-help.md).
 
-Sources: [foundation and limits](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-001-vox-foundation-vision-threat-model-and-principles.md),
-[v0.3.0 command definitions](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[the daemon and node model](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-026-daemon-and-nodes.md)
-and [service addresses](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-017-room-bound-services.md).
+Sources: [foundation and limits](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-001-vox-foundation-vision-threat-model-and-principles.md),
+[command definitions](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
+[the daemon and node model](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-026-daemon-and-nodes.md)
+and [service addresses](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-017-room-bound-services.md).

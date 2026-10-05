@@ -1,6 +1,6 @@
 # Reach a shared service
 
-Applies to: v0.3.0. This chapter describes named services reached as `service.node.room.vox`.
+Applies to: v0.3.1. This chapter describes named services reached as `service.node.room.vox`.
 Examples act as the only attached node; with several, add `--node NAME`.
 
 You need a running local service on the host, two nodes whose fingerprints have been compared,
@@ -152,7 +152,7 @@ shared in it.
 members are one subnet, so local-network discovery works across Vox. Creating an interface needs
 root, and only a separate helper has it: run `sudo vox lan helper` in another terminal, then run
 `vox lan up` as yourself, not with sudo. Without the helper it stops with `no LAN helper is
-answering on /var/run/vox-lan.sock`. This manual's v0.3.0 check went no further than that message.
+answering on /var/run/vox-lan.sock`. The manual's command check went no further than that message.
 
 ## When an anchor is needed
 
@@ -168,7 +168,7 @@ vox node --node anchor --listen 0.0.0.0:PORT
 The anchor prints a `FINGERPRINT@ADDRESS` specification. Verify it through a way you already
 trust and supply it with `--anchor` to the commands that attach or start nodes, such as
 `vox node attach`, `serve` and `up`; a room link also carries the anchors its sharer uses. The
-manual's v0.3.0 check did not run an anchor; these two commands come from the command help.
+manual's command check did not run an anchor; these two commands come from the command help.
 
 An anchor is infrastructure you operate, not an account with a central provider. It holds
 no room key and stores nothing for rooms it is not in. Running it does not make an arbitrary
@@ -176,14 +176,14 @@ private address publicly reachable; its actual address must be reachable by the 
 Do not blame an absent anchor when the failed step was a directly reached member refusing a
 passphrase.
 
-**Not in this release:** v0.3.0 does not notice when your machine changes network, for example
-from home Wi-Fi to a phone hotspot, and off Linux it does not read the default route. After such a
-change, peers may keep trying the old address. This work is planned for v0.3.1.
+When your machine changes network, for example from home Wi-Fi to a phone hotspot, the daemon
+notices within seconds, publishes its new addresses and dials its peers and anchors again; see
+[after a network change](troubleshooting.md#peers-cannot-find-me-after-a-network-change).
 
 If it fails, use [service troubleshooting](troubleshooting.md#the-service-is-unreachable)
 or [join troubleshooting](troubleshooting.md#i-cannot-join-a-room).
 
-Source: [v0.3.0 service, proxy and forward arguments](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[tunnel behavior and diagnostics](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/tunnel_cli.rs),
-[service addresses](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-017-room-bound-services.md)
-and [network-change work for v0.3.1](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-012-nat-traversal-and-reachability.md).
+Source: [service, proxy and forward arguments](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
+[tunnel behavior and diagnostics](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/tunnel_cli.rs),
+[service addresses](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-017-room-bound-services.md)
+and [network changes and port mappings](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-012-nat-traversal-and-reachability.md).

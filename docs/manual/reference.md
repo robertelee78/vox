@@ -1,6 +1,6 @@
 # Commands and local state
 
-Applies to: v0.3.0. This is a map to the real command help, not a substitute for the parser
+Applies to: v0.3.1. This is a map to the real command help, not a substitute for the parser
 in your installed version.
 
 ## Find the right help
@@ -134,13 +134,33 @@ A hook's zero exit is deliberately not a delivery assertion.
 
 `vox status` shows the node's rooms with each member's trust, connection and last sync, its
 peers with their path (`direct` or relayed) and round-trip time, its tunnels, and anything that
-needs attention. When gathering support evidence, use the smallest relevant status excerpt.
+needs attention.
+
+Its `gateway` section says, for IPv4 and IPv6, which router the machine's default route names,
+which routers the daemon asked for a port mapping, and which method answered: PCP, NAT-PMP,
+UPnP-IGD or an IPv6 pinhole. For example:
+
+```text
+gateway
+  ipv4  next hop 192.168.1.1 via en0
+        asked 192.168.1.1:5351, 192.0.0.9:5351: PCP answered at 192.168.1.1:5351
+  ipv6  no default route
+        no gateway asked
+```
+
+`asked …: none answered` means no router granted a mapping; `no gateway asked` means there was
+none to ask. `vox status --json` carries the same under `gateway.ipv4` and `gateway.ipv6`
+(`next_hop`, `asked`, and `answered` with the method as `rung`, the outside address as
+`external` and the mapping's `lifetime` in seconds), and the machine's last network change under
+`network_changed`. The daemon renews a mapping before it lapses and deletes every mapping it holds
+when it stops; its log names each one, for example `vox daemon: deleted the port mapping UDP 53277
+at 192.168.1.1:5351 (PCP)`. When gathering support evidence, use the smallest relevant status excerpt.
 Paths, aliases, peer addresses, session IDs and even public fingerprints can expose private
 relationships.
 
-Source: [v0.3.0 CLI parser](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/cli.rs),
-[node selection](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/client.rs),
-[path resolution](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-core/src/node/paths.rs)
-and [the daemon and its files](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/docs/adr/ADR-026-daemon-and-nodes.md).
-The [daemon parser](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/app.rs)
+Source: [CLI parser](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
+[node selection](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/client.rs),
+[path resolution](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-core/src/node/paths.rs)
+and [the daemon and its files](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-026-daemon-and-nodes.md).
+The [daemon parser](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/app.rs)
 defines the passphrase-file lines.

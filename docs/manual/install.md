@@ -1,6 +1,6 @@
 # Install and update
 
-Applies to: v0.3.0. The installer may select a later published release; check the resulting
+Applies to: v0.3.1. The installer may select a later published release; check the resulting
 version and its release notes before using version-specific instructions.
 
 ## Install
@@ -78,6 +78,45 @@ This restores the binary retained by the updater. It is **not a state-directory 
 your nodes and rooms stay as the replaced binary left them, and the restored binary is not
 guaranteed to read them. Do not open valuable state with a guessed executable.
 
+## Run Vox in a container
+
+Vox runs in a container such as Podman or Docker like any other program, with two conditions.
+
+**Run it as an ordinary user, not root.** The daemon admits no control connection from root, so
+nothing run as root can use it, and `vox daemon` will not start as root. A command run as root says:
+
+```text
+vox: this is running as root (uid 0), and the vox daemon refuses every control connection from root, so nothing run as root can use it. Run vox as an ordinary user: in a container, set a non-root USER (for example `podman run --user 1000 …`)
+```
+
+Set a non-root `USER` in the image, or start the container with `--user 1000` (any non-root
+user ID). Give `VOX_DATA_DIR` and `VOX_CONFIG_DIR` a directory that user can write, on a volume
+if the node must outlive the container.
+
+**On a Linux host, raise `net.core.rmem_max` on the host to at least 4 MiB.** Vox asks for a 4 MiB
+UDP receive buffer. Linux caps it at `net.core.rmem_max`, about 208 KiB on a stock host, and a
+container cannot raise that limit. With the smaller buffer a busy host can cut Vox's throughput to
+about a tenth of the link. When the buffer it gets is short, the daemon says so once in its log:
+
+```text
+vox: UDP receive buffer 416 KiB: path-MTU ceiling 1452 bytes, not 8192 — the OS granted a smaller receive buffer than 8192-byte datagrams need (on Linux, raise net.core.rmem_max to at least 4 MiB)
+```
+
+Set it on the host, as root there, not inside the container:
+
+```sh
+sysctl -w net.core.rmem_max=4194304
+```
+
+That lasts until the host restarts. To keep it, put the line `net.core.rmem_max = 4194304` in a
+file such as `/etc/sysctl.d/90-vox.conf` on the host, then run `sysctl --system`. Check the value
+with `sysctl net.core.rmem_max`. After the daemon's next start, its log should not show the
+line above.
+
+On macOS, Podman runs containers in a Linux virtual machine. Check that machine's limit with
+`podman machine ssh sysctl net.core.rmem_max`; the one checked for this manual already had
+`net.core.rmem_max = 4194304`.
+
 ## Remove shell integration or the executable
 
 ```sh
@@ -98,5 +137,5 @@ room state, and deleting it is not recoverable through a central Vox account. Se
 Follow [Your first shared room](first-room.md). If installation fails, keep the exact error and
 use [Get help safely](getting-help.md); never paste signing bypasses or secrets into a retry.
 
-Source: [installer](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/install.sh),
-and [update implementation](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/update.rs).
+Source: [installer](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/install.sh),
+and [update implementation](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/update.rs).
