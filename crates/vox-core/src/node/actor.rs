@@ -216,7 +216,7 @@ const OPEN_DETAIL_PATIENCE: Duration = Duration::from_secs(2);
 fn summary_of(ch: &ChannelState) -> ChannelSummary {
     ChannelSummary {
         channel_id: ch.channel_id(),
-        local_name: Some(ch.local_name().to_owned()),
+        name: ch.name().map(str::to_owned),
         open: true,
         entries: ch.entry_count() as u64,
         over: over_of(ch),
@@ -281,7 +281,8 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
     };
     ChannelDetail {
         channel_id: ch.channel_id(),
-        local_name: ch.local_name().to_owned(),
+        name: ch.name().map(str::to_owned),
+        notices: ch.notices(),
         epoch: ch.epoch(),
         members: ch.members(),
         timeline,
@@ -1174,8 +1175,9 @@ enum NetEvent {
         /// Answered with whether the admission was applied: `Ok` releases the acceptance frame, an
         /// error refuses the joiner instead (a full room says so). A dropped sender answers too —
         /// the slot must never wait on an actor that has moved on — and is a refusal: nothing
-        /// admitted the joiner.
-        ack: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
+        /// admitted the joiner. `Ok` carries the room's shared name, which the acceptance tells
+        /// the joiner (ADR-028 R-1).
+        ack: tokio::sync::oneshot::Sender<crate::error::Result<Option<String>>>,
     },
     /// **The member answering a join holds a place for the joiner** (V030-30, #366), if the room
     /// has one: its authors and every place promised and not yet settled leave one. Answered with
@@ -1295,8 +1297,6 @@ enum NetEvent {
         reply: oneshot::Sender<Outcome>,
         /// The link joined with.
         parsed: Box<crate::node::link::InviteLink>,
-        /// The room's local name.
-        local_name: String,
         /// The passphrase, kept by the room's state.
         passphrase: Secret,
         /// When the join began.
@@ -1311,8 +1311,8 @@ enum NetEvent {
     ChannelSealed {
         /// The `CreateChannel` command's reply, answered once the room exists.
         reply: oneshot::Sender<Outcome>,
-        /// The room's local name.
-        local_name: String,
+        /// The room's shared name (ADR-028 R-1).
+        room_name: String,
         /// The passphrase, kept by the room's state.
         passphrase: Secret,
         /// The genesis made before the seal.
@@ -4641,11 +4641,11 @@ impl Node {
                     // nothing while it runs. So the seal goes to a blocking thread and the reply
                     // travels with it; `NetEvent::ChannelSealed` finishes the room and answers.
                     if let NodeCommand::CreateChannel {
-                        local_name,
+                        name: room_name,
                         passphrase,
                     } = command
                     {
-                        self.begin_create_channel(local_name, passphrase, None, reply)
+                        self.begin_create_channel(room_name, passphrase, None, reply)
                             .await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
@@ -4656,7 +4656,7 @@ impl Node {
                     // also re-verifies the room's whole log. Both ran on the actor, so a post on
                     // any other room waited seconds behind them.
                     if let NodeCommand::Serve {
-                        local_name,
+                        room: room_name,
                         passphrase,
                         name: service,
                         port,
@@ -4673,7 +4673,7 @@ impl Node {
                             service
                         };
                         self.begin_create_channel(
-                            local_name,
+                            room_name,
                             passphrase,
                             Some((tag, endpoint)),
                             reply,
@@ -4724,13 +4724,8 @@ impl Node {
                     }
                     // Joining is answered later for the same reason, and for a longer wait: see
                     // `begin_join_channel`.
-                    if let NodeCommand::JoinChannel {
-                        link,
-                        local_name,
-                        passphrase,
-                    } = command
-                    {
-                        self.begin_join_channel(link, local_name, passphrase, reply).await;
+                    if let NodeCommand::JoinChannel { link, passphrase } = command {
+                        self.begin_join_channel(link, passphrase, reply).await;
                         self.note_if_stalled(name, started);
                         self.publish().await;
                         continue;
@@ -4915,10 +4910,12 @@ impl Node {
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 },
             },
-            NodeCommand::CreateChannel {
-                local_name,
-                passphrase,
-            } => self.create_channel(&local_name, &passphrase).await,
+            NodeCommand::CreateChannel { name, passphrase } => {
+                self.create_channel(&name, &passphrase).await
+            }
+            NodeCommand::RenameRoom { channel_id, name } => {
+                self.rename_room(&channel_id, &name).await
+            }
             // Answered through `begin_open_channel`, which the run loop calls instead of this.
             NodeCommand::OpenChannel { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
@@ -6630,7 +6627,9 @@ impl Node {
                 ) {
                     (Some(profile), Some(shared)) => {
                         let mut ch = shared.lock().await;
-                        let admitted = ch.admit_author(profile.store(), &identity, now).map(|_| ());
+                        let admitted = ch
+                            .admit_author(profile.store(), &identity, now)
+                            .map(|_| ch.name().map(str::to_owned));
                         // A member that left and proved the passphrase again is in again here,
                         // until its own return reaches the others through this node (V030-08).
                         if admitted.is_ok() {
@@ -6718,7 +6717,6 @@ impl Node {
             NetEvent::JoinerDone {
                 reply,
                 parsed,
-                local_name,
                 passphrase,
                 now,
                 me,
@@ -6735,7 +6733,7 @@ impl Node {
                             step: "making the room here and publishing this member on its boards"
                                 .to_owned(),
                         });
-                        self.finish_join_channel(*parsed, local_name, passphrase, now, me, won)
+                        self.finish_join_channel(*parsed, passphrase, now, me, won)
                             .await
                     }
                     Err(lost) => {
@@ -6781,7 +6779,7 @@ impl Node {
             }
             NetEvent::ChannelSealed {
                 reply,
-                local_name,
+                room_name,
                 passphrase,
                 genesis,
                 now,
@@ -6795,7 +6793,7 @@ impl Node {
                         None => Outcome::Failed(Fault::NoIdentity),
                         Some(profile) => match ChannelState::create_from_sealed(
                             profile,
-                            &local_name,
+                            &room_name,
                             &passphrase,
                             *genesis,
                             sek,
@@ -8552,7 +8550,6 @@ impl Node {
     async fn begin_join_channel(
         &mut self,
         link: String,
-        local_name: String,
         passphrase: Secret,
         reply: oneshot::Sender<Outcome>,
     ) {
@@ -8696,7 +8693,6 @@ impl Node {
                 .send(NetEvent::JoinerDone {
                     reply,
                     parsed: Box::new(parsed),
-                    local_name,
                     passphrase,
                     now,
                     me,
@@ -8862,7 +8858,6 @@ impl Node {
     async fn finish_join_channel(
         &mut self,
         parsed: crate::node::link::InviteLink,
-        local_name: String,
         passphrase: Secret,
         now: u64,
         me: Digest32,
@@ -8885,7 +8880,7 @@ impl Node {
                 profile,
                 &genesis,
                 &parsed.channel_id,
-                &local_name,
+                joined.room_name.as_deref(),
                 &passphrase,
                 now,
                 sealed,
@@ -12596,19 +12591,19 @@ impl Node {
 
     fn create_channel<'a>(
         &'a mut self,
-        local_name: &'a str,
+        room_name: &'a str,
         passphrase: &'a Secret,
     ) -> Boxed<'a, Outcome> {
-        Box::pin(self.create_channel_unboxed(local_name, passphrase))
+        Box::pin(self.create_channel_unboxed(room_name, passphrase))
     }
 
     /// [`Self::create_channel`], unboxed: see [`Boxed`].
-    async fn create_channel_unboxed(&mut self, local_name: &str, passphrase: &Secret) -> Outcome {
+    async fn create_channel_unboxed(&mut self, room_name: &str, passphrase: &Secret) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        match ChannelState::create_with_profile(profile, local_name, passphrase, now, self.argon2) {
+        match ChannelState::create_with_profile(profile, room_name, passphrase, now, self.argon2) {
             Ok(ch) => self.finish_create_channel(ch).await,
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
@@ -12703,7 +12698,7 @@ impl Node {
 
     async fn begin_create_channel(
         &mut self,
-        local_name: String,
+        room_name: String,
         passphrase: Secret,
         service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
@@ -12715,7 +12710,7 @@ impl Node {
         };
         // A service room's genesis is like any other room's: it carries no grant (PRD-001 R44).
         // The service is the host's to offer, and its gate decides who reaches it.
-        let (genesis, sek) = match ChannelState::create_genesis(profile, &local_name, now) {
+        let (genesis, sek) = match ChannelState::create_genesis(profile, &room_name, now) {
             Ok(g) => g,
             Err(e) => {
                 let _ = reply.send(Outcome::Failed(fault_of(&e)));
@@ -12765,7 +12760,7 @@ impl Node {
             let _ = tx
                 .send(NetEvent::ChannelSealed {
                     reply,
-                    local_name,
+                    room_name,
                     passphrase,
                     genesis: Box::new(genesis),
                     now,
@@ -13460,7 +13455,7 @@ impl Node {
         let mut name = String::new();
         if let Some(shared) = self.channels.remove(channel_id) {
             let mut ch = shared.lock().await;
-            name = ch.local_name().to_owned();
+            name = crate::node::resolver::room_shown(ch.name(), channel_id);
             ch.lock_now();
         }
         // The read cursors and held-claim records agent sessions kept for it go too: nothing
@@ -13782,13 +13777,10 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let local_name = shared.lock().await.local_name().to_owned();
+        let room = crate::node::resolver::room_shown(shared.lock().await.name(), channel_id);
         // The name to tell the person: a service shared in the room is
         // `<service>.<node>.<room>.vox` (V030-25), and nothing shorter is an address.
-        let hostname = format!(
-            "<service>.<node>.{}.vox",
-            crate::node::resolver::label_of(&local_name)
-        );
+        let hostname = format!("<service>.<node>.{room}.vox");
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return Outcome::Failed(Fault::NotNetworked);
         };
@@ -13862,7 +13854,7 @@ impl Node {
         let mut names = crate::node::resolver::VoxResolver::new();
         let view = self.view_tx.borrow().clone();
         for room in &view.open_channels {
-            names.add_room(room.channel_id, &room.local_name, &room.members);
+            names.add_room(room.channel_id, room.name.as_deref(), &room.members);
             names.set_synced(room.channel_id, room.synced);
             for share in &room.shares {
                 names.add_share(room.channel_id, share.host, &share.name, share.udp);
@@ -14162,7 +14154,7 @@ impl Node {
             // while it runs, and a status read must not wait on it or come back blank (#58).
             report.rooms.push(RoomStatus {
                 id: room.channel_id,
-                name: room.local_name.clone(),
+                name: crate::node::resolver::room_shown(room.name.as_deref(), &room.channel_id),
                 epoch: room.epoch,
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
                 retention: room.retention,
@@ -14302,6 +14294,26 @@ impl Node {
     /// `vox room retention` (V030-32): the room's creator or an admin sets the **room's**
     /// retention, on every member. Any other member sets **their own node's** retention for the
     /// room, at or below the room's — it changes nothing anywhere else — and is refused above it.
+    /// Name a room for every member (ADR-028 R-1): its creator or an admin appends a room-name
+    /// statement; anyone else is refused, and told who may.
+    async fn rename_room(&mut self, channel_id: &Digest32, name: &str) -> Outcome {
+        if crate::governance::name::room_name(name).as_deref() != Ok(name) {
+            return Outcome::Failed(Fault::NotARoomName);
+        }
+        let now = self.now();
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        if let Err(e) = shared.lock().await.set_name(profile, name, now) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.note_local_append(channel_id);
+        Outcome::Done
+    }
+
     async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
@@ -14602,7 +14614,7 @@ impl Node {
             .into_iter()
             .map(|channel_id| ChannelSummary {
                 channel_id,
-                local_name: None,
+                name: None,
                 open: false,
                 entries: 0,
                 over: None,
@@ -14732,7 +14744,7 @@ impl Node {
                         .cloned()
                         .unwrap_or(ChannelSummary {
                             channel_id: *id,
-                            local_name: None,
+                            name: None,
                             open: true,
                             entries: 0,
                             over: None,
@@ -14740,7 +14752,7 @@ impl Node {
                 },
                 None => ChannelSummary {
                     channel_id: *id,
-                    local_name: None,
+                    name: None,
                     open: false,
                     entries: 0,
                     over: None,
@@ -15441,6 +15453,10 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::MalformedGovernance("only the room's admin may set its retention") => {
             Fault::NotAdmin
         }
+        Error::MalformedGovernance("only the room's creator or an admin may rename it") => {
+            Fault::NotAdmin
+        }
+        Error::MalformedGovernance("room name is not a DNS label") => Fault::NotARoomName,
         // A room's lifecycle (V030-08): said as what it is, not as an internal fault.
         Error::Profile("this room has ended") => Fault::RoomEnded,
         Error::Profile(

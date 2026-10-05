@@ -398,15 +398,7 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
     assert!(ok, "vox room link: {err}");
     let (ok, _, err) = vox(
         bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "r",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "vox room join: {err}");

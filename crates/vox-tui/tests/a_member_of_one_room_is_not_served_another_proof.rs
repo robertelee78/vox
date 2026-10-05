@@ -217,15 +217,7 @@ fn a_member_of_one_room_is_not_served_another_through_the_shipped_daemon() {
     let xavier = daemon("xavier", &xavier_dir, 0, &spec, &idpass);
     let (ok, out, err) = vox_in(
         &xavier_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &a_link,
-            "--name",
-            "alpha",
-        ],
+        &["room", "join", "--passphrase-file", "-", &a_link],
         "alpha passphrase",
     );
     assert!(

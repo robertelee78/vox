@@ -616,15 +616,7 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         let t = Instant::now();
         let o = w.vox_in(
             None,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "mission",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             Some(ROOM_PASS),
         );
         // The joiner's own daemon too: under ADR-026 the join runs there, not in `vox room join`,

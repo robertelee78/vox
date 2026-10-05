@@ -324,15 +324,7 @@ fn room(creator: &Path, joiner: &Path) -> String {
     assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         joiner,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "r",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join: {err}");
@@ -778,15 +770,7 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
     assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         &carol,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "r",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): carol's late join failed: {err}");

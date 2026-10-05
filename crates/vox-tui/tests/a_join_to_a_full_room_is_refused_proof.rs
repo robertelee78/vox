@@ -144,15 +144,7 @@ fn a_join_to_a_full_room_is_refused() {
     let late = Member::new(root, "late");
     let _late_d = late.daemon(Some(&spec));
     let (ok, out, err) = late.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "full",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(ROOM_PASS),
     );
     let said = format!("{out}{err}");
@@ -205,15 +197,7 @@ fn a_join_a_member_cannot_admit_says_why() {
     let joiner = Member::new(root, "joiner");
     let _joiner_d = joiner.daemon(Some(&spec));
     let (ok, out, err) = joiner.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "locked",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(ROOM_PASS),
     );
     let said = format!("{out}{err}");
@@ -265,18 +249,10 @@ fn roster(who: &Member, room: &str) -> Vec<String> {
         .collect()
 }
 
-/// `who`'s `vox room join` of `link` as `name`, asked once: whether it exited 0, and what it said.
-fn join(who: &Member, link: &str, name: &str) -> (bool, String) {
+/// `who`'s `vox room join` of `link`, asked once: whether it exited 0, and what it said.
+fn join(who: &Member, link: &str) -> (bool, String) {
     let (ok, out, err) = who.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link,
-            "--name",
-            name,
-        ],
+        &["room", "join", "--passphrase-file", "-", link],
         Some(ROOM_PASS),
     );
     (ok, format!("{out}{err}"))
@@ -378,7 +354,7 @@ fn three_members_answering_at_once_never_take_the_room_past_its_cap() {
         let handles: Vec<_> = newcomers
             .iter()
             .zip(&links)
-            .map(|(n, l)| (n, s.spawn(move || join(n, l, "strict"))))
+            .map(|(n, l)| (n, s.spawn(move || join(n, l))))
             .collect();
         let held = opener
             .join()
@@ -446,7 +422,7 @@ fn three_members_answering_at_once_never_take_the_room_past_its_cap() {
         .find(|j| !j.1)
         .map(|j| j.0)
         .expect("CANNOT MEASURE: every newcomer was told it joined (already PRODUCT above)");
-    let (ok, said) = join(again, &links[0], "strict");
+    let (ok, said) = join(again, &links[0]);
     println!("[proof] {} tried again: ok={ok}:\n{said}", again.name);
     if admitted.is_empty() {
         assert!(
@@ -504,7 +480,7 @@ fn a_member_online_that_does_not_answer_fails_the_join_and_is_named() {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     let t1 = std::time::Instant::now();
-    let (ok, said) = join(&late, &link, "bound");
+    let (ok, said) = join(&late, &link);
     let took = t1.elapsed();
     println!("[proof] the join with bob not answering exited ok={ok} after {took:?}:\n{said}");
     assert!(
@@ -560,7 +536,7 @@ fn a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap() {
         );
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    let (ok, said) = join(&x, &host_link, "split");
+    let (ok, said) = join(&x, &host_link);
     assert!(
         ok,
         "PRODUCT: with bob offline, x's join through the host was refused:\n{said}"
@@ -578,7 +554,7 @@ fn a_split_room_keeps_both_newcomers_and_says_it_passed_its_cap() {
         !roster(&bob, &room).contains(&x.fp),
         "CANNOT MEASURE: bob already knows x, so the two sides did not split"
     );
-    let (ok, said) = join(&y, &bob_link, "split");
+    let (ok, said) = join(&y, &bob_link);
     assert!(
         ok,
         "PRODUCT: with the host offline, y's join through bob was refused:\n{said}"

@@ -323,15 +323,7 @@ fn restarted_responder() -> World {
         // host admits another joiner was #217, fixed), and retrying past it would hide it.
         let (joined, _, err) = vox(
             &m.dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link.trim(),
-                "--name",
-                "pair",
-            ],
+            &["room", "join", "--passphrase-file", "-", link.trim()],
             Some(ROOMPASS),
         );
         assert!(

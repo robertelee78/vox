@@ -28,7 +28,7 @@ Join the intended room as that node, substituting the full room link, then excha
 fingerprints and trust decisions with the other participants:
 
 ```sh
-vox room join --node claude-mbp 'ROOM_LINK' --name build-vox
+vox room join --node claude-mbp 'ROOM_LINK'
 vox id --node claude-mbp
 ```
 

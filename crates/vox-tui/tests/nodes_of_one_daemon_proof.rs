@@ -211,7 +211,8 @@ impl Daemon {
     }
 }
 
-/// A room on `node`, made through the daemon that holds it: its id.
+/// A room on `node`, named after it (a node may hold one room of a name), made through the daemon
+/// that holds it: its id.
 fn make_room(a: &Account, node: &str) -> String {
     let (ok, out, err) = a.run(
         &[
@@ -222,7 +223,7 @@ fn make_room(a: &Account, node: &str) -> String {
             "--passphrase-file",
             "-",
             "--name",
-            "r",
+            node,
         ],
         ROOM_PASS,
     );
@@ -426,15 +427,9 @@ fn nodes_attached_at_once_all_serve_at_one_address_each_as_itself() {
     let joined: Vec<(bool, String, String)> = std::thread::scope(|s| {
         let hs: Vec<_> = links
             .iter()
-            .zip(&names)
-            .map(|(link, n)| {
+            .map(|link| {
                 let m = &m;
-                s.spawn(move || {
-                    m.run(
-                        &["room", "join", "--passphrase-file", "-", link, "--name", n],
-                        ROOM_PASS,
-                    )
-                })
+                s.spawn(move || m.run(&["room", "join", "--passphrase-file", "-", link], ROOM_PASS))
             })
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
@@ -560,15 +555,7 @@ fn a_kept_node_is_reached_again_at_its_address_after_a_restart() {
         "APPARATUS: trust a"
     );
     let (ok, out, err) = m.run(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "r",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
     );
     assert!(ok, "PRODUCT (staging): the member's join: {out}{err}");

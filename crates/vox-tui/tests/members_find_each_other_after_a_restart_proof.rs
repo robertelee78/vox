@@ -230,15 +230,7 @@ fn a_pair(tmp: &Path) -> (Member, Member, String) {
     assert!(ok, "CANNOT MEASURE: room link: {err}");
     let (ok, _, err) = vox(
         &bob.dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "pair",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(ROOMPASS),
     );
     assert!(ok, "CANNOT MEASURE: bob could not join: {err}");

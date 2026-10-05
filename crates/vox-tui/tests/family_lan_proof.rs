@@ -677,15 +677,7 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         loop {
             let (ok, out, err) = vox_in(
                 d,
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    link.trim(),
-                    "--name",
-                    "family",
-                ],
+                &["room", "join", "--passphrase-file", "-", link.trim()],
                 ROOM_PASS,
             );
             if ok {

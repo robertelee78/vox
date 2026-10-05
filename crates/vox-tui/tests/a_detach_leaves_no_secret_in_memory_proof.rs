@@ -926,15 +926,7 @@ fn a_detach_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     let mut join = start(
         &account.dir,
         "bob",
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "team",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(&format!("{roompass}\n")),
     );
     let during = scanner.until_more("room", before.of("room"));

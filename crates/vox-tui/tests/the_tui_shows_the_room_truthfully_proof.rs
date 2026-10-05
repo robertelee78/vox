@@ -28,8 +28,11 @@
 //!   m-071, on his screen, is read by bob, and m-001, not yet drawn, by nobody (ADR-028 RR-1,
 //!   #504);
 //! - `scrolls`: PageUp brings m-001 into view, and End returns to m-071;
-//! - `clamp`: PageUp well past the oldest line, then one PageDown, shows m-011 first (the scroll
+//! - `clamp`: PageUp well past the oldest line, then one PageDown, shows m-010 first, the oldest
+//!   line being the one saying alice named the room (the scroll
 //!   ran on past the top, so PageDown needed as many presses again before the view moved);
+//! - `renamed`: Alice renames the room while Bob's TUI is open, and his timeline says so in one
+//!   line, by his name for her: "alice renamed the room to family" (ADR-028 R-1, E-5);
 //! - `consent`: Carol, whom Bob never trusted, reads "not in keyring · you don't read each
 //!   other", and Alice "in keyring · reads you" (the pane said "consented" for
 //!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
@@ -68,15 +71,15 @@
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
-//! top, a scroll not clamped to the oldest line, every member shown `Trust::Trusted`, a stub command
-//! restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
+//! top, a scroll not clamped to the oldest line, the room's own lines (who named it) not drawn,
+//! every member shown `Trust::Trusted`, a stub command restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
 //! as not having read, every message marked read whether drawn or not, a message called held by a
 //! node that has not said it holds it, a read record named by a read record, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
 //! carries the message text or is raised per message, a room with a message to Bob grouped other
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`). It passes only on the
-//! script's PASS with all 22 claims ok.
+//! script's PASS with all 23 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -166,7 +169,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (22 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (23 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -180,8 +183,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (22, 22),
-                "APPARATUS: the driver said PASS without all 22 claims ok: {said}"
+                (23, 23),
+                "APPARATUS: the driver said PASS without all 23 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

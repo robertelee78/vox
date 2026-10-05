@@ -437,15 +437,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     for (who, dir, local) in [("bob", &bob_dir, "fam"), ("carol", &carol_dir, "house")] {
         let (ok, out, err) = vox(
             dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &address,
-                "--name",
-                local,
-            ],
+            &["room", "join", "--passphrase-file", "-", &address],
             Some(&format!("{passphrase}\n")),
         );
         assert!(

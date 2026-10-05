@@ -348,15 +348,7 @@ fn newcomer_reads_the_whole_history(posts: usize, page: usize) {
     attached(&bob, "bob");
     let (ok, _, err) = vox(
         &bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "long",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT: bob's `vox room join` was refused: {err}");

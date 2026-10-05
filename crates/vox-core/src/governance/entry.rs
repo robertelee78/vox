@@ -39,6 +39,7 @@ use crate::governance::cert::{AdminCert, AdminRevocation};
 use crate::governance::consent::{ConsentGrant, ConsentRevocation};
 use crate::governance::genesis::Genesis;
 use crate::governance::lifecycle::RoomLifecycle;
+use crate::governance::name::RoomName;
 use crate::governance::policy::PolicyUpdate;
 use crate::governance::presence::Presence;
 use crate::governance::share::ServiceShare;
@@ -74,6 +75,8 @@ pub enum GovBody {
     ServiceShare(Box<ServiceShare>),
     /// A member's own statement that it has left the room, or is back (tag `0x0015`).
     Presence(Box<Presence>),
+    /// The room's shared name, stated by its creator or an admin (tag `0x001F`, ADR-028 R-1).
+    RoomName(Box<RoomName>),
 }
 
 impl GovBody {
@@ -105,6 +108,7 @@ impl GovBody {
             StructTag::ServiceShare => Ok(GovBody::ServiceShare(Box::new(
                 ServiceShare::from_wire(bytes)?,
             ))),
+            StructTag::RoomName => Ok(GovBody::RoomName(Box::new(RoomName::from_wire(bytes)?))),
             StructTag::PolicyRotation => Ok(GovBody::PolicyUpdate(Box::new(
                 PolicyUpdate::from_wire(bytes)?,
             ))),
@@ -126,6 +130,7 @@ impl GovBody {
             GovBody::Lifecycle(l) => (l.body.channel_id, l.body.epoch),
             GovBody::ServiceShare(s) => (s.body.channel_id, s.body.epoch),
             GovBody::Presence(p) => (p.body.channel_id, p.body.epoch),
+            GovBody::RoomName(n) => (n.body.channel_id, n.body.epoch),
         }
     }
 
@@ -143,6 +148,7 @@ impl GovBody {
             GovBody::Lifecycle(l) => l.body.issuer_id,
             GovBody::ServiceShare(s) => s.body.author_id,
             GovBody::Presence(p) => p.body.author_id,
+            GovBody::RoomName(n) => n.body.issuer_id,
         }
     }
 }

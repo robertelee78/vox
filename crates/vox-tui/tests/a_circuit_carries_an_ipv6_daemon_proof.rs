@@ -590,15 +590,7 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link.trim(),
-                "--name",
-                "crossed",
-            ],
+            &["room", "join", "--passphrase-file", "-", link.trim()],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "PRODUCT (staging): a join failed: {err}");

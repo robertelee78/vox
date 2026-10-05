@@ -346,15 +346,7 @@ fn a_dead_member_does_not_stall_the_room() {
     // rather than retried past.
     for m in [bob, carol] {
         let (ok, out, err) = m.vox(
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "mission",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             Some(ROOM_PASS),
         );
         assert!(

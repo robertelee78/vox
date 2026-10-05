@@ -378,15 +378,7 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     for who in [&bob, &mallory, &carol] {
         let (ok, out, err) = vox(
             &who.dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link.trim(),
-                "--name",
-                "files",
-            ],
+            &["room", "join", "--passphrase-file", "-", link.trim()],
             Some(&format!("{ROOM_PASS}\n")),
         );
         assert!(ok, "{} joins files: {out}{err}", who.name);
@@ -817,15 +809,7 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
     assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, out, err) = vox(
         &bob.dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "files",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOM_PASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): bob joins files: {out}{err}");

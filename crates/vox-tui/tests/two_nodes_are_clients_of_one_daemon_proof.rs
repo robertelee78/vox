@@ -484,8 +484,6 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
             "room",
             "join",
             &b_link,
-            "--name",
-            "bx",
             "--passphrase-file",
             b_room_pf.to_str().unwrap(),
         ],

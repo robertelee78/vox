@@ -438,15 +438,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.
     let (ok, out, err) = bob.run(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
         Duration::from_secs(120),
     );
@@ -719,15 +711,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         assert!(ok, "PRODUCT (staging): trust {name}: {err}");
     }
     let (ok, out, err) = carol.run(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
         Duration::from_secs(120),
     );

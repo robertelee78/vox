@@ -266,15 +266,7 @@ fn path_to(dir: &std::path::Path, peer: &str) -> String {
 fn join(dir: &std::path::Path, link: &str, who: &str) {
     let (ok, _, err) = vox(
         dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link,
-            "--name",
-            "rekeyed",
-        ],
+        &["room", "join", "--passphrase-file", "-", link],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): {who}'s join failed: {err}");

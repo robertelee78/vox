@@ -214,18 +214,7 @@ fn foreground_daemon(p: &Person, err: &Path) -> Proc {
 /// Bob tries `link` with a wrong passphrase: refused, or a staging red.
 fn wrong_join(bob: &Person, link: &str) {
     let wp = file(&bob.dir, "wrong.pass", WRONG);
-    let (ok, said) = run(
-        &bob.dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            &wp,
-            link,
-            "--name",
-            "theirs",
-        ],
-    );
+    let (ok, said) = run(&bob.dir, &["room", "join", "--passphrase-file", &wp, link]);
     assert!(
         !ok,
         "PRODUCT (staging): bob's join with a wrong passphrase was not refused: {said}"

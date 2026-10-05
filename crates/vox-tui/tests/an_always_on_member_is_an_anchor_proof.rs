@@ -186,15 +186,7 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
     for d in [&a_dir, &b_dir] {
         staged(
             d,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "r",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             &format!("{ROOMPASS}\n"),
         );
     }

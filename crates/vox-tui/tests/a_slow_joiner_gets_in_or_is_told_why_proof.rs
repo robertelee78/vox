@@ -283,15 +283,7 @@ fn a_joiner_slower_than_the_old_patience_gets_in() {
 
     let t = Instant::now();
     let (ok, out, err) = s.bob.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &s.link,
-            "--name",
-            "slow",
-        ],
+        &["room", "join", "--passphrase-file", "-", &s.link],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();
@@ -340,15 +332,7 @@ fn a_joiner_slower_than_the_patience_is_told_why() {
 
     let t = Instant::now();
     let (ok, out, err) = s.bob.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &s.link,
-            "--name",
-            "slow",
-        ],
+        &["room", "join", "--passphrase-file", "-", &s.link],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();

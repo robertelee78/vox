@@ -224,20 +224,12 @@ fn post_range(alice: &Path, room: &str, lo: usize, hi: usize) {
 }
 
 /// Bob joins `room` from alice's `vox room link`.
-fn join(bob: &Path, alice: &Path, room: &str, name: &str) {
+fn join(bob: &Path, alice: &Path, room: &str) {
     let (ok, link, err) = vox(alice, &["room", "link", room], None);
     assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            name,
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join: {err}");
@@ -329,7 +321,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
 
     let bob_daemon = daemon(&bob, "bob");
     attached(&bob, "bob");
-    join(&bob, &alice, &room_a, "arma");
+    join(&bob, &alice, &room_a);
     // Let bob's join settle on alice, so he is a member of A when she decides.
     std::thread::sleep(Duration::from_secs(5));
 
@@ -368,7 +360,7 @@ fn posts_sealed_before_trust_stay_unreadable_and_everything_after_is_read() {
     );
 
     // ---- arm B: joins after a generation that spans the decision ------------------------
-    join(&bob, &alice, &room_b, "armb");
+    join(&bob, &alice, &room_b);
     let b_need: Vec<usize> = (1_101..=2_050).collect();
     let b = watch(&bob, &room_b, "arm B", &b_need, Duration::from_secs(60));
     let b_pre: Vec<usize> = b.iter().copied().filter(|n| *n <= 1_100).collect();

@@ -209,15 +209,7 @@ fn a_post_answers_promptly_while_a_peer_posts() {
     assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "busy",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         "room pass",
     );
     assert!(ok, "PRODUCT (staging): bob joins: {out}{err}");

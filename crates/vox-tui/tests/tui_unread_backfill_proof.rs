@@ -335,15 +335,7 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     assert!(ok, "bob creates home over the TUI's socket: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some("mission passphrase\n"),
     );
     assert!(

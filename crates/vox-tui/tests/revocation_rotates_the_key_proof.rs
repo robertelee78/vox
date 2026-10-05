@@ -277,15 +277,7 @@ fn join(m: &Member, link: &str, name: &str) {
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.
     let (ok, o, e) = m.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link,
-            "--name",
-            name,
-        ],
+        &["room", "join", "--passphrase-file", "-", link],
         Some(&format!("{ROOM_PASS}\n")),
     );
     assert!(

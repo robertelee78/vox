@@ -338,15 +338,7 @@ fn a_crash_inside_a_join_never_costs_the_member_the_room() {
         let join = || {
             vox(
                 &alice,
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    &link,
-                    "--name",
-                    &format!("h{k}"),
-                ],
+                &["room", "join", "--passphrase-file", "-", &link],
                 Some(&format!("{ROOMPASS}\n")),
             )
         };
@@ -548,15 +540,7 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
     let join = || {
         vox(
             &alice,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "h",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             Some(&format!("{ROOMPASS}\n")),
         )
     };

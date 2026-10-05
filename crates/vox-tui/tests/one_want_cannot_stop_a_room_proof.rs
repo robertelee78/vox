@@ -345,15 +345,7 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
     // refusal is fixed (V210-43), so nothing known excuses one.
     let (ok, out, err) = vox_in(
         &mallory_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "team",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
     );
     assert!(

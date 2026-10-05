@@ -230,15 +230,7 @@ fn a_restarted_creator_stays_findable_on_its_board() {
     let t = Instant::now();
     let (joined, out, err) = vox_in(
         &carol_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &anchor_only,
-            "--name",
-            "kept",
-        ],
+        &["room", "join", "--passphrase-file", "-", &anchor_only],
         "room pass",
     );
     let took = t.elapsed();

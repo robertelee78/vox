@@ -264,15 +264,7 @@ fn a_member_holding_silent_pairwise_streams_does_not_stop_the_node() {
     let joined = (1..=6).any(|attempt| {
         let (ok, out, err) = vox_in(
             &mallory_dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "team",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             ROOM_PASS,
         );
         if !ok {

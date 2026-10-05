@@ -293,15 +293,7 @@ fn scene(
     loop {
         let (ok, out, err) = vox_in(
             &bob_dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link.trim(),
-                "--name",
-                "ops",
-            ],
+            &["room", "join", "--passphrase-file", "-", link.trim()],
             ROOM_PASS,
         );
         if ok {

@@ -493,7 +493,7 @@ fn no_command_waits_for_input_it_cannot_get() {
     );
     check(
         "vox room join (running node)",
-        &mut vox_cmd(&alice, &["room", "join", "vox://not-read", "--name", "r"]),
+        &mut vox_cmd(&alice, &["room", "join", "vox://not-read"]),
         false,
         &["no terminal to ask at", "--passphrase-file"],
     );

@@ -178,10 +178,24 @@ pub struct Evaluator {
     /// The room's lifecycle as its log states it (V030-08): who has left, whether the creator
     /// ended it, and the idle end the creator chose.
     lifecycle: Lifecycle,
+    /// Every room-name statement that counts (ADR-028 R-1), in the canonical order: the name,
+    /// the entry that stated it, and its author. The last is the room's name.
+    names: Vec<NameStatement>,
     /// The entries that passed pass 1 (bound to this channel, signature verified under
     /// their author's root), by entry hash: what [`Evaluator::build_reusing`] need not
     /// verify again.
     verified: BTreeSet<Digest32>,
+}
+
+/// A room-name statement that counts (ADR-028 R-1): an admin's, authorized in its causal past.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameStatement {
+    /// The name it gave the room.
+    pub name: String,
+    /// The log entry that stated it.
+    pub entry_hash: Digest32,
+    /// Who stated it.
+    pub author: Digest32,
 }
 
 /// What a room's lifecycle facts say (V030-08), folded from the log.
@@ -304,6 +318,7 @@ impl Evaluator {
         let policy = resolver.resolve_policy(genesis)?;
         let consent = resolver.resolve_consent()?;
         let lifecycle = resolver.resolve_lifecycle()?;
+        let names = resolver.resolve_names()?;
 
         Ok(Self {
             channel_id,
@@ -315,6 +330,7 @@ impl Evaluator {
             consent,
             members,
             lifecycle,
+            names,
             verified: verified_hashes,
         })
     }
@@ -332,6 +348,7 @@ impl Evaluator {
             GovBody::Lifecycle(l) => l.verify(author_key),
             GovBody::Presence(p) => p.verify(author_key),
             GovBody::ServiceShare(s) => s.verify(author_key),
+            GovBody::RoomName(n) => n.verify(author_key),
         }
     }
 
@@ -347,6 +364,19 @@ impl Evaluator {
     #[must_use]
     pub fn root_admin(&self) -> Digest32 {
         self.root_admin
+    }
+
+    /// The room's shared name (ADR-028 R-1), or `None` while no admin has named it.
+    #[must_use]
+    pub fn room_name(&self) -> Option<&str> {
+        self.names.last().map(|n| n.name.as_str())
+    }
+
+    /// Every room-name statement that counts, in the canonical order (ADR-028 R-1): the last is
+    /// the room's name.
+    #[must_use]
+    pub fn name_statements(&self) -> &[NameStatement] {
+        &self.names
     }
 
     /// The effective channel policy (the genesis policy, with the retention from updates).
@@ -724,6 +754,37 @@ impl<'a> Resolver<'a> {
             }
         }
         Ok(policy)
+    }
+
+    /// Resolve the room's shared name (ADR-028 R-1) exactly as [`Resolver::resolve_policy`]
+    /// resolves its retention: a statement counts when its author held `policy` in its strict
+    /// past and was not revoked meanwhile, and the last in the canonical order wins.
+    fn resolve_names(&mut self) -> Result<Vec<NameStatement>> {
+        let mut names = Vec::new();
+        let order: Vec<&GovEntry> = self.causality.order.clone();
+        for e in order {
+            let GovBody::RoomName(n) = &e.body else {
+                continue;
+            };
+            if !self.in_effect(e)? {
+                continue;
+            }
+            let before = self.strict_before(&e.entry_hash)?;
+            if !before
+                .authority
+                .get(&e.author_id)
+                .is_some_and(|c| c.grants(&Capability::Policy))
+                || self.revoked_meanwhile(&e.author_id, &e.entry_hash)?
+            {
+                continue;
+            }
+            names.push(NameStatement {
+                name: n.body.name.clone(),
+                entry_hash: e.entry_hash,
+                author: e.author_id,
+            });
+        }
+        Ok(names)
     }
 
     /// Resolve consent edges. Consent is single-writer (`A` alone authors `A`'s

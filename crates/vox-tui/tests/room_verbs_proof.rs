@@ -216,6 +216,59 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         "PRODUCT: list did not name the room: {out}"
     );
 
+    // ---- the room's name (ADR-028 R-1, R-2): one DNS label, changed with `vox room rename`,
+    // which asks for the identity passphrase; a name that is no label is refused with the reason ----
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "Our Room",
+        ],
+        Some("channel passphrase"),
+    );
+    assert!(
+        !ok && err.contains("a room name holds only letters a-z, digits and `-`")
+            && err.contains("' '"),
+        "PRODUCT: `vox room create --name \"Our Room\"` must be refused, saying a room name is \
+         one DNS label and what is wrong with this one; it said: {out}{err}"
+    );
+    let identity = [
+        "--identity-passphrase-file",
+        pass.to_str().expect("APPARATUS: a UTF-8 path"),
+    ];
+    let rename = |room: &str, name: &str| {
+        vox(
+            &data,
+            &cfg,
+            &[&["room", "rename", room, name][..], &identity[..]].concat(),
+            None,
+        )
+    };
+    let (ok, out, err) = rename("agents", "team-");
+    assert!(
+        !ok && err.contains("a room name cannot start or end with `-`"),
+        "PRODUCT: renaming to `team-` must be refused with the reason; it said: {out}{err}"
+    );
+    // By its name, as a person refers to it.
+    let (ok, out, err) = rename("agents", "Team");
+    assert!(
+        ok && out.contains("renamed") && out.contains("to team"),
+        "PRODUCT: `vox room rename agents Team` by the room's creator must rename it to `team` \
+         (a name is lower case); it said: {out}{err}"
+    );
+    let (ok, out, err) = vox(&data, &cfg, &["room", "list"], None);
+    assert!(
+        ok && out.contains(" team") && !out.contains("agents"),
+        "PRODUCT: after the rename `vox room list` must show the room as `team`, and `agents` no \
+         more; it said: {out}{err}"
+    );
+    println!("[proof] a room renamed by its creator lists under its new name: {out}");
+
     // ---- post, and check the NODE's view rather than trusting the exit code ----
     let (ok, _, err) = vox(
         &data,

@@ -401,15 +401,7 @@ fn a_session_started_before_a_rotation_completes_after_it() {
         // The join runs in the guest's daemon; `vox room join` waits for it.
         let joining = std::thread::spawn({
             let cmd = guest
-                .command(&[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    &link,
-                    "--name",
-                    &format!("w{attempt}"),
-                ])
+                .command(&["room", "join", "--passphrase-file", "-", &link])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -514,15 +506,7 @@ fn sessions_get_one_time_prekeys_past_the_whole_pool() {
         // separate defect): retried, bounded, and said.
         let joined = (1..=4).any(|attempt| {
             let o = guest.vox(
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    &link,
-                    "--name",
-                    &name,
-                ],
+                &["room", "join", "--passphrase-file", "-", &link],
                 Some(ROOM_PASS),
             );
             if !o.ok {

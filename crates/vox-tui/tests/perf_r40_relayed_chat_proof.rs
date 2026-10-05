@@ -247,15 +247,7 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
     assert!(ok, "PRODUCT (staging): invite: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "chat",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some("room passphrase\n"),
     );
     assert!(

@@ -113,15 +113,7 @@ fn a_node_leaves_a_room_and_the_others_see_it_gone() {
     carol
         .vox_in(
             None,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "mission",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             Some(ROOM_PASS),
         )
         .expect_ok("carol joining again");

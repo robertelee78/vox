@@ -432,15 +432,7 @@ fn two_fetches_at_once_share_one_dial() {
     // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
     // and retrying would hide it.
     let (ok, out, err) = bob.vox_with(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
     );
     assert!(

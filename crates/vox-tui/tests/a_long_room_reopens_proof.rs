@@ -367,15 +367,7 @@ fn a_room_of(posts: usize, writers: usize, catch_up: Duration) {
     attached(&bob, "bob");
     let (ok, _, err) = vox(
         &bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "long",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join: {err}");

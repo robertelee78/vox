@@ -245,15 +245,7 @@ fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "kept",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join failed: {err}");

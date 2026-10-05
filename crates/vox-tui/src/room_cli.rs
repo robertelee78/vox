@@ -129,7 +129,8 @@ fn held_since(since_secs: u64) -> String {
     )
 }
 
-/// Resolve a room prefix against what the node holds, and insist it is open.
+/// Resolve a room's name (ADR-028 R-1), or a prefix of its id, against what the node holds, and
+/// insist it is open. A name is matched whole, and only when one room holds it.
 ///
 /// A closed room is reported as closed rather than "unknown": the two are
 /// different problems and an operator fixes them differently.
@@ -141,7 +142,15 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
         ));
     }
     let ids: Vec<Digest32> = rooms.iter().map(|(id, _, _, _)| *id).collect();
-    let id = resolve_prefix(prefix, &ids)?;
+    let named: Vec<Digest32> = rooms
+        .iter()
+        .filter(|(_, name, _, _)| !name.is_empty() && name.eq_ignore_ascii_case(prefix.trim()))
+        .map(|(id, _, _, _)| *id)
+        .collect();
+    let id = match named.as_slice() {
+        [one] => *one,
+        _ => resolve_prefix(prefix, &ids)?,
+    };
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
     // Named by the id the operator typed a prefix of, and by its name only when there is one.
@@ -3421,7 +3430,6 @@ fn room_passphrase(
 pub async fn join(
     paths: &Paths,
     link: &str,
-    local_name: &str,
     passphrase_file: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
@@ -3448,7 +3456,6 @@ pub async fn join(
         return match client
             .request(&Request::Join {
                 link: link.to_owned(),
-                local_name: local_name.to_owned(),
                 passphrase: zeroize::Zeroizing::new(String::new()),
             })
             .await
@@ -3479,13 +3486,23 @@ pub async fn join(
     match client
         .request(&Request::Join {
             link: link.to_owned(),
-            local_name: local_name.to_owned(),
             passphrase: zeroize::Zeroizing::new(passphrase),
         })
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: joined {local_name}");
+            // The room's own name, as a member told it (ADR-028 R-1): the joiner names nothing.
+            let joined = match vox_core::node::link::InviteLink::parse(link) {
+                Ok(parsed) => rooms_of(&mut client)
+                    .await?
+                    .into_iter()
+                    .find(|(id, _, _, _)| *id == parsed.channel_id)
+                    .map(|(id, name, _, _)| {
+                        vox_core::node::resolver::room_shown(Some(name.as_str()), &id)
+                    }),
+                Err(_) => None,
+            };
+            println!("vox: joined {}", joined.as_deref().unwrap_or("the room"));
             println!("     you read a member once you trust it and it trusts you: `vox trust add`");
             Ok(())
         }
@@ -3512,10 +3529,14 @@ pub async fn join(
 /// If the node cannot be reached or the create is refused.
 pub async fn create(
     paths: &Paths,
-    local_name: &str,
+    name: &str,
     passphrase_file: Option<&std::path::Path>,
     idle_end: Option<&str>,
 ) -> Result<(), AppError> {
+    // Every member sees the room under this name, and it is the room part of every service
+    // address in it: one DNS label (ADR-028 R-1, R-2). Said before a passphrase is asked for.
+    let name = vox_core::governance::name::room_name(name)
+        .map_err(|why| AppError::Usage(format!("cannot create the room: {why}")))?;
     // Checked before anything is made: a typo must not leave a room with no idle end behind.
     let idle_secs = match idle_end {
         None => None,
@@ -3540,13 +3561,13 @@ pub async fn create(
     };
     match client
         .request(&Request::Create {
-            local_name: local_name.to_owned(),
+            name: name.clone(),
             passphrase: zeroize::Zeroizing::new(passphrase),
         })
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: created {local_name}");
+            println!("vox: created {name}");
             if let Some(idle_secs) = idle_secs {
                 let made = rooms_of(&mut client)
                     .await?
@@ -3583,6 +3604,43 @@ pub async fn create(
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot create: {reason}"))),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// `vox room rename` — give a room a new name, for every member (ADR-028 R-1).
+///
+/// # Errors
+/// A name that is not one DNS label, an unreachable node, an unknown room, a wrong identity
+/// passphrase, or a caller who is not the room's creator or an admin.
+pub async fn rename(
+    paths: &Paths,
+    room: &str,
+    name: &str,
+    identity_passphrase: &str,
+) -> Result<(), AppError> {
+    let name = vox_core::governance::name::room_name(name)
+        .map_err(|why| AppError::Usage(format!("cannot rename the room: {why}")))?;
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    match client
+        .request(&Request::RenameRoom {
+            channel_id,
+            name: name.clone(),
+            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
+        })
+        .await
+    {
+        Ok(Frame::Ok) => {
+            println!("vox: renamed {} to {name}", short(&channel_id));
+            println!("     every member sees the new name as this reaches them");
+            Ok(())
+        }
+        // The node's own words (`Fault::explain`) say why: not an admin, or not a name.
+        Ok(Frame::Error { reason }) => {
+            Err(AppError::Usage(format!("cannot rename the room: {reason}")))
+        }
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }

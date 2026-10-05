@@ -329,15 +329,7 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
     // while the host admits another joiner was #217, fixed), and it is named so.
     for m in [bob, carol] {
         let (ok, out, err) = m.vox(
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "mission",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             Some(ROOM_PASS),
         );
         assert!(

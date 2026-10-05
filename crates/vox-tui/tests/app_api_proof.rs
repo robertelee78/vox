@@ -321,15 +321,7 @@ fn member(tmp: &Path, name: &str) -> Member {
 fn join(who: &Member, link: &str) {
     let (ok, out, err) = vox_in(
         &who.data,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link,
-            "--name",
-            "calls",
-        ],
+        &["room", "join", "--passphrase-file", "-", link],
         ROOM_PASS,
     );
     assert!(ok, "PRODUCT (staging): {} joins: {out}{err}", who.name);

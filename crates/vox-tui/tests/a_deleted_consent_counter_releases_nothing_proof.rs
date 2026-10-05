@@ -402,15 +402,7 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
     let (ok, _, err) = vox(
         &bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "c",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join failed: {err}");

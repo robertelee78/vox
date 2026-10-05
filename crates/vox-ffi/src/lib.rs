@@ -262,7 +262,7 @@ impl VoxNode {
             .into_iter()
             .map(|c| Room {
                 id: b32_encode(&c.channel_id),
-                name: c.local_name.unwrap_or_default(),
+                name: c.name.unwrap_or_default(),
                 open: c.open,
             })
             .collect()
@@ -283,7 +283,7 @@ impl VoxNode {
         self.apply(
             "creating the room",
             NodeCommand::CreateChannel {
-                local_name: name,
+                name,
                 passphrase: Secret::new(passphrase.into_bytes()),
             },
         )
@@ -317,12 +317,7 @@ impl VoxNode {
     ///
     /// # Errors
     /// A wrong passphrase, or no member could be reached.
-    pub async fn join_room(
-        &self,
-        link: String,
-        name: String,
-        passphrase: String,
-    ) -> Result<String, VoxError> {
+    pub async fn join_room(&self, link: String, passphrase: String) -> Result<String, VoxError> {
         let before: Vec<Digest32> = self
             .node
             .view()
@@ -334,7 +329,6 @@ impl VoxNode {
             "joining the room",
             NodeCommand::JoinChannel {
                 link,
-                local_name: name,
                 passphrase: Secret::new(passphrase.into_bytes()),
             },
         )

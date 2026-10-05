@@ -108,11 +108,14 @@ pub enum StructTag {
     /// `0x001E` — identity exchange flight 3, `CLAIM` (ADR-011 requirement 28): the dialler's
     /// composite key, its per-attach instance and its signature under `vox-id/v2/init`.
     IdentityClaim = 0x001E,
+    /// `0x001F` — room name (ADR-028 R-1): the room's one shared name, stated by its creator or
+    /// an admin. The causally last statement by an admin wins, as retention does.
+    RoomName = 0x001F,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 26] = [
+    pub const ALL: [StructTag; 27] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -139,6 +142,7 @@ impl StructTag {
         StructTag::IdentityAsk,
         StructTag::IdentityProve,
         StructTag::IdentityClaim,
+        StructTag::RoomName,
     ];
 
     /// The 2-byte tag value.
@@ -149,7 +153,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 26-element table: trivial and avoids an
+        // Linear scan over a 27-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -192,6 +196,7 @@ impl StructTag {
             StructTag::IdentityAsk => "vox-id/v2/ask",
             StructTag::IdentityProve => "vox-id/v2/resp",
             StructTag::IdentityClaim => "vox-id/v2/init",
+            StructTag::RoomName => "vox/room-name/v1",
         }
     }
 }

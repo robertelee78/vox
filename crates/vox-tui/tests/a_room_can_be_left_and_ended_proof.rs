@@ -257,15 +257,7 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
     let t = Instant::now();
     let o = alice.vox_in(
         None,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some("channel passphrase"),
     );
     assert!(
@@ -539,15 +531,7 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     // its address and passphrase.
     let o = carol.vox_in(
         None,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some("channel passphrase"),
     );
     assert!(
@@ -608,15 +592,7 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
         .to_owned();
     let o = bob.vox_in(
         None,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "quiet",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some("idle room passphrase"),
     );
     assert!(
