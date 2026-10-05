@@ -15,6 +15,13 @@
 //!    conflicting reuse with exit 4 and never reports success for it;
 //! 4. **two conflicting posts racing** never both report success.
 //!
+//! 5. **a conflicting post that lands after a post's lookup** is found by the post's read-back,
+//!    every time: section (4) races two posts and is a coin toss about which interleaving it
+//!    gets, so a second test stages the one interleaving that needs the read-back with a
+//!    test-only pause between the lookup and the post (`VOX_TEST_OP_HOLD_MS`; V030-31, #368).
+//!    Mutant: no read-back verdict after the post (`coord::post_once` reporting success once its
+//!    entry is back) — red as PRODUCT at its own assertion.
+//!
 //! Cases 2 and 3 need two entries under one `(author, op)` that the CLI's own lookup
 //! would have prevented, which is precisely what a racing retry produces. They are
 //! written onto the control socket as the bytes such a retry writes.
@@ -23,6 +30,8 @@
 
 #[path = "support/room.rs"]
 mod support;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -422,4 +431,121 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
             );
         }
     }
+}
+
+/// **A conflicting post that lands after a post's lookup is found by its read-back** (ADR-021
+/// §6.6, M21.4; V030-31, #368). Alice's first `vox room post --op` is paused between its lookup
+/// of the operation (which finds nothing) and its post, by the test-only `VOX_TEST_OP_HOLD_MS`;
+/// it says so on stderr. In that pause her second post, under the same op with different
+/// content, is made and succeeds: nothing was there before it. Then the first posts. Asserted:
+/// the first must read the group back, find the conflict and exit 4, never 0; both entries read
+/// `conflict`. Unlike section (4)'s races, this interleaving is staged on every run.
+#[test]
+#[ignore = "two networked nodes with production Argon2id; CI runs it in release"]
+fn a_conflict_that_lands_after_the_lookup_is_found_by_the_read_back() {
+    test_knobs::require(&["VOX_TEST_OP_HOLD_MS"]);
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: could not build the test's tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
+    let room = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let alice = &room.workers[0];
+    let r = room.id.as_str();
+    let op = "op-held-conflict-5";
+    let args = |n: u32| {
+        vec![
+            "room".to_owned(),
+            "post".to_owned(),
+            r.to_owned(),
+            "--type".to_owned(),
+            "status".to_owned(),
+            "--op".to_owned(),
+            op.to_owned(),
+            "--data".to_owned(),
+            format!("{{\"n\":{n}}}"),
+            "note".to_owned(),
+        ]
+    };
+    let mut cmd = Command::new(VOX);
+    cmd.args(args(1))
+        .env("VOX_DATA_DIR", &alice.data)
+        .env("VOX_CONFIG_DIR", &alice.cfg)
+        .env("VOX_TEST_OP_HOLD_MS", "4000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for v in HARNESS_SESSION_VARS {
+        cmd.env_remove(v);
+    }
+    cmd.env("VOX_SESSION", "a1");
+    let mut held = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn the held post: {e}"));
+    let stderr = held
+        .stderr
+        .take()
+        .expect("APPARATUS: the held post's stderr");
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let reader = {
+        let lines = Arc::clone(&lines);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if line.contains("holding the post of operation") {
+                    let _ = tx.send(());
+                }
+                lines
+                    .lock()
+                    .expect("APPARATUS: the stderr lines")
+                    .push(line);
+            }
+        })
+    };
+    let paused = rx.recv_timeout(Duration::from_secs(120)).is_ok();
+    assert!(
+        paused,
+        "PRODUCT (staging): the first post never said it was holding after its lookup: {:?}",
+        lines.lock().expect("APPARATUS: the stderr lines")
+    );
+    let n2: Vec<String> = args(2);
+    let n2: Vec<&str> = n2.iter().map(String::as_str).collect();
+    let second = alice.vox(Some("a1"), &n2);
+    assert!(
+        second.ok,
+        "PRODUCT (staging): the second post, made while the first was held and with nothing under \
+         its op yet, must succeed: {second:?}"
+    );
+    let out = held
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not collect the held post: {e}"));
+    reader.join().expect("APPARATUS: the stderr reader");
+    let said = lines
+        .lock()
+        .expect("APPARATUS: the stderr lines")
+        .join("\n");
+    println!(
+        "[proof] (5) the held post exited {:?}; the post made in its pause exited {:?}",
+        out.status.code(),
+        second.code
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "PRODUCT: a post whose operation gained a conflicting entry after its lookup must find it \
+         when it reads the group back, and exit 4, never 0. It exited {:?}; stdout {:?}; stderr \
+         {said}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let entries = rows_with_op(alice, r, op);
+    assert!(
+        entries.len() == 2 && entries.iter().all(|x| x["op"]["status"] == "conflict"),
+        "PRODUCT: both entries under the held op must read conflict: {entries:?}"
+    );
 }

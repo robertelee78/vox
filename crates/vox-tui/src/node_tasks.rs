@@ -173,8 +173,11 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
         starting: true,
         ..Tending::default()
     };
+    let deaf = wake_deaf();
     // Counted at once, not at the first tick.
-    tend(&paths, &node.view(), &answered, &mut tending);
+    if !deaf {
+        tend(&paths, &node.view(), &answered, &mut tending);
+    }
     loop {
         let sweep = tokio::select! {
             item = events.next() => match item {
@@ -204,7 +207,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                                         &row,
                                     );
                                 }
-                                if may_wake(&row.text) {
+                                if may_wake(&row.text) && !deaf {
                                     judge(&paths, &node.view(), &channel_id, &row);
                                 }
                                 if may_answer(&row.text) {
@@ -222,7 +225,7 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             },
             _ = tick.tick() => true,
         };
-        if sweep {
+        if sweep && !deaf {
             let view = node.view();
             // Every unseen row is marked seen; only one that could interrupt
             // someone is copied out to be judged.
@@ -266,6 +269,22 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             answered.clear();
         }
     }
+}
+
+/// **Test-only: a wake loop that judges and sends nothing** (V030-31, #368), read from
+/// `VOX_TEST_WAKE_DEAF=1` in a build with the `test-knobs` feature; no shipped build reads it
+/// (V210-105). It stages the one window the startup count guards: an urgent row in the node's
+/// store that the wake loop never looked at before the daemon was killed. Rows still land and are
+/// stored; only the loop's judging and sending are off, and the daemon says so at start.
+fn wake_deaf() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var("VOX_TEST_WAKE_DEAF").is_ok_and(|v| v.trim() == "1") {
+        eprintln!(
+            "vox daemon: test-knobs: the wake loop judges and sends nothing (VOX_TEST_WAKE_DEAF)"
+        );
+        return true;
+    }
+    false
 }
 
 /// How long one wake may take before it is abandoned.
@@ -437,8 +456,8 @@ fn tend(
         // daemon killed after a row reached its store and before the wake loop looked at it (the
         // next sweep, at most 2 s). Such a row is history to the restarted loop, so nothing new
         // marks it. Rows that land while the daemon is down arrive by sync after it starts and are
-        // judged as new without this. The window cannot be staged through the shipped binary
-        // (`vox room post` needs a running node), so this is unproven by mutant: a review-only guard.
+        // judged as new without this. The window is staged with the test-only `VOX_TEST_WAKE_DEAF`
+        // (remote_interrupt_proof, a wake owed when the daemon died; V030-31, #368).
         if starting && urgent > 0 {
             n.urgent_due = true;
         }

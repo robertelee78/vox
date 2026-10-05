@@ -62,12 +62,23 @@
 //!   client's full socket holds it, and the second client receives nothing while it is
 //!   frozen (RP-45 goes red);
 //! - a client's death ends every subscription: the second client is cut off at the first
-//!   SIGKILL and misses the rest (RP-18 goes red).
+//!   SIGKILL and misses the rest (RP-18 goes red);
+//! - a cursor read on by position, not arrival, in the node's `Read { since }` (vox-core
+//!   `ipc.rs`): from bob's cursor where the two part, `read --since` yields none of the late
+//!   rows (F19 goes red); and the same in `tail`'s own backlog cut (`room_cli::after_cursor`):
+//!   `tail --since` that cursor emits none of them (F19 goes red at its `tail` assertion).
+//!
+//! And a second test, **a row that lands between the subscription and the read is not lost**
+//! (ADR-021 §7.1, M21.5; V030-31, #368): `tail --since` is paused between its two steps by the
+//! test-only `VOX_TEST_TAIL_HOLD_MS` while three rows are posted. Mutant: read, then subscribe
+//! (the order §7.1 forbids) — the three rows are in neither, and it goes red as PRODUCT.
 
 #![cfg(unix)]
 
 #[path = "support/room.rs"]
 mod support;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -797,6 +808,34 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
          (late, above it in the room's order): {} by arrival, {by_position} by position",
         after_bob.len()
     );
+    // And the adapter's own surface, `tail --since`, from the same cursor (ADR-021 §7.1): its
+    // backlog is cut by the client's own rule, apart from the node's, so it is asked too.
+    let tailed: Vec<String> = {
+        let run = start(bob, &r, &bob_last, &stderr);
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while got.len() < after_bob.len() && std::time::Instant::now() < deadline {
+            if let Ok(line) = run.rx.recv_timeout(Duration::from_millis(200)) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    got.push(v);
+                }
+            }
+        }
+        drop(run);
+        hashes(&got)
+    };
+    eprintln!(
+        "[proof] tail --since bob's last row: {} rows; read --since: {}",
+        tailed.len(),
+        after_bob.len()
+    );
+    assert!(
+        tailed == after_bob,
+        "PRODUCT: `tail --since` bob's last row must emit what follows it by arrival, the {} rows \
+         `read --since` gives, in that order; it emitted {} ({by_position} follow it by position)",
+        after_bob.len(),
+        tailed.len()
+    );
     eprintln!(
         "[proof] before bob's node restarts: {} rows, {late} of them late arrivals, position \
          {before_position}; {} rows follow the consumer's cursor",
@@ -894,5 +933,127 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
          the rows that followed it: {} of {} rows, {resumed:?} against {followed:?}",
         resumed.len(),
         followed.len()
+    );
+}
+
+/// **A row that lands between `tail`'s subscription and its read is emitted, once** (ADR-021 §7.1,
+/// M21.5; V030-31, #368). The rule is "subscribe, then read": a row landing between the two is in
+/// both and emitted once, and a row can land in neither only when the read comes first. A plain
+/// run almost never puts a row there, so the moment is staged every run: bob's `vox room tail
+/// --since <cursor> --json` is paused between its subscription and its read by the test-only
+/// `VOX_TEST_TAIL_HOLD_MS`, which it says on stderr, and three rows are posted on bob's node in the
+/// pause. The room's other member is stopped first, so no sync from anyone else wakes the stream
+/// into a re-read that would cover for a lost row. Asserted: each of the three rows is emitted exactly once within
+/// 10 s of the pause's end.
+#[test]
+#[ignore = "a vox daemon with production Argon2id; CI runs it in release"]
+fn a_row_that_lands_between_the_subscription_and_the_read_is_not_lost() {
+    test_knobs::require(&["VOX_TEST_TAIL_HOLD_MS"]);
+    watchdog::arm();
+    const HOLD_MS: u64 = 4000;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("APPARATUS: could not build the test's tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: could not make a temp dir");
+    let mut room = rt.block_on(support::room(tmp.path(), &["bob", "alice"]));
+    // alice is stopped (killed by her own pid): no sync from another member can wake bob's stream
+    // into a re-read that would cover for a lost row.
+    room.stop(1);
+    let bob = &room.workers[0];
+    let r = room.id.as_str();
+    let base = bob.vox(None, &["room", "post", r, "BASE-ROW"]);
+    assert!(
+        base.ok,
+        "PRODUCT (staging): bob's first post failed: {base:?}"
+    );
+    let read = bob.vox(None, &["room", "read", r, "--json"]);
+    let cursor = read
+        .stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.to_string().contains("BASE-ROW"))
+        .find_map(|v| v["entry_hash"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            panic!("PRODUCT (staging): `vox room read --json` has no row for bob's post: {read:?}")
+        });
+
+    let mut cmd = Command::new(VOX);
+    cmd.args(["room", "tail", r, "--since", &cursor, "--json"])
+        .env("VOX_DATA_DIR", &bob.data)
+        .env("VOX_CONFIG_DIR", &bob.cfg)
+        .env("VOX_TEST_TAIL_HOLD_MS", HOLD_MS.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for v in HARNESS_SESSION_VARS {
+        cmd.env_remove(v);
+    }
+    let mut tail = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: could not spawn `vox room tail`: {e}"));
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let err = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    {
+        let stdout = tail.stdout.take().expect("APPARATUS: tail's stdout");
+        let out = std::sync::Arc::clone(&out);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                out.lock().expect("APPARATUS: tail's lines").push(line);
+            }
+        });
+        let stderr = tail.stderr.take().expect("APPARATUS: tail's stderr");
+        let err = std::sync::Arc::clone(&err);
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if line.contains("between its subscribe and its read") {
+                    let _ = tx.send(());
+                }
+                err.lock().expect("APPARATUS: tail's stderr").push(line);
+            }
+        });
+    }
+    let held_at = std::time::Instant::now();
+    let held = rx.recv_timeout(Duration::from_secs(60)).is_ok();
+    assert!(
+        held,
+        "PRODUCT (staging): `vox room tail` never said it was holding between its subscription and \
+         its read: {:?}",
+        err.lock().expect("APPARATUS: tail's stderr")
+    );
+    for i in 1..=3 {
+        let o = bob.vox(None, &["room", "post", r, &format!("GAP-ROW-{i}")]);
+        assert!(o.ok, "PRODUCT (staging): bob's post {i} failed: {o:?}");
+    }
+    let posted_in = held_at.elapsed();
+    assert!(
+        posted_in < Duration::from_millis(HOLD_MS),
+        "CANNOT MEASURE (staging not achieved): the three posts took {posted_in:?}, past the \
+         tail's {HOLD_MS} ms pause, so they did not all land between its two steps"
+    );
+    let count = |i: usize| {
+        out.lock()
+            .expect("APPARATUS: tail's lines")
+            .iter()
+            .filter(|l| l.contains(&format!("GAP-ROW-{i}")))
+            .count()
+    };
+    let deadline = held_at + Duration::from_millis(HOLD_MS) + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline && (1..=3).any(|i| count(i) == 0) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let counts: Vec<usize> = (1..=3).map(count).collect();
+    let _ = tail.kill();
+    let _ = tail.wait();
+    println!("[proof] rows posted between the subscription and the read, emitted: {counts:?}");
+    assert!(
+        counts == [1, 1, 1],
+        "PRODUCT: every row posted between `tail`'s subscription and its read must be emitted \
+         exactly once (subscribe, then read; ADR-021 §7.1); emitted {counts:?} times. tail \
+         printed:\n{}\nand said:\n{}",
+        out.lock().expect("APPARATUS: tail's lines").join("\n"),
+        err.lock().expect("APPARATUS: tail's stderr").join("\n")
     );
 }

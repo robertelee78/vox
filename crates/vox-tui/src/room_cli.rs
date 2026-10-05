@@ -1244,6 +1244,18 @@ pub async fn tail(
         .subscribe()
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
+    // **Test-only: a pause between the subscription and the read** (V030-31, #368), read from
+    // `VOX_TEST_TAIL_HOLD_MS` in a build with the `test-knobs` feature; no shipped build reads it
+    // (V210-105). Rows posted in it land between the two steps every time, which is the moment
+    // the order exists for.
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var("VOX_TEST_TAIL_HOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        eprintln!("vox: test-knobs: tail holding {ms} ms between its subscribe and its read");
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
 
     let all = coord::read_all(&mut lookup, channel_id, None).await?;
     // With no cursor, a tail starts at the live edge, as it always has; everything

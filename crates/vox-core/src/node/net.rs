@@ -1355,6 +1355,56 @@ impl ConnectionManager {
         before - map.len()
     }
 
+    /// **Close every held connection the machine's network change stranded** (ADR-012 N-51):
+    /// each connection this end accepted, and each to a peer in `dialled_too` (the anchors), is
+    /// probed at once; one that does not answer within its probe's patience is closed, said, and
+    /// its peer returned for the caller to dial again. A connection this end accepted cannot follow
+    /// the move: QUIC lets only the dialling end migrate (RFC 9000 §9), so the peer keeps sending to
+    /// an address this machine may no longer have. One that answers survived, and is kept.
+    pub async fn close_stranded(
+        &self,
+        dialled_too: &std::collections::BTreeSet<Digest32>,
+    ) -> Vec<Digest32> {
+        let held: Vec<Arc<VoxConnection>> = lock(&self.conns)
+            .values()
+            .filter(|c| is_live(c))
+            .filter(|c| {
+                c.quinn().side() == quinn::Side::Server || dialled_too.contains(&c.peer_id())
+            })
+            .map(Arc::clone)
+            .collect();
+        let mut probes = tokio::task::JoinSet::new();
+        for c in held {
+            probes.spawn(async move { probe_unanswered(&c).await.map(|before| (c, before)) });
+        }
+        let mut stranded = Vec::new();
+        while let Some(done) = probes.join_next().await {
+            let Ok(Some((conn, before))) = done else {
+                continue;
+            };
+            if !is_live(&conn) || heard_count(conn.quinn()) != before {
+                continue;
+            }
+            let accepted = conn.quinn().side() == quinn::Side::Server;
+            conn.close(WireError::Unresponsive);
+            self.note(
+                conn.peer_id(),
+                format!(
+                    "the connection {} ({}) did not answer a probe after the network changed; \
+                     closed, and dialled again",
+                    conn_tag(&conn),
+                    if accepted {
+                        "accepted here"
+                    } else {
+                        "dialled from here"
+                    }
+                ),
+            );
+            stranded.push(conn.peer_id());
+        }
+        stranded
+    }
+
     /// The peers with a live connection, in unspecified order.
     #[must_use]
     pub fn peers(&self) -> Vec<Digest32> {

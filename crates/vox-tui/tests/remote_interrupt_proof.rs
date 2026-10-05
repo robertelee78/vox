@@ -110,6 +110,8 @@
 
 #[path = "support/room.rs"]
 mod support;
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -1672,5 +1674,131 @@ fn a_sender_is_told_how_each_addressee_can_be_reached() {
         !o.stderr.to_lowercase().contains("overdue"),
         "PRODUCT: a sender cannot see another node's reads, so nothing may say overdue: {}",
         o.stderr
+    );
+}
+
+/// **A wake owed when the daemon died is sent once it is back** (V030-15's startup count;
+/// V030-31, #368). At start the daemon counts every session from its cursors: a row that reached
+/// the node's store but that the wake loop never looked at before the daemon was killed is
+/// history to the restarted loop, and nothing new marks it.
+///
+/// **Staged every run, with a test-only knob.** Bob's daemon runs with `VOX_TEST_WAKE_DEAF=1`:
+/// its node syncs and stores alice's urgent message to bob, and its wake loop judges and sends
+/// nothing (`vox daemon` says so at start). Bob's daemon is then killed (SIGKILL, by its own pid)
+/// and started again without the knob, as an operator restarts it after a crash. Asserted: bob's
+/// session, which never read the message, is woken by the restarted daemon, once, with a notice
+/// naming one urgent message from alice and none of its bytes.
+///
+/// **Mutant:** delete the startup count (`if starting && urgent > 0 { n.urgent_due = true }` in
+/// `node_tasks::tend`): the restarted daemon owes nothing, and this goes red as PRODUCT at its own
+/// assertion.
+#[test]
+#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
+fn a_wake_owed_when_the_daemon_died_is_sent_after_it_restarts() {
+    test_knobs::require(&["VOX_TEST_WAKE_DEAF"]);
+    watchdog::arm();
+    label_reds();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a tokio runtime");
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
+    let mut r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let room = r.id.clone();
+    let bob_err = || daemon_err(tmp.path(), "bob");
+
+    // bob's session registers and reads everything so far, as in the cases above.
+    let sock = tmp.path().join("session.sock");
+    let inbox = listen(&sock);
+    let sock_s = sock.to_string_lossy().into_owned();
+    let bob_env = [
+        ("CLAUDE_CODE_MESSAGING_SOCKET", sock_s.as_str()),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "a-token"),
+    ];
+    let turn = |bob: &Worker, prompt: &str| {
+        injected(&hook(
+            bob,
+            &bob_env,
+            &["agent", "hook", "--node", "default", "--room", &room],
+            Some(&hook_json("UserPromptSubmit", "session-bob", Some(prompt))),
+        ))
+    };
+    let _ = turn(&r.workers[1], "hi");
+    assert_eq!(
+        registered_endpoint(&r.workers[1], "session-bob"),
+        ("claude".to_owned(), sock_s.clone()),
+        "PRODUCT (staging): bob's session must be registered at the test's own socket, never a \
+         real session's"
+    );
+    post(&r.workers[0], &room, "SYNC-MARKER");
+    until(
+        &r.workers[1],
+        None,
+        "alice's marker to reach bob",
+        &["room", "read", &room],
+        |o| o.stdout.contains("SYNC-MARKER"),
+    );
+    let _ = turn(&r.workers[1], "hi");
+
+    // ---- bob's daemon, deaf: the message is stored, and nothing judges it ----
+    let deaf_err = tmp.path().join("bob.daemon.deaf.err");
+    r.workers[1].restart_daemon_as(support::VOX, &[("VOX_TEST_WAKE_DEAF", "1")], &deaf_err);
+    let said = std::fs::read_to_string(&deaf_err).unwrap_or_default();
+    assert!(
+        said.contains("the wake loop judges and sends nothing"),
+        "CANNOT MEASURE (staging not achieved): bob's daemon did not say its wake loop is off, so \
+         the window is not staged; it said:\n{said}"
+    );
+    post(
+        &r.workers[0],
+        &room,
+        &to_node(
+            r#"{"v":1,"type":"ask","to":["bob"],"urgent":true,"body":"bob: CANARY-OWED wake up"}"#,
+            &r.workers[1],
+        ),
+    );
+    until(
+        &r.workers[1],
+        None,
+        "the urgent message to reach bob's node",
+        &["room", "read", &room],
+        |o| o.stdout.contains("CANARY-OWED"),
+    );
+    // Ten seconds, five of the daemon's sweeps: the deaf loop must have sent nothing, or the
+    // window is not what this measures.
+    let (early, _) = collect(&inbox, Duration::from_secs(10), |_| false);
+    assert!(
+        contents(&early).is_empty(),
+        "CANNOT MEASURE (staging not achieved): bob's deaf daemon woke the session anyway, so \
+         the restart has nothing to owe: {early:?}"
+    );
+
+    // ---- killed, and started again as an operator does ----
+    let err = tmp.path().join("bob.daemon.restart.err");
+    r.workers[1].restart_daemon_as(support::VOX, &[], &err);
+    let (frames, stall) = collect(&inbox, Duration::from_secs(20), |all| {
+        !contents(&[all.to_owned()]).is_empty()
+    });
+    let wakes = contents(&frames);
+    let all = frames.join("\n");
+    println!(
+        "[proof] after the restart bob's session got {} notice(s): {wakes:?}",
+        wakes.len()
+    );
+    assert!(
+        !(wakes.is_empty() && stalled(stall, Duration::from_secs(20))),
+        "APPARATUS, CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 20 s \
+         window, so a missing wake cannot be judged; bob's daemon:\n{}",
+        bob_err()
+    );
+    assert!(
+        wakes.len() == 1
+            && wakes[0].contains("1 urgent message addressed to you from alice")
+            && !all.contains("CANARY-OWED"),
+        "PRODUCT: an urgent message bob's node stored but never judged before its daemon was \
+         killed must wake his session once its daemon is back — the startup count — with a \
+         notice naming one urgent message from alice and none of its bytes; received \
+         {frames:?}; bob's daemon:\n{}",
+        bob_err()
     );
 }

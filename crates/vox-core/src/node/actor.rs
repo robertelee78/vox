@@ -466,6 +466,8 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::UpgradeFailed { .. } => "filing a path upgrade that failed",
         NetEvent::AnchorConnected { .. } => "publishing every room to an anchor that answered",
         NetEvent::AddressesDiscovered => "publishing every room at a new address",
+        NetEvent::NetworkChanged(_) => "acting on a change of the machine's network",
+        NetEvent::Stranded(_) => "dialling again peers a network change stranded",
         NetEvent::SyncDone { .. } => "filing a sync that finished",
         NetEvent::RoomStored { .. } => "evaluating a room whose log grew",
         NetEvent::SlotFreed => "starting a queued sync",
@@ -895,6 +897,11 @@ enum NetEvent {
     /// The presence's publish side composed what its nodes advertise (ADR-026 D-3): this node's
     /// records are published again with it.
     AddressesDiscovered,
+    /// The machine's network changed, and the presence's publish side has run for it (ADR-012
+    /// N-51): republish, and dial again whatever did not survive the move.
+    NetworkChanged(Arc<crate::nat::netwatch::NetChange>),
+    /// Peers whose connection the network change stranded, closed now: dialled again at once.
+    Stranded(Vec<Digest32>),
     /// A configured anchor answered its dial (ADR-016 M15.1): it gets the ordinary
     /// bookkeeping, the `Anchor` class, and every open channel's records.
     AnchorConnected {
@@ -3522,6 +3529,8 @@ pub struct Node {
     stream_loops: std::collections::BTreeMap<u64, std::sync::Weak<VoxConnection>>,
     /// The task telling this node each new composition of its presence's addresses.
     addresses_task: Option<tokio::task::AbortHandle>,
+    /// The task telling this node each real change of the machine's network (ADR-012 N-51).
+    changes_task: Option<tokio::task::AbortHandle>,
     /// Per anchor that failed to connect: when it may be dialled again (unix seconds), and the
     /// wait that set it, doubling to [`ANCHOR_REDIAL_SECS`] (V210-57). No entry: dial when
     /// needed.
@@ -4104,6 +4113,7 @@ impl Node {
             pow_params,
             stream_loops: std::collections::BTreeMap::new(),
             addresses_task: None,
+            changes_task: None,
             anchor_backoff: BTreeMap::new(),
             anchor_dials: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
             anchor_window: BTreeMap::new(),
@@ -4963,6 +4973,28 @@ impl Node {
                 old.abort();
             }
         }
+        // Each real change of the machine's network, told once the presence has composed the new
+        // addresses (ADR-012 N-51, N-52).
+        {
+            let mut changes = presence.changes();
+            let tx = self.net_tx.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    match changes.recv().await {
+                        Ok(change) => {
+                            if tx.send(NetEvent::NetworkChanged(change)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            if let Some(old) = self.changes_task.replace(task.abort_handle()) {
+                old.abort();
+            }
+        }
         spawn_inbound_pump(
             net,
             link.inbound,
@@ -5060,6 +5092,9 @@ impl Node {
             task.abort();
         }
         if let Some(task) = self.addresses_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.changes_task.take() {
             task.abort();
         }
         self.nearby = None;
@@ -5558,6 +5593,70 @@ impl Node {
                 .room_anchors
                 .iter()
                 .any(|(room, set)| self.channels.contains_key(room) && set.get(peer).is_some())
+    }
+
+    /// **Act on a change of the machine's network** (ADR-012 N-51, N-52), after the presence has
+    /// forgotten its reflexive addresses and composed the new ones: publish every open room's
+    /// records to this node's board and to every anchor now, without waiting for their renewal;
+    /// say the change; and probe, off the actor, every connection this node accepted and every
+    /// anchor's, dialling again whatever did not survive ([`NetEvent::Stranded`]).
+    async fn network_changed(&mut self, change: &crate::nat::netwatch::NetChange) {
+        let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        for channel_id in &channels {
+            self.publish_channel_locally(channel_id).await;
+            self.publish_channel_to_anchors(channel_id, PublishCause::Addresses)
+                .await;
+        }
+        let advertised = self
+            .presence
+            .as_ref()
+            .and_then(|(p, _)| p.advertised_now())
+            .map(|list| {
+                list.addrs()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_else(|| "nothing".to_owned());
+        let _ = self.event_tx.send(NodeEvent::NetworkChanged {
+            summary: format!(
+                "{}; this node now advertises {advertised}, and republished {} room(s) to its \
+                 board and its anchors",
+                change.summary(),
+                channels.len()
+            ),
+        });
+        let Some(net) = self.net.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let anchors: std::collections::BTreeSet<Digest32> =
+            self.kept_anchors().into_iter().map(|(id, _)| id).collect();
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            let stranded = net.manager().close_stranded(&anchors).await;
+            if !stranded.is_empty() {
+                let _ = tx.send(NetEvent::Stranded(stranded)).await;
+            }
+        });
+    }
+
+    /// Dial again, now, each peer whose connection a network change stranded: an anchor through
+    /// the anchors' own redial, a member through a room it is in.
+    async fn dial_stranded(&mut self, peers: &[Digest32]) {
+        self.redial_anchors_if_due();
+        for peer in peers {
+            let mut room = None;
+            for (cid, shared) in &self.channels {
+                if shared.lock().await.members().contains(peer) {
+                    room = Some(*cid);
+                    break;
+                }
+            }
+            if let Some(room) = room {
+                let _ = self.reach_member(&room, *peer, true).await;
+            }
+        }
     }
 
     /// Dial any configured or learned anchor this node is not connected to. Runs on
@@ -6395,6 +6494,8 @@ impl Node {
                     self.answer_addresses(room).await;
                 }
             }
+            NetEvent::NetworkChanged(change) => self.network_changed(&change).await,
+            NetEvent::Stranded(peers) => self.dial_stranded(&peers).await,
             NetEvent::ReachFailed { peer, why } => {
                 // An anchor that failed to connect waits before its next dial, doubling to
                 // `ANCHOR_UNREACHED_REDIAL_SECS` (V210-57, V210-86), jittered once it is there, a
@@ -13411,6 +13512,11 @@ impl Node {
             started: self.status.started,
             identity: me,
             networked: self.net.is_some(),
+            network_changed: self
+                .presence
+                .as_ref()
+                .and_then(|(p, _)| p.last_change())
+                .map(|c| (c.at, c.summary())),
             listening: view.listening.clone(),
             relaying: view.relaying,
             app: self.app.stats(),

@@ -27,6 +27,7 @@ use crate::error::Result;
 use crate::hash::Digest32;
 use crate::identity::composite::RootSigner;
 use crate::nat::multiaddr::{EndpointList, Multiaddr};
+use crate::nat::netwatch::{NetChange, NetShape, NetWatch};
 use crate::nat::portmap::PortMapping;
 use crate::node::circuitstream::CircuitLedger;
 use crate::node::nearby::{Entry, Nearby};
@@ -149,6 +150,15 @@ pub struct NetPresence {
     /// The nearby group, opened for the first node that wants it (N-44), and what it hears, said
     /// to every node.
     nearby: Mutex<Option<NearbyGroup>>,
+    /// Each real change of the machine's network, said to every node once its new routable
+    /// addresses are advertised (ADR-012 N-49–N-52).
+    changes: broadcast::Sender<Arc<NetChange>>,
+    /// The last real change, for `vox status` (N-52).
+    last_change: Mutex<Option<NetChange>>,
+    /// Why this machine's network changes are not heard, if they are not (N-49).
+    unwatched: Mutex<Option<String>>,
+    /// The task that hears the operating system's network events.
+    watcher: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 /// What the nearby group heard: where from, and the members it named.
@@ -300,6 +310,17 @@ impl Mapping {
         due
     }
 
+    /// Let go of the mapping held for one family (`true`: the IPv6 pinhole): its internal address
+    /// is gone, so the gateway forwards to nobody, and a new one is asked for the new address
+    /// (RFC 6887 §11.5, ADR-012 N-51).
+    fn forget(&mut self, v6: bool) {
+        self.held.retain(|m| mapping_is_v6(m) != v6);
+        self.expires.remove(&v6);
+        self.retry.remove(&v6);
+        self.granted.remove(&v6);
+        self.failures.remove(&v6);
+    }
+
     /// The mappings whose lease has not run out, offered again at a renewal so a family whose
     /// renewal fails is still advertised at its mapped address until the lease ends.
     fn leased(&self, now: u64) -> Vec<PortMapping> {
@@ -349,9 +370,20 @@ impl NetPresence {
             observed: Mutex::new(BTreeMap::new()),
             ledger: Arc::new(CircuitLedger::default()),
             nearby: Mutex::new(None),
+            changes: broadcast::channel(16).0,
+            last_change: Mutex::new(None),
+            unwatched: Mutex::new(None),
+            watcher: Mutex::new(None),
         });
         let mapper = spawn_mapper(Arc::downgrade(&presence));
         *lock(&presence.mapper) = Some(mapper);
+        match NetWatch::open() {
+            Ok(watch) => {
+                let watcher = spawn_watcher(Arc::downgrade(&presence), watch);
+                *lock(&presence.watcher) = Some(watcher);
+            }
+            Err(why) => *lock(&presence.unwatched) = Some(why),
+        }
         presence
     }
 
@@ -444,6 +476,49 @@ impl NetPresence {
     /// Run the ladder's publish side again now (a node's network changed).
     pub fn rediscover(&self) {
         self.rediscover.notify_one();
+    }
+
+    /// Each real change of the machine's network from now on (N-51, N-52), said once its new
+    /// routable addresses are advertised.
+    #[must_use]
+    pub fn changes(&self) -> broadcast::Receiver<Arc<NetChange>> {
+        self.changes.subscribe()
+    }
+
+    /// The last real change of the machine's network, if there was one (N-52).
+    #[must_use]
+    pub fn last_change(&self) -> Option<NetChange> {
+        lock(&self.last_change).clone()
+    }
+
+    /// Why this machine's network changes are not heard, if they are not (N-49).
+    #[must_use]
+    pub fn unwatched(&self) -> Option<String> {
+        lock(&self.unwatched).clone()
+    }
+
+    /// **A real change of the machine's network** (N-51): forget every reflexive address, let go
+    /// of a mapping whose internal address is gone, advertise the new routable addresses at once,
+    /// say the change to every node, and run the full publish side, with its gateway work, after.
+    async fn changed(&self, change: NetChange) {
+        self.refresh_observed();
+        let leased = {
+            let mut m = lock(&self.mapping);
+            if change.went.iter().any(|ip| ip.is_ipv4()) {
+                m.forget(false);
+            }
+            if change.went.iter().any(|ip| ip.is_ipv6()) {
+                m.forget(true);
+            }
+            m.leased(unix_now())
+        };
+        *lock(&self.last_change) = Some(change.clone());
+        if let Ok(bound) = self.shared.local_addr() {
+            let list = crate::nat::reachability::routable_endpoints(bound, &leased).await;
+            self.advertised.send_replace(Some(list));
+        }
+        let _ = self.changes.send(Arc::new(change));
+        self.rediscover();
     }
 
     /// Remember what `reporter`, asked by the local node `local`, said this presence's source
@@ -564,6 +639,9 @@ impl NetPresence {
         if let Some(g) = lock(&self.nearby).take() {
             g.task.abort();
         }
+        if let Some(watcher) = lock(&self.watcher).take() {
+            watcher.abort();
+        }
         // **Every mapping it holds is deleted** (N-56; N-43: the daemon's stop unmaps, a node's
         // detach never does): timed ones, which would otherwise hold a port on the gateway for
         // the rest of their lifetime, and a UPnP router's permanent one. Best-effort, all at
@@ -595,6 +673,9 @@ impl Drop for NetPresence {
         if let Some(g) = lock(&self.nearby).take() {
             g.task.abort();
         }
+        if let Some(watcher) = lock(&self.watcher).take() {
+            watcher.abort();
+        }
     }
 }
 
@@ -604,14 +685,16 @@ impl Drop for NetPresence {
 /// the presence goes. A node asking for a discovery ([`NetPresence::rediscover`]) wakes it early.
 fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
-        let mut leased: Vec<PortMapping> = Vec::new();
         loop {
-            let (bound, wake) = {
+            // Read at each discovery, not carried over: a network change lets go of a mapping
+            // whose internal address is gone (`NetPresence::changed`).
+            let (bound, wake, leased) = {
                 let Some(p) = presence.upgrade() else { return };
                 let Ok(bound) = p.shared.local_addr() else {
                     return;
                 };
-                (bound, Arc::clone(&p.rediscover))
+                let leased = lock(&p.mapping).leased(unix_now());
+                (bound, Arc::clone(&p.rediscover), leased)
             };
             let started = unix_now();
             let (list, granted, asks) =
@@ -619,12 +702,7 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
             let due = {
                 let Some(p) = presence.upgrade() else { return };
                 let now = unix_now();
-                let due = {
-                    let mut m = lock(&p.mapping);
-                    let due = m.take(&granted, started, now);
-                    leased = m.leased(now);
-                    due
-                };
+                let due = lock(&p.mapping).take(&granted, started, now);
                 *lock(&p.asks) = asks;
                 p.discoveries
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -641,6 +719,33 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                 }
                 None => wake.notified().await,
             }
+        }
+    })
+    .abort_handle()
+}
+
+/// **Hear the machine's network change** (ADR-012 N-49, N-50): coalesce each burst of the
+/// operating system's events, read the machine's shape, and act only on a real change.
+fn spawn_watcher(
+    presence: std::sync::Weak<NetPresence>,
+    mut watch: NetWatch,
+) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        let mut before = NetShape::now().await;
+        loop {
+            if let Err(e) = watch.settled().await {
+                if let Some(p) = presence.upgrade() {
+                    *lock(&p.unwatched) = Some(format!("the network event socket failed: {e}"));
+                }
+                return;
+            }
+            let after = NetShape::now().await;
+            let Some(change) = NetChange::between(&before, &after, unix_now()) else {
+                continue;
+            };
+            before = after;
+            let Some(p) = presence.upgrade() else { return };
+            p.changed(change).await;
         }
     })
     .abort_handle()

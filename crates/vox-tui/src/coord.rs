@@ -677,6 +677,19 @@ pub async fn post_once(
         ));
     }
 
+    // **Test-only: a pause between the lookup and the post** (V030-31, #368), read from
+    // `VOX_TEST_OP_HOLD_MS` in a build with the `test-knobs` feature; no shipped build reads it
+    // (V210-105). A conflicting post can then land after this call's lookup found nothing, every
+    // time, which is the race the read-back below exists for.
+    #[cfg(feature = "test-knobs")]
+    if let Some(ms) = std::env::var("VOX_TEST_OP_HOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        eprintln!("vox: test-knobs: holding the post of operation {op} {ms} ms after its lookup");
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+
     match ask(
         client,
         &Request::Post {
