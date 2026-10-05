@@ -305,6 +305,12 @@ pub(crate) fn take_account(
         })
         .map_err(|e| AppError::Usage(format!("listen on {listen}: {e}")))?;
     presence.ledger().set_limits(limits);
+    // Said once, at start, where this machine's network changes cannot be heard (ADR-012 N-49).
+    if let Some(why) = presence.unwatched() {
+        eprintln!(
+            "vox daemon: {why}; a move to another network is noticed only when a peer is lost"
+        );
+    }
     let router = Router::new(
         account.clone(),
         rt.handle().clone(),

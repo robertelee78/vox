@@ -36,6 +36,7 @@
 pub mod bootstrap;
 pub mod holepunch;
 pub mod multiaddr;
+pub mod netwatch;
 pub mod portmap;
 pub mod reachability;
 pub mod record;

@@ -578,6 +578,7 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             );
         }
         NodeEvent::NodeNote { note } => eprintln!("vox: {note}"),
+        NodeEvent::NetworkChanged { summary } => eprintln!("vox: {summary}"),
         NodeEvent::RetentionAboveRoom {
             channel_id,
             node,

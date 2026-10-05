@@ -545,7 +545,9 @@ impl DaemonCore {
             NodeEvent::InviteLink { url, .. } => {
                 self.notice = Some(format!("invite link: {url}"));
             }
-            NodeEvent::AddressNote { note, .. } | NodeEvent::NodeNote { note } => {
+            NodeEvent::AddressNote { note, .. }
+            | NodeEvent::NodeNote { note }
+            | NodeEvent::NetworkChanged { summary: note } => {
                 self.notice = Some(note);
             }
             NodeEvent::AddressWithheld { reason, .. } => {
