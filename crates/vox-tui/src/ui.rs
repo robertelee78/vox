@@ -285,7 +285,7 @@ fn render_timeline(
     let lines = timeline
         .iter()
         .rev()
-        .map(|m| {
+        .flat_map(|m| {
             // Characters a reader cannot see are shown as escapes (#331).
             let body = m.body.as_deref().map_or_else(
                 || UNDECRYPTABLE_MARKER.to_owned(),
@@ -320,7 +320,6 @@ fn render_timeline(
                 .into_iter()
                 .chain(std::iter::once(Line::from(spans)))
         })
-        .flatten()
         .chain(notices.rev());
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
