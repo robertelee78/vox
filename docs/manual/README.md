@@ -26,6 +26,11 @@ website edition.
 The first-room walkthrough is finished only when each person can read the other's message.
 A successful local post or join is not enough.
 
+The [recorded reader check](https://github.com/robertelee78/vox/blob/ec70bb177cdfab0362f9569ecf49b695bda75f77/docs/research/manual-reader-proof-2026-10-04.md)
+shows that walkthrough and representative recovery steps with the released macOS binary in
+isolated, same-host profiles. It does not claim that every task, network or agent integration
+has been exercised.
+
 ## Find a task
 
 - [Identity and keyring](keyring.md): compare fingerprints, trust someone, remove trust.
