@@ -228,6 +228,9 @@ impl GatewayFamily {
 pub struct StatusReport {
     /// When this was taken, seconds since the epoch.
     pub now: u64,
+    /// How many seconds a keyring change still goes without the identity passphrase, or `None`
+    /// when the next one will ask for it (ADR-028 K-9).
+    pub keyring_open_secs: Option<u64>,
     /// When the node started, seconds since the epoch.
     pub started: u64,
     /// This node.
@@ -378,6 +381,12 @@ impl StatusReport {
             self.identity.map_or("null".into(), |d| q(&b32_encode(&d)))
         );
         let _ = write!(j, "\"networked\":{},", self.networked);
+        let _ = write!(
+            j,
+            "\"keyring_open_secs\":{},",
+            self.keyring_open_secs
+                .map_or_else(|| "null".to_owned(), |s| s.to_string())
+        );
         let _ = write!(
             j,
             "\"network_changed\":{},",

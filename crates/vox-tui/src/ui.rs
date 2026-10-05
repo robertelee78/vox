@@ -438,8 +438,25 @@ fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     } else {
         "  ⚠ mlock unavailable (zeroize-only)".to_owned()
     };
-    let text = format!(" sync: {}  ·  {lock}{mlock}", sync_label(vm.sync));
+    // The keyring window (ADR-028 K-9): whether a keyring change will ask for the passphrase.
+    let keyring = if vm.attached {
+        format!("  ·  {}", keyring_label(vm.keyring_open_secs))
+    } else {
+        String::new()
+    };
+    let text = format!(" sync: {}  ·  {lock}{keyring}{mlock}", sync_label(vm.sync));
     frame.render_widget(Paragraph::new(text), area);
+}
+
+/// The keyring window as the status bar and `vox status` say it (ADR-028 K-9): `keyring open 23m`
+/// while a keyring change goes without the passphrase, rounded up so an open window never reads
+/// `0m`; `keyring asks for the passphrase` once it will ask.
+#[must_use]
+pub fn keyring_label(open_secs: Option<u64>) -> String {
+    match open_secs {
+        Some(left) => format!("keyring open {}m", left.div_ceil(60).max(1)),
+        None => "keyring asks for the passphrase".to_owned(),
+    }
 }
 
 /// The most rows the line under the status bar takes: a long notice wraps onto as many as this,

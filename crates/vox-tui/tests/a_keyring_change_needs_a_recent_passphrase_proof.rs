@@ -17,6 +17,10 @@
 //!   with a wrong passphrase is refused; one with the right passphrase succeeds;
 //! - past the window again, `vox trust remove --identity-passphrase-file` succeeds.
 //!
+//! **The window is visible where the person works** (ADR-028 K-9, #478): `vox status` says
+//! `keyring open Nm` right after the unlock, and, past the window, that the keyring asks for the
+//! passphrase. Mutation: the window reported open after it closed — red, PRODUCT.
+//!
 //! **A change given the right passphrase is always made.** Every change whose passphrase was just
 //! checked waits [`PROVED_DELAY`], longer than [`WINDOW`], between the check and the change
 //! (`VOX_TEST_PROVED_CHANGE_DELAY_MS`): the window the check restarted is gone by the time the
@@ -224,6 +228,16 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         kill(daemon);
         panic!("PRODUCT: a trust add right after the unlock was refused: {said}");
     }
+    // K-9: `vox status` says the window is open, while it is.
+    let (ok, open_said) = run(&mut vox_cmd(&alice, &["status"]));
+    let still_open = unlocked.elapsed() < WINDOW;
+    if !(ok && open_said.lines().any(|l| l.starts_with("keyring open "))) {
+        kill(daemon);
+        if !still_open {
+            panic!("CANNOT MEASURE: `vox status` ran after the {WINDOW:?} window: {open_said}");
+        }
+        panic!("PRODUCT: right after the unlock, `vox status` must say `keyring open Nm`; it said:\n{open_said}");
+    }
 
     // 2. Past the window, the CLI with nothing to give: refused at once, nothing changed.
     std::thread::sleep(WINDOW + Duration::from_secs(2));
@@ -236,6 +250,26 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
              it (succeeded {ok}); it said:\n{said}\nthe keyring now:\n{list}"
         );
     }
+
+    // K-9: past the window, `vox status` says a keyring change will ask for the passphrase.
+    let (ok, closed_said) = run(&mut vox_cmd(&alice, &["status"]));
+    if !(ok
+        && closed_said
+            .lines()
+            .any(|l| l == "keyring asks for the passphrase")
+        && !closed_said.contains("keyring open"))
+    {
+        kill(daemon);
+        panic!(
+            "PRODUCT: past the window, `vox status` must say the keyring asks for the passphrase, \
+             not that it is open; it said:\n{closed_said}"
+        );
+    }
+    eprintln!(
+        "[proof] vox status, open: {:?}; past the window: {:?}",
+        open_said.lines().find(|l| l.starts_with("keyring")),
+        closed_said.lines().find(|l| l.starts_with("keyring"))
+    );
 
     // 3. Past the window, a raw socket request: none given, then a wrong one, then the right one.
     let none = raw_trust(&sock, &carol, "carol", "");

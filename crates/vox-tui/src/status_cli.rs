@@ -71,6 +71,11 @@ fn render(v: &Value) -> String {
             );
         }
     }
+    let _ = writeln!(
+        o,
+        "{}",
+        crate::ui::keyring_label(v.get("keyring_open_secs").and_then(Value::as_u64))
+    );
     let unhealthy = arr("unhealthy");
     if unhealthy.is_empty() {
         let _ = writeln!(o, "healthy: nothing needs attention");

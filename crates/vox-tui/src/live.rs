@@ -909,6 +909,7 @@ impl DaemonCore {
             node: self.node.as_str().to_owned(),
             nodes: self.attached.clone(),
             mlock_active: snap.mlock_active,
+            keyring_open_secs: snap.keyring_open_secs,
             has_identity: self.has_identity,
             tunnels: snap.tunnels,
             closed_tunnels: snap.closed_tunnels,
