@@ -62,7 +62,11 @@
 //!   client's full socket holds it, and the second client receives nothing while it is
 //!   frozen (RP-45 goes red);
 //! - a client's death ends every subscription: the second client is cut off at the first
-//!   SIGKILL and misses the rest (RP-18 goes red).
+//!   SIGKILL and misses the rest (RP-18 goes red);
+//! - a cursor read on by position, not arrival, in the node's `Read { since }` (vox-core
+//!   `ipc.rs`): from bob's cursor where the two part, `read --since` yields none of the late
+//!   rows (F19 goes red); and the same in `tail`'s own backlog cut (`room_cli::after_cursor`):
+//!   `tail --since` that cursor emits none of them (F19 goes red at its `tail` assertion).
 //!
 //! And a second test, **a row that lands between the subscription and the read is not lost**
 //! (ADR-021 §7.1, M21.5; V030-31, #368): `tail --since` is paused between its two steps by the
@@ -803,6 +807,34 @@ fn a_consumer_that_lags_and_crashes_three_times_misses_nothing() {
         "PRODUCT: reading on from bob's last row must yield the {late} rows that arrived after it \
          (late, above it in the room's order): {} by arrival, {by_position} by position",
         after_bob.len()
+    );
+    // And the adapter's own surface, `tail --since`, from the same cursor (ADR-021 §7.1): its
+    // backlog is cut by the client's own rule, apart from the node's, so it is asked too.
+    let tailed: Vec<String> = {
+        let run = start(bob, &r, &bob_last, &stderr);
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while got.len() < after_bob.len() && std::time::Instant::now() < deadline {
+            if let Ok(line) = run.rx.recv_timeout(Duration::from_millis(200)) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    got.push(v);
+                }
+            }
+        }
+        drop(run);
+        hashes(&got)
+    };
+    eprintln!(
+        "[proof] tail --since bob's last row: {} rows; read --since: {}",
+        tailed.len(),
+        after_bob.len()
+    );
+    assert!(
+        tailed == after_bob,
+        "PRODUCT: `tail --since` bob's last row must emit what follows it by arrival, the {} rows \
+         `read --since` gives, in that order; it emitted {} ({by_position} follow it by position)",
+        after_bob.len(),
+        tailed.len()
     );
     eprintln!(
         "[proof] before bob's node restarts: {} rows, {late} of them late arrivals, position \
