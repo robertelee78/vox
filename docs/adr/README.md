@@ -26,7 +26,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [011](ADR-011-transport-substrate.md) | Transport Substrate (QUIC) | 002, 004, 008 |
 | [012](ADR-012-nat-traversal-and-reachability.md) | NAT Traversal, Bootstrap & Reachability | 005, 011 |
 | [013](ADR-013-overlay-tunneling.md) | Overlay Tunneling (TCP-over-Vox) | 002, 007, 011, 012 |
-| [014](ADR-014-macos-client.md) | macOS Client (native SwiftUI + Rust core) | 002, 005–010, 012, 013 |
+| [014](ADR-014-macos-client.md) | The macOS App (SwiftUI client of the daemon, login item, LAN helper, packaging, proof) — proposed | 013, 015, 017, 018, 026, 028 |
 | [015](ADR-015-rust-tui-client.md) | Rust TUI Client (chat, swarm create/join, verification) | 002, 005–010, 012, 013 |
 | [016](ADR-016-node-runtime.md) | Node Runtime — composing the core (persistence, rendezvous service, join over the network, sync, headless anchor) | 002, 003, 005–008, 010–013, 015 |
 | [017](ADR-017-room-bound-services.md) | Room-Bound Services (the Tor-hidden-service equivalent) | 005, 007, 012, 013, 016 |
