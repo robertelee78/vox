@@ -18,6 +18,17 @@
 //!
 //! Mutation: every member counted as able to reach it (the trust check in
 //! `tunnel_cli::audience` taken as true) turns it red.
+//!
+//! ADR-028 S-2 (#489) — **a share records what the service is, detected, never guessed**. The
+//! host shares three services from this machine: one that greets with an SSH banner, named
+//! `login`, on a port the system picks (never 22); a plain echo **named `ssh`**; and, with
+//! `vox service add`, an HTTP server listening on this machine's LAN address, not loopback.
+//! Asserted from what `vox serve` printed and what `vox service list` lists, on the host and on
+//! the guest (which knows the kinds only from the room's log): `login` is `ssh`, the one named
+//! `ssh` is plain `tcp`, and the LAN one is `http`.
+//!
+//! Mutation: the kind taken from the port (`ssh` for 22, else `tcp`) turns it red on `login`;
+//! taken from the name, red on the echo named `ssh`.
 
 #![cfg(unix)]
 
@@ -27,9 +38,11 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
+use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::time::Duration;
 
-use world::{args, fingerprint, mkdir, vox_once, VoxProc, World};
+use world::{args, echo_service, fingerprint, mkdir, vox_once, PathKind, Setup, VoxProc, World};
 
 const WITHIN: Duration = Duration::from_secs(60);
 const CAN: &str = "can reach it now:";
@@ -58,7 +71,13 @@ fn audience(host: &mut VoxProc, pred: impl Fn(&str, &str) -> bool) -> Option<(St
 #[ignore = "an anchor and three vox daemons with production Argon2id; CI runs it in release"]
 fn vox_serve_names_who_can_reach_it_and_who_cannot() {
     watchdog::arm();
-    let mut w = World::new(world::echo_service(), true);
+    let login = ssh_banner_service();
+    let mut w = World::build(&Setup {
+        specs: vec![format!("login={login}"), format!("ssh={}", echo_service())],
+        trusted: true,
+        path: PathKind::Direct,
+        guest_leg: None,
+    });
     let mallory = w.tmp.path().join("mallory");
     mkdir(&mallory.join("cfg"));
     let mallory_fp = fingerprint(&mallory, "mallory");
@@ -111,4 +130,157 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
          that nobody in the room cannot; it said {trusted:?}:\n{}",
         host.transcript()
     );
+
+    // ADR-028 S-2: what each share is, as `vox serve` said it when it shared them.
+    let host = w.host.as_mut().expect("APPARATUS: the world's host runs");
+    let said = host.transcript();
+    let sharing = |name: &str| {
+        said.lines()
+            .find(|l| l.starts_with("sharing ") && l.contains(&format!(" as {name}.")))
+            .map(str::to_owned)
+    };
+    let (login_said, ssh_said) = (sharing("login"), sharing("ssh"));
+    eprintln!("[proof] vox serve said: {login_said:?} / {ssh_said:?}");
+    assert!(
+        login_said.as_deref().is_some_and(|l| l.ends_with(" (ssh)")),
+        "PRODUCT: `login` greets with an SSH banner on port {login}, so `vox serve` must say it \
+         shares it as ssh; it said {login_said:?}:\n{said}"
+    );
+    assert!(
+        ssh_said.as_deref().is_some_and(|l| l.ends_with(" (tcp)")),
+        "PRODUCT: the service named `ssh` is a plain echo, so `vox serve` must say it shares it \
+         as tcp, not from its name; it said {ssh_said:?}:\n{said}"
+    );
+
+    // An HTTP server on this machine's LAN address, shared with `vox service add`.
+    let web = http_service(lan_address());
+    let (ok, out, err) = vox_once(
+        &w.host_dir,
+        &args(&["service", "add", &w.room, "pages", &web.to_string()]),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the host's `vox service add` of {web}: {out}{err}"
+    );
+    let (ok, out, err) = vox_once(&w.host_dir, &args(&["service", "list", &w.room]));
+    eprintln!("[proof] the host's vox service list:\n{out}{err}");
+    for (name, kind) in [("login", "ssh"), ("ssh", "tcp"), ("pages", "http")] {
+        assert!(
+            ok && listed_as(&out, name, kind),
+            "PRODUCT: the host's `vox service list` must list `{name}` as {kind}; it said:\n\
+             {out}{err}"
+        );
+    }
+
+    // The guest knows them only from the room's log: its node runs, as a person's does, and
+    // lists what has reached it.
+    let pass_file = w.guest_dir.join("passphrases");
+    std::fs::write(&pass_file, format!("{}\n", world::IDENTITY))
+        .unwrap_or_else(|e| panic!("APPARATUS: the guest's passphrase file: {e}"));
+    let mut guest = VoxProc::spawn(
+        "guest daemon",
+        &w.guest_dir,
+        &args(&[
+            "daemon",
+            "--listen",
+            "127.0.0.1:0",
+            "--anchor",
+            &w.guest_anchor,
+            "--passphrase-file",
+            &world::utf8(&pass_file),
+        ]),
+    );
+    let want = [("login", "ssh"), ("ssh", "tcp"), ("pages", "http")];
+    let deadline = std::time::Instant::now() + WITHIN;
+    let (ok, said) = loop {
+        let (ok, out, err) =
+            world::vox_once_plain(&w.guest_dir, &args(&["service", "list", &w.room]));
+        let all = ok && want.iter().all(|(name, kind)| listed_as(&out, name, kind));
+        if all || std::time::Instant::now() >= deadline {
+            break (all, format!("{out}{err}"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    eprintln!("[proof] the guest's vox service list:\n{said}");
+    assert!(
+        ok,
+        "PRODUCT: within {WITHIN:?} the guest's `vox service list` must list `login` as ssh, \
+         `ssh` as tcp and `pages` as http, as the host's shares said; it said:\n{said}\n\
+         its daemon said:\n{}",
+        guest.transcript()
+    );
+}
+
+/// Whether `vox service list`'s output lists the service `name` as `kind`:
+/// `  <name>.<node>.<room>.vox  by <who>  <kind>`.
+fn listed_as(out: &str, name: &str, kind: &str) -> bool {
+    out.lines().any(|l| {
+        let l = l.trim();
+        l.starts_with(&format!("{name}."))
+            && l.contains("  by ")
+            && l.ends_with(&format!("  {kind}"))
+    })
+}
+
+/// A service that greets every connection with an SSH banner, as `sshd` does, on a port the
+/// system picks. Returns its port.
+fn ssh_banner_service() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind the SSH-banner service: {e}"));
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: the SSH-banner service has no address: {e}"))
+        .port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                let _ = s.write_all(b"SSH-2.0-OpenSSH_9.8\r\n");
+                let mut buf = [0u8; 4096];
+                while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
+            });
+        }
+    });
+    port
+}
+
+/// A minimal HTTP server listening on `ip`: every request is answered `200 OK`. Returns where
+/// it listens.
+fn http_service(ip: IpAddr) -> SocketAddr {
+    let listener = TcpListener::bind((ip, 0))
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind the HTTP service on {ip}: {e}"));
+    let at = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: the HTTP service has no address: {e}"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                if matches!(s.read(&mut buf), Ok(n) if n > 0) {
+                    let _ = s.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                }
+            });
+        }
+    });
+    at
+}
+
+/// This machine's own LAN address: the source address of a route out (a UDP socket connected
+/// to a documentation address sends nothing).
+fn lan_address() -> IpAddr {
+    let sock = UdpSocket::bind("0.0.0.0:0")
+        .unwrap_or_else(|e| panic!("APPARATUS: could not bind a UDP socket: {e}"));
+    sock.connect("192.0.2.1:9").unwrap_or_else(|e| {
+        panic!("APPARATUS: this machine has no route out for a LAN address: {e}")
+    });
+    let ip = sock
+        .local_addr()
+        .unwrap_or_else(|e| panic!("APPARATUS: no local address: {e}"))
+        .ip();
+    assert!(
+        !ip.is_loopback() && !ip.is_unspecified(),
+        "APPARATUS: this machine has no LAN address ({ip})"
+    );
+    ip
 }

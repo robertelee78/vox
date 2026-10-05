@@ -869,9 +869,15 @@ impl DaemonCore {
                                 } else {
                                     names.alias_of(&s.host)
                                 };
-                                let udp = if s.udp { " (udp)" } else { "" };
+                                // Its kind, as its sharer's node detected it (ADR-028 S-2).
+                                let kind = s.kind;
+                                let udp = if s.udp && kind.as_str() != "udp" {
+                                    "/udp"
+                                } else {
+                                    ""
+                                };
                                 format!(
-                                    "{} by {who}{udp}",
+                                    "{} by {who}  {kind}{udp}",
                                     names.address_of(&d.channel_id, &s.host, &s.name)
                                 )
                             })

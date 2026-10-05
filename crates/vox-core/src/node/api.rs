@@ -796,6 +796,9 @@ pub enum NodeCommand {
         service_tag: String,
         /// The local address the service listens on.
         local: std::net::SocketAddr,
+        /// What the service is, as detected before it was offered (ADR-028 S-2,
+        /// [`crate::node::probe::detect`]): said to the room with the share.
+        kind: crate::governance::share::ServiceKind,
         /// Whether the offer outlives this node's run. `false` for an offer that lasts
         /// only as long as the process that made it (`vox room send`, V210-72).
         persist: bool,

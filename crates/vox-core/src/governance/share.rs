@@ -11,7 +11,8 @@
 //! Only the member itself can make the statement: the body names its author, and the log entry
 //! that carries it is signed by that author. The last statement an author made about a name wins.
 //!
-//! Body: `{ channelID, epoch, author_id, name, udp, shared }`.
+//! Body: `{ channelID, epoch, author_id, name, udp, shared, kind }`. The kind is what the sharing
+//! node detected the service to be (ADR-028 S-2), never what its sharer typed.
 
 use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
@@ -35,6 +36,81 @@ pub fn service_fingerprint(channel_id: &Digest32, host: &Digest32, name: &str) -
     sha256(&input)
 }
 
+/// What a shared service is, as its sharing node detected it (ADR-028 S-2): from the listening
+/// process and a probe for an endpoint on that machine, from a probe on the wire for one on
+/// another. Never from the port number or the service's name. Anything not identified is plain
+/// [`ServiceKind::Tcp`] or [`ServiceKind::Udp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceKind {
+    /// A byte stream nothing identified.
+    Tcp,
+    /// Datagrams nothing identified.
+    Udp,
+    /// An SSH server: it sent an `SSH-` banner.
+    Ssh,
+    /// An HTTP server: it answered a request with `HTTP/`.
+    Http,
+    /// A TLS server: it answered a ClientHello.
+    Https,
+    /// A DNS server: it answered a query.
+    Dns,
+}
+
+impl ServiceKind {
+    /// Its word, as the statement carries it and a person reads it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Ssh => "ssh",
+            Self::Http => "http",
+            Self::Https => "https",
+            Self::Dns => "dns",
+        }
+    }
+
+    /// The kind its word names, or `None` for any other word.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Self> {
+        Some(match word {
+            "tcp" => Self::Tcp,
+            "udp" => Self::Udp,
+            "ssh" => Self::Ssh,
+            "http" => Self::Http,
+            "https" => Self::Https,
+            "dns" => Self::Dns,
+            _ => return None,
+        })
+    }
+
+    /// The kind of a service nothing identified.
+    #[must_use]
+    pub fn plain(udp: bool) -> Self {
+        if udp {
+            Self::Udp
+        } else {
+            Self::Tcp
+        }
+    }
+
+    /// Whether a service of this kind can be carried as datagrams (`udp`) or as a byte stream.
+    #[must_use]
+    pub fn fits(self, udp: bool) -> bool {
+        match self {
+            Self::Tcp | Self::Ssh | Self::Http | Self::Https => !udp,
+            Self::Udp => udp,
+            Self::Dns => true,
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The unsigned share body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceShareBody {
@@ -50,20 +126,24 @@ pub struct ServiceShareBody {
     pub udp: bool,
     /// `true`: shared. `false`: no longer shared.
     pub shared: bool,
+    /// What the service is, as its sharing node detected it (ADR-028 S-2).
+    pub kind: ServiceKind,
 }
 
 impl ServiceShareBody {
-    /// Canonical-CBOR body `[channelID, epoch, author_id, name, udp, shared]`, flags as 0 or 1.
+    /// Canonical-CBOR body `[channelID, epoch, author_id, name, udp, shared, kind]`, flags as 0
+    /// or 1, the kind as its word.
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(6)
+        e.array(7)
             .bytes(&self.channel_id)
             .uint(self.epoch)
             .bytes(&self.author_id)
             .text(&self.name)
             .uint(u64::from(self.udp))
-            .uint(u64::from(self.shared));
+            .uint(u64::from(self.shared))
+            .text(self.kind.as_str());
         e.finish()
     }
 
@@ -93,8 +173,12 @@ impl ServiceShare {
         name: &str,
         udp: bool,
         shared: bool,
+        kind: ServiceKind,
     ) -> Result<Self> {
         check_name(name)?;
+        if !kind.fits(udp) {
+            return Err(Error::MalformedGovernance("service share kind"));
+        }
         let body = ServiceShareBody {
             channel_id: *channel_id,
             epoch,
@@ -102,6 +186,7 @@ impl ServiceShare {
             name: name.to_owned(),
             udp,
             shared,
+            kind,
         };
         let signature = author_root.sign(&body.signing_input())?;
         Ok(Self { body, signature })
@@ -112,13 +197,14 @@ impl ServiceShare {
     pub fn to_wire(&self) -> Vec<u8> {
         let b = &self.body;
         let mut e = Encoder::new();
-        e.array(7)
+        e.array(8)
             .bytes(&b.channel_id)
             .uint(b.epoch)
             .bytes(&b.author_id)
             .text(&b.name)
             .uint(u64::from(b.udp))
             .uint(u64::from(b.shared))
+            .text(b.kind.as_str())
             .bytes(&self.signature.to_bytes());
         frame(StructTag::ServiceShare, &e.finish())
     }
@@ -130,7 +216,7 @@ impl ServiceShare {
             return Err(Error::MalformedGovernance("service share wrong struct tag"));
         }
         let mut d = Decoder::new(parsed.body);
-        if d.array()? != 7 {
+        if d.array()? != 8 {
             return Err(Error::MalformedGovernance("service share wire arity"));
         }
         let channel_id = take_digest(&mut d)?;
@@ -140,6 +226,9 @@ impl ServiceShare {
         check_name(&name)?;
         let udp = flag(d.uint()?)?;
         let shared = flag(d.uint()?)?;
+        let kind = ServiceKind::from_word(d.text()?)
+            .filter(|k| k.fits(udp))
+            .ok_or(Error::MalformedGovernance("service share kind"))?;
         let sig: [u8; COMPOSITE_SIG_LEN] = d
             .bytes()?
             .try_into()
@@ -153,6 +242,7 @@ impl ServiceShare {
                 name,
                 udp,
                 shared,
+                kind,
             },
             signature: CompositeSignature::from_bytes(&sig)?,
         })

@@ -348,15 +348,17 @@ pub fn print_services(
     room: &str,
     channel_id: &Digest32,
     services: &[(String, String)],
-    shared: &[(String, String, bool)],
+    shared: &[(String, String, bool, String)],
 ) {
     if shared.is_empty() {
         println!("vox: nothing is shared in {room} ({})", short(channel_id));
     } else {
         println!("vox: shared in {room} ({})", short(channel_id));
-        for (address, who, udp) in shared {
-            let udp = if *udp { "  (udp)" } else { "" };
-            println!("  {address}  by {who}{udp}");
+        // Its kind, as its sharer's node detected it (ADR-028 S-2); a datagram service that
+        // is not plain `udp` says so too.
+        for (address, who, udp, kind) in shared {
+            let udp = if *udp && kind != "udp" { "/udp" } else { "" };
+            println!("  {address}  by {who}  {kind}{udp}");
         }
     }
     if services.is_empty() {
@@ -1130,16 +1132,25 @@ pub async fn serve(
     // The address with the fingerprints in the node and room places: what any member can use
     // as printed, or with its own aliases for this node and this room (V030-25).
     let me = held.me.as_ref().map(b32_encode).unwrap_or_default();
+    // What each was detected to be (ADR-028 S-2), as the room's log says it.
+    let shared = match held.client.request(&Request::Services { channel_id }).await {
+        Ok(Frame::Services { shared, .. }) => shared,
+        _ => Vec::new(),
+    };
     for (port, label) in &services {
         let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
-        let proto = if vox_core::tunnel::udp::is_udp(label) {
-            " (udp)"
-        } else {
-            ""
-        };
+        let name = vox_core::node::channel::service_name(label);
+        let udp = vox_core::tunnel::udp::is_udp(label);
+        let said = shared
+            .iter()
+            .find(|(address, who, ..)| who == "you" && address.starts_with(&format!("{name}.")))
+            .map(|(.., kind)| {
+                let proto = if udp && kind != "udp" { "/udp" } else { "" };
+                format!(" ({kind}{proto})")
+            })
+            .unwrap_or_default();
         println!(
-            "sharing {endpoint} as {}.{me}.{}.vox{proto}",
-            vox_core::node::channel::service_name(label),
+            "sharing {endpoint} as {name}.{me}.{}.vox{said}",
             b32_encode(&channel_id)
         );
     }
