@@ -516,52 +516,16 @@ pub async fn post_cmd(
             data.insert("attempt".into(), a);
         }
     }
-    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
-    // chain of its own with a fresh hop budget, and two agents answering each other urgently
-    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
-    // with several, the agent must say which.
-    let re = match &opts.re {
-        Some(re) => Some(re.clone()),
-        None => {
-            // The wakes and what followed the oldest of them, read from there (V210-120).
-            let rows = coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
-            let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &snap.me);
-            match &open[..] {
-                [] => None,
-                [only] => {
-                    eprintln!(
-                        "vox: replying to {} (the message that woke this session); pass --re to \
-                         answer another",
-                        &only[..12.min(only.len())]
-                    );
-                    Some(only.clone())
-                }
-                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
-                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
-                // that left two wakes unanswered stayed that way: every later wake added to the
-                // set rather than being inherited, and two such sessions woke each other for ever.
-                several if opts.urgent => {
-                    return Err(AppError::Usage(format!(
-                        "refusing an urgent message with no --re from session {session}: it was \
-                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
-                         which one this answers.",
-                        several.len(),
-                        several.join(", ")
-                    )));
-                }
-                _ => None,
-            }
-        }
-    };
-    // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
-    // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
-    let hops_of_reply = match &re {
-        Some(re) => Some(crate::wake::reply_hops(
-            re,
-            &coord::reply_chain(&mut client, cid, re).await?,
-        )),
-        None => None,
-    };
+    let (re, hops_of_reply) = answers(
+        &mut client,
+        cid,
+        paths,
+        Some(&session),
+        &snap.me,
+        opts.re.as_deref(),
+        opts.urgent,
+    )
+    .await?;
     let draft = Draft {
         kind,
         to,
@@ -1019,6 +983,72 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
         crate::ident::name_of(&r.author),
         text
     )
+}
+
+/// What a post answers and the hop budget it starts with, by the one rule `vox room post` and
+/// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
+/// woke `session`; and that parent's budget less one.
+///
+/// # Errors
+/// An urgent post from a session woken by several unanswered messages names none of them, or a
+/// parent cannot be read.
+pub(crate) async fn answers(
+    client: &mut IpcClient,
+    cid: Digest32,
+    paths: &Paths,
+    session: Option<&str>,
+    me: &Digest32,
+    re: Option<&str>,
+    urgent: bool,
+) -> Result<(Option<String>, Option<u32>), AppError> {
+    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
+    // chain of its own with a fresh hop budget, and two agents answering each other urgently
+    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
+    // with several, the agent must say which.
+    let re = match (re, session) {
+        (Some(re), _) => Some(re.to_owned()),
+        (None, None) => None,
+        (None, Some(session)) => {
+            // The wakes and what followed the oldest of them, read from there (V210-120).
+            let rows = coord::wake_context(client, cid, paths, session, &id(&cid)).await?;
+            let open = crate::wake::open_wakes(paths, session, &id(&cid), &rows, me);
+            match &open[..] {
+                [] => None,
+                [only] => {
+                    eprintln!(
+                        "vox: replying to {} (the message that woke this session); pass --re to \
+                         answer another",
+                        &only[..12.min(only.len())]
+                    );
+                    Some(only.clone())
+                }
+                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
+                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
+                // that left two wakes unanswered stayed that way: every later wake added to the
+                // set rather than being inherited, and two such sessions woke each other for ever.
+                several if urgent => {
+                    return Err(AppError::Usage(format!(
+                        "refusing an urgent message with no --re from session {session}: it was \
+                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
+                         which one this answers.",
+                        several.len(),
+                        several.join(", ")
+                    )));
+                }
+                _ => None,
+            }
+        }
+    };
+    // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
+    // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
+    let hops_of_reply = match &re {
+        Some(re) => Some(crate::wake::reply_hops(
+            re,
+            &coord::reply_chain(client, cid, re).await?,
+        )),
+        None => None,
+    };
+    Ok((re, hops_of_reply))
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.

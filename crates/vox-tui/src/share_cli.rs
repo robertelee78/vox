@@ -60,6 +60,8 @@ pub struct ShareOpts {
     pub to: Vec<String>,
     /// May interrupt the addressed members' agents mid-turn.
     pub urgent: bool,
+    /// The entry hash this share answers.
+    pub re: Option<String>,
     /// The note, carried in the share itself.
     pub note: Option<String>,
     /// Stop after this many completed fetches.
@@ -95,15 +97,36 @@ pub async fn share(
     let channel_id = room_of(&mut client, room).await?;
     let to = addressees(&mut client, channel_id, &opts.to).await?;
     let note = opts.note.as_deref().map(str::trim).unwrap_or_default();
+    let session = crate::coord::session_if_named();
+    let me = client
+        .me()
+        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
+    // **A share is a post, and follows a post's hop rule** (ADR-020 §9, V210-121): it answers
+    // what woke the session, and spends a hop of that budget. An urgent share with a fresh one
+    // would let two agents wake each other for ever by sharing.
+    let (re, hops) = crate::room_cli::answers(
+        &mut client,
+        channel_id,
+        paths,
+        session.as_deref(),
+        &me,
+        opts.re.as_deref(),
+        opts.urgent,
+    )
+    .await?;
     let env = {
         // The note is the message's body; with none, the daemon says what is shared.
         let mut e = Envelope::new(FILE, note);
         e.to = to;
         e.urgent = opts.urgent;
+        e.re = re;
+        if let Some(h) = hops {
+            e.hops = h;
+        }
         if !note.is_empty() {
             e.data = serde_json::json!({ "note": note });
         }
-        if let Some(session) = crate::coord::session_if_named() {
+        if let Some(session) = session {
             e.from = session;
         }
         e

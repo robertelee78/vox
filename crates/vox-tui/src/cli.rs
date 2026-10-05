@@ -624,6 +624,9 @@ pub struct ShareArgs {
     /// May interrupt the addressed members' agents mid-turn.
     #[arg(long)]
     pub urgent: bool,
+    /// The entry hash this share answers. A session woken by one message answers it without.
+    #[arg(long)]
+    pub re: Option<String>,
     /// A note, carried in the share itself.
     #[arg(short = 'm', long = "message")]
     pub note: Option<String>,
@@ -2224,6 +2227,7 @@ pub fn run() -> ExitCode {
             let opts = crate::share_cli::ShareOpts {
                 to: args.to.clone(),
                 urgent: args.urgent,
+                re: args.re.clone(),
                 note: args.note.clone(),
                 count: args.count,
                 for_,

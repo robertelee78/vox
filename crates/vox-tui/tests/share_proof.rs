@@ -15,8 +15,12 @@
 //! the offer is gone. A folder is shared as one tar, arrives as a valid one, and after `vox share
 //! stop` a pull is told it is gone. A share alice leaves behind when she leaves the room ends.
 //!
+//! The folder is shared as a reply to the report's announcement (`--re`): it carries that entry
+//! and spends a hop of its budget, as a `vox room post` reply does (ADR-020 §9).
+//!
 //! Mutants: post the note as a message of its own (red: two rows carry the note); serve only while
-//! `vox share` runs (red: bob's curl gets nothing after it exits).
+//! `vox share` runs (red: bob's curl gets nothing after it exits); a share keeps a fresh hop budget
+//! (red: the folder's announcement carries the default, not its parent's less one).
 
 #![cfg(unix)]
 
@@ -423,14 +427,35 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     let (late_ok, late_said) = bob.run(&["room", "get", &room, "report.bin"]);
     eprintln!("[proof] bob's get after the share ended (ok {late_ok}): {late_said}");
 
-    // A folder, as one tar; then stopped by hand (`vox share stop`).
-    let (folder_ok, folder_said) =
-        alice.run(&["share", &room, folder.to_str().unwrap(), "--for", "120s"]);
+    // A folder, as one tar, shared as a reply to the report's announcement; then stopped by hand
+    // (`vox share stop`). **A share follows a post's hop rule** (ADR-020 §9): a reply carries its
+    // `re` and spends a hop of its parent's budget, so agents sharing back and forth cannot wake
+    // each other for ever.
+    let report_entry = announcements
+        .first()
+        .and_then(|a| a["entry_hash"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let report_hops = announcements
+        .first()
+        .and_then(|a| a["envelope"]["hops"].as_u64());
+    let (folder_ok, folder_said) = alice.run(&[
+        "share",
+        &room,
+        folder.to_str().unwrap(),
+        "--for",
+        "120s",
+        "--re",
+        &report_entry,
+    ]);
     assert!(
         folder_ok,
         "PRODUCT (staging): vox share of a folder: {folder_said}"
     );
     bob.sees(&room, "photos.tar");
+    let folder_row = rows_of(&bob, &room)
+        .into_iter()
+        .find(|r| r["envelope"]["type"] == "file" && r["envelope"]["data"]["name"] == "photos.tar");
     let (tar_ok, tar_said) = bob.run(&["room", "get", &room, "photos.tar"]);
     let listing = Command::new("tar")
         .args(["-tf", bob_dl.join("photos.tar").to_str().unwrap()])
@@ -533,6 +558,17 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         "PRODUCT: a collector of an offer whose share has ended must be told the offer is gone \
          (ADR-020 11.8), not a transport error; bob's `vox room get` said (ok {late_ok}): \
          {late_said}"
+    );
+    let folder_env = folder_row.map(|r| r["envelope"].clone());
+    assert!(
+        folder_env
+            .as_ref()
+            .is_some_and(|e| e["re"] == report_entry.as_str()
+                && e["hops"].as_u64().is_some()
+                && e["hops"].as_u64() == report_hops.map(|h| h.saturating_sub(1))),
+        "PRODUCT: a share replying to an entry must carry it as `re` and its parent's hop budget \
+         less one ({report_hops:?} - 1, as `vox room post` does); bob read the folder's \
+         announcement as: {folder_env:?}"
     );
     assert!(
         tar_ok,
