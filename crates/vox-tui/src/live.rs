@@ -25,7 +25,7 @@
 //! [`CommandStatus`] / [`UiError`] set where the daemon's answer names a [`Fault`]; any other
 //! answer is the daemon's own sentence for a person, which carries no plaintext or key.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -109,6 +109,16 @@ pub struct DaemonCore {
     active: Option<Digest32>,
     /// Unread counts per room (incremented by events for rooms off screen).
     unread: BTreeMap<Digest32, usize>,
+    /// Rooms off screen that rows have arrived in since the last frame, and how many rows: each
+    /// is a notification to raise, once per room (ADR-028 R-10).
+    arrived: BTreeMap<Digest32, usize>,
+    /// Rooms already notified and not looked at since: a room raises one notification until it
+    /// comes on screen, however many messages follow (R-10, grouped by room).
+    notified: BTreeSet<Digest32>,
+    /// Where this node's notifications go (`notify::command`), or `None` for the terminal; and
+    /// whether they are off (`notify = off`). Read from the node's settings when the TUI opens.
+    notify_to: Option<std::ffi::OsString>,
+    notify_off: bool,
     /// The most recent public notice: a room link, a join, a trust grant, a detach.
     notice: Option<String>,
     /// The room on screen's rows, as read.
@@ -237,6 +247,10 @@ impl DaemonCore {
             });
             Ok::<_, crate::app::AppError>((attached, task))
         })?;
+        let (notify_to, notify_off) = account
+            .node_paths(&node)
+            .map(|p| (crate::notify::command(&p), crate::notify::disabled(&p)))
+            .unwrap_or((None, false));
         let mut core = Self {
             has_identity: account.nodes_on_disk().contains(&node),
             anchors,
@@ -252,6 +266,10 @@ impl DaemonCore {
             asked: None,
             active: None,
             unread: BTreeMap::new(),
+            arrived: BTreeMap::new(),
+            notified: BTreeSet::new(),
+            notify_to,
+            notify_off,
             notice: None,
             timeline: None,
             ended: None,
@@ -478,8 +496,68 @@ impl DaemonCore {
         ));
     }
 
+    /// **One notification per room, naming who wrote, never what** (ADR-028 R-10): for each room
+    /// off screen that rows arrived in, and that has not been notified since it was last on screen,
+    /// read who wrote the rows that arrived and raise one notification. The message text is never
+    /// read into it: a notification shows on a locked screen and to whoever stands near it.
+    fn notify_arrivals(&mut self) {
+        let arrived = std::mem::take(&mut self.arrived);
+        if self.notify_off {
+            return;
+        }
+        for (cid, n) in arrived {
+            if self.notified.contains(&cid) || self.active == Some(cid) {
+                continue;
+            }
+            let Some(conn) = self.conn.as_mut() else {
+                return;
+            };
+            let Some(Ok(Frame::Rows { mut rows })) =
+                until_stopped(&self.rt, &self.stop, conn.client.read_rows(cid, None))
+            else {
+                continue;
+            };
+            // The rows that arrived: the newest `n` by arrival, from a member other than this node.
+            rows.retain(|r| !r.owed);
+            rows.sort_by_key(|r| std::cmp::Reverse(r.arrival));
+            let me = self.snapshot.me;
+            let mut from: Vec<String> = Vec::new();
+            for r in rows.iter().take(n).filter(|r| Some(r.author) != me) {
+                let name = self.member_name(&r.author);
+                if !from.contains(&name) {
+                    from.push(name);
+                }
+            }
+            if from.is_empty() {
+                continue;
+            }
+            let room = self
+                .snapshot
+                .rooms
+                .iter()
+                .find(|r| r.channel_id == cid)
+                .and_then(|r| r.local_name.clone())
+                .unwrap_or_else(|| vox_core::node::link::b32_encode(&cid)[..12].to_owned());
+            let note = crate::notify::Note {
+                title: format!("Vox: {room}"),
+                body: format!(
+                    "new message{} from {}",
+                    if n == 1 { "" } else { "s" },
+                    from.join(", ")
+                ),
+            };
+            crate::notify::raise_from_tui(&note, self.notify_to.as_deref());
+            self.notified.insert(cid);
+        }
+    }
+
     /// Fold the events waiting into UI-local state.
     fn drain_events(&mut self) {
+        self.drain_queued();
+        self.notify_arrivals();
+    }
+
+    fn drain_queued(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 Ev::Node(ev) => self.on_node_event(ev),
@@ -532,6 +610,7 @@ impl DaemonCore {
                 }
             } else if n > 0 {
                 *me.unread.entry(channel_id).or_insert(0) += n;
+                *me.arrived.entry(channel_id).or_insert(0) += n;
             }
         };
         match ev {
@@ -1161,6 +1240,8 @@ impl CoreHandle for DaemonCore {
                 self.active = channel_id;
                 if let Some(cid) = channel_id {
                     self.unread.remove(&cid);
+                    // Looked at: the next message there is news again.
+                    self.notified.remove(&cid);
                 }
                 CommandStatus::Done
             }

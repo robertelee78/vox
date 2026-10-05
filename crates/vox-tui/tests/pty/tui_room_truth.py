@@ -29,6 +29,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             one member, so 2 or more (it said "idle" always);
   reach     back on the channel list, the room reads "● online" while Bob's node is connected to
             its other members;
+  notify    with no room on screen, three messages Alice posts raise one notification (bob's
+            `notify-command`, as `VOX_NOTIFY_COMMAND` sets it): titled with the room, naming Alice,
+            and holding none of their text (ADR-028 R-10, #486); none more follows for the same
+            room while it stays off screen;
   unreach   once Alice's and Carol's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   idle      once the anchor is stopped too, it says "idle", with no count.
@@ -200,7 +204,13 @@ try:
     stop(daemons["bob"])
 
     stage("bob's tui: unlock and open the room")
-    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env("bob"))
+    # Bob's notifications go to a script that writes each one to a file, so what is judged is the
+    # TUI's own decision to notify and what it put in the notification.
+    NOTES = f"{S}/bob-notes"
+    open(f"{S}/note.sh", "w").write(f"#!/bin/sh\nprintf '%s | %s\\n' \"$1\" \"$2\" >> {NOTES}\n")
+    os.chmod(f"{S}/note.sh", 0o755)
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec],
+              {**env("bob"), "VOX_NOTIFY_COMMAND": f"{S}/note.sh"})
     tui.pump(4)
     tui.key("id pass\r", 4)
     tui.key("\r", 2)
@@ -356,6 +366,23 @@ try:
     rows = lambda: [r.strip() for r in tui.display() if "online" in r or "offline" in r]
     tui.until(lambda: any("● online" in r for r in rows()), 20, 1)
     claim("reach", any("● online" in r for r in rows()), f"list rows: {rows()!r}")
+
+    stage("notify")
+    def notes():
+        try:
+            return [l for l in open(NOTES).read().splitlines() if l.strip()]
+        except FileNotFoundError:
+            return []
+    before = len(notes())
+    for i in (1, 2, 3):
+        p = run("alice", "room", "post", room, f"secret-n{i} do not show this")
+        if p.returncode != 0: product(f"alice's `vox room post` of secret-n{i} failed: {p.stderr.strip()}")
+    tui.until(lambda: len(notes()) > before, 30, 0.5)
+    tui.pump(6)  # time for a second notification, were the room's messages not grouped
+    raised = notes()[before:]
+    claim("notify", len(raised) == 1 and raised[0].startswith("Vox: m |") and "alice" in raised[0]
+          and "secret" not in raised[0] and "do not show" not in raised[0],
+          f"notifications for three messages in a room off screen: {raised!r}")
 
     stage("unreach")
     for w in ("alice", "carol"):

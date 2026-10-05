@@ -3,7 +3,7 @@
 //!
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
 //! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks thirteen claims, each
+//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks fourteen claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -29,6 +29,9 @@
 //!   one member, so 2 or more (it said "idle" always);
 //! - `reach`: back on the channel list, the room reads "● online" while Bob's node is connected
 //!   to its other members (it said offline always);
+//! - `notify`: with no room on screen, three messages Alice posts raise one notification, titled
+//!   with the room, naming Alice and holding none of their text (ADR-028 R-10, #486), and no
+//!   second one for the same room while it stays off screen;
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
@@ -39,8 +42,9 @@
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
 //! top, a scroll not clamped to the oldest line, every member shown `Trust::Trusted`, a stub command
-//! restored, the message pane's `reveal` removed, `SyncStatus` hard-coded (idle, or any one count), or `Reachability`
-//! hard-coded either way. It passes only on the script's PASS with all 13 claims ok.
+//! restored, the message pane's `reveal` removed, `SyncStatus` hard-coded (idle, or any one count),
+//! `Reachability` hard-coded either way, or a notification that carries the message text or is
+//! raised per message. It passes only on the script's PASS with all 14 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -129,7 +133,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (13 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (14 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -143,8 +147,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (13, 13),
-                "APPARATUS: the driver said PASS without all 13 claims ok: {said}"
+                (14, 14),
+                "APPARATUS: the driver said PASS without all 14 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
