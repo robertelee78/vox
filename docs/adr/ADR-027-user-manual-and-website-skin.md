@@ -1,10 +1,13 @@
 # ADR-027: One user manual, automatically skinned by voxlux.us
 
-**Status**: Accepted for implementation — decider authorization 2026-10-04; independent technical review by `manual_practice_research` on 2026-10-04. Not yet implemented or published.
+**Status**: Accepted — decider authorization 2026-10-04; independent technical review by `manual_practice_research` on 2026-10-04.
+**Execution**: [manual work and acceptance](https://github.com/robertelee78/vox/issues/421); [website work and publication](https://github.com/robertelee78/voxlux.us/issues/2). Acceptance of this decision is not a delivery claim.
 **Date**: 2026-10-04
 **Deciders**: Robert E. Lee
 **Tags**: documentation, user-experience, website, troubleshooting
-**Related**: ADR-001, ADR-018, ADR-020, ADR-021; ADR-026 on `rearch/v030`.
+**Related**: ADR-001, ADR-018, ADR-020, ADR-021, ADR-026
+
+ADR-026 is on `rearch/v030`; its existence is not a claim that those commands are released.
 
 ## Context
 
@@ -163,4 +166,4 @@ document Project per owning repository and cross-link their contract items.
 
 ## Research
 
-See [research record](ADR-027-research.md) for the local evidence and external primary sources.
+See [research record](../research/manual-2026-10-04.md) for the local evidence and external primary sources.
