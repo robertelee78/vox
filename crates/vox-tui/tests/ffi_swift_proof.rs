@@ -95,7 +95,10 @@ fn build_harness(out: &Path) -> PathBuf {
     // proof's temporary HOME the rustup proxy found no toolchain, downloaded a bare one, and the
     // script refused for want of the iOS targets the operator's toolchain has.
     let built = watchdog::temp_home::real_toolchain(
-        Command::new(root().join("scripts/build-xcframework.sh")).env("OUT", out),
+        Command::new(root().join("scripts/build-xcframework.sh"))
+            .env("OUT", out)
+            // The macOS slice is all a macOS app links, and all this proof runs.
+            .env("XCFRAMEWORK_SLICES", "macos"),
     )
     .output()
     .expect("APPARATUS: could not start build-xcframework.sh");
@@ -118,7 +121,7 @@ fn build_harness(out: &Path) -> PathBuf {
             built.status
         );
     }
-    let lib = out.join("VoxFFI.xcframework/macos-arm64_x86_64");
+    let lib = out.join("VoxFFI.xcframework/macos-arm64");
     let harness = out.join("harness");
     let swiftc = Command::new("swiftc")
         .arg("-O")
