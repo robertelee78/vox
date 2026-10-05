@@ -10,10 +10,15 @@
 // 1. At first run the app lists the Mac's nodes; the person picks one and types its passphrase.
 //    A wrong passphrase shows the daemon's own sentence where it was typed.
 // 2. The right one attaches the node: the app says so, and `vox node list` says `attached`.
-// 3. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 3. The main window (ADR-028 W-1, W-2; ADR-014 M-13): once bob, a member alice trusts, posts to
+//    the room a message addressed to alice, the sidebar lists the room under "needs you (1)"; the
+//    inspector lists bob with his trust glyph; the status bar says the node, its peers and the
+//    keyring window.
+// 4. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
-// Mutant: the app attaches its node so that it outlives the app (the daemon's explicit attach
-// in place of the app's hold), and quitting leaves it attached: (3) goes red.
+// Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
+// place of the app's hold), and quitting leaves it attached: (4) goes red. A room with a message
+// addressed to this node grouped as quiet (`attention::group`): (3) goes red.
 
 import XCTest
 
@@ -86,7 +91,77 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
                       "PRODUCT: `vox node list` must say alice is attached; it said: \(listed)")
 
-        // (3) Quitting detaches it.
+        // (3) The main window groups the room by what it needs from alice. Bob is a second node of
+        // the same daemon: a member reached directly, no anchor.
+        let bobEnv = voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "bob identity"]) { $1 }
+        let roomPass = scratch.appendingPathComponent("room.pass").path
+        let alicePass = scratch.appendingPathComponent("alice.pass").path
+        let bobPass = scratch.appendingPathComponent("bob.pass").path
+        try "mission room\n".write(toFile: roomPass, atomically: true, encoding: .utf8)
+        try "alice identity\n".write(toFile: alicePass, atomically: true, encoding: .utf8)
+        try "bob identity\n".write(toFile: bobPass, atomically: true, encoding: .utf8)
+        try staged(vox, ["node", "create", "bob"], env: bobEnv)
+        try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                         "--name", "mission"], env: voxEnv)
+        let rooms = try staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)
+        guard let room = rooms.split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Apparatus("`vox room list --node alice` listed no room: \(rooms)")
+        }
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", roomPass, link,
+                         "--name", "mission"], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
+                         "--identity-passphrase-file", bobPass], env: voxEnv)
+        // Staged when alice reads a post of bob's: forward-only, so bob posts afresh until one is
+        // readable to her.
+        var readable = false
+        let staging = Date().addingTimeInterval(120)
+        var n = 0
+        var seen = ""
+        while !readable && Date() < staging {
+            n += 1
+            try staged(vox, ["room", "post", "--node", "bob", room, "STAGE-\(n)"], env: voxEnv)
+            Thread.sleep(forTimeInterval: 1)
+            seen = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+            readable = seen.contains("STAGE-")
+        }
+        guard readable else {
+            throw Apparatus("alice never read a post of bob's in 120 s; `vox room read` said: \(seen)")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
+                   env: voxEnv)
+        let needsYou = ui.descendants(matching: .any)["group-needs you"]
+        let grouped = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
+        let met = XCTWaiter.wait(for: [expectation(for: grouped, evaluatedWith: needsYou)], timeout: 60)
+        let row = ui.descendants(matching: .any)["room-mission"]
+        XCTAssertEqual(met, .completed,
+                       "PRODUCT: a message to alice must list the room under \"needs you (1)\"; the sidebar said \"\(needsYou.exists ? needsYou.label : "no needs-you group")\", the room's row \"\(row.exists ? row.label : "not listed")\"")
+        XCTAssertTrue(row.exists && row.label.contains("needs you"),
+                      "PRODUCT: the room's row must say it needs you; it said \"\(row.exists ? row.label : "not listed")\"")
+        row.click()
+        let bob = ui.descendants(matching: .any)["member-bob"]
+        XCTAssertTrue(bob.waitForExistence(timeout: 30),
+                      "PRODUCT: the inspector never listed bob")
+        XCTAssertTrue(bob.label.hasPrefix("bob, in keyring"),
+                      "PRODUCT: the inspector must show bob in alice's keyring; it said \"\(bob.label)\"")
+        let status = ui.descendants(matching: .any)["status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10), "PRODUCT: the window has no status bar")
+        let bar = status.label
+        XCTAssertTrue(bar.contains("node alice") && bar.contains("peer") && bar.contains("keyring"),
+                      "PRODUCT: the status bar must say the node, its peers and the keyring window; it said \"\(bar)\"")
+        let regrouped = ui.descendants(matching: .any)["group-needs you"].label
+        XCTAssertEqual(regrouped, "needs you (0)",
+                       "PRODUCT: the room shown is read, so nothing needs alice; the sidebar said \"\(regrouped)\"")
+        print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bob.label); status: \(bar)")
+
+        // (4) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
@@ -99,6 +174,25 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(nodeLine(after, "alice")?.contains(" detached") ?? false,
                       "PRODUCT: once the app quit, node alice must be detached; `vox node list` said: \(after)")
         print("[proof] while attached: \(listed)[proof] after quit: \(after)")
+    }
+
+    /// A staging step: `vox` must succeed, else the staging was not achieved. Its output, trimmed.
+    @discardableResult
+    private func staged(_ vox: String, _ args: [String], env: [String: String]) throws -> String {
+        let (status, out) = run(vox, args, env: env)
+        guard status == 0 else {
+            throw Apparatus("`vox \(args.joined(separator: " "))` exited \(status): \(out)")
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The line of `out` that `is` picks: `vox` prints its answer on a line of its own.
+    private func line(_ out: String, _ is: (String) -> Bool) throws -> String {
+        guard let found = out.split(separator: "\n").map({ $0.trimmingCharacters(in: .whitespaces) })
+            .first(where: `is`) else {
+            throw Apparatus("no line of `vox`'s answer was the one asked for: \(out)")
+        }
+        return found
     }
 
     private func nodeLine(_ list: String, _ node: String) -> String? {

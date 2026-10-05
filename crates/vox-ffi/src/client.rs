@@ -128,6 +128,58 @@ pub struct RoomMessage {
     pub late: bool,
     /// Its body has not been received yet.
     pub owed: bool,
+    /// What it is to this node while unread (ADR-028 R-8), by the rule the TUI counts by.
+    pub level: UnreadLevel,
+}
+
+/// **The three unread levels** (ADR-028 R-8): what one unread message is to this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum UnreadLevel {
+    /// Addressed to this node.
+    ToYou,
+    /// New, to the room.
+    New,
+    /// Coordination traffic, counted only (ADR-020 6.6).
+    Coordination,
+}
+
+/// **What a room needs from the person** (ADR-028 W-2): the sidebar's groups, in the order it
+/// lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RoomGroup {
+    /// A message addressed to this node is unread.
+    NeedsYou,
+    /// New messages are unread.
+    Active,
+    /// Nothing is unread.
+    Quiet,
+}
+
+/// The group a room's unread counts, by [`UnreadLevel`], put it in: the TUI's rule
+/// (`vox_agentcomms::attention::group`).
+#[uniffi::export]
+#[must_use]
+pub fn room_group(to_you: u32, new: u32, coordination: u32) -> RoomGroup {
+    use vox_agentcomms::attention::{group, RoomGroup as G};
+    match group(to_you as usize, new as usize, coordination as usize) {
+        G::NeedsYou => RoomGroup::NeedsYou,
+        G::Active => RoomGroup::Active,
+        G::Quiet => RoomGroup::Quiet,
+    }
+}
+
+/// The group, as the sidebar heads it: the TUI's words.
+#[uniffi::export]
+#[must_use]
+pub fn room_group_words(group: RoomGroup) -> String {
+    use vox_agentcomms::attention::RoomGroup as G;
+    match group {
+        RoomGroup::NeedsYou => G::NeedsYou,
+        RoomGroup::Active => G::Active,
+        RoomGroup::Quiet => G::Quiet,
+    }
+    .label()
+    .to_owned()
 }
 
 /// A member of a room.
@@ -155,6 +207,26 @@ pub struct RoomLink {
     pub url: String,
     /// What it carries, in words; empty when there is nothing to say.
     pub note: String,
+}
+
+/// Who reads whom in a room: both directions of trust, off the room's log.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomConsents {
+    /// The members this node consents to reading it, as fingerprints.
+    pub outbound: Vec<String>,
+    /// The members that consent to this node reading them, as fingerprints.
+    pub inbound: Vec<String>,
+}
+
+/// The node at a glance, as a client draws it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NodeView {
+    /// Its fingerprint, base32.
+    pub me: String,
+    /// How many peers it holds a connection to now.
+    pub peers: u32,
+    /// The keyring window, as the TUI's status bar says it (ADR-028 K-9).
+    pub keyring: String,
 }
 
 /// What the app hears from the node it acts as.
@@ -240,7 +312,8 @@ fn shown_name(s: &str) -> String {
     vox_agentcomms::envelope::reveal_keeping(s, |_| false)
 }
 
-fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>) -> RoomMessage {
+fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str>) -> RoomMessage {
+    use vox_agentcomms::attention::{unread_level, UnreadLevel as L};
     let reveal = |s: &str| vox_agentcomms::envelope::reveal_keeping(s, |c| c == '\n' || c == '\t');
     let (kind, text, to, re, urgent) = match vox_agentcomms::envelope::Envelope::parse(&row.text) {
         Ok(env) => (
@@ -270,6 +343,11 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>) -> RoomMessage 
         urgent,
         late: row.late,
         owed: row.owed,
+        level: match unread_level(&row.text, me) {
+            L::ToYou => UnreadLevel::ToYou,
+            L::New => UnreadLevel::New,
+            L::Coordination => UnreadLevel::Coordination,
+        },
     }
 }
 
@@ -635,6 +713,7 @@ impl VoxClient {
         };
         on_held!(self, |c| {
             let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
             match ask(
                 c,
                 &Request::Read {
@@ -646,7 +725,10 @@ impl VoxClient {
             )
             .await?
             {
-                Frame::Rows { rows } => Ok(rows.iter().map(|r| rendered(r, &names)).collect()),
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .map(|r| rendered(r, &names, me.as_deref()))
+                    .collect()),
                 other => Err(unexpected(&other)),
             }
         })
@@ -874,6 +956,51 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
+    /// The node at a glance: who it is and how many peers it is connected to.
+    ///
+    /// # Errors
+    /// No node attached, or the daemon's refusal.
+    pub async fn view(&self) -> Result<NodeView, VoxError> {
+        let body = vox_core::node::snapshot::request_body();
+        let reply = on_held!(self, |c| c
+            .exchange(&body)
+            .await
+            .map_err(|e| failed(format!("the vox daemon stopped answering: {e}"))))?;
+        match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
+            Ok(Some(s)) => Ok(NodeView {
+                me: s.me.map(|m| b32_encode(&m)).unwrap_or_default(),
+                peers: u32::try_from(s.connected_peers.len()).unwrap_or(u32::MAX),
+                keyring: vox_core::node::snapshot::keyring_label(s.keyring_open_secs),
+            }),
+            Ok(None) => match Frame::from_bytes(&reply) {
+                Ok(frame) => Err(answered(frame).err().unwrap_or_else(|| {
+                    failed("the vox daemon did not answer with the node's state")
+                })),
+                Err(e) => Err(failed(format!("the vox daemon's answer did not read: {e}"))),
+            },
+            Err(e) => Err(failed(format!("the vox daemon's answer did not read: {e}"))),
+        }
+    }
+
+    /// Who reads whom in a room (ADR-028 L-4: a member in the keyring that consents back is
+    /// shown ⇄).
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal.
+    pub async fn consents(&self, room: String) -> Result<RoomConsents, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::Consents { channel_id }).await? {
+                Frame::Consents { outbound, inbound } => Ok(RoomConsents {
+                    outbound: outbound.iter().map(b32_encode).collect(),
+                    inbound: inbound.iter().map(b32_encode).collect(),
+                }),
+                other => Err(unexpected(&other)),
+            }
+        )
+    }
+
     /// Deliver the held node's events to `listener` until it is detached or the daemon stops.
     ///
     /// When the node says a room has new readable messages (its own post, a sync that rendered
@@ -1003,8 +1130,9 @@ async fn follow(
                     }
                 };
                 let names = names(&mut h.client).await.unwrap_or_default();
+                let me = h.client.me().map(|f| b32_encode(&f));
                 rows.iter()
-                    .map(|r| (r.clone(), rendered(r, &names)))
+                    .map(|r| (r.clone(), rendered(r, &names, me.as_deref())))
                     .collect::<Vec<_>>()
             };
             if let Some(newest) = rows

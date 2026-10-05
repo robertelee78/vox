@@ -21,6 +21,8 @@ final class AppModel: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .starting
+    /// The node acted as, once attached: what the main window shows.
+    @Published private(set) var node: NodeModel?
     private var client: VoxClient?
 
     /// Whether the app holds a node the daemon is to let go of when it quits.
@@ -80,7 +82,7 @@ final class AppModel: ObservableObject {
         do {
             let fingerprint = try await client.attach(node: node, passphrase: passphrase)
             remember(node, client)
-            phase = .attached(node: node, fingerprint: fingerprint)
+            enter(node, fingerprint, client)
         } catch {
             phase = .passphrase(node: node, said: sentence(error))
         }
@@ -103,10 +105,18 @@ final class AppModel: ObservableObject {
         do {
             let fingerprint = try await client.attach(node: node.name, passphrase: nil)
             remember(node.name, client)
-            phase = .attached(node: node.name, fingerprint: fingerprint)
+            enter(node.name, fingerprint, client)
         } catch {
             phase = .passphrase(node: node.name, said: sentence(error))
         }
+    }
+
+    /// Act as `node`: the main window takes over, and follows the node's events.
+    private func enter(_ node: String, _ fingerprint: String, _ client: VoxClient) {
+        let model = NodeModel(client: client, node: node, me: fingerprint)
+        self.node = model
+        phase = .attached(node: node, fingerprint: fingerprint)
+        Task { await model.start() }
     }
 
     // The node chosen at first run, kept in the account's config directory beside vox's own

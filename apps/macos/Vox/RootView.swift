@@ -1,5 +1,5 @@
-// The window until the main window (#440) takes over: reaching the daemon, choosing the node at
-// first run, its passphrase, and the node attached.
+// The window: reaching the daemon, choosing the node at first run and its passphrase, then the
+// main window once the node is attached.
 
 import AppKit
 import SwiftUI
@@ -9,6 +9,15 @@ struct RootView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        if case .attached = model.phase, let node = model.node {
+            MainWindow(model: node)
+                .font(Theme.text)
+        } else {
+            setup
+        }
+    }
+
+    private var setup: some View {
         VStack(alignment: .leading, spacing: 16) {
             switch model.phase {
             case .starting:
@@ -25,8 +34,8 @@ struct RootView: View {
                 PassphraseForm(node: node, said: said, model: model)
             case let .attaching(node):
                 ProgressView("Attaching node \(node)…")
-            case let .attached(node, fingerprint):
-                Attached(node: node, fingerprint: fingerprint)
+            case .attached:
+                ProgressView("Opening the node…")
             }
         }
         .padding(24)
@@ -100,24 +109,6 @@ private struct PassphraseForm: View {
     private func submit() {
         let bytes = field.take()
         Task { await model.attach(node, passphrase: bytes) }
-    }
-}
-
-/// The node this app acts as.
-private struct Attached: View {
-    let node: String
-    let fingerprint: String
-
-    var body: some View {
-        Text("Node \(node)").font(Theme.heading)
-        StateMark(kind: .plain, words: "attached")
-            .accessibilityIdentifier("attached")
-            .accessibilityLabel("Node \(node), attached")
-        Text("FINGERPRINT").font(Theme.eyebrow).secondaryText()
-        Text(fingerprint)
-            .font(Theme.mono)
-            .textSelection(.enabled)
-            .accessibilityIdentifier("fingerprint")
     }
 }
 
