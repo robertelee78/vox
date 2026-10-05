@@ -1514,20 +1514,31 @@ fn a_structured_post_reads_alike_for_a_person_and_an_agent() {
     );
 }
 
-/// Every entry `d` holds for its room, as `vox room read --hashes` prints them: hash → clock (ms).
-fn held_entries(d: &Daemon) -> std::collections::BTreeMap<String, u64> {
+/// What `d` holds of its room that nobody is shown, by what a person can read: the entries `vox
+/// status --json` says the node holds there, less the messages `vox room board --json` counts.
+fn unshown(d: &Daemon) -> u64 {
     let label: String = d.room_key.chars().take(12).collect();
-    let (ok, out, err) = hook(&d.data, &d.cfg, &["room", "read", &label, "--hashes"], "");
-    assert!(
-        ok,
-        "PRODUCT (staging): vox room read --hashes failed: {err}"
-    );
-    out.lines()
-        .filter_map(|l| {
-            let (h, clock) = l.split_once(' ')?;
-            Some((h.to_owned(), clock.trim().parse().ok()?))
+    let (ok, status, err) = hook(&d.data, &d.cfg, &["status", "--json"], "");
+    assert!(ok, "PRODUCT (staging): vox status --json failed: {err}");
+    let held = serde_json::from_str::<serde_json::Value>(status.trim())
+        .ok()
+        .and_then(|v| {
+            v["rooms"]
+                .as_array()?
+                .iter()
+                .find(|r| r["id"].as_str().is_some_and(|id| id.starts_with(&label)))?["entries"]
+                .as_u64()
         })
-        .collect()
+        .unwrap_or_else(|| {
+            panic!("PRODUCT: `vox status --json` says no entries held for the room: {status}")
+        });
+    let (ok, board, err) = hook(&d.data, &d.cfg, &["room", "board", &label, "--json"], "");
+    assert!(ok, "PRODUCT (staging): vox room board --json failed: {err}");
+    let rows = serde_json::from_str::<serde_json::Value>(board.trim())
+        .ok()
+        .and_then(|v| v["position"]["entries"].as_u64())
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room board --json` counts no rows: {board}"));
+    held.saturating_sub(rows)
 }
 
 /// The rows `vox room read --json` shows on `d`: (entry hash, text).
@@ -1572,11 +1583,12 @@ fn drain_as(d: &Daemon, session: &str) -> String {
 ///    them ("4 new"), and its next turn is told nothing; bob's own next drain is told only the
 ///    one new post.
 /// 2. **batched** (RR-2): the first drain's record goes at once; a second drain within 5 s adds
-///    no record until 5 s after the first, and then one record names what it drained. The clocks
-///    `vox room read --hashes` prints for the two records are at least 5 s apart.
+///    no record until 5 s after the first, and then one record names what it drained: the two are
+///    seen at least 4.5 s apart (5 s, less one poll).
 ///
-/// A record is an entry bob holds that is neither one held before the drains nor a row his
-/// `vox room read` shows: bob posts nothing else.
+/// A record is counted by what a person can read: the entries `vox status` says the node holds
+/// in the room, less the messages `vox room board --json` counts, compared with before the drains.
+/// bob posts nothing else.
 ///
 /// **Mutant**: render a read record as a text row (its entry hashes as the text). Red on (1):
 /// alice's `vox room read` shows rows she did not post.
@@ -1654,15 +1666,10 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         "PRODUCT (staging): bob never read alice's three posts in 90 s; he shows {:?}",
         shown_rows(&bob)
     );
-    let before = held_entries(&bob);
-    let records = |d: &Daemon| -> Vec<(String, u64)> {
-        let rows: std::collections::BTreeSet<String> =
-            shown_rows(d).into_iter().map(|(h, _)| h).collect();
-        held_entries(d)
-            .into_iter()
-            .filter(|(h, _)| !before.contains_key(h) && !rows.contains(h))
-            .collect()
-    };
+    // What each node holds that nobody is shown, before any drain: from here on, bob's read
+    // records are what it grows by (bob posts nothing).
+    let (before, alice_before) = (unshown(&bob), unshown(&alice));
+    let records = |d: &Daemon| -> u64 { unshown(d).saturating_sub(before) };
 
     // ---- (2) batched: the first record at once ----
     let out = drain_as(&bob, "reader");
@@ -1670,17 +1677,18 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         posts.iter().all(|p| out.contains(p)),
         "PRODUCT (staging): bob's drain did not show alice's posts: {out}"
     );
-    let first_at = Instant::now();
-    let deadline = first_at + Duration::from_secs(3);
-    while records(&bob).is_empty() && Instant::now() < deadline {
+    let drained_at = Instant::now();
+    let deadline = drained_at + Duration::from_secs(3);
+    while records(&bob) == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
     }
+    // When the first record was seen: no later than it was posted plus one poll.
+    let first_at = Instant::now();
     let first = records(&bob);
     assert_eq!(
-        first.len(),
-        1,
-        "PRODUCT: bob's first drain must post one read record at once; within 3 s he holds \
-         {first:?} besides the room's rows"
+        first, 1,
+        "PRODUCT: bob's first drain must post one read record at once; within 3 s `vox status` \
+         says he holds {first} entries more than his rows"
     );
 
     // A second drain within the 5 s: nothing more yet.
@@ -1691,11 +1699,11 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
          second drain could not be made inside the 5-second batch"
     );
     let out = drain_as(&bob, "reader");
-    let second_drain = first_at.elapsed();
+    let second_drain = drained_at.elapsed();
     assert!(
         second_drain < Duration::from_secs(4),
         "APPARATUS: staging not achieved: bob's second drain came {second_drain:?} after the \
-         first record, not inside the 5-second batch"
+         first, not inside the 5-second batch"
     );
     assert!(
         out.contains(&format!(
@@ -1707,44 +1715,40 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
     );
     let now = records(&bob);
     assert_eq!(
-        now.len(),
-        1,
-        "PRODUCT: a second drain {second_drain:?} after the first record posted another record at \
-         once: bob holds {now:?}; at most one per room per 5 s"
+        now, 1,
+        "PRODUCT: a second drain {second_drain:?} after the first posted another record at once: \
+         `vox status` says bob holds {now} entries more than his rows; at most one per room per 5 s"
     );
-    let deadline = first_at + Duration::from_secs(10);
-    while records(&bob).len() < 2 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
+    let deadline = drained_at + Duration::from_secs(10);
+    while records(&bob) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
     }
+    let gap = first_at.elapsed();
     let both = records(&bob);
     assert_eq!(
-        both.len(),
-        2,
-        "PRODUCT: the second drain's read record never went out within 10 s of the first: bob \
-         holds {both:?}"
+        both, 2,
+        "PRODUCT: the second drain's read record never went out within 10 s of the first: \
+         `vox status` says bob holds {both} entries more than his rows"
     );
-    let (lo, hi) = (
-        both.iter().map(|(_, c)| *c).min().unwrap_or(0),
-        both.iter().map(|(_, c)| *c).max().unwrap_or(0),
-    );
+    // Seen 5 s apart at least, less the half second a poll (two `vox` calls) may have taken to
+    // see the first.
     assert!(
-        hi - lo >= 5_000,
-        "PRODUCT: bob's two read records are {} ms apart by their clocks; at most one per room \
-         per 5 s: {both:?}",
-        hi - lo
+        gap >= Duration::from_millis(4_500),
+        "PRODUCT: bob's second read record was there {gap:?} after his first; at most one per room \
+         per 5 s"
     );
 
     // ---- (1) never a message: once alice holds both records ----
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let held = held_entries(&alice);
-        if both.iter().all(|(h, _)| held.contains_key(h)) {
+        let held = unshown(&alice).saturating_sub(alice_before);
+        if held >= 2 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): bob's read records did not reach alice in 60 s: she holds {held:?}, \
-             his records are {both:?}"
+            "PRODUCT (staging): bob's two read records did not reach alice in 60 s: `vox status` \
+             says she holds {held} entries more than her rows"
         );
         std::thread::sleep(Duration::from_millis(200));
     }

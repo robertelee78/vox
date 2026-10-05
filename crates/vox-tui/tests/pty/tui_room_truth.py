@@ -28,6 +28,11 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             into its turn, and then says exactly "read by alice": from the read record Alice's node
             posted, which Bob can open because she trusts him. Carol, who cannot read Bob, is
             named neither as having read it nor as not (ADR-028 R-6, RR-3, #505);
+  nostorm   read records never answer read records (the decider; ADR-028 RR-2): Alice's daemon is
+            stopped and her real `vox tui` opened on the room beside Bob's; each posts, and once
+            each TUI says the other has read its post, with both TUIs on the room and both agents
+            draining, the entries `vox status --json` says each node holds stay the same for 15 s
+            and no agent is told anything; Alice's daemon is then started again;
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
@@ -127,6 +132,7 @@ class Product(Exception):
     pass
 
 tui = None
+TUIS = []  # every other `vox tui`, stopped at the end like the first
 code = 2
 results = {}
 def claim(name, ok, detail):
@@ -374,6 +380,72 @@ try:
     claim("readby", not (before or "").startswith("read by") and after == "read by alice",
           f"under r-001 before alice's drain: {before!r}; after it: {after!r}")
 
+    stage("nostorm")
+    # Read records never answer read records (the decider; ADR-028 RR-2): with both people's TUIs
+    # on the room and both agents draining, what each node holds stays flat once the first
+    # records are out. Counted as a person can: `vox status --json`'s entries held in the room.
+    stop(daemons["alice"])
+    atui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env("alice"))
+    TUIS.append(atui)
+    def both_until(pred, secs):
+        """`pred` within `secs`, both TUIs drawn meanwhile: one not read stalls on its pty."""
+        end = time.time() + secs
+        while time.time() < end:
+            tui.pump(0.5); atui.pump(0.5)
+            if pred():
+                return True
+        return False
+    for keys, secs in (("", 4), ("id pass\r", 4), ("\r", 2), ("room pass\r", 4), ("\r", 2)):
+        if keys: os.write(atui.fd, keys.encode())
+        both_until(lambda: False, secs)
+    if not both_until(lambda: "m-0" in "\n".join(r[:112] for r in atui.display()), 30):
+        product("alice's `vox tui` never drew a message in the room's timeline within 30 s of unlocking")
+    def held(w):
+        r = run(w, "status", "--json")
+        if r.returncode != 0: product(f"{w}'s `vox status --json` failed: {r.stderr.strip()}")
+        rooms = [x for x in json.loads(r.stdout)["rooms"] if x["id"].startswith(room)]
+        if not rooms or "entries" not in rooms[0]:
+            product(f"{w}'s `vox status --json` says no entries held for the room: {r.stdout[:300]!r}")
+        return rooms[0]["entries"]
+    def under_in(t, key):
+        rows = [r[:112] for r in t.display()]
+        for i, r in enumerate(rows):
+            if key in r:
+                return bare(rows[i + 1]) if i + 1 < len(rows) else ""
+        return None
+    for w, text in (("alice", "s-001 from alice"), ("bob", "s-002 from bob")):
+        p = run(w, "room", "post", room, text)
+        if p.returncode != 0: product(f"{w}'s `vox room post` of {text!r} with both TUIs open failed: {p.stderr.strip()}")
+    # The first records: each TUI says its post was read by the other, whose TUI drew it.
+    first = both_until(lambda: under("s-002") == "read by alice"
+                       and under_in(atui, "s-001") == "read by bob", 60)
+    if not first:
+        product(f"the first read records never showed: under bob's s-002 {under('s-002')!r}, "
+                f"under alice's s-001 {under_in(atui, 's-001')!r}")
+    drains = lambda: [run(w, "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+                          "--session", f"{w}-storm") for w in ("alice", "bob")]
+    drains()
+    both_until(lambda: False, 6)  # a record held back by the 5-second batch goes out
+    counts = [(held("alice"), held("bob"))]
+    told = ""
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        told += "".join(h.stdout for h in drains())
+        both_until(lambda: False, 1)  # both TUIs keep drawing the room
+        counts.append((held("alice"), held("bob")))
+    claim("nostorm", len(set(counts)) == 1 and not told.strip(),
+          f"entries held (alice, bob) over 15 s, both TUIs on the room and both agents draining: "
+          f"{counts[0]} to {counts[-1]} ({len(counts)} samples, {len(set(counts))} distinct); "
+          f"told to an agent meanwhile: {told.strip()[:200]!r}")
+    if not atui.stop():
+        product(f"alice's vox tui (pid {atui.pid}) outlived SIGKILL and could not be reaped")
+    TUIS.remove(atui)
+    daemons["alice"] = spawn("alice", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                             "--passphrase-file", f"{S}/idpass", out="alice-after-tui")
+    if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
+        product("alice's daemon, started again after her TUI, never answered `vox room list` within 60 s: "
+                + open(f"{S}/alice-after-tui.err").read())
+
     stage("words")
     # Before `unknown`, whose short answers leave the line under the status bar one row again.
     # The decider's words (#406): a room link and a passphrase, never an "invite link". `:link`
@@ -509,9 +581,10 @@ except Exception:
 finally:
     disarm()
     stage("stopping every process")
-    if tui is not None and not tui.stop():
-        print(f"{TAG} RED: vox tui (pid {tui.pid}) outlived SIGKILL and could not be reaped")
-        code = 1
+    for t in [tui, *TUIS]:
+        if t is not None and not t.stop():
+            print(f"{TAG} RED: vox tui (pid {t.pid}) outlived SIGKILL and could not be reaped")
+            code = 1
     for p in PROCS:
         if p.poll() is None:
             stop(p)

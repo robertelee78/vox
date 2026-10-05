@@ -14057,6 +14057,11 @@ impl Node {
                 received_key_generations: room.received_key_generations,
                 frozen: room.frozen.clone(),
                 refused_below_checkpoint: room.refused_below_checkpoint,
+                entries: view
+                    .channels
+                    .iter()
+                    .find(|c| c.channel_id == room.channel_id)
+                    .map_or(0, |c| c.entries),
                 members,
             });
         }
