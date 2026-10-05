@@ -546,8 +546,11 @@ pub(crate) fn stop_daemon(
             tokio::time::timeout(patience + Duration::from_millis(500), router.stop_all())
                 .await
                 .unwrap_or(false);
-        // Every node is detached: the presence goes, and with it the port mapping (N-43).
-        presence.close().await;
+        // Every node is detached: the presence goes, and with it the port mapping (N-43): what
+        // became of each mapping is said (N-56).
+        for line in presence.close().await {
+            say(format_args!("vox daemon: {line}"));
+        }
         finished
     });
     // The same bound on the runtime itself: dropping it waits for every blocking task, and a sync

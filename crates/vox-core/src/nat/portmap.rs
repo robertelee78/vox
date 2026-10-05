@@ -534,8 +534,8 @@ pub async fn unmap(m: &PortMapping) -> Result<()> {
                 _ => Ipv4Addr::UNSPECIFIED,
             };
             let req = pcp::encode_map_request(&nonce, protocol, client_ip, m.internal_port, 0, 0);
-            exchange(&socket, &req, "pcp: deletion not answered").await?;
-            Ok(())
+            let resp = exchange(&socket, &req, "pcp: deletion not answered").await?;
+            pcp_result(&resp, "pcp: deletion refused")
         }
         (Method::PcpV6Pinhole, Some(server), Some(nonce)) => {
             let Some(IpAddr::V6(client_ip)) = m.asked_for else {
@@ -544,14 +544,18 @@ pub async fn unmap(m: &PortMapping) -> Result<()> {
             let socket = connected(server).await?;
             let req =
                 pcp::encode_map_request_pinhole(&nonce, protocol, client_ip, m.internal_port, 0);
-            exchange(&socket, &req, "pinhole: deletion not answered").await?;
-            Ok(())
+            let resp = exchange(&socket, &req, "pinhole: deletion not answered").await?;
+            pcp_result(&resp, "pinhole: deletion refused")
         }
         (Method::NatPmp, Some(server), _) => {
             let socket = connected(server).await?;
             let req = natpmp::encode_map_request(protocol, m.internal_port, 0, 0);
-            exchange(&socket, &req, "nat-pmp: deletion not answered").await?;
-            Ok(())
+            let resp = exchange(&socket, &req, "nat-pmp: deletion not answered").await?;
+            // NAT-PMP's result code is the 16 bits after the opcode (RFC 6886 §3.5).
+            match resp.get(2..4) {
+                Some([0, 0]) => Ok(()),
+                _ => Err(Error::PortMappingFailed("nat-pmp: deletion refused")),
+            }
         }
         // The router the grant found, asked directly: no search at stop (N-56).
         (Method::UpnpIgd, _, _) => match &m.upnp {
@@ -559,6 +563,28 @@ pub async fn unmap(m: &PortMapping) -> Result<()> {
             None => unmap_port_upnp(protocol, m.external_port).await,
         },
         _ => Err(Error::PortMappingFailed("unmap: no server or nonce")),
+    }
+}
+
+/// A PCP answer's result code (RFC 6887 §7.2: the fourth byte): SUCCESS, or `refused`.
+fn pcp_result(resp: &[u8], refused: &'static str) -> Result<()> {
+    match resp.get(3) {
+        Some(0) => Ok(()),
+        _ => Err(Error::PortMappingFailed(refused)),
+    }
+}
+
+impl PortMapping {
+    /// The mapping as a person reads it in a log: `UDP 51820 at 192.168.1.1:5351 (PCP)`.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "UDP {} at {} ({})",
+            self.internal_port,
+            self.server
+                .map_or_else(|| "the router".to_owned(), |s| s.to_string()),
+            self.method.rung()
+        )
     }
 }
 

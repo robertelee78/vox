@@ -641,8 +641,10 @@ impl NetPresence {
     }
 
     /// **Close the presence** — the daemon stopping: the accept loop ends, the endpoint and every
-    /// connection on it close, and the closes are given a moment to leave.
-    pub async fn close(&self) {
+    /// connection on it close, and the closes are given a moment to leave. Returns, for the
+    /// daemon's log, what became of each port mapping it held: deleted (the gateway answered the
+    /// deletion with success), refused, or not answered within `UNMAP_PATIENCE` (N-56).
+    pub async fn close(&self) -> Vec<String> {
         self.accept.abort();
         if let Some(mapper) = lock(&self.mapper).take() {
             mapper.abort();
@@ -661,12 +663,35 @@ impl NetPresence {
         // once, and bounded by UNMAP_PATIENCE in all, while the endpoint's closes leave.
         let mut unmaps = tokio::task::JoinSet::new();
         let held = std::mem::take(&mut lock(&self.mapping).held);
-        for m in held.into_iter().chain(self.races.to_delete()) {
-            unmaps.spawn(async move { crate::nat::portmap::unmap(&m).await });
+        // A held mapping is said by name; what a race may hold is deleted blind, and said only
+        // if the gateway answered it.
+        let mut asked: Vec<(String, bool)> = Vec::new();
+        for m in held {
+            let what = m.describe();
+            asked.push((what.clone(), true));
+            unmaps.spawn(async move { (what, crate::nat::portmap::unmap(&m).await) });
         }
+        for m in self.races.to_delete() {
+            let what = m.describe();
+            asked.push((what.clone(), false));
+            unmaps.spawn(async move { (what, crate::nat::portmap::unmap(&m).await) });
+        }
+        let mut said: Vec<String> = Vec::new();
+        let mut done: Vec<String> = Vec::new();
         let unmapped = async {
             let _ = tokio::time::timeout(crate::nat::portmap::UNMAP_PATIENCE, async {
-                while unmaps.join_next().await.is_some() {}
+                while let Some(joined) = unmaps.join_next().await {
+                    let Ok((what, result)) = joined else { continue };
+                    let held = asked.iter().any(|(w, h)| *h && *w == what);
+                    match result {
+                        Ok(()) => said.push(format!("deleted the port mapping {what}")),
+                        Err(e) if held => {
+                            said.push(format!("the port mapping {what} was not deleted: {e}"));
+                        }
+                        Err(_) => {}
+                    }
+                    done.push(what);
+                }
             })
             .await;
         };
@@ -675,6 +700,15 @@ impl NetPresence {
             let _ = tokio::time::timeout(CLOSE_FLUSH, self.shared.wait_idle()).await;
         };
         tokio::join!(unmapped, flushed);
+        for (what, held) in &asked {
+            if *held && !done.contains(what) {
+                said.push(format!(
+                    "the port mapping {what} was not deleted: the gateway did not answer within {} s",
+                    crate::nat::portmap::UNMAP_PATIENCE.as_secs()
+                ));
+            }
+        }
+        said
     }
 }
 

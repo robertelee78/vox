@@ -5126,7 +5126,7 @@ impl Node {
         // Bounded inside: a close that cannot leave is not worth a stuck shutdown.
         if let Some((presence, owned)) = self.presence.take() {
             if owned {
-                presence.close().await;
+                let _ = presence.close().await;
             }
         }
         self.stream_loops.clear();

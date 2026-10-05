@@ -27,8 +27,17 @@
 //! 3. **renewed under its nonce:** `vox status` shows a renewal (`renewal: true`) answered by that
 //!    server on PCP, no sooner than 1/2 and no later than 5/8 of the granted lifetime (plus
 //!    slack), and the proof's fresh-nonce MAP is still refused;
-//! 4. **deleted at stop:** after SIGTERM to the daemon (by its pid) and its exit, the proof's
-//!    fresh-nonce MAP for the same port **succeeds**: no mapping under another nonce is left.
+//! 4. **deleted at stop:** after SIGTERM to the daemon (by its pid) it exits 0 and its own log
+//!    says "deleted the port mapping UDP <port> at <server> (PCP)" (the router answered the
+//!    deletion with success, N-56), and the proof's fresh-nonce MAP for the same port
+//!    **succeeds**: no mapping under another nonce is left.
+//!
+//! **A router that does not enforce RFC 6887 §11.3** grants step 2's fresh-nonce MAP. Against it
+//! the run measures what it can and passes on it: claim 1, claim 3's timing (a renewal answered by
+//! that server, by status), and a clean stop (exit 0, the daemon's own deletion answered). The
+//! nonce kept on renewal and the deletion seen at the router are reported as not measurable on
+//! this router; they are proved against the strict stand-in by
+//! `a_port_mapping_keeps_its_nonce_proof` and `a_stopped_daemon_deletes_its_port_mappings_proof`.
 //!
 //! **Cleanup on every exit**, by a guard that runs on success and on every red: the daemon, if
 //! still running, gets SIGTERM (its own stop deletes its mappings) and is waited for, then killed
@@ -37,7 +46,8 @@
 //! lifetime granted.
 //!
 //! **Which side a red is on.** The daemon's mapping missing, a renewal refused or unanswered, or a
-//! mapping left at stop is `PRODUCT:`. The router not speaking PCP, not enforcing nonces, or
+//! mapping left at stop, or a stop that does not say its deletion was answered, is `PRODUCT:`. The
+//! router not speaking PCP, answering the probe with neither SUCCESS nor NOT_AUTHORIZED, or
 //! granting a lifetime too long to see a renewal within the watchdog's budget is `CANNOT MEASURE`.
 
 #![cfg(unix)]
@@ -68,6 +78,11 @@ const PROBE_LIFETIME: u32 = 60;
 const DISCOVERY: Duration = Duration::from_secs(45);
 /// The longest this proof waits for a renewal: inside the watchdog's 600 s.
 const RENEWAL_CAP: Duration = Duration::from_secs(420);
+/// What a router that does not enforce RFC 6887 §11.3 cannot show, and where it is shown.
+const NOT_HERE: &str = "the nonce kept on renewal, and the deletion at stop seen at the router \
+     (it does not enforce §11.3); proved against the strict stand-in by \
+     a_port_mapping_keeps_its_nonce_proof and a_stopped_daemon_deletes_its_port_mappings_proof";
+
 /// PCP's result code for a request under another nonce (RFC 6887 §7.4).
 const NOT_AUTHORIZED: u8 = 2;
 
@@ -171,7 +186,9 @@ struct Cleanup {
 
 impl Cleanup {
     /// SIGTERM the daemon by its pid and wait for it; how it ended and when the signal went.
-    fn stop_daemon(&mut self) -> Option<(Instant, Option<std::process::ExitStatus>)> {
+    /// SIGTERM the daemon by its pid and wait for it; when the signal went, how it ended, and
+    /// everything it said.
+    fn stop_daemon(&mut self) -> Option<(Instant, Option<std::process::ExitStatus>, String)> {
         let mut d = self.daemon.take()?;
         let pid = d.child.id();
         let at = Instant::now();
@@ -186,15 +203,18 @@ impl Cleanup {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        // What it said last reaches the reader threads a moment after it exits.
+        std::thread::sleep(Duration::from_millis(300));
+        let said = d.transcript();
         // Dropping it kills by pid what did not exit.
         drop(d);
-        Some((at, exited))
+        Some((at, exited, said))
     }
 }
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if let Some((_, exited)) = self.stop_daemon() {
+        if let Some((_, exited, _)) = self.stop_daemon() {
             eprintln!("[cleanup] the daemon was stopped: {exited:?}");
         }
         if let Some(server) = self.server {
@@ -336,19 +356,26 @@ fn a_real_router_maps_renews_and_deletes() {
         .unwrap_or_else(|e| panic!("PRODUCT: vox names the PCP server {server_text:?}: {e}"));
     cleanup.server = Some(server);
 
-    // ---- 2. the mapping is the daemon's, under its nonce ----
+    // ---- 2. the mapping is the daemon's, under its nonce (a strict router) ----
     let probe = nonce();
     cleanup.probes.push(probe);
     let said = pcp_map(server, probe, port, PROBE_LIFETIME);
     println!("[proof] a fresh-nonce MAP for UDP {port} while the daemon holds it: {said:?}");
-    match said {
-        Some((NOT_AUTHORIZED, _)) => {}
-        Some((0, _)) => panic!(
-            "CANNOT MEASURE (precondition unmet): the router at {server} granted a MAP for UDP \
-             {port} under a fresh nonce while the daemon held it: it does not enforce RFC 6887 \
-             §11.3, so neither the nonce nor the deletion can be shown against it (this MAP is \
-             deleted on the way out)."
-        ),
+    // A strict router refuses it (RFC 6887 §11.3); a lax one grants it, and then neither the
+    // nonce nor the deletion can be shown by a fresh-nonce MAP against it. What can still be
+    // measured is: the grant (above), the renewal's timing, and a clean stop that sent its
+    // deletion and had it answered.
+    let strict = match said {
+        Some((NOT_AUTHORIZED, _)) => true,
+        Some((0, _)) => {
+            println!(
+                "[proof] the router at {server} granted a MAP for UDP {port} under a fresh nonce \
+                 while the daemon held it: it does not enforce RFC 6887 §11.3. Measured here: the \
+                 grant, the renewal's timing and a clean stop with its deletion answered. Not \
+                 measurable on this router: {NOT_HERE}"
+            );
+            false
+        }
         Some((code, _)) => panic!(
             "CANNOT MEASURE: the router at {server} answered a fresh-nonce MAP with result {code}, \
              neither SUCCESS nor NOT_AUTHORIZED"
@@ -357,9 +384,9 @@ fn a_real_router_maps_renews_and_deletes() {
             "CANNOT MEASURE: the router at {server} did not answer this proof's MAP, though it \
              granted the daemon's"
         ),
-    }
+    };
 
-    // ---- 3. renewed under its nonce ----
+    // ---- 3. renewed (under its nonce, on a strict router) ----
     let window = Duration::from_secs(lifetime * 5 / 8 + 15);
     assert!(
         window <= RENEWAL_CAP,
@@ -395,35 +422,61 @@ fn a_real_router_maps_renews_and_deletes() {
         "PRODUCT: the renewal at {server} was not granted (a renewal under another nonce is \
          refused NOT_AUTHORIZED, §11.3): {renewed}"
     );
-    let again = nonce();
-    cleanup.probes.push(again);
-    let said = pcp_map(server, again, port, PROBE_LIFETIME);
-    println!("[proof] a fresh-nonce MAP after the renewal: {said:?}");
-    assert!(
-        matches!(said, Some((NOT_AUTHORIZED, _))),
-        "PRODUCT: after the renewal the router no longer holds the daemon's mapping under its \
-         nonce: a fresh-nonce MAP got {said:?}"
-    );
+    if strict {
+        let again = nonce();
+        cleanup.probes.push(again);
+        let said = pcp_map(server, again, port, PROBE_LIFETIME);
+        println!("[proof] a fresh-nonce MAP after the renewal: {said:?}");
+        assert!(
+            matches!(said, Some((NOT_AUTHORIZED, _))),
+            "PRODUCT: after the renewal the router no longer holds the daemon's mapping under its \
+             nonce: a fresh-nonce MAP got {said:?}"
+        );
+    }
 
-    // ---- 4. deleted at stop ----
-    let (stopped, exited) = cleanup.stop_daemon().expect("APPARATUS: the daemon handle");
+    // ---- 4. a clean stop that deletes the mapping (shown by the router, if it is strict) ----
+    let (stopped, exited, daemon_said) =
+        cleanup.stop_daemon().expect("APPARATUS: the daemon handle");
     println!(
         "[proof] the daemon exited {exited:?} {:.2}s after SIGTERM",
         stopped.elapsed().as_secs_f64()
     );
-    let last = nonce();
-    cleanup.probes.push(last);
-    let said = pcp_map(server, last, port, PROBE_LIFETIME);
-    println!("[proof] a fresh-nonce MAP after the stop: {said:?}");
-    assert!(
-        matches!(said, Some((0, l)) if l > 0),
-        "PRODUCT: after the daemon stopped, a fresh-nonce MAP for UDP {port} got {said:?}: the \
-         daemon's mapping was not deleted (a held one refuses it, RFC 6887 §11.3; N-56)"
-    );
+    // The daemon's own account of its deletion (N-56): sent, and answered with success.
+    let deleted = format!("deleted the port mapping UDP {port} at {server} (PCP)");
+    let deletion_said: Vec<&str> = daemon_said
+        .lines()
+        .filter(|l| l.contains("port mapping"))
+        .collect();
+    println!("[proof] the daemon said of its port mappings at stop: {deletion_said:?}");
     assert!(
         exited.is_some_and(|s| s.success()),
         "PRODUCT: the daemon did not exit cleanly after SIGTERM: {exited:?}"
     );
-    println!("[proof] REAL ROUTER PASS: granted on PCP at {server}, renewed under its nonce, deleted at stop");
+    assert!(
+        daemon_said.contains(&deleted),
+        "PRODUCT: the daemon's stop did not say its mapping was deleted ({deleted:?}, N-56); it \
+         said of its port mappings: {deletion_said:?}"
+    );
+    if strict {
+        let last = nonce();
+        cleanup.probes.push(last);
+        let said = pcp_map(server, last, port, PROBE_LIFETIME);
+        println!("[proof] a fresh-nonce MAP after the stop: {said:?}");
+        assert!(
+            matches!(said, Some((0, l)) if l > 0),
+            "PRODUCT: after the daemon stopped, a fresh-nonce MAP for UDP {port} got {said:?}: the \
+             daemon's mapping was not deleted (a held one refuses it, RFC 6887 §11.3; N-56)"
+        );
+        println!(
+            "[proof] REAL ROUTER PASS: granted on PCP at {server}, renewed under its nonce, \
+             deleted at stop"
+        );
+    } else {
+        println!(
+            "[proof] REAL ROUTER PASS (a router that does not enforce RFC 6887 §11.3): granted on \
+             PCP at {server}, renewed {after:.1}s into a {lifetime}s lease, stopped cleanly with \
+             its deletion answered. Not measurable on this router: {NOT_HERE}"
+        );
+    }
     // `cleanup` deletes this proof's MAPs on the way out.
 }
