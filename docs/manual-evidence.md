@@ -8,7 +8,7 @@ not a chapter in the public navigation manifest. Source inspection is not an exe
 | Label | Exact source revision | Use |
 |---|---|---|
 | v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8`; review fixes at `c142ddd3293bfd1273cfd5737a673bcceb93dfc9` and `vox room link` at `d01c2c767c9ae295d1ed9aabdf66b73838c8f266` (each built, rechecked) | Task chapters, troubleshooting, the v0.3.0 command check |
-| Released v0.2.10 | `8d95a381f14d6bbb45f714d75f64e57d2f5dbf96` | "Coming from v0.2.10"; the profile-to-node move check |
+| Released v0.2.10 | `8d95a381f14d6bbb45f714d75f64e57d2f5dbf96` | History only: the earlier edition and the profile-to-node move check; the manual no longer describes it |
 | `rearch/v030` | `2d8385d4f90891c96843f32d6d002bc1b69aac1e` | Superseded label: an ancestor of the v0.3.0 baseline, which ships it |
 | Manual branch base | `412303a3` plus accepted ADR-027 | Canonical prose; website resolves moving main once per build |
 
@@ -139,14 +139,22 @@ B's join and the audience line both succeeded, and it was not investigated furth
 
 ## Retired heading fragments
 
-The v0.3.0 rewrite keeps every fragment whose heading is still true. These v0.2.10 fragments
-were retired because their headings would now be false; a published website needs a redirect or
-compatible anchor for each (ADR-027 D1): `agents.md#give-the-agent-its-own-profile-and-room`,
-`first-room.md#2-each-person-keeps-a-daemon-running`,
-`first-room.md#3-one-person-creates-and-invites` (at `d01c2c76`, when `invite` left the product), `keyring.md#names-and-versions`,
-`reference.md#select-the-same-profile`. The troubleshooting headings `No node is running for
-this profile` and `Another Vox process is using this profile` are kept, with their v0.3.0
-meaning, so existing links still land.
+Decider ruling, 2026-10-04: the manual describes v0.3.0 as it is, with nothing that looks back at
+earlier releases. The "Coming from v0.2.10" chapter (slug `development`, route
+`/docs/manual/development/`), the install chapter's upgrade section and the troubleshooting entry
+for rooms made before v0.3.0 were removed. ADR-027 D1 requires that a published slug or heading
+fragment be preserved, or given a compatible route/anchor or an explicit redirect, never left as a
+silently broken link. If the website has published any of the following, each needs an explicit
+redirect there; plain Markdown cannot carry a compatibility anchor without raw HTML, which D4 forbids:
+
+- the page `/docs/manual/development/` and its fragments: redirect to `/docs/manual/`;
+- `install.md#upgrading-from-v0210`: redirect to `/docs/manual/install/`;
+- `troubleshooting.md#no-node-is-running-for-this-profile`: now `#the-node-is-not-attached`;
+- `troubleshooting.md#another-vox-process-is-using-this-profile`: now `#a-daemon-is-already-running`;
+- `troubleshooting.md#the-room-was-made-before-v030`: removed; redirect to `/docs/manual/troubleshooting/`;
+- from the earlier v0.3.0 rewrite: `agents.md#give-the-agent-its-own-profile-and-room`,
+  `first-room.md#2-each-person-keeps-a-daemon-running`, `first-room.md#3-one-person-creates-and-invites`,
+  `keyring.md#names-and-versions`, `reference.md#select-the-same-profile`.
 
 ## Earlier verification (v0.2.10)
 

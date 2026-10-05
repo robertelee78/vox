@@ -1,8 +1,6 @@
 # Troubleshooting by symptom
 
-Applies to: v0.3.0. If your command uses `--profile`, you are running v0.2.10 or following
-v0.2.10 instructions; read [Coming from v0.2.10](development.md) first. Do not mix fixes across
-versions.
+Applies to: v0.3.0. Check `vox --version` first: the fixes here are for the version they name.
 
 ## Before changing anything
 
@@ -45,9 +43,9 @@ recreate identity data and do not install as root to resolve a user's PATH order
 **Verify:** the selected path and `vox --version` agree with the release you intend to use.
 If not, report both paths/versions with personal directory components redacted.
 
-## No node is running for this profile
+## The node is not attached
 
-That was v0.2.10's wording. In v0.3.0 the same situation reads:
+**Exact symptoms:**
 
 - `no vox daemon is running for this data root, so node robertgpt is not attached.` followed by
   `Start one: vox daemon (or vox node attach robertgpt)`;
@@ -70,12 +68,14 @@ restarts, attach it with `--keep` (see [passphrase input](reference.md#passphras
 **Verify:** `vox room list` returns the rooms or `no rooms`, not the attach message. If the
 same message remains, report the selected roots and the exact message.
 
-## Another Vox process is using this profile
+## A daemon is already running
 
-That was v0.2.10's wording; v0.3.0 has no profile lock. **Meaning in v0.3.0:** each data root
+**Exact symptom:** `a daemon is already running for …`.
+
+**Meaning:** each data root
 has **one** daemon, and every command, the TUI and agent hooks are its clients. A second
-`vox daemon` for the same data root stops with `a daemon is already running for …`. Attaching a
-node that is already attached simply succeeds.
+`vox daemon` for the same data root stops with that message. Attaching a node that is already
+attached simply succeeds.
 
 **Check:** you rarely need to start `vox daemon` yourself. If you meant to use another data
 root, compare `VOX_DATA_DIR` in both terminals.
@@ -162,14 +162,6 @@ prove that the link names the intended room.
 **Fix:** compare the full room link with its sender and keep the hosting member online.
 **Verify:** the corrected link joins the intended room. If it still fails, share the
 error category and redacted structure, not the room link and passphrase together.
-
-### The room was made before v0.3.0
-
-**Exact symptom:** `this room was made by vox before v0.3.0, and its message format changed, so
-this vox cannot open it`.
-
-**Fix:** make the room again with `vox room create` and share its new link with the members.
-Trust carries over; the old room's messages do not.
 
 ## We joined but cannot read each other
 

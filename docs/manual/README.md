@@ -9,9 +9,7 @@ changed, and recover when it does not.
 ## Start with your version
 
 Run `vox --version`. The task chapters here describe **v0.3.0**, in which one daemon hosts
-your nodes and every command names the node it acts as. If you are coming from v0.2.10, which
-selected identities with `--profile`, read [Coming from v0.2.10](development.md) first: its
-commands no longer work.
+your nodes and every command names the node it acts as.
 
 The manual follows the source repository. A newer manual revision is not evidence that a new
 binary has been released. The website skins these same files; there is no separately edited

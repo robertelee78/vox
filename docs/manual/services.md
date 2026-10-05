@@ -126,8 +126,7 @@ vox forward ssh.robertgpt.family.vox 127.0.0.1:2222
 It prints `forwarding 127.0.0.1:2222 to ssh on ssh.robertgpt.family.vox` and runs until Ctrl-C.
 It is a client of the daemon, so nothing else needs stopping. Point the tool at loopback port
 2222; for SSH, `ssh -p 2222 SSH_USER@127.0.0.1`. Do not bind a forward publicly unless you
-explicitly intend other local-network users to access it. The older three-part form, room then
-member then service, is gone in this release.
+explicitly intend other local-network users to access it.
 
 `vox status` lists live tunnels under `tunnels`. `vox tunnel close MEMBER [SERVICE]`, or
 `vox tunnel close --id NUMBER`, closes them.

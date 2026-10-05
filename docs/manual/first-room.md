@@ -47,7 +47,7 @@ vox room list
 
 A new node prints `no rooms`. If you see `no vox daemon is running for this data root, so node
 robertgpt is not attached`, run `vox node attach robertgpt` again; see
-[the node is not attached](troubleshooting.md#no-node-is-running-for-this-profile).
+[the node is not attached](troubleshooting.md#the-node-is-not-attached).
 
 ## 3. One person creates the room and shares its link
 
