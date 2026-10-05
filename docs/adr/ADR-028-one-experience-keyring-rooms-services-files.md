@@ -146,24 +146,28 @@ keep code in sync through GitHub.
   the composer's To: and urgent switch (W-4).
 - **F-2.** The daemon MUST hash and serve the share on a room-bound service until the message
   expires under the room's retention, the sharer stops it, the sharer leaves the room, or the room
-  ends. No foreground process is needed; `vox share` returns once the daemon serves.
+  ends. No foreground process is needed; `vox share` returns once the daemon serves. `--count`
+  and `--for` MAY remain as the sharer's own earlier stop.
 - **F-3.** A node MUST pull a share automatically when it is addressed to that node, or to no one,
-  and the sharer is in its keyring. Any other share MUST show as a card (name, size, note, sharer,
-  addressees, whether the sharer is online) that the person may pull with `vox room get` or the
-  card's action. Every pull MUST be verified (ADR-020 11.4) before it is shown or saved.
-- **F-4.** Pulled files MUST land in `<data root>/nodes/<node>/files/<room>/`. A person MAY also
-  save a copy elsewhere, for example `~/Downloads`; that copy is theirs and outlives the message.
+  and the sharer is in its keyring, whatever its size, file or folder: an agent cannot click.
+  A share addressed to other nodes MUST show as a card naming who it is for (with its name, size,
+  note, sharer and whether the sharer is online); any member MAY still pull it with `vox room get`
+  or the card's action. Every pull MUST be verified (ADR-020 11.4) before it is shown or saved.
+- **F-4.** Pulled files MUST land in `<data root>/nodes/<node>/files/<room>/`. A person's client MAY
+  save a copy elsewhere, for example `~/Downloads`, and MUST ask before it does; that copy is theirs
+  and outlives the message. Nothing is written outside the node's files directory without asking.
 - **F-5.** When a share's message expires, every node MUST delete its pulled copy under
   `files/<room>/`, its thumbnail and its preview, and the sharer's daemon MUST stop serving it.
 - **F-6.** An agent's node MUST give its agent, through its hook (ADR-020 6.6), the share's note and
   the local path of the pulled copy. `--urgent` MUST wake an addressed agent as any addressed urgent
-  message does (ADR-020 6.2).
+  message does (ADR-020 4.5, 6.2).
 - **F-7.** The sharer's card MUST show who has pulled the share, by alias, from its own daemon's
   record of completed, verified fetches, beside the message's read receipts: `pulled by agent-2 ·
   read by ann`.
 - **F-8.** A shared folder's announcement MUST carry a file list with each file's hash and size.
   Pulling it again MUST fetch only new or changed files, and an interrupted pull MUST resume. The
-  sharer's folder is the source; there MUST be no live or two-way sync.
+  sharer's folder is the source; there MUST be no live or two-way sync. A share is a hand-off that
+  ends with its message; keeping code or long-lived files in step is git's job, not Vox's.
 - **F-9.** An image announcement MUST carry a thumbnail of at most 16 KB, a BlurHash and the image's
   dimensions inside the encrypted message, so a reader sees a preview while the sharer is offline.
 - **F-10.** A message carrying a URL MUST carry a link card (title, description, an image of at most
@@ -341,7 +345,8 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-020 3.10 | "Not built" | Built by read records (§6) |
 | ADR-020 4.9a, last sentence | "It MUST NOT say a reply is overdue: a node cannot see another node's reads" | A node sees the reads it can open (RR-3); still no "overdue" claim |
 | ADR-020 11.1 | "File bytes MUST NOT enter the log" | Except a thumbnail and a link card of at most 16 KB each inside the encrypted message (F-9, F-10) |
-| ADR-020 11.6 | Share ends after `--count`, `--for` or ^C | The daemon serves until expiry, stop, leave or end (F-2); a share is addressed like a message (F-1) |
+| ADR-020 11.3 | Announcement carries name, size, SHA-256 and service tag | Also the note and the addressees, and the urgent flag (F-1) |
+| ADR-020 11.6 | `vox share <room> <file\|dir> [--count N] [--for D]`; ends after `--count`, `--for` or ^C | Also `--to NODE…`, `--urgent`, `-m NOTE` inside the announcement (F-1); the daemon serves until expiry, stop, leave or end, with `--count`/`--for` as the sharer's earlier stop (F-2) |
 | ADR-020 11.6 | A folder served as one tar | A file list with hashes, incremental and resumable (F-8) |
 | ADR-020 11.5 | Default destination `downloads` setting, else `~/Downloads` | `<data root>/nodes/<node>/files/<room>/`; a person may save a copy elsewhere (F-4) |
 | ADR-020 11.2 | The receiver pulls when asked | Pulled automatically when addressed to this node or to no one, from a keyring member (F-3) |
