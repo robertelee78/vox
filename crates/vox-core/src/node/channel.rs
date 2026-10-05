@@ -1742,8 +1742,11 @@ impl ChannelState {
                 None => BTreeMap::new(),
             };
         // How this node came to be a member here (M17.6). A joined room holds the witness to its
-        // join, written with the room; the creator's is the genesis itself, which names it, so
-        // nothing is written for it. A joined room without its witness is malformed (#423).
+        // join (`SEG_ADMISSION`, written with the room). **A room this node created holds none:
+        // its admission is the genesis, which names it**, so it is read from there. Left unset,
+        // a reopened creator's room published no member bundle and no address record again, to
+        // any board, and lapsed off its anchor's (a_restarted_creator_stays_on_its_board_proof).
+        // A joined room without its witness is malformed (#423).
         let own_admission =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION)? {
                 Some(seg) => {
