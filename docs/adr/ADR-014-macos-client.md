@@ -95,7 +95,7 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
 - **M-15.** A room with agents' nodes as members MUST offer the lanes view (ADR-028 W-3–W-6), with
   the To: selector and urgent switch in the composer.
 - **M-16.** The keyring view MUST list the nodes in the keyring by alias with fingerprint art and
-  grouped fingerprint, and offer add (paste, or scan with the Mac's camera), rename, compare and
+  grouped fingerprint, and offer add (paste or type the fingerprint), rename, compare and
   remove, each stating its effect first (ADR-028 K-1–K-6, E-5).
 - **M-17.** The services view MUST list every service the node can see and its own shares, with
   the copy box (readable shown, canonical copied) and the needs lines, and offer one-step sharing
@@ -150,11 +150,15 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
 
 - **M-26.** The bundle MUST be `Vox.app`, identifier `us.vox.app`, with the release's `vox` binary
   inside at `Contents/Helpers/vox` (identifier `us.vox.cli`, unchanged), the two plists of M-8 and
-  M-10, and the share extension. The app's minimum MUST be macOS 13, which `SMAppService` needs;
-  `vox` alone keeps the release's floor (ADR-015 17.15), and on macOS 11 and 12 `install.sh` MUST
-  install `vox` alone and say why.
-- **M-27.** `release.yml`'s macOS jobs MUST build the app for both architectures (or as one
-  universal bundle), sign every executable in it inside-out with the Developer ID by fingerprint,
+  M-10, and the share extension.
+- **M-26a.** On macOS, Vox MUST support only Apple Silicon (`aarch64-apple-darwin`) on macOS 13 or
+  later, the floor `SMAppService` needs; this one floor applies to `Vox.app` and to `vox`. The
+  Intel macOS target (`x86_64-apple-darwin`) MUST NOT be built, signed, recorded or published.
+  On an Intel Mac, or on macOS before 13, `install.sh` MUST stop before downloading anything and
+  say plainly that this Mac is not supported. Linux (`x86_64-unknown-linux-gnu`) is unchanged.
+  The README and the manual's install chapter are to list these targets when v0.4.0 ships.
+- **M-27.** `release.yml`'s one macOS job MUST build `vox` and the app for `aarch64-apple-darwin`
+  only, with `MACOSX_DEPLOYMENT_TARGET=13.0` asserted by the signer, sign every executable in it inside-out with the Developer ID by fingerprint,
   with the hardened runtime and a secure timestamp, notarize the bundle, staple it, and publish it
   as `Vox-<version>-<triple>.zip` with a record and proof receipt like `vox`'s (ADR-015 17.2,
   17.16–17.19). A release MUST NOT publish one without the other (ADR-028 I-3).
@@ -191,7 +195,17 @@ F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6;
 
 ### 7. Out of scope
 
-The iOS app (v0.4.1) and calls (v0.5.0).
+The iOS app (v0.4.1), with showing and scanning fingerprint QR codes (ADR-028 K-1, K-5), and calls
+(v0.5.0).
+
+## Superseded and amended lines
+
+| ADR line | Was | Now |
+|---|---|---|
+| ADR-015 17.9 | On macOS too, the binary is published by renaming a candidate beside it, keeping `.previous` | On macOS the whole `Vox.app` bundle is swapped and the previous bundle kept for `--rollback`; `~/.local/bin/vox` is a link into it (M-28, M-29). Linux unchanged |
+| ADR-015 17.10 | The installer's marker sits beside the binary in place | On macOS the marker belongs to the installed bundle; `~/.local/bin/vox` is its link (M-28) |
+| ADR-015 17.15 | Targets include `x86_64-apple-darwin`; macOS floor 11.0 | Targets are `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`; macOS floor 13.0 (M-26a) |
+| ADR-015 17.16–17.19 | Signing, notarization and receipts per macOS target | Also for `Vox.app`; one macOS target (M-27) |
 
 ## Consequences
 
