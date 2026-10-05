@@ -603,12 +603,14 @@ fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     frame.render_widget(list, area);
 }
 
-fn pane_block(title: &str, focus: bool) -> Block<'_> {
-    let b = Block::default().borders(Borders::ALL).title(title);
+/// A pane's frame, its title said once: "Members", or "Members [focus]" while it holds the focus.
+fn pane_block(title: &str, focus: bool) -> Block<'static> {
+    let b = Block::default().borders(Borders::ALL);
     if focus {
         focus_block(b.title(format!("{title} [focus]")))
     } else {
-        b.border_style(theme::fg(theme::LINE_HAIR))
+        b.title(title.to_owned())
+            .border_style(theme::fg(theme::LINE_HAIR))
     }
 }
 
