@@ -44,15 +44,13 @@ pub const GENESIS_NONCE_LEN: usize = 16;
 
 /// Read the retired service-grant slot, accepting it only empty.
 ///
-/// v0.1.0–v0.2.x wrote `dial:<port>` here for every `vox serve` room, under the capability
-/// model ADR-017 M17.7 withdrew; it is removed (PRD-001 R44). The slot stays in the layout,
-/// always an empty array, and a genesis carrying anything in it is a room made before
-/// v0.3.0, which this build does not carry forward (decider: recreate it).
+/// The slot stays in the layout, always an empty array (PRD-001 R44: the capability model
+/// ADR-017 M17.7 withdrew); a genesis carrying anything in it is malformed.
 fn empty_grant_slot(d: &mut Decoder<'_>) -> Result<()> {
     if d.array()? == 0 {
         Ok(())
     } else {
-        Err(Error::LogFormatBeforeV030)
+        Err(Error::MalformedBundle("genesis service-grant slot"))
     }
 }
 

@@ -212,12 +212,12 @@ network presence from the start: there is no interim design with one socket per 
   `relay-circuits-per-asker` (ADR-012 N-45).
 - **F-3. No migration.** Vox MUST carry no code that reads, converts or migrates data written by a
   release before v0.3.0: nobody has run one (decider, 2026-10-04, #423).
-  - A data root holding a profile folder of such a release (`<data root>/<name>/` holding
-    `vault.cbor`, `node-identity.key` or `store.redb`) MUST be refused by every verb, and by the
-    daemon before it takes its lock, with the reason that it is not a Vox data directory this
-    version reads, and MUST be left byte for byte unchanged.
-  - Only this version's formats are read: a vault, keyring, store blob or cache row of an earlier
-    version is refused as malformed, never converted.
+  - A directory of the data root outside `nodes/` holding `vault.cbor`, `node-identity.key` or
+    `store.redb` is not a node. A data root holding one MUST be refused by every verb, and by the
+    daemon before it takes its lock, saying "`<root>` is not a Vox data directory this version
+    reads: `<root>/<name>` is not a node", and MUST be left byte for byte unchanged.
+  - Only this version's formats are read: a vault, keyring, store blob, cache row or log entry of
+    another version is malformed, never converted.
   - One node is one identity: a node holding a vault runs its anchor (`vox node`) as node
     `<name>-anchor`.
 
@@ -276,8 +276,8 @@ Each claim MUST be proved by real use of the shipped binary (ADR-018), with one 
 9. a hook acts only as its `--node`, and refuses without it
    (`an_agents_wiring_acts_only_as_its_node_proof`); a one-shot verb refuses an unattached node
    (`the_nodes_of_one_daemon_proof`); node names follow N-1a (`the_nodes_of_one_daemon_proof`);
-10. a fresh data root works end to end, and one laid out by a release before v0.3.0 is refused with
-    the reason and left unchanged (`a_data_root_of_an_earlier_release_is_refused_proof`);
+10. a fresh data root works end to end, and one holding a node's files outside `nodes/` is refused
+    with the reason and left unchanged (`a_data_root_of_an_earlier_release_is_refused_proof`);
 11. a node keeps running in full past the keyring window, and only a keyring change asks for the
     passphrase again (`a_keyring_change_needs_a_recent_passphrase_proof`);
 12. R40 and R42 are re-measured (`perf_r40_chat_latency_proof`, `perf_r40_relayed_chat_proof`,

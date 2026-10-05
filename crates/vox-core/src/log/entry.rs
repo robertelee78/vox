@@ -67,10 +67,6 @@ pub const MAX_SEEN: usize = 16;
 /// The number of elements in the canonical skeleton array.
 const SKELETON_ARITY: usize = 12;
 
-/// The skeleton's arity before v0.3.0 added `seen` and the causal time (ADR-023 decision 1).
-/// Recognised only to be refused by name ([`Error::LogFormatBeforeV030`]).
-const SKELETON_ARITY_BEFORE_V030: usize = 10;
-
 /// Wire discriminant for [`Authenticator::Composite`] (attributable).
 const AUTH_TYPE_COMPOSITE: u64 = 1;
 
@@ -545,9 +541,6 @@ impl Entry {
         }
         let mut d = Decoder::new(parsed.body);
         let arity = d.array()?;
-        if arity == SKELETON_ARITY_BEFORE_V030 + 3 || arity == SKELETON_ARITY_BEFORE_V030 + 4 {
-            return Err(Error::LogFormatBeforeV030);
-        }
         if arity != SKELETON_ARITY + 3 && arity != SKELETON_ARITY + 4 {
             return Err(Error::MalformedBundle("log-entry wire arity"));
         }

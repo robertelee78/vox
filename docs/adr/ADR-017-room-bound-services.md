@@ -17,7 +17,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 - anchors as configuration, followed while a daemon runs (decision 7, M17.4);
 - addresses: only `service.node.room.vox` connects, with named shares and `vox forward` by address
   only (decision 12, #339);
-- passphrase rotation removed (11.3) and rooms made before v0.3.0 refused (11.4).
+- passphrase rotation removed (11.3) and the old grant slot kept empty (11.4).
 
 Not built:
 - `vox serve` into an existing room, naming the audience and non-audience (4.1, 4.2): `vox serve`
@@ -235,10 +235,9 @@ is what a person offers. A tunnel is how bytes reach it.
   empty reacher set.
 - **11.2** Leaving one room MUST NOT disturb a service bound to another.
 - **11.3** Passphrase rotation is removed (ADR-007 G-21).
-- **11.4** A room made before v0.3.0 MUST be refused, with "make the room again"
-  (`Fault::RoomFromBeforeV030`). The genesis service grant MUST be removed, along with `<room-id>.vox`
-  resolving to a room's creator (R44, #94; #339). The grant slot stays in the genesis layout, always
-  empty; a genesis carrying a token is refused as a room made before v0.3.0. `0x0013` is reserved.
+- **11.4** The genesis service grant MUST be removed, along with `<room-id>.vox` resolving to a
+  room's creator (R44, #94; #339). The grant slot stays in the genesis layout, always empty; a
+  genesis carrying anything in it is malformed. `0x0013` is reserved.
 - **M17.8** A governance entry MUST count only if its epoch equals the epoch established in its
   strict causal past (`Evaluator::in_effect`, ADR-007), so a replayed pre-rotation grant buys nothing.
 - **M17.13** Superseded by 11.4.

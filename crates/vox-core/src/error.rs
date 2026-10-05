@@ -175,13 +175,6 @@ pub enum Error {
     #[error("at-rest unlock failed (wrong factor or tampered ciphertext)")]
     AtRestUnlockFailed,
 
-    /// A log entry in the shape vox wrote **before v0.3.0**: its skeleton has no `seen` and no
-    /// causal time (ADR-023 decision 1). v0.3.0 does not read them; the decider chose that
-    /// such a room is made again (2026-09-29, #226). Its own variant so a person is told that,
-    /// not "an internal error".
-    #[error("a log entry written by vox before v0.3.0, whose message format changed")]
-    LogFormatBeforeV030,
-
     /// A SEK-backed operation (segment seal/open, re-wrap) was attempted after the
     /// app was **locked** (ADR-010 §"App-lock and memory hygiene"): the SEK was
     /// zeroized and invalidated, so it must be re-derived from both factors
@@ -475,8 +468,9 @@ pub enum Error {
     #[error("node: {0}")]
     Profile(&'static str),
 
-    /// A data root this version does not read: it holds a profile folder of a vox before
-    /// v0.3.0 (#423). It is refused before anything is written, and left as it is.
+    /// A data root this version does not read: a directory of it outside `nodes/` holds a vault,
+    /// an anchor's key or a store, and is not a node (#423). It is refused before anything is
+    /// written, and left as it is.
     #[error("{root} is not a Vox data directory this version reads: {why}")]
     DataRootNotRead {
         /// The data root.

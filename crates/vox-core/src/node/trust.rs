@@ -17,8 +17,8 @@
 //! ## The escalation it closes
 //!
 //! A room cannot be joined without the passphrase
-//! ([`ChannelState::join_channel_with_profile`](crate::node::channel::ChannelState::join_channel_with_profile)
-//! derives the channel secret through Argon2id). But **admission is not joining**:
+//! ([`ChannelState::join_channel_from_sealed`](crate::node::channel::ChannelState::join_channel_from_sealed)
+//! takes a channel secret sealed through Argon2id). But **admission is not joining**:
 //! [`admit_author`](crate::node::channel::ChannelState::admit_author) is a *log*
 //! fact, and `nat::service` admits a member-bundle record for an author this node
 //! does not know when a peer it *does* know publishes it — deliberate vouching, so

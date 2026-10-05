@@ -5163,10 +5163,7 @@ impl Node {
         let (genesis_wire, epoch, admission) = match self.channels.get(channel_id) {
             Some(shared) => {
                 let c = shared.lock().await;
-                let Some(admission) = c.own_admission().cloned() else {
-                    return;
-                };
-                (c.genesis().to_wire(), c.epoch(), admission)
+                (c.genesis().to_wire(), c.epoch(), c.own_admission().clone())
             }
             None => return,
         };
@@ -5958,9 +5955,7 @@ impl Node {
         };
         let ring = ring.lock().await;
         let _ = net.publish_local(&channel.genesis().to_wire());
-        let Some(admission) = channel.own_admission().cloned() else {
-            return;
-        };
+        let admission = channel.own_admission().clone();
         if let Ok((address, bundle)) = net.own_records(
             signer,
             channel_id,
@@ -8391,9 +8386,7 @@ impl Node {
                 // would fall off every board. The joiner already verified it binds its own key,
                 // this room and this epoch, in `run_initiator`. Written with the room, in one
                 // batch, so a join that fails here leaves no room behind (V210-80).
-                Some(crate::nat::record::Admission::Witnessed(Box::new(
-                    joined.witness.clone(),
-                ))),
+                crate::nat::record::Admission::Witnessed(Box::new(joined.witness.clone())),
             ) {
                 Ok(c) => c,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
@@ -14677,7 +14670,6 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
-        Error::LogFormatBeforeV030 => Fault::RoomFromBeforeV030,
         Error::AtRestLocked => Fault::Locked,
         Error::ProfileBusy => Fault::ProfileBusy,
         // Before the general size arm: a full keyring is not an input that was too long.

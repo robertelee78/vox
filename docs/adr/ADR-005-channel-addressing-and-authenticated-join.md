@@ -34,8 +34,8 @@ readable: who reads whom is decided by trust (ADR-007).
   that answer, with the anchors it names, are kept as the room's address. An address at which no member
   answers MUST change nothing. A link that names no other member of the room MUST be refused as a bad
   link.
-- **J-4.** A room made by a Vox release before v0.3.0 MUST be refused, saying to make the room again
-  (`Fault::RoomFromBeforeV030`). There is no compatibility path.
+- **J-4.** There is no compatibility path: an entry in another log format is malformed (ADR-023
+  RL-7.1, ADR-026 F-3).
 - **J-5.** Addressing a service is ADR-017's: only `service.node.room.vox` connects; `room.vox` and
   `node.room.vox` MUST resolve to nothing. No `<room>.vox` name resolves to the room's creator.
 

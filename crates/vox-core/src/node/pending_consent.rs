@@ -46,8 +46,8 @@ pub const SEGMENT_ID: u64 = 1;
 const VERSION: u64 = 1;
 
 /// Most pending consents held at once: every trusted identity in a generous number of rooms.
-/// **One bound, kept on both sides**: [`PendingConsents::insert`] holds no more, and a map
-/// written before it did (V210-77) loads its first this many rather than refusing the unlock.
+/// **One bound, kept on both sides**: [`PendingConsents::insert`] holds no more, and a map with
+/// more is malformed.
 const MAX_PENDING: usize = MAX_TRUSTED * 16;
 
 /// Longest SKDM kept. A real one is a few KiB (composite signing key and signature).
@@ -134,8 +134,11 @@ impl PendingConsents {
             return Err(bad("pending trust grants version"));
         }
         // Rows are read one at a time and nothing is sized from `n`, so a corrupt count
-        // allocates nothing; past the bound, rows are read and not kept.
+        // allocates nothing; more than the bound is malformed.
         let n = d.array().map_err(|_| bad("pending trust grants len"))?;
+        if n > MAX_PENDING {
+            return Err(Error::SizeLimitExceeded("pending trust grants"));
+        }
         let mut entries = BTreeMap::new();
         for _ in 0..n {
             if d.array().map_err(|_| bad("pending trust grant row"))? != 3 {
@@ -150,9 +153,7 @@ impl PendingConsents {
             if skdm.len() > MAX_SKDM {
                 return Err(Error::SizeLimitExceeded("pending trust grant key"));
             }
-            if entries.len() < MAX_PENDING {
-                entries.insert((room, member), Zeroizing::new(skdm.to_vec()));
-            }
+            entries.insert((room, member), Zeroizing::new(skdm.to_vec()));
         }
         d.finish()
             .map_err(|_| bad("pending trust grants trailing"))?;

@@ -673,7 +673,7 @@ pub struct ChannelState {
     /// whenever this node publishes its own bundle record, which is every time it
     /// refreshes its board presence. Distinct from `admission`, which is the ADR-007
     /// policy governing *other* authors' entries.
-    own_admission: Option<Admission>,
+    own_admission: Admission,
     /// The iteration-0 chain key of every sender-key generation this identity has
     /// minted here (M18.1), persisted in `SEG_ORIGINS`. Held so a rotation can
     /// re-key the members who keep consent *at the new generation's origin* — which
@@ -1384,7 +1384,7 @@ impl ChannelState {
             transient: BTreeSet::new(),
             // This node made the channel, so the genesis names it and nothing else needs
             // to (M17.6).
-            own_admission: Some(Admission::Creator),
+            own_admission: Admission::Creator,
             origins,
             delivered: BTreeMap::new(),
             retention: RetentionIndex::default(),
@@ -1741,17 +1741,17 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
-        // How this node came to be a member here (M17.6). `None` for a channel that
-        // predates the segment; such a node cannot publish a bundle record until it
-        // has one, which is correct — its membership is exactly as unevidenced as any
-        // other unwitnessed key's.
+        // How this node came to be a member here (M17.6). A joined room holds the witness to its
+        // join, written with the room; the creator's is the genesis itself, which names it, so
+        // nothing is written for it. A joined room without its witness is malformed (#423).
         let own_admission =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION)? {
                 Some(seg) => {
                     let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ADMISSION, &seg)?;
-                    Some(Admission::from_body(&bytes)?)
+                    Admission::from_body(&bytes)?
                 }
-                None => None,
+                None if genesis.body.creator_pubkey.fingerprint() == me => Admission::Creator,
+                None => return Err(Error::MalformedAtRest("joined room has no admission")),
             };
         // The origins of this identity's own generations (M18.1). A channel from
         // before the segment existed retains none, and cannot: the live chain has
@@ -1896,66 +1896,6 @@ impl ChannelState {
         )
     }
 
-    /// Create the local state for a channel this identity **joined** (ADR-007
-    /// §"Join and per-sender consent flow", step 1) rather than created.
-    ///
-    /// `genesis` comes from the rendezvous board and is accepted **only if its hash
-    /// equals `channel_id`** (ADR-007: that check, not any roster, is what makes a
-    /// cold-fetched genesis trustworthy). The joiner gets its own local SEK (the
-    /// at-rest double-lock is per device, ADR-010) and its own sender chain at
-    /// `chain_id` 0 — holding channel credentials releases **no** sender keys, so it
-    /// can read nothing until members consent (step 3); its own messages are
-    /// readable by others only once it distributes its SKDM (step 2).
-    ///
-    /// The creator is admitted as an author immediately (its key is in the verified
-    /// genesis); every other member is admitted as its verified key arrives.
-    pub fn join_channel(
-        profile: &Profile,
-        genesis: &Genesis,
-        channel_id: &Digest32,
-        local_name: &str,
-        channel_passphrase: &[u8],
-        now_secs: u64,
-    ) -> Result<Self> {
-        Self::join_channel_with_profile(
-            profile,
-            genesis,
-            channel_id,
-            local_name,
-            channel_passphrase,
-            now_secs,
-            Argon2Profile::default(),
-        )
-    }
-
-    /// [`ChannelState::join_channel`] with an explicit Argon2id profile (tests use
-    /// the reduced one).
-    pub fn join_channel_with_profile(
-        profile: &Profile,
-        genesis: &Genesis,
-        channel_id: &Digest32,
-        local_name: &str,
-        channel_passphrase: &[u8],
-        now_secs: u64,
-        argon2: Argon2Profile,
-    ) -> Result<Self> {
-        Self::join_checks(profile, genesis, channel_id, local_name)?;
-        let sek = Sek::generate()?;
-        let signer = profile.signer()?;
-        let factor = SignatureIdentityFactor::new(signer);
-        let wrap = sek.seal(&factor, channel_id, channel_passphrase, argon2)?;
-        Self::join_channel_from_sealed(
-            profile,
-            genesis,
-            channel_id,
-            local_name,
-            channel_passphrase,
-            now_secs,
-            (sek, wrap),
-            None,
-        )
-    }
-
     /// What must hold before a joined room is made: a name within the limit, an unlocked signer,
     /// a genesis that verifies and names this room, and no copy of the room already in the profile.
     ///
@@ -2005,7 +1945,7 @@ impl ChannelState {
         channel_passphrase: &[u8],
         now_secs: u64,
         sealed: (Sek, crate::atrest::SekWrap),
-        own_admission: Option<Admission>,
+        own_admission: Admission,
     ) -> Result<Self> {
         Self::join_checks(profile, genesis, channel_id, local_name)?;
         let (sek, wrap) = sealed;
@@ -2050,17 +1990,12 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins.to_state(),
         )?;
-        let admission_seg = own_admission
-            .as_ref()
-            .map(|a| {
-                seal_segment(
-                    &sek,
-                    SegmentKind::KeyMaterial,
-                    SEG_ADMISSION,
-                    &a.body_bytes(),
-                )
-            })
-            .transpose()?;
+        let admission_seg = seal_segment(
+            &sek,
+            SegmentKind::KeyMaterial,
+            SEG_ADMISSION,
+            &own_admission.body_bytes(),
+        )?;
         let mut batch = profile.store().batch()?;
         batch.put_sek_wrap(channel_id, &wrap)?;
         batch.put_segment(
@@ -2087,9 +2022,12 @@ impl ChannelState {
             SEG_ORIGINS,
             &origins_seg,
         )?;
-        if let Some(seg) = &admission_seg {
-            batch.put_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION, seg)?;
-        }
+        batch.put_segment(
+            channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_ADMISSION,
+            &admission_seg,
+        )?;
         batch.put_segment(
             channel_id,
             SegmentKind::KeyMaterial,
@@ -2520,11 +2458,10 @@ impl ChannelState {
         Ok(true)
     }
 
-    /// How this node came to be a member here (M17.6) — `None` only for a channel
-    /// opened from a store written before the segment existed.
+    /// How this node came to be a member here (M17.6).
     #[must_use]
-    pub fn own_admission(&self) -> Option<&Admission> {
-        self.own_admission.as_ref()
+    pub fn own_admission(&self) -> &Admission {
+        &self.own_admission
     }
 
     fn persist_services(&mut self, store: &Store) -> Result<()> {

@@ -2,22 +2,23 @@
 //! data root works end to end, and one laid out by a release before v0.3.0 is refused with a
 //! plain reason and left byte for byte unchanged**, through the shipped binary.
 //!
-//! Nobody has run a Vox release (decider, 2026-10-04), so nothing needs migrating. The code that
-//! moved v0.2.x profile folders into `nodes/` (and split, renamed and re-sealed what it found) is
-//! gone; what is left is a refusal, before anything is written.
+//! Nobody has run a Vox release (decider, 2026-10-04), so nothing needs migrating: Vox carries no
+//! code that reads, converts or moves such a data root. What is left is a refusal, before anything
+//! is written.
 //!
 //! **Arm 1, fresh data roots, end to end** (`support/room.rs`): an anchor and two members, each
 //! made by `vox id`, attached in its own `vox daemon`; `vox room create`, `invite`, `join` and
 //! `trust add`; each posts until the other reads it. Then bob posts once more and alice reads it.
 //!
 //! **Arm 2, a data root of an earlier release.** A data root laid out as v0.2.x left it: a
-//! profile folder `default/` holding `vault.cbor`, `store.redb` and `port` (their contents do not
-//! matter: they must never be read), beside a file of the person's own. Every way in is tried —
-//! `vox id`, `vox node list`, `vox node attach default`, `vox room list`, `vox status`,
-//! `vox daemon` and `vox node` — and each must fail, saying the directory is not a Vox data
-//! directory this version reads and naming the profile folder. The data root is snapshotted
-//! before and after (every path, every file's bytes): it must be identical. The config directory
-//! and `HOME` are outside it, so nothing legitimate writes inside it.
+//! directory `default/` of the root itself holding `vault.cbor`, `store.redb` and `port` (their
+//! contents do not matter: they must never be read), beside a file of the person's own. Every way
+//! in is tried — `vox id`, `vox node list`, `vox node attach default`, `vox room list`,
+//! `vox status`, `vox daemon` and `vox node` — and each must fail, saying "<root> is not a Vox
+//! data directory this version reads: <root>/default is not a node", and never "profile". The
+//! data root is snapshotted before and after (every path, every file's bytes): it must be
+//! identical. The config directory and `HOME` are outside it, so nothing legitimate writes inside
+//! it.
 //!
 //! **Which side a red is on.** A verb that succeeds, one that refuses for another reason, or a
 //! data root that changed is `PRODUCT:`; the proof's own I/O is `APPARATUS:`.
@@ -45,6 +46,8 @@ const IDENTITY: &str = "identity passphrase";
 
 /// What every refusal must say.
 const REASON: &str = "is not a Vox data directory this version reads";
+/// What it says of the directory that is not a node.
+const NOT_A_NODE: &str = "is not a node";
 
 /// Every path under `root` with its bytes (`None` for a directory; a fixed marker for a socket or
 /// a link).
@@ -174,13 +177,13 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
     ] {
         std::fs::create_dir_all(&d).expect("APPARATUS: staging directories");
     }
-    // A data root as v0.2.x left it: a profile folder of the root itself.
-    let profile = data.join("default");
-    std::fs::write(profile.join("vault.cbor"), b"a vault of an earlier release")
+    // A data root as v0.2.x left it: a node's files in a directory of the root itself.
+    let folder = data.join("default");
+    std::fs::write(folder.join("vault.cbor"), b"a vault of an earlier release")
         .expect("APPARATUS: staging vault.cbor");
-    std::fs::write(profile.join("store.redb"), b"a store of an earlier release")
+    std::fs::write(folder.join("store.redb"), b"a store of an earlier release")
         .expect("APPARATUS: staging store.redb");
-    std::fs::write(profile.join("port"), b"41234\n").expect("APPARATUS: staging port");
+    std::fs::write(folder.join("port"), b"41234\n").expect("APPARATUS: staging port");
     std::fs::write(data.join("notes.txt"), b"a file of the person's own")
         .expect("APPARATUS: staging notes.txt");
     let before = snapshot(&data);
@@ -197,17 +200,19 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
     let mut red = Vec::new();
     for argv in verbs {
         let (status, said) = run_on(&data, &outside, argv);
-        let names_it = said.contains(REASON) && said.contains(&profile.display().to_string());
+        let names_it = said.contains(&format!("{} {REASON}", data.display()))
+            && said.contains(&format!("{} {NOT_A_NODE}", folder.display()))
+            && !said.to_lowercase().contains("profile");
         println!(
             "[proof] vox {}: exit ok = {status:?}; says why = {names_it}",
             argv.join(" ")
         );
         if status != Some(false) || !names_it {
             red.push(format!(
-                "`vox {}` must fail saying the data root {REASON}, naming {}; it ended {status:?} \
-                 and said: {said}",
+                "`vox {}` must fail saying the data root {REASON} and that {} {NOT_A_NODE}, \
+                 never \"profile\"; it ended {status:?} and said: {said}",
                 argv.join(" "),
-                profile.display()
+                folder.display()
             ));
         }
     }

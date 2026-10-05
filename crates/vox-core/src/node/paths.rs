@@ -6,8 +6,9 @@
 //! - data:   `$XDG_DATA_HOME/vox/` is the **data root** (ADR-026 F-1): `.daemon/` holds what is
 //!   the daemon's (lock, socket, port, log, attach list, settings) and `nodes/<name>/` holds one
 //!   node each — `vault.cbor` or `node-identity.key`, `store.redb`, its own `config/` directory,
-//!   `cursors/` and `sessions/`. A data root in the layout before v0.3.0 (`<data root>/<name>/`)
-//!   is refused, unchanged ([`crate::node::layout::refuse_old_layout`], #423).
+//!   `cursors/` and `sessions/`. A data root holding a node's files outside `nodes/`
+//!   (`<data root>/<name>/`) is refused, unchanged ([`crate::node::layout::refuse_old_layout`],
+//!   #423).
 //!
 //! Precedence (ADR-015), highest first: explicit override, then the
 //! `VOX_CONFIG_DIR` / `VOX_DATA_DIR` env vars, then the XDG env vars, then the
@@ -360,7 +361,7 @@ impl Paths {
     /// Resolve and create the directories for node `profile`, honoring the ADR-015
     /// precedence. `data_override` / `config_override` are the CLI-flag layer.
     ///
-    /// **A data root not in v0.3.0's layout is refused** before anything is created
+    /// **A data root not in this version's layout is refused** before anything is created
     /// ([`crate::node::layout::refuse_old_layout`], #423).
     ///
     /// # Errors

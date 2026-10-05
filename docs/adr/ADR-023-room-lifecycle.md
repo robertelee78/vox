@@ -198,8 +198,7 @@ million-message room holds about 3.5 GB of skeletons after every body has expire
 ### No backwards compatibility
 
 - **RL-7.1.** The ADR-008 skeleton changes once, and every node updates; there is no compatibility
-  ceremony. A room made by vox before v0.3.0 MUST be refused when opened, with a plain reason that
-  says to make the room again (`Fault::RoomFromBeforeV030`, `node/api.rs`).
+  ceremony. An entry in another log format is malformed (ADR-026 F-3).
 
 ### Leaving and ending a room
 
@@ -297,7 +296,6 @@ The ADR-004 O2–O4 delivery proofs stay as proofs of the direct path:
 - Two members who are never online together require an always-on member.
 - The skeleton carries `seen` and `claimed_ms`, and checkpoints add an entry kind.
 - Late arrivals can appear above rows already read.
-- Rooms made before v0.3.0 are made again.
 
 ## Related ADRs
 
