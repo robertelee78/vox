@@ -41,15 +41,6 @@
 //! 3. once Alice is back, Bob reads both, and shows nothing as not received yet;
 //! 4. and still reads them after his daemon restarts.
 //!
-//! ## A message lost before V210-73 is reported ([`a_message_lost_to_the_old_row_ids_is_reported`])
-//! Before V210-73 a reopened room resumed its row ids from its log rows alone, so its first post
-//! overwrote the cache row of the last message it had received, the only plaintext of it. That
-//! cannot be undone (its message key was used up when it was read), so it is reported. Bob's store
-//! is damaged the old way: his daemon is the mutant build as `old-row-ids` while he receives
-//! Alice's posts, restarts, and posts. Then the shipped daemon opens it. Asserted: `vox status`
-//! reports exactly one message lost that way, and Bob reads one post fewer (else APPARATUS (the mutant peer):
-//! nothing was lost).
-//!
 //! ## Mutations
 //! - no refusal of an unclassifiable entry before it is held (`unclassifiable` answering `None`):
 //!   arm 1 goes red at (4), the entry was stored;
@@ -427,78 +418,6 @@ fn a_stripped_body_is_owed_and_asked_for_until_it_arrives() {
             bob.status()
         );
     }
-}
-
-#[test]
-#[ignore = "real daemons with the mutant sender build (VOX_MUTANT_SENDER); CI runs it in release"]
-fn a_message_lost_to_the_old_row_ids_is_reported() {
-    const MODE: &str = "old-row-ids";
-    watchdog::arm();
-    let sender = mutant_sender();
-    let tmp = tempfile::tempdir().expect("APPARATUS: tempdir");
-    let root = tmp.path();
-    let (_anchor, spec) = anchor(root);
-    let alice = Member::new(root, "alice");
-    let bob = Member::new(root, "bob");
-    alice.trust(&bob);
-    bob.trust(&alice);
-    let _alice_d = alice.daemon(Some(&spec));
-    let bob_d = bob.daemon_mutant(&sender, MODE, Some(&spec));
-    let room = alice.create("old");
-    bob.join(&alice.invite(&room), "old");
-    let hers = ["alice one", "alice two", "alice three"];
-    for p in hers {
-        alice.post(&room, p);
-    }
-    for p in hers {
-        if let Err(e) = arrives(&bob, &room, p) {
-            panic!("PRODUCT (staging): bob never received {p:?}: {e}");
-        }
-    }
-    // ---- bob's store is damaged the old way: restart, post ---------------------------------
-    drop(bob_d);
-    let bob_d = bob.daemon_mutant(&sender, MODE, Some(&spec));
-    bob.post(&room, "bob, after the restart");
-    assert!(
-        announced(&bob_d, MODE),
-        "APPARATUS (the mutant peer): bob's daemon never announced {MODE:?}:\n{}",
-        bob_d.transcript()
-    );
-    drop(bob_d);
-
-    // ---- the shipped daemon opens it --------------------------------------------------------
-    let _bob_d = bob.daemon(Some(&spec));
-    if let Err(e) = arrives(&bob, &room, "bob, after the restart") {
-        panic!("PRODUCT: the shipped daemon does not hold bob's room: {e}");
-    }
-    let (read_ok, read, read_err) = bob.vox(&["room", "read", &room], None);
-    assert!(
-        read_ok,
-        "PRODUCT: bob's `vox room read` failed after it had shown his post: {read}{read_err}"
-    );
-    let kept = hers
-        .iter()
-        .filter(|p| read.lines().any(|l| l.ends_with(**p)))
-        .count();
-    let lost: Vec<String> = set_aside(&bob)
-        .into_iter()
-        .filter(|e| e.contains("lost to the row-id collision"))
-        .collect();
-    println!(
-        "[proof] old row ids: bob reads {kept} of alice's 3 posts; vox status reports {} lost: \
-         {lost:?}",
-        lost.len()
-    );
-    assert!(
-        kept < hers.len(),
-        "APPARATUS (the mutant peer): the old row ids lost nothing (bob reads {kept} of 3)"
-    );
-    assert_eq!(
-        lost.len(),
-        hers.len() - kept,
-        "PRODUCT: bob lost {} of alice's posts to the old row ids; vox status reports {lost:?}",
-        hers.len() - kept
-    );
 }
 
 #[test]

@@ -1492,10 +1492,6 @@ impl ChannelState {
         let mut inbound_packages = Vec::new();
         let mut set_aside = Vec::new();
         let mut unlinked = Vec::new();
-        // For the V210-73 check below: each log row's entry, and each received message's chain
-        // position.
-        let mut log_at: BTreeMap<u64, Digest32> = BTreeMap::new();
-        let mut received: Vec<(u64, String, Digest32, Digest32, u64, u64)> = Vec::new();
         // Each entry held without its body, `(author, seq, claimed_ms)`: owed again unless it has
         // expired here (V030-10).
         let mut held_bare: Vec<(Digest32, u64, u64)> = Vec::new();
@@ -1564,16 +1560,6 @@ impl ChannelState {
                             cache_id: None,
                         },
                     );
-                    if let Ok(msg) = crate::group::message::GroupMessage::from_wire(payload) {
-                        received.push((
-                            id,
-                            at.clone(),
-                            entry.entry_hash(),
-                            entry.skeleton.author_id,
-                            msg.header.chain_id,
-                            msg.header.iteration,
-                        ));
-                    }
                 }
                 if let Some(pkg) = Some(payload)
                     .filter(|p| crate::node::keypackage::KeyPackage::is_key_package(p))
@@ -1591,7 +1577,6 @@ impl ChannelState {
                     entry.skeleton.claimed_ms,
                 ));
             }
-            log_at.insert(id, entry.entry_hash());
             log_ids.insert(entry.entry_hash(), id);
             match dag.accept(entry.clone(), kind, &key, &admission) {
                 Ok(_) => {}
@@ -1660,19 +1645,11 @@ impl ChannelState {
         // received message's cache row, and its own cache row overwrote that one: the message
         // was gone from the room at the next restart.
         let mut timeline = Vec::new();
-        let mut cache_at: BTreeMap<u64, (Digest32, Digest32)> = BTreeMap::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
-            #[cfg(feature = "mutant-sender")]
-            let old_row_ids = crate::log::sync::mutant::old_row_ids();
-            #[cfg(not(feature = "mutant-sender"))]
-            let old_row_ids = false;
-            if !old_row_ids {
-                next_log_id = next_log_id.max(id.saturating_add(1));
-            }
+            next_log_id = next_log_id.max(id.saturating_add(1));
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
             let mut rendered = parse_cache(&row)?;
             rendered.arrival = id;
-            cache_at.insert(id, (rendered.entry_hash, rendered.author));
             if retention.get(&rendered.entry_hash).is_some() {
                 retention.rendered(&rendered.entry_hash, rendered.created_millis / 1_000, id);
                 timeline.push(rendered);
@@ -1698,31 +1675,6 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
-        // **A received message lost to the row-id collision before V210-73** is reported, since it
-        // cannot be brought back: its only plaintext was the overwritten row, and its message key
-        // was used up when it was read (forward secrecy). Two things together say which: the row
-        // after its log row holds one of this node's own posts, log and cache row both (the post
-        // that took the id), and its author's chain has already opened that message. A message not
-        // readable yet fails the second.
-        let me = sender.author_id();
-        let shown: BTreeSet<Digest32> = timeline.iter().map(|r: &Rendered| r.entry_hash).collect();
-        for (id, at, hash, author, chain, iteration) in received {
-            if author == me || shown.contains(&hash) {
-                continue;
-            }
-            let next = id.saturating_add(1);
-            let overwritten = cache_at
-                .get(&next)
-                .is_some_and(|(h, a)| *a == me && log_at.get(&next) == Some(h));
-            let opened = receivers
-                .get(&(author, chain))
-                .is_some_and(|c: &ReceiverChain| !c.holds_key_for(iteration));
-            if overwritten && opened {
-                set_aside.push(format!(
-                    "{at}: a received message lost to a storage defect fixed in v0.2.10"
-                ));
-            }
-        }
         // The anchors this channel is published to (M15.1). A channel from before the
         // segment existed has none recorded, which is what it had.
         let anchors = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ANCHORS)? {
