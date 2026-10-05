@@ -747,7 +747,7 @@ async fn open_rooms_over_socket(client: &mut IpcClient, line: &str) {
         if let Ok(Frame::Ok) = client
             .request(&Request::OpenRoom {
                 channel_id: *channel_id,
-                passphrase: line.to_owned(),
+                passphrase: Zeroizing::new(line.to_owned()),
             })
             .await
         {
@@ -763,7 +763,7 @@ async fn open_rooms_over_socket(client: &mut IpcClient, line: &str) {
             let _ = client
                 .request(&Request::OpenRoom {
                     channel_id: id,
-                    passphrase: pass.to_owned(),
+                    passphrase: Zeroizing::new(pass.to_owned()),
                 })
                 .await;
         }
