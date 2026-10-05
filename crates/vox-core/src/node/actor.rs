@@ -4556,6 +4556,11 @@ impl Node {
             node.view_tx.subscribe(),
             handle_event_tx.clone(),
         );
+        crate::node::pulls::Pulls::spawn(
+            node.paths.clone(),
+            cmd_tx.downgrade(),
+            node.view_tx.subscribe(),
+        );
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
             cmd_tx,

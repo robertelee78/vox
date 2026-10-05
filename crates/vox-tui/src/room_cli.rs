@@ -2689,9 +2689,10 @@ struct Offer {
 /// `../../.ssh/authorized_keys` or `/etc/…` was honoured, `File::create` truncated whatever was
 /// there before a single byte was verified, and a mismatch then *deleted* it. Now:
 ///
-/// - the file goes into a download directory — `--dir`, else the profile's `downloads` config
-///   file, else `~/Downloads` — under the sender's name reduced to a bare file name
-///   ([`safe_file_name`]); `--out` names an exact path instead;
+/// - the file goes into the node's files directory for the room, `<data root>/nodes/<node>/files/
+///   <room>/` (ADR-028 F-4), or `--dir` when the person names another, under the sender's name
+///   reduced to a bare file name ([`safe_file_name`]); `--out` names an exact path instead.
+///   Nothing is written outside the node's files directory unless the person asked for it here;
 /// - **nothing that exists is ever overwritten**: a taken name gets a ` (1)`, ` (2)` … suffix,
 ///   and an `--out` that exists is refused;
 /// - the bytes go to a hidden `.part` file beside it, and only a transfer whose SHA-256 and size
@@ -2924,12 +2925,20 @@ async fn collect_offer(
         }
         None => {
             let dir = match dir {
-                Some(d) => d.to_owned(),
-                None => download_dir(paths)?,
+                Some(d) => {
+                    std::fs::create_dir_all(d).map_err(|e| {
+                        AppError::Usage(format!("cannot use {} for the file: {e}", d.display()))
+                    })?;
+                    d.to_owned()
+                }
+                None => {
+                    let d = vox_core::node::pulls::room_dir(paths, &channel_id);
+                    vox_core::node::paths::create_private_dir(&d).map_err(|e| {
+                        AppError::Usage(format!("cannot use {} for the file: {e}", d.display()))
+                    })?;
+                    d
+                }
             };
-            std::fs::create_dir_all(&dir).map_err(|e| {
-                AppError::Usage(format!("cannot use {} for downloads: {e}", dir.display()))
-            })?;
             Destination::Into(dir, safe_file_name(&offer.name))
         }
     };
@@ -3068,81 +3077,8 @@ impl Destination {
     }
 }
 
-/// The directory a collected file goes in when `--dir` and `--out` are both absent: the
-/// profile's `downloads` config file if it names one, else `~/Downloads`.
-fn download_dir(paths: &Paths) -> Result<std::path::PathBuf, AppError> {
-    let home = || {
-        std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| {
-                AppError::Usage("HOME is not set, so there is no ~/Downloads; pass --dir".into())
-            })
-    };
-    let expand = |line: &str| -> Result<std::path::PathBuf, AppError> {
-        Ok(match line.strip_prefix("~/") {
-            Some(rest) => home()?.join(rest),
-            None => std::path::PathBuf::from(line),
-        })
-    };
-    if let Ok(text) = std::fs::read_to_string(paths.downloads_file()) {
-        if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
-            return expand(line);
-        }
-    }
-    // Or `downloads = <dir>` in the profile's settings file (`vox share`'s form, PRD-001 R18
-    // and R37): the two changes that built R18 chose different files, and both are honoured.
-    if let Ok(text) = std::fs::read_to_string(paths.config_file()) {
-        let set = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with('#'))
-            .filter_map(|l| l.split_once('='))
-            .find(|(k, _)| k.trim() == "downloads")
-            .map(|(_, v)| v.trim().to_owned());
-        if let Some(dir) = set.filter(|d| !d.is_empty()) {
-            return expand(&dir);
-        }
-    }
-    Ok(home()?.join("Downloads"))
-}
-
-/// The sender's file name reduced to a **bare file name** that cannot leave the directory it
-/// is put in.
-///
-/// Everything up to the last `/` or `\` is dropped, so `../../x`, `/etc/passwd` and
-/// `..\\x` all become their last component. Control characters go, leading dots go (no
-/// `..`, and no file hidden from a listing by a name somebody else chose), and the result is
-/// cut to 200 bytes. Whatever is left empty becomes `download`.
-#[must_use]
-pub fn safe_file_name(name: &str) -> String {
-    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
-    let trimmed = cleaned.trim().trim_start_matches('.').trim();
-    let mut out = String::new();
-    for c in trimmed.chars() {
-        if out.len() + c.len_utf8() > 200 {
-            break;
-        }
-        out.push(c);
-    }
-    if out.is_empty() {
-        "download".to_owned()
-    } else {
-        out
-    }
-}
-
-/// `name`, then `name (1)`, `name (2)` … with the number before the extension.
-fn numbered(name: &str, n: usize) -> String {
-    if n == 0 {
-        return name.to_owned();
-    }
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
-        _ => format!("{name} ({n})"),
-    }
-}
+use vox_core::node::pulls::numbered;
+pub use vox_core::node::pulls::safe_file_name;
 
 /// How long one read of the transfer may wait before the transfer is abandoned. A sender
 /// that has gone quiet must not hold the collector for ever.
