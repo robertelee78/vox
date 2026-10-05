@@ -4025,14 +4025,27 @@ async fn live_tunnels(
     out
 }
 
+/// How long [`cut_since`] waits for the sessions a change cuts to end.
+const CUT_WITHIN: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Of `before`, the tunnels no longer live, and those still live: what a change cut, and what it
 /// left open.
+/// A serving task ends its session once it sees the change, a moment after the node answers: so
+/// what is still live is read again for up to [`CUT_WITHIN`] before it is called still open.
 async fn cut_since(paths: &Paths, before: Vec<(u64, String)>) -> (Vec<String>, Vec<String>) {
-    let now: std::collections::BTreeSet<u64> = live_tunnels(paths, |_, _, _| true)
-        .await
-        .into_iter()
-        .map(|(id, _)| id)
-        .collect();
+    let deadline = tokio::time::Instant::now() + CUT_WITHIN;
+    let now = loop {
+        let now: std::collections::BTreeSet<u64> = live_tunnels(paths, |_, _, _| true)
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        if before.iter().all(|(id, _)| !now.contains(id)) || tokio::time::Instant::now() >= deadline
+        {
+            break now;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     let (open, cut): (Vec<_>, Vec<_>) = before.into_iter().partition(|(id, _)| now.contains(id));
     (
         cut.into_iter().map(|(_, t)| t).collect(),
@@ -4168,7 +4181,14 @@ pub async fn trust_remove(
     let rooms = rooms_with(&mut client, &target).await;
     let room_names: Vec<String> = rooms.iter().map(|(id, n)| room_said(id, n)).collect();
     let services = offered_across(&mut client, &rooms).await;
-    let sessions = live_tunnels(paths, |peer, _, _| *peer == target).await;
+    // Only its sessions into this node's services are cut: those are this keyring's to grant.
+    // This node's own sessions into its services are its keyring's, and are left alone.
+    let sessions = live_tunnels(paths, |peer, _, inbound| *peer == target && inbound).await;
+    let ours: Vec<String> = live_tunnels(paths, |peer, _, inbound| *peer == target && !inbound)
+        .await
+        .into_iter()
+        .map(|(_, t)| t)
+        .collect();
     println!(
         "vox: about to stop trusting {}",
         crate::ident::author_id(&target)
@@ -4182,7 +4202,10 @@ pub async fn trust_remove(
         listed(&services, "none of your services")
     );
     let said: Vec<String> = sessions.iter().map(|(_, t)| t.clone()).collect();
-    println!("     live sessions with it now: {}", listed(&said, "none"));
+    println!(
+        "     its live sessions into your services are to be cut: {}",
+        listed(&said, "none is open")
+    );
     match keyring_change(&mut client, given, |identity_passphrase| Request::Untrust {
         target,
         identity_passphrase,
@@ -4195,19 +4218,21 @@ pub async fn trust_remove(
                 crate::ident::author_id(&target)
             );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");
-            let had = !sessions.is_empty();
             let (cut, open) = cut_since(paths, sessions).await;
-            if !cut.is_empty() {
-                println!("     cut: {}", listed(&cut, ""));
-            }
+            println!("     cut: {}", listed(&cut, "none was open"));
             if !open.is_empty() {
                 println!(
                     "     still open: {} — `vox tunnel close` ends one",
                     listed(&open, "")
                 );
             }
-            if !had {
-                println!("     no live session with it was open");
+            if ours.is_empty() {
+                println!("     your sessions into its services are untouched");
+            } else {
+                println!(
+                    "     your sessions into its services are untouched: {}",
+                    listed(&ours, "")
+                );
             }
             Ok(())
         }
