@@ -79,10 +79,10 @@ as long as its command runs; files are not shown inline and are not fetched auto
 
 ## Recover from an unavailable or bad transfer
 
-- An old announcement can outlive its offer. Fetching it then fails; in this release the
-  message is a connection error such as `reading the reply: Connection reset by peer`, not a
-  plain "the offer is gone". Ask the sender whether the offer is still running, and to re-offer
-  if appropriate.
+- An old announcement can outlive its offer. Fetching it then fails with, for example,
+  `the offer of report.pdf is gone: robertGPT no longer serves it`. When the sender cannot be
+  reached at all, it says `the offer of report.pdf cannot be collected now` and why. Ask the
+  sender to re-offer if appropriate.
 - Missing trust and unavailable serving can both prevent reach. Check the named identities
   and room before deciding it is a network fault.
 - A stalled, truncated, oversized or mismatched transfer is refused. Do not use a partial

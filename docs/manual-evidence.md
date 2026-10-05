@@ -7,7 +7,7 @@ not a chapter in the public navigation manifest. Source inspection is not an exe
 
 | Label | Exact source revision | Use |
 |---|---|---|
-| v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8` | Task chapters, troubleshooting, the v0.3.0 command check |
+| v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8`; review fixes at `c142ddd3293bfd1273cfd5737a673bcceb93dfc9` (built, rechecked) | Task chapters, troubleshooting, the v0.3.0 command check |
 | Released v0.2.10 | `8d95a381f14d6bbb45f714d75f64e57d2f5dbf96` | "Coming from v0.2.10"; the profile-to-node move check |
 | `rearch/v030` | `2d8385d4f90891c96843f32d6d002bc1b69aac1e` | Superseded label: an ancestor of the v0.3.0 baseline, which ships it |
 | Manual branch base | `412303a3` plus accepted ADR-027 | Canonical prose; website resolves moving main once per build |
@@ -32,7 +32,7 @@ later parser or implementation may invalidate both an example and its troublesho
 | install: profiles move to `nodes/<name>/`; pre-v0.3.0 rooms refused | `crates/vox-core/src/node/layout.rs`; `crates/vox-tui/src/client.rs:81`; `crates/vox-core/src/node/api.rs:1196` |
 | nodes, daemon, selection order, attach/detach | `docs/adr/ADR-026-daemon-and-nodes.md` (C-3, L-2, L-3, S-2); `crates/vox-tui/src/client.rs:319`; `crates/vox-core/src/node/daemonipc.rs:324`; `crates/vox-tui/src/daemon.rs:596` |
 | first-room / rooms: create, invite, join, roster, post, read | `crates/vox-tui/src/cli.rs` (`RoomCmd`); `crates/vox-tui/src/room_cli.rs` |
-| rooms: read row format, `  \| ` continuation, hidden characters | `crates/vox-tui/src/room_cli.rs:983-1022` (`plain_row`), `:889` (`row_json`) |
+| rooms: read row format, `  \| ` continuation, hidden characters | `crates/vox-tui/src/room_cli.rs` (`plain_row`, `row_json`); `crates/vox-text/src/lib.rs` |
 | rooms: retention, admin, end, idle end, leave | `crates/vox-tui/src/cli.rs` (`Retention`, `Admin`, `End`, `--idle-end`); `docs/adr/ADR-023-room-lifecycle.md` RL-2, RL-8; `crates/vox-core/src/node/api.rs:1131`, `:1178`, `:1184` |
 | keyring: scope, rename, history, 30-minute window | `crates/vox-tui/src/cli.rs` (`TrustCmd`); `crates/vox-core/src/node/actor.rs:1967` (`KEYRING_WINDOW_SECS = 30 * 60`); `crates/vox-tui/src/ui.rs` (`trust_label`) |
 | TUI commands | `crates/vox-tui/src/state.rs:716-780` (`parse_command`), `:323` (`t`), `crates/vox-tui/src/ui.rs` (hint bar) |
@@ -69,8 +69,8 @@ are replaced by placeholders.
 | Trust scope is stated | `vox trust add FINGERPRINT --name ann` | `trusting eldco374… as "ann"` / `it may now read what you write in every room you share — now and later` / `and you read what it writes, once it trusts you too` / `and reach every service you bind to a room you are both in` |
 | Receipt both ways | A posts `hello from robertGPT`; B `room read`; B posts; A `room read` | B: `wezorchin… robertGPT hello from robertGPT`; A: `wezorchin… you hello from robertGPT` and `ea6ldny… ann hello back from ann` |
 | `--to` reports reach | `vox room post ROOM --to ann "…"` | `vox: to ann: none of its sessions has announced itself in this room; you trust it; it trusts you` |
-| Structured posts read as JSON | B `room read` after `--to` and `--re` posts | the whole envelope as text, e.g. `{"v":1,…,"type":"say",…,"body":"can you check the file?",…}` then `  (to you)` |
-| Hidden characters | post `bidi U+202E evil U+202C and zero U+200B width` | `bidi \u{202e}evil\u{202c} and zero⟨U+200B⟩width`, then a `  \| ` line for the trailing newline |
+| Structured posts read as words (rechecked at `c142ddd3`) | B `room read` after `--to`, `--re`, a file offer and a ping | `j3w3hlj6… robertGPT can you check the file?` then `  (to you)`; `yrunj6g7… you yes, it arrived`; `2ug6v2n4… robertGPT file offered: report.txt (18 bytes)`; `z6baqjlu… you ping: which agent sessions does this node hold, and can each be reached?` then `  (to robertGPT)`; `srioj3qf… robertGPT pong: 0 agent sessions on this node` |
+| Hidden characters, one escape style (rechecked at `c142ddd3`) | post `bidi U+202E evil U+202C and zero U+200B width`, a newline, `second line` | `bidi ⟨U+202E⟩evil⟨U+202C⟩ and zero⟨U+200B⟩width`, then `  \| second line` and a `  \| ` line for the trailing newline |
 | `--since` takes a full hash | `vox room read ROOM --since wezorchin` | `vox: --since takes a full 52-character entry hash, as vox room read prints it in the first column` (exit 1) |
 | Ping | `vox room ping ROOM robertGPT --wait 5` (B) | `robertGPT's node answered: it holds no agent session` |
 | Share into an existing room | `vox service add ROOM web 127.0.0.1:18080` | `vox: offering "web" at 127.0.0.1:18080 in room bmbkjywlgzar` / `it is dark until you vox trust add someone — and they join this room` |
@@ -89,9 +89,9 @@ are replaced by placeholders.
 | Leave | `vox room leave 743wt` (B) | `left room "svc" (…)` / `its other members see that you left; this node no longer holds it` |
 | Send and get | `vox room send ROOM ./report.txt` (A); `vox room get ROOM report.txt --dir ./incoming` twice; `--out` onto an existing file (B) | `offering report.txt (18 bytes) as file-4c694ad7…`, `collect it with: vox room get bmbkjywlgzar report.txt`; `./incoming/report.txt (18 bytes) verified`; `./incoming/report (1).txt (18 bytes) verified`; `./incoming/report.txt already exists; vox room get never overwrites a file …` (exit 1) |
 | Share a folder | `vox share ROOM ./shared --count 1` (A); `vox room get ROOM shared.tar --dir ./incoming` (B) | `sharing shared.tar (4096 bytes)` with a curl line through `vox up`; `./incoming/shared.tar (4096 bytes) verified`; the share then printed `no longer sharing shared.tar (fetched 1 time(s))` and exited |
-| A stopped offer | the same get again | `vox: reading the reply: Connection reset by peer (os error 54)` (exit 1) |
+| A stopped offer is said to be gone (rechecked at `c142ddd3`) | `vox share ROOM ./report.txt --count 1`, one get, then the same get again (B) | first: `./incoming/report.txt (18 bytes) verified`; again: `vox: the offer of report.txt is gone: robertGPT no longer serves it. The announcement stays in the room, but the file is served only while robertGPT shares it; ask them to share it again` (exit 1); the unreachable-sender wording `the offer of … cannot be collected now` is from source (`room_cli.rs`), not run |
 | Named shares only | `vox serve 18080` | `"18080" has no name: every shared service is named, and reached as <name>.<node>.<room>.vox` / `name it as <name>=<port>, e.g. vox serve ssh=22` (exit 1) |
-| `serve` and `connect` | `vox serve web2=18080 --name svc` (A); `vox connect 'ROOM_LINK' --passphrase-file PASS --name svc` (B) | room, address, `passphrase …-…-…` with `^ send this by a different channel than the address`, `sharing 127.0.0.1:18080 as web2.FINGERPRINT.ROOM_ID.vox`, `who can reach it: the identities you have trusted, once they join`; B: `joined. vox service list 743wt6obkyej shows what is shared here`; `curl --socks5-hostname` to `web2.robertgpt.svc.vox` returned the page |
+| `serve` and `connect` | `vox serve web2=18080 --name svc` (A); `vox connect 'ROOM_LINK' --passphrase-file PASS --name svc` (B) | room, address, `passphrase …-…-…` with `^ send this by a different channel than the address`, `sharing 127.0.0.1:18080 as web2.FINGERPRINT.ROOM_ID.vox`, `who can reach it: a member of this room you have trusted (vox trust add)`, `can reach it now: nobody yet`, `in the room and cannot (not trusted): nobody`, and after B joined `can reach it now: ann` (audience lines rechecked at `c142ddd3`); B: `joined. vox service list 743wt6obkyej shows what is shared here`; `curl --socks5-hostname` to `web2.robertgpt.svc.vox` returned the page |
 | `lan up` needs the helper | `vox lan up ROOM` | `no LAN helper is answering on /var/run/vox-lan.sock. … start it in another terminal with sudo vox lan helper` (exit 1); the helper was not run (no sudo) |
 | `tunnel close` | `vox tunnel close --id 999` | `no live tunnel matches that — vox status lists them, with their numbers` (exit 1) |
 | Agents need `--node` | `vox agent plugin claude`; `vox agent hook` | both `error: the following required arguments were not provided: --node <NODE>` (exit 2) |
@@ -112,21 +112,28 @@ ADR-017 §12 and its proof, not on this check.
 
 ## Product findings recorded during the check
 
-These are behaviors of the binary, not manual errors. The manual describes them as they are:
+The first check, at `82523ceb`, found seven product issues. All are fixed at `c142ddd3`
+(`f68741b0`, `38cc358b`, #406), rechecked there with a release build in scratch roots, and the
+manual now quotes the fixed output:
 
-- `vox room read` prints structured posts (addressed posts, replies, file offers, ping and pong)
-  as the raw JSON envelope; agents' hooks show only the body.
-- Hidden characters are escaped in two styles: `⟨U+XXXX⟩`, or `\u{…}` for line and direction
-  controls.
-- Fetching from a stopped offer reports a connection reset, not that the offer is gone
-  (ADR-020 11.8).
-- Help and messages still say "profile" in places: `vox id`, `vox node`, `vox service list` and
-  `vox up` help, the doctor's `start this profile's node: vox daemon (or vox tui)` fix, and
-  `this profile has no identity yet`. `vox up` help still shows the withdrawn two-part
-  `ssh nas.family.vox`.
-- The TUI join prompt labels its first field `invite link (vox://…)`; `vox status` prints
-  `always-on member: unknown: not recorded until ADR-023`.
-- `vox serve` states who can reach a service as a rule, not as a list of members (ADR-017 4.2).
+- `vox room read` printed structured posts as the raw JSON envelope; it now prints their words
+  (`file offered: …`, `ping: …`, `pong: …`), with `(to …)` lines as before.
+- Hidden characters were escaped in two styles; now every one is `⟨U+XXXX⟩`.
+- A fetch from a stopped offer reported a connection reset; it now says
+  `the offer of FILE is gone: NAME no longer serves it` (ADR-020 11.8).
+- Help and messages said "profile"; at `c142ddd3` no `--help` page of the 64 contains "profile",
+  `vox up` help no longer shows the two-part `ssh nas.family.vox`, and `vox id` with no node says
+  `this node has no identity yet, and there is no terminal to ask at.`
+- The TUI join prompt's first field is now `room link (vox://…)` (`state.rs`).
+- `vox status` now says `always-on member: not recorded: Vox does not track which member stays
+  online; each member's last_seen says when it was last heard from`.
+- `vox serve` now names who can reach the service and who in the room cannot (ADR-017 4.2).
+
+Still as quoted, and outside those seven: `vox room invite` and `vox serve` tell the sharer to
+send the passphrase `by a different channel than this address`; the top-level `vox --help` line
+still mentions `consent`. During the `c142ddd3` recheck, `vox serve`'s output also printed once,
+after B joined, `sync of room … did not complete — sync failed: the peer refused: epoch mismatch`;
+B's join and the audience line both succeeded, and it was not investigated further.
 
 ## Retired heading fragments
 
