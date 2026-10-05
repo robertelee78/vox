@@ -591,7 +591,7 @@ pub enum IpcHandshake {
     /// uid 0, its own user's or any other's (ADR-026 C-1): said before connecting, at once, rather
     /// than as a daemon that never answered.
     #[error(
-        "vox is running as root (uid 0), and the vox daemon refuses every control connection \
+        "this is running as root (uid 0), and the vox daemon refuses every control connection \
          from root, so nothing run as root can use it. Run vox as an ordinary user: in a \
          container, set a non-root USER (for example `podman run --user 1000 …`)"
     )]
