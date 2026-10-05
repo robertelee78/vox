@@ -16,6 +16,15 @@
 # Needs those Rust targets (`rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 # aarch64-apple-darwin`, or only the last for the macOS slice) and Xcode's command-line
 # tools.
+#
+# Local macOS hosts with Xcode 27 / sccache: set
+#   CARGO_PROFILE_RELEASE_STRIP=none   Xcode 27's strip corrupts release proc-macro dylibs
+#                                      ("mis-aligned LINKEDIT string pool"; rustc then says
+#                                      "can't find crate for `time_macros`" or similar)
+#   RUSTC_WRAPPER=                     sccache mixed in rlibs from rustup's default toolchain
+#                                      during the bindings step (E0514, "compiled by an
+#                                      incompatible version of rustc")
+# Neither is needed where neither tool is (CI).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
