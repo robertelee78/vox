@@ -443,6 +443,20 @@ fn dialable(listening: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// The addresses of `listening` another machine can dial: none on loopback (`127.0.0.0/8`, `::1`).
+fn off_machine(listening: &[String]) -> Vec<String> {
+    listening
+        .iter()
+        .filter(|text| {
+            vox_core::nat::multiaddr::Multiaddr::parse(text)
+                .ok()
+                .and_then(|m| m.socket_addr())
+                .is_none_or(|sa| !sa.ip().to_canonical().is_loopback())
+        })
+        .cloned()
+        .collect()
+}
+
 /// A signal that asks this process to stop, as `stop_requested` resolves to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopSignal {
@@ -630,9 +644,20 @@ pub fn run_node(
                             // paste the specs below.
                             Err(e) => eprintln!("vox node: could not write the anchors file ({e})"),
                         }
-                        println!("vox node: clients on this machine need no --anchor. Elsewhere:");
-                        for addr in &listening {
-                            println!("  {fp}@{addr}");
+                        // **Elsewhere is another machine** (V210-170, #395): the anchors file above
+                        // keeps loopback for clients on this one, but a loopback spec printed for
+                        // copying to another machine is one that cannot reach this anchor.
+                        let elsewhere = off_machine(&listening);
+                        if elsewhere.is_empty() {
+                            println!(
+                                "vox node: clients on this machine need no --anchor. It listens on \
+                                 no address another machine can dial"
+                            );
+                        } else {
+                            println!("vox node: clients on this machine need no --anchor. Elsewhere:");
+                            for addr in &elsewhere {
+                                println!("  {fp}@{addr}");
+                            }
                         }
                         printed = listening;
                     }
