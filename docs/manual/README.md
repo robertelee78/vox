@@ -8,10 +8,10 @@ changed, and recover when it does not.
 
 ## Start with your version
 
-Run `vox --version`. The released instructions here describe **v0.2.10**. The installer can
-deliver a newer release later: check its version before applying these instructions unchanged.
-The [development guide](development.md) describes the separate `rearch/v030` command surface;
-it is not an instruction to upgrade or use unreleased software.
+Run `vox --version`. The task chapters here describe **v0.3.0**, in which one daemon hosts
+your nodes and every command names the node it acts as. If you are coming from v0.2.10, which
+selected identities with `--profile`, read [Coming from v0.2.10](development.md) first: its
+commands no longer work.
 
 The manual follows the source repository. A newer manual revision is not evidence that a new
 binary has been released. The website skins these same files; there is no separately edited
@@ -26,38 +26,39 @@ website edition.
 The first-room walkthrough is finished only when each person can read the other's message.
 A successful local post or join is not enough.
 
-The [recorded reader check](https://github.com/robertelee78/vox/blob/ec70bb177cdfab0362f9569ecf49b695bda75f77/docs/research/manual-reader-proof-2026-10-04.md)
-shows that walkthrough and representative recovery steps with the released macOS binary in
-isolated, same-host profiles. It does not claim that every task, network or agent integration
-has been exercised.
+The [v0.3.0 command check](https://github.com/robertelee78/vox/blob/main/docs/manual-evidence.md#v030-command-check)
+records the commands in these chapters run against the v0.3.0 binary in isolated, same-host
+data roots. It does not claim that every task, network or agent integration has been exercised.
 
 ## Find a task
 
-- [Identity and keyring](keyring.md): compare fingerprints, trust someone, remove trust.
-- [Rooms and messages](rooms.md): create, invite, join, read, reply, leave.
-- [Reach a shared service](services.md): SSH or another TCP service, with no public sharing link.
-- [Send and receive files](files.md): live availability, verified bytes, safe destinations.
-- [Agent communications](agents.md): hooks, delivery timing, claims and handoffs.
-- [Commands and local state](reference.md): help, profiles, paths and automation.
+- [Identity and keyring](keyring.md): your nodes, comparing fingerprints, trusting, renaming, removing trust.
+- [Rooms and messages](rooms.md): create, share the room link, join, read, reply, retention, leave, end.
+- [Reach a shared service](services.md): SSH or another TCP or UDP service, by its `.vox` address.
+- [Send and receive files](files.md): live availability, verified bytes, folders, safe destinations.
+- [Agent communications](agents.md): an agent's own node, hooks, delivery timing, claims and handoffs.
+- [Commands and local state](reference.md): help, node selection, paths and automation.
 
 ## Find a symptom
 
-Go straight to [Troubleshooting by symptom](troubleshooting.md) for a refused join, an
-unreachable node or file, an unreadable message, or an agent that has not responded. Start
-there before changing trust, restarting processes or recreating anything.
+Go straight to [Troubleshooting by symptom](troubleshooting.md) for a node that is not
+attached, a refused join, an unreachable node or file, an unreadable message, or an agent that
+has not responded. Start there before changing trust, restarting processes or recreating
+anything.
 
 If the checks do not settle it, [Get help safely](getting-help.md) describes what to collect
 and what must stay private.
 
 ## Reading the examples
 
-`ROOM_ID`, `FULL_FINGERPRINT` and `INVITE` are placeholders. Replace them with your own output;
-do not type the words literally. A command block has no shell prompt prefix, so only the
-command is copied. Explanations say which person or terminal runs it.
+`ROOM_ID`, `FULL_FINGERPRINT` and `ROOM_LINK` are placeholders. Replace them with your own
+output; do not type the words literally. A command block has no shell prompt prefix, so only
+the command is copied. Explanations say which person or terminal runs it.
 
-The example profile is `family`. A **profile** is the released CLI's local selection of an
-identity and its state, not a room. The alias `robertGPT` is one person's local name for
-another node; it is not a registered username.
+The example node is `robertgpt`. A **node** is one identity with its own keys, rooms, keyring
+and services; one machine can have several, for example yours and one for each agent. Node
+names are lower case. The alias `robertGPT` is one person's local name for another node; it
+is not a registered username.
 
 Public fingerprints are not passwords, but sharing them publicly can link your activities.
 Passphrases are secrets. Keep them out of commands, screenshots and issue reports.

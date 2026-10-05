@@ -7,8 +7,8 @@ It does not need your private conversation or a copy of your identity.
 
 ## Before opening a report
 
-Find the matching entry in [Troubleshooting by symptom](troubleshooting.md), or the
-[development guide](development.md) for a node-based build. Keep the original failure text
+Find the matching entry in [Troubleshooting by symptom](troubleshooting.md), or
+[Coming from v0.2.10](development.md) if you upgraded. Keep the original failure text
 and the result of each check. Do not make several trust, network and identity changes at
 once: that removes the evidence that distinguishes causes.
 
@@ -46,7 +46,7 @@ Do not infer a remote version from a website example or local Cargo manifest.
 Never post:
 
 - Identity or room passphrases, tokens, private keys, vaults, stores or entire state directories.
-- An invitation together with the room's passphrase.
+- A room link together with the room's passphrase.
 - Unreviewed `env` output, full configuration files, full agent transcripts or full logs.
 - Private message bodies, attachments or another participant's details without permission.
 
@@ -73,7 +73,7 @@ never reached its precondition is not evidence of a product failure.
 
 Do not publish secrets or a working attack transcript to demonstrate severity. Describe the
 affected version, component and impact without sensitive details, and arrange an appropriate
-private reporting channel with the maintainer before supplying more. This manual does not
+private way of reporting with the maintainer before supplying more. This manual does not
 promise a monitored private address or response deadline that the project has not published.
 
 If the problem is only documentation, identify the chapter and sentence, your installed
