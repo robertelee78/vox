@@ -89,8 +89,7 @@ too if you mean it — nobody can recover a room for you.
 
 The [user manual](docs/manual/README.md) has a complete first-room walkthrough, task guides,
 and troubleshooting organised by symptom. Read the same canonical manual at
-[voxlux.us](https://voxlux.us/docs/manual/). It describes v0.3.0, with a page for readers coming
-from v0.2.10.
+[voxlux.us](https://voxlux.us/docs/manual/).
 
 ### The daemon and your nodes
 
@@ -106,8 +105,8 @@ vox node detach alice       # its connections close and its keys leave memory
 ```
 
 Every verb acts as one node: `--node <name>` after the verb, or `VOX_NODE`; with only one node
-attached, that one. `--profile` is gone. Verbs that hold a session (`serve`, `connect`, `up`,
-`forward`, `lan up`) start the daemon and attach their node themselves. The one-shot verbs (`room`,
+attached, that one. Verbs that hold a session (`serve`, `connect`, `up`, `forward`, `lan up`)
+start the daemon and attach their node themselves. The one-shot verbs (`room`,
 `status`, `trust`, `share`, `service`, `app`) only ask an attached node, and say so if it is not:
 `vox node attach <name>` first.
 
@@ -352,10 +351,6 @@ ladder; trust-gated reading; replication and sync; room-bound TCP and UDP servic
 `<service>.<node>.<room>.vox`, and `ssh` over Vox; `vox share`; the family LAN (macOS); leaving and
 ending rooms, admins and retention; key rotation and per-member revocation; agent comms for Claude
 Code, Codex and OpenCode, each agent its own node.
-
-**Upgrading from v0.2.x:** on first run, each old profile directory is moved to `nodes/<name>/`
-with its identity and trust. Rooms made by an earlier vox are refused by v0.3.0: make them
-again, and send their members the new room link and passphrase.
 
 Next: the native macOS client ([ADR-014](docs/adr/ADR-014-macos-client.md)). iOS is a separate,
 later capability.

@@ -74,10 +74,9 @@ the middle of a claim.
 vox update --rollback
 ```
 
-This restores the binary retained by the updater. It is **not a state-directory rollback**,
-and does not guarantee that an older binary understands data migrated by a newer one. Read
-the target release's compatibility notes before crossing a format or major command-surface
-change. Do not open valuable state with a guessed older executable.
+This restores the binary retained by the updater. It is **not a state-directory rollback**:
+your nodes and rooms stay as the replaced binary left them, and the restored binary is not
+guaranteed to read them. Do not open valuable state with a guessed executable.
 
 ## Remove shell integration or the executable
 
