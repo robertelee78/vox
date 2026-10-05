@@ -16,14 +16,15 @@ enum Theme {
     static var mono: Font { font(VoxTokens.Fonts.appMono) }
     /// Uppercase eyebrow labels: SF Mono, tracked (L-7).
     static var eyebrow: Font { font(VoxTokens.Fonts.appEyebrow) }
-    /// Large headings: Inter Display, heavy (L-7), when the app carries it; else the system face
-    /// at the same weight.
+    /// Large headings: Inter Display ExtraBold, which the app carries (L-7).
     static var heading: Font { font(VoxTokens.Fonts.appHeading, defaultSize: 28) }
 
     static func font(_ face: VoxTokens.Face, defaultSize: Double? = nil) -> Font {
         let weight = Font.Weight(face.weight)
         if let bundled = face.bundled, registered(bundled) {
-            return .custom(face.family, size: face.size ?? defaultSize ?? 13).weight(weight)
+            // A bundled file is one face: it is named by its PostScript name, the file's name.
+            let postScript = (bundled as NSString).deletingPathExtension
+            return .custom(postScript, size: face.size ?? defaultSize ?? 13)
         }
         switch face.system {
         case "monospaced":
@@ -37,17 +38,21 @@ enum Theme {
         }
     }
 
-    /// Whether the font file `name` ships in the bundle and is registered for this process.
+    /// Whether the font file `name` ships in the bundle; registered for this process the first
+    /// time it is asked for.
     private static func registered(_ name: String) -> Bool {
+        if let known = fonts[name] { return known }
         let file = name as NSString
-        guard let url = Bundle.main.url(forResource: file.deletingPathExtension,
-                                        withExtension: file.pathExtension) else {
-            return false
+        var found = false
+        if let url = Bundle.main.url(forResource: file.deletingPathExtension,
+                                     withExtension: file.pathExtension) {
+            found = CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
         }
-        var error: Unmanaged<CFError>?
-        _ = CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error)
-        return true
+        fonts[name] = found
+        return found
     }
+
+    private static var fonts: [String: Bool] = [:]
 
     /// The app's one animation, or none under Reduce Motion (L-5).
     static func motion(reduced: Bool) -> Animation? {
