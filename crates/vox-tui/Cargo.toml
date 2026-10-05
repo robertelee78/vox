@@ -40,6 +40,10 @@ live-model-sandbox = ["optional-proofs"]
 # MEASURE, a `vox` without it. No shipped build enables it.
 test-knobs = ["vox-core/test-knobs"]
 
+# The look's one token file (ADR-028 L-1), read at build time into `src/theme.rs`'s constants.
+[build-dependencies]
+vox-theme = { path = "../vox-theme" }
+
 [dependencies]
 vox-core = { path = "../vox-core" }
 # The app tier (ADR-020 §1). `vox room claim|release|handoff|board` are this crate's

@@ -3163,6 +3163,13 @@ name = "vox-text"
 version = "0.3.1"
 
 [[package]]
+name = "vox-theme"
+version = "0.3.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "vox-tui"
 version = "0.3.1"
 dependencies = [
@@ -3196,6 +3203,7 @@ dependencies = [
  "tokio-util",
  "vox-agentcomms",
  "vox-core",
+ "vox-theme",
  "vt100",
  "zeroize",
 ]

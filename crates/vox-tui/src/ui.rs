@@ -18,6 +18,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
+use crate::theme;
 use crate::viewmodel::{MemberView, MessageView, Reachability, SyncStatus, Trust, ViewModel};
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
@@ -62,6 +63,9 @@ fn sync_label(s: SyncStatus) -> String {
 /// so scrolling up past the oldest line leaves nothing to scroll back through.
 pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
     let area = frame.area();
+    // The whole screen is drawn on the theme's base, not the terminal's own background (ADR-028
+    // L-2); with no colour (NO_COLOR, a dumb terminal) this draws nothing.
+    frame.render_widget(Block::default().style(theme::base()), area);
     let hint = hint_text(ui, vm);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -127,10 +131,11 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
             ))
         })
         .collect();
-    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(format!(
-        "node {} · Rooms (Enter: open · : command)",
-        vm.node
-    )));
+    let title = format!("node {} · Rooms (Enter: open · : command)", vm.node);
+    // The room list is the screen's one pane, so it holds the focus (ADR-028 L-3).
+    let list = List::new(items).block(focus_block(
+        Block::default().borders(Borders::ALL).title(title),
+    ));
     frame.render_widget(list, area);
 }
 
@@ -401,12 +406,18 @@ fn render_members(
 }
 
 fn pane_block(title: &str, focus: bool) -> Block<'_> {
-    let mut b = Block::default().borders(Borders::ALL).title(title);
+    let b = Block::default().borders(Borders::ALL).title(title);
     if focus {
-        b = b.border_style(Style::default().add_modifier(Modifier::BOLD));
-        b = b.title(format!("{title} [focus]"));
+        focus_block(b.title(format!("{title} [focus]")))
+    } else {
+        b.border_style(theme::fg(theme::LINE_HAIR))
     }
-    b
+}
+
+/// A focused pane's border: the accent, bold, so focus reads by weight where there is no colour
+/// (ADR-028 L-3, E-6).
+fn focus_block(b: Block<'_>) -> Block<'_> {
+    b.border_style(theme::fg(theme::ACCENT).add_modifier(Modifier::BOLD))
 }
 
 fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {

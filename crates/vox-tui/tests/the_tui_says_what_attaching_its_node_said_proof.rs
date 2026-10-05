@@ -17,8 +17,15 @@
 //! side: what the TUI drew is PRODUCT; a TUI that never asked to attach, or never attached, is
 //! PRODUCT (staging); the driver's own machinery (pyte missing) is APPARATUS.
 //!
-//! **The mutation that must turn it red:** `DaemonCore::attach` not putting the attach's notes in
-//! the notice line — red as PRODUCT, the screen saying nothing of the file.
+//! **The look comes from the token file (ADR-028 L-1, L-2; #508).** On the same screen, in a
+//! terminal that declares truecolour, the top-left cell's background is the token file's `bg.base`
+//! and the focused room list's border is drawn in its `accent`, both read from
+//! `assets/theme/vox-tokens.json` by this proof, so a change to a token is what the TUI draws.
+//!
+//! **The mutations that must turn it red:** `DaemonCore::attach` not putting the attach's notes in
+//! the notice line — red as PRODUCT, the screen saying nothing of the file; a colour hard-coded in
+//! `ui.rs` in place of a token (the base fill or the focus border) — red as PRODUCT, naming the
+//! colour drawn.
 
 #![cfg(unix)]
 
@@ -52,6 +59,24 @@ fn the_tui_says_what_attaching_its_node_said() {
     .expect("APPARATUS: cannot write the anchors file");
     let file = file.display().to_string();
 
+    // The two tokens this screen must show, from the one token file (ADR-028 L-1).
+    let tokens_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/theme/vox-tokens.json"
+    );
+    let tokens: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tokens_path).expect("APPARATUS: cannot read the token file"),
+    )
+    .expect("APPARATUS: the token file is not JSON");
+    let token = |name: &str| {
+        tokens["color"][name]["hex"]
+            .as_str()
+            .expect("APPARATUS: the token file has no such colour")
+            .trim_start_matches('#')
+            .to_lowercase()
+    };
+    let (base_hex, accent_hex) = (token("bg.base"), token("accent"));
+
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_attach_notes.py");
     let out = pty_driver::run(
         script,
@@ -61,6 +86,7 @@ fn the_tui_says_what_attaching_its_node_said() {
             &bob.join("cfg").to_string_lossy(),
             IDENTITY,
             "bob",
+            &accent_hex,
         ],
     );
     let said = out
@@ -95,6 +121,33 @@ fn the_tui_says_what_attaching_its_node_said() {
         names_file && no_usable && carries_on,
         "PRODUCT: the TUI attached its node, whose anchors file ({file}) names no usable anchor, \
          and its screen does not say so: it said {said:?}\n[the screen]\n{}",
+        out.stdout
+    );
+
+    let colours = out
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("bob COLOURS: "))
+        .unwrap_or("")
+        .to_owned();
+    let base = colours
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("base="))
+        .unwrap_or("");
+    let accent_cells: usize = colours
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("accent_cells="))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    println!(
+        "[proof] the screen's base is {base:?} (bg.base {base_hex:?}); cells in the accent \
+         {accent_hex:?}: {accent_cells}"
+    );
+    assert!(
+        base == base_hex && accent_cells > 0,
+        "PRODUCT: the TUI did not draw the token file's colours in a truecolour terminal: the \
+         screen's base is {base:?}, not bg.base {base_hex:?}, or no cell is in the accent \
+         {accent_hex:?} ({accent_cells} cells)\n[the screen]\n{}",
         out.stdout
     );
 }

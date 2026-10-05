@@ -1,0 +1,26 @@
+# Vox Lux — the look's one token file, read for every client (ADR-028 L-1).
+#
+# `assets/theme/vox-tokens.json` defines every colour, type and motion value. This crate reads and
+# checks it, and writes it out in the form each client builds from: Rust constants for the TUI
+# (`vox-tui`'s build script) and an asset catalogue plus a Swift file for the macOS app
+# (`vox-theme swift`). Nothing else may define a colour.
+[package]
+name = "vox-theme"
+description = "Vox Lux: the one token file for colour, type and motion, generated for the TUI and the macOS app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "vox_theme"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vox-theme"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
