@@ -109,6 +109,10 @@ type SharedChannel = Arc<tokio::sync::Mutex<ChannelState>>;
 /// connection died and raises the periodic request (D7).
 const TICK: Duration = Duration::from_secs(1);
 
+/// At most one read record per room in this many milliseconds (ADR-028 RR-2): what is read in
+/// between waits, and the next record names all of it.
+const READ_RECORD_EVERY_MS: u64 = 5_000;
+
 /// How long a room this node holds ended keeps syncing to pass the end on, when some member
 /// cannot be reached (V030-08), before this node deletes it (the decider, 2026-10-03). Each member
 /// synced with after the end counts as passed on at once; a member still unreachable past this
@@ -4024,6 +4028,10 @@ pub struct Node {
     /// entry is removed once a view reads the room under its lock, since that read includes the
     /// write: an entry here is therefore always newer than the published one.
     fresh_details: BTreeMap<Digest32, (ChannelSummary, ChannelDetail)>,
+    /// Per room, the entries shown to this node's person or drained into its agent's turn and not
+    /// yet named by a read record of its own, and when it last posted one (ms): ADR-028 RR-2's
+    /// "at most one per room per 5 seconds" ([`READ_RECORD_EVERY_MS`]).
+    reads_pending: BTreeMap<Digest32, (BTreeSet<Digest32>, u64)>,
     /// Rooms this node holds ended, passing the end on before it deletes them (V030-08).
     winding: BTreeMap<Digest32, Winding>,
     /// Rooms this node took off boards (V030-14) — left, or ended — with the signed withdraw, put
@@ -4471,6 +4479,7 @@ impl Node {
             nearby_rooms: 0,
             nearby_dialed: BTreeMap::new(),
             fresh_details: BTreeMap::new(),
+            reads_pending: BTreeMap::new(),
             winding: BTreeMap::new(),
             departed_seen: BTreeMap::new(),
             withdrawn: BTreeMap::new(),
@@ -4810,6 +4819,8 @@ impl Node {
                     if self.sweep_retention().await {
                         self.publish().await;
                     }
+                    // A read record held back by the 5-second batch goes out when it is due.
+                    self.flush_reads().await;
                 }
             }
         }
@@ -4912,6 +4923,10 @@ impl Node {
                 test_panic_on_text(&text);
                 self.send_text(&channel_id, &text).await
             }
+            NodeCommand::MarkRead {
+                channel_id,
+                entries,
+            } => self.mark_read(&channel_id, entries).await,
             NodeCommand::Invite { channel_id } => self.invite(&channel_id).await,
             // Answered through `begin_join_channel`, which the run loop calls instead of this; a
             // join reaching here would have to be answered inline, which is the stall that
@@ -14301,6 +14316,79 @@ impl Node {
             self.note_local_append(cid);
         }
         pruned > 0 || !checkpointed.is_empty() || applied
+    }
+
+    /// Note that `entries` of a room were shown to this node's person or drained into its agent's
+    /// turn (ADR-028 RR-1), and post a read record for them if one is due (RR-2).
+    async fn mark_read(&mut self, channel_id: &Digest32, entries: Vec<Digest32>) -> Outcome {
+        if !self.channels.contains_key(channel_id) {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        }
+        if !entries.is_empty() {
+            self.reads_pending
+                .entry(*channel_id)
+                .or_insert_with(|| (BTreeSet::new(), 0))
+                .0
+                .extend(entries);
+            self.flush_reads().await;
+        }
+        Outcome::Done
+    }
+
+    /// Post a read record in each room whose pending reads are due: the last record is
+    /// [`READ_RECORD_EVERY_MS`] old. A room not synced yet keeps its reads for a later tick; one
+    /// that refuses the record (ended, left) drops them.
+    async fn flush_reads(&mut self) {
+        let now_millis = (self.millis_clock)();
+        let due: Vec<Digest32> = self
+            .reads_pending
+            .iter()
+            .filter(|(_, (pending, last))| {
+                !pending.is_empty() && now_millis >= last.saturating_add(READ_RECORD_EVERY_MS)
+            })
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in due {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let Some(shared) = self.channels.get(&cid).map(Arc::clone) else {
+                self.reads_pending.remove(&cid);
+                continue;
+            };
+            // A room mid-session is left for the next tick, as the sweep does.
+            let Ok(mut ch) = shared.try_lock() else {
+                continue;
+            };
+            let me = profile.fingerprint();
+            let Some((pending, last)) = self.reads_pending.get_mut(&cid) else {
+                continue;
+            };
+            let shown: Vec<Digest32> = pending.iter().copied().collect();
+            let mut read = ch.unrecorded_reads(&me, &shown);
+            read.truncate(crate::node::content::MAX_READ_HASHES);
+            if read.is_empty() {
+                pending.clear();
+                continue;
+            }
+            match ch.append_read(profile, read.clone(), now_millis) {
+                Ok(_) => {
+                    for h in &read {
+                        pending.remove(h);
+                    }
+                    *last = now_millis;
+                }
+                Err(crate::error::Error::RoomNotSynced) => continue,
+                Err(_) => {
+                    pending.clear();
+                    continue;
+                }
+            }
+            drop(ch);
+            // Pushed like a post, so the members it trusts learn of it promptly; no event, since
+            // a read record wakes nobody and is no row (RR-4).
+            self.note_local_append(&cid);
+        }
     }
 
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {

@@ -69,7 +69,7 @@ use crate::log::sync::{frontier_session_peer, AuthorResolver, Transport};
 use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
 use crate::node::consent_order::Stamp;
-use crate::node::content::Content;
+use crate::node::content::{Content, Decoded};
 use crate::node::profile::Profile;
 use crate::node::retention::{RetentionIndex, Tracked};
 use crate::node::store::Store;
@@ -629,6 +629,15 @@ pub struct ChannelState {
     /// uses its message key up even when what it opened does not render, so a pass that rendered
     /// nothing must write the chains too, or a restart could derive that key again.
     chains_advanced: bool,
+    /// The read records this node holds and can open (ADR-028 §6), by the record's entry hash:
+    /// `(reader, entries read)`. Never rows of the timeline (RR-4).
+    read_records: BTreeMap<Digest32, (Digest32, Vec<Digest32>)>,
+    /// [`Self::read_records`] turned round: for each entry read, each reader and how many of its
+    /// records name it. A count, so a record pruned by retention takes away only its own share.
+    reads: BTreeMap<Digest32, BTreeMap<Digest32, u32>>,
+    /// Read records decrypted into a batch not yet committed: applied by
+    /// [`Self::place_committed`] once it has, as rendered rows are.
+    pending_reads: Vec<(ReadRow, u64)>,
     /// **Bodies owed** (V030-10): `(author, seq)` of each entry held without its body that has not
     /// expired by this node's own reckoning ([`ChannelState::body_expired`]). Asked of every peer
     /// whose feed reaches it, on every sync, until one supplies it or it expires here. May hold
@@ -1154,9 +1163,47 @@ fn cache_bytes(r: &Rendered) -> Vec<u8> {
     e.finish()
 }
 
-fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
+/// A read record this node opened (ADR-028 §6): what its cache row holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadRow {
+    /// The record's own ADR-008 entry hash.
+    pub entry_hash: Digest32,
+    /// Who read: the record's author.
+    pub reader: Digest32,
+    /// The author's recorded send time, milliseconds since the Unix epoch.
+    pub created_millis: u64,
+    /// The entries it names as read.
+    pub read: Vec<Digest32>,
+}
+
+/// A read record's cache row: a message's fields with the record's kind and its entries in place
+/// of the text, `[CACHE_VERSION, entry hash, reader, created_millis, KIND_READ, [hash, …]]`. Six
+/// fields where a message's row has five, so a row says which it is.
+fn read_cache_bytes(r: &ReadRow) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(6)
+        .uint(CACHE_VERSION)
+        .bytes(&r.entry_hash)
+        .bytes(&r.reader)
+        .uint(r.created_millis)
+        .uint(crate::node::content::KIND_READ)
+        .array(r.read.len());
+    for h in &r.read {
+        e.bytes(h);
+    }
+    e.finish()
+}
+
+/// One plaintext-cache row: a message or a read record.
+enum CacheRow {
+    Text(Rendered),
+    Read(ReadRow),
+}
+
+fn parse_cache(bytes: &[u8]) -> Result<CacheRow> {
     let mut d = Decoder::new(bytes);
-    if d.array()? != 5 {
+    let arity = d.array()?;
+    if arity != 5 && arity != 6 {
         return Err(Error::MalformedAtRest("plaintext cache arity"));
     }
     if d.uint()? != CACHE_VERSION {
@@ -1171,9 +1218,33 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
         .try_into()
         .map_err(|_| Error::MalformedAtRest("plaintext cache author"))?;
     let created_millis = d.uint()?;
+    if arity == 6 {
+        if d.uint()? != crate::node::content::KIND_READ {
+            return Err(Error::MalformedAtRest("plaintext cache kind"));
+        }
+        let n = d.array()?;
+        if n > crate::node::content::MAX_READ_HASHES {
+            return Err(Error::MalformedAtRest("plaintext cache read record"));
+        }
+        let mut read = Vec::with_capacity(n);
+        for _ in 0..n {
+            read.push(
+                d.bytes()?
+                    .try_into()
+                    .map_err(|_| Error::MalformedAtRest("plaintext cache read entry"))?,
+            );
+        }
+        d.finish()?;
+        return Ok(CacheRow::Read(ReadRow {
+            entry_hash,
+            reader: author,
+            created_millis,
+            read,
+        }));
+    }
     let text = d.text()?.to_owned();
     d.finish()?;
-    Ok(Rendered {
+    Ok(CacheRow::Text(Rendered {
         entry_hash,
         author,
         created_millis,
@@ -1182,7 +1253,22 @@ fn parse_cache(bytes: &[u8]) -> Result<Rendered> {
         shown_at_ms: 0,
         late: false,
         owed: false,
-    })
+    }))
+}
+
+/// Add `row` to a room's read records and the index turned round from them.
+fn index_read(
+    records: &mut BTreeMap<Digest32, (Digest32, Vec<Digest32>)>,
+    reads: &mut BTreeMap<Digest32, BTreeMap<Digest32, u32>>,
+    row: ReadRow,
+) {
+    if records.contains_key(&row.entry_hash) {
+        return;
+    }
+    for h in &row.read {
+        *reads.entry(*h).or_default().entry(row.reader).or_default() += 1;
+    }
+    records.insert(row.entry_hash, (row.reader, row.read));
 }
 
 /// Sort rendered rows into the room's one order ([`Dag::order_key`]) and mark the late
@@ -1386,6 +1472,9 @@ impl ChannelState {
             next_log_id: 1,
             set_aside: Vec::new(),
             chains_advanced: false,
+            read_records: BTreeMap::new(),
+            reads: BTreeMap::new(),
+            pending_reads: Vec::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
             now_hint: now_secs,
@@ -1662,14 +1751,29 @@ impl ChannelState {
         // received message's cache row, and its own cache row overwrote that one: the message
         // was gone from the room at the next restart.
         let mut timeline = Vec::new();
+        let (mut read_records, mut reads) = (BTreeMap::new(), BTreeMap::new());
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
             next_log_id = next_log_id.max(id.saturating_add(1));
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
-            let mut rendered = parse_cache(&row)?;
-            rendered.arrival = id;
-            if retention.get(&rendered.entry_hash).is_some() {
-                retention.rendered(&rendered.entry_hash, rendered.created_millis / 1_000, id);
-                timeline.push(rendered);
+            match parse_cache(&row)? {
+                CacheRow::Text(mut rendered) => {
+                    rendered.arrival = id;
+                    if retention.get(&rendered.entry_hash).is_some() {
+                        retention.rendered(
+                            &rendered.entry_hash,
+                            rendered.created_millis / 1_000,
+                            id,
+                        );
+                        timeline.push(rendered);
+                    }
+                }
+                // A read record ages like a message (RR-2) and is never a row of the timeline.
+                CacheRow::Read(r) => {
+                    if retention.get(&r.entry_hash).is_some() {
+                        retention.rendered(&r.entry_hash, r.created_millis / 1_000, id);
+                        index_read(&mut read_records, &mut reads, r);
+                    }
+                }
             }
         }
         // The cache is in the order rows were rendered; the timeline is in the room's.
@@ -1801,6 +1905,9 @@ impl ChannelState {
             next_log_id,
             set_aside,
             chains_advanced: false,
+            read_records,
+            reads,
+            pending_reads: Vec::new(),
             owed,
             owed_asked_to: None,
             now_hint: now_secs,
@@ -2041,6 +2148,9 @@ impl ChannelState {
             next_log_id: 1,
             set_aside: Vec::new(),
             chains_advanced: false,
+            read_records: BTreeMap::new(),
+            reads: BTreeMap::new(),
+            pending_reads: Vec::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
             now_hint: now_secs,
@@ -4102,6 +4212,9 @@ impl ChannelState {
         }
         let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
         self.timeline.retain(|r| !gone.contains(&r.entry_hash));
+        for h in &gone {
+            self.forget_read_record(h);
+        }
         mark_late(&mut self.timeline);
         Ok(due.len())
     }
@@ -5045,7 +5158,12 @@ impl ChannelState {
         now_secs: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Vec<Rendered>> {
-        let already: BTreeSet<Digest32> = self.timeline.iter().map(|r| r.entry_hash).collect();
+        let already: BTreeSet<Digest32> = self
+            .timeline
+            .iter()
+            .map(|r| r.entry_hash)
+            .chain(self.read_records.keys().copied())
+            .collect();
         let pending: Vec<(Digest32, Vec<u8>)> = match self.dag.feed(author) {
             None => Vec::new(),
             Some(feed) => (1..=feed.max_seq())
@@ -5094,7 +5212,7 @@ impl ChannelState {
                 now_secs,
                 &mut expired,
             )?;
-            if row.is_none() && expired.is_empty() {
+            if row.is_none() && expired.is_empty() && self.pending_reads.is_empty() {
                 return Ok(None);
             }
             self.queue_receivers(&mut batch)?;
@@ -5166,8 +5284,40 @@ impl ChannelState {
         // three callers invoke it with `?` **inside a loop over pending entries** — so one
         // undecodable envelope did not hide one message, it aborted the render pass and took every
         // later entry in it along.
-        let Ok(content) = Content::from_canonical_slice(&plaintext) else {
-            return Ok(None);
+        let content = match crate::node::content::decode(&plaintext) {
+            Ok(Decoded::Text(content)) => content,
+            // **A read record is never a row** (ADR-028 RR-4): it is cached like a message, so it
+            // survives a restart (its key is used up), and ages like one (RR-2), and is indexed
+            // for `read by` once the batch has committed.
+            Ok(Decoded::Read(record)) => {
+                if self.already_expired(&entry_hash, record.created_millis / 1_000, now_secs) {
+                    expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
+                    return Ok(None);
+                }
+                let id = self.next_log_id;
+                let row = ReadRow {
+                    entry_hash,
+                    reader: author,
+                    created_millis: record.created_millis,
+                    read: record.read,
+                };
+                let cache_seg = seal_segment(
+                    &self.sek,
+                    SegmentKind::PlaintextCache,
+                    id,
+                    &read_cache_bytes(&row),
+                )?;
+                batch.put_segment(
+                    &self.channel_id,
+                    SegmentKind::PlaintextCache,
+                    id,
+                    &cache_seg,
+                )?;
+                self.next_log_id = id.saturating_add(1);
+                self.pending_reads.push((row, id));
+                return Ok(None);
+            }
+            Err(_) => return Ok(None),
         };
         if self.already_expired(&entry_hash, content.created_millis / 1_000, now_secs) {
             expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
@@ -5212,6 +5362,11 @@ impl ChannelState {
         rows: Vec<Rendered>,
         expired: &[(Digest32, Tracked)],
     ) -> Result<()> {
+        for (row, cache_id) in std::mem::take(&mut self.pending_reads) {
+            self.retention
+                .rendered(&row.entry_hash, row.created_millis / 1_000, cache_id);
+            index_read(&mut self.read_records, &mut self.reads, row);
+        }
         for rendered in rows {
             self.retention.rendered(
                 &rendered.entry_hash,
@@ -5615,6 +5770,163 @@ impl ChannelState {
             .iter()
             .find(|r| r.entry_hash == entry_hash)
             .ok_or(Error::Profile("timeline lost the appended row"))
+    }
+
+    /// Take a read record pruned by retention out of the index (RR-2).
+    fn forget_read_record(&mut self, record: &Digest32) {
+        let Some((reader, read)) = self.read_records.remove(record) else {
+            return;
+        };
+        for h in read {
+            if let Some(readers) = self.reads.get_mut(&h) {
+                if let Some(n) = readers.get_mut(&reader) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        readers.remove(&reader);
+                    }
+                }
+                if readers.is_empty() {
+                    self.reads.remove(&h);
+                }
+            }
+        }
+    }
+
+    /// Who this node knows has read `entry`: the authors of the read records it holds and can
+    /// open that name it (ADR-028 RR-3). A member whose records this node cannot open is not here,
+    /// read or not.
+    #[must_use]
+    pub fn read_by(&self, entry: &Digest32) -> Vec<Digest32> {
+        self.reads
+            .get(entry)
+            .map(|r| r.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Of `shown`, the entries a read record of this identity's should name: rows of the timeline
+    /// (not a body still owed, not a read record), written by someone else, and not named by a
+    /// record of its own already (RR-2: "since its last record").
+    #[must_use]
+    pub fn unrecorded_reads(&self, me: &Digest32, shown: &[Digest32]) -> Vec<Digest32> {
+        let shown: BTreeSet<&Digest32> = shown.iter().collect();
+        self.timeline
+            .iter()
+            .filter(|r| r.author != *me && shown.contains(&r.entry_hash))
+            .map(|r| r.entry_hash)
+            .filter(|h| {
+                self.reads
+                    .get(h)
+                    .is_none_or(|readers| !readers.contains_key(me))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Author a read record naming `read` (ADR-028 RR-2): sealed under this identity's sender key
+    /// like a message, so only the members it trusts can open it, appended to its feed in this
+    /// room, and kept as a cache row that ages with the room's retention. Never a row of the
+    /// timeline. Returns the record's entry hash.
+    ///
+    /// Not in a room that has ended, nor one this identity has left: a record is an entry of its
+    /// feed, and an entry after a leave undoes the leave (V210-164). Reading says nothing.
+    pub fn append_read(
+        &mut self,
+        profile: &Profile,
+        read: Vec<Digest32>,
+        now_millis: u64,
+    ) -> Result<Digest32> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "room is poisoned after a failed persist; reopen it",
+            ));
+        }
+        if !self.settled {
+            return Err(Error::RoomNotSynced);
+        }
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if !self.authors.contains_key(&me) || self.left().contains(&me) {
+            return Err(Error::Profile("this identity is not an author of the room"));
+        }
+        if self.ended(now_millis).is_some() {
+            return Err(Error::Profile("this room has ended"));
+        }
+        let (now_millis, _) = self.stamp_after_held(now_millis);
+        let record = crate::node::content::ReadRecord::new(now_millis, read)?;
+        let plaintext = Zeroizing::new(record.to_canonical_vec());
+        let msg = self.sender.encrypt(&plaintext)?;
+        let payload = msg.to_wire();
+        let skeleton = self.next_skeleton(&me, &payload, now_millis);
+        let entry = Entry::build_signed(signer, skeleton, payload)?;
+        let entry_hash = entry.entry_hash();
+        let wire = entry.to_wire();
+        let row = ReadRow {
+            entry_hash,
+            reader: me,
+            created_millis: now_millis,
+            read: record.read,
+        };
+        let id = self.next_log_id;
+        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+        let cache_seg = seal_segment(
+            &self.sek,
+            SegmentKind::PlaintextCache,
+            id,
+            &read_cache_bytes(&row),
+        )?;
+        let sender_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_SENDER,
+            &self.sender.to_state(),
+        )?;
+        let seen_seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            id,
+            &first_seen_bytes(now_millis / 1_000),
+        )?;
+        let key = signer.public_key();
+        self.dag
+            .accept(entry, EntryKind::Content, &key, &self.admission)
+            .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
+        let persisted = (|| -> Result<()> {
+            let mut batch = profile.store().batch()?;
+            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::PlaintextCache,
+                id,
+                &cache_seg,
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_SENDER,
+                &sender_seg,
+            )?;
+            batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen_seg)?;
+            batch.commit()
+        })();
+        if let Err(e) = persisted {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.log_ids.insert(entry_hash, id);
+        self.next_log_id = id.saturating_add(1);
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.retention.track(
+            entry_hash,
+            Tracked {
+                log_id: id,
+                first_seen: now_millis / 1_000,
+                claimed: Some(now_millis / 1_000),
+                cache_id: Some(id),
+            },
+        );
+        index_read(&mut self.read_records, &mut self.reads, row);
+        Ok(entry_hash)
     }
 
     /// The next entry skeleton for `author`'s feed in this DAG, naming in `seen` the
