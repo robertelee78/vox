@@ -57,6 +57,12 @@ member as the room syncs, and each member's timeline in `vox tui` says who renam
 `bob renamed the room to home`. Service addresses follow the name: `ssh.nas.home.vox`, and the old
 `ssh.nas.family.vox` then leads nowhere. In `vox tui`, `:rename home` does the same.
 
+A node holds one room of a name: creating or joining a room under a name a room on it already has
+is refused, naming that room. A rename can still give a room the name of another room a member
+holds; that member then sees both rooms by their room IDs, in `vox room list`, `vox tui` and their
+addresses, and is told why once, until one of them is renamed. A verb given that name is refused
+and names both IDs.
+
 Joining a room your node already holds updates where it finds the room's members; it is not
 refused. Confirm with `room list` and `room roster`, then compare and exchange trust as needed.
 [Your first shared room](first-room.md) shows the complete sequence.

@@ -25,16 +25,16 @@
 //! 3. An unknown room and an unknown node are refused, and an alias already in use is refused, each with
 //!    a sentence saying which.
 //! 4. A node that is no longer trusted has no name.
-//! 8. **One room of a name on a node** (ADR-028 R-3). carol cannot create a second *home*, and
-//!    alice cannot join bob's room called *work*, each told which room holds the name. When bob
-//!    renames his room *extra* to *work*, carol, in both, lists each by its room ID and says why
-//!    once, and alice, in one, sees nothing change; renamed again, carol sees names again.
-//!    **Mutation:** a clashing join is let through, and alice holds two rooms called work.
 //! 7. **A room has one shared name** (ADR-028 R-1). alice joins with no name of her own and lists
 //!    each room under its creator's name; her rename of a room she is no admin of is refused;
 //!    bob's rename of family to *home* reaches her, `22.nas.home.vox` then reaches bob and
 //!    `22.nas.family.vox` leads nowhere. **Mutation:** a member keeps the name it heard at its
 //!    join over the log's (`ChannelState::name`), and alice still lists family.
+//! 8. **One room of a name on a node** (ADR-028 R-3). carol cannot create a second *home*, and
+//!    alice cannot join bob's room called *work*, each told which room holds the name. When bob
+//!    renames his room *extra* to *work*, carol, in both, lists each by its room ID and says why
+//!    once, and alice, in one, sees nothing change; renamed again, carol sees names again.
+//!    **Mutation:** a clashing join is let through, and alice holds two rooms called work.
 //!
 //! 5. **A service added to a running daemon is offered without a restart** (V030-06, #238). bob and
 //!    carol add theirs with `vox service add` while their daemons run; `vox service add` asks the
