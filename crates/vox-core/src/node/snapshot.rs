@@ -477,6 +477,17 @@ fn read_digests(d: &mut Decoder<'_>) -> Result<Vec<Digest32>> {
     (0..n).map(|_| digest(d)).collect()
 }
 
+/// The keyring window as every client says it (ADR-028 K-9): `keyring open 23m` while a keyring
+/// change goes without the passphrase, rounded up so an open window never reads `0m`; `keyring asks
+/// for the passphrase` once it will ask.
+#[must_use]
+pub fn keyring_label(open_secs: Option<u64>) -> String {
+    match open_secs {
+        Some(left) => format!("keyring open {}m", left.div_ceil(60).max(1)),
+        None => "keyring asks for the passphrase".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

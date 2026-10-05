@@ -849,16 +849,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// The keyring window as the status bar and `vox status` say it (ADR-028 K-9): `keyring open 23m`
-/// while a keyring change goes without the passphrase, rounded up so an open window never reads
-/// `0m`; `keyring asks for the passphrase` once it will ask.
-#[must_use]
-pub fn keyring_label(open_secs: Option<u64>) -> String {
-    match open_secs {
-        Some(left) => format!("keyring open {}m", left.div_ceil(60).max(1)),
-        None => "keyring asks for the passphrase".to_owned(),
-    }
-}
+pub use vox_core::node::snapshot::keyring_label;
 
 /// The most rows the line under the status bar takes: a long notice wraps onto as many as this,
 /// and no more, so the screen above it keeps its room.
