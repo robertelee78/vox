@@ -26,8 +26,8 @@ select a later binary; the manual must tell readers which commands it actually d
   "slug": "first-room",
   "path": "first-room.md",
   "title": "Your first shared room",
-  "description": "Create two identities, exchange trust, and verify a message in both directions.",
-  "appliesTo": "v0.2.10"
+  "description": "Make a node, create and join a room, exchange trust, and verify a message in both directions.",
+  "appliesTo": "v0.3.0"
 }
 ```
 
