@@ -46,3 +46,7 @@ From an outside review, noting a pattern; whether Vox keeps such a record is the
   - It MUST hold no message text, passphrase, key or token. It names who (fingerprint or alias) and what was decided, never content, so a message's retention leaves nothing behind in it.
   - It is local only, never sent anywhere.
   - Its retention is the decider's call, e.g. 90 days.
+
+## Parked ideas from the 2026-10-04 review (not decided)
+
+- **Benchmark records.** Each timing or throughput run (R40, R41, R42 and the rest) appends one record outside the repo (e.g. `~/vox-coord/perf/`): commit, binary sha256, method, and every sample including failed ones, after Bromure's per-run benchmark records. Today the numbers live only in issue comments and run logs, so a regression cannot be told from noise. Proof-side only; nothing in the product. A candidate v0.3.1 story, the decider's call.
