@@ -663,7 +663,7 @@ pub fn run_node(
                         }
                         if !here.is_empty() {
                             println!(
-                                "vox node: on this machine only, for a profile that reads another \
+                                "vox node: on this machine only, for a node that reads another \
                                  anchors file:"
                             );
                             for addr in here {

@@ -1093,7 +1093,7 @@ impl Fault {
             Fault::SealedUnreadable => {
                 "the identity passphrase is right, but this node's trust keyring, pending \
                  trust grants or prekey ring will not open under it\n       the store was altered, \
-                 or copied from another identity's profile"
+                 or copied from another node's data directory"
             }
             Fault::ShuttingDown => "the node is shutting down",
             Fault::NotNetworked => {
