@@ -1748,16 +1748,20 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
-        // How this node came to be a member here (M17.6). `None` for a channel that
-        // predates the segment; such a node cannot publish a bundle record until it
-        // has one, which is correct — its membership is exactly as unevidenced as any
-        // other unwitnessed key's.
+        // How this node came to be a member here (M17.6). A joined room holds the witness to its
+        // join (`SEG_ADMISSION`, written with the room). **A room this node created holds none:
+        // its admission is the genesis, which names it**, so it is read from there. Left unset,
+        // a reopened creator's room published no member bundle and no address record again, to
+        // any board, and lapsed off its anchor's (a_restarted_creator_stays_on_its_board_proof).
+        // `None` only for a joined room without its witness, which cannot publish until it has
+        // one: its membership is as unevidenced as any other unwitnessed key's.
         let own_admission =
             match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_ADMISSION)? {
                 Some(seg) => {
                     let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_ADMISSION, &seg)?;
                     Some(Admission::from_body(&bytes)?)
                 }
+                None if genesis.body.creator_pubkey.fingerprint() == me => Some(Admission::Creator),
                 None => None,
             };
         // The origins of this identity's own generations (M18.1). A channel from
