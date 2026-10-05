@@ -207,9 +207,19 @@ impl GatewayFamily {
             .answered
             .as_ref()
             .map_or("null".to_owned(), |(at, m)| {
-                format!("{{\"address\":{},\"rung\":{}}}", q(at), q(m.rung()))
+                // What it granted: the external address and port, and the lifetime (N-54).
+                let (external, lifetime) = self.ask.granted.unwrap_or((None, 0));
+                format!(
+                    "{{\"address\":{},\"rung\":{},\"external\":{},\"lifetime\":{lifetime}}}",
+                    q(at),
+                    q(m.rung()),
+                    external.map_or("null".to_owned(), |e| q(&e.to_string()))
+                )
             });
-        format!("{{\"next_hop\":{hop},\"asked\":[{asked}],\"answered\":{answered}}}")
+        format!(
+            "{{\"next_hop\":{hop},\"asked\":[{asked}],\"answered\":{answered},\"renewal\":{}}}",
+            self.ask.renewal
+        )
     }
 }
 

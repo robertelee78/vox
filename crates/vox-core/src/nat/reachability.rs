@@ -41,6 +41,11 @@ pub struct GatewayAsk {
     pub asked: Vec<String>,
     /// The candidate that granted a mapping, and on which rung; `None` when none did.
     pub answered: Option<(String, Method)>,
+    /// What it granted: the external address and port, when the gateway said them, and the
+    /// lifetime in seconds.
+    pub granted: Option<(Option<SocketAddr>, u32)>,
+    /// Whether this ask was a held mapping's renewal at its own server (N-55), not a discovery.
+    pub renewal: bool,
 }
 
 /// [`GatewayAsk`] for both families: what `vox status` names (N-54).
@@ -57,6 +62,13 @@ impl GatewayAsk {
     fn of(asked: Vec<String>, won: Option<&PortMapping>) -> Self {
         Self {
             asked,
+            renewal: false,
+            granted: won.map(|m| {
+                (
+                    m.external_ip.map(|ip| SocketAddr::new(ip, m.external_port)),
+                    m.lifetime_secs,
+                )
+            }),
             answered: won.map(|m| {
                 (
                     m.server.map_or_else(|| "?".to_owned(), |s| s.to_string()),
@@ -131,6 +143,34 @@ pub fn direct_candidates(endpoints: &EndpointList) -> Vec<SocketAddr> {
 /// matches the ADR-012 address-record TTL, so a mapping and the record that
 /// advertises it age together.
 pub const PORT_MAP_LIFETIME_SECS: u32 = 2 * 60 * 60;
+
+/// The environment variable [`map_lifetime_secs`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
+pub const TEST_MAP_LIFETIME_ENV: &str = "VOX_TEST_MAP_LIFETIME_SECS";
+
+/// The shortest lifetime `VOX_TEST_MAP_LIFETIME_SECS` may ask for.
+pub const MIN_TEST_MAP_LIFETIME_SECS: u32 = 30;
+
+/// The mapping lifetime this node asks a gateway for: [`PORT_MAP_LIFETIME_SECS`], or a proof's
+/// shorter one (`VOX_TEST_MAP_LIFETIME_SECS`, test-knobs only, at least
+/// [`MIN_TEST_MAP_LIFETIME_SECS`]), so a renewal against a real router comes within a sitting
+/// (ADR-012 N-58, the real-router proof). It only ever shortens the request.
+#[must_use]
+pub fn map_lifetime_secs() -> u32 {
+    #[cfg(feature = "test-knobs")]
+    {
+        static ASKED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(l) = *ASKED.get_or_init(|| {
+            std::env::var(TEST_MAP_LIFETIME_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .map(|l| l.clamp(MIN_TEST_MAP_LIFETIME_SECS, PORT_MAP_LIFETIME_SECS))
+        }) {
+            return l;
+        }
+    }
+    PORT_MAP_LIFETIME_SECS
+}
 
 /// The address the operating system would use to reach the wider internet, found
 /// **without sending a packet**: a UDP socket is "connected" to a public address,
@@ -305,10 +345,13 @@ fn mapping_is_v6(m: &PortMapping) -> bool {
 /// Renew `held` at its own server (N-55), and say so as the family's ask (N-54).
 async fn renew_one(held: &PortMapping) -> (Option<PortMapping>, GatewayAsk) {
     let asked = held.server.iter().map(ToString::to_string).collect();
-    let won = crate::nat::portmap::renew(held, PORT_MAP_LIFETIME_SECS)
+    let won = crate::nat::portmap::renew(held, map_lifetime_secs())
         .await
         .ok();
-    let ask = GatewayAsk::of(asked, won.as_ref());
+    let ask = GatewayAsk {
+        renewal: true,
+        ..GatewayAsk::of(asked, won.as_ref())
+    };
     (won, ask)
 }
 
@@ -577,7 +620,7 @@ async fn pinhole_any(
                 Protocol::Udp,
                 client_ip,
                 port,
-                PORT_MAP_LIFETIME_SECS,
+                map_lifetime_secs(),
                 nonce,
             )
             .await
@@ -634,7 +677,7 @@ async fn map_port_any(
                 Protocol::Udp,
                 port,
                 port,
-                PORT_MAP_LIFETIME_SECS,
+                map_lifetime_secs(),
                 nonce,
             )
             .await
@@ -652,7 +695,7 @@ async fn map_port_any(
     };
     asked.push(format!("UPnP search {target}"));
     let won =
-        crate::nat::portmap::map_port_upnp(Protocol::Udp, port, client_ip, PORT_MAP_LIFETIME_SECS)
+        crate::nat::portmap::map_port_upnp(Protocol::Udp, port, client_ip, map_lifetime_secs())
             .await
             .ok();
     let ask = GatewayAsk::of(asked, won.as_ref());
