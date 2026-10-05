@@ -211,7 +211,7 @@ pub enum UiError {
     /// The profile had no identity when this TUI started, and another vox created one since:
     /// nothing was created here (V210-100, the CLI's V210-91 refusal).
     IdentityMadeElsewhere,
-    /// Another vox holds this profile open for writing.
+    /// Another vox holds this node open for writing.
     ProfileBusy,
     /// The node this TUI acts as is not attached: give its passphrase (`:attach`).
     NotAttached,
@@ -277,7 +277,7 @@ impl UiError {
         match self {
             UiError::WrongPassphrase => "wrong passphrase",
             UiError::SealedUnreadable => {
-                "passphrase right, but this profile's keyring or prekeys will not open — altered, or another identity's"
+                "passphrase right, but this node's keyring or prekeys will not open — altered, or another identity's"
             }
             UiError::JoinPowDelay => "join proof-of-work in progress…",
             UiError::JoinPowTooSlow => {
@@ -299,7 +299,7 @@ impl UiError {
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",
             UiError::NoIdentity => "no identity yet — :init to create one",
-            UiError::IdentityExists => "an identity already exists in this profile",
+            UiError::IdentityExists => "an identity already exists on this node",
             UiError::IdentityMadeElsewhere => {
                 "another vox created this node's identity at the same time; nothing was created here — :attach with its passphrase"
             }

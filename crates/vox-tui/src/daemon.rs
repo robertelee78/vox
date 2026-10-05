@@ -521,9 +521,9 @@ fn refusal_words(r: &Refusal, account: &Account, node: &NodeName) -> String {
         // A new person is sent here by `vox room list`'s "start one: vox daemon", and this is
         // the second thing they see: it says that `vox id` is what makes an identity.
         Refusal::NoIdentity { .. } | Refusal::NoSuchNode { .. } => format!(
-            "this profile has no identity yet, so there is nothing to unlock.\n\
+            "this node has no identity yet, so there is nothing to unlock.\n\
              \x20      Make one:  vox id\n\
-             \x20      Then start the daemon again. Profile: {}",
+             \x20      Then start the daemon again. Node: {}",
             account.node_dir(node).display()
         ),
         Refusal::WrongPassphrase { .. } => "that identity passphrase is wrong.\n       The first \

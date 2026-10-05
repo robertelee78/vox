@@ -19,7 +19,7 @@
 //!
 //! Mutations: the unbounded `node.apply(Shutdown)` this replaced turns it red at ~60 s; a
 //! daemon that leaves something holding its store's lock past its own exit turns it red at
-//! the `vox trust list`, which is refused with "another vox already has this profile open".
+//! the `vox trust list`, which is refused with "another vox already has this node open".
 //!
 //! ## And when a finished transfer's last bytes are unacknowledged (V210-81, #272)
 //! [`a_stop_waits_out_last_bytes_within_its_patience`]: a stopping node waits, up to

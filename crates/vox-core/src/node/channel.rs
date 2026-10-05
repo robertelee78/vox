@@ -1423,7 +1423,7 @@ impl ChannelState {
         let store = profile.store();
         let wrap = store
             .get_sek_wrap(channel_id)?
-            .ok_or(Error::Profile("no such channel in this profile"))?;
+            .ok_or(Error::Profile("no such room on this node"))?;
         let factor = SignatureIdentityFactor::new(signer);
         let sek = wrap.unwrap_sek(&factor, channel_id, channel_passphrase)?;
         let me = signer.fingerprint();
@@ -1726,7 +1726,7 @@ impl ChannelState {
                 .is_some_and(|c: &ReceiverChain| !c.holds_key_for(iteration));
             if overwritten && opened {
                 set_aside.push(format!(
-                    "{at}: a received message lost to the row-id collision fixed in V210-73"
+                    "{at}: a received message lost to a storage defect fixed in v0.2.10"
                 ));
             }
         }
@@ -1985,7 +1985,7 @@ impl ChannelState {
             ));
         }
         if profile.store().get_sek_wrap(channel_id)?.is_some() {
-            return Err(Error::Profile("this channel is already in the profile"));
+            return Err(Error::Profile("this room is already on this node"));
         }
         Ok(())
     }

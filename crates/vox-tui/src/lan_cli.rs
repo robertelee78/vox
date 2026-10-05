@@ -255,7 +255,7 @@ pub async fn up(
 
 #[cfg(not(target_os = "macos"))]
 const NOT_HERE: &str = "the family LAN is built for macOS only so far: Linux's /dev/net/tun \
-     needs an ioctl no safe binding offers, and Vox writes no `unsafe` (ADR-013 §\"The family LAN\")";
+     needs an ioctl no safe binding offers, and Vox writes no `unsafe`";
 
 #[cfg(target_os = "macos")]
 mod mac {

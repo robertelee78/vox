@@ -4,7 +4,7 @@
 //!
 //! A TUI started on a profile with no identity opens on its first-run "Create identity" prompt.
 //! If another vox makes the identity meanwhile, the create the person then confirms finds a vault
-//! and is refused. The TUI said "an identity already exists in this profile": true, but it reads
+//! and is refused. The TUI said "an identity already exists on this node": true, but it reads
 //! as a profile that already had one when the TUI started, and nothing says that this one was not
 //! made here, or what to do.
 //!
@@ -23,7 +23,7 @@
 //! it could not reap) and a temp dir this proof could not make are `APPARATUS:`.
 //!
 //! Mutation that must turn it red: the TUI's create path mapping the race to the generic
-//! `IdentityExists` again — it says "an identity already exists in this profile".
+//! `IdentityExists` again — it says "an identity already exists on this node".
 
 #![cfg(unix)]
 

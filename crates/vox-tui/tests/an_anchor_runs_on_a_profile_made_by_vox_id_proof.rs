@@ -4,7 +4,7 @@
 //! An anchor's first run: `vox id`, then `vox node`. The node refused at once with
 //!
 //! ```text
-//! vox node: node: another vox already has this profile open
+//! vox node: node: another vox already has this node open
 //! ```
 //!
 //! and no other vox was running. A headless node opened the profile's vault, which held its store
@@ -29,7 +29,7 @@
 //!
 //! **Mutation that must turn it red.** In `node::actor`'s `spawn_config`, open the profile's vault
 //! for a headless node again (`Profile::exists` without the `headless.is_none()` guard): the node
-//! exits at once with "another vox already has this profile open", a `PRODUCT:` red on assertion 1.
+//! exits at once with "another vox already has this node open", a `PRODUCT:` red on assertion 1.
 
 #![cfg(unix)]
 
@@ -52,7 +52,7 @@ const SERVE_BOUND: Duration = Duration::from_secs(180);
 /// How long the anchor may take to report the room on its board once the guest has joined.
 const BOARD_BOUND: Duration = Duration::from_secs(60);
 /// What the defect said.
-const BUSY: &str = "already has this profile open";
+const BUSY: &str = "already has this node open";
 
 /// Why a wait ended without the line it wanted.
 #[derive(Debug)]

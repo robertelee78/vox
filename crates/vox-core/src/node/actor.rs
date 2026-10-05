@@ -4066,7 +4066,7 @@ impl Node {
         // A headless node networks as its key file and holds no room, so it never opens the
         // profile's vault — which a `vox node --serve trusted` profile has, to keep its trust
         // list. Opening it here held the store the anchor's own logs need, and the anchor
-        // refused to start: "another vox already has this profile open".
+        // refused to start: "another vox already has this node open".
         let profile = if headless.is_none() && Profile::exists(&paths) {
             Some(Profile::open_noting(paths.clone(), &profile_wait)?)
         } else {
@@ -4844,7 +4844,7 @@ impl Node {
                 (Some(signer), _) => Arc::clone(signer) as _,
                 (None, Some(profile)) => profile.signer_arc()? as _,
                 (None, None) => {
-                    return Err(crate::error::Error::Profile("no identity in this profile"))
+                    return Err(crate::error::Error::Profile("no identity on this node"))
                 }
             };
         // The daemon's presence, or one of this node's own.
@@ -6147,7 +6147,7 @@ impl Node {
                         admitted
                     }
                     (None, _) => Err(Error::Profile("locked")),
-                    (_, None) => Err(Error::Profile("no such channel in this profile")),
+                    (_, None) => Err(Error::Profile("no such room on this node")),
                 };
                 // **Not admitted, not accepted.** This was dropped, and the joiner was told it was
                 // in whatever happened: a room already full took nobody, and its joiner exited 0.
@@ -11655,7 +11655,7 @@ impl Node {
         let profile = self
             .profile
             .as_ref()
-            .ok_or(crate::error::Error::Profile("no identity in this profile"))?;
+            .ok_or(crate::error::Error::Profile("no identity on this node"))?;
         let signer = profile.signer()?;
         // The ring's identity DH key is the identity's own (ADR-002), taken from the
         // unlocked vault — never a fresh one, or a restore would change it.
@@ -12240,7 +12240,7 @@ impl Node {
             let opened = tokio::task::spawn_blocking(move || {
                 let wrap = store
                     .get_sek_wrap(&channel_id)?
-                    .ok_or(Error::Profile("no such channel in this profile"))?;
+                    .ok_or(Error::Profile("no such room on this node"))?;
                 let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
                 let sek = wrap.unwrap_sek(&factor, &channel_id, &passphrase)?;
                 ChannelState::open_with_sek(&store, &channel_id, sek, &passphrase, me, now)
@@ -14540,10 +14540,10 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::TunnelLimit(_) => Fault::TunnelLimit,
         Error::ServiceNameTaken(..) => Fault::NameTaken,
         Error::RoomNotSynced => Fault::RoomNotSynced,
-        Error::Profile("no identity in this profile") => Fault::NoIdentity,
-        Error::Profile("identity already exists in this profile") => Fault::IdentityExists,
+        Error::Profile("no identity on this node") => Fault::NoIdentity,
+        Error::Profile("identity already exists on this node") => Fault::IdentityExists,
         Error::Profile("locked") => Fault::Locked,
-        Error::Profile("no such channel in this profile") => Fault::UnknownChannel,
+        Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,
         Error::LogFormatBeforeV030 => Fault::RoomFromBeforeV030,
         Error::AtRestLocked => Fault::Locked,
