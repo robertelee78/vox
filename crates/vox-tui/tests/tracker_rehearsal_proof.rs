@@ -691,9 +691,13 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
         "vox room post \"$VOX_ROOM\" --type blocked --work 'wl:rehearsal#2' --data '{\"reason\":\"waiting on the schema\"}' blocked",
     ]);
-    support::arrives(bob, "w2's blocked", &["room", "read", &r], |o: &Out| {
-        o.stdout.contains("waiting on the schema")
-    });
+    // The reason is in the row's data, which `--json` carries and the words do not (#406).
+    support::arrives(
+        bob,
+        "w2's blocked",
+        &["room", "read", &r, "--json"],
+        |o: &Out| o.stdout.contains("waiting on the schema"),
+    );
     adapter.pump(&mut tracker);
     let board = bob.vox(None, &["room", "board", &r, "--json"]).json();
     tracker.board(&board);
@@ -740,7 +744,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     support::arrives(
         bob,
         "w2's failure while the tracker is down",
-        &["room", "read", &r],
+        // The reason is in the row's data, which `--json` carries and the words do not (#406).
+        &["room", "read", &r, "--json"],
         |o: &Out| o.stdout.contains("the schema never came"),
     );
     std::thread::sleep(Duration::from_secs(45)); // w1's 45 s lease lapses with nobody acting
