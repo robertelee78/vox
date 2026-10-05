@@ -185,6 +185,8 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
         .env("VOX_CONFIG_DIR", cfg)
         // In the environment, not argv: a command line is world-readable (ADR-015).
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        // The data root holds a second node, carol's (see `carol`): every verb here is bob's.
+        .env("VOX_NODE", "default")
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ROOM_PASSPHRASE")
         .stdin(if input.is_some() {
@@ -217,6 +219,72 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// **Someone else in the room** for the hand-opened session's "addressed to someone else": a
+/// message is addressed to a node, so it is another member's node — carol's, a second node in this
+/// data root on the same daemon, joined to the room. Its fingerprint.
+fn carol(data: &Path, cfg: &Path, room: &str, tmp: &Path) -> String {
+    let (ok, _, err) = vox(data, cfg, &["node", "create", "carol"], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox node create carol` refused: {err}"
+    );
+    let pass = tmp.join("carol.pass");
+    std::fs::write(&pass, format!("{IDENTITY}\n"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write carol's passphrase file: {e}"));
+    let (ok, _, err) = vox(
+        data,
+        cfg,
+        &[
+            "node",
+            "attach",
+            "carol",
+            "--passphrase-file",
+            path_arg(&pass),
+        ],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): `vox node attach carol` refused: {err}"
+    );
+    let (ok, invite, err) = vox(data, cfg, &["room", "invite", room], None);
+    let address = invite
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT (staging): `vox room invite` printed no address: {invite:?} {err} ({ok})"
+            )
+        })
+        .to_owned();
+    let (ok, _, err) = vox(
+        data,
+        cfg,
+        &[
+            "room",
+            "join",
+            "--node",
+            "carol",
+            "--passphrase-file",
+            "-",
+            &address,
+        ],
+        Some("channel passphrase\n"),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): carol's `vox room join` refused: {err}"
+    );
+    let (_, roster, _) = vox(data, cfg, &["room", "roster", room], None);
+    let (_, own, _) = vox(data, cfg, &["id"], None);
+    roster
+        .lines()
+        .map(str::trim)
+        .find(|l| l.len() == 52 && *l != own.trim())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the roster does not list carol: {roster:?}"))
+        .to_owned()
 }
 
 /// Run one `opencode` turn, confined by `sb` under `profile`, and return its stdout.
@@ -368,6 +436,7 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
         None,
     );
     assert!(ok, "PRODUCT: `vox room post` refused: {err}");
+    let carol = carol(&data, &cfg, &room, tmp.path());
     println!("[proof] room {room} holds codeword {codeword}, posted through `vox room post`");
 
     // Isolate OpenCode's **configuration**, so the operator's own plugins, model
@@ -636,6 +705,8 @@ fn a_real_model_reads_the_room_through_the_opencode_plugin() {
             path_arg(&fed_profile),
             path_arg(&sb.home),
             "wake",
+            &carol,
+            fp.trim(),
         ],
     );
     let said = out.stdout.clone();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""opencode_wake.py <vox> <data_dir> <config_dir> <room> <project> <xdg_config> <plugin_log> <tmpdir> <sandbox_profile> <sandbox_home> <tag>
+"""opencode_wake.py <vox> <data_dir> <config_dir> <room> <project> <xdg_config> <plugin_log> <tmpdir> <sandbox_profile> <sandbox_home> <tag> <other_node> <own_node>
 
 A plain `opencode`, opened by hand with no flags, interrupted by an urgent message addressed to it
 (ADR-020 §6, ADR-021 F17). The caller runs the `vox daemon` holding `<room>` and has installed
@@ -10,8 +10,11 @@ What a person does, in order:
 
 1. opens `opencode` in `<project>` — `VOX_ROOM` and `VOX_AGENT_NAME=bobby` exported, nothing
    else — and asks it to run `sleep` and then reply, so a turn is running;
-2. while it runs, posts an urgent message addressed to **someone else** (`vox room post --to
-   carol --urgent`), then an urgent one addressed to **bobby**.
+2. while it runs, posts an urgent message addressed to **someone else** — `<other_node>`, another
+   member's node (`vox room post --to <fingerprint> --urgent`) — then an urgent one addressed to
+   **bobby's own node**, `<own_node>`: a message is addressed to a node, and wakes its sessions.
+   The caller's data root holds the other member's node too, so every `vox` here names its node
+   (`default`).
 
 The screen is read through pyte, as the person sees it. Prints, each on its own line:
 - `<tag> REGISTERED: <harness>: <how it is woken>` — the session its drain registered with the
@@ -61,7 +64,8 @@ sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, pyte, reap, stage  # noqa: E402
 
-VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TMP, SANDBOX, SB_HOME, TAG = sys.argv[1:12]
+VOX, DATA, CFG, ROOM, PROJECT, XDG, PLUGIN_LOG, TMP, SANDBOX, SB_HOME, TAG, OTHER_NODE, OWN_NODE = \
+    sys.argv[1:14]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
 # How Vox's wake notice reads (V030-15): a count and the senders, never the message.
 NOTICE = "urgent message addressed to you"
@@ -109,8 +113,8 @@ env.update(TERM="xterm-256color", XDG_CONFIG_HOME=XDG, VOX_DATA_DIR=DATA, VOX_CO
 def post(to, body):
     """`vox room post` by the person, on the daemon's profile."""
     out = subprocess.run(
-        [VOX, "room", "post", ROOM, "--session", "person", "--type", "ask", "--to", to,
-         "--urgent", body],
+        [VOX, "room", "post", ROOM, "--node", "default", "--session", "person", "--type", "ask",
+         "--to", to, "--urgent", body],
         env={**{k: v for k, v in env.items() if not k.startswith("VOX_")},
              "VOX_DATA_DIR": DATA, "VOX_CONFIG_DIR": CFG},
         capture_output=True, text=True, timeout=60)
@@ -125,7 +129,7 @@ def sessions():
     read from its files, whose layout is the product's to change (it moved under `nodes/`, and a
     glob of the old place found nothing)."""
     out = subprocess.run(
-        [VOX, "agent", "doctor", "--json"],
+        [VOX, "agent", "doctor", "--node", "default", "--json"],
         env={**{k: v for k, v in env.items() if not k.startswith("VOX_")},
              "VOX_DATA_DIR": DATA, "VOX_CONFIG_DIR": CFG},
         capture_output=True, text=True, timeout=60)
@@ -262,13 +266,13 @@ try:
     t_turn = time.time()
 
     stage("post an urgent message addressed to someone else")
-    post("carol", f"carol: {OTHER} is for you.")
+    post(OTHER_NODE, f"carol: {OTHER} is for you.")
     tui.pump(8)
     other = OTHER in flat()
     print(f"{TAG} OTHER: {'shown' if other else 'absent'}")
 
     stage("post an urgent message addressed to bobby")
-    post("bobby", f"bobby: {WAKE} please acknowledge.")
+    post(OWN_NODE, f"bobby: {WAKE} please acknowledge.")
     shown = tui.until(lambda: WAKE in flat() or NOTICE in flat(), SLEEP + 60, step=0.25)
     turn_done = SLEPT in flat()
     took = time.time() - t_turn
