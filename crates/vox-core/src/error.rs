@@ -587,6 +587,15 @@ pub enum IpcHandshake {
     /// What answered did not greet at all.
     #[error("what answered on the control socket did not greet like a vox node")]
     NotHello,
+    /// This process runs as root (uid 0), and a vox daemon admits no control connection from
+    /// uid 0, its own user's or any other's (ADR-026 C-1): said before connecting, at once, rather
+    /// than as a daemon that never answered.
+    #[error(
+        "vox is running as root (uid 0), and the vox daemon refuses every control connection \
+         from root, so nothing run as root can use it. Run vox as an ordinary user: in a \
+         container, set a non-root USER (for example `podman run --user 1000 …`)"
+    )]
+    Root,
     /// The socket, or the process serving it, is not this user's: nothing is sent to it.
     #[error("refusing the control socket: {detail}")]
     NotYours {
