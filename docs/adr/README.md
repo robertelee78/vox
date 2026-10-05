@@ -42,6 +42,10 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 
 ## Tiers
 
+User documentation: [ADR-027 — One user manual, automatically skinned by voxlux.us](ADR-027-user-manual-and-website-skin.md)
+is accepted for implementation. ADR-026 is reserved on `rearch/v030`; this documentation decision
+does not import that branch's unreleased command surface into the released manual.
+
 - **Tier 0 — Foundation:** 001
 - **Tier 1 — Cross-cutting policy:** 002, 003
 - **Tier 2 — Crypto core:** 004, 005, 006

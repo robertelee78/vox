@@ -35,10 +35,11 @@ either machine can be reached directly, no anchor is involved.
 
 ## Install
 
-GitHub Releases are the distribution — no vanity domain, no package manager, no account, no token:
+Install through the Vox vanity address; GitHub Releases remains the source of the executable
+and its release record. No package manager, account or token is required:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/robertelee78/vox/main/install.sh | sh
+curl -fsSL https://voxlux.us/install.sh | sh
 ```
 
 Targets: `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin` (macOS 11+).
@@ -85,6 +86,11 @@ Your nodes and their rooms live in `~/.local/share/vox/nodes/<name>/` (macOS:
 too if you mean it — nobody can recover a room for you.
 
 ## Getting started
+
+The [user manual](docs/manual/README.md) has a complete first-room walkthrough, task guides,
+and troubleshooting organised by symptom. Read the same canonical manual at
+[voxlux.us](https://voxlux.us/docs/manual/); released and development instructions are clearly
+separated there.
 
 ### The daemon and your nodes
 
