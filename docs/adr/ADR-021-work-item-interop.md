@@ -4,9 +4,11 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 **Status**: Accepted. Built on integrate/v0.3.0: M21.1–M21.10, in `crates/vox-agentcomms/src/{claim,ops,version,envelope}.rs`
 and `crates/vox-tui/src/{room_cli,coord,agent_hook}.rs`, each with a real-binary proof in
-`crates/vox-tui/tests/`. Open: the
-timing-dependent M21.4 mutant and the unused M21.5 mutation (#368); `adapter_stream_proof` on
-v0.3.0's single room order (V030-28, #350).
+`crates/vox-tui/tests/`. M21.4's read-back is proved by
+`work_op_proof::a_conflict_that_lands_after_the_lookup_is_found_by_the_read_back`, M21.5's
+subscribe-before-read by `adapter_stream_proof::a_row_that_lands_between_the_subscription_and_the_read_is_not_lost`
+(#368), and F19 on the single room order by `adapter_stream_proof`, through `read --since` and
+`tail --since` (V030-28, #350).
 **Date**: 2026-09-23
 **Deciders**: Robert E. Lee <robert@agidreams.us>
 **Tags**: agent-comms, interop, work-tracking, adapter, envelope, claims, versioning
@@ -279,8 +281,9 @@ keys).
 F16's gate half (a `--data` reference passes the version gate) follows
 by construction and is not separately proved; `work_version_proof` drives the gate through `--work`
 only. M21.8's assertions that a `release` is never Done and a `result` reaches Acceptance at most
-test the stub tracker's own rules, not Vox. The M21.4 no-post-read mutant is timing-dependent and
-M21.5's subscribe-after-read mutation is used by no proof (#368).
+test the stub tracker's own rules, not Vox. M21.4's read-back and M21.5's subscribe-before-read are
+each staged with a test-only pause (`VOX_TEST_OP_HOLD_MS`, `VOX_TEST_TAIL_HOLD_MS`), compiled only
+with the `test-knobs` feature; the binary that ships has neither.
 
 ## Consequences
 
