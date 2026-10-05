@@ -54,6 +54,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
 
+pub mod attention;
 pub mod claim;
 pub mod envelope;
 pub mod ops;
