@@ -226,7 +226,7 @@ impl OriginKeyStore {
             let channel_id: Digest32 = d
                 .bytes()?
                 .try_into()
-                .map_err(|_| Error::MalformedBundle("origin record channel_id"))?;
+                .map_err(|_| Error::MalformedBundle("origin record room id"))?;
             let epoch = d.uint()?;
             let chain_id = d.uint()?;
             let author_id: Digest32 = d
@@ -396,9 +396,7 @@ impl OriginKeyStore {
         // stored binding matches so a future refactor cannot silently reintroduce
         // a cross-channel release.
         if &rec.channel_id != channel_id || rec.epoch != epoch {
-            return Err(Error::MalformedBundle(
-                "origin record channel/epoch mismatch",
-            ));
+            return Err(Error::MalformedBundle("origin record room/epoch mismatch"));
         }
         // The released author_id MUST be the author that signs (Skdm::build sets
         // author_id = author_root.fingerprint()); guard that the retained record

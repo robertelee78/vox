@@ -153,7 +153,7 @@ fn fixed_x(slice: &[u8]) -> Result<[u8; X25519_PUB_LEN]> {
 fn fixed32(slice: &[u8]) -> Result<[u8; 32]> {
     slice
         .try_into()
-        .map_err(|_| Error::MalformedBundle("pqxdh-init channel id length"))
+        .map_err(|_| Error::MalformedBundle("pqxdh-init room id length"))
 }
 
 fn fixed_ct(slice: &[u8]) -> Result<[u8; ML_KEM_768_CT_LEN]> {

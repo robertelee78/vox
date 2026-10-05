@@ -6,9 +6,10 @@
 //! design documents, so a reference to one tells them nothing.
 //!
 //! Asserted, over the help of **every** subcommand (walked from `vox --help`, as clap lists them)
-//! and over what a running node says to `vox status`, `vox status --json` and a room it does not
-//! hold:
+//! and over what a running node says to `vox status`, `vox status --json`, a room it does not
+//! hold, `vox room invite` and `vox serve`:
 //! - no "profile" (the node's old name);
+//! - no "channel" and no "consent": a person has rooms, and trusts a member (#406);
 //! - no reference to a design document (`ADR-…`, `PRD-…`, `V030-…`, `V210-…`, `M17.…`, `(#…)`);
 //! - every example `.vox` address has the one form that connects, `<service>.<node>.<room>.vox`:
 //!   four labels.
@@ -18,8 +19,10 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::io::BufRead;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDENTITY: &str = "identity passphrase for the wording proof";
@@ -87,6 +90,9 @@ fn faults(text: &str) -> Vec<String> {
         if low.contains("profile") && !low.contains("bash_profile") {
             out.push(format!("says \"profile\": {}", line.trim()));
         }
+        if let Some(w) = ["channel", "consent"].iter().find(|w| low.contains(**w)) {
+            out.push(format!("says \"{w}\": {}", line.trim()));
+        }
         let refs = ["ADR-", "PRD-", "V030-", "V210-", "V29-", "M17.", "(#"];
         if let Some(r) = refs.iter().find(|r| line.contains(**r)) {
             out.push(format!("names a design document ({r}…): {}", line.trim()));
@@ -106,6 +112,48 @@ fn faults(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// What `vox serve` prints up to the passphrase advice and the line after it: it keeps running,
+/// so it is stopped once that is read, or after 60 s.
+fn serve_says(data: &Path) -> String {
+    let mut child = Command::new(VOX)
+        .args(["serve", "web=9", "--name", "served"])
+        .env("VOX_DATA_DIR", data.join("data"))
+        .env("VOX_CONFIG_DIR", data.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .env_remove("VOX_NODE")
+        .env_remove("VOX_ROOM")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox serve: {e}"));
+    let stdout = child.stdout.take().expect("APPARATUS: piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut said = String::new();
+    let mut advice = false;
+    while let Ok(line) = rx.recv_timeout(Duration::from_secs(60)) {
+        said.push_str(&line);
+        said.push('\n');
+        if advice {
+            break;
+        }
+        advice = line.trim_start().starts_with('^');
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    said
 }
 
 #[test]
@@ -147,6 +195,38 @@ fn help_and_messages_name_the_node_and_no_design_document() {
         let (_, text) = vox(tmp.path(), argv);
         said_by_node.push((format!("vox {}", argv.join(" ")), text));
     }
+    // A room and its link, as a person shares one: the advice on sending the passphrase.
+    let room_pass = tmp.path().join("room-pass");
+    std::fs::write(&room_pass, "room passphrase for the wording proof\n")
+        .expect("APPARATUS: room passphrase file");
+    let room_pass = room_pass.to_str().expect("utf-8");
+    let (ok, said) = vox(
+        tmp.path(),
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            room_pass,
+            "--name",
+            "words",
+        ],
+    );
+    assert!(ok, "PRODUCT (staging): vox room create: {said}");
+    // The room by its id, as `vox room list` names it first.
+    let (_, listed) = vox(tmp.path(), &["room", "list"]);
+    let room: String = listed
+        .lines()
+        .find(|l| l.contains("words"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let (ok, said) = vox(tmp.path(), &["room", "invite", &room]);
+    assert!(
+        ok,
+        "PRODUCT (staging): vox room invite {room}: {said}\n{listed}"
+    );
+    said_by_node.push(("vox room invite words".into(), said));
+    said_by_node.push(("vox serve web=9".into(), serve_says(tmp.path())));
     let _ = vox(tmp.path(), &["node", "detach", "a"]);
 
     let mut all = Vec::new();
@@ -168,8 +248,17 @@ fn help_and_messages_name_the_node_and_no_design_document() {
         "PRODUCT (staging): `vox status` did not answer with its report: {said_by_node:?}"
     );
     assert!(
+        said_by_node
+            .iter()
+            .filter(|(c, _)| ["vox room invite words", "vox serve web=9"].contains(&c.as_str()))
+            .all(|(_, t)| t.contains("passphrase")),
+        "PRODUCT (staging): `vox room invite` or `vox serve` said nothing of the passphrase: \
+         {said_by_node:?}"
+    );
+    assert!(
         all.is_empty(),
-        "PRODUCT: what vox says must name the node, not the profile, name no design document, and \
+        "PRODUCT: what vox says must name the node, not the profile, say room and trust, not channel \
+         or consent, name no design document, and \
          give addresses as <service>.<node>.<room>.vox:\n{}",
         all.join("\n")
     );

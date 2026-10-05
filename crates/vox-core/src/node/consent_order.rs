@@ -160,7 +160,7 @@ impl ConsentOrder {
             .last
             .max(at_least)
             .checked_add(1)
-            .ok_or(Error::SizeLimitExceeded("consent order counter"))?;
+            .ok_or(Error::SizeLimitExceeded("trust order counter"))?;
         self.last = v;
         Ok(self.stamp(v))
     }
@@ -181,34 +181,34 @@ impl ConsentOrder {
     fn from_bytes(b: &[u8]) -> Result<Self> {
         let bad = |why: &'static str| Error::MalformedAtRest(why);
         let mut d = Decoder::new(b);
-        if d.array().map_err(|_| bad("consent order"))? != 4 {
-            return Err(bad("consent order arity"));
+        if d.array().map_err(|_| bad("trust order"))? != 4 {
+            return Err(bad("trust order arity"));
         }
-        if d.uint().map_err(|_| bad("consent order version"))? != VERSION {
-            return Err(bad("consent order version"));
+        if d.uint().map_err(|_| bad("trust order version"))? != VERSION {
+            return Err(bad("trust order version"));
         }
-        let id = OrderId::try_from(d.bytes().map_err(|_| bad("consent order id"))?)
-            .map_err(|_| bad("consent order id length"))?;
-        let last = d.uint().map_err(|_| bad("consent order counter"))?;
-        let n = d.array().map_err(|_| bad("consent order list"))?;
+        let id = OrderId::try_from(d.bytes().map_err(|_| bad("trust order id"))?)
+            .map_err(|_| bad("trust order id length"))?;
+        let last = d.uint().map_err(|_| bad("trust order counter"))?;
+        let n = d.array().map_err(|_| bad("trust order list"))?;
         if n > MAX_TRUSTED {
-            return Err(Error::SizeLimitExceeded("consent order entries"));
+            return Err(Error::SizeLimitExceeded("trust order entries"));
         }
         let mut trusted = BTreeMap::new();
         for _ in 0..n {
-            if d.array().map_err(|_| bad("consent order row"))? != 2 {
-                return Err(bad("consent order row arity"));
+            if d.array().map_err(|_| bad("trust order row"))? != 2 {
+                return Err(bad("trust order row arity"));
             }
-            let fp = Digest32::try_from(d.bytes().map_err(|_| bad("consent order identity"))?)
-                .map_err(|_| bad("consent order identity length"))?;
-            let v = d.uint().map_err(|_| bad("consent order value"))?;
+            let fp = Digest32::try_from(d.bytes().map_err(|_| bad("trust order identity"))?)
+                .map_err(|_| bad("trust order identity length"))?;
+            let v = d.uint().map_err(|_| bad("trust order value"))?;
             // Every value was handed out by this counter, so none can exceed it.
             if v > last {
-                return Err(bad("consent order value past the counter"));
+                return Err(bad("trust order value past the counter"));
             }
             trusted.insert(fp, v);
         }
-        d.finish().map_err(|_| bad("consent order trailing"))?;
+        d.finish().map_err(|_| bad("trust order trailing"))?;
         Ok(Self { id, last, trusted })
     }
 
@@ -219,11 +219,11 @@ impl ConsentOrder {
             return Self::fresh();
         };
         if blob.len() < NONCE_LEN {
-            return Err(Error::MalformedAtRest("consent order blob too short"));
+            return Err(Error::MalformedAtRest("trust order blob too short"));
         }
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
         let nonce = <[u8; NONCE_LEN]>::try_from(nonce_bytes)
-            .map_err(|_| Error::MalformedAtRest("consent order nonce"))?;
+            .map_err(|_| Error::MalformedAtRest("trust order nonce"))?;
         let sealed = SealedSegment {
             nonce,
             ciphertext: ciphertext.to_vec(),
@@ -291,7 +291,7 @@ pub fn stamp_trust(
 ) -> Result<Stamp> {
     ConsentOrder::update(store, signer, |o| {
         if !o.trusted.contains_key(&fingerprint) && o.trusted.len() >= MAX_TRUSTED {
-            return Err(Error::SizeLimitExceeded("consent order entries"));
+            return Err(Error::SizeLimitExceeded("trust order entries"));
         }
         let v = o.next(at_least)?;
         o.trusted.insert(fingerprint, v.seq);

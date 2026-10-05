@@ -385,7 +385,7 @@ impl InviteLink {
             Some((id, q)) => (id, Some(q)),
             None => (rest, None),
         };
-        let channel_id = b32_decode(id_part, "room link channelID")?;
+        let channel_id = b32_decode(id_part, "room link room id")?;
         // Anchors are built as they are read: an `a=` opens one, the `b=`s that
         // follow belong to it.
         let mut anchors: Vec<BootstrapNode> = Vec::new();

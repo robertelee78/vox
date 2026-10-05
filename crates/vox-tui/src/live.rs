@@ -566,12 +566,12 @@ impl DaemonCore {
             }
             NodeEvent::PeerJoined { peer, .. } => {
                 self.notice = Some(format!(
-                    "{} joined — they read nothing until you consent",
+                    "{} joined — they read nothing until you trust them",
                     self.member_name(&peer)
                 ));
             }
             NodeEvent::Consented { target, .. } => {
-                self.notice = Some(format!("consented to {}", self.member_name(&target)));
+                self.notice = Some(format!("you now trust {}", self.member_name(&target)));
             }
             NodeEvent::SenderKeyReceived {
                 channel_id,
@@ -586,11 +586,11 @@ impl DaemonCore {
                 rows_in(self, channel_id, backfilled as usize);
                 self.notice = Some(if backfilled > 0 {
                     format!(
-                        "{} consented to you — {backfilled} earlier message(s) now readable",
+                        "{} trusts you — {backfilled} earlier message(s) now readable",
                         self.member_name(&peer)
                     )
                 } else {
-                    format!("{} consented to you", self.member_name(&peer))
+                    format!("{} trusts you", self.member_name(&peer))
                 });
             }
             NodeEvent::Synced {

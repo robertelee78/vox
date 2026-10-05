@@ -2255,6 +2255,19 @@ const JOIN_ADDRESS_PATIENCE: Duration = Duration::from_secs(20);
 /// Poll interval while waiting for it. One extra board fetch is cheap; a failed join is not.
 const JOIN_ADDRESS_POLL: Duration = Duration::from_millis(250);
 
+/// How long after this node answers a join a failed sync with the joiner is taken for the join
+/// still settling, and not said as a failed sync (#406).
+///
+/// This node pushes to a joiner the moment it is admitted, and the joiner is not ready for it: it
+/// holds the room only once it has sealed the room's key, seconds of Argon2id ("epoch mismatch");
+/// `vox connect` joins in a process that then exits ("transport failed"); the node attached after
+/// it is still reopening the room ("authenticator invalid"). Each is expected, and nothing a
+/// person can act on: measured, an ordinary `vox serve` and `vox connect` printed two. 60 s is an
+/// order of magnitude past the seal, and two of the 30 s `Policy` backoffs a refusal takes, so a
+/// retry inside it normally succeeds. A failure after it, or after the joiner has synced cleanly
+/// once, is reported as before.
+const JOINER_SEAL_GRACE: Duration = Duration::from_secs(60);
+
 /// How many members a join will try when the link pins no responder.
 ///
 /// Each attempt runs the ADR-005 join, which carries a proof of work, so walking every
@@ -3630,6 +3643,10 @@ pub struct Node {
     sync_book: crate::node::status::SharedSyncBook,
     /// Rooms this node is joining right now (their join is on a `Joiner` task).
     joining: std::collections::BTreeSet<Digest32>,
+    /// Joins this node answered, `(room, joiner)`, and when: until the joiner's first clean
+    /// session, or [`JOINER_SEAL_GRACE`], a session with it that fails is the join still settling,
+    /// not a failed sync, and is not reported (#406).
+    joins_answered: BTreeMap<(Digest32, Digest32), std::time::Instant>,
     /// Rooms being reopened off the actor at unlock (#208). A room leaves this set when it is
     /// held, closed, or the identity locks; a reopened room not in it is dropped, not held.
     reopening: std::collections::BTreeSet<Digest32>,
@@ -4132,6 +4149,7 @@ impl Node {
             join_tasks: tokio::task::JoinSet::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
+            joins_answered: BTreeMap::new(),
             reopening: std::collections::BTreeSet::new(),
             reopen_task: None,
             unlock_waiters: Vec::new(),
@@ -5404,7 +5422,7 @@ impl Node {
                     // ordinary opening move of a join, which cures when a member mirrors us
                     // onward. Say nothing until it has had time to cure.
                     let not_yet_vouched = matches!(kind, "our member bundle" | "our address")
-                        && why.contains("author is not a channel member");
+                        && why.contains("author is not a room member");
                     // Our own record refused as stale is cured by the republish past the second
                     // (`NetEvent::RepublishTo`); said only if it is still refused after that.
                     let stale = own_stale_refusal(kind, &Some(why.clone()));
@@ -6924,7 +6942,18 @@ impl Node {
                 if report.fail.is_none() && report.out.complete {
                     self.settle_room(&channel_id).await;
                 }
-                if current {
+                // A joiner this node let in, not ready for the room yet, fails a session with
+                // it: the join still settling, not a failure (#406). Its first clean session ends
+                // the grace; so does `JOINER_SEAL_GRACE`.
+                let settling = if report.fail.is_none() {
+                    self.joins_answered.remove(&(channel_id, peer));
+                    false
+                } else {
+                    self.joins_answered
+                        .get(&(channel_id, peer))
+                        .is_some_and(|at| at.elapsed() < JOINER_SEAL_GRACE)
+                };
+                if current && !settling {
                     if let Some(fail) = &report.fail {
                         // Said, with its reason (PRD-001 R36), so a failure that does not resolve
                         // can be told from one that does.
@@ -7459,6 +7488,10 @@ impl Node {
         // joiner for good. The actor is serial, so releasing here — before any later
         // command is served — means everything posted after the join is readable.
         self.deliver_owed_consents(None).await;
+        self.joins_answered
+            .retain(|_, at| at.elapsed() < JOINER_SEAL_GRACE);
+        self.joins_answered
+            .insert((channel_id, peer), std::time::Instant::now());
         let _ = self
             .event_tx
             .send(NodeEvent::PeerJoined { channel_id, peer });
@@ -9057,7 +9090,7 @@ impl Node {
                 net.manager().note(
                     t,
                     format!(
-                        "its consent in room {} waits: {why}; it goes once that changes",
+                        "your key for it in room {} waits: {why}; it is sent once that changes",
                         crate::node::network::short_id(channel_id)
                     ),
                 );
@@ -14595,7 +14628,7 @@ pub fn fault_of(e: &Error) -> Fault {
         // A revocation the log has already settled, or one aimed at oneself: the
         // caller's request cannot be honoured, which is not an internal failure.
         Error::MalformedGovernance(
-            "no consent to revoke" | "an identity cannot revoke its own consent",
+            "no trust to withdraw" | "an identity cannot withdraw trust in itself",
         ) => Fault::NotConsented,
         // A sync that did not complete, or a peer that refused: the peer did not serve this, which
         // is reachability, not an internal fault (#202).

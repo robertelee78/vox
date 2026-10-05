@@ -453,7 +453,7 @@ impl RendezvousStore {
         // 1. Member-only: resolve the author's authenticated membership key. No key
         //    for this author_id ⇒ not a channel member ⇒ rejected.
         let author_pubkey = resolve_member(&record.author_id)
-            .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
+            .ok_or(Error::RendezvousRejected("author is not a room member"))?;
         // 2. Cryptographic authenticity + author binding.
         record.verify(&author_pubkey)?;
         if self.withdrawn(&record.channel_id, &record.author_id, record.timestamp) {
@@ -522,7 +522,7 @@ impl RendezvousStore {
     ) -> Result<bool> {
         // 1. Member-only.
         let author_pubkey = resolve_member(&record.author_id)
-            .ok_or(Error::RendezvousRejected("author is not a channel member"))?;
+            .ok_or(Error::RendezvousRejected("author is not a room member"))?;
         // 2. Record signature, author binding, bundle root == author, bundle
         //    self-signatures.
         record.verify(&author_pubkey)?;
@@ -790,7 +790,7 @@ impl RendezvousStore {
         // unauthenticated peer making this node allocate a bucket per fabricated channelID.
         if self.genesis(&record.channel_id).is_none() {
             return Err(Error::RendezvousRejected(
-                "pre-join for a channel this board does not serve",
+                "pre-join for a room this board does not serve",
             ));
         }
 

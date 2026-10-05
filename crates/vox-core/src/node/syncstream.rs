@@ -160,7 +160,7 @@ pub async fn read_sync_request(recv: &mut quinn::RecvStream) -> Result<(Digest32
     let channel_id: Digest32 = d
         .bytes()?
         .try_into()
-        .map_err(|_| Error::MalformedGovernance("sync preamble channel_id"))?;
+        .map_err(|_| Error::MalformedGovernance("sync preamble room id"))?;
     let epoch = d.uint()?;
     d.finish()?;
     Ok((channel_id, epoch))
