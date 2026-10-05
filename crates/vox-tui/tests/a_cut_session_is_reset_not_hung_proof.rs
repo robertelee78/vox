@@ -31,9 +31,16 @@
 //!   her `vox room send` of a small offer is sent SIGTERM. It asked the daemon to withdraw the
 //!   offer and waited for the answer with no bound, so only SIGKILL ended it.
 //!
-//! Asserted: in every round of both arms the collector ends within [`BOUND`] with a reset (an
-//! error naming the connection), never by stalling and never with a clean end. With the daemon
-//! frozen, `vox room send` exits within [`STOP_WITHIN`] of SIGTERM, saying [`FROZEN_SAID`].
+//! - **Raw collector** ([`RAW_ROUNDS`] rounds, SIGINT and SIGTERM in turn): not `vox room get` but
+//!   a plain socket on the same forward of Bob's daemon, sending the same request. What any
+//!   application reaching a service through Vox sees.
+//!
+//! Asserted: in every round of the `vox room get` arms the collector ends within [`BOUND`] with
+//! a reset, or with Vox's own words for one ([`WITHDRAWN_SAID`]: `vox room get` follows its node's
+//! events, and says why a transfer failed instead of the socket's error, #406), never by
+//! stalling and never with a clean end; in every round of the raw arm the socket is reset
+//! (`ECONNRESET`), never closed cleanly and never left hanging. With the daemon frozen,
+//! `vox room send` exits within [`STOP_WITHIN`] of SIGTERM, saying [`FROZEN_SAID`].
 //!
 //! ## Preconditions (else PRODUCT (staging))
 //! Each collector had received bytes, and not the whole file, when the offer was stopped.
@@ -65,6 +72,10 @@ use sync_pair::{Member, ID_PASS, VOX};
 const ROUNDS: usize = if cfg!(debug_assertions) { 3 } else { 30 };
 /// Rounds of the SIGTERM arm, whose red was every round.
 const TERM_ROUNDS: usize = if cfg!(debug_assertions) { 2 } else { 10 };
+/// Rounds of the raw-collector arm, SIGINT and SIGTERM in turn.
+const RAW_ROUNDS: usize = if cfg!(debug_assertions) { 2 } else { 10 };
+/// What `vox room get` says of a transfer its sharer withdrew mid-way (#406).
+const WITHDRAWN_SAID: &str = "was withdrawn while it was being collected";
 const FILE_BYTES: usize = 64 << 20;
 /// A collector that is reset ends at once; one that hangs is given up on by `vox room get` after
 /// 30 s of silence.
@@ -129,6 +140,8 @@ fn said(out: &Path) -> String {
 #[derive(Debug, PartialEq, Eq)]
 enum End {
     Reset,
+    /// `vox room get` said, in Vox's words, that the sharer withdrew the offer mid-transfer.
+    Explained,
     Stalled,
     Other,
 }
@@ -237,6 +250,8 @@ fn a_cut_session_is_reset_not_hung() {
                     End::Stalled
                 } else if text.contains("reset") || text.contains("reading the transfer") {
                     End::Reset
+                } else if text.contains(WITHDRAWN_SAID) {
+                    End::Explained
                 } else {
                     eprintln!("[proof] round {round}: collector said: {}", text.trim());
                     End::Other
@@ -258,6 +273,125 @@ fn a_cut_session_is_reset_not_hung() {
         let _ = std::fs::remove_file(&file);
         ends.push((sig, end));
     }
+    // The raw arm: a plain socket on Bob's daemon's forward, as any application has.
+    let mut raw = Vec::new();
+    for round in 0..RAW_ROUNDS {
+        let sig = if round % 2 == 0 { "-INT" } else { "-TERM" };
+        let name = format!("raw{round}.bin");
+        let file = root.join(&name);
+        {
+            let mut f = std::fs::File::create(&file).expect("APPARATUS: create the offered file");
+            let chunk: Vec<u8> = (0..1 << 20)
+                .map(|i: u32| (i.wrapping_mul(37).wrapping_add(round as u32) % 251) as u8)
+                .collect();
+            for _ in 0..FILE_BYTES >> 20 {
+                f.write_all(&chunk)
+                    .expect("APPARATUS: write the offered file");
+            }
+        }
+        let send_out = root.join(format!("send-raw{round}.out"));
+        let send = spawn_vox(
+            &alice,
+            &[
+                "room",
+                "send",
+                &room,
+                file.to_str().expect("APPARATUS: a UTF-8 path"),
+            ],
+            &send_out,
+        );
+        let t0 = Instant::now();
+        while !rb.texts(cb).iter().any(|t| t.contains(&name)) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "PRODUCT (staging): raw round {round}: Bob never read the offer\n{}",
+                said(&send_out)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let tag = said(&send_out)
+            .split_whitespace()
+            .find(|w| w.starts_with("file-"))
+            .map(|w| w.trim_end_matches([',', '.', ';']).to_owned())
+            .unwrap_or_else(|| {
+                panic!(
+                    "PRODUCT (staging): raw round {round}: vox room send named no offer tag: {}",
+                    said(&send_out)
+                )
+            });
+        let host = rb
+            .author_of(cb, &name)
+            .expect("PRODUCT (staging): the offer has no author");
+        let local = rb.forward(cb, host, &tag);
+        let mut sock =
+            std::net::TcpStream::connect(&local).expect("APPARATUS: connect to the forward");
+        sock.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("APPARATUS: set a read timeout");
+        write!(
+            sock,
+            "GET /{name} HTTP/1.1\r\nHost: vox\r\nConnection: close\r\n\r\n"
+        )
+        .expect("APPARATUS: write the request");
+        let mut buf = vec![0u8; 64 << 10];
+        let mut got = 0usize;
+        let t1 = Instant::now();
+        // The head and the first of the body, as `vox room get` has when the offer is stopped.
+        while got < 64 << 10 {
+            match std::io::Read::read(&mut sock, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    panic!("PRODUCT (staging): raw round {round}: reading before the cut: {e}")
+                }
+            }
+            assert!(
+                t1.elapsed() < Duration::from_secs(60),
+                "PRODUCT (staging): raw round {round}: the raw collector received {got} bytes"
+            );
+        }
+        let ok = Command::new("kill")
+            .args([sig, &send.0.id().to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "APPARATUS: kill {sig} of vox room send did not take");
+        let cut = Instant::now();
+        let end = loop {
+            match std::io::Read::read(&mut sock, &mut buf) {
+                // Draining what was queued: the reset comes after it (macOS, see above).
+                Ok(n) if n > 0 => got += n,
+                Ok(_) => break End::Other,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break End::Reset,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    eprintln!("[proof] raw round {round}: the socket ended with {e}");
+                    break End::Other;
+                }
+            }
+            if cut.elapsed() > BOUND {
+                break End::Stalled;
+            }
+        };
+        assert!(
+            got < FILE_BYTES,
+            "PRODUCT (staging): raw round {round}: the whole file arrived before the cut"
+        );
+        eprintln!(
+            "[proof] raw round {round} ({sig}): {got} of {FILE_BYTES} bytes; the socket ended \
+             {end:?} after {:?}",
+            cut.elapsed()
+        );
+        drop(sock);
+        drop(send);
+        let _ = std::fs::remove_file(&file);
+        raw.push(end);
+    }
+
     // The frozen-daemon arm: Alice's daemon is stopped (SIGSTOP), then her `vox room send` is sent
     // SIGTERM. It cannot withdraw the offer, and is to stop anyway, saying so.
     let name = "frozen.bin";
@@ -317,15 +451,32 @@ fn a_cut_session_is_reset_not_hung() {
     let mut red = Vec::new();
     for (sig, rounds) in [("-INT", ROUNDS), ("-TERM", TERM_ROUNDS)] {
         let count = |e: End| ends.iter().filter(|(s, x)| *s == sig && *x == e).count();
-        let (reset, stalled, other) = (count(End::Reset), count(End::Stalled), count(End::Other));
-        eprintln!(
-            "[proof] {sig}: {rounds} cut transfers: {reset} reset, {stalled} stalled, {other} other"
+        let (reset, explained, stalled, other) = (
+            count(End::Reset),
+            count(End::Explained),
+            count(End::Stalled),
+            count(End::Other),
         );
-        if reset != rounds {
+        eprintln!(
+            "[proof] {sig}: {rounds} cut transfers: {reset} reset, {explained} explained as \
+             withdrawn, {stalled} stalled, {other} other"
+        );
+        if reset + explained != rounds {
             red.push(format!(
-                "{sig}: {reset} of {rounds} reset, {stalled} stalled past {BOUND:?}, {other} other"
+                "{sig}: {reset} of {rounds} reset and {explained} explained, {stalled} stalled \
+                 past {BOUND:?}, {other} other"
             ));
         }
+    }
+    let raw_reset = raw.iter().filter(|e| **e == End::Reset).count();
+    eprintln!(
+        "[proof] raw collector: {RAW_ROUNDS} cut transfers: {raw_reset} reset; {:?}",
+        raw
+    );
+    if raw_reset != RAW_ROUNDS {
+        red.push(format!(
+            "raw collector: {raw_reset} of {RAW_ROUNDS} reset: {raw:?}"
+        ));
     }
     assert!(
         red.is_empty(),
