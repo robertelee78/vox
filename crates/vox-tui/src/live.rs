@@ -151,10 +151,21 @@ struct Timeline {
     projected: Option<Projected>,
 }
 
+/// What the node says of this node's own recent messages in the room on screen (ADR-028 R-6).
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Own {
+    /// `(entry, readers)`, from the read records the node can open.
+    read_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// `(entry, how many other members' nodes hold it)`.
+    held: Vec<(Digest32, u64)>,
+    /// How many other members the room has.
+    others: u64,
+}
+
 struct Projected {
     me: Option<Digest32>,
     trusted: Vec<(Digest32, String)>,
-    read_by: Vec<(Digest32, Vec<Digest32>)>,
+    own: Own,
     len: usize,
     rows: std::sync::Arc<Vec<MessageView>>,
 }
@@ -167,6 +178,9 @@ impl std::fmt::Debug for DaemonCore {
             .finish_non_exhaustive()
     }
 }
+
+/// Said under a message this node sent that no other member's node is known to hold (ADR-028 R-6).
+pub const ONLY_HERE: &str = "only on this machine";
 
 /// Short display form of a fingerprint (first 8 hex chars).
 #[must_use]
@@ -813,7 +827,7 @@ impl DaemonCore {
         &mut self,
         me: Option<Digest32>,
         trusted: &[(Digest32, String)],
-        read_by: &[(Digest32, Vec<Digest32>)],
+        own: &Own,
     ) -> std::sync::Arc<Vec<MessageView>> {
         let Some(t) = self.timeline.as_mut() else {
             return std::sync::Arc::default();
@@ -822,7 +836,7 @@ impl DaemonCore {
             if me != Some(r.author) {
                 return String::new();
             }
-            let Some((_, who)) = read_by.iter().find(|(e, _)| *e == r.entry_hash) else {
+            let Some((_, who)) = own.read_by.iter().find(|(e, _)| *e == r.entry_hash) else {
                 return String::new();
             };
             let mut names: Vec<String> = who
@@ -831,6 +845,18 @@ impl DaemonCore {
                 .collect();
             names.sort();
             names.join(", ")
+        };
+        // Where a message it sent is, while no member is known to have read it (ADR-028 R-6):
+        // from what other members' nodes said they hold, never from what was sent them.
+        let whereabouts = |r: &MessageRow| -> String {
+            if me != Some(r.author) {
+                return String::new();
+            }
+            match own.held.iter().find(|(e, _)| *e == r.entry_hash) {
+                None => String::new(),
+                Some((_, 0)) => ONLY_HERE.to_owned(),
+                Some((_, n)) => format!("on {n} of {} members' nodes", own.others),
+            }
         };
         let view_of = |r: &MessageRow| MessageView {
             entry_hash: r.entry_hash,
@@ -856,12 +882,13 @@ impl DaemonCore {
             }),
             late: r.late,
             read_by: readers(r),
+            whereabouts: whereabouts(r),
         };
         match t.projected.as_mut() {
             Some(p)
                 if p.me == me
                     && p.trusted.as_slice() == trusted
-                    && p.read_by.as_slice() == read_by
+                    && p.own == *own
                     && p.len <= t.rows.len() =>
             {
                 if p.len < t.rows.len() {
@@ -876,7 +903,7 @@ impl DaemonCore {
                 t.projected = Some(Projected {
                     me,
                     trusted: trusted.to_vec(),
-                    read_by: read_by.to_vec(),
+                    own: own.clone(),
                     len: t.rows.len(),
                     rows: std::sync::Arc::clone(&rows),
                 });
@@ -919,7 +946,12 @@ impl DaemonCore {
             .collect();
         let timeline = self.active.and_then(|cid| {
             let room = snap.open.iter().find(|d| d.channel_id == cid)?;
-            Some(self.project_timeline(me, &snap.trusted, &room.read_by))
+            let own = Own {
+                read_by: room.read_by.clone(),
+                held: room.held.clone(),
+                others: room.members.iter().filter(|m| me != Some(**m)).count() as u64,
+            };
+            Some(self.project_timeline(me, &snap.trusted, &own))
         });
         let active = self.active.and_then(|cid| {
             snap.open

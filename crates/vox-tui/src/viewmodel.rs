@@ -71,6 +71,10 @@ pub struct MessageView {
     /// read records it can open say (ADR-028 R-6, RR-3): `ann, bea`; empty when it knows of no
     /// reader. A member that does not trust this node is never here, read or not.
     pub read_by: String,
+    /// Under a message this node sent that no member is known to have read, where it is (ADR-028
+    /// R-6): "only on this machine", or "on N of M members' nodes" from what their nodes said they
+    /// hold. Empty when the node does not say.
+    pub whereabouts: String,
 }
 
 impl MessageView {

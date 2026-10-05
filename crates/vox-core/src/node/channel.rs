@@ -171,6 +171,43 @@ const FORKS_VERSION: u64 = 1;
 /// still writes nothing when it reopens the room. See `ChannelState::settled`.
 const SEG_UNSETTLED: u64 = 13;
 
+/// How far each member's node holds this identity's feed here, as that node last said in a sync
+/// (ADR-028 R-6, #482), within [`SegmentKind::KeyMaterial`]: what "on N of M members' nodes" is
+/// counted from, kept so a restart does not say "only on this machine" of what was delivered.
+const SEG_HELD: u64 = 14;
+
+/// Encoding version of [`SEG_HELD`].
+const HELD_VERSION: u64 = 1;
+
+fn held_bytes(held: &BTreeMap<Digest32, u64>) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(HELD_VERSION).array(held.len());
+    for (member, seq) in held {
+        e.array(2).bytes(member).uint(*seq);
+    }
+    e.finish()
+}
+
+fn parse_held(bytes: &[u8]) -> Result<BTreeMap<Digest32, u64>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 || d.uint()? != HELD_VERSION {
+        return Err(Error::MalformedAtRest("room held-by record"));
+    }
+    let mut out = BTreeMap::new();
+    for _ in 0..d.array()? {
+        if d.array()? != 2 {
+            return Err(Error::MalformedAtRest("room held-by entry"));
+        }
+        let member: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("room held-by member"))?;
+        out.insert(member, d.uint()?);
+    }
+    d.finish()?;
+    Ok(out)
+}
+
 pub(crate) fn forks_bytes(proofs: &[&ForkProof]) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(FORKS_VERSION).array(proofs.len());
@@ -389,6 +426,9 @@ pub struct SyncOutcome {
     pub gen_have: Option<u64>,
     /// The room's generation when the session ended.
     pub gen_end: Option<u64>,
+    /// How far the peer said it holds this identity's feed here: the highest seq its frontier
+    /// named, `0` for none (ADR-028 R-6). `None` when the session never read its frontier.
+    pub mine_held: Option<u64>,
 }
 
 impl SyncOutcome {
@@ -642,6 +682,10 @@ pub struct ChannelState {
     /// Read records decrypted into a batch not yet committed: applied by
     /// [`Self::place_committed`] once it has, as rendered rows are.
     pending_reads: Vec<(ReadRow, u64)>,
+    /// How far each other member's node holds this identity's feed here, by its own word in its
+    /// last sync with this node (ADR-028 R-6): the highest seq of the feed its frontier named.
+    /// Persisted as [`SEG_HELD`].
+    held: BTreeMap<Digest32, u64>,
     /// **Bodies owed** (V030-10): `(author, seq)` of each entry held without its body that has not
     /// expired by this node's own reckoning ([`ChannelState::body_expired`]). Asked of every peer
     /// whose feed reaches it, on every sync, until one supplies it or it expires here. May hold
@@ -1479,6 +1523,7 @@ impl ChannelState {
             read_records: BTreeMap::new(),
             reads: BTreeMap::new(),
             pending_reads: Vec::new(),
+            held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
             now_hint: now_secs,
@@ -1715,6 +1760,16 @@ impl ChannelState {
             ));
         }
 
+        // How far each member's node holds this identity's feed (ADR-028 R-6).
+        let held = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_HELD)? {
+            Some(seg) => parse_held(&open_segment(
+                &sek,
+                SegmentKind::KeyMaterial,
+                SEG_HELD,
+                &seg,
+            )?)?,
+            None => BTreeMap::new(),
+        };
         // Joined, and not yet synced since (V210-164).
         let settled = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?
@@ -1912,6 +1967,7 @@ impl ChannelState {
             read_records,
             reads,
             pending_reads: Vec::new(),
+            held,
             owed,
             owed_asked_to: None,
             now_hint: now_secs,
@@ -2155,6 +2211,7 @@ impl ChannelState {
             read_records: BTreeMap::new(),
             reads: BTreeMap::new(),
             pending_reads: Vec::new(),
+            held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
             now_hint: now_secs,
@@ -5807,6 +5864,51 @@ impl ChannelState {
             .unwrap_or_default()
     }
 
+    /// Record that `member`'s node said, in a sync, it holds this identity's feed here up to `seq`
+    /// (ADR-028 R-6). Its last word stands. Kept on disk best effort: a write that fails costs a
+    /// restart the count until the next sync, never the room.
+    pub fn note_held(&mut self, store: &Store, member: Digest32, seq: u64) {
+        if member == self.me() || self.held.get(&member) == Some(&seq) {
+            return;
+        }
+        self.held.insert(member, seq);
+        if let Ok(seg) = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_HELD,
+            &held_bytes(&self.held),
+        ) {
+            let _ = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_HELD, &seg);
+        }
+    }
+
+    /// Where this identity's own newest [`READ_BY_SHOWN`] messages here are, oldest first:
+    /// `(entry, how many of the room's other members' nodes said they hold it)` (ADR-028 R-6,
+    /// "on N of M members' nodes"). Only a node's own word counts: an entry sent to it is not
+    /// held until it says so.
+    #[must_use]
+    pub fn held_own(&self) -> Vec<(Digest32, u64)> {
+        let me = self.me();
+        let others: Vec<Digest32> = self.members().into_iter().filter(|m| *m != me).collect();
+        let mut out: Vec<(Digest32, u64)> = self
+            .timeline
+            .iter()
+            .rev()
+            .filter(|r| r.author == me)
+            .take(READ_BY_SHOWN)
+            .filter_map(|r| {
+                let seq = self.dag.get_by_hash(&r.entry_hash)?.skeleton.seq;
+                let n = others
+                    .iter()
+                    .filter(|m| self.held.get(*m).is_some_and(|h| *h >= seq))
+                    .count();
+                Some((r.entry_hash, n as u64))
+            })
+            .collect();
+        out.reverse();
+        out
+    }
+
     /// [`Self::read_by`] for this identity's own newest [`READ_BY_SHOWN`] messages here, those
     /// anyone is known to have read, oldest first: what a client shows under each message it sent
     /// (ADR-028 R-6).
@@ -6457,6 +6559,15 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
         remote: &[crate::log::sync::FeedFrontier],
     ) -> std::result::Result<Vec<crate::log::sync::WantRange>, crate::wire::WireError> {
         let mut room = self.room()?;
+        // What the peer holds of this identity's feed, by its own frontier: nothing it was sent
+        // counts until it says it holds it (ADR-028 R-6).
+        let me = room.me();
+        self.out.borrow_mut().mine_held = Some(
+            remote
+                .iter()
+                .find(|f| f.author_id == me)
+                .map_or(0, |f| f.max_seq),
+        );
         let mut wants = crate::log::sync::wants_for_unfrozen(&room.dag, remote);
         // And every body owed here that this peer's feed reaches (V030-10).
         let owed = room.owed_wants(remote, &wants);

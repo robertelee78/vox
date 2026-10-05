@@ -305,6 +305,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         frozen,
         refused_below_checkpoint,
         read_by: ch.read_by_own(),
+        held: ch.held_own(),
     }
 }
 
@@ -7386,6 +7387,15 @@ impl Node {
                             reason: fail.to_string(),
                         });
                     }
+                }
+                // How far the peer holds this node's feed, by its own frontier (ADR-028 R-6):
+                // whatever became of the session, that is what it said.
+                if let (Some(seq), Some(shared), Some(store)) = (
+                    report.out.mine_held,
+                    self.channels.get(&channel_id).map(Arc::clone),
+                    self.profile.as_ref().map(Profile::store_handle),
+                ) {
+                    shared.lock().await.note_held(&store, peer, seq);
                 }
                 self.refresh_network_view().await;
                 if report.fail.is_none() {

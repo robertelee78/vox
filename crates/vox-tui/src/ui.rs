@@ -326,11 +326,16 @@ fn render_timeline(
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(body));
-            // Under a message it sent, who has read it (ADR-028 R-6). Lines run newest first
-            // here, so it goes before the message's own.
-            let read_by = (!m.read_by.is_empty()).then(|| {
+            // Under a message it sent, who has read it, or where it is while nobody is known to
+            // have (ADR-028 R-6). Lines run newest first here, so it goes before the message's own.
+            let under = if m.read_by.is_empty() {
+                m.whereabouts.clone()
+            } else {
+                format!("{READ_BY}{}", m.read_by)
+            };
+            let read_by = (!under.is_empty()).then(|| {
                 Line::from(Span::styled(
-                    format!("  {READ_BY}{}", m.read_by),
+                    format!("  {under}"),
                     Style::default().add_modifier(Modifier::DIM),
                 ))
             });

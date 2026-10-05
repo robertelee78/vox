@@ -42,6 +42,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             room while it stays off screen;
   unreach   once Alice's and Carol's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
+  where     with Alice's and Carol's daemons stopped, under a message Bob then posts his TUI says
+            "only on this machine"; once Alice's daemon is started again and has synced, "on 1 of
+            2 members' nodes" (ADR-028 R-6, #482); Alice's daemon is then stopped again;
   idle      once the anchor is stopped too, it says "idle", with no count.
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
@@ -449,6 +452,27 @@ try:
     # Only the anchor is left to be connected to.
     tui.until(lambda: peers() == 1, 30, 1)
     claim("fewer", peers() == 1, f"with only the anchor left, status bar: {tui.display()[-2].strip()!r}")
+
+    stage("where")
+    tui.key("\r", 2)  # back into the room
+    p = run("bob", "room", "post", room, "d-001 where am i")
+    if p.returncode != 0: product(f"bob's `vox room post` with every other member offline failed: {p.stderr.strip()}")
+    if not tui.until(lambda: has(timeline(), "d-001"), 30, 1):
+        product("bob's `vox tui` never showed his own post d-001 within 30 s")
+    tui.until(lambda: under("d-001") == "only on this machine", 10, 0.5)
+    alone = under("d-001")
+    daemons["alice"] = spawn("alice", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                             "--passphrase-file", f"{S}/idpass", out="alice-again")
+    if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
+        product("alice's daemon, started again, never answered `vox room list` within 60 s: "
+                + open(f"{S}/alice-again.err").read())
+    WHERE = "on 1 of 2 members' nodes"
+    tui.until(lambda: under("d-001") == WHERE, 90, 1)
+    synced = under("d-001")
+    claim("where", alone == "only on this machine" and synced == WHERE,
+          f"under d-001 with every other member offline: {alone!r}; once alice's daemon is back: {synced!r}")
+    stop(daemons["alice"])
+    tui.key("\x1b", 2)  # Esc back to the channel list
 
     stage("idle")
     # Ctrl-C, how a person stops `vox node` (it takes no SIGTERM of its own).

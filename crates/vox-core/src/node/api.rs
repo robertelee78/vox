@@ -489,6 +489,10 @@ pub struct ChannelDetail {
     /// [`crate::node::channel::READ_BY_SHOWN`] messages that any member is known to have read,
     /// oldest first. A member whose records this node cannot open is in none of them.
     pub read_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// Where this node's own recent messages are (ADR-028 R-6): `(entry, how many of the room's
+    /// other members' nodes said they hold it)`, oldest first, for the same messages as
+    /// [`Self::read_by`] looks at.
+    pub held: Vec<(Digest32, u64)>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
