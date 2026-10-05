@@ -149,6 +149,9 @@ pub struct PeerStatus {
     pub datagrams: DatagramStats,
     /// The TLS key-exchange group its handshake negotiated, as rustls observed it (V030-33).
     pub tls_group: u16,
+    /// Its receiver-overflow reports, both ways, and what this end's controller made of the
+    /// peer's (ADR-024 RO-7).
+    pub overflow: crate::transport::overflow::OverflowStats,
 }
 
 /// A local port forwarded to a member's service (the dial side): a door, which carries a tunnel
@@ -432,13 +435,18 @@ impl StatusReport {
         let _ = write!(j, "\"rooms\":[{}],", list(rooms));
         let peers = self.peers.iter().map(|p| {
             format!(
-                "{{\"id\":{},\"path\":{},\"relay\":{},\"rtt_ms\":{},\"tls_group\":{},\"datagrams\":{}}}",
+                "{{\"id\":{},\"path\":{},\"relay\":{},\"rtt_ms\":{},\"tls_group\":{},\"datagrams\":{},\"overflow\":{{\"reports_sent\":{},\"reports_received\":{},\"credit_packets\":{},\"cuts_skipped\":{},\"cuts_undone\":{}}}}}",
                 q(&b32_encode(&p.id)),
                 q(p.path),
                 p.relay.map_or("null".into(), |d| q(&b32_encode(&d))),
                 p.rtt_ms,
                 q(&format!("{:?}", rustls::NamedGroup::from(p.tls_group))),
-                dgram_json(&p.datagrams)
+                dgram_json(&p.datagrams),
+                p.overflow.reports_sent,
+                p.overflow.reports_received,
+                p.overflow.credit_packets,
+                p.overflow.cuts_skipped,
+                p.overflow.cuts_undone
             )
         });
         let _ = write!(j, "\"peers\":[{}],", list(peers));

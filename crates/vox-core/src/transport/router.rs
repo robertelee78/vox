@@ -139,6 +139,8 @@ pub struct DatagramRouter {
     conn: Connection,
     table: Mutex<Table>,
     counters: Counters,
+    /// Overflow reports sent to the peer (ADR-024 RO-3).
+    overflow_sent: AtomicU64,
 }
 
 impl std::fmt::Debug for DatagramRouter {
@@ -152,7 +154,15 @@ impl std::fmt::Debug for DatagramRouter {
 impl DatagramRouter {
     /// Start the router for `conn`: from here on it is the connection's only datagram
     /// reader. Must be called inside a tokio runtime.
-    pub(crate) fn start(conn: Connection) -> Arc<Self> {
+    ///
+    /// `overflow` is this end's socket's drop count, `(epoch, drops)`, for a direct connection:
+    /// reported to the peer when it changes, if the peer has sent anything since the last report
+    /// (ADR-024 RO-3). `None` over a relay circuit, whose packets reach this socket through the
+    /// relay's connection.
+    pub(crate) fn start(
+        conn: Connection,
+        overflow: Option<tokio::sync::watch::Receiver<Option<(u32, u32)>>>,
+    ) -> Arc<Self> {
         let router = Arc::new(Self {
             conn,
             table: Mutex::new(Table {
@@ -161,8 +171,9 @@ impl DatagramRouter {
                 reader: None,
             }),
             counters: Counters::default(),
+            overflow_sent: AtomicU64::new(0),
         });
-        let task = tokio::spawn(Arc::clone(&router).read_loop());
+        let task = tokio::spawn(Arc::clone(&router).read_loop(overflow));
         router.table().reader = Some(task.abort_handle());
         router
     }
@@ -271,10 +282,40 @@ impl DatagramRouter {
         self.table().flows.contains_key(&id)
     }
 
-    async fn read_loop(self: Arc<Self>) {
+    async fn read_loop(
+        self: Arc<Self>,
+        mut overflow: Option<tokio::sync::watch::Receiver<Option<(u32, u32)>>>,
+    ) {
         let mut reassembler = Reassembler::default();
-        while let Ok(raw) = self.conn.read_datagram().await {
-            self.route(&raw, &mut reassembler);
+        // The count as it stands goes first, so the peer has a mark before the first overflow it
+        // is to be told of.
+        if let Some(rx) = &mut overflow {
+            rx.mark_changed();
+        }
+        let mut reported_rx = 0u64;
+        loop {
+            let changed = async {
+                match &mut overflow {
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                raw = self.conn.read_datagram() => match raw {
+                    Ok(raw) => self.route(&raw, &mut reassembler),
+                    Err(_) => break,
+                },
+                live = changed => {
+                    if !live {
+                        overflow = None;
+                        continue;
+                    }
+                    let now = overflow
+                        .as_mut()
+                        .and_then(|rx| *rx.borrow_and_update());
+                    self.report_overflow(now, &mut reported_rx);
+                }
+            }
         }
         // The connection is gone: every flow's inbox closes, so every reader sees the
         // end rather than waiting for a datagram that cannot come, and nothing new can
@@ -284,12 +325,53 @@ impl DatagramRouter {
         t.reader = None;
     }
 
+    /// Tell the peer this socket's drop count, `now`, if it has sent anything on this connection
+    /// since the last report (`reported_rx`, its datagram count then): only a peer sending to this
+    /// end can have lost anything to its overflow (ADR-024 RO-3).
+    fn report_overflow(&self, now: Option<(u32, u32)>, reported_rx: &mut u64) {
+        let Some((epoch, drops)) = now else {
+            return;
+        };
+        let rx = self.conn.stats().udp_rx.datagrams;
+        if rx == *reported_rx {
+            return;
+        }
+        *reported_rx = rx;
+        let report = crate::transport::overflow::encode_report(epoch, drops);
+        if self.conn.send_datagram(report.into()).is_ok() {
+            bump(&self.overflow_sent, 1);
+        }
+    }
+
+    /// The peer's overflow reports, as this end has used them (ADR-024 RO-7).
+    #[must_use]
+    pub fn overflow_stats(&self) -> crate::transport::overflow::OverflowStats {
+        let mut stats = crate::transport::congestion::overflow_ledger(&self.conn)
+            .map(|l| l.stats())
+            .unwrap_or_default();
+        stats.reports_sent = self.overflow_sent.load(Ordering::Relaxed);
+        stats
+    }
+
     fn route(&self, raw: &[u8], reassembler: &mut Reassembler) {
         let c = &self.counters;
         let Some((id, rest)) = take_varint(raw) else {
             bump(&c.malformed, 1);
             return;
         };
+        // Vox's own control datagrams: flow 3 can name no flow (ADR-024 RO-2).
+        if id == crate::transport::overflow::CONTROL_FLOW {
+            match crate::transport::overflow::decode_report(rest) {
+                Some((epoch, drops)) => {
+                    if let Some(ledger) = crate::transport::congestion::overflow_ledger(&self.conn)
+                    {
+                        ledger.report(epoch, drops, Instant::now());
+                    }
+                }
+                None => bump(&c.unknown_flow, 1),
+            }
+            return;
+        }
         let Some((tx, mode)) = self.table().flows.get(&id).map(|e| (e.tx.clone(), e.mode)) else {
             bump(&c.unknown_flow, 1);
             return;

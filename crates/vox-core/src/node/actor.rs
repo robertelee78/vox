@@ -14048,6 +14048,7 @@ impl Node {
                     rtt_ms: u64::try_from(conn.quinn().rtt().as_millis()).unwrap_or(u64::MAX),
                     datagrams,
                     tls_group: conn.negotiated_group(),
+                    overflow: conn.overflow_stats(),
                 });
             }
         }

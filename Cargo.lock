@@ -3142,6 +3142,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "vox-sockdrops",
  "vox-text",
  "x25519-dalek",
  "x509-parser 0.16.0",
@@ -3156,6 +3157,13 @@ dependencies = [
  "tokio",
  "uniffi",
  "vox-core",
+]
+
+[[package]]
+name = "vox-sockdrops"
+version = "0.3.1"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

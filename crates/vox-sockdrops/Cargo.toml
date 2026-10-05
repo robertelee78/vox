@@ -1,0 +1,13 @@
+[package]
+name = "vox-sockdrops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "The one getsockopt Vox needs that its safe dependencies do not offer: a UDP socket's own drop count (SO_MEMINFO). The only Vox crate that allows unsafe."
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"

@@ -68,7 +68,10 @@
 
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
-optional_proof::not_run!(r41_a_tunnel_does_not_throttle_the_link_it_runs_over);
+optional_proof::not_run!(
+    r41_a_tunnel_does_not_throttle_the_link_it_runs_over,
+    r41a_a_stalled_receiver_behind_a_short_buffer_keeps_its_speed
+);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -790,6 +793,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 #[ignore = "three real vox processes, production Argon2id and ~2 GB through an emulated link; optional, run it in release"]
 fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
+    let _alone = one_run();
     // The raw-TCP links take about 4 minutes; ADR-024's arms add about 10 (each runs a settle and a
     // judged stretch, 60 s on the congested ones). The watchdog bounds a hung run, so it gets both
     // and a margin: at 600 s it aborted a run that had measured every arm.
@@ -800,162 +804,20 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         .unwrap_or(MIN_RATIO);
     shown(&format!("uptime at start: {}", uptime()));
 
-    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let anchor_dir = tmp.path().join("anchor");
-    let host_dir = tmp.path().join("host");
-    let guest_dir = tmp.path().join("guest");
-    for d in [&anchor_dir, &host_dir, &guest_dir] {
-        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
-    }
-    let (port, done) = sink();
-    let link: Shared = Arc::new(Mutex::new(None));
-
-    let anchor = Proc::spawn(
-        "anchor",
-        &anchor_dir,
-        &["node", "--listen", "127.0.0.1:0"],
-        &[],
-    );
-    let spec = anchor
-        .expect_line("an --anchor spec", |l| {
-            l.trim_start().contains('@')
-                && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
-        })
-        .trim()
-        .to_owned();
-
-    let (ok, host_fp, err) = vox_once(&host_dir, &["id"]);
-    assert!(ok, "PRODUCT: host id: {err}");
-    let (ok, guest_fp, err) = vox_once(&guest_dir, &["id"]);
-    assert!(ok, "PRODUCT: guest id: {err}");
-    let (ok, _, err) = vox_once(
-        &host_dir,
-        &["trust", "add", guest_fp.trim(), "--name", "guest"],
-    );
-    assert!(ok, "PRODUCT (staging): host trusts guest: {err}");
-
-    // The host listens on a known port behind the UDP shaper, and advertises only the shaper.
-    let host_port = {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
-        probe
-            .local_addr()
-            .expect("APPARATUS: read a socket the proof bound")
-            .port()
-    };
-    let host_listen = format!("127.0.0.1:{host_port}");
-    // The tunnel's queue toward the host: the competing flow of the congested arm shares it.
-    let bottleneck = Arc::new(Mutex::new(Pacer::new()));
-    let (shaped, carried) = udp_shaper(
-        host_listen
-            .parse()
-            .expect("APPARATUS: a socket address the proof wrote"),
-        Arc::clone(&link),
-        Arc::clone(&bottleneck),
-        SEED_TUNNEL,
-    );
-    let _ = TUNNEL_CARRIED.set(Arc::clone(&carried));
-    let advertise = shaped.to_string();
-    let port_s = port.to_string();
-    let host = Proc::spawn(
-        "host",
-        &host_dir,
-        &[
-            "serve",
-            &format!("{port_s}={port_s}"),
-            "--anchor",
-            &spec,
-            "--listen",
-            &host_listen,
-        ],
-        &[("VOX_TEST_ADVERTISE", advertise.as_str())],
-    );
-    let room = after_label(
-        &host.expect_line("the room id", |l| l.starts_with("room ")),
-        "room",
-    );
-    let address = after_label(
-        &host.expect_line("the address", |l| l.starts_with("address ")),
-        "address",
-    );
-    let passphrase = after_label(
-        &host.expect_line("the passphrase", |l| l.starts_with("passphrase ")),
-        "passphrase",
-    );
-    assert!(
-        address.contains(&format!("/udp/{}", shaped.port())),
-        "PRODUCT (staging): the host did not advertise the shaper: {address}"
-    );
-
-    // The guest advertises nothing reachable, so the host cannot open a second, unshaped path.
-    let nowhere = [("VOX_TEST_ADVERTISE", "127.0.0.1:9")];
-    let (ok, out, err) = vox_once_env(
-        &guest_dir,
-        &[
-            "connect",
-            &address,
-            "--passphrase-file",
-            &room_pass_file(&guest_dir, &passphrase),
-            "--anchor",
-            &spec,
-            "--listen",
-            "127.0.0.1:0",
-        ],
-        &nowhere,
-    );
-    assert!(ok, "PRODUCT (staging): vox connect failed.\n{out}\n{err}");
-    let forward = Proc::spawn(
-        "forward",
-        &guest_dir,
-        &[
-            "forward",
-            &format!("{port_s}.{}.{room}.vox", host_fp.trim()),
-            "127.0.0.1:0",
-            "--anchor",
-            &spec,
-            "--listen",
-            "127.0.0.1:0",
-        ],
-        &nowhere,
-    );
-    // "vox: forwarding <addr> to <service> on <address>" (V030-25).
-    let line = forward.expect_line("the forward's bound address", |l| {
-        l.starts_with("vox: forwarding ")
-    });
-    let tunnel: SocketAddr = line
-        .split_whitespace()
-        .nth(2)
-        .expect("PRODUCT: an address")
-        .parse()
-        .expect("PRODUCT: a socket address");
-    let sink_addr: SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .expect("APPARATUS: a socket address the proof wrote");
-    let raw = tcp_shaper(sink_addr, Arc::clone(&link));
-
-    // Direct, asserted: the anchor must carry no circuit for the timed transfers.
-    let carried_line = |l: &str| l.contains("circuit(s) carried") && !l.contains(" 0 circuit(s)");
-    let circuit_lines = |a: &Proc| -> Vec<String> {
-        a.said()
-            .into_iter()
-            .filter(|l| l.contains("circuit(s) carried"))
-            .collect()
-    };
-    let _ = transfer(tunnel, &done);
-    let settle = Instant::now();
-    while circuit_lines(&anchor)
-        .last()
-        .is_some_and(|l| carried_line(l))
-        && settle.elapsed() < Duration::from_secs(120)
-    {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        !circuit_lines(&anchor)
-            .last()
-            .is_some_and(|l| carried_line(l)),
-        "PRODUCT (staging): two hosts on one loopback found no direct path; the anchor still \
-         carried their circuit 120 s after the forward came up"
-    );
+    let Staged {
+        tmp: _tmp,
+        anchor,
+        host,
+        forward,
+        tunnel,
+        raw,
+        sink_addr,
+        done,
+        carried,
+        link,
+        bottleneck,
+        ..
+    } = stage(&[]);
 
     // Unshaped first: the raw-efficiency figure. The tunnel still crosses the emulator here, so this
     // is a floor on Vox's efficiency, not a ceiling. (An unpaced blast through the emulator overruns
@@ -1112,6 +974,410 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     drop(forward);
     drop(host);
     drop(anchor);
+}
+
+/// Everything one R41 run stands on, set up as a person sets a tunnel up (see the module docs):
+/// an anchor, the host serving the sink behind the UDP shaper, the guest joined and forwarding.
+struct Staged {
+    // Field order is drop order: the processes go before the directories they run in.
+    forward: Proc,
+    host: Proc,
+    anchor: Proc,
+    tmp: tempfile::TempDir,
+    host_dir: std::path::PathBuf,
+    guest_dir: std::path::PathBuf,
+    tunnel: SocketAddr,
+    raw: SocketAddr,
+    sink_addr: SocketAddr,
+    done: mpsc::Receiver<(Instant, Instant)>,
+    carried: Arc<std::sync::atomic::AtomicU64>,
+    link: Shared,
+    bottleneck: Arc<Mutex<Pacer>>,
+}
+
+/// Stage one R41 run; `host_env` is added to the host's `vox serve`, and so to the daemon it
+/// starts.
+fn stage(host_env: &[(&str, &str)]) -> Staged {
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let anchor_dir = tmp.path().join("anchor");
+    let host_dir = tmp.path().join("host");
+    let guest_dir = tmp.path().join("guest");
+    for d in [&anchor_dir, &host_dir, &guest_dir] {
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
+    }
+    let (port, done) = sink();
+    let link: Shared = Arc::new(Mutex::new(None));
+
+    let anchor = Proc::spawn(
+        "anchor",
+        &anchor_dir,
+        &["node", "--listen", "127.0.0.1:0"],
+        &[],
+    );
+    let spec = anchor
+        .expect_line("an --anchor spec", |l| {
+            l.trim_start().contains('@')
+                && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
+        })
+        .trim()
+        .to_owned();
+
+    let (ok, host_fp, err) = vox_once(&host_dir, &["id"]);
+    assert!(ok, "PRODUCT: host id: {err}");
+    let (ok, guest_fp, err) = vox_once(&guest_dir, &["id"]);
+    assert!(ok, "PRODUCT: guest id: {err}");
+    let (ok, _, err) = vox_once(
+        &host_dir,
+        &["trust", "add", guest_fp.trim(), "--name", "guest"],
+    );
+    assert!(ok, "PRODUCT (staging): host trusts guest: {err}");
+
+    // The host listens on a known port behind the UDP shaper, and advertises only the shaper.
+    let host_port = {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
+        probe
+            .local_addr()
+            .expect("APPARATUS: read a socket the proof bound")
+            .port()
+    };
+    let host_listen = format!("127.0.0.1:{host_port}");
+    // The tunnel's queue toward the host: the competing flow of the congested arm shares it.
+    let bottleneck = Arc::new(Mutex::new(Pacer::new()));
+    let (shaped, carried) = udp_shaper(
+        host_listen
+            .parse()
+            .expect("APPARATUS: a socket address the proof wrote"),
+        Arc::clone(&link),
+        Arc::clone(&bottleneck),
+        SEED_TUNNEL,
+    );
+    let _ = TUNNEL_CARRIED.set(Arc::clone(&carried));
+    let advertise = shaped.to_string();
+    let port_s = port.to_string();
+    let host = Proc::spawn(
+        "host",
+        &host_dir,
+        &[
+            "serve",
+            &format!("{port_s}={port_s}"),
+            "--anchor",
+            &spec,
+            "--listen",
+            &host_listen,
+        ],
+        &[&[("VOX_TEST_ADVERTISE", advertise.as_str())][..], host_env].concat(),
+    );
+    let room = after_label(
+        &host.expect_line("the room id", |l| l.starts_with("room ")),
+        "room",
+    );
+    let address = after_label(
+        &host.expect_line("the address", |l| l.starts_with("address ")),
+        "address",
+    );
+    let passphrase = after_label(
+        &host.expect_line("the passphrase", |l| l.starts_with("passphrase ")),
+        "passphrase",
+    );
+    assert!(
+        address.contains(&format!("/udp/{}", shaped.port())),
+        "PRODUCT (staging): the host did not advertise the shaper: {address}"
+    );
+
+    // The guest advertises nothing reachable, so the host cannot open a second, unshaped path.
+    let nowhere = [("VOX_TEST_ADVERTISE", "127.0.0.1:9")];
+    let (ok, out, err) = vox_once_env(
+        &guest_dir,
+        &[
+            "connect",
+            &address,
+            "--passphrase-file",
+            &room_pass_file(&guest_dir, &passphrase),
+            "--anchor",
+            &spec,
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        &nowhere,
+    );
+    assert!(ok, "PRODUCT (staging): vox connect failed.\n{out}\n{err}");
+    let forward = Proc::spawn(
+        "forward",
+        &guest_dir,
+        &[
+            "forward",
+            &format!("{port_s}.{}.{room}.vox", host_fp.trim()),
+            "127.0.0.1:0",
+            "--anchor",
+            &spec,
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        &nowhere,
+    );
+    // "vox: forwarding <addr> to <service> on <address>" (V030-25).
+    let line = forward.expect_line("the forward's bound address", |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let tunnel: SocketAddr = line
+        .split_whitespace()
+        .nth(2)
+        .expect("PRODUCT: an address")
+        .parse()
+        .expect("PRODUCT: a socket address");
+    let sink_addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .expect("APPARATUS: a socket address the proof wrote");
+    let raw = tcp_shaper(sink_addr, Arc::clone(&link));
+
+    // Direct, asserted: the anchor must carry no circuit for the timed transfers.
+    let carried_line = |l: &str| l.contains("circuit(s) carried") && !l.contains(" 0 circuit(s)");
+    let circuit_lines = |a: &Proc| -> Vec<String> {
+        a.said()
+            .into_iter()
+            .filter(|l| l.contains("circuit(s) carried"))
+            .collect()
+    };
+    let _ = transfer(tunnel, &done);
+    let settle = Instant::now();
+    while circuit_lines(&anchor)
+        .last()
+        .is_some_and(|l| carried_line(l))
+        && settle.elapsed() < Duration::from_secs(120)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !circuit_lines(&anchor)
+            .last()
+            .is_some_and(|l| carried_line(l)),
+        "PRODUCT (staging): two hosts on one loopback found no direct path; the anchor still \
+         carried their circuit 120 s after the forward came up"
+    );
+    Staged {
+        forward,
+        host,
+        anchor,
+        host_dir,
+        guest_dir,
+        tmp,
+        tunnel,
+        raw,
+        sink_addr,
+        done,
+        carried,
+        link,
+        bottleneck,
+    }
+}
+
+/// One R41 run at a time in this process: the emulator's counters ([`LATENESS_US`],
+/// [`TAIL_DROPS`]) and the machine's load are the run's own.
+fn one_run() -> std::sync::MutexGuard<'static, ()> {
+    static RUN: Mutex<()> = Mutex::new(());
+    RUN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// ---- R41a: a stalled receiver behind a short buffer (#218, ADR-024 RO-1–RO-7) -------------------
+//
+// A receiver in a container on a host that keeps Linux's default `net.core.rmem_max` is granted a
+// 416 KiB socket buffer, and one that stops reading for a moment (a VM pause, a throttled cgroup)
+// overflows it. Its sender took each overflow for congestion and cut: at 1 Gbit/s and 50 ms, with
+// the receiver stopped 20 ms in every 100 ms, R41's WAN arm carried 9–10% of raw (six runs, RCA of
+// #218). The receiver now reports its socket's overflow, and the sender takes back the cuts it
+// covers.
+
+/// How long the receiving daemon is stopped…
+const STALL: Duration = Duration::from_millis(20);
+/// …in every this long.
+const STALL_EVERY: Duration = Duration::from_millis(100);
+/// A stop that lasted this much past [`STALL`] was the stopper's lateness, not the stall staged…
+const STALL_LATE: Duration = Duration::from_millis(5);
+/// …and past this share of late stops, the arm measured the stopper.
+const STALL_LATE_SHARE: f64 = 0.10;
+/// R41a's bar: at least this share of raw TCP over the same link, through the same stalls. Not R41's
+/// 90%: a receiver stopped a fifth of the time with a 416 KiB buffer loses packets whatever the
+/// sender does, and the RCA measured 68.7% with no cut at all for them.
+const STALLED_FLOOR: f64 = 0.50;
+/// What a container on a stock Linux host may ask for: `net.core.rmem_max`'s default.
+const SHORT_BUFFER: &str = "212992";
+
+/// The kernel's count of UDP datagrams dropped for a full socket buffer, IPv4 and IPv6, from
+/// `/proc/net/snmp` and `/proc/net/snmp6`; `None` off Linux.
+fn rcvbuf_errors() -> Option<u64> {
+    let v4 = std::fs::read_to_string("/proc/net/snmp").ok()?;
+    let mut lines = v4.lines().filter(|l| l.starts_with("Udp:"));
+    let (head, vals) = (lines.next()?, lines.next()?);
+    let at = head.split_whitespace().position(|h| h == "RcvbufErrors")?;
+    let mut n: u64 = vals.split_whitespace().nth(at)?.parse().ok()?;
+    if let Ok(v6) = std::fs::read_to_string("/proc/net/snmp6") {
+        n += v6
+            .lines()
+            .find_map(|l| l.strip_prefix("Udp6RcvbufErrors"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+    }
+    Some(n)
+}
+
+/// Stop the process `pid` for [`STALL`] in every [`STALL_EVERY`] until `stop` is set, as a VM
+/// pause or a throttled cgroup stops a receiver. Its stops and how many ran [`STALL_LATE`] long.
+fn stall_until(pid: u32, stop: &std::sync::atomic::AtomicBool) -> (u64, u64) {
+    let pid = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .expect("APPARATUS: the daemon's pid is a process id");
+    let (mut stops, mut late) = (0, 0);
+    let mut next = Instant::now();
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::STOP);
+        let stopped = Instant::now();
+        sleep_until(stopped + STALL);
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+        stops += 1;
+        if stopped.elapsed() > STALL + STALL_LATE {
+            late += 1;
+        }
+        next += STALL_EVERY;
+        sleep_until(next);
+    }
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
+    (stops, late)
+}
+
+/// The `overflow` object `vox status --json` gives for each peer of the node in `dir`.
+fn overflow_of(dir: &std::path::Path) -> String {
+    let (_, out, err) = vox_once(dir, &["status", "--json"]);
+    let peers: Vec<String> = serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| v["peers"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|p| format!("{}", p["overflow"]))
+        .collect();
+    if peers.is_empty() {
+        format!("(no peers in `vox status --json`: {out}{err})")
+    } else {
+        peers.join(", ")
+    }
+}
+
+/// R41a: on R41's WAN link (1 Gbit/s, 50 ms), the host receives through a 416 KiB socket buffer and
+/// its daemon is stopped 20 ms in every 100 ms; the tunnel must carry at least [`STALLED_FLOOR`] of
+/// raw TCP through the same stalls. Linux only, where the kernel counts a socket's own drops: on
+/// macOS nothing is reported by design, and the arm is CANNOT MEASURE.
+///
+/// **CANNOT MEASURE (APPARATUS)** when the staging did not happen: not Linux; the daemon did not say
+/// it was granted 416 KiB; the kernel counted no receive-buffer overflow during the transfers (the
+/// stalls overflowed nothing); the stopper ran late on more than [`STALL_LATE_SHARE`] of its stops;
+/// the emulator fell short of [`EMULATOR_FIDELITY`] or ran more than [`MAX_EMULATOR_LATENESS`] late.
+/// **PRODUCT** when all of that held and the tunnel carried less than [`STALLED_FLOOR`] of raw.
+///
+/// Mutations that must turn it red, each at its own assertion: the receiver never reports
+/// (`sample_overflow` returning at once); the sender ignores reports (`OverflowLedger::take`
+/// always false); a report's credit is spent but the cut stays (`VoxCubic::undo_cut` a no-op).
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "three real vox processes, production Argon2id and ~800 MB through an emulated link with a stopped receiver; optional, run it in release on Linux"]
+fn r41a_a_stalled_receiver_behind_a_short_buffer_keeps_its_speed() {
+    test_knobs::require(&["VOX_TEST_ADVERTISE", "VOX_TEST_UDP_RCVBUF_CAP"]);
+    let _alone = one_run();
+    watchdog::arm_for(Duration::from_secs(900));
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        panic!(
+            "CANNOT MEASURE R41a (APPARATUS): this OS keeps no per-socket drop count, so a \
+             receiver here reports no overflow by design; run it on Linux"
+        );
+    }
+    let wan = LINKS[1];
+    let st = stage(&[("VOX_TEST_UDP_RCVBUF_CAP", SHORT_BUFFER)]);
+    let log = std::fs::read_to_string(st.host_dir.join(".daemon").join("log")).unwrap_or_default();
+    assert!(
+        log.contains("UDP receive buffer 416 KiB"),
+        "CANNOT MEASURE R41a (APPARATUS): the host's daemon did not say it was granted the short \
+         buffer (asked for {SHORT_BUFFER}), so the staging did not happen; its log:\n{log}"
+    );
+    let windows = calibrate_windows(Some(wan));
+    let fidelity = windows.iter().copied().fold(f64::INFINITY, f64::min) * 8.0 / wan.bits_per_sec;
+    assert!(
+        fidelity >= EMULATOR_FIDELITY,
+        "CANNOT MEASURE R41a (APPARATUS): the emulator delivered only {:.1}% of the link in a \
+         calibration window; load {}",
+        fidelity * 100.0,
+        uptime()
+    );
+    *st.link
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned") = Some(wan);
+    std::thread::sleep(Duration::from_millis(500));
+    let pid: u32 = std::fs::read_to_string(st.host_dir.join(".daemon").join("lock"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .expect("APPARATUS: the host's daemon wrote no pid in its lock file");
+    let overflow_before = rcvbuf_errors();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopper = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || stall_until(pid, &stop))
+    };
+    let measured = measure(st.tunnel, st.raw, &st.done, &st.carried, Some(wan));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (stops, late_stops) = stopper
+        .join()
+        .expect("APPARATUS: the stopper thread panicked");
+    let overflowed = rcvbuf_errors()
+        .zip(overflow_before)
+        .map(|(after, before)| after.saturating_sub(before));
+    *st.link
+        .lock()
+        .expect("APPARATUS: a lock the proof holds was poisoned") = None;
+    let host_said = overflow_of(&st.host_dir);
+    let guest_said = overflow_of(&st.guest_dir);
+    let (t, r, rounds) = measured.unwrap_or_else(|fault| panic!("{fault}"));
+    let ratio = t / r;
+    let late = rounds.iter().map(|x| x.2).max().unwrap_or_default();
+    let summary = format!(
+        "R41a, {}, host receiving through {SHORT_BUFFER} asked (416 KiB granted) and stopped {} ms \
+         in every {} ms: tunnel {:.1} MB/s, raw {:.1} MB/s, {:.1}% (bar {:.0}%); kernel receive \
+         overflows during it {overflowed:?}; stops {stops}, late {late_stops}; emulator lateness \
+         {} ms; rounds (tunnel/raw/late) {rounds:?}\nhost's overflow per peer: {host_said}\n\
+         guest's overflow per peer: {guest_said}",
+        wan.name,
+        STALL.as_millis(),
+        STALL_EVERY.as_millis(),
+        t / 1e6,
+        r / 1e6,
+        ratio * 100.0,
+        STALLED_FLOOR * 100.0,
+        late.as_millis()
+    );
+    shown(&summary);
+    assert!(
+        late <= MAX_EMULATOR_LATENESS,
+        "CANNOT MEASURE R41a (APPARATUS): the emulator ran {} ms late\n{summary}",
+        late.as_millis()
+    );
+    assert!(
+        stops > 0 && (late_stops as f64) <= STALL_LATE_SHARE * stops as f64,
+        "CANNOT MEASURE R41a (APPARATUS): the stopper was late on {late_stops} of {stops} stops\n\
+         {summary}"
+    );
+    assert!(
+        overflowed.is_some_and(|n| n > 0),
+        "CANNOT MEASURE R41a (APPARATUS): the kernel counted no receive-buffer overflow while the \
+         receiver was stopped, so nothing was staged\n{summary}"
+    );
+    assert!(
+        ratio >= STALLED_FLOOR,
+        "R41a (PRODUCT): with the receiver stopped {} ms in every {} ms behind a 416 KiB buffer, the \
+         tunnel carried {:.1}% of raw, under {:.0}%: the sender took the receiver's overflow for \
+         congestion\n{summary}",
+        STALL.as_millis(),
+        STALL_EVERY.as_millis(),
+        ratio * 100.0,
+        STALLED_FLOOR * 100.0
+    );
 }
 
 /// One round: the tunnel's and raw's throughput, and the emulator's longest lateness during the

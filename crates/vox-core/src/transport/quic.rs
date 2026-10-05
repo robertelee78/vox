@@ -97,6 +97,54 @@ pub struct SharedEndpoint {
     /// Each node's connections, by node, so a node gone without detaching can still have its own
     /// closed ([`SharedEndpoint::evict`]). Closed ones are dropped as new ones are added.
     by_node: Mutex<std::collections::HashMap<Digest32, Vec<Connection>>>,
+    /// The socket's own drop count, `(epoch, drops)`, as the overflow sampler last read it
+    /// (ADR-024 RO-1); `None` until it has, and for a socket with no such count. Each direct
+    /// connection reports it to its peer ([`crate::transport::overflow`]).
+    overflow: tokio::sync::watch::Receiver<Option<(u32, u32)>>,
+}
+
+/// Read the drop count of the socket under `mux` (descriptor `fd`) every
+/// [`overflow::SAMPLE_EVERY`] while it receives, and publish it on `tx` when it changes (ADR-024
+/// RO-1). Ends when the socket is gone, when nobody listens, or at once where the kernel keeps no
+/// per-socket count. It holds the socket only while it reads it, so it never keeps the port bound.
+fn sample_overflow(
+    mux: std::sync::Weak<MuxSocket>,
+    fd: std::os::fd::RawFd,
+    epoch: u32,
+    tx: tokio::sync::watch::Sender<Option<(u32, u32)>>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(crate::transport::overflow::SAMPLE_EVERY);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut seen_batches = None;
+        let mut last = None;
+        loop {
+            tick.tick().await;
+            if tx.is_closed() {
+                return;
+            }
+            let Some(mux) = mux.upgrade() else {
+                return;
+            };
+            // Read only after the socket has handed something up: an idle socket costs nothing,
+            // and the first tick after a stall (the process stopped, the buffer overflowing) is the
+            // one that sees the drops.
+            let batches = mux.received();
+            if seen_batches == Some(batches) {
+                continue;
+            }
+            seen_batches = Some(batches);
+            match vox_sockdrops::recv_drops(fd) {
+                Ok(Some(drops)) if last != Some(drops) => {
+                    last = Some(drops);
+                    tx.send_replace(Some((epoch, drops)));
+                }
+                Ok(Some(_)) => {}
+                // No per-socket count here (macOS), or none the kernel will give: nothing to say.
+                Ok(None) | Err(_) => return,
+            }
+        }
+    });
 }
 
 /// One node on a [`SharedEndpoint`].
@@ -289,6 +337,27 @@ pub const MAX_UDP_PAYLOAD: u16 = 8_192;
 /// The OS may grant less, and Linux does so silently (`net.core.rmem_max`); that is not an
 /// error, but it decides the path-MTU ceiling (`mtu_ceiling_for`).
 const UDP_SOCKET_BUFFER: usize = 4 << 20;
+
+/// The test-only variable that caps the receive buffer a socket asks for, in bytes (see
+/// [`recv_buffer_asked`]).
+#[cfg(feature = "test-knobs")]
+pub const TEST_UDP_RCVBUF_CAP_ENV: &str = "VOX_TEST_UDP_RCVBUF_CAP";
+
+/// The receive buffer a socket asks for: [`UDP_SOCKET_BUFFER`], or **less**, read from
+/// `VOX_TEST_UDP_RCVBUF_CAP` in a build with the `test-knobs` feature. **Test-only: for proofs; no
+/// shipped build reads it** (V210-105). It stands for a container on a host that keeps Linux's
+/// default `net.core.rmem_max`: asked for 212992, the kernel grants 416 KiB (R41a, #218). It only
+/// ever lowers the request; unset, empty or unparsable is the real one.
+fn recv_buffer_asked() -> usize {
+    #[cfg(feature = "test-knobs")]
+    if let Some(cap) = std::env::var(TEST_UDP_RCVBUF_CAP_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return cap.min(UDP_SOCKET_BUFFER);
+    }
+    UDP_SOCKET_BUFFER
+}
 
 /// Per-stream flow-control window (and half the connection's send window), sized for the
 /// bandwidth-delay product of a 1 Gbit/s path at ~130 ms, or 10 Gbit/s at ~13 ms.
@@ -710,7 +779,7 @@ impl SharedEndpoint {
         let socket = bind_udp(addr)?;
         let effective = {
             let sock = socket2::SockRef::from(&socket);
-            let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+            let _ = sock.set_recv_buffer_size(recv_buffer_asked());
             let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
             // What the OS granted, not what was asked for: see `mtu_ceiling_for`.
             sock.recv_buffer_size().unwrap_or(0)
@@ -727,10 +796,11 @@ impl SharedEndpoint {
                 );
             });
         }
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&socket);
         let wrapped = quinn::TokioRuntime
             .wrap_udp_socket(socket)
             .map_err(|_| Error::MalformedBundle("quic endpoint bind"))?;
-        Self::bind_abstract_with(wrapped, mtu_ceiling)
+        Self::bind_abstract_with(wrapped, mtu_ceiling, Some(fd))
     }
 
     /// Bind on a caller-supplied datagram socket instead of a real UDP socket: how a simulated
@@ -740,16 +810,26 @@ impl SharedEndpoint {
     /// A TLS or endpoint setup error.
     pub fn bind_abstract(socket: Arc<dyn quinn::AsyncUdpSocket>) -> Result<Arc<Self>> {
         // A caller-supplied socket has no kernel buffer to overflow.
-        Self::bind_abstract_with(socket, MAX_UDP_PAYLOAD)
+        Self::bind_abstract_with(socket, MAX_UDP_PAYLOAD, None)
     }
 
+    /// `drops_fd` is the real socket's descriptor, for its drop count (ADR-024 RO-1); `None` for a
+    /// caller-supplied socket.
     fn bind_abstract_with(
         socket: Arc<dyn quinn::AsyncUdpSocket>,
         mtu_ceiling: u16,
+        drops_fd: Option<std::os::fd::RawFd>,
     ) -> Result<Arc<Self>> {
         // Every endpoint runs on the multiplexer, so a relay circuit can be attached to a real
         // socket and a simulated one alike.
         let mux = MuxSocket::new(socket);
+        let (overflow_tx, overflow) = tokio::sync::watch::channel(None);
+        if let Some(fd) = drops_fd {
+            // A fresh epoch per socket, so a peer never reads a restarted count as one that
+            // went backwards.
+            let epoch = u32::from_le_bytes(crate::identity::rng::random_array()?);
+            sample_overflow(Arc::downgrade(&mux), fd, epoch, overflow_tx);
+        }
         let for_endpoint: Arc<dyn quinn::AsyncUdpSocket> =
             Arc::clone(&mux) as Arc<dyn quinn::AsyncUdpSocket>;
         // One neutral leaf for every connection this endpoint makes or takes (ADR-011
@@ -782,6 +862,7 @@ impl SharedEndpoint {
             limiter: identity::AskLimiter::standard(),
             closed: tokio::sync::watch::channel(false).0,
             by_node: Mutex::new(std::collections::HashMap::new()),
+            overflow,
         }))
     }
 
@@ -951,7 +1032,9 @@ impl SharedEndpoint {
             ));
         };
         self.track(local.id(), &connection);
-        let mut conn = finish_connection(connection, local, &proven, now_secs, via_circuit)?;
+        let overflow = (!via_circuit).then(|| self.overflow.clone());
+        let mut conn =
+            finish_connection(connection, local, &proven, now_secs, via_circuit, overflow)?;
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
@@ -1203,6 +1286,7 @@ impl VoxEndpoint {
             &proven,
             now_secs,
             via_circuit,
+            (!via_circuit).then(|| self.shared.overflow.clone()),
         )?;
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
@@ -1397,6 +1481,7 @@ fn finish_connection(
     proven: &identity::Proven,
     now_secs: u64,
     via_circuit: bool,
+    overflow: Option<tokio::sync::watch::Receiver<Option<(u32, u32)>>>,
 ) -> Result<VoxConnection> {
     let peer_id = proven.peer;
     // Confirm the handshake ran under the Vox configuration and read the key-exchange group it
@@ -1423,7 +1508,7 @@ fn finish_connection(
         session,
         via_circuit,
         circuit_origin: None,
-        router: DatagramRouter::start(connection.clone()),
+        router: DatagramRouter::start(connection.clone(), overflow),
         connection,
         closed_here: std::sync::OnceLock::new(),
         peer_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2091,6 +2176,13 @@ impl VoxConnection {
     #[must_use]
     pub fn datagram_stats(&self) -> DatagramStats {
         self.router.stats()
+    }
+
+    /// This connection's receiver-overflow reports, both ways, and what its controller made of
+    /// the peer's (ADR-024 RO-7).
+    #[must_use]
+    pub fn overflow_stats(&self) -> crate::transport::overflow::OverflowStats {
+        self.router.overflow_stats()
     }
 
     /// The largest packet any flow on this connection sends as one datagram right now
