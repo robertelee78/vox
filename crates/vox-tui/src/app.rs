@@ -698,20 +698,25 @@ pub fn run_node(
                     // symptom appears on somebody else's node, as a peer that cannot be reached.
                     //
                     // On change, like everything else here, so a settled anchor stays silent.
+                    //
+                    // **In words** (V210-171, #396): `1m/0p` was read cold as "peers", and the line
+                    // exists to be read without the source. The board does not count a room's
+                    // entries, so the line says nothing about them rather than imply none.
                     let board: Vec<String> = view
                         .anchoring
                         .iter()
                         .map(|a| {
                             format!(
-                                "{} {}m/{}p",
+                                "{}: {} member{}, {} pending",
                                 crate::tunnel_cli::short_id_of(&a.channel_id),
                                 a.members,
+                                if a.members == 1 { "" } else { "s" },
                                 a.pending,
                             )
                         })
                         .collect();
                     if board != last_board {
-                        println!("vox node: board — {}", board.join(", "));
+                        println!("vox node: board — {}", board.join("; "));
                         last_board = board;
                     }
                     // **Where the board points each member** (V210-51, #230): the address its live
