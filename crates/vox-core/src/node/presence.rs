@@ -157,6 +157,10 @@ pub struct NetPresence {
     changes: broadcast::Sender<Arc<NetChange>>,
     /// The last real change, for `vox status` (N-52).
     last_change: Mutex<Option<NetChange>>,
+    /// How many real changes of the machine's network this presence has seen, counted under the
+    /// mapping lock: a discovery that spans one is of the network before it, and its result is
+    /// not published (N-51).
+    generation: std::sync::atomic::AtomicU64,
     /// Why this machine's network changes are not heard, if they are not (N-49).
     unwatched: Mutex<Option<String>>,
     /// The task that hears the operating system's network events.
@@ -375,6 +379,7 @@ impl NetPresence {
             nearby: Mutex::new(None),
             changes: broadcast::channel(16).0,
             last_change: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
             unwatched: Mutex::new(None),
             watcher: Mutex::new(None),
         });
@@ -507,6 +512,9 @@ impl NetPresence {
         self.refresh_observed();
         let leased = {
             let mut m = lock(&self.mapping);
+            // Any discovery running now read the network before this change.
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if change.went.iter().any(|ip| ip.is_ipv4()) {
                 m.forget(false);
             }
@@ -699,26 +707,63 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                 let Ok(bound) = p.shared.local_addr() else {
                     return;
                 };
-                let leased = lock(&p.mapping).leased(unix_now());
+                let (leased, generation) = {
+                    let m = lock(&p.mapping);
+                    (
+                        m.leased(unix_now()),
+                        p.generation.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                };
                 (
                     bound,
                     Arc::clone(&p.rediscover),
-                    leased,
+                    (leased, generation),
                     Arc::clone(&p.races),
                 )
             };
+            let (leased, generation) = leased;
             let started = unix_now();
             let (list, granted, asks) =
                 crate::nat::reachability::advertise_endpoints(bound, &leased, &races).await;
             let due = {
                 let Some(p) = presence.upgrade() else { return };
                 let now = unix_now();
-                let due = lock(&p.mapping).take(&granted, started, now);
+                let mut m = lock(&p.mapping);
+                // **A discovery that spanned a network change is of the network before it**: its
+                // addresses are the old ones, and publishing them would undo what the change
+                // advertised (N-51). Its grants are for the old network too: deleted, and the
+                // discovery runs again at once (the change asked for one).
+                if p.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    // A renewal of a mapping still held is that mapping: kept, not deleted.
+                    let fresh: Vec<PortMapping> = granted
+                        .into_iter()
+                        .filter(|g| {
+                            !m.held.iter().any(|h| {
+                                h.method == g.method && h.server == g.server && h.nonce == g.nonce
+                            })
+                        })
+                        .collect();
+                    drop(m);
+                    p.races.release_winners();
+                    for stale in fresh {
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                crate::nat::portmap::UNMAP_PATIENCE,
+                                crate::nat::portmap::unmap(&stale),
+                            )
+                            .await;
+                        });
+                    }
+                    continue;
+                }
+                let due = m.take(&granted, started, now);
                 // The winners are held now: the races keep only what the stop must delete.
                 p.races.release_winners();
                 *lock(&p.asks) = asks;
                 p.discoveries
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Published under the mapping lock, which a change takes to count itself: a
+                // change either comes after this (and publishes after it) or is seen above.
                 p.advertised.send_replace(Some(list));
                 due
             };
