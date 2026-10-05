@@ -2048,6 +2048,17 @@ fn keyring_window() -> u64 {
     KEYRING_WINDOW_SECS
 }
 
+/// How many seconds a keyring change still goes without the passphrase, for a passphrase entered
+/// at `entered_at` (`0`: not since the node was attached) and the time `now`: `None` once a change
+/// would ask for it (ADR-028 K-9). A clock that went backwards counts as just entered, as
+/// a keyring change counts it.
+#[must_use]
+pub fn keyring_left(entered_at: u64, now: u64) -> Option<u64> {
+    let window = keyring_window();
+    let gone = now.saturating_sub(entered_at);
+    (entered_at != 0 && gone <= window).then(|| window - gone)
+}
+
 /// **For proofs only.** The keyring window in seconds instead of 30 minutes, so a proof can see a
 /// keyring change refused once it has passed. Nothing a person runs sets it. Not compiled in
 /// without the `test-knobs` feature (V210-105).
@@ -3453,9 +3464,33 @@ pub struct NodeHandle {
     net_tx: mpsc::Sender<NetEvent>,
     /// The sync counters `vox status --json` reports (ADR-025 S0b).
     sync_book: crate::node::status::SharedSyncBook,
+    /// When the identity passphrase was last entered, shared with the actor, and the actor's
+    /// clock: how long the keyring window has left (ADR-028 K-9).
+    keyring: KeyringWindow,
+}
+
+/// When the identity passphrase was last entered, shared with the actor, and the actor's clock.
+#[derive(Clone)]
+struct KeyringWindow {
+    entered: Arc<std::sync::atomic::AtomicU64>,
+    clock: Clock,
+}
+
+impl std::fmt::Debug for KeyringWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyringWindow").finish_non_exhaustive()
+    }
 }
 
 impl NodeHandle {
+    /// How many seconds a keyring change still goes without the identity passphrase, or `None`
+    /// when the next one will ask for it (ADR-028 K-9, V210-159).
+    #[must_use]
+    pub fn keyring_open_secs(&self) -> Option<u64> {
+        let KeyringWindow { entered, clock } = &self.keyring;
+        keyring_left(entered.load(std::sync::atomic::Ordering::Relaxed), clock())
+    }
+
     /// The sync counters `vox status --json` reports (ADR-025 S0b).
     #[must_use]
     pub fn sync_book(&self) -> &crate::node::status::SharedSyncBook {
@@ -4488,6 +4523,10 @@ impl Node {
         }
         let view_rx = node.view_tx.subscribe();
         let sync_book = Arc::clone(&node.sync_book);
+        let keyring = KeyringWindow {
+            entered: Arc::clone(&node.passphrase_entered_at),
+            clock: Arc::clone(&node.clock),
+        };
         // A headless node has nothing to unlock: it is on the network from the start.
         let mut node = node;
         if node.headless.is_some() {
@@ -4504,6 +4543,7 @@ impl Node {
             status_tx,
             net_tx: handle_net_tx,
             sync_book,
+            keyring,
         };
         Ok((handle, actor))
     }
@@ -4998,7 +5038,7 @@ impl Node {
         let at = self
             .passphrase_entered_at
             .load(std::sync::atomic::Ordering::Relaxed);
-        at != 0 && self.now().saturating_sub(at) <= keyring_window()
+        keyring_left(at, self.now()).is_some()
     }
 
     fn create_identity(&mut self, passphrase: &Secret) -> Outcome {
@@ -13932,6 +13972,11 @@ impl Node {
             .unwrap_or_default();
         let mut report = StatusReport {
             now,
+            keyring_open_secs: keyring_left(
+                self.passphrase_entered_at
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                now,
+            ),
             started: self.status.started,
             identity: me,
             networked: self.net.is_some(),

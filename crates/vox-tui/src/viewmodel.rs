@@ -157,6 +157,9 @@ pub struct ViewModel {
     /// The nodes attached to the daemon now, by name, kept from its attach and detach events
     /// (ADR-015 9.1).
     pub nodes: Vec<String>,
+    /// How many seconds a keyring change still goes without the identity passphrase, or `None`
+    /// when the next one will ask for it (ADR-028 K-9).
+    pub keyring_open_secs: Option<u64>,
     /// Whether `mlock` is in effect; `false` surfaces the documented zeroize-only
     /// degradation warning (ADR-015 memory-protection honesty).
     pub mlock_active: bool,

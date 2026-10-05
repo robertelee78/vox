@@ -66,6 +66,9 @@ pub struct NodeSnapshot {
     pub tunnels: Vec<LiveTunnel>,
     /// Its tunnels that ended for a reason a person should see.
     pub closed_tunnels: Vec<ClosedTunnel>,
+    /// How many seconds a keyring change still goes without the identity passphrase, or `None`
+    /// when the next one will ask for it (ADR-028 K-9).
+    pub keyring_open_secs: Option<u64>,
 }
 
 impl NodeSnapshot {
@@ -107,6 +110,7 @@ impl NodeSnapshot {
             closed_tunnels: me
                 .map(|me| crate::transport::quic::closed_tunnels(&me))
                 .unwrap_or_default(),
+            keyring_open_secs: handle.keyring_open_secs(),
         }
     }
 
@@ -114,7 +118,7 @@ impl NodeSnapshot {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(9).uint(T_SNAPSHOT_REPLY);
+        e.array(10).uint(T_SNAPSHOT_REPLY);
         e.bytes(self.me.as_ref().map_or(&[][..], |d| &d[..]));
         e.uint(u64::from(self.mlock_active));
         e.array(self.rooms.len());
@@ -169,6 +173,11 @@ impl NodeSnapshot {
                 .uint(t.closed)
                 .text(&t.why);
         }
+        // `[]` when a change will ask; else `[seconds left]`.
+        match self.keyring_open_secs {
+            Some(left) => e.array(1).uint(left),
+            None => e.array(0),
+        };
         e.finish()
     }
 
@@ -178,7 +187,7 @@ impl NodeSnapshot {
     /// If it is a snapshot reply that does not decode.
     pub fn from_bytes(body: &[u8]) -> Result<Option<Self>> {
         let mut d = Decoder::new(body);
-        if !matches!((d.array(), d.uint()), (Ok(9), Ok(T_SNAPSHOT_REPLY))) {
+        if !matches!((d.array(), d.uint()), (Ok(10), Ok(T_SNAPSHOT_REPLY))) {
             return Ok(None);
         }
         let bad = |what: &'static str| move |_| Error::MalformedIpc(what);
@@ -275,6 +284,11 @@ impl NodeSnapshot {
                 why: d.text().map_err(bad("ipc snapshot closed why"))?.to_owned(),
             });
         }
+        let keyring_open_secs = match d.array().map_err(bad("ipc snapshot keyring"))? {
+            0 => None,
+            1 => Some(d.uint().map_err(bad("ipc snapshot keyring left"))?),
+            _ => return Err(Error::MalformedIpc("ipc snapshot keyring")),
+        };
         d.finish().map_err(bad("ipc snapshot trailing"))?;
         Ok(Some(Self {
             me,
@@ -285,6 +299,7 @@ impl NodeSnapshot {
             connected_peers,
             tunnels,
             closed_tunnels,
+            keyring_open_secs,
         }))
     }
 }
@@ -409,6 +424,7 @@ mod tests {
                 closed: 6,
                 why: "closed at the other end".into(),
             }],
+            keyring_open_secs: Some(1380),
         };
         assert_eq!(
             NodeSnapshot::from_bytes(&s.to_bytes()).unwrap(),

@@ -22,7 +22,12 @@
 //! and the focused room list's border is drawn in its `accent`, both read from
 //! `assets/theme/vox-tokens.json` by this proof, so a change to a token is what the TUI draws.
 //!
-//! **The mutations that must turn it red:** `DaemonCore::attach` not putting the attach's notes in
+//! **The keyring window is on the status bar (ADR-028 K-9, #478).** The passphrase was just typed
+//! to attach the node, so a keyring change goes without it for the next 30 minutes: the status bar
+//! says `keyring open 30m`.
+//!
+//! **The mutations that must turn it red:** the keyring window left off the status bar — red as
+//! PRODUCT, quoting the bottom rows; `DaemonCore::attach` not putting the attach's notes in
 //! the notice line — red as PRODUCT, the screen saying nothing of the file; a colour hard-coded in
 //! `ui.rs` in place of a token (the base fill or the focus border) — red as PRODUCT, naming the
 //! colour drawn.
@@ -122,6 +127,17 @@ fn the_tui_says_what_attaching_its_node_said() {
         "PRODUCT: the TUI attached its node, whose anchors file ({file}) names no usable anchor, \
          and its screen does not say so: it said {said:?}\n[the screen]\n{}",
         out.stdout
+    );
+
+    // K-9: the passphrase was just typed, so the whole window is ahead.
+    println!(
+        "[proof] the status bar says the keyring is open: {}",
+        said.contains("keyring open 30m")
+    );
+    assert!(
+        said.contains("keyring open 30m"),
+        "PRODUCT: the TUI's node was just attached with its passphrase, and its status bar does \
+         not say `keyring open 30m`: it said {said:?}"
     );
 
     let colours = out
