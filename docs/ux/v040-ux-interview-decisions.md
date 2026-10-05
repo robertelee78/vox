@@ -35,3 +35,14 @@ From an outside review, agreed by the decider for v0.4.0:
 - **A small privileged helper, registered with `SMAppService` as a launchd daemon** and approved once in System Settings, creates the tunnel interface and passes its descriptor to the user-level daemon. It never sees keys or room data. It replaces the hand-started `sudo vox lan helper`.
 - **The user-level `vox daemon` is a login item** registered with `SMAppService`, so it runs before the app opens; quitting the app detaches its node (Q11).
 - **Offscreen screenshots of every window from demo data** for docs and release notes, never from a real data root. They show the look; they are not product proof. Localization (the reference does 8 languages) is not planned yet.
+
+## Note for the TUI and macOS ADRs: a record of what the node decided (2026-10-04, not decided)
+
+From an outside review, noting a pattern; whether Vox keeps such a record is the decider's call.
+- **The gap:** Vox says why at the moment it refuses (a join, a forward, a trust change, a circuit), but if no one was watching, the reason is gone except in the daemon's log text.
+- **The reference:** Bromure's Security Timeline (`/opt/bromure/Sources/AgentCoding/SecurityTimeline.swift`, `SecurityTimelineView.swift`). Every decision its engines make is one event: time, engine, condition (what it saw), decision (what it did), and a kind of allowed, blocked or info, which colours the row. Events are always recorded, appended to one JSONL file per day in the app's support folder, pruned after 90 days, reloaded at launch, and shown as one chronological table.
+- **How it would map to Vox without a new concept:** the daemon already emits these decisions as node events (`JoinFailed`, refusals with their reasons, connection notes), and writes them to `.daemon/log` when no client is subscribed. The Vox version is that same stream kept as structured events, per node, under the data root (`.daemon/decisions/<date>.jsonl`), with a "what happened" view in the TUI and the app, and `vox status` naming the latest refusals.
+- **Constraints if adopted:**
+  - It MUST hold no message text, passphrase, key or token. It names who (fingerprint or alias) and what was decided, never content, so a message's retention leaves nothing behind in it.
+  - It is local only, never sent anywhere.
+  - Its retention is the decider's call, e.g. 90 days.
