@@ -120,7 +120,9 @@ fn opencode_socket(path: &std::path::Path) -> mpsc::Receiver<(Instant, String, S
 fn hook(bob: &Worker, env: &[(&str, &str)], args: &[&str], stdin: Option<&str>) -> String {
     use std::io::Write as _;
     let mut cmd = std::process::Command::new(support::VOX);
-    cmd.env_clear();
+    cmd.env_clear()
+        // A proof's daemon never takes port 1080 (.cargo/config.toml).
+        .env("VOX_PROXY", "127.0.0.1:0");
     for key in ["PATH", "HOME", "TMPDIR"] {
         if let Some(v) = std::env::var_os(key) {
             cmd.env(key, v);

@@ -82,25 +82,31 @@ impl DaemonProxy {
         *state = match bind(self.bind, rt) {
             Ok(listener) => {
                 let bound = listener.local_addr().unwrap_or(self.bind);
+                let listed = Arc::clone(&nodes.0);
+                let cut_list = Arc::clone(&nodes.0);
                 let nodes = Arc::new(nodes);
                 let task = rt.spawn(vox_core::node::up::serve_reporting(
                     listener,
                     Arc::clone(&nodes),
                     nodes,
                     Arc::new(vox_core::tunnel::udp::UdpFlows::default()),
-                    |room: &Digest32, port: u16| {
-                        eprintln!(
-                            "vox daemon: proxy: the host withdrew access to port {port} in room \
-                             {} — that session was cut",
-                            vox_core::node::link::b32_encode(room)
-                        );
-                    },
-                    |note: vox_core::node::tunnel::TunnelNote| match note {
-                        vox_core::node::tunnel::TunnelNote::Refused(reason) => {
-                            eprintln!("vox daemon: proxy: {reason}");
+                    // Each note is the event of the node that holds the room, which the TUI, the
+                    // app, `vox up --watch` and the decision record take as they take any.
+                    move |room: &Digest32, port: u16| {
+                        if let Some((_, node)) = holder(&cut_list(), room) {
+                            node.proxy_reach_withdrawn(*room, port);
                         }
-                        vox_core::node::tunnel::TunnelNote::Closed(reason) => {
-                            eprintln!("vox daemon: proxy: tunnel closed — {reason}");
+                    },
+                    move |room: Option<Digest32>, note: vox_core::node::tunnel::TunnelNote| {
+                        let nodes = listed();
+                        match room.and_then(|room| holder(&nodes, &room)) {
+                            Some((_, node)) => node.proxy_note(note),
+                            // A name that led nowhere is said to every attached node.
+                            None => {
+                                for (_, node) in &nodes {
+                                    node.proxy_note(note.clone());
+                                }
+                            }
                         }
                     },
                 ));
@@ -186,13 +192,7 @@ impl vox_core::node::up::HostDialer for Nodes {
         host: &Digest32,
         channel_id: &Digest32,
     ) -> vox_core::error::Result<Arc<VoxConnection>> {
-        let holder = (self.0)().into_iter().find(|(_, node)| {
-            node.view()
-                .channels
-                .iter()
-                .any(|c| c.channel_id == *channel_id && c.open)
-        });
-        let Some((_, node)) = holder else {
+        let Some((_, node)) = holder(&(self.0)(), channel_id).cloned() else {
             return Err(vox_core::error::Error::Unreachable(
                 "no attached node holds that room open any more",
             ));
@@ -202,6 +202,19 @@ impl vox_core::node::up::HostDialer for Nodes {
             .connection(host, channel_id)
             .await
     }
+}
+
+/// The attached node that holds `room` open.
+fn holder<'a>(
+    nodes: &'a [(String, NodeHandle)],
+    room: &Digest32,
+) -> Option<&'a (String, NodeHandle)> {
+    nodes.iter().find(|(_, node)| {
+        node.view()
+            .channels
+            .iter()
+            .any(|c| c.channel_id == *room && c.open)
+    })
 }
 
 /// `vox up`'s question to the daemon: where is the proxy? Answered with its address or the

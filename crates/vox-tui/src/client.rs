@@ -363,6 +363,7 @@ async fn warn_if_listening_elsewhere(account: &Account, listen: SocketAddr) {
 }
 
 /// Where a held verb's identity passphrase comes from, as the command line gave it.
+#[derive(Clone)]
 pub struct Pass {
     /// `--identity-passphrase` (refused when given).
     pub flag: Option<String>,
@@ -451,6 +452,61 @@ pub async fn hold(
         at: at.attached_only(),
         me,
     })
+}
+
+/// Attach this verb's node so that it stays attached after the verb ends, if it is not attached
+/// already: `vox up`, whose answer is the daemon's proxy, which runs only while a node is
+/// attached (ADR-028 S-5). A hold would let the node go when `vox up` exits, and the proxy with it.
+///
+/// # Errors
+/// No daemon, no identity, a passphrase refused, or the daemon's refusal.
+pub async fn attach_to_stay(
+    paths: &Paths,
+    args: &NodeArgs,
+    pass: Pass,
+    waiting: Option<&crate::tunnel_cli::Waiting>,
+) -> Result<(), AppError> {
+    let account = paths.account();
+    let node = name_of(paths)?;
+    if let Some(w) = waiting {
+        w.on("the vox daemon to answer");
+    }
+    ensure_daemon(&account, args.listen, &args.anchor_specs()).await?;
+    // Held open while the passphrase is read: a daemon this started exits as idle otherwise (L-8).
+    let mut d = daemon(&account).await?;
+    if d.attached
+        .iter()
+        .any(|n| n.name == node && n.state == NodeState::Attached)
+    {
+        return Ok(());
+    }
+    if let Some(w) = waiting {
+        w.on("this node's identity passphrase");
+    }
+    let passphrase = identity_for_attach(paths, pass, false).await?;
+    if let Some(w) = waiting {
+        w.on("the daemon to attach this node");
+    }
+    match d
+        .request(DaemonRequest::Attach {
+            node,
+            passphrase: Some(passphrase),
+            keep: None,
+            rooms: Vec::new(),
+            anchors: args.anchor_specs(),
+        })
+        .await
+    {
+        Ok(DaemonFrame::Attached(_, notes)) => {
+            for note in &notes {
+                eprintln!("vox: {note}");
+            }
+            Ok(())
+        }
+        Ok(DaemonFrame::Refused(r)) => Err(AppError::Usage(r.to_string())),
+        Ok(other) => Err(unexpected_daemon(&other)),
+        Err(e) => Err(AppError::Usage(format!("the daemon did not answer: {e}"))),
+    }
 }
 
 /// The identity passphrase a node needs to attach: given, or asked for. For a verb that makes an

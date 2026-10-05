@@ -57,7 +57,9 @@ fn isolated(program: &str, home: &Path) -> Command {
     let user_home = home.join("user-home");
     std::fs::create_dir_all(&user_home).expect("APPARATUS: cannot make the temporary HOME");
     let mut c = Command::new(program);
-    c.env_clear();
+    c.env_clear()
+        // A proof's daemon never takes port 1080 (.cargo/config.toml).
+        .env("VOX_PROXY", "127.0.0.1:0");
     if let Some(path) = std::env::var_os("PATH") {
         c.env("PATH", path);
     }

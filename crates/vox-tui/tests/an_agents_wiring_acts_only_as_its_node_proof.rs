@@ -40,7 +40,9 @@ impl Dirs {
 
     fn vox(&self, args: &[&str]) -> (bool, String, String) {
         let mut c = Command::new(VOX);
-        c.env_clear();
+        c.env_clear()
+            // A proof's daemon never takes port 1080 (.cargo/config.toml).
+            .env("VOX_PROXY", "127.0.0.1:0");
         if let Some(p) = std::env::var_os("PATH") {
             c.env("PATH", p);
         }

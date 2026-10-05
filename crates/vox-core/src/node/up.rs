@@ -109,7 +109,7 @@ where
     N: Names + 'static,
 {
     let flows = Arc::new(crate::tunnel::udp::UdpFlows::default());
-    serve_reporting(listener, resolver, dialer, flows, |_, _| {}, |_| {}).await
+    serve_reporting(listener, resolver, dialer, flows, |_, _| {}, |_, _| {}).await
 }
 
 /// [`serve`], reporting each carried tunnel that was **cut by a withdrawal of reach**
@@ -120,7 +120,9 @@ where
 /// turns these into [`crate::node::api::NodeEvent::ReachWithdrawn`], which is what puts
 /// the sentence in front of the person whose `ssh` just died.
 ///
-/// A **refusal** is reported too, through `refused`. The SOCKS reply the client gets stays
+/// A **refusal** is reported too, through `refused`, with the room it concerns when the name
+/// resolved to one (`None` when it did not), so a proxy carrying several nodes' rooms can say it
+/// as the event of the node that holds the room (ADR-028 S-5). The SOCKS reply the client gets stays
 /// uniform, because which of unauthorized / no-such-service / could-not-get-there it was is not
 /// the proxy's to disclose (ADR-013). But the operator's own node is not the peer: the ladder's
 /// verdict was already kept specifically so it could be said, and returning it into a dropped
@@ -140,7 +142,7 @@ where
     D: HostDialer + 'static,
     N: Names + 'static,
     R: Fn(&Digest32, u16) + Send + Sync + 'static,
-    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
+    F: Fn(Option<Digest32>, crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
 {
     let withdrawn = Arc::new(withdrawn);
     let refused = Arc::new(refused);
@@ -374,7 +376,7 @@ where
     D: HostDialer + 'static,
     N: Names + 'static,
     R: Fn(&Digest32, u16),
-    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
+    F: Fn(Option<Digest32>, crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
 {
     use crate::node::tunnel::TunnelNote::{Closed, Refused};
     socks::negotiate(&mut stream).await?;
@@ -389,9 +391,10 @@ where
         Target::Ip(_) => {
             // Not a Vox name. Refusing is the point: a proxy on loopback that forwarded
             // arbitrary addresses would be an open relay for anything on this machine.
-            refused(Refused(
-                "a CONNECT to a bare address: vox up carries .vox names only".to_owned(),
-            ));
+            refused(
+                None,
+                Refused("a CONNECT to a bare address: vox up carries .vox names only".to_owned()),
+            );
             socks::write_reply(&mut stream, Reply::AddressNotSupported, UNSPECIFIED).await?;
             return Err(Error::MalformedTunnel(
                 "vox up carries .vox names only; configure socks5h so the name reaches it",
@@ -404,7 +407,7 @@ where
             // Said to this machine's operator only, and only about this machine's own
             // names: which part of the name matched nothing, or matched too much. The
             // SOCKS client gets the one code.
-            refused(Refused(why.to_string()));
+            refused(None, Refused(why.to_string()));
             socks::write_reply(&mut stream, Reply::NotAllowed, UNSPECIFIED).await?;
             return Err(Error::MalformedTunnel("no such .vox name on this machine"));
         }
@@ -430,7 +433,10 @@ where
             Err(why) => {
                 // The SOCKS reply is a code, and a coarse one; the sentence goes to this node's
                 // own operator. Neither says anything the host did not.
-                refused(Refused(refusal(&why, &format!("{name}:{port}"))));
+                refused(
+                    Some(room.channel_id),
+                    Refused(refusal(&why, &format!("{name}:{port}"))),
+                );
                 let reply = match why {
                     Error::TunnelDenied(_) => Reply::NotAllowed,
                     _ => Reply::GeneralFailure,
@@ -449,7 +455,10 @@ where
         }
         // Closed on purpose, here or at the host, or as stuck (V030-11): said as a close.
         Err(e @ Error::TunnelClosed(_)) => {
-            refused(Closed(format!("a session to {name}:{port}: {e}")));
+            refused(
+                Some(room.channel_id),
+                Closed(format!("a session to {name}:{port}: {e}")),
+            );
             Err(e)
         }
         other => other,
@@ -492,7 +501,7 @@ async fn associate<D, N, F>(
 where
     D: HostDialer + 'static,
     N: Names + 'static,
-    F: Fn(crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
+    F: Fn(Option<Digest32>, crate::node::tunnel::TunnelNote) + Send + Sync + 'static,
 {
     use crate::node::tunnel::TunnelNote::Refused;
     use crate::tunnel::udp;
@@ -542,7 +551,7 @@ where
                     continue;
                 }
                 let Target::Domain(name, port) = datagram.target else {
-                    refused(Refused(
+                    refused(None, Refused(
                         "a UDP datagram to a bare address: vox up carries .vox names only"
                             .to_owned(),
                     ));
@@ -557,7 +566,7 @@ where
                     let room = match resolver.lookup(&name).await {
                         Ok(room) => room,
                         Err(why) => {
-                            refused(Refused(why.to_string()));
+                            refused(None, Refused(why.to_string()));
                             continue;
                         }
                     };
@@ -573,7 +582,7 @@ where
                         _ => None,
                     };
                     if let Some(why) = why {
-                        refused(Refused(format!("{name}:{port}/udp: its sharer {why} by that name")));
+                        refused(Some(room.channel_id), Refused(format!("{name}:{port}/udp: its sharer {why} by that name")));
                         continue;
                     }
                     let label = format!(
@@ -594,7 +603,7 @@ where
                                 };
                                 udp::client_pump(flow, rx, to_client, guard).await;
                             }
-                            Err(e) => refused(Refused(refusal(&e, &format!("{name}:{port}/udp")))),
+                            Err(e) => refused(Some(room.channel_id), Refused(refusal(&e, &format!("{name}:{port}/udp")))),
                         }
                     });
                     dests.insert(key.clone(), tx);

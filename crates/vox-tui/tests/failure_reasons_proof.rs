@@ -17,7 +17,7 @@
 //! 2. `vox room join` of a room already held → not a failure: it says the room is already held,
 //!    reaches a member at the address, and keeps it as where the host is now (V210-167);
 //! 3. `vox daemon --listen` on a UDP port something else holds → that port, in use;
-//! 4. `vox up --bind` on a TCP port something else holds → that address, in use — promptly;
+//! 4. (moved: the proxy's port in use is the daemon's to report, `vox_up_binds_loopback_only_proof`);
 //! 5. `vox forward` onto a local port something else holds → that address, in use — promptly,
 //!    not after the path-waiting loop;
 //! 6. `vox trust remove` of someone never trusted → there is nothing to remove;
@@ -558,39 +558,12 @@ fn every_common_failure_names_its_cause() {
     // The service's address, the only form `vox forward` takes (V030-25).
     let service_address = format!("{port}.{host_fp}.{room}.vox");
 
-    // ---- (4) and (5): a local TCP port that is taken ----
+    // ---- (5): a local TCP port that is taken ----
     let busy = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
     let busy_addr = busy
         .local_addr()
         .expect("APPARATUS: read a socket the proof bound")
         .to_string();
-    let (ok, said, took) = vox(
-        &guest_dir,
-        &[
-            "up",
-            &room,
-            "--passphrase-file",
-            &room_pass_file(&guest_dir, &passphrase),
-            "--bind",
-            &busy_addr,
-            "--anchor",
-            &spec,
-            "--listen",
-            "127.0.0.1:0",
-        ],
-        "",
-        quick,
-    );
-    assert!(!ok, "PRODUCT: vox up on a taken port must fail");
-    assert_says(
-        "up, --bind port in use",
-        &said,
-        &[
-            &format!("cannot bring the proxy up on {busy_addr}"),
-            "already in use",
-        ],
-    );
-    eprintln!("[up, --bind port in use] reported after {took:?}");
     let (ok, said, took) = vox(
         &guest_dir,
         &[

@@ -508,7 +508,6 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) => "resolving a .vox name",
-        NetEvent::UpAll { .. } => "bringing the proxy up for every room",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
     }
 }
@@ -874,14 +873,6 @@ enum NetEvent {
     /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
     /// name that resolved to one of this node's rooms.
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
-    /// Bring the SOCKS proxy up across every room this node holds, for a `vox up` that
-    /// asked over the control socket; refusals and cut sessions go to `report`.
-    UpAll {
-        bind: std::net::SocketAddr,
-        report: mpsc::UnboundedSender<String>,
-        reply:
-            oneshot::Sender<crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)>>,
-    },
     /// A held room's address was given again and a member it names answered there (V210-167):
     /// keep what it names as the room's, dial its anchors, and answer the join.
     AddressReached {
@@ -3505,28 +3496,19 @@ impl NodeHandle {
         .await
     }
 
-    /// Bring the SOCKS proxy up across every room this node holds (`vox up` over the
-    /// control socket, PRD-001 R20). Refusals and cut sessions are sent to `report` as
-    /// sentences; the proxy runs until the returned handle is aborted.
-    ///
-    /// # Errors
-    /// If the address is not loopback, cannot be bound, or the node is not networked.
-    pub async fn up_all(
-        &self,
-        bind: std::net::SocketAddr,
-        report: mpsc::UnboundedSender<String>,
-    ) -> crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)> {
-        let (reply, rx) = oneshot::channel();
-        self.net_tx
-            .send(NetEvent::UpAll {
-                bind,
-                report,
-                reply,
-            })
-            .await
-            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?;
-        rx.await
-            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?
+    /// Say a note of the daemon's proxy (ADR-028 S-5) as this node's event, as the node's own
+    /// proxy did: a refusal or a deliberate close, which the TUI, the app, `vox up --watch` and
+    /// the decision record take like any other event.
+    pub fn proxy_note(&self, note: crate::node::tunnel::TunnelNote) {
+        let _ = self.event_tx.send(note_event(note));
+    }
+
+    /// Say that a tunnel the daemon's proxy carried into `channel_id` was cut because the host
+    /// withdrew this node's reach to `port` (ADR-017 M17.11), as this node's event.
+    pub fn proxy_reach_withdrawn(&self, channel_id: Digest32, port: u16) {
+        let _ = self
+            .event_tx
+            .send(NodeEvent::ReachWithdrawn { channel_id, port });
     }
 
     /// This node's way of reaching a member of one of its rooms, for the daemon's proxy
@@ -7408,13 +7390,6 @@ impl Node {
             }
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
-            }
-            NetEvent::UpAll {
-                bind,
-                report,
-                reply,
-            } => {
-                let _ = reply.send(self.bring_up_all(bind, report).await);
             }
             NetEvent::MemberDialer(reply) => {
                 let _ = reply.send(
@@ -13669,7 +13644,7 @@ impl Node {
                     });
                 }
             },
-            move |note: crate::node::tunnel::TunnelNote| {
+            move |_room: Option<Digest32>, note: crate::node::tunnel::TunnelNote| {
                 let _ = events.send(note_event(note));
             },
         ));
@@ -13698,67 +13673,6 @@ impl Node {
             names.name(*fp, petname);
         }
         names
-    }
-
-    /// Bring the SOCKS proxy up for every room at once (PRD-001 R20): names resolve
-    /// against the node's rooms and keyring as they are when each connection asks.
-    async fn bring_up_all(
-        &mut self,
-        bind: std::net::SocketAddr,
-        report: mpsc::UnboundedSender<String>,
-    ) -> crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)> {
-        if !bind.ip().is_loopback() {
-            return Err(crate::error::Error::MalformedTunnel(
-                "vox up binds loopback only",
-            ));
-        }
-        let net = self
-            .net
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or(crate::error::Error::Unreachable(
-                "the node is not networked",
-            ))?;
-        let listener =
-            tokio::net::TcpListener::bind(bind)
-                .await
-                .map_err(|e| crate::error::Error::Path {
-                    op: "bind the vox up proxy",
-                    detail: format!("{bind}: {e}"),
-                })?;
-        let bound = listener
-            .local_addr()
-            .map_err(|_| crate::error::Error::Unreachable("the proxy listener has no address"))?;
-        let names = Arc::new(NodeNames {
-            net_tx: self.net_tx.clone(),
-        });
-        let dialer = Arc::new(NodeDialer {
-            net,
-            channel_id: None,
-        });
-        let cut = report.clone();
-        let task = tokio::spawn(crate::node::up::serve_reporting(
-            listener,
-            names,
-            dialer,
-            Arc::clone(&self.udp_flows),
-            move |room: &Digest32, port: u16| {
-                let _ = cut.send(format!(
-                    "the host withdrew access to port {port} in room {} — that session was cut",
-                    crate::node::link::b32_encode(room)
-                ));
-            },
-            // A deliberate close is said as one, never as a refusal (V030-11).
-            move |note: crate::node::tunnel::TunnelNote| {
-                let _ = report.send(match note {
-                    crate::node::tunnel::TunnelNote::Refused(reason) => reason,
-                    crate::node::tunnel::TunnelNote::Closed(reason) => {
-                        format!("tunnel closed — {reason}")
-                    }
-                });
-            },
-        ));
-        Ok((bound, task.abort_handle()))
     }
 
     /// Start a forward: the checks that are this machine's business here, and the first dial —

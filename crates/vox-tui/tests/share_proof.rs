@@ -182,7 +182,7 @@ impl Member {
         let mut p = VoxProc::spawn(
             &format!("{} up", self.name),
             &self.dir,
-            &args(&["up", "--bind", "127.0.0.1:0"]),
+            &args(&["up", "--watch"]),
         );
         let line = p.expect_within(TIMEOUT, "vox up's address", |l| l.starts_with("vox up on "));
         let addr = line

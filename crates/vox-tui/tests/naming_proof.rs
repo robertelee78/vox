@@ -533,11 +533,7 @@ fn a_local_name_reaches_the_node_it_names() {
     }
 
     // `vox up`, no room: the proxy inside alice's daemon, across every room it holds.
-    let mut up = VoxProc::spawn(
-        "alice up",
-        &alice.dir,
-        &args(&["up", "--bind", "127.0.0.1:0"]),
-    );
+    let mut up = VoxProc::spawn("alice up", &alice.dir, &args(&["up", "--watch"]));
     let first = up.expect_line("PRODUCT (staging): vox up's address", |l| {
         l.starts_with("vox up on ")
     });

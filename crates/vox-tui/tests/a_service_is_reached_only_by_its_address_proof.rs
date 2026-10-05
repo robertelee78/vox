@@ -281,7 +281,7 @@ fn who_answers(proxy: SocketAddr, name: &str) -> Result<String, u8> {
 
 /// `vox up` in the daemon holding `dir`'s profile, and the proxy's address.
 fn up(name: &str, dir: &Path) -> (VoxProc, SocketAddr) {
-    let mut p = VoxProc::spawn(name, dir, &args(&["up", "--bind", "127.0.0.1:0"]));
+    let mut p = VoxProc::spawn(name, dir, &args(&["up", "--watch"]));
     let first = p.expect_line("PRODUCT (staging): vox up's address", |l| {
         l.starts_with("vox up on ")
     });

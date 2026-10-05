@@ -592,6 +592,12 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
         NodeEvent::TunnelClosed { reason } => {
             eprintln!("vox: tunnel closed — {reason}");
         }
+        NodeEvent::ReachWithdrawn { channel_id, port } => {
+            eprintln!(
+                "vox: the host withdrew access to port {port} in room {} — that session was cut",
+                short(channel_id)
+            );
+        }
         NodeEvent::SyncFailed {
             channel_id,
             peer,
@@ -1352,40 +1358,47 @@ pub async fn connect(
     Ok(())
 }
 
-/// `vox up [<room>]` — the local entry point: a SOCKS5 proxy, run by the daemon for this node,
-/// carrying every room the node holds (PRD-001 R20, ADR-017 decision 5) until stopped. A room
-/// named with its passphrase is opened first, if it is closed.
+/// `vox up [<room>] [--watch]` — say where this machine's `.vox` proxy is, and how to use it.
+///
+/// The proxy is the daemon's (ADR-028 S-5): it runs while any node is attached, on
+/// `127.0.0.1:1080` unless the daemon was told otherwise, and carries every room the attached
+/// nodes hold. So `vox up` starts nothing. It attaches this node if it is not attached, and leaves
+/// it attached, because the proxy runs only while a node is. It opens the named room with its
+/// passphrase, if it is closed. It asks the daemon where the proxy is, prints that with the
+/// `ProxyCommand` block, and exits. With `--watch` it stays in the foreground and prints what the
+/// proxy refuses or cuts (PRD-001 R23, R36) until stopped; the proxy runs on without it.
 ///
 /// Prints the `ProxyCommand` block rather than writing it: `~/.ssh/config` is the user's file,
 /// and a tool that edits it unasked is a tool that will one day edit it wrongly.
 ///
 /// # Errors
-/// The node not held, the room not opened, or the proxy not bound. Once up, it ends only with the
-/// daemon or the node's detach, which is an error (L-7).
+/// The node not attached, the room not opened, or the proxy not running, with the daemon's
+/// reason. Watching ends only with the daemon or the node's detach, which is an error (L-7).
 pub async fn up(
     paths: &Paths,
     args: &crate::client::NodeArgs,
     pass: crate::client::Pass,
     room: Option<(&str, Option<&str>)>,
-    bind: SocketAddr,
+    watch: bool,
     waiting: &Waiting,
 ) -> Result<(), AppError> {
+    crate::client::attach_to_stay(paths, args, pass.clone(), Some(waiting)).await?;
     let mut held = crate::client::hold(paths, args, pass, false, Some(waiting)).await?;
     if let Some((prefix, room_passphrase)) = room {
         open_named_room(&mut held.client, prefix, room_passphrase).await?;
     }
-    waiting.on("the proxy to bind");
-    let mut up = vox_core::node::nameipc::up(&held.at, bind)
+    waiting.on("the vox daemon to say where its proxy is");
+    let bound = vox_core::node::nameipc::proxy(&held.at)
         .await
         .map_err(|e| match e {
-            vox_core::error::Error::AppRefused(reason) => AppError::Usage(format!(
-                "cannot bring the proxy up on {bind}: {}",
-                tcp_bind_failure(bind).unwrap_or(reason)
-            )),
+            vox_core::error::Error::AppRefused(reason) => {
+                AppError::Usage(format!("the .vox proxy is not running: {reason}"))
+            }
             other => crate::client::said(&held.at, other),
         })?;
-    let bound = up.bound;
-    println!("vox up on {bound} — carrying every room this node holds");
+    println!(
+        "vox up on {bound} — the vox daemon's proxy, carrying every room its attached nodes hold"
+    );
     println!();
     println!("add this to ~/.ssh/config, once, for every room there will ever be:");
     println!();
@@ -1397,11 +1410,17 @@ pub async fn up(
         "then:  ssh user@<service>.<node>.<room>.vox   (`vox service list <room>` shows each one)"
     );
     println!("other tools:  ALL_PROXY=socks5h://{bound}");
-    println!("Ctrl-C to stop");
+    if !watch {
+        println!(
+            "it runs while a node is attached; `vox up --watch` shows what it refuses or cuts"
+        );
+        return Ok(());
+    }
+    println!("watching what the proxy refuses or cuts; Ctrl-C stops watching, not the proxy");
     waiting.on("the vox daemon to stop");
-    // **What the node says about its reaches is said here too** (PRD-001 R23, R36): a path that
-    // stays relayed, a peer that cannot be reached, a refusal's reason. The proxy's own notes say
-    // which name matched nothing; the node's events say what happened to the connection it made.
+    // **What the node says about its reaches is said here** (PRD-001 R23, R36): the proxy's
+    // refusals and cut tunnels are this node's events, beside a path that stays relayed, a peer
+    // that cannot be reached, or a refusal's reason.
     let mut events = crate::client::events(&held.at).await.ok();
     let closed = crate::client::hold_until_closed(&mut held.client);
     tokio::pin!(closed);
@@ -1414,10 +1433,6 @@ pub async fn up(
         };
         tokio::select! {
             why = &mut closed => return Err(why),
-            note = up.next_note() => match note {
-                Some(note) => eprintln!("vox: {note}"),
-                None => return Err((&mut closed).await),
-            },
             ev = event => match ev {
                 Ok(Some(Frame::Event(ev))) => say_if_it_explains_a_failure(&ev),
                 Ok(Some(_)) => {}
