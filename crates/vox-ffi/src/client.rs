@@ -185,6 +185,8 @@ pub struct VoxClient {
     runtime: Mutex<Option<Runtime>>,
     rt: Handle,
     socket: PathBuf,
+    /// The account's config directory.
+    config_dir: PathBuf,
     held: Slot,
 }
 
@@ -444,8 +446,16 @@ impl VoxClient {
             runtime: Mutex::new(Some(runtime)),
             rt,
             socket,
+            config_dir: account.config_dir.clone(),
             held: Arc::new(tokio::sync::Mutex::new(None)),
         }))
+    }
+
+    /// The account's config directory, where an app keeps its own settings beside vox's
+    /// (`VOX_CONFIG_DIR` when set).
+    #[must_use]
+    pub fn config_dir(&self) -> String {
+        self.config_dir.to_string_lossy().into_owned()
     }
 
     /// The nodes on this machine, as the daemon lists them.
