@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """tui_room_truth.py <vox> <tag> — V210-82 (#273), through the shipped `vox tui`.
 
-Alice creates a room; Bob and Carol join it, all through real daemons. Alice and Bob trust each
-other, so each holds the other's key; nobody trusts Carol, and Carol trusts Bob. Alice posts 70 lines, more than Bob's
+Alice creates a room; Bob, Carol and Dave join it, all through real daemons. Alice and Bob trust
+each other, so each holds the other's key; nobody trusts Carol, and Carol trusts Bob; Bob trusts
+Dave, who trusts nobody. Alice posts 70 lines, more than Bob's
 timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in a pty (pyte at
 160x50). Each claim prints one `CLAIM <name> ok|RED` line:
 
@@ -24,8 +25,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   consent   Carol, whom Bob never trusted, reads "not in keyring · you don't read each other";
             Alice, whom he did, "in keyring · reads you" (V210-155: once
             "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
-  look      in truecolour, Alice's row is "→ alice" in text.primary bold and Carol's "· <her
-            fingerprint>" in text.secondary, not bold (ADR-028 L-4); the accent is on the focused
+  look      in truecolour, Alice's row is "⇄ alice" (each trusts the other) and Dave's "→ dave" (only
+            Bob trusts him), both in text.primary bold, and Carol's "· <her fingerprint>" in
+            text.secondary, not bold (ADR-028 L-4); the accent is on the focused
             members pane's border and nowhere else (L-3);
   readby    under a message Bob posts, his TUI says nothing of readers until Alice's agent drains it
             into its turn, and then says exactly "read by alice": from the read record Alice's node
@@ -60,7 +62,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   accent    there, the accent marks only the focused list's border and the live "● online";
   idle      once the anchor is stopped too, it says "idle", with no count;
   depths    Bob's TUI opened again three ways (L-5): under NO_COLOR with an ASCII locale (LC_ALL=C)
-            it draws no colour at all and Alice reads "-> alice", bold, Carol ". <fingerprint>";
+            it draws no colour at all and Alice reads "<> alice" and Dave "-> dave", bold, and Carol
+            ". <fingerprint>";
             in 16 colours (TERM=xterm) every colour drawn is one of the 16 and the trust glyphs,
             weights and words are as in truecolour; in 256 colours (TERM=xterm-256color) Alice's
             name is index 255 and Carol's 247. In each the accent is on the focused border alone.
@@ -99,7 +102,7 @@ SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix=
 S = f"{SP}/tuit-{TAG}"
 POSTS = 70  # the timeline pane holds 43 lines at 160x50
 subprocess.run(["rm", "-rf", S])
-WHO = ["anchor", "alice", "bob", "carol"]
+WHO = ["anchor", "alice", "bob", "carol", "dave"]
 for w in WHO:
     for d in ("data", "cfg"):
         os.makedirs(f"{S}/{w}/{d}")
@@ -215,7 +218,7 @@ try:
         if m is None: product(f"{w}'s `vox id` printed no fingerprint: {r.stdout!r}")
         fp[w] = m.group(0)
     daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
-                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol")}
+                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol", "dave")}
     for w in daemons:
         if not until(lambda: run(w, "room", "list").returncode == 0, 60):
             product(f"{w}'s daemon never answered `vox room list` within 60 s: " + open(f"{S}/{w}.err").read())
@@ -232,7 +235,7 @@ try:
     # join's worth of JOIN_SECS, not two.
     joins = {w: subprocess.Popen([VOX, "room", "join", "--passphrase-file", "-", link, "--name", "m"], env=env(w),
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True) for w in ("bob", "carol")}
+                                 stderr=subprocess.PIPE, text=True) for w in ("bob", "carol", "dave")}
     PROCS.extend(joins.values())
     t_join = time.time()
     for w, p in joins.items():
@@ -242,10 +245,12 @@ try:
             t.cmd = [VOX, "room", "join"]
             raise
         if p.returncode != 0: product(f"{w}'s `vox room join` failed: {err.strip()}")
-    print(f"{TAG} bob's and carol's joins took {time.time() - t_join:.1f} s")
+    print(f"{TAG} bob's, carol's and dave's joins took {time.time() - t_join:.1f} s")
     # Carol trusts Bob, so what her label says is Bob's trust alone: a node reads only whom its
     # owner trusts (V210-118).
-    for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob")):
+    # Bob trusts Dave, and Dave trusts nobody: the one way of the three (ADR-028 L-4's `→`).
+    for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob"),
+                             ("bob", "dave", "dave")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
     stage("alice posts")
@@ -268,7 +273,7 @@ try:
         r = run("bob", "room", "read", room, "--limit", "500")
         ro = run("bob", "room", "roster", room)
         return (r.returncode == 0 and f"m-{POSTS:03d}" in r.stdout and "h-5" in r.stdout and ro.returncode == 0
-                and fp["alice"] in ro.stdout and fp["carol"] in ro.stdout)
+                and fp["alice"] in ro.stdout and fp["carol"] in ro.stdout and fp["dave"] in ro.stdout)
     if not until(bob_ready, 120, 1):
         last = run("bob", "room", "roster", room)
         product("bob's node never read m-%03d and listed alice and carol within 120 s: read %r; roster %r"
@@ -384,31 +389,37 @@ try:
     def label_of(who):
         """The state line under `who`'s name in the members pane, and whether the marker is on it."""
         rows = members_pane()
-        key = "alice" if who == "alice" else fp[who][:26]
+        key = who if who in ("alice", "dave") else fp[who][:26]
         for i, r in enumerate(rows):
             if key in r:
                 return (rows[i + 1] if i + 1 < len(rows) else ""), "▶" in r, i
         return None, False, None
 
-    def trust_look(t, glyph_in, glyph_out, primary, secondary, accent):
-        """What the members pane of `t` shows of Alice and Carol by glyph, weight and colour, and
-        whether the accent strays off the focused pane's border: (ok, detail)."""
-        ya, yc = label_of("alice")[2], label_of("carol")[2]
-        if ya is None or yc is None:
-            return False, f"alice's row {ya}, carol's row {yc}: not both in the members pane"
-        a = span(t, ya, glyph_in + "alice")
-        c = span(t, yc, glyph_out + fp["carol"][:26])
-        if a is None or c is None:
-            return False, (f"alice's row {cells_of(t, ya)[1][112:].strip()!r} (want {glyph_in!r}), carol's "
-                           f"{cells_of(t, yc)[1][112:].strip()!r} (want {glyph_out!r})")
-        a_name, c_name = a[len(glyph_in):], c[len(glyph_out):]
-        a_ok = all(x.bold and x.fg == primary for x in a_name)
-        c_ok = all(not x.bold and x.fg == secondary for x in c_name)
+    def trust_look(t, glyphs, primary, secondary, accent):
+        """What the members pane of `t` shows of Alice (`glyphs[0]`, each trusts the other), Dave
+        (`glyphs[1]`, only Bob trusts him) and Carol (`glyphs[2]`, not in Bob's keyring) by glyph,
+        weight and colour, and whether the accent strays off the focused pane's border:
+        (ok, detail)."""
+        want = {"alice": (glyphs[0], "alice", True), "dave": (glyphs[1], "dave", True),
+                "carol": (glyphs[2], fp["carol"][:26], False)}
+        ok, said = True, []
+        for who, (glyph, name, strong) in want.items():
+            y = label_of(who)[2]
+            cells = None if y is None else span(t, y, glyph + name)
+            if cells is None:
+                row = "" if y is None else cells_of(t, y)[1][112:].strip()
+                ok = False
+                said.append(f"{who}'s row {row!r} (want {glyph + name!r})")
+                continue
+            name_cells = cells[len(glyph):]
+            colour = primary if strong else secondary
+            good = all(x.bold == strong and x.fg == colour for x in name_cells)
+            ok = ok and good
+            said.append(f"{who} {glyph}name bold {name_cells[0].bold} fg {name_cells[0].fg!r} "
+                        f"(want bold {strong}, {colour!r})")
         off = stray(t, accent, cols=(112, 160))
-        return a_ok and c_ok and not off, (
-            f"alice {glyph_in}name bold {[x.bold for x in a_name][:1]} fg {a_name[0].fg!r} (want "
-            f"{primary!r}); carol {glyph_out}name bold {c_name[0].bold} fg {c_name[0].fg!r} (want "
-            f"{secondary!r}); accent cells off the focused border: {off[:6]!r}")
+        said.append(f"accent cells off the focused border: {off[:6]!r}")
+        return ok and not off, "; ".join(said)
 
     stage("consent")
     # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
@@ -426,7 +437,10 @@ try:
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
 
     stage("look")
-    ok, detail = trust_look(tui, "→ ", "· ", HEX["text.primary"], HEX["text.secondary"], {HEX["accent"]})
+    # Alice's key reaches Bob once her node has released it: wait for her ⇄ before judging.
+    tui.until(lambda: label_of("alice")[2] is not None and span(tui, label_of("alice")[2], "⇄ alice"), 60, 1)
+    ok, detail = trust_look(tui, ("⇄ ", "→ ", "· "), HEX["text.primary"], HEX["text.secondary"],
+                            {HEX["accent"]})
     claim("look", ok, f"in truecolour: {detail}")
 
     stage("readby")
@@ -633,9 +647,9 @@ try:
     claim("regions", regions(), f"sidebar: {side()!r}")
 
     stage("unreach")
-    for w in ("alice", "carol"):
+    for w in ("alice", "carol", "dave"):
         daemons[w].terminate()
-    for w in ("alice", "carol"):
+    for w in ("alice", "carol", "dave"):
         stop(daemons[w])
     gone = tui.until(lambda: any("○ offline" in r for r in rows()), 30, 1)
     claim("unreach", gone, f"with every other member's daemon stopped, list rows: {rows()!r}")
@@ -679,9 +693,9 @@ try:
     p256 = pyte.graphics.FG_BG_256
     depths = {}
     for name, extra, glyphs, colours in (
-        ("no colour", dict(NO_COLOR="1", LC_ALL="C"), ("-> ", ". "), None),
-        ("16 colours", dict(TERM="xterm"), ("→ ", "· "), "16"),
-        ("256 colours", dict(TERM="xterm-256color"), ("→ ", "· "), "256"),
+        ("no colour", dict(NO_COLOR="1", LC_ALL="C"), ("<> ", "-> ", ". "), None),
+        ("16 colours", dict(TERM="xterm"), ("⇄ ", "→ ", "· "), "16"),
+        ("256 colours", dict(TERM="xterm-256color"), ("⇄ ", "→ ", "· "), "256"),
     ):
         tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], tui_env(**extra))
         tui.pump(4)
@@ -691,18 +705,20 @@ try:
         tui.key("\r", 2)
         tui.key("\t", 1)   # timeline -> composer
         tui.key("\t", 1)   # composer -> members
-        if not tui.until(lambda: label_of("alice")[0] is not None and label_of("carol")[0] is not None, 30, 1):
-            product(f"bob's `vox tui` ({name}) never drew alice and carol in its members pane:\n{tui.text()}")
+        if not tui.until(lambda: all(label_of(w)[0] is not None for w in ("alice", "carol", "dave")), 30, 1):
+            product(f"bob's `vox tui` ({name}) never drew alice, carol and dave in its members pane:\n{tui.text()}")
         words = bare(label_of("alice")[0]) == ALICE and bare(label_of("carol")[0]) == CAROL
         if colours is None:
             drawn = {c for y in range(tui.screen.lines) for c in
                      ((x.fg, x.bg) for x in cells_of(tui, y)[0])} - {("default", "default")}
-            ya, yc = label_of("alice")[2], label_of("carol")[2]
+            ya, yd, yc = label_of("alice")[2], label_of("dave")[2], label_of("carol")[2]
             a = span(tui, ya, glyphs[0] + "alice")
-            c = span(tui, yc, glyphs[1] + fp["carol"][:26])
-            ok = a is not None and c is not None and all(x.bold for x in a[3:]) and not drawn
-            detail = (f"alice {cells_of(tui, ya)[1][112:].strip()!r} bold "
-                      f"{a is not None and all(x.bold for x in a[3:])}; carol "
+            dv = span(tui, yd, glyphs[1] + "dave")
+            c = span(tui, yc, glyphs[2] + fp["carol"][:26])
+            bold = a is not None and dv is not None and all(x.bold for x in a[3:] + dv[3:])
+            ok = bold and c is not None and not drawn
+            detail = (f"alice {cells_of(tui, ya)[1][112:].strip()!r}, dave "
+                      f"{cells_of(tui, yd)[1][112:].strip()!r}, bold {bold}; carol "
                       f"{cells_of(tui, yc)[1][112:].strip()!r}; colours drawn: {sorted(drawn)[:4]!r}")
         elif colours == "16":
             sixteen = set(p256[:16]) | {"default", "black", "red", "green", "brown", "blue", "magenta",
@@ -710,11 +726,11 @@ try:
                                         ("black", "red", "green", "brown", "blue", "magenta", "cyan", "white")}
             other = {v for y in range(tui.screen.lines) for x in cells_of(tui, y)[0]
                      for v in (x.fg, x.bg)} - sixteen
-            ok, detail = trust_look(tui, *glyphs, "default", "default", {p256[14], "brightcyan"})
+            ok, detail = trust_look(tui, glyphs, "default", "default", {p256[14], "brightcyan"})
             ok = ok and not other
             detail += f"; colours drawn outside the 16: {sorted(other)[:4]!r}"
         else:
-            ok, detail = trust_look(tui, *glyphs, p256[255], p256[247], {p256[81]})
+            ok, detail = trust_look(tui, glyphs, p256[255], p256[247], {p256[81]})
         depths[name] = ok and words
         print(f"{TAG} depth {name}: {'ok' if depths[name] else 'RED'}: words {words}; {detail}")
         if not tui.stop():

@@ -1107,10 +1107,14 @@ impl DaemonCore {
                                 // member's key only if it trusts it.
                                 trust: {
                                     let reads_you = d.consented.binary_search(m).is_ok();
+                                    let trusts_you = d.consenting.binary_search(m).is_ok();
                                     if is_me {
                                         Trust::You
                                     } else if snap.trusted.iter().any(|(t, _)| t == m) {
-                                        Trust::Trusted { reads_you }
+                                        Trust::Trusted {
+                                            reads_you,
+                                            trusts_you,
+                                        }
                                     } else {
                                         Trust::NotTrusted { reads_you }
                                     }

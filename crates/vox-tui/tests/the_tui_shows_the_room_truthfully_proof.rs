@@ -1,9 +1,10 @@
 //! The TUI shows a room as it is (V210-82, #273),
 //! through the shipped `vox tui` in a pty.
 //!
-//! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
-//! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks twenty-two claims, each
+//! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
+//! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
+//! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
+//! 160x50. It checks twenty-two claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -33,9 +34,10 @@
 //!   other", and Alice "in keyring · reads you" (the pane said "consented" for
 //!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
 //!   refuses her key; V210-155);
-//! - `look`: in truecolour, Alice's row reads "→ alice" in text.primary bold and Carol's
-//!   "· <fingerprint>" in text.secondary, not bold, and the accent is on the focused members
-//!   pane's border and nowhere else (ADR-028 L-3, L-4; colours read from the token file);
+//! - `look`: in truecolour, Alice's row reads "⇄ alice" (each trusts the other) and Dave's
+//!   "→ dave" (only Bob trusts him), both in text.primary bold, and Carol's "· <fingerprint>" in
+//!   text.secondary, not bold; the accent is on the focused members pane's border and nowhere
+//!   else (ADR-028 L-3, L-4; colours read from the token file);
 //! - `unknown`: `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command",
 //!   and the help line names none of them (they only said "not available yet"; V210-155);
 //! - `sync`: the status bar says how many peers the node is connected to, the anchor and at least
@@ -57,8 +59,8 @@
 //! - `accent`: there, the accent marks only the focused list's border and the live "● online";
 //! - `idle`: once the anchor is stopped too, it says "idle", with no count;
 //! - `depths`: Bob's TUI opened again three ways (ADR-028 L-5, #509): under `NO_COLOR` with
-//!   `LC_ALL=C` it draws no colour at all, and Alice reads "-> alice", bold, and Carol ". <her
-//!   fingerprint>", every state still read by glyph, weight and word; in 16 colours (`TERM=xterm`)
+//!   `LC_ALL=C` it draws no colour at all, and Alice reads "<> alice" and Dave "-> dave", bold, and
+//!   Carol ". <her fingerprint>", every state still read by glyph, weight and word; in 16 colours (`TERM=xterm`)
 //!   every colour drawn is one of the 16; in 256 colours Alice's name is index 255 and Carol's 247.
 //!   In each the words are as in truecolour and the accent is on the focused border alone.
 //!
@@ -72,7 +74,8 @@
 //! node that has not said it holds it, a read record named by a read record, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
 //! carries the message text or is raised per message, a room with a message to Bob grouped other
-//! than "needs you", or trust coloured with the accent (`look`, `depths`). It passes only on the
+//! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
+//! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`). It passes only on the
 //! script's PASS with all 22 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
@@ -146,7 +149,7 @@ const STALL_BUDGET: Duration = Duration::from_secs(30);
 fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (#240).
     // Its bounds are the product's: a member waits 480 s for a joiner's proof of work (V210-87),
-    // which a debug build can take minutes to grind, and the driver joins three members, then
+    // which a debug build can take minutes to grind, and the driver joins three members at once, then
     // opens the TUI three times more (`depths`, about 90 s). So
     // the driver's budget is 1260 s, it is stopped from outside at 1290 s, and the watchdog is past
     // both. A release run takes about two minutes.

@@ -39,8 +39,12 @@ pub const READ_BY: &str = "read by ";
 pub fn trust_label(t: Trust) -> Option<&'static str> {
     match t {
         Trust::You => None,
-        Trust::Trusted { reads_you: true } => Some("in keyring · reads you"),
-        Trust::Trusted { reads_you: false } => Some("in keyring · cannot read you yet"),
+        Trust::Trusted {
+            reads_you: true, ..
+        } => Some("in keyring · reads you"),
+        Trust::Trusted {
+            reads_you: false, ..
+        } => Some("in keyring · cannot read you yet"),
         Trust::NotTrusted { reads_you: true } => Some("not in keyring · still reads you"),
         Trust::NotTrusted { reads_you: false } => {
             Some("not in keyring · you don't read each other")
@@ -48,14 +52,20 @@ pub fn trust_label(t: Trust) -> Option<&'static str> {
     }
 }
 
-/// A member's trust glyph and the style of its name (ADR-028 L-4): `→` in text.primary bold for a
-/// node in your keyring, `·` in text.secondary for one that is not; nothing for yourself.
+/// A member's trust glyph and the style of its name (ADR-028 L-4): in text.primary bold, `⇄` for a
+/// node in your keyring that trusts you too and `→` for one that does not (yet); `·` in
+/// text.secondary for one not in your keyring; nothing for yourself.
 fn trust_mark(t: Trust) -> (&'static str, Style) {
     let ascii = theme::ascii();
     match t {
         Trust::You => ("", theme::fg(theme::TEXT_PRIMARY)),
-        Trust::Trusted { .. } => (
-            if ascii { "-> " } else { "→ " },
+        Trust::Trusted { trusts_you, .. } => (
+            match (ascii, trusts_you) {
+                (true, true) => "<> ",
+                (true, false) => "-> ",
+                (false, true) => "⇄ ",
+                (false, false) => "→ ",
+            },
             theme::strong(theme::TEXT_PRIMARY),
         ),
         Trust::NotTrusted { .. } => (
