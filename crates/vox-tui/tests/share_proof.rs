@@ -605,7 +605,9 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     );
     assert!(
         !bob_pulled_carols,
-        "PRODUCT: bob's node must not pull a share addressed to carol"
+        "PRODUCT: bob's node must not pull a share addressed to carol; it landed {} before he \
+         asked for it",
+        bob_dl.join("for-carol.txt").display()
     );
     assert!(
         card.len() == 2 && card[1].contains("to carol"),
