@@ -33,7 +33,12 @@
 //!   did not choose one.
 //! - **The TUI.** The same verbs typed in `vox tui` (`tests/pty/tui_room_verb.py`, a pty read
 //!   through `pyte`): carol's `:leave` drops her from alice's and bob's rosters and the room from
-//!   her store; alice's `:end` takes the room off bob's `vox room list`.
+//!   her store; alice's `:end` takes the room off bob's `vox room list`. Each first asks to be
+//!   confirmed in words that state its effect, and then says what it did, not "done" (ADR-028
+//!   E-5).
+//! - **The CLI says it too** (ADR-028 E-5): `vox room leave` and `vox room end` each say, before
+//!   they act, what they are to do (a line starting "vox: about to leave" or "vox: about to end"
+//!   that names the room), and after, what they did.
 //!
 //! **Every red names which it is.** `PRODUCT:` — `vox` did the wrong thing, and what it said is
 //! quoted; `PRODUCT (staging):` — a `vox` step of the staging failed (a create, join, post or list
@@ -44,7 +49,8 @@
 //! **Mutations that must turn it red:** a leave that keeps the room (leave, nothing left); a
 //! member that left still synced with (leave); an end that leaves the members' copies (end, idle
 //! end, TUI), or their agent cursor files (end); a post taken after the end, an admin's end ignored, or a join to an ended room
-//! refused as a wrong passphrase (end).
+//! refused as a wrong passphrase (end); the TUI's `:leave` acting with no confirmation, or saying
+//! "done" in place of what it did (TUI); the CLI's before-sentence dropped (leave).
 
 #![cfg(unix)]
 
@@ -153,6 +159,17 @@ fn cursors_of(w: &Worker, room: &str) -> Vec<String> {
 }
 
 /// `w`'s line for `room` in `vox room list`, or `None`.
+/// Whether `o` said what it was to do before it acted and what it did after (ADR-028 E-5): a line
+/// "vox: about to <verb>" naming the room "mission", and after it a line starting `after`.
+fn said_before_and_after(o: &Out, verb: &str, after: &str) -> bool {
+    let lines: Vec<&str> = o.stdout.lines().collect();
+    let before = lines
+        .iter()
+        .position(|l| l.starts_with(&format!("vox: about to {verb}")) && l.contains("\"mission\""));
+    let done = lines.iter().position(|l| l.starts_with(after));
+    matches!((before, done), (Some(b), Some(a)) if b < a)
+}
+
 fn listed(w: &Worker, room: &str) -> Option<String> {
     let short: String = room.chars().take(12).collect();
     setup(w, &["room", "list"])
@@ -380,6 +397,12 @@ fn a_room_left_leaves_nothing_on_the_node() {
         t.elapsed().as_secs_f64(),
         o.stdout.trim()
     );
+    assert!(
+        said_before_and_after(&o, "leave", "vox: left "),
+        "PRODUCT: `vox room leave` must say what it is to do, naming the room, before it acts, and \
+         what it did after: {:?}",
+        o.stdout
+    );
     // Checked the moment it answers: a leave that says it is done is done.
     assert!(
         !holds(alice, &cid),
@@ -492,6 +515,13 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
     assert!(
         o.ok,
         "PRODUCT: bob, an admin the creator named, was refused `vox room end`: {o:?}"
+    );
+    eprintln!("[proof] end: it said: {}", o.stdout.trim());
+    assert!(
+        said_before_and_after(&o, "end", "vox: ended "),
+        "PRODUCT: `vox room end` must say what it is to do, naming the room, before it acts, and \
+         what it did after: {:?}",
+        o.stdout
     );
     for w in [alice, bob, carol] {
         let (gone, o) = poll(w, &["room", "list"], GONE, |o| {

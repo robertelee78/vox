@@ -2243,6 +2243,14 @@ pub async fn service_add(
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
+    // Who it is to reach, said before it is done (ADR-028 E-5).
+    let which = room_named(&mut client, channel_id).await;
+    let reach = trusted_in(&mut client, channel_id).await;
+    println!("vox: about to offer {tag:?} at {local} in {which}");
+    println!(
+        "     the members of it in your keyring are to reach it: {}",
+        listed(&reach, "none yet")
+    );
     match client
         .request(&Request::AddService {
             channel_id,
@@ -2258,7 +2266,13 @@ pub async fn service_add(
                 "vox: offering {tag:?} at {local} in room {}",
                 crate::tunnel_cli::short_id_of(&channel_id)
             );
-            println!("     it is dark until you `vox trust add` someone — and they join this room");
+            if reach.is_empty() {
+                println!(
+                    "     it is dark until you `vox trust add` someone — and they join this room"
+                );
+            } else {
+                println!("     {} can reach it now", listed(&reach, ""));
+            }
             Ok(())
         }
         // The node's reason, as `vox service add` without a daemon gives it.
@@ -2282,6 +2296,15 @@ pub async fn service_add(
 pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
+    // What it is to cut, said before it is done (ADR-028 E-5).
+    let which = room_named(&mut client, channel_id).await;
+    let sessions = live_tunnels(paths, |_, service, inbound| inbound && service == tag).await;
+    let said: Vec<String> = sessions.iter().map(|(_, t)| t.clone()).collect();
+    println!("vox: about to stop offering {tag:?} in {which}");
+    println!(
+        "     its live sessions are to be cut: {}",
+        listed(&said, "none is open")
+    );
     match client
         .request(&Request::RemoveService {
             channel_id,
@@ -2290,7 +2313,17 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
         .await
     {
         Ok(Frame::Ok) => {
-            println!("vox: no longer offering {tag:?}; its live sessions were cut");
+            let (cut, open) = cut_since(paths, sessions).await;
+            println!(
+                "vox: no longer offering {tag:?}; live sessions cut: {}",
+                listed(&cut, "none was open")
+            );
+            if !open.is_empty() {
+                println!(
+                    "     still open: {} — `vox tunnel close` ends one",
+                    listed(&open, "")
+                );
+            }
             Ok(())
         }
         // The node's reason, as `vox service remove` without a daemon gives it (V210-83).
@@ -3665,6 +3698,21 @@ pub async fn retention(
     })?;
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
+    // What it is to do, said before it is done (ADR-028 E-5).
+    let which = room_named(&mut client, channel_id).await;
+    println!(
+        "vox: about to set how long {which} keeps messages: {}",
+        match ttl {
+            0 => "forever".to_owned(),
+            t => vox_core::node::retention::describe(t),
+        }
+    );
+    if ttl > 0 {
+        println!(
+            "     older messages are to be removed: on every member's node if you created the \
+             room or are its admin, on this node alone otherwise"
+        );
+    }
     match client
         .request(&Request::SetRetention {
             channel_id,
@@ -3793,6 +3841,151 @@ async fn keyring_change(
     }
 }
 
+// ------------------------------------------------- what a change of access touches (ADR-028 E-5)
+
+/// `items` as a person reads a list: "a", "a and b", "a, b and c"; `none` when there are none.
+pub(crate) fn listed(items: &[String], none: &str) -> String {
+    match items {
+        [] => none.to_owned(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+/// A room as a person names it: its name, or its short id when it has none.
+fn room_said(id: &Digest32, name: &str) -> String {
+    if name.is_empty() {
+        format!("room {}", short(id))
+    } else {
+        format!("{name:?}")
+    }
+}
+
+/// The rooms this node holds open that `member` is in, as `(id, name)`. A closed room's members
+/// are not known until it opens, so it is not named.
+async fn rooms_with(client: &mut IpcClient, member: &Digest32) -> Vec<(Digest32, String)> {
+    let mut out = Vec::new();
+    for (id, name, open, _) in rooms_of(client).await.unwrap_or_default() {
+        if open
+            && members_of(client, id)
+                .await
+                .is_ok_and(|m| m.contains(member))
+        {
+            out.push((id, name));
+        }
+    }
+    out
+}
+
+/// `channel_id` as a person names it, from this node's room list.
+pub(crate) async fn room_named(client: &mut IpcClient, channel_id: Digest32) -> String {
+    let name = rooms_of(client)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(id, _, _, _)| *id == channel_id)
+        .map(|(_, name, _, _)| name)
+        .unwrap_or_default();
+    room_said(&channel_id, &name)
+}
+
+/// The members of `channel_id` in this node's keyring, by name: who a service or a file shared
+/// there reaches.
+pub(crate) async fn trusted_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String> {
+    let names = crate::ident::names();
+    members_of(client, channel_id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|m| names.iter().any(|(t, _)| t == *m))
+        .map(|m| crate::ident::member_name(names, m))
+        .collect()
+}
+
+/// The services this node offers in `channel_id`, by tag, as `vox service list` names them.
+async fn offered_in(client: &mut IpcClient, channel_id: Digest32) -> Vec<String> {
+    match client.request(&Request::Services { channel_id }).await {
+        Ok(Frame::Services { services, .. }) => services.into_iter().map(|(tag, _)| tag).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The services this node offers in each of `rooms`: "22 in "team"".
+async fn offered_across(client: &mut IpcClient, rooms: &[(Digest32, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (id, name) in rooms {
+        for tag in offered_in(client, *id).await {
+            out.push(format!("{tag} in {}", room_said(id, name)));
+        }
+    }
+    out
+}
+
+/// The live tunnels `vox status` lists that `keep` selects, by number, each as a person reads it:
+/// "tunnel 3: bob reaching your 22", "tunnel 4: you reaching bob's 8080". Empty when the node does
+/// not say.
+async fn live_tunnels(
+    paths: &Paths,
+    keep: impl Fn(&Digest32, &str, bool) -> bool,
+) -> Vec<(u64, String)> {
+    let Ok(at) = crate::client::one_shot(paths) else {
+        return Vec::new();
+    };
+    let Ok(json) = vox_core::node::status::request(&at).await else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for t in v
+        .get("tunnels")
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let (Some(id), Some(peer), Some(service), Some(dir)) = (
+            t.get("id").and_then(serde_json::Value::as_u64),
+            t.get("peer")
+                .and_then(|p| p.as_str())
+                .and_then(|p| vox_core::node::link::b32_decode(p, "tunnel peer").ok()),
+            t.get("service").and_then(|s| s.as_str()),
+            t.get("direction").and_then(|d| d.as_str()),
+        ) else {
+            continue;
+        };
+        let inbound = dir == "in";
+        if !keep(&peer, service, inbound) {
+            continue;
+        }
+        let who = crate::ident::member_name(crate::ident::names(), &peer);
+        out.push((
+            id,
+            if inbound {
+                format!("tunnel {id}: {who} reaching your {service}")
+            } else {
+                format!("tunnel {id}: you reaching {who}'s {service}")
+            },
+        ));
+    }
+    out
+}
+
+/// Of `before`, the tunnels no longer live, and those still live: what a change cut, and what it
+/// left open.
+async fn cut_since(paths: &Paths, before: Vec<(u64, String)>) -> (Vec<String>, Vec<String>) {
+    let now: std::collections::BTreeSet<u64> = live_tunnels(paths, |_, _, _| true)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let (open, cut): (Vec<_>, Vec<_>) = before.into_iter().partition(|(id, _)| now.contains(id));
+    (
+        cut.into_iter().map(|(_, t)| t).collect(),
+        open.into_iter().map(|(_, t)| t).collect(),
+    )
+}
+
 /// `vox trust add`, asked of the running node instead of a second one.
 pub async fn trust_add(
     paths: &Paths,
@@ -3803,6 +3996,29 @@ pub async fn trust_add(
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     crate::ident::check_new_name(crate::ident::names(), &target, petname)?;
+    // What it is to cover, said before it is done (ADR-028 E-5).
+    let rooms = rooms_with(&mut client, &target).await;
+    let room_names: Vec<String> = rooms.iter().map(|(id, n)| room_said(id, n)).collect();
+    let services = offered_across(&mut client, &rooms).await;
+    println!(
+        "vox: about to trust {} as {petname:?}",
+        crate::ident::author_id(&target)
+    );
+    if room_names.is_empty() {
+        println!("     you share no open room with it yet; it is to read what you write in any you share later");
+    } else {
+        println!(
+            "     it is to read what you write in {}, and in any room you share with it later",
+            listed(&room_names, "")
+        );
+    }
+    println!(
+        "     and to reach {}",
+        listed(
+            &services,
+            "your services in a room you share, once you offer one"
+        )
+    );
     match keyring_change(&mut client, given, |identity_passphrase| Request::Trust {
         target,
         petname: petname.to_owned(),
@@ -3819,9 +4035,18 @@ pub async fn trust_add(
             if full_history {
                 println!("     with full history: it may also read what you wrote before now");
             }
-            println!("     it may now read what you write in every room you share — now and later");
+            println!(
+                "     it may now read what you write in {} — now and later",
+                listed(&room_names, "every room you share")
+            );
             println!("     and you read what it writes, once it trusts you too");
-            println!("     and reach every service you bind to a room you are both in");
+            println!(
+                "     and reach {}",
+                listed(
+                    &services,
+                    "every service you bind to a room you are both in"
+                )
+            );
             println!("     `vox trust remove` undoes it and changes the lock everywhere");
             Ok(())
         }
@@ -3885,6 +4110,25 @@ pub async fn trust_remove(
     given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
+    // What it is to stop, said before it is done (ADR-028 E-5).
+    let rooms = rooms_with(&mut client, &target).await;
+    let room_names: Vec<String> = rooms.iter().map(|(id, n)| room_said(id, n)).collect();
+    let services = offered_across(&mut client, &rooms).await;
+    let sessions = live_tunnels(paths, |peer, _, _| *peer == target).await;
+    println!(
+        "vox: about to stop trusting {}",
+        crate::ident::author_id(&target)
+    );
+    println!(
+        "     it is to read nothing you write from now on in {}; what it already read stays read",
+        listed(&room_names, "any room")
+    );
+    println!(
+        "     and to reach {}",
+        listed(&services, "none of your services")
+    );
+    let said: Vec<String> = sessions.iter().map(|(_, t)| t.clone()).collect();
+    println!("     live sessions with it now: {}", listed(&said, "none"));
     match keyring_change(&mut client, given, |identity_passphrase| Request::Untrust {
         target,
         identity_passphrase,
@@ -3897,6 +4141,20 @@ pub async fn trust_remove(
                 crate::ident::author_id(&target)
             );
             println!("     your sender key is rotated and everyone still trusted is re-keyed");
+            let had = !sessions.is_empty();
+            let (cut, open) = cut_since(paths, sessions).await;
+            if !cut.is_empty() {
+                println!("     cut: {}", listed(&cut, ""));
+            }
+            if !open.is_empty() {
+                println!(
+                    "     still open: {} — `vox tunnel close` ends one",
+                    listed(&open, "")
+                );
+            }
+            if !had {
+                println!("     no live session with it was open");
+            }
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
@@ -3997,10 +4255,28 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
     } else {
         format!("room {name:?} ({})", b32_encode(&channel_id))
     };
+    // What it is to do, said before it is done (ADR-028 E-5).
+    let services = offered_in(&mut client, channel_id).await;
+    println!(
+        "vox: about to leave {which}: its other members are to see that you left, and this node \
+         is to delete it with everything it holds of it"
+    );
+    if !services.is_empty() {
+        println!(
+            "     your services offered there go with it: {}",
+            listed(&services, "")
+        );
+    }
     match client.request(&Request::Leave { channel_id }).await {
         Ok(Frame::Ok) => {
             println!("vox: left {which}");
             println!("     its other members see that you left; this node no longer holds it");
+            if !services.is_empty() {
+                println!(
+                    "     your services there are no longer offered: {}",
+                    listed(&services, "")
+                );
+            }
             Ok(())
         }
         Ok(Frame::Error { reason }) => {
@@ -4019,6 +4295,19 @@ pub async fn leave(paths: &Paths, room: &str) -> Result<(), AppError> {
 pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
+    // What it is to do, said before it is done (ADR-028 E-5).
+    let which = room_named(&mut client, channel_id).await;
+    let services = offered_in(&mut client, channel_id).await;
+    println!(
+        "vox: about to end {which} for everyone: every member's node is to take no new message in \
+         it and delete it"
+    );
+    if !services.is_empty() {
+        println!(
+            "     your services offered there go with it: {}",
+            listed(&services, "")
+        );
+    }
     match client.request(&Request::End { channel_id }).await {
         Ok(Frame::Ok) => {
             println!("vox: ended {} for everyone", short(&channel_id));
@@ -4026,6 +4315,12 @@ pub async fn end(paths: &Paths, room: &str) -> Result<(), AppError> {
                 "     every member's node takes no new message in it once it has this, passes the end \
                  on, and deletes the room"
             );
+            if !services.is_empty() {
+                println!(
+                    "     your services there are no longer offered: {}",
+                    listed(&services, "")
+                );
+            }
             Ok(())
         }
         Ok(Frame::Error { reason }) => Err(AppError::Usage(format!("cannot end: {reason}"))),
