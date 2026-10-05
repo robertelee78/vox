@@ -36,9 +36,11 @@
 //! programs (this proof's own among them, by name, on its port, "every interface"); once the
 //! person picks it by port and names it `db`, the address members will use and who can reach it
 //! (the guest and mallory, by name) are shown, and **before** it is shared it warns that it
-//! listens on every interface and is on a database's port; then it is shared.
+//! listens on every interface and is on a database's port; then it is shared. The list says,
+//! before it asks, that another user's services may be missing from it.
 //!
-//! Mutation: the warnings skipped turns it red.
+//! Mutation: the warnings skipped turns it red; so does the list's line about another user's
+//! services left out.
 
 #![cfg(unix)]
 
@@ -243,6 +245,16 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
         listed.is_some_and(|l| l.contains("vox_serve")),
         "PRODUCT: `vox serve` with no service named must list what listens here, with its \
          program: this proof's ({db_port}, every interface) by name; it said:\n{said}"
+    );
+    // Unprivileged, the list cannot show every service: it says so, before the question.
+    let unseen = at(&|l: &str| {
+        l.contains("another user's services") && l.contains("vox serve <name>=<port>")
+    });
+    let asked = at(&|l: &str| l.starts_with("share which?"));
+    assert!(
+        unseen.zip(asked).is_some_and(|(u, a)| u < a),
+        "PRODUCT: `vox serve`'s list must say that another user's services may be missing from \
+         it, before it asks which to share; it said:\n{said}"
     );
     let me = &w.host_fp;
     let preview = at(&|l: &str| l.contains(&format!("members will reach it as db.{me}.")));

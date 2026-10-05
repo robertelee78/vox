@@ -1291,6 +1291,12 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
     for (i, l) in found.iter().enumerate() {
         println!("  {:>2}  {}", i + 1, listing_line(l));
     }
+    // Unprivileged, `lsof` sees only this user's sockets and `ss` hides another user's program:
+    // a service missing here may still be listening.
+    println!(
+        "  another user's services, root's among them, may be missing here or listed without \
+         their program; name one with vox serve <name>=<port>"
+    );
     let answer = ask("share which? (its number, or its port)").await?;
     let chosen = answer
         .parse::<usize>()
