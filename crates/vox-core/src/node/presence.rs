@@ -564,22 +564,25 @@ impl NetPresence {
         if let Some(g) = lock(&self.nearby).take() {
             g.task.abort();
         }
-        // A UPnP mapping the router granted only *permanently* (lifetime 0) would outlive the
-        // presence: it is deleted, best-effort, on its own task. Timed mappings of every kind
-        // expire by themselves (N-43: the daemon's stop unmaps; a node's detach never does).
+        // **Every mapping it holds is deleted** (N-56; N-43: the daemon's stop unmaps, a node's
+        // detach never does): timed ones, which would otherwise hold a port on the gateway for
+        // the rest of their lifetime, and a UPnP router's permanent one. Best-effort, all at
+        // once, and bounded by UNMAP_PATIENCE in all, while the endpoint's closes leave.
+        let mut unmaps = tokio::task::JoinSet::new();
         for m in std::mem::take(&mut lock(&self.mapping).held) {
-            if m.method == crate::nat::portmap::Method::UpnpIgd && m.lifetime_secs == 0 {
-                tokio::spawn(async move {
-                    let _ = crate::nat::portmap::unmap_port_upnp(
-                        crate::nat::portmap::Protocol::Udp,
-                        m.internal_port,
-                    )
-                    .await;
-                });
-            }
+            unmaps.spawn(async move { crate::nat::portmap::unmap(&m).await });
         }
-        self.shared.close();
-        let _ = tokio::time::timeout(CLOSE_FLUSH, self.shared.wait_idle()).await;
+        let unmapped = async {
+            let _ = tokio::time::timeout(crate::nat::portmap::UNMAP_PATIENCE, async {
+                while unmaps.join_next().await.is_some() {}
+            })
+            .await;
+        };
+        let flushed = async {
+            self.shared.close();
+            let _ = tokio::time::timeout(CLOSE_FLUSH, self.shared.wait_idle()).await;
+        };
+        tokio::join!(unmapped, flushed);
     }
 }
 

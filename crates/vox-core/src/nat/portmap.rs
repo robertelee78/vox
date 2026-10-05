@@ -484,6 +484,48 @@ pub async fn renew(held: &PortMapping, lifetime_secs: u32) -> Result<PortMapping
     }
 }
 
+/// **Delete a mapping at the server that granted it** (ADR-012 N-56), best-effort: PCP and the
+/// IPv6 pinhole by a MAP with lifetime 0 and the mapping's own nonce (RFC 6887 §15.1), NAT-PMP by
+/// lifetime 0 and suggested external port 0 (RFC 6886 §3.4), UPnP by `DeletePortMapping`. The
+/// request is retransmitted as any other; the caller bounds the whole by [`UNMAP_PATIENCE`].
+///
+/// # Errors
+/// [`Error::PortMappingFailed`] when the server could not be reached or did not answer.
+pub async fn unmap(m: &PortMapping) -> Result<()> {
+    let protocol = Protocol::Udp;
+    let server = m.server;
+    match (m.method, server, m.nonce) {
+        (Method::Pcp, Some(server), Some(nonce)) => {
+            let socket = connected(server).await?;
+            let client_ip = match socket.local_addr() {
+                Ok(SocketAddr::V4(v4)) => *v4.ip(),
+                _ => Ipv4Addr::UNSPECIFIED,
+            };
+            let req = pcp::encode_map_request(&nonce, protocol, client_ip, m.internal_port, 0, 0);
+            exchange(&socket, &req, "pcp: deletion not answered").await?;
+            Ok(())
+        }
+        (Method::PcpV6Pinhole, Some(server), Some(nonce)) => {
+            let Some(IpAddr::V6(client_ip)) = m.asked_for else {
+                return Err(Error::PortMappingFailed("unmap: pinhole without address"));
+            };
+            let socket = connected(server).await?;
+            let req =
+                pcp::encode_map_request_pinhole(&nonce, protocol, client_ip, m.internal_port, 0);
+            exchange(&socket, &req, "pinhole: deletion not answered").await?;
+            Ok(())
+        }
+        (Method::NatPmp, Some(server), _) => {
+            let socket = connected(server).await?;
+            let req = natpmp::encode_map_request(protocol, m.internal_port, 0, 0);
+            exchange(&socket, &req, "nat-pmp: deletion not answered").await?;
+            Ok(())
+        }
+        (Method::UpnpIgd, _, _) => unmap_port_upnp(protocol, m.external_port).await,
+        _ => Err(Error::PortMappingFailed("unmap: no server or nonce")),
+    }
+}
+
 /// Convenience: build a [`SocketAddr`] for the standard gateway port 5351 from a
 /// gateway IP (RFC 6886/6887).
 #[must_use]

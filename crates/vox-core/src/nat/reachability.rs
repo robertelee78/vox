@@ -456,13 +456,16 @@ async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> (Option<PortMapping>, G
     (won, ask)
 }
 
-/// Run every future at once and return the first `Some`, abandoning the rest.
+/// Run every future at once and return the first `Some`; **every other grant is deleted** as it
+/// comes (N-57).
 ///
 /// Candidates are **raced**, not tried in turn: a candidate that is not a PCP server
 /// simply never answers, and its full retransmission schedule (~3.75 s) would
 /// otherwise be paid before the next one is even asked. Racing bounds a whole rung at
-/// one schedule. Two gateways both granting is harmless — the unused grant expires on
-/// its own lifetime.
+/// one schedule. The losers are not abandoned mid-request: one whose request has left may
+/// already have been granted, and a grant left behind holds a port on that gateway for its
+/// whole lifetime. So they run on, off the caller's path, and each grant one of them gets is
+/// deleted at once ([`crate::nat::portmap::unmap`]).
 async fn first_success<F>(futures: impl Iterator<Item = F>) -> Option<PortMapping>
 where
     F: std::future::Future<Output = Option<PortMapping>> + Send + 'static,
@@ -473,7 +476,19 @@ where
     }
     while let Some(joined) = set.join_next().await {
         if let Ok(Some(m)) = joined {
-            set.abort_all();
+            if !set.is_empty() {
+                tokio::spawn(async move {
+                    while let Some(late) = set.join_next().await {
+                        if let Ok(Some(lost)) = late {
+                            let _ = tokio::time::timeout(
+                                crate::nat::portmap::UNMAP_PATIENCE,
+                                crate::nat::portmap::unmap(&lost),
+                            )
+                            .await;
+                        }
+                    }
+                });
+            }
             return Some(m);
         }
     }
