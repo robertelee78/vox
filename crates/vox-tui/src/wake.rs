@@ -403,47 +403,26 @@ pub fn end(paths: &Paths, session: &str) {
     let _ = std::fs::remove_file(woke_file(paths, session));
 }
 
-/// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9).
-///
-/// Its own `hops`, but never more than any message it replies to allows: a parent with
-/// `h` hops leaves its reply `h - 1`, a grandparent `h - 2`, and so on up the `re` chain.
-/// The chain is read from the log, so a sender that writes a fresh budget into a reply
-/// does not reset it; and a chain longer than [`DEFAULT_HOPS`] has none left whatever
-/// its members claim. A parent this room does not hold ends the walk.
+/// The hop budget `envelope` really has left, given the `rows` of its room (ADR-020 §9): see
+/// [`vox_agentcomms::envelope::hops_left_by`], the one rule.
 #[must_use]
 pub fn hops_left<'a, R>(envelope: &Envelope, rows: &'a R) -> u32
 where
     R: ?Sized,
     &'a R: IntoIterator<Item = &'a MessageRow>,
 {
-    let mut left = envelope.hops;
-    let mut re = envelope.re.clone();
-    let mut depth: u32 = 0;
-    while let Some(parent) = re.as_deref().and_then(|h| find(rows, h)) {
-        depth += 1;
-        if depth > DEFAULT_HOPS {
-            return 0;
-        }
-        let Ok(p) = Envelope::parse(&parent.text) else {
-            break;
-        };
-        left = left.min(p.hops.saturating_sub(depth));
-        re = p.re;
-    }
-    left
+    vox_agentcomms::envelope::hops_left_by(envelope, |h| find(rows, h).map(|r| r.text.clone()))
 }
 
-/// The budget a reply to entry `re` starts with: its parent's less one (see [`hops_left`]),
-/// or the default when the room does not hold that entry.
+/// The budget a reply to entry `re` starts with: its parent's less one, or the default when the
+/// room does not hold that entry.
 #[must_use]
 pub fn reply_hops<'a, R>(re: &str, rows: &'a R) -> u32
 where
     R: ?Sized,
     &'a R: IntoIterator<Item = &'a MessageRow>,
 {
-    let mut reply = Envelope::new(vox_agentcomms::envelope::SAY, "");
-    reply.re = Some(re.to_owned());
-    hops_left(&reply, rows)
+    vox_agentcomms::envelope::reply_hops_by(re, |h| find(rows, h).map(|r| r.text.clone()))
 }
 
 /// Where the daemon records the entries that woke `session`: a file of the same name as its

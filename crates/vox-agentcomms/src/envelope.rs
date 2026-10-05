@@ -421,3 +421,40 @@ impl Envelope {
         Some(next)
     }
 }
+
+/// The hop budget `envelope` really has left (ADR-020 §9), `parent` giving the text of the entry
+/// a `re` names when the room holds it.
+///
+/// Its own `hops`, but never more than any message it replies to allows: a parent with `h` hops
+/// leaves its reply `h - 1`, a grandparent `h - 2`, and so on up the `re` chain. The chain is read
+/// from the log, so a sender that writes a fresh budget into a reply does not reset it; and a
+/// chain longer than [`DEFAULT_HOPS`] has none left whatever its members claim. A parent the room
+/// does not hold ends the walk. **The one rule** for every client that posts a reply (the CLI,
+/// the TUI, the app).
+#[must_use]
+pub fn hops_left_by(envelope: &Envelope, mut parent: impl FnMut(&str) -> Option<String>) -> u32 {
+    let mut left = envelope.hops;
+    let mut re = envelope.re.clone();
+    let mut depth: u32 = 0;
+    while let Some(text) = re.as_deref().and_then(&mut parent) {
+        depth += 1;
+        if depth > DEFAULT_HOPS {
+            return 0;
+        }
+        let Ok(p) = Envelope::parse(&text) else {
+            break;
+        };
+        left = left.min(p.hops.saturating_sub(depth));
+        re = p.re;
+    }
+    left
+}
+
+/// The budget a reply to entry `re` starts with: its parent's less one (see [`hops_left_by`]),
+/// or the default when the room does not hold that entry.
+#[must_use]
+pub fn reply_hops_by(re: &str, parent: impl FnMut(&str) -> Option<String>) -> u32 {
+    let mut reply = Envelope::new(SAY, "");
+    reply.re = Some(re.to_owned());
+    hops_left_by(&reply, parent)
+}
