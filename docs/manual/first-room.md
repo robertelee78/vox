@@ -157,7 +157,7 @@ On the room list: `:new` creates a room and `:join` takes a room link, both thro
 passphrase prompt; Enter or `:open` opens the selected room; `t` or `:tunnels` lists live
 tunnels. In a room: `:link` prints its link, `:close` closes it on this node, `:leave` leaves
 it, `:end` ends it for everyone (creator or admin only), and `:back` or Esc returns to the list.
-`:quit` exits. The members pane states trust in words, such as `trusted · reads you`. Use the
+`:quit` exits. The members pane states trust by glyph and in words, such as `→ alice` and `in keyring · reads you`. Use the
 same fingerprints and room IDs whichever client you choose.
 
 Next: [Rooms and messages](rooms.md), or [Identity and keyring](keyring.md).

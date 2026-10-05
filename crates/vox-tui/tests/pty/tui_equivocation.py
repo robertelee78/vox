@@ -41,16 +41,17 @@ try:
     tui.key(f"{ROOM_PASS}\r", 4)
     tui.key("\r", 2)
 
-    # The timeline pane, found by its title; its notices are the rows that start "! ".
+    # The timeline pane, found by its title; its notices are the rows that start "✕ "
+    # (ADR-028 L-2: danger is said with ✕).
     def timeline():
         return pane_of(tui.display(), "Timeline")
     def said(name):
         """The notice begins a row of its own, and reads whole across the rows it wraps onto."""
         rows = timeline()
         for i, r in enumerate(rows):
-            if r.lstrip().startswith(f"! {name} "):
+            if r.lstrip().startswith(f"\u2715 {name} "):
                 joined = re.sub(r"\s+", " ", "".join(rows[i:i + 4]))
-                if f"! {name} signed two different messages at the same place" in joined:
+                if f"\u2715 {name} signed two different messages at the same place" in joined:
                     return True
         return False
     stage("the timeline pane")

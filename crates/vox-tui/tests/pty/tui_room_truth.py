@@ -21,9 +21,12 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
-  consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
-            whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
-            "← in-only" for Carol, though nothing comes in from her);
+  consent   Carol, whom Bob never trusted, reads "not in keyring · you don't read each other";
+            Alice, whom he did, "in keyring · reads you" (V210-155: once
+            "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
+  look      in truecolour, Alice's row is "→ alice" in text.primary bold and Carol's "· <her
+            fingerprint>" in text.secondary, not bold (ADR-028 L-4); the accent is on the focused
+            members pane's border and nowhere else (L-3);
   readby    under a message Bob posts, his TUI says nothing of readers until Alice's agent drains it
             into its turn, and then says exactly "read by alice": from the read record Alice's node
             posted, which Bob can open because she trusts him. Carol, who cannot read Bob, is
@@ -54,7 +57,13 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   where     with Alice's and Carol's daemons stopped, under a message Bob then posts his TUI says
             "only on this machine"; once Alice's daemon is started again and has synced, "on 1 of
             2 members' nodes" (ADR-028 R-6, #482); Alice's daemon is then stopped again;
-  idle      once the anchor is stopped too, it says "idle", with no count.
+  accent    there, the accent marks only the focused list's border and the live "● online";
+  idle      once the anchor is stopped too, it says "idle", with no count;
+  depths    Bob's TUI opened again three ways (L-5): under NO_COLOR with an ASCII locale (LC_ALL=C)
+            it draws no colour at all and Alice reads "-> alice", bold, Carol ". <fingerprint>";
+            in 16 colours (TERM=xterm) every colour drawn is one of the 16 and the trust glyphs,
+            weights and words are as in truecolour; in 256 colours (TERM=xterm-256color) Alice's
+            name is index 255 and Carol's 247. In each the accent is on the focused border alone.
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
@@ -66,16 +75,23 @@ and exits 1. An exception in the driver itself prints `APPARATUS: driver crashed
 traceback and exits 2. Every process is recorded and killed by PID. Bounded throughout
 (`vox_pty.py`, V210-54).
 """
-import os, re, subprocess, sys, time, traceback
+import json, os, re, subprocess, sys, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
 
+# The colours the TUI is built from (ADR-028 L-1), read as pyte reads a cell: lowercase hex.
+TOKENS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "../../../../assets/theme/vox-tokens.json")))["color"]
+HEX = {k: v["hex"].lstrip("#").lower() for k, v in TOKENS.items()}
+BOX = set("─│┌┐└┘╭╮╰╯")
+
 VOX, TAG = sys.argv[1], sys.argv[2]
 # Sized for the debug build, whose joins grind their proof of work for minutes: two joins at
-# JOIN_SECS each, and the rest (about 150 s in debug). The Rust wrapper's bound sits above it.
-BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1170"))
+# JOIN_SECS each, and the rest (about 150 s in debug, and 90 s more for the depths' three TUIs).
+# The Rust wrapper's bound sits above it.
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1260"))
 # A member waits 480 s for a joiner's proof of work (V210-87), plus its 5 s slack: a join that has
 # not returned by then is past what the product allows, and is a named RED.
 JOIN_SECS = 490
@@ -142,6 +158,42 @@ results = {}
 def claim(name, ok, detail):
     results[name] = ok
     print(f"{TAG} CLAIM {name} {'ok' if ok else 'RED'}: {detail}")
+
+def cells_of(t, y):
+    """Row `y` of `t`'s screen as cells, and its text with one character per column (the second
+    column of a wide character is NUL), so an index into the text is a column."""
+    row = t.screen.buffer[y]
+    cs = [row[x] for x in range(t.screen.columns)]
+    return cs, "".join(c.data or "\0" for c in cs)
+
+def span(t, y, text):
+    """The cells of the first `text` on row `y`, or None."""
+    cs, line = cells_of(t, y)
+    x = line.find(text)
+    return None if x < 0 else cs[x:x + len(text)]
+
+def stray(t, colours, live=(), cols=(0, 160)):
+    """Every cell drawn in one of `colours` (fg or bg) that is not the focused pane's frame (a
+    border character within `cols`, or its top row there, which holds the pane's title) nor inside
+    one of the `live` texts: where the accent must not be (ADR-028 L-3)."""
+    top = next((y for y in range(t.screen.lines) if cells_of(t, y)[1][cols[0]] in "┌╭"), None)
+    out = []
+    for y in range(t.screen.lines):
+        cs, line = cells_of(t, y)
+        ok = set()
+        for text in live:
+            for m in re.finditer(re.escape(text), line):
+                ok.update(range(m.start(), m.end()))
+        for x, c in enumerate(cs):
+            frame = cols[0] <= x < cols[1] and (c.data in BOX or y == top)
+            if (c.fg in colours or c.bg in colours) and x not in ok and not frame:
+                out.append((y, x, c.data))
+    return out
+
+def tui_env(**extra):
+    e = env("bob")
+    e.update(extra)
+    return e
 
 try:
     stage("anchor")
@@ -234,7 +286,7 @@ try:
     open(f"{S}/note.sh", "w").write(f"#!/bin/sh\nprintf '%s | %s\\n' \"$1\" \"$2\" >> {NOTES}\n")
     os.chmod(f"{S}/note.sh", 0o755)
     tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec, "--node", "default"],
-              {**env("bob"), "VOX_NOTIFY_COMMAND": f"{S}/note.sh"})
+              tui_env(COLORTERM="truecolor", VOX_NOTIFY_COMMAND=f"{S}/note.sh"))
     tui.pump(4)
     tui.key("id pass\r", 4)
     tui.key("\r", 2)
@@ -338,10 +390,30 @@ try:
                 return (rows[i + 1] if i + 1 < len(rows) else ""), "▶" in r, i
         return None, False, None
 
+    def trust_look(t, glyph_in, glyph_out, primary, secondary, accent):
+        """What the members pane of `t` shows of Alice and Carol by glyph, weight and colour, and
+        whether the accent strays off the focused pane's border: (ok, detail)."""
+        ya, yc = label_of("alice")[2], label_of("carol")[2]
+        if ya is None or yc is None:
+            return False, f"alice's row {ya}, carol's row {yc}: not both in the members pane"
+        a = span(t, ya, glyph_in + "alice")
+        c = span(t, yc, glyph_out + fp["carol"][:26])
+        if a is None or c is None:
+            return False, (f"alice's row {cells_of(t, ya)[1][112:].strip()!r} (want {glyph_in!r}), carol's "
+                           f"{cells_of(t, yc)[1][112:].strip()!r} (want {glyph_out!r})")
+        a_name, c_name = a[len(glyph_in):], c[len(glyph_out):]
+        a_ok = all(x.bold and x.fg == primary for x in a_name)
+        c_ok = all(not x.bold and x.fg == secondary for x in c_name)
+        off = stray(t, accent, cols=(112, 160))
+        return a_ok and c_ok and not off, (
+            f"alice {glyph_in}name bold {[x.bold for x in a_name][:1]} fg {a_name[0].fg!r} (want "
+            f"{primary!r}); carol {glyph_out}name bold {c_name[0].bold} fg {c_name[0].fg!r} (want "
+            f"{secondary!r}); accent cells off the focused border: {off[:6]!r}")
+
     stage("consent")
     # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
     # judging Carol.
-    ALICE, CAROL = "trusted · reads you", "not trusted · you don't read each other"
+    ALICE, CAROL = "in keyring · reads you", "not in keyring · you don't read each other"
     # The pane's border is part of the row: the label is what sits between its edges.
     bare = lambda row: (row or "").strip().strip("│").strip()
     alice_ok = tui.until(lambda: bare(label_of("alice")[0]) == ALICE, 60, 1)
@@ -352,6 +424,10 @@ try:
     carol_label = label_of("carol")[0]
     claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
+
+    stage("look")
+    ok, detail = trust_look(tui, "→ ", "· ", HEX["text.primary"], HEX["text.secondary"], {HEX["accent"]})
+    claim("look", ok, f"in truecolour: {detail}")
 
     stage("readby")
     p = run("bob", "room", "post", room, "r-001 read me")
@@ -518,6 +594,9 @@ try:
     rows = lambda: [r.strip() for r in tui.display() if "online" in r or "offline" in r]
     tui.until(lambda: any("● online" in r for r in rows()), 20, 1)
     claim("reach", any("● online" in r for r in rows()), f"list rows: {rows()!r}")
+    off = stray(tui, {HEX["accent"]}, live=("● online",))
+    claim("accent", any("● online" in r for r in rows()) and not off,
+          f"accent cells that are neither the list's border nor '● online': {off[:6]!r}")
 
     stage("notify")
     def notes():
@@ -592,6 +671,56 @@ try:
     bar = tui.display()[-2]
     claim("idle", "idle" in bar and peers() is None, f"with no peer left, status bar: {bar.strip()!r}")
 
+    stage("depths")
+    # Bob's TUI again, as three terminals would run it (ADR-028 L-5): the room is read from his
+    # node's own log, so it needs no peer, and no anchor is given.
+    if not tui.stop():
+        apparatus(f"the first `vox tui` (pid {tui.pid}) could not be stopped before the next")
+    p256 = pyte.graphics.FG_BG_256
+    depths = {}
+    for name, extra, glyphs, colours in (
+        ("no colour", dict(NO_COLOR="1", LC_ALL="C"), ("-> ", ". "), None),
+        ("16 colours", dict(TERM="xterm"), ("→ ", "· "), "16"),
+        ("256 colours", dict(TERM="xterm-256color"), ("→ ", "· "), "256"),
+    ):
+        tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], tui_env(**extra))
+        tui.pump(4)
+        tui.key("id pass\r", 4)
+        tui.key("\r", 2)
+        tui.key("room pass\r", 4)
+        tui.key("\r", 2)
+        tui.key("\t", 1)   # timeline -> composer
+        tui.key("\t", 1)   # composer -> members
+        if not tui.until(lambda: label_of("alice")[0] is not None and label_of("carol")[0] is not None, 30, 1):
+            product(f"bob's `vox tui` ({name}) never drew alice and carol in its members pane:\n{tui.text()}")
+        words = bare(label_of("alice")[0]) == ALICE and bare(label_of("carol")[0]) == CAROL
+        if colours is None:
+            drawn = {c for y in range(tui.screen.lines) for c in
+                     ((x.fg, x.bg) for x in cells_of(tui, y)[0])} - {("default", "default")}
+            ya, yc = label_of("alice")[2], label_of("carol")[2]
+            a = span(tui, ya, glyphs[0] + "alice")
+            c = span(tui, yc, glyphs[1] + fp["carol"][:26])
+            ok = a is not None and c is not None and all(x.bold for x in a[3:]) and not drawn
+            detail = (f"alice {cells_of(tui, ya)[1][112:].strip()!r} bold "
+                      f"{a is not None and all(x.bold for x in a[3:])}; carol "
+                      f"{cells_of(tui, yc)[1][112:].strip()!r}; colours drawn: {sorted(drawn)[:4]!r}")
+        elif colours == "16":
+            sixteen = set(p256[:16]) | {"default", "black", "red", "green", "brown", "blue", "magenta",
+                                        "cyan", "white"} | {f"bright{n}" for n in
+                                        ("black", "red", "green", "brown", "blue", "magenta", "cyan", "white")}
+            other = {v for y in range(tui.screen.lines) for x in cells_of(tui, y)[0]
+                     for v in (x.fg, x.bg)} - sixteen
+            ok, detail = trust_look(tui, *glyphs, "default", "default", {p256[14], "brightcyan"})
+            ok = ok and not other
+            detail += f"; colours drawn outside the 16: {sorted(other)[:4]!r}"
+        else:
+            ok, detail = trust_look(tui, *glyphs, p256[255], p256[247], {p256[81]})
+        depths[name] = ok and words
+        print(f"{TAG} depth {name}: {'ok' if depths[name] else 'RED'}: words {words}; {detail}")
+        if not tui.stop():
+            apparatus(f"`vox tui` ({name}, pid {tui.pid}) could not be stopped")
+    claim("depths", all(depths.values()), f"{depths!r}")
+
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} screen at the end:")
     for r in tui.display():
@@ -620,8 +749,9 @@ except Exception:
 finally:
     disarm()
     stage("stopping every process")
+    # A TUI already stopped (the depths) has closed its pty.
     for t in [tui, *TUIS]:
-        if t is not None and not t.stop():
+        if t is not None and t.fd is not None and not t.stop():
             print(f"{TAG} RED: vox tui (pid {t.pid}) outlived SIGKILL and could not be reaped")
             code = 1
     for p in PROCS:
