@@ -74,6 +74,23 @@ impl VoxProc {
         args: &[String],
         env: &[(&str, &str)],
     ) -> Self {
+        Self::spawn_exe_fed(exe, name, data, args, env, None)
+    }
+
+    /// [`VoxProc::spawn`] with `input` typed at its stdin, as a person answers its questions,
+    /// and the end of the input after it.
+    pub fn spawn_fed(name: &str, data: &Path, args: &[String], input: &str) -> Self {
+        Self::spawn_exe_fed(Path::new(VOX), name, data, args, &[], Some(input))
+    }
+
+    fn spawn_exe_fed(
+        exe: &Path,
+        name: &str,
+        data: &Path,
+        args: &[String],
+        env: &[(&str, &str)],
+        input: Option<&str>,
+    ) -> Self {
         let mut child = Command::new(exe)
             .args(args)
             .envs(env.iter().copied())
@@ -81,13 +98,22 @@ impl VoxProc {
             .env("VOX_CONFIG_DIR", data.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
             .env_remove("VOX_ROOM_PASSPHRASE")
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| {
                 panic!("APPARATUS: could not spawn {name} ({}): {e}", exe.display())
             });
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin
+                .write_all(input.as_bytes())
+                .unwrap_or_else(|e| panic!("APPARATUS: could not answer {name} at its stdin: {e}"));
+        }
         let started = Instant::now();
         let (tx, rx) = mpsc::channel();
         let out = child.stdout.take().expect("APPARATUS: a piped stdout");

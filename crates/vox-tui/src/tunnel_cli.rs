@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use vox_core::governance::share::ServiceKind;
 use vox_core::hash::Digest32;
 use vox_core::node::actor::NodeHandle;
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome};
@@ -1060,14 +1061,56 @@ pub async fn serve(
         }
         services.push((port, label));
     }
-    if services.is_empty() {
-        return Err(AppError::Usage(
-            "name at least one service to share: vox serve <name>=<port>, e.g. vox serve ssh=22"
-                .into(),
-        ));
+    // **One step** (ADR-028 S-4): no service named, the person picks one of those listening here.
+    let picked = services.is_empty();
+    let mut at = at;
+    if picked {
+        let (port, tag, endpoint) = pick_service().await?;
+        services.push((port, tag));
+        at = Some(endpoint);
     }
     let mut held = crate::client::hold(paths, args, pass, true, Some(waiting)).await?;
     crate::ident::load_names(&mut held.client).await;
+    // Said before anything is shared (S-4): a service any network here already reaches, or one
+    // a member should think twice about holding.
+    let warnings = exposure_warnings(&services, at).await;
+    if picked {
+        let me = held.me.as_ref().map(b32_encode).unwrap_or_default();
+        let trusted = match held.client.trusted("").await {
+            Ok(Frame::Trusted { entries }) => entries,
+            _ => Vec::new(),
+        };
+        let (_, label) = &services[0];
+        println!();
+        println!(
+            "members will reach it as {}.{me}.<the new room>.vox",
+            vox_core::node::channel::service_name(label)
+        );
+        if trusted.is_empty() {
+            println!("who can reach it: nobody yet: you trust no node (`vox trust add`)");
+        } else {
+            let names: Vec<String> = trusted
+                .iter()
+                .map(|(fp, _)| crate::ident::name_in(&trusted, fp))
+                .collect();
+            println!(
+                "who can reach it: each node you trust, once it joins the room: {}",
+                names.join(", ")
+            );
+        }
+        println!("who cannot: anyone else who joins with the room link and passphrase");
+        for w in &warnings {
+            println!("warning: {w}");
+        }
+        let answer = ask("share it? [y/N]").await?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            return Err(AppError::Usage("not shared".into()));
+        }
+    } else {
+        for w in &warnings {
+            eprintln!("vox: warning: {w}");
+        }
+    }
     // Taken before the room is made, so who reaches it from the first moment is said.
     let events = crate::client::events(&held.at).await?;
     waiting.on("the room to be created");
@@ -1206,6 +1249,142 @@ pub async fn serve(
             },
         }
     }
+}
+
+/// Ask the person at stdin, and the line they answered, trimmed; refused at the end of the input.
+async fn ask(question: &str) -> Result<String, AppError> {
+    use std::io::Write;
+    print!("{question} ");
+    std::io::stdout().flush().map_err(AppError::Io)?;
+    let line = tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map(|n| (n > 0).then_some(line))
+    })
+    .await
+    .map_err(|e| AppError::Usage(format!("cannot read the answer: {e}")))?
+    .map_err(AppError::Io)?;
+    // Typed at a terminal, the answer's Enter ended the line; read from a pipe, nothing did.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        println!();
+    }
+    line.map(|l| l.trim().to_owned())
+        .ok_or_else(|| AppError::Usage("no answer: nothing shared".into()))
+}
+
+/// `vox serve` with no service named (ADR-028 S-4): list what listens on this machine, with
+/// its program's name, have the person pick one, suggest a name for it, and return
+/// `(port, tag, endpoint)`.
+async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
+    let found = tokio::task::spawn_blocking(vox_core::node::probe::listening)
+        .await
+        .unwrap_or_default();
+    if found.is_empty() {
+        return Err(AppError::Usage(
+            "nothing listening on this machine can be seen from here: name the service, \
+             vox serve <name>=<port>, e.g. vox serve ssh=22"
+                .into(),
+        ));
+    }
+    println!("vox: services listening on this machine");
+    for (i, l) in found.iter().enumerate() {
+        println!("  {:>2}  {}", i + 1, listing_line(l));
+    }
+    let answer = ask("share which? (its number, or its port)").await?;
+    let chosen = answer
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|i| found.get(i))
+        .or_else(|| {
+            let port: u16 = answer.parse().ok()?;
+            found.iter().find(|l| l.port == port)
+        })
+        .ok_or_else(|| {
+            AppError::Usage(format!(
+                "{answer:?} is neither a number from the list nor a port listed"
+            ))
+        })?;
+    let endpoint = chosen.endpoint();
+    // Its detected kind is the best name; else its program's (S-2: the kind itself is never
+    // taken from either).
+    let kind = vox_core::node::probe::detect(endpoint, chosen.udp).await;
+    let suggested = match kind {
+        ServiceKind::Tcp | ServiceKind::Udp => chosen
+            .command
+            .as_deref()
+            .map(vox_core::node::resolver::label_of)
+            .filter(|n| !n.is_empty() && n.len() <= vox_core::governance::share::MAX_SERVICE_NAME)
+            .unwrap_or_else(|| "service".to_owned()),
+        other => other.as_str().to_owned(),
+    };
+    let given = ask(&format!("name it [{suggested}]")).await?;
+    let name = if given.is_empty() {
+        suggested
+    } else {
+        vox_core::node::resolver::label_of(&given)
+    };
+    if name.is_empty() || name.len() > vox_core::governance::share::MAX_SERVICE_NAME {
+        return Err(AppError::Usage(format!(
+            "{given:?}: a service's name is letters, digits and `-`, at most 63 of them"
+        )));
+    }
+    let tag = if chosen.udp {
+        format!("udp/{name}")
+    } else {
+        name
+    };
+    Ok((chosen.port, tag, endpoint))
+}
+
+/// One listening service as the list shows it: its program, where it listens, and over what.
+fn listing_line(l: &vox_core::node::probe::Listening) -> String {
+    let program = l.command.as_deref().unwrap_or("(not visible to you)");
+    let addrs: Vec<String> = l
+        .addrs
+        .iter()
+        .map(|a| SocketAddr::new(*a, l.port).to_string())
+        .collect();
+    let proto = if l.udp { "udp" } else { "tcp" };
+    let every = if l.on_every_interface() {
+        "  (every interface)"
+    } else {
+        ""
+    };
+    format!("{program:<20} {}  {proto}{every}", addrs.join(", "))
+}
+
+/// What a person must hear before `services` are shared (ADR-028 S-4): each one this machine
+/// listens for on every interface, which its networks reach with no Vox at all, and each on a
+/// well-known sensitive port.
+async fn exposure_warnings(services: &[(u16, String)], at: Option<SocketAddr>) -> Vec<String> {
+    let found = tokio::task::spawn_blocking(vox_core::node::probe::listening)
+        .await
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (port, label) in services {
+        let name = vox_core::node::channel::service_name(label);
+        let udp = vox_core::tunnel::udp::is_udp(label);
+        let port = at.map_or(*port, |a| a.port());
+        if let Some(l) = found
+            .iter()
+            .find(|l| l.port == port && l.udp == udp && l.on_every_interface())
+        {
+            out.push(format!(
+                "`{name}` ({}) listens on every interface of this machine, so its networks \
+                 reach it without Vox; sharing it does not change that",
+                listing_line(l).trim()
+            ));
+        }
+        if let Some(what) = vox_core::node::probe::sensitive_port(port) {
+            out.push(format!(
+                "`{name}` is on port {port}, {what}: every node you trust in the room can \
+                 reach it"
+            ));
+        }
+    }
+    out
 }
 
 /// Who in `channel_id` can reach this node's services and who cannot (ADR-017 4.2), by name:

@@ -29,6 +29,16 @@
 //!
 //! Mutation: the kind taken from the port (`ssh` for 22, else `tcp`) turns it red on `login`;
 //! taken from the name, red on the echo named `ssh`.
+//!
+//! ADR-028 S-4 (#491) — **sharing is one step**. With mallory and the guest trusted, the host
+//! runs `vox serve` with no service named while this proof listens on every interface on a
+//! database port. Asserted from what it printed: the listening services are listed with their
+//! programs (this proof's own among them, by name, on its port, "every interface"); once the
+//! person picks it by port and names it `db`, the address members will use and who can reach it
+//! (the guest and mallory, by name) are shown, and **before** it is shared it warns that it
+//! listens on every interface and is on a database's port; then it is shared.
+//!
+//! Mutation: the warnings skipped turns it red.
 
 #![cfg(unix)]
 
@@ -39,7 +49,7 @@ mod watchdog;
 mod world;
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::time::Duration;
 
 use world::{args, echo_service, fingerprint, mkdir, vox_once, PathKind, Setup, VoxProc, World};
@@ -209,6 +219,75 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
          its daemon said:\n{}",
         guest.transcript()
     );
+    drop(guest);
+
+    // ADR-028 S-4: `vox serve` with nothing named, picking a database listening everywhere.
+    let (db, db_port) = everywhere_on_a_database_port();
+    let mut pick = VoxProc::spawn_fed(
+        "vox serve (one step)",
+        &w.host_dir,
+        &args(&["serve", "--name", "db-room"]),
+        &format!("{db_port}\ndb\ny\n"),
+    );
+    let shared = pick.line_within(WITHIN, |l| {
+        l.starts_with("sharing ") && l.contains(" as db.")
+    });
+    let said = pick.transcript();
+    eprintln!("[proof] one-step vox serve said:\n{said}");
+    let lines: Vec<&str> = said.lines().collect();
+    let at = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
+    let listed = lines
+        .iter()
+        .find(|l| l.contains(&format!("0.0.0.0:{db_port}")) && l.contains("(every interface)"));
+    assert!(
+        listed.is_some_and(|l| l.contains("vox_serve")),
+        "PRODUCT: `vox serve` with no service named must list what listens here, with its \
+         program: this proof's ({db_port}, every interface) by name; it said:\n{said}"
+    );
+    let me = &w.host_fp;
+    let preview = at(&|l: &str| l.contains(&format!("members will reach it as db.{me}.")));
+    let who = lines
+        .iter()
+        .find(|l| l.starts_with("who can reach it: each node you trust"));
+    assert!(
+        preview.is_some() && who.is_some_and(|l| l.contains("the guest") && l.contains("mallory")),
+        "PRODUCT: before sharing, `vox serve` must show the address members will use and name \
+         who can reach it (the guest and mallory); it said:\n{said}"
+    );
+    let everywhere = at(&|l: &str| l.starts_with("warning: `db`") && l.contains("every interface"));
+    let database =
+        at(&|l: &str| l.starts_with("warning: `db`") && l.contains(&format!("port {db_port}")));
+    let sharing = at(&|l: &str| l.starts_with("sharing ") && l.contains(" as db."));
+    assert!(
+        shared.is_some()
+            && everywhere.zip(sharing).is_some_and(|(w, s)| w < s)
+            && database.zip(sharing).is_some_and(|(d, s)| d < s),
+        "PRODUCT: `vox serve` must warn that `db` listens on every interface and is on a \
+         database's port ({db_port}) before it shares it, then share it; it said:\n{said}"
+    );
+    drop(db);
+}
+
+/// A listener on every interface on a well-known database port this machine has free: this
+/// proof's own, held for as long as the returned listener is.
+fn everywhere_on_a_database_port() -> (TcpListener, u16) {
+    for port in [5432, 3306, 6379, 27017, 9200, 11211, 5984, 1433] {
+        let Ok(l) = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)) else {
+            continue;
+        };
+        let held = l
+            .try_clone()
+            .unwrap_or_else(|e| panic!("APPARATUS: the database stand-in's listener: {e}"));
+        std::thread::spawn(move || {
+            // Accepted and held, so a probe of it finds a silent service.
+            let mut open = Vec::new();
+            for s in held.incoming().map_while(Result::ok) {
+                open.push(s);
+            }
+        });
+        return (l, port);
+    }
+    panic!("APPARATUS: every database port this proof can stand in on is taken on this machine")
 }
 
 /// Whether `vox service list`'s output lists the service `name` as `kind`:
