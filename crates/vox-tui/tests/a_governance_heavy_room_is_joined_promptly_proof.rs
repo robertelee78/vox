@@ -256,8 +256,8 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
         .next()
         .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
-    let (ok, link, err) = vox_once(&host_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    let (ok, link, err) = vox_once(&host_dir, &args(&["room", "link", &prefix]));
+    assert!(ok, "PRODUCT (staging): room link: {err}");
     let link = link.trim().to_owned();
     // Which attempt got in, and when it started: `None` if none did.
     let attempts = |data: &Path, who: &str| {

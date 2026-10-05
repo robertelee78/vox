@@ -16,7 +16,7 @@
 //! mentioned.
 //!
 //! The board cannot tell a room whose host has not published it there from a room that does not
-//! exist — an invite link carries no checksum, so a room id with one mistyped character still
+//! exist — an room link carries no checksum, so a room id with one mistyped character still
 //! parses — so the advice must name both and claim neither. Two cases, nothing faked:
 //!
 //! 1. **A mistyped room id.** A host `vox serve`s a room through anchor A. One character of the

@@ -91,7 +91,7 @@ impl AppError {
 /// What the TUI's status line says while creating the identity waits for another
 /// vox holding the profile.
 pub const WAITING_FOR_PROFILE_TUI: &str =
-    "waiting: another vox holds this profile open, and only one at a time may write it — this goes on by itself";
+    "waiting: another vox holds this node open, and only one at a time may write it — this goes on by itself";
 
 pub trait CoreHandle {
     /// The latest view model to render (may fold in pending core events).
@@ -587,7 +587,7 @@ pub fn run_node(
     router.attach_kept();
     if let Some(creators) = serve_only {
         println!(
-            "vox node: serving only rooms made by the {} identit{} this profile trusts",
+            "vox node: serving only rooms made by the {} identit{} this node trusts",
             creators.len(),
             if creators.len() == 1 { "y" } else { "ies" }
         );
@@ -1327,7 +1327,7 @@ fn write_anchors_file(
     // it unless it keeps an anchors file of its own, so each of them reaches its anchor unasked.
     let path = paths.config_dir.join(vox_core::node::paths::ANCHORS_FILE);
     let mut body = String::from(
-        "# Written by `vox node`. Anchors this profile publishes to, reads from and reaches\n\
+        "# Written by `vox node`. Anchors this node publishes to, reads from and reaches\n\
          # peers through: one <fingerprint>@<multiaddr> per line. Add anchors on other\n\
          # machines here; `--anchor` on a command merges with this file rather than\n\
          # replacing it. Rewritten whole whenever this node's addresses change.\n",

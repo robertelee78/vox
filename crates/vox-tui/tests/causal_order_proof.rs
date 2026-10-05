@@ -329,8 +329,8 @@ fn room(creator: &Path, joiners: &[&Path]) -> String {
         .expect("PRODUCT (staging): a room id")
         .to_owned();
     for joiner in joiners {
-        let (ok, link, err) = vox(creator, &["room", "invite", &room], None);
-        assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+        let (ok, link, err) = vox(creator, &["room", "link", &room], None);
+        assert!(ok, "PRODUCT (staging): vox room link: {err}");
         let (ok, _, err) = vox(
             joiner,
             &[

@@ -325,7 +325,7 @@ impl Skdm {
         expected_epoch: u64,
     ) -> Result<()> {
         if &self.body.channel_id != expected_channel || self.body.epoch != expected_epoch {
-            return Err(Error::MalformedBundle("skdm (channelID, epoch) mismatch"));
+            return Err(Error::MalformedBundle("skdm (room id, epoch) mismatch"));
         }
         if author_root.fingerprint() != self.body.author_id {
             return Err(Error::MalformedBundle("skdm author_id != root fingerprint"));

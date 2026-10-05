@@ -1913,8 +1913,8 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 }
                 Ok(out)
             };
-            let outbound = set("ipc consents outbound")?;
-            let inbound = set("ipc consents inbound")?;
+            let outbound = set("ipc trust grants outbound")?;
+            let inbound = set("ipc trust grants inbound")?;
             return Ok(Frame::Consents { outbound, inbound });
         }
         (T_BOUND, 2) => {

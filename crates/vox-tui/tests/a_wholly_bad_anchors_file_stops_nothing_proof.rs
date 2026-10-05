@@ -21,7 +21,7 @@
 //!   fingerprint and exits 0, and the daemon that attaches her says the file is skipped whole,
 //!   why, and that it carries on.
 //! - alice's `vox daemon` **starts** (answers `vox room list`) and says it carries on; she
-//!   `vox room create`s a room, posts in it, and `vox room invite`s.
+//!   `vox room create`s a room, posts in it, and `vox room link`s.
 //! - bob **`vox connect`s** with that address and the room passphrase, and exits 0, saying in his
 //!   own terminal what the attach of his node said (the daemon it started logs it too).
 //! - bob's `vox daemon` starts, and bob **reads alice's post** with `vox room read` — the room
@@ -425,12 +425,12 @@ fn an_anchors_file_with_no_usable_anchor_stops_nothing() {
     };
     let (ok, _, err) = vox_once(&alice, &args(&["room", "post", &room, POST]));
     assert!(ok, "PRODUCT: alice's post in her own room: {err}");
-    let (ok, link, err) = vox_once(&alice, &args(&["room", "invite", &room]));
+    let (ok, link, err) = vox_once(&alice, &args(&["room", "link", &room]));
     let link = link.trim().to_owned();
     println!("[proof] alice's room {room}; invite {link}");
     assert!(
         ok && link.starts_with("vox://"),
-        "PRODUCT: `vox room invite` from alice's anchorless daemon gave no address: {link:?} {err}"
+        "PRODUCT: `vox room link` from alice's anchorless daemon gave no address: {link:?} {err}"
     );
 
     // ---- bob connects, with no anchor anywhere ---------------------------------------------------

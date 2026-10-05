@@ -6,7 +6,7 @@
 //! has an identity (`vox id`). A person who did that saw `vox node` refuse to start:
 //!
 //! ```text
-//! vox node: node: another vox already has this profile open
+//! vox node: node: another vox already has this node open
 //! ```
 //!
 //! The headless node opened the profile's vault — whose store it then held — and then opened
@@ -109,11 +109,11 @@ fn vox_node_starts_in_a_profile_with_an_identity_and_keeps_its_trust_list_sealed
         let said = node.transcript();
         println!("[proof] vox node --serve trusted in a profile with an identity: started");
         assert!(
-            !said.contains("already has this profile open"),
+            !said.contains("already has this node open"),
             "PRODUCT: `vox node --serve trusted` said the profile is already open:\n{said}"
         );
         assert!(
-            said.contains("serving only rooms made by the 1 identity this profile trusts"),
+            said.contains("serving only rooms made by the 1 identity this node trusts"),
             "PRODUCT: `vox node --serve trusted` did not say it serves only the trusted identity's rooms:\n{said}"
         );
 

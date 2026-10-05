@@ -22,14 +22,14 @@ use crate::app::{run_live, run_node, AppError};
 
 pub use crate::client::NodeArgs;
 
-/// Run a verb that holds a session on the daemon (ADR-026 L-7): `serve`, `connect`, `up`,
+/// Run a verb that holds a session on the daemon: `serve`, `connect`, `up`,
 /// `forward`.
 ///
-/// **The whole run races every stop signal, from before the first prompt** (V210-108): the
+/// **The whole run races every stop signal, from before the first prompt**: the
 /// passphrase prompts run on a blocking thread inside `work`. A server's stop (`vox serve`) is its
 /// normal end and exits 0, as a service manager expects of a service it stopped; any other verb
-/// stopped before it finished exits 128 + the signal's number, saying what it waited for
-/// (V210-85). Stopping the client leaves the node as the daemon has it: the hold this verb took
+/// stopped before it finished exits 128 + the signal's number, saying what it waited for.
+/// Stopping the client leaves the node as the daemon has it: the hold this verb took
 /// goes with its connection (L-3), and nothing here has a node to shut down.
 fn run_session<Fut>(waiting: std::sync::Arc<crate::tunnel_cli::Waiting>, work: Fut) -> ExitCode
 where
@@ -95,7 +95,7 @@ fn pass(flag: Option<String>, file: Option<std::path::PathBuf>) -> crate::client
     crate::client::Pass { flag, file }
 }
 
-/// The service label a person's spec names: `53/udp` is `udp/53` (ADR-022 decision 6), and
+/// The service label a person's spec names: `53/udp` is `udp/53`, and
 /// anything that is not a port spec is used as the tag it already is.
 fn label_of(spec: &str) -> String {
     vox_core::tunnel::udp::service_label(spec).unwrap_or_else(|| spec.to_owned())
@@ -126,7 +126,7 @@ where
     }
 }
 
-/// The name `vox trust add` files an identity under (V210-162): `--name`, or asked for on a
+/// The name `vox trust add` files an identity under: `--name`, or asked for on a
 /// terminal. With neither it is refused at once: every identity under one default name could
 /// not be told apart, nor addressed.
 fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
@@ -247,7 +247,7 @@ enum ServiceCmd {
     Remove(ServiceRemoveArgs),
     /// List the services offered in a room.
     ///
-    /// Only a room this profile holds open. Listing opens no room, so it asks for no room
+    /// Only a room this node holds open. Listing opens no room, so it asks for no room
     /// passphrase, and a room you closed stays closed.
     List(ServiceListArgs),
 }
@@ -257,7 +257,7 @@ enum ServiceCmd {
 enum LanCmd {
     /// Create LAN interfaces for `vox lan up`, as root. Run it with `sudo`: it serves only
     /// the person who ran `sudo`, accepts only LAN addresses (`100.64.0.0/10`,
-    /// `fd00::/8`), opens no profile and touches no network. Runs until interrupted;
+    /// `fd00::/8`), opens no node and touches no network. Runs until interrupted;
     /// interfaces it made live exactly as long as the `vox lan up` holding them.
     Helper(LanHelperArgs),
     /// Bring this machine onto a room's LAN, through the helper. Run it as yourself, not
@@ -290,7 +290,7 @@ pub struct LanUpArgs {
     /// sends still come back. ICMP echo always passes.
     #[arg(long, value_delimiter = ',')]
     pub allow: Vec<u16>,
-    /// Serve Prometheus metrics at this address, as `vox daemon --metrics` does (PRD-001 R38).
+    /// Serve Prometheus metrics at this address, as `vox daemon --metrics` does.
     /// Loopback only: the counters name every peer and room this node talks to.
     #[arg(long)]
     pub metrics: Option<SocketAddr>,
@@ -353,14 +353,13 @@ enum RoomCmd {
     /// SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     ///
     /// With `--since`, first every message after that cursor, then every new one —
-    /// **with no gap across a lag or a restart** (ADR-021 §7). Persist the last entry
+    /// **with no gap across a lag or a restart**. Persist the last entry
     /// hash you processed and pass it back to resume. `--json` prints one
     /// `vox.room.row/1` object per line.
     Tail(RoomTailArgs),
     /// Print the fingerprints of the room's members.
     Roster(RoomRefArgs),
-    /// Ask a member's node which agent sessions it holds, and whether each can be reached
-    /// (V030-16).
+    /// Ask a member's node which agent sessions it holds, and whether each can be reached.
     ///
     /// The ping is answered by that node's **daemon**, never by a model: it lists each session,
     /// whether an urgent message interrupts it, and when it last read. Pings and answers are
@@ -374,7 +373,7 @@ enum RoomCmd {
     Ping(RoomPingArgs),
     /// List the rooms this node holds.
     List(NodeArgs),
-    /// Take a unit of work, so no other agent starts it (ADR-020 §5).
+    /// Take a unit of work, so no other agent starts it.
     ///
     /// The room is the record of who holds what. Holding an item is not progress: the
     /// attempt itself is recorded on the GitHub issue through awa.
@@ -387,7 +386,7 @@ enum RoomCmd {
     /// and the exit status is 5; the claim stays posted. `--ttl` is what makes an
     /// agent that dies holding work release it without anyone noticing it died.
     ///
-    /// Ownership is per **session** (ADR-021 §4): the session comes from `--session`,
+    /// Ownership is per **session**: the session comes from `--session`,
     /// `VOX_SESSION`, or the harness (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`).
     /// Every participant must run this exact vox version, or the claim is refused
     /// with exit status 3. A claim also completes a handoff pending for this session.
@@ -405,7 +404,7 @@ enum RoomCmd {
     /// Show what is held or pending, by whom, until when — and whether coordination
     /// is refused because a participant runs another vox version.
     Board(RoomBoardArgs),
-    /// Offer a file to the room and announce it (ADR-020 §11).
+    /// Offer a file to the room and announce it.
     ///
     /// The bytes never enter the log: they ride a room-bound service, and what
     /// goes on the log is a signed announcement carrying the name, the size and
@@ -417,7 +416,7 @@ enum RoomCmd {
     /// Nobody is granted anything: whoever can read the announcement can reach
     /// the bytes, because both are gated on this node's trust keyring.
     Send(SendFileArgs),
-    /// Join a room from a `vox://` address, over a running node (ADR-020 §12).
+    /// Join a room from a `vox://` address, over a running node.
     ///
     /// The passphrase is asked for at the terminal, or read from `--passphrase-file`
     /// (`-` reads stdin); never argv, which anything that can run `ps` would see:
@@ -435,7 +434,7 @@ enum RoomCmd {
     /// `--passphrase-file` (`-` reads stdin).
     Create(CreateRoomArgs),
     /// Set how long the room keeps messages: `1h`, `1w`, `1m` (a month), a number of
-    /// seconds, or `forever` (PRD-001 R7).
+    /// seconds, or `forever`.
     ///
     /// It applies to **everything already in the room**, on every member, as the change
     /// reaches them: shortening it deletes older messages. Only the room's admin may, and it
@@ -443,12 +442,12 @@ enum RoomCmd {
     /// (the `retention` file in its config directory); the shorter wins. This is look and
     /// feel, not a security property: a modified node can keep everything.
     Retention(RetentionArgs),
-    /// Print a room's address, for someone else to `vox room join` with.
+    /// Print a room's link, for someone else to `vox room join` with.
     ///
-    /// The address is rendezvous information, not a credential — no passphrase,
+    /// The link is rendezvous information, not a credential — no passphrase,
     /// and joining with it grants nothing. Goes to stdout so it pipes; the
     /// warnings go to stderr so they do not.
-    Invite(RoomRefArgs),
+    Link(RoomRefArgs),
     /// Leave a room: the other members are told, then the room is deleted from this node.
     ///
     /// Waits up to 30 s for another member to take the news. If none can be told by then, it
@@ -558,7 +557,7 @@ pub struct GetFileArgs {
     /// The file's name, or a prefix of its SHA-256, or its service tag.
     pub file: String,
     /// The directory to put it in, under the sender's name made safe. Defaults to the
-    /// directory named in the profile's `downloads` config file, else `~/Downloads`.
+    /// directory named in the `downloads` file of the config directory, else `~/Downloads`.
     #[arg(long, conflicts_with = "out")]
     pub dir: Option<PathBuf>,
     /// An exact path to write it to instead. Refused if something is already there.
@@ -577,11 +576,11 @@ pub struct DaemonArgs {
     /// else read from stdin.
     #[arg(long)]
     pub passphrase_file: Option<PathBuf>,
-    /// Serve Prometheus metrics at this address (PRD-001 R38). Loopback only: the
+    /// Serve Prometheus metrics at this address. Loopback only: the
     /// counters name every peer and room this node talks to.
     #[arg(long)]
     pub metrics: Option<SocketAddr>,
-    /// The node to attach in the foreground (ADR-026 C-3). Without it: the only node on disk,
+    /// The node to attach in the foreground. Without it: the only node on disk,
     /// else `default` when there is none, else no node (the daemon runs with none).
     #[arg(long, env = "VOX_NODE")]
     pub node: Option<String>,
@@ -589,17 +588,17 @@ pub struct DaemonArgs {
     /// `<data root>/.daemon/log`. It exits once it has no attached node and no client.
     #[arg(long, conflicts_with_all = ["keep", "passphrase_file"])]
     pub detach: bool,
-    /// Keep the foreground node attached across daemon restarts (`.daemon/attach`, ADR-026 L-4).
+    /// Keep the foreground node attached across daemon restarts (`.daemon/attach`).
     /// Its passphrase comes from `--passphrase-file` then, or it has none.
     #[arg(long)]
     pub keep: bool,
-    /// How a client starts the daemon (ADR-026 S-2): its own session, no foreground node, and an
+    /// How a client starts the daemon: its own session, no foreground node, and an
     /// exit once nothing is attached and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
 }
 
-/// `vox tunnel …` (V030-11).
+/// `vox tunnel …`.
 #[derive(Subcommand, Debug, Clone)]
 pub enum TunnelCmd {
     /// Close live tunnels: one by its number, or a member's — all of them, or those to one
@@ -692,7 +691,7 @@ pub struct ClaimArgs {
     /// has agreed to name. Optional with `--work`, which is then the resource.
     pub resource: Option<String>,
     /// awa's work key for the item, as `gwa:<key>` (the key may contain `:`), carried
-    /// in `data.work` and used as the resource (ADR-021 §2).
+    /// in `data.work` and used as the resource.
     #[arg(long)]
     pub work: Option<String>,
     /// Seconds after which the claim lapses on its own unless renewed.
@@ -804,7 +803,7 @@ enum AgentCmd {
     /// The plugin is a shim over `vox agent hook`, not a second implementation.
     Plugin(AgentPluginArgs),
     /// Print the agent-facing skill: what the room is for, its vocabulary and its
-    /// manners (ADR-020 §8).
+    /// manners.
     ///
     /// A skill is on-demand only, so it cannot be what guarantees an agent reads
     /// its room — that is `vox agent hook`'s job. This carries what a hook cannot.
@@ -836,8 +835,7 @@ enum AgentCmd {
     /// vox agent trust codex
     /// ```
     Trust(AgentTrustArgs),
-    /// Check that this node's agent sessions are wired up, and say how to fix what is not
-    /// (V030-16).
+    /// Check that this node's agent sessions are wired up, and say how to fix what is not.
     ///
     /// One line per check, `ok`, `warn` or `fail`, each with a one-line fix: the node answers;
     /// the room resolves; Claude Code's hook entries exist once at user scope; Codex's hook is
@@ -899,7 +897,7 @@ pub struct AgentSkillArgs {
 /// `$CODEX_HOME/skills`, `~/.codex/skills` when unset (its own skill-installer says so); and
 /// OpenCode 1.18's global `~/.config/opencode/skills` (its docs table, and xdg-basedir, which
 /// honours `XDG_CONFIG_HOME`). Each was checked by starting the real harness on a fake model
-/// server and seeing the skill in what it sent (V210-166).
+/// server and seeing the skill in what it sent.
 fn skill_dir(harness: &str) -> Option<&'static str> {
     match harness.to_ascii_lowercase().as_str() {
         "claude" | "claude-code" => Some("~/.claude/skills/vox-agent-comms"),
@@ -930,8 +928,8 @@ pub struct AgentPluginArgs {
     /// The harness to print an integration for. Only `opencode` needs one today;
     /// Claude Code and Codex are configured with a hook command instead.
     pub harness: String,
-    /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`,
-    /// ADR-020 2.1). Required: an agent never uses a person's node.
+    /// The agent's own node, which the printed hooks act as (`vox agent hook --node <name>`).
+    /// Required: an agent never uses a person's node.
     #[arg(long, required = true)]
     pub node: String,
 }
@@ -941,7 +939,7 @@ pub struct AgentPluginArgs {
 pub struct AgentHookArgs {
     #[command(flatten)]
     pub profile: AccountArgs,
-    /// The node this hook acts as: the agent's own node (ADR-020 2.1, ADR-026 N-6). Required, and
+    /// The node this hook acts as: the agent's own node. Required, and
     /// never taken from the environment or any other node: a hook without it refuses.
     #[arg(long, required = true)]
     pub node: String,
@@ -1046,11 +1044,11 @@ pub struct RoomReadArgs {
     pub json: bool,
     /// Print every entry this node holds for the room in the room's order, one per
     /// line as `<entry-hash> <clock-ms>` — readable or not. The sequence every member's view is a part of,
-    /// and the one that must be identical on every node (PRD-001 R13).
+    /// and the one that must be identical on every node.
     #[arg(long, hide = true, conflicts_with_all = ["since", "limit", "json"])]
     pub hashes: bool,
     /// Print only the messages marked late: they arrived after rows below them had already
-    /// been shown, and sit in their true place in history (ADR-023 decision 1).
+    /// been shown, and sit in their true place in history.
     #[arg(long, hide = true, conflicts_with = "hashes")]
     pub late: bool,
 }
@@ -1066,7 +1064,7 @@ pub struct RoomArgs {
     /// process on the machine while it runs. Still parsed so that anything scripted against
     /// it is told the replacement. `VOX_ROOM_PASSPHRASE` is refused for the same reason: a
     /// process's environment is readable by whatever runs as its user, and is inherited by
-    /// everything it starts (V210-72).
+    /// everything it starts.
     ///
     /// Use `--passphrase-file`, or let it prompt (it reads a line from stdin when stdin is
     /// not a terminal).
@@ -1091,7 +1089,7 @@ pub struct RoomArgs {
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
-/// `vox service list`: a room's args without its passphrase, which listing never uses (V210-149).
+/// `vox service list`: a room's args without its passphrase, which listing never uses.
 #[derive(Args, Debug, Clone)]
 pub struct ServiceListArgs {
     #[command(flatten)]
@@ -1154,7 +1152,7 @@ pub struct IdentityArgs {
 pub enum Serve {
     /// Any room published to this anchor.
     Anyone,
-    /// Only rooms made by someone in this profile's `vox trust` list.
+    /// Only rooms made by someone in this node's `vox trust` list.
     Trusted,
 }
 
@@ -1167,7 +1165,7 @@ pub struct AccountArgs {
     /// Config directory.
     #[arg(long, env = "VOX_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
-    /// Address the daemon binds when this command starts it (ADR-026 D-3).
+    /// Address the daemon binds when this command starts it.
     #[arg(long, env = "VOX_LISTEN", default_value = crate::client::DEFAULT_LISTEN)]
     pub listen: SocketAddr,
     /// Anchors a node is attached with (`<fingerprint>@<multiaddr>`, repeatable).
@@ -1188,7 +1186,7 @@ impl AccountArgs {
     }
 }
 
-/// `vox node create|attach|detach|list` (ADR-026 §3).
+/// `vox node create|attach|detach|list`.
 #[derive(Subcommand, Debug, Clone)]
 pub enum NodeCmd {
     /// Make a new node: an identity with its own rooms, trust and services. Its files are
@@ -1292,8 +1290,8 @@ pub struct AnchorArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
     /// Which rooms this anchor serves: `anyone` (the default) serves any room published to
-    /// it; `trusted` serves only rooms made by someone in this profile's `vox trust` list.
-    /// `trusted` needs this profile's identity passphrase to read that list, and reads it once
+    /// it; `trusted` serves only rooms made by someone in this node's `vox trust` list.
+    /// `trusted` needs this node's identity passphrase to read that list, and reads it once
     /// at start. Give it with `--identity-passphrase-file`: `VOX_IDENTITY_PASSPHRASE` also
     /// works, but it stays in the anchor's environment for as long as it runs, where any
     /// process of the same user can read it (`ps -E`). Without the flag, the `serve` file in
@@ -1305,12 +1303,12 @@ pub struct AnchorArgs {
     #[arg(long)]
     pub identity_passphrase: Option<String>,
     /// Read the identity passphrase from this file (first line). Only `--serve trusted`
-    /// needs it: the trust list is sealed under this profile's identity.
+    /// needs it: the trust list is sealed under this node's identity.
     #[arg(long)]
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
-/// The node `vox node` runs its anchor as. One node is one identity (ADR-026 F-3), so a node
+/// The node `vox node` runs its anchor as. One node is one identity, so a node
 /// holding a vault keeps its anchor's key in node `<name>-anchor` — where the migration put the
 /// key of a directory that held both — and `--serve trusted` still reads the vault's trust list
 /// from `<name>`. Otherwise the anchor is the named node itself.
@@ -1364,7 +1362,7 @@ impl AnchorArgs {
         }
         let refuse = |why: String| {
             AppError::Usage(format!(
-                "--serve trusted: {why}. It serves only rooms made by someone in this profile's \
+                "--serve trusted: {why}. It serves only rooms made by someone in this node's \
                  `vox trust` list, so it will not start without it"
             ))
         };
@@ -1373,16 +1371,16 @@ impl AnchorArgs {
         // opened has a list this process cannot get at, and remaking it would not help.
         if !vox_core::node::profile::Profile::exists(paths) {
             return Err(refuse(format!(
-                "this profile has no identity, so no `vox trust` list to read; make one with \
-                 `vox id` and `vox trust add <fingerprint>` in the profile at {}",
+                "this node has no identity, so no `vox trust` list to read; make one with \
+                 `vox id` and `vox trust add <fingerprint>` in the node at {}",
                 paths.profile_dir.display()
             )));
         }
         let mut profile = vox_core::node::profile::Profile::open(paths.clone()).map_err(|e| {
             refuse(format!(
-                "this profile's identity and `vox trust` list exist but could not be opened \
+                "this node's identity and `vox trust` list exist but could not be opened \
                  ({e}); check that the files in {} belong to and are readable by the user \
-                 running `vox node`, and that no other vox has this profile open",
+                 running `vox node`, and that no other vox has this node open",
                 paths.profile_dir.display()
             ))
         })?;
@@ -1412,9 +1410,9 @@ enum TrustCmd {
     /// Trust an identity, node-wide.
     ///
     /// This is the decision the whole model rests on. It is per **identity**, not per
-    /// room: from here on every room this node shares with that key auto-consents to it,
-    /// including rooms made later, **and** that key may reach every service this node
-    /// binds to a room they are both in (ADR-017 decision 3). One act, not one per room.
+    /// room: from here on it reads what you post in every room this node shares with that
+    /// key, including rooms made later, **and** that key may reach every service this node
+    /// binds to a room they are both in. One act, not one per room.
     Add(TrustAddArgs),
     /// List the identities this node trusts, and what it calls them.
     List(IdentityArgs),
@@ -1422,11 +1420,11 @@ enum TrustCmd {
     ///
     /// Removes the ring entry, then rotates this identity's sender key and re-keys
     /// everyone still trusted, in every room shared with the removed key — so it stops
-    /// reading what comes next, everywhere (ADR-017 M17.14). It keeps what it already
+    /// reading what comes next, everywhere. It keeps what it already
     /// read; that cannot be taken back.
     Remove(TrustRemoveArgs),
-    /// Change the name this node calls a trusted identity. The name is what
-    /// `<name>.<room>.vox` reaches (PRD-001 R20); it is local to this machine and never
+    /// Change the name this node calls a trusted identity. The name is the node part of
+    /// `<service>.<name>.<room>.vox`; it is local to this machine and never
     /// leaves it. Grants nothing: only an identity already trusted can be renamed.
     Rename(TrustRenameArgs),
 }
@@ -1461,8 +1459,8 @@ pub struct TrustAddArgs {
     /// and there is a terminal.
     #[arg(long)]
     pub name: Option<String>,
-    /// What each consent to it releases of **your own** messages (PRD-001 R12): `now`,
-    /// the default, from this approval onward; or `full`, everything you still hold a key
+    /// What trusting it releases of **your own** messages: `now`,
+    /// the default, from now on; or `full`, everything you still hold a key
     /// for, so it also reads what you wrote before. Your messages only — nobody else's.
     #[arg(long, value_parser = ["now", "full"], default_value = "now")]
     pub history: String,
@@ -1565,7 +1563,7 @@ pub struct ConnectArgs {
     /// process on the machine while it runs. Still parsed so that anything scripted against
     /// it is told the replacement. `VOX_ROOM_PASSPHRASE` is refused for the same reason: a
     /// process's environment is readable by whatever runs as its user, and is inherited by
-    /// everything it starts (V210-72).
+    /// everything it starts.
     ///
     /// Use `--passphrase-file`, or let it prompt (it reads a line from stdin when stdin is
     /// not a terminal).
@@ -1599,10 +1597,11 @@ pub struct UpArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
     /// One room to open and carry, with its passphrase. Omitted, the proxy runs inside
-    /// the node already holding this profile (`vox daemon`) and carries every room it
-    /// holds: `ssh nas.family.vox` for any node you trust, in any room (PRD-001 R20).
+    /// the daemon, as this node (`vox daemon`), and carries every room it holds: `ssh
+    /// user@ssh.nas.family.vox` reaches service `ssh` on the node you call `nas` in room
+    /// `family`, for any node you trust, in any room.
     pub room: Option<String>,
-    /// **Refused**, as on every room verb (V210-72): use `--passphrase-file`, or let it prompt
+    /// **Refused**, as on every room verb: use `--passphrase-file`, or let it prompt
     /// when a room is named.
     #[arg(long)]
     pub passphrase: Option<String>,
@@ -1640,13 +1639,13 @@ enum Cmd {
     /// Run a headless node: the always-on anchor that serves the board, coordinates
     /// hole punches and carries circuits for your rooms. Needed only when your hosts are
     /// both behind NAT and cannot reach each other directly. It holds no room and can
-    /// read nothing; its identity is a key file in the profile directory, created on
+    /// read nothing; its identity is a key file in its node directory, created on
     /// first run. Prints the `<fingerprint>@<multiaddr>` to give clients as `--anchor`.
     ///
     /// Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Node(AnchorArgs),
     /// Run this data root's daemon in the foreground: the machine's Vox presence, which the
-    /// nodes in this data root attach to (ADR-026).
+    /// nodes in this data root attach to.
     ///
     /// There is one daemon per data root (`VOX_DATA_DIR`). It holds the one UDP port, the
     /// control socket every other `vox` command talks to (`<data root>/.daemon/vox.sock`) and
@@ -1672,7 +1671,7 @@ enum Cmd {
     /// stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each detaches every node cleanly
     /// and stops it.
     Daemon(DaemonArgs),
-    /// Offer a local TCP port as a room-bound service, in one command (ADR-017).
+    /// Offer a local TCP port as a room-bound service, in one command.
     ///
     /// Creates a room, offers the port in it, and prints the address, the
     /// machine-generated passphrase and the `.vox` hostname it answers on. Runs until
@@ -1682,30 +1681,22 @@ enum Cmd {
     ///
     /// **Joining the room does not grant access to the port.** Whoever you have run
     /// `vox trust add` on can reach it, and nobody else — the trust keyring is the
-    /// authorization (ADR-017 decision 3, M17.6/M17.7). Handing somebody the address and
+    /// authorization. Handing somebody the address and
     /// the passphrase lets them into the room; it does not let them at your machine's
     /// port.
-    ///
-    /// This said the opposite until 2026-09-22 — that the room's genesis granted every
-    /// member the right to dial, so "joining the room *is* the authorization and you
-    /// never wait to grant anyone anything". That model was withdrawn in ADR-017's third
-    /// revision, along with the genesis service grant and the `vox grant` verb, and the
-    /// text outlived it. A person reading it would have believed that sharing an address
-    /// was all it took to let somebody at a local port.
     Serve(ServeArgs),
     /// Join a room from the address you were given, and print the name its services
-    /// answer on (ADR-017). One-shot: joining is durable, so there is nothing to keep
+    /// answer on. One-shot: joining is durable, so there is nothing to keep
     /// running — `vox up` is what makes the name resolve.
     Connect(ConnectArgs),
-    /// Offer a local TCP service to a room, or list what is offered (ADR-013).
+    /// Offer a local TCP service to a room, or list what is offered.
     ///
     /// A service is dark by default: offering it grants nobody reach. Members reach it
     /// only once their host has trusted them (`vox trust add`) and they are a member of this
-    /// room — the ring-keyed gate of ADR-017 decision 3 as revised. `dial:` capabilities and
-    /// `vox grant` are withdrawn with the model that needed them (M17.7).
+    /// room.
     #[command(subcommand)]
     Service(ServiceCmd),
-    /// Join, create or leave a room, and speak in it, over a **running** node (ADR-020) —
+    /// Join, create or leave a room, and speak in it, over a **running** node —
     /// the agent-comms verbs.
     ///
     /// For agents on one repository, the room settles who does what: an agent claims
@@ -1721,7 +1712,7 @@ enum Cmd {
     /// from stdin with `--passphrase-file -`.
     #[command(subcommand)]
     Room(RoomCmd),
-    /// Open or accept an app stream to a program on another member's node (ADR-022).
+    /// Open or accept an app stream to a program on another member's node.
     ///
     /// The shape of `nc`, over a running node: `listen` waits for one stream speaking a
     /// label and pipes it; `open` opens one. Both sides must trust each other, and the
@@ -1729,16 +1720,16 @@ enum Cmd {
     #[command(subcommand)]
     App(AppCmd),
     /// Share a file or a folder with a room: served over HTTP as a room-bound service,
-    /// announced with its name, size and SHA-256 (PRD-001 R18). Members you trust pull
+    /// announced with its name, size and SHA-256. Members you trust pull
     /// it with `vox room get`, or with curl through `vox up`. Stops after `--count`
     /// fetches, after `--for`, or on ^C.
     Share(ShareArgs),
-    /// What the running node is doing, and what needs attention (PRD-001 R35): rooms and
+    /// What the running node is doing, and what needs attention: rooms and
     /// their sync, peers and their paths, tunnels, datagram and app counters, and the sync
-    /// counters per room and peer (ADR-025): sessions opened, admitted, refused, completed,
+    /// counters per room and peer: sessions opened, admitted, refused, completed,
     /// partial and failed, and any backoff.
     Status(StatusArgs),
-    /// Wire an agent session into a room (ADR-020) — Claude Code, Codex and OpenCode.
+    /// Wire an agent session into a room — Claude Code, Codex and OpenCode.
     ///
     /// The room settles who does what: an agent claims work there, asks there who is
     /// on what, and answers there, briefly, when asked about its own work; it is also
@@ -1751,7 +1742,7 @@ enum Cmd {
     #[command(subcommand)]
     Agent(AgentCmd),
     /// Bring up the local entry point for a room's services: a SOCKS5 proxy that resolves
-    /// the room's `.vox` name (ADR-017).
+    /// the room's `.vox` name.
     ///
     /// This is how a tool reaches a room-bound service by name — the same shape a Tor user
     /// reaches a `.onion` through, and for the same reason: it needs no privilege of any
@@ -1760,10 +1751,10 @@ enum Cmd {
     /// SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
     Up(UpArgs),
     /// Forward a local port to a shared service, named by its address
-    /// `<service>.<node>.<room>.vox` — `ssh` over Vox (ADR-013, V030-25). Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
+    /// `<service>.<node>.<room>.vox` — `ssh` over Vox. Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
     /// cleanly.
     Forward(ForwardArgs),
-    /// Put this machine on a room's **family LAN** (PRD-001 R28): a network interface on
+    /// Put this machine on a room's **family LAN**: a network interface on
     /// which the room's trusted members are one subnet, so that discovery — Plex and
     /// Jellyfin, Chromecast, a game's LAN lobby — works across Vox.
     ///
@@ -1772,17 +1763,17 @@ enum Cmd {
     /// for one and carries the room's traffic on it.
     #[command(subcommand)]
     Lan(LanCmd),
-    /// Print this profile's own identity fingerprint — what to send someone so they can
-    /// trust you (ADR-002).
+    /// Print this node's own identity fingerprint — what to send someone so they can
+    /// trust you.
     ///
     /// It is the whole 52-character base32 fingerprint, on its own line, so it can be
     /// piped or pasted without editing. Verify it out of band, the way you would a PGP
     /// fingerprint: nothing registers it and nothing looks it up.
     Id(IdentityArgs),
-    /// Decide which identities this node trusts (ADR-020 §3, ADR-017 decision 3).
+    /// Decide which identities this node trusts.
     #[command(subcommand)]
     Trust(TrustCmd),
-    /// Close the live tunnels `vox status` lists (V030-11).
+    /// Close the live tunnels `vox status` lists.
     #[command(subcommand)]
     Tunnel(TunnelCmd),
     /// Put `vox` on PATH and install tab completion for your shell.
@@ -1797,7 +1788,7 @@ enum Cmd {
         #[arg(long)]
         remove: bool,
     },
-    /// Replace this `vox` with the latest GitHub release (ADR-015).
+    /// Replace this `vox` with the latest GitHub release.
     ///
     /// Fetches the per-target release record, verifies the download's size and SHA-256 against
     /// it before anything is renamed, keeps the binary it replaced as `.vox-previous`, and
@@ -1975,7 +1966,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Get(a) => &a.profile,
                 RoomCmd::Join(a) => &a.profile,
                 RoomCmd::Create(a) => &a.profile,
-                RoomCmd::Invite(a) => &a.profile,
+                RoomCmd::Link(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
                 RoomCmd::Leave(a) | RoomCmd::End(a) => &a.profile,
                 RoomCmd::Admin(a) => &a.profile,
@@ -2123,7 +2114,7 @@ pub fn run() -> ExitCode {
                             )
                             .await
                         }
-                        RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                        RoomCmd::Link(a) => crate::room_cli::link(&paths, &a.room).await,
                         RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
                         RoomCmd::End(a) => crate::room_cli::end(&paths, &a.room).await,
                         RoomCmd::Admin(a) => {

@@ -215,8 +215,8 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
         .chars()
         .take(12)
         .collect();
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,

@@ -37,7 +37,7 @@ from vox_pty import Hung, Tui, arm, disarm, is_attached, pyte, stage  # noqa: E4
 VOX, DATA, CFG, IDPASS, TAG, MODE, HOLDER = sys.argv[1:8]
 HOLDER = int(HOLDER)
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "300"))
-TUI_NOTICE = "waiting: another vox holds this profile open"
+TUI_NOTICE = "waiting: another vox holds this node open"
 CLI_ONLY = ("vox: waiting", "resume it", "Ctrl-Z")
 # What `vox tui` says on the terminal, before it takes the screen, while the daemon has not greeted
 # it (ADR-026: the daemon is moving or attaching the node).
@@ -87,7 +87,7 @@ try:
         """The bottom rows, where the TUI's status line is."""
         return " ".join(" ".join(r.split()) for r in tui.display()[-3:])
 
-    answered = ("another vox created", "done", "unlocked", "holds this profile", "error",
+    answered = ("another vox created", "done", "unlocked", "holds this node", "error",
                 "wrong", "could not")
     if MODE == "startup":
         # The holder is the daemon, stopped while it moves and attaches the node: the TUI waits for

@@ -25,14 +25,14 @@ has not opened it. See [closed-room recovery](troubleshooting.md#the-room-is-clo
 
 ```sh
 vox room create --name family
-vox room invite ROOM_ID
+vox room link ROOM_ID
 ```
 
 Create asks for a new room passphrase and confirmation; an empty one is allowed, but then anyone
 with the link can join. Without `--name` the local name is `room`. `--idle-end 1w` makes the room
 end by itself after a week with nothing said in it; it is off unless given.
 
-`room invite` prints the **room link** (`vox://…`) on standard output, so it can be piped; its
+`room link` prints the **room link** (`vox://…`) on standard output, so it can be piped; its
 notes go to standard error. Send the link one way and the passphrase another. The new member runs:
 
 ```sh
@@ -73,17 +73,18 @@ who can read your posts can still read it. `--re` names the message being answer
 is told what its node can see about each addressed member, for example `vox: to ann: none of its
 sessions has announced itself in this room; you trust it; it trusts you`.
 
-In this release `room read` prints an addressed post, a reply, a file offer or a ping exactly as
-it travels: one JSON object (the envelope), with the message in its `body` field. An addressed
-post adds a line such as `(to you)`. Agents read the same posts through their hook, which shows
-only the body.
+An addressed post, a reply, a file offer and a ping are printed by their words, as any message
+is: the reply reads `yes, it arrived`, a file offer `file offered: report.pdf (18 bytes)`, a ping
+`ping: which agent sessions does this node hold, and can each be reached?`. An addressed post
+adds a line naming its recipients as you name them, such as `(to you)`. `--json` keeps the whole
+envelope, with the words in its `body` field, for programs.
 
 ### Characters you cannot see
 
-`room read` shows characters a reader could not otherwise see instead of printing them. An
-invisible character such as a zero-width space appears as `⟨U+200B⟩`. A character that changes
-text direction or breaks a line, such as U+202E, appears as `\u{202e}`. Treat either inside a
-name, link or command as a warning sign: the sender's text is not what it first looks like.
+`room read` shows characters a reader could not otherwise see instead of printing them, each as
+its code point: a zero-width space appears as `⟨U+200B⟩`, and a character that reverses text
+direction, such as U+202E, as `⟨U+202E⟩`. Treat one inside a name, link or command as a warning
+sign: the sender's text is not what it first looks like.
 `--json` output keeps the original characters, JSON-escaped.
 
 ## Follow messages or resume a reader

@@ -226,8 +226,8 @@ fn a_pair(tmp: &Path) -> (Member, Member, String) {
         .next()
         .expect("the room in `vox room list`")
         .to_owned();
-    let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
-    assert!(ok, "CANNOT MEASURE: room invite: {err}");
+    let (ok, link, err) = vox(&alice.dir, &["room", "link", &room], None);
+    assert!(ok, "CANNOT MEASURE: room link: {err}");
     let (ok, _, err) = vox(
         &bob.dir,
         &[

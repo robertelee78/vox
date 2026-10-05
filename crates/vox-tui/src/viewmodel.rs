@@ -211,7 +211,7 @@ pub enum UiError {
     /// The profile had no identity when this TUI started, and another vox created one since:
     /// nothing was created here (V210-100, the CLI's V210-91 refusal).
     IdentityMadeElsewhere,
-    /// Another vox holds this profile open for writing.
+    /// Another vox holds this node open for writing.
     ProfileBusy,
     /// The node this TUI acts as is not attached: give its passphrase (`:attach`).
     NotAttached,
@@ -277,7 +277,7 @@ impl UiError {
         match self {
             UiError::WrongPassphrase => "wrong passphrase",
             UiError::SealedUnreadable => {
-                "passphrase right, but this profile's keyring or prekeys will not open — altered, or another identity's"
+                "passphrase right, but this node's keyring or prekeys will not open — altered, or another identity's"
             }
             UiError::JoinPowDelay => "join proof-of-work in progress…",
             UiError::JoinPowTooSlow => {
@@ -295,11 +295,11 @@ impl UiError {
             UiError::JoinProofMismatch => "join identity proof failed",
             UiError::Unreachable => "no reachable peer — the host or a member must be online",
             UiError::EpochMismatch => "the room's passphrase was changed — re-syncing",
-            UiError::MissingConsent => "you'll see this member once they consent to you",
+            UiError::MissingConsent => "you'll see this member once they trust you",
             UiError::Malformed => "received a malformed entry (ignored)",
             UiError::Transport => "connection error",
             UiError::NoIdentity => "no identity yet — :init to create one",
-            UiError::IdentityExists => "an identity already exists in this profile",
+            UiError::IdentityExists => "an identity already exists on this node",
             UiError::IdentityMadeElsewhere => {
                 "another vox created this node's identity at the same time; nothing was created here — :attach with its passphrase"
             }
@@ -320,7 +320,7 @@ impl UiError {
                 })
             }
             UiError::Storage => "could not write this node's files — check free disk space, and that the data directory is writable",
-            UiError::NotConsented => "nothing to revoke — this member was never consented to",
+            UiError::NotConsented => "nothing to withdraw — you never trusted this member",
             UiError::NotAdmitted => "that member is not admitted here yet — try again once synced",
             UiError::NoSuchTunnel => "that tunnel is no longer open",
             UiError::Refused => "refused — check the room passphrase",

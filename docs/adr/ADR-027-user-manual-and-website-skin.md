@@ -62,8 +62,8 @@ recipient's independently retained copy.
 
 ### D3 — Tell the truth about versions and evidence
 
-Every page shows applicability. The task chapters describe v0.3.0; readers coming from v0.2.10
-get a clearly marked chapter of what changed, so v0.2.10 instructions are never mixed into them.
+Every page shows applicability. The manual describes the current release, v0.3.0, as it is; it
+carries no chapter or passage about earlier releases or how they differed.
 The installer follows the established `https://voxlux.us/install.sh` transport; GitHub remains
 the executable source of truth. Updating the manual must not change installer promotion policy.
 

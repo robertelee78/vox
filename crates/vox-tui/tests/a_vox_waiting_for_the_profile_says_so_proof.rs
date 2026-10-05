@@ -82,8 +82,8 @@ const STOPPED_FOR: Duration = Duration::from_secs(5);
 const FINISHES_WITHIN: Duration = Duration::from_secs(240);
 /// How long A holds the lock once it has it, so it can be stopped holding it.
 const HOLD_MS: &str = "4000";
-const HOLDING: &str = "holding the profile lock";
-const WAITING: &str = "waiting: another vox holds this profile open";
+const HOLDING: &str = "holding the node lock";
+const WAITING: &str = "waiting: another vox holds this node open";
 /// What a client says while the daemon has not greeted it.
 const DAEMON_WAITING: &str = "waiting: the vox daemon here has not answered yet";
 const CONCURRENT: &str = "another vox created this node's identity at the same time";

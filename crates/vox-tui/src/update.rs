@@ -763,7 +763,7 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
     let target = target_triple();
     if target == "unsupported" {
         return Err(usage(
-            "this platform has no vox release (ADR-015 ships x86_64 Linux and both macOS \
+            "this platform has no vox release (releases are built for x86_64 Linux and both macOS \
              architectures)",
         ));
     }

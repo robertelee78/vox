@@ -7,7 +7,7 @@
 //! - `default`: a vault (`vox id`), whose daemon makes a room;
 //! - `anchor`: a headless anchor (`vox node`), its key and its store;
 //! - `both`: a vault (`vox id`) and, from a `vox node` run in the same profile, an anchor's key.
-//!   v0.2.9's `vox node` refuses to run there ("another vox already has this profile open") but
+//!   v0.2.9's `vox node` refuses to run there ("another vox already has this node open") but
 //!   writes the key first; which identity that key is, [`PREVIOUS`] itself says, run on a copy of
 //!   the key alone in a data root of its own.
 //!

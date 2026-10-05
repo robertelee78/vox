@@ -691,9 +691,13 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     w2.run(&oc_cfg, &bin_dir, &calls, &r, &[
         "vox room post \"$VOX_ROOM\" --type blocked --work 'wl:rehearsal#2' --data '{\"reason\":\"waiting on the schema\"}' blocked",
     ]);
-    support::arrives(bob, "w2's blocked", &["room", "read", &r], |o: &Out| {
-        o.stdout.contains("waiting on the schema")
-    });
+    // The reason is in the row's data, which `--json` carries and the words do not (#406).
+    support::arrives(
+        bob,
+        "w2's blocked",
+        &["room", "read", &r, "--json"],
+        |o: &Out| o.stdout.contains("waiting on the schema"),
+    );
     adapter.pump(&mut tracker);
     let board = bob.vox(None, &["room", "board", &r, "--json"]).json();
     tracker.board(&board);
@@ -740,7 +744,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     support::arrives(
         bob,
         "w2's failure while the tracker is down",
-        &["room", "read", &r],
+        // The reason is in the row's data, which `--json` carries and the words do not (#406).
+        &["room", "read", &r, "--json"],
         |o: &Out| o.stdout.contains("the schema never came"),
     );
     std::thread::sleep(Duration::from_secs(45)); // w1's 45 s lease lapses with nobody acting
@@ -793,7 +798,8 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
     support::arrives(
         bob,
         "w2's premature result",
-        &["room", "read", &r],
+        // The evidence ref is in the row's data, which `--json` carries and the words do not (#406).
+        &["room", "read", &r, "--json"],
         |o: &Out| o.stdout.contains("1111aaaa"),
     );
     adapter.pump(&mut tracker);
@@ -827,9 +833,12 @@ fn workers_do_work_and_the_tracker_never_mistakes_an_observation_for_a_verdict()
         "vox room post \"$VOX_ROOM\" --type working --work 'wl:rehearsal#2' retrying",
         "vox room post \"$VOX_ROOM\" --type result --work 'wl:rehearsal#2' --data '{\"evidence\":[{\"kind\":\"commit\",\"ref\":\"9f3c2e1a\"}]}' candidate-ready",
     ]);
-    support::arrives(bob, "w2's result", &["room", "read", &r], |o: &Out| {
-        o.stdout.contains("9f3c2e1a")
-    });
+    support::arrives(
+        bob,
+        "w2's result",
+        &["room", "read", &r, "--json"],
+        |o: &Out| o.stdout.contains("9f3c2e1a"),
+    );
     adapter.pump(&mut tracker);
     tracker.board(&bob.vox(None, &["room", "board", &r, "--json"]).json());
     // Reaching Acceptance rests on Vox's typed `result` row (the started attempt's id and

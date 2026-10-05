@@ -310,8 +310,8 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         .map(str::to_owned)
         .find(|w| !before.contains(w))
         .expect("PRODUCT (staging): no new room id in alice's `room list`");
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let link = link.trim().to_owned();
 
     // The recorder's positive control: alice's daemon has opened its store by now, so a log with
@@ -640,8 +640,8 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
             .map(str::to_owned)
             .find(|w| !before.contains(w))
             .expect("PRODUCT (staging): no new room id in the host's `room list`");
-        let (ok, link, err) = vox(&host, &["room", "invite", &room], None);
-        assert!(ok, "PRODUCT (staging): host{k}'s room invite: {err}");
+        let (ok, link, err) = vox(&host, &["room", "link", &room], None);
+        assert!(ok, "PRODUCT (staging): host{k}'s room link: {err}");
         let link = link.trim().to_owned();
         let join = |dir: &Path| {
             vox(

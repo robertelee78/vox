@@ -7,7 +7,7 @@
 //! vox node --node anchor --listen 127.0.0.1:0       (the daemon, the anchor attached)
 //! vox node create person; vox node attach person    (attached to that same daemon)
 //! vox node list                                     (both attached)
-//! vox room create --node person; vox room invite    (the room's address names the anchor)
+//! vox room create --node person; vox room link    (the room's address names the anchor)
 //! ```
 //!
 //! Claims: `vox node` holds the account's lock itself (it is the daemon, not a process of its
@@ -192,11 +192,7 @@ fn vox_node_is_the_daemon_and_a_person_node_shares_it() {
         .and_then(|l| l.split_whitespace().next())
         .expect("PRODUCT: the person's room list is empty")
         .to_owned();
-    let link = ok(
-        &d,
-        "PRODUCT:",
-        &["room", "invite", &room, "--node", "person"],
-    );
+    let link = ok(&d, "PRODUCT:", &["room", "link", &room, "--node", "person"]);
     assert!(
         link.contains(&format!("a={anchor_fp}")),
         "PRODUCT: the person's room address does not name the anchor of its own daemon: {link}"

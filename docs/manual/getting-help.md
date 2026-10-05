@@ -7,8 +7,7 @@ It does not need your private conversation or a copy of your identity.
 
 ## Before opening a report
 
-Find the matching entry in [Troubleshooting by symptom](troubleshooting.md), or
-[Coming from v0.2.10](development.md) if you upgraded. Keep the original failure text
+Find the matching entry in [Troubleshooting by symptom](troubleshooting.md). Keep the original failure text
 and the result of each check. Do not make several trust, network and identity changes at
 once: that removes the evidence that distinguishes causes.
 

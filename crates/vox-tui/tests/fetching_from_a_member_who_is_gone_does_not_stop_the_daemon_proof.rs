@@ -351,13 +351,13 @@ fn fetching_from_a_member_who_is_gone_does_not_stop_the_daemon() {
         .next()
         .expect("PRODUCT (staging): alice's new room in `vox room list`")
         .to_owned();
-    let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = alice.vox(&["room", "link", &label]);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let link = link.trim().to_owned();
     let room = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .unwrap_or_else(|| panic!("PRODUCT (staging): an invite link naming the room: {link:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): an room link naming the room: {link:?}"))
         .to_owned();
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.

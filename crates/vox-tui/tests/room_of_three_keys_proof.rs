@@ -301,7 +301,7 @@ fn every_member_eventually_reads_every_other(order: [&'static str; 2]) {
         })
         .to_owned();
     let link = alice
-        .vox(&["room", "invite", &room], None)
+        .vox(&["room", "link", &room], None)
         .1
         .trim()
         .to_owned();

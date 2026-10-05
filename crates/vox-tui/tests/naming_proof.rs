@@ -257,8 +257,8 @@ impl Member {
     }
 
     fn invite(&self, room: &str) -> String {
-        let (ok, link, err) = vox(&self.dir, &["room", "invite", room], None);
-        assert!(ok, "PRODUCT (staging): vox room invite {room}: {err}");
+        let (ok, link, err) = vox(&self.dir, &["room", "link", room], None);
+        assert!(ok, "PRODUCT (staging): vox room link {room}: {err}");
         link.trim().to_owned()
     }
 

@@ -400,7 +400,7 @@ impl StatusReport {
         let _ = write!(
             j,
             "\"always_on_member\":{},",
-            q("unknown: not recorded until ADR-023; see each member's last_seen")
+            q("not recorded: Vox does not track which member stays online; each member's last_seen says when it was last heard from")
         );
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {

@@ -227,8 +227,8 @@ fn a_member_trusted_while_unreachable_reads_the_posts_made_meanwhile() {
             )
         })
         .to_owned();
-    let (ok, link, err) = vox(alice_dir, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
+    let (ok, link, err) = vox(alice_dir, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,

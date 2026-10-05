@@ -36,7 +36,7 @@ use crate::app::AppError;
 /// peers are told to dial (see [`NodeArgs::listen`]), so binding broadly is right.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:0";
 
-/// Which node a verb acts as, and the account it belongs to (ADR-026 C-3).
+/// Which node a verb acts as, and the account it belongs to.
 #[derive(Args, Debug, Clone)]
 pub struct NodeArgs {
     /// The node to act as. Without it: the only attached node, else the only node on disk.
@@ -49,11 +49,11 @@ pub struct NodeArgs {
     #[arg(long, env = "VOX_CONFIG_DIR")]
     pub config_dir: Option<PathBuf>,
     /// Address the daemon binds for peer connections (`ip:port`; port 0 picks one), used only
-    /// when this command starts the daemon (ADR-026 D-3). A daemon already running listens where
+    /// when this command starts the daemon. A daemon already running listens where
     /// it does, and is used.
     ///
     /// This is only where the socket binds. What a node *advertises* is worked out separately by
-    /// the ADR-012 ladder — its routable address, a gateway-mapped address when one can be had,
+    /// the reachability ladder — its routable address, a gateway-mapped address when one can be had,
     /// and loopback — so the wildcard default is correct and needs no configuration.
     #[arg(long, env = "VOX_LISTEN", default_value = DEFAULT_LISTEN)]
     pub listen: SocketAddr,
@@ -111,10 +111,10 @@ impl NodeArgs {
 
     /// The configured anchors, parsed and merged by identity.
     ///
-    /// **An anchors file that names no usable anchor stops nothing** (V210-107). Each skipped
+    /// **An anchors file that names no usable anchor stops nothing**. Each skipped
     /// line is said, then that the file names none, and the verb carries on with what is usable
-    /// (perhaps nothing): an anchor only bridges hosts that cannot otherwise reach each other
-    /// (ADR-012), so a peer this node can reach directly needs none, and a verb that does need
+    /// (perhaps nothing): an anchor only bridges hosts that cannot otherwise reach each other,
+    /// so a peer this node can reach directly needs none, and a verb that does need
     /// one fails where it needs it, saying what it tried. V210-75 refused such a file for every
     /// verb that starts a node, which stopped `vox connect` to a directly reachable host.
     ///
@@ -189,7 +189,7 @@ impl NodeArgs {
     }
 }
 
-/// The node a verb acts as (ADR-026 C-3), in order: the one it names; else the only attached
+/// The node a verb acts as, in order: the one it names; else the only attached
 /// node; else the only node on disk; else `default`, when the data root has no node at all and
 /// the verb creates an identity; else a refusal listing the nodes.
 ///
@@ -295,7 +295,7 @@ pub const DAEMON_WAITING: &str = "vox: waiting: the vox daemon here has not answ
      be busy (moving or attaching a node) or stopped (Ctrl-Z, which goes on once resumed); this \
      waits up to 10 s";
 
-/// Say [`DAEMON_WAITING`]: a verb waiting on the daemon is never silent (V210-100).
+/// Say [`DAEMON_WAITING`]: a verb waiting on the daemon is never silent.
 pub fn say_daemon_waiting() {
     eprintln!("{DAEMON_WAITING}");
 }
@@ -331,10 +331,10 @@ pub fn said(at: &NodeSocket, e: Error) -> AppError {
     })
 }
 
-/// Make sure the account's daemon is running (ADR-026 S-2), starting it with `listen` and
+/// Make sure the account's daemon is running, starting it with `listen` and
 /// `anchors` when none answers, and waiting for it within its bound.
 ///
-/// **The one place a client starts the daemon** (`vox daemon --detach`'s start, #405).
+/// **The one place a client starts the daemon** (`vox daemon --detach`'s start).
 ///
 /// # Errors
 /// If no daemon answers and none could be started.
@@ -375,7 +375,7 @@ pub struct Pass {
     pub file: Option<PathBuf>,
 }
 
-/// A verb's hold on its node (ADR-026 L-7): the connection that holds it, and the socket further
+/// A verb's hold on its node: the connection that holds it, and the socket further
 /// connections reach it by, which never attach.
 pub struct Held {
     /// The holding connection; requests go over it.
@@ -560,8 +560,8 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
     }
 }
 
-/// Wait on a held connection until the daemon closes it or the node detaches, and say which
-/// (ADR-026 L-7): a held verb never runs on with nothing behind it.
+/// Wait on a held connection until the daemon closes it or the node detaches, and say which:
+/// a held verb never runs on with nothing behind it.
 pub async fn hold_until_closed(client: &mut IpcClient) -> AppError {
     loop {
         match client.next().await {
@@ -632,7 +632,7 @@ pub async fn events(at: &NodeSocket) -> Result<IpcClient, AppError> {
 /// `vox node create <name> [--headless]`: write the node's files here (C-5), sending nothing over
 /// the socket.
 /// Its passphrase comes from `--passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the terminal
-/// (asked twice); an empty one is allowed (V030-36).
+/// (asked twice); an empty one is allowed.
 ///
 /// # Errors
 /// A bad name, a node that exists, or a passphrase that cannot be had.

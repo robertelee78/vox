@@ -321,7 +321,7 @@ fn a_member_who_joins_through_another_is_seen_by_the_third_within_seconds() {
         })
         .to_owned();
     let link = alice
-        .vox(&["room", "invite", &room], None)
+        .vox(&["room", "link", &room], None)
         .1
         .trim()
         .to_owned();

@@ -109,7 +109,7 @@ pub struct DaemonCore {
     active: Option<Digest32>,
     /// Unread counts per room (incremented by events for rooms off screen).
     unread: BTreeMap<Digest32, usize>,
-    /// The most recent public notice: an invite link, a join, a consent, a detach.
+    /// The most recent public notice: a room link, a join, a trust grant, a detach.
     notice: Option<String>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
@@ -454,7 +454,7 @@ impl DaemonCore {
                 CommandStatus::Done
             }
             // **The link is the answer** (#406): set only as a notice, it sat under the "done" this
-            // command's own status puts over every notice, and `:invite` showed a person nothing to
+            // command's own status puts over every notice, and `:link` showed a person nothing to
             // give anyone. A room link is no secret: the passphrase travels apart.
             Ok(Frame::Link { url, .. }) => {
                 self.notice = Some(format!("room link: {url}"));
@@ -568,12 +568,12 @@ impl DaemonCore {
             }
             NodeEvent::PeerJoined { peer, .. } => {
                 self.notice = Some(format!(
-                    "{} joined — they read nothing until you consent",
+                    "{} joined — they read nothing until you trust them",
                     self.member_name(&peer)
                 ));
             }
             NodeEvent::Consented { target, .. } => {
-                self.notice = Some(format!("consented to {}", self.member_name(&target)));
+                self.notice = Some(format!("you now trust {}", self.member_name(&target)));
             }
             NodeEvent::SenderKeyReceived {
                 channel_id,
@@ -588,11 +588,11 @@ impl DaemonCore {
                 rows_in(self, channel_id, backfilled as usize);
                 self.notice = Some(if backfilled > 0 {
                     format!(
-                        "{} consented to you — {backfilled} earlier message(s) now readable",
+                        "{} trusts you — {backfilled} earlier message(s) now readable",
                         self.member_name(&peer)
                     )
                 } else {
-                    format!("{} consented to you", self.member_name(&peer))
+                    format!("{} trusts you", self.member_name(&peer))
                 });
             }
             NodeEvent::Synced {

@@ -93,7 +93,7 @@ pub fn require_session(flag: Option<&str>) -> Result<String, AppError> {
             shown(&s, SHOWN_NAME)
         ))),
         None => Err(AppError::Usage(
-            "no session: work coordination is owned per session (ADR-021 §4), and nothing \
+            "no session: work coordination is owned per session, and nothing \
              names this one. Run inside Claude Code or Codex, set VOX_SESSION, or pass \
              --session."
                 .into(),
@@ -754,7 +754,7 @@ fn conflict(op: &str, group: &[Digest32]) -> AppError {
         code: EXIT_CONFLICT,
         message: format!(
             "operation {op} conflicts: this identity has already posted it with different \
-             content, so it has NO effect anywhere (ADR-021 §6). Entries: {}. Use a new \
+             content, so it has NO effect anywhere. Entries: {}. Use a new \
              --op for a different operation.",
             list.join(", ")
         ),

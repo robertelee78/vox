@@ -11,7 +11,7 @@
 //! member that had been reached and had waited. A slow device is the same window as a slow build.
 //!
 //! **What this drives, with real binaries.** An anchor (`vox node`), alice (`vox id`,
-//! `vox daemon`, `vox room create`, `vox room invite`) and bob (`vox id`, `vox daemon`,
+//! `vox daemon`, `vox room create`, `vox room link`) and bob (`vox id`, `vox daemon`,
 //! `vox room join`). Bob's daemon is started with `VOX_TEST_SOLVE_AT_LEAST_MS`, the product's
 //! test-only floor on its own grind, inert when unset: the release build solves in a second or
 //! two, and nothing else stages a joiner slower than the member's patience deterministically.
@@ -261,11 +261,7 @@ fn stage(tmp: &Path, grind_ms: u64) -> Staged {
         .next()
         .expect("PRODUCT: the new room in `vox room list`")
         .to_owned();
-    let link = alice
-        .vox(&["room", "invite", &id], None)
-        .1
-        .trim()
-        .to_owned();
+    let link = alice.vox(&["room", "link", &id], None).1.trim().to_owned();
     Staged {
         _anchor: anchor,
         _alice: alice_proc,

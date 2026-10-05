@@ -223,10 +223,10 @@ fn post_range(alice: &Path, room: &str, lo: usize, hi: usize) {
     }
 }
 
-/// Bob joins `room` from alice's `vox room invite`.
+/// Bob joins `room` from alice's `vox room link`.
 fn join(bob: &Path, alice: &Path, room: &str, name: &str) {
-    let (ok, link, err) = vox(alice, &["room", "invite", room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(alice, &["room", "link", room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         bob,
         &[

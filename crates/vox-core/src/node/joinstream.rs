@@ -325,13 +325,13 @@ impl JoinFrame {
         let op = d.uint()?;
         let frame = match (op, n) {
             (OP_WANT, 3) => Self::Want {
-                channel_id: *take_fixed::<32>(&mut d, "want channel_id")?,
+                channel_id: *take_fixed::<32>(&mut d, "want room id")?,
                 epoch: d.uint()?,
             },
             (OP_CHALLENGE, 9) => {
                 let responder_pub = take_fixed::<COMPOSITE_PUB_LEN>(&mut d, "challenge key")?;
                 let challenge_sig = take_fixed::<COMPOSITE_SIG_LEN>(&mut d, "challenge sig")?;
-                let channel_id = take_fixed::<32>(&mut d, "challenge channel_id")?;
+                let channel_id = take_fixed::<32>(&mut d, "challenge room id")?;
                 let epoch = d.uint()?;
                 let difficulty_bits = u8::try_from(d.uint()?)
                     .map_err(|_| Error::MalformedJoin("challenge difficulty range"))?;
@@ -611,9 +611,7 @@ pub async fn run_initiator(
         ));
     }
     if channel_id != ctx.channel_id || epoch != ctx.epoch {
-        return Err(Error::MalformedJoin(
-            "challenge binds another channel/epoch",
-        ));
+        return Err(Error::MalformedJoin("challenge binds another room/epoch"));
     }
     let bundle = PrekeyBundlePublic::decode_canonical(&bundle)?;
     if bundle.root_pub != responder_pub.to_bytes() {

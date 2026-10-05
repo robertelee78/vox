@@ -21,7 +21,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
             whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
             "← in-only" for Carol, though nothing comes in from her);
-  words     `:invite` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
+  words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
             the help line names none of them: the TUI offers only what vox supports (V210-155);
@@ -149,8 +149,8 @@ try:
     listed = run("alice", "room", "list")
     if not listed.stdout.split(): product(f"alice's `vox room list` shows no room after create: {listed.stderr.strip()}")
     room = listed.stdout.split()[0]
-    inv = run("alice", "room", "invite", room)
-    if inv.returncode != 0: product(f"alice's `vox room invite` failed: {inv.stderr.strip()}")
+    inv = run("alice", "room", "link", room)
+    if inv.returncode != 0: product(f"alice's `vox room link` failed: {inv.stderr.strip()}")
     link = inv.stdout.strip()
     # Bob and Carol join at once, as two people given the link might: so the budget holds one
     # join's worth of JOIN_SECS, not two.
@@ -308,9 +308,9 @@ try:
 
     stage("words")
     # Before `unknown`, whose short answers leave the line under the status bar one row again.
-    # The decider's words (#406): a room link and a passphrase, never an "invite link". `:invite`
+    # The decider's words (#406): a room link and a passphrase, never an "invite link". `:link`
     # names what it gives a person, and `:join` asks for what a person was given.
-    tui.key(":invite\r", 2)
+    tui.key(":link\r", 2)
     tui.until(lambda: "vox://" in "\n".join(tui.display()), 10, 0.5)
     # The link wraps over the rows under the status bar: read them as one.
     invite_said = " ".join(r.strip() for r in tui.display()[-4:])
@@ -320,21 +320,21 @@ try:
     said_both = invite_said + "\n" + join_prompt
     claim("words", "room link: vox://" in invite_said and "room link (vox://" in join_prompt
           and "invite link" not in said_both.lower(),
-          f":invite says {invite_said.strip()[:90]!r}; :join asks for "
+          f":link says {invite_said.strip()[:90]!r}; :join asks for "
           f"{[r.strip() for r in join_prompt.splitlines() if 'link' in r][:2]!r}; "
           f"'invite link' anywhere: {'invite link' in said_both.lower()}")
 
     stage("unknown")
-    # Each answer is read after `:invite`, a command vox supports, has replaced the status line, so
+    # Each answer is read after `:link`, a command vox supports, has replaced the status line, so
     # an "unknown command" seen is this command's answer and not the one before it.
     def bottom():
         return "\n".join(r.rstrip() for r in tui.display()[-3:])
     REMOVED = ("show", "hide", "block", "unblock", "verify")
     answers = {}
     for c in REMOVED:
-        tui.key(":invite\r", 2)
+        tui.key(":link\r", 2)
         if "unknown command" in bottom():
-            product(f"bob's `vox tui` answered :invite, a command it supports, with unknown command:\n{bottom()}")
+            product(f"bob's `vox tui` answered :link, a command it supports, with unknown command:\n{bottom()}")
         tui.key(f":{c}\r", 2)
         answers[c] = bottom().split("\n")[-1].strip()
     screen = "\n".join(tui.display())

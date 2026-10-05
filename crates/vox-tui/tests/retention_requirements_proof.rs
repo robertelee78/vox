@@ -312,8 +312,8 @@ fn create(creator: &Path) -> String {
 }
 
 fn join(creator: &Path, joiner: &Path, room: &str) {
-    let (ok, link, err) = vox(creator, &["room", "invite", room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(creator, &["room", "link", room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         joiner,
         &[

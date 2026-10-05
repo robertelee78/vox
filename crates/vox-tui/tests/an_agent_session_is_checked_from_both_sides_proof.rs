@@ -569,7 +569,15 @@ fn an_agent_session_is_checked_from_both_sides() {
         "APPARATUS: bob's daemon still answers 10 s after it was stopped"
     );
     let (o, v) = doctor(bob, &home, &room);
-    expect("bob's node stopped", &o, &v, "node", "fail", "vox daemon");
+    // A node is started by attaching it (ADR-026): the attach starts the daemon when none runs.
+    expect(
+        "bob's node stopped",
+        &o,
+        &v,
+        "node",
+        "fail",
+        "vox node attach",
+    );
 
     // ---- (6) a ping to a stopped node: a named timeout ----
     let ping = alice.vox(None, &["room", "ping", &room, "bob", "--wait", "15"]);

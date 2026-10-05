@@ -316,8 +316,8 @@ fn restarted_responder() -> World {
             )
         })
         .to_owned();
-    let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
+    let (ok, link, err) = vox(&alice.dir, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
     for m in [&bob, &carol] {
         // One attempt: a join that fails is the product failing (a join turned away while the
         // host admits another joiner was #217, fixed), and retrying past it would hide it.
