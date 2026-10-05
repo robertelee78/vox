@@ -1,3 +1,20 @@
+// **Vox: a vendored copy of quinn-udp 0.5.14, with one change** (Vox #414, 2026-10-05).
+//
+// What: on Apple platforms an IPv4 datagram's source address is asked for with `IP_PKTINFO`
+// (`ipi_spec_dst`), not `IP_RECVDSTADDR`. The hunk is in `src/unix.rs`, marked "Vox:".
+//
+// Why, measured on macOS (Darwin 27.2): from a socket bound to `0.0.0.0`, a datagram to
+// 192.168.1.135 asking for source 127.0.0.1 arrived from 192.168.1.135 with `IP_RECVDSTADDR`
+// (ignored), and from 127.0.0.1 with `IP_PKTINFO`, through both `sendmsg` and `sendmsg_x`. A
+// node listening on every address therefore answered a peer from the route's choice of address,
+// and the peer's QUIC dropped every answer: "the room's host did not answer". IPv6 is unchanged:
+// `IPV6_PKTINFO` was already used, and was measured honoured.
+//
+// Drop this copy, and the `[patch.crates-io]` entry in the workspace `Cargo.toml`, once upstream
+// quinn-udp sends `IP_PKTINFO` on Apple (still `IP_RECVDSTADDR` in 0.6.3 and on main,
+// 2026-10-05). The proof that must stay green without it:
+// `a_node_dials_only_what_it_can_reach_proof::a_host_on_every_address_answers_from_the_one_it_was_reached_at`.
+
 //! Uniform interface to send and receive UDP packets with advanced features useful for QUIC
 //!
 //! This crate exposes kernel UDP stack features available on most modern systems which are required
