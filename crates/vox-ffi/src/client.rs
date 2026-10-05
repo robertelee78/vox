@@ -27,6 +27,7 @@ use vox_core::node::daemonipc::{
 use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
 use vox_core::node::link::b32_encode;
 use vox_core::node::paths::Account;
+use vox_core::node::resolver::ShareState;
 use zeroize::Zeroizing;
 
 use crate::{digest, failed, VoxError};
@@ -157,6 +158,40 @@ pub struct RoomLink {
     pub note: String,
 }
 
+/// What is shared in a room, and what this node offers there, as `vox service list` says it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomServices {
+    /// The room's local name.
+    pub room: String,
+    /// What every member shares there.
+    pub shared: Vec<SharedService>,
+    /// The services this node offers there.
+    pub offered: Vec<OfferedService>,
+}
+
+/// A service a member shares in a room.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SharedService {
+    /// Its address, `<service>.<node>.<room>.vox`, in this node's own aliases: what a forward
+    /// takes.
+    pub address: String,
+    /// Who shares it: this node's name for them, or `you`.
+    pub by: String,
+    /// Whether it carries datagrams.
+    pub udp: bool,
+    /// What its sharer's node detected it to be (ADR-028 S-2).
+    pub kind: String,
+}
+
+/// A service this node offers in a room.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OfferedService {
+    /// Its tag.
+    pub tag: String,
+    /// The local endpoint connections are carried to.
+    pub local: String,
+}
+
 /// What the app hears from the node it acts as.
 #[uniffi::export(with_foreign)]
 pub trait ClientListener: Send + Sync {
@@ -175,6 +210,9 @@ struct Held {
     client: IpcClient,
     /// For further connections as the same node; they attach nothing.
     at: NodeSocket,
+    /// The forwards this app made, by the address each is bound at: each on a connection of its
+    /// own, which carries it until it is stopped or the node is let go of.
+    forwards: HashMap<String, IpcClient>,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
@@ -512,6 +550,7 @@ impl VoxClient {
                 node: name,
                 client,
                 at: at.attached_only(),
+                forwards: HashMap::new(),
             });
             Ok(me)
         })
@@ -862,6 +901,196 @@ impl VoxClient {
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
         };
         on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// What is shared in `room` and what this node offers there (`vox service list`).
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal.
+    pub async fn services(&self, room: String) -> Result<RoomServices, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::Services { channel_id }).await? {
+                Frame::Services {
+                    room,
+                    services,
+                    shared,
+                } => Ok(RoomServices {
+                    room: shown_name(&room),
+                    shared: shared
+                        .into_iter()
+                        .map(|(address, by, udp, kind)| SharedService {
+                            address: shown_name(&address),
+                            by: shown_name(&by),
+                            udp,
+                            kind: shown_name(&kind),
+                        })
+                        .collect(),
+                    offered: services
+                        .into_iter()
+                        .map(|(tag, local)| OfferedService { tag, local })
+                        .collect(),
+                }),
+                other => Err(unexpected(&other)),
+            }
+        )
+    }
+
+    /// Offer the local endpoint `local` (`ip:port`) in `room` as the service `tag`, kept across
+    /// this node's restarts until removed (`vox service add`).
+    ///
+    /// # Errors
+    /// A malformed id or endpoint, or the node's refusal.
+    pub async fn service_add(
+        &self,
+        room: String,
+        tag: String,
+        local: String,
+    ) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let local: std::net::SocketAddr = local.trim().parse().map_err(|_| {
+            failed(format!(
+                "{local:?} is not a local endpoint: give it as ip:port, like 127.0.0.1:22"
+            ))
+        })?;
+        let req = Request::AddService {
+            channel_id,
+            service_tag: tag,
+            local: local.to_string(),
+            persist: true,
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// Stop offering the service `tag` in `room`; its live sessions are cut
+    /// (`vox service remove`).
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (no such service).
+    pub async fn service_remove(&self, room: String, tag: String) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let req = Request::RemoveService {
+            channel_id,
+            service_tag: tag,
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// Forward `local` (`ip:port`; port 0 lets the system choose, empty is `127.0.0.1:0`) to the
+    /// service at `address`, `<service>.<node>.<room>.vox`, as `vox forward` does: in a room not
+    /// yet synced it waits for the room's log to say what is shared there, and a share the log
+    /// does not carry is refused at once. Carried until [`Self::stop_forward`] or the node is let
+    /// go of. Answers the address bound.
+    ///
+    /// # Errors
+    /// The name leading nowhere, the share absent, or the node's refusal to bind.
+    pub async fn forward(&self, address: String, local: String) -> Result<String, VoxError> {
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let at = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.at.clone())
+                .ok_or_else(not_attached)?;
+            let resolve = || async {
+                vox_core::node::nameipc::resolve(&at, &address)
+                    .await
+                    .map_err(|e| failed(format!("{address}: {e}")))
+            };
+            let mut room = resolve().await?;
+            let deadline = tokio::time::Instant::now() + vox_core::node::up::HOST_PATIENCE;
+            while room.share == ShareState::NotYetKnown && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                room = resolve().await?;
+            }
+            match room.share {
+                ShareState::Stated => {}
+                ShareState::Absent => {
+                    return Err(failed(format!(
+                        "{address}: {} shares no service called `{}` in that room",
+                        b32_encode(&room.host),
+                        vox_core::node::channel::service_name(&room.service)
+                    )))
+                }
+                ShareState::NotYetKnown => {
+                    return Err(failed(format!(
+                        "{address}: that room has not synced with its members since this node \
+                         joined it, so what is shared there is not known here yet; try again once \
+                         a member is reachable"
+                    )))
+                }
+            }
+            let local = match local.trim() {
+                "" => "127.0.0.1:0".to_owned(),
+                l => l.to_owned(),
+            };
+            let mut carrier = IpcClient::open_at(&at)
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            let req = Request::Forward {
+                channel_id: room.channel_id,
+                host: room.host,
+                service_tag: room.service,
+                local,
+            };
+            let bound = match ask(&mut carrier, &req).await? {
+                Frame::Bound { local } => local,
+                other => return Err(unexpected(&other)),
+            };
+            match held.lock().await.as_mut() {
+                Some(h) => {
+                    h.forwards.insert(bound.clone(), carrier);
+                    Ok(bound)
+                }
+                // Let go of while the forward was being made: its connection ends it.
+                None => Err(not_attached()),
+            }
+        })
+        .await
+    }
+
+    /// Stop the forward bound at `local`, as [`Self::forward`] answered it.
+    ///
+    /// # Errors
+    /// No forward of this app's is bound there, or the node's refusal.
+    pub async fn stop_forward(&self, local: String) -> Result<(), VoxError> {
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let carrier = held
+                .lock()
+                .await
+                .as_mut()
+                .ok_or_else(not_attached)?
+                .forwards
+                .remove(&local);
+            let Some(mut carrier) = carrier else {
+                return Err(failed(format!("this app has no forward bound at {local}")));
+            };
+            done(&mut carrier, &Request::StopForward { local }).await
+        })
+        .await
+    }
+
+    /// The node's report, as `vox status --json` prints it: JSON, the report's contract.
+    ///
+    /// # Errors
+    /// No node attached, or the node did not answer.
+    pub async fn status(&self) -> Result<String, VoxError> {
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let at = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.at.clone())
+                .ok_or_else(not_attached)?;
+            vox_core::node::status::request(&at)
+                .await
+                .map_err(|e| failed(format!("the node did not report: {e}")))
+        })
+        .await
     }
 
     /// Deliver the held node's events to `listener` until it is detached or the daemon stops.
