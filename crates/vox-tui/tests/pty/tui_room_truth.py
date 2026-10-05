@@ -15,6 +15,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             three people are read from the bytes the TUI wrote, not from pyte's cells, and how a
             real terminal draws the glyph is not seen here;
   follows   a message Alice posts while it is open (m-071) is shown when it arrives;
+  shown     what Bob's TUI has drawn is read, and only that (ADR-028 RR-1, #504): Alice's
+            `vox room read --json` says m-071, on Bob's screen, is "read by" bob, and m-001, which
+            his TUI has not drawn yet, is read by nobody;
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
@@ -255,6 +258,19 @@ try:
     if p.returncode != 0: product(f"alice's `vox room post` while bob's TUI is open failed: {p.stderr.strip()}")
     follows = tui.until(lambda: has(timeline(), f"m-{POSTS + 1:03d}"), 60, 1)
     claim("follows", follows, f"m-{POSTS + 1:03d} shown within 60 s: {follows}")
+
+    stage("shown")
+    import json
+    def alice_read_by():
+        r = run("alice", "room", "read", room, "--json")
+        if r.returncode != 0: product(f"alice's `vox room read --json` failed: {r.stderr.strip()}")
+        rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
+        return {row["text"]: row.get("read_by", []) for row in rows}
+    newest_read = until(lambda: alice_read_by().get(f"m-{POSTS + 1:03d}") == ["bob"], 30, 1)
+    seen = alice_read_by()
+    claim("shown", newest_read and seen.get("m-001") == [],
+          f"read by, on alice's node: m-{POSTS + 1:03d} {seen.get(f'm-{POSTS + 1:03d}')!r}; "
+          f"m-001 {seen.get('m-001')!r}")
 
     stage("scrolls")
     for _ in range((POSTS + 10) // 10):

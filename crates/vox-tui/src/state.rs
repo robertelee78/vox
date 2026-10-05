@@ -221,6 +221,10 @@ pub struct UiState {
     /// The tunnel selected in the tunnel list, **by its number**, so a tunnel that ends or opens
     /// does not move the selection onto another (V030-11).
     pub selected_tunnel: Option<u64>,
+    /// The messages the last frame drew in the room on screen, by entry: what this node's
+    /// person has been shown, for a read record (ADR-028 RR-1). Taken by the loop after each
+    /// frame; empty when no room is on screen.
+    pub on_screen: Vec<Digest32>,
 }
 
 impl Default for UiState {
@@ -235,6 +239,7 @@ impl Default for UiState {
             status_message: None,
             composer: String::new(),
             selected_tunnel: None,
+            on_screen: Vec::new(),
         }
     }
 }

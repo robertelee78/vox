@@ -116,6 +116,11 @@ pub trait CoreHandle {
     fn ended(&self) -> Option<String> {
         None
     }
+    /// The messages a frame just drew in the room on screen: the person has been shown them,
+    /// so the node posts a read record for them (ADR-028 RR-1). Nothing for a core with no node.
+    fn shown(&mut self, entries: &[vox_core::hash::Digest32]) {
+        let _ = entries;
+    }
 }
 
 /// A no-node core binding: renders an empty/seeded view and records commands as
@@ -1430,6 +1435,9 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
         was_attached = Some(vm.attached);
 
         io.draw(&mut |f| render(f, &vm, &mut ui))?;
+        if !ui.on_screen.is_empty() {
+            core.shown(&ui.on_screen);
+        }
 
         // Poll so the render loop never blocks indefinitely (daemon updates are folded in each
         // tick). A passphrase is read past the terminal library (V210-94): see `poll_secret_key`.
