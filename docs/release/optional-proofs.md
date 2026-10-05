@@ -17,6 +17,31 @@ They are kept "at the ready for troubleshooting". When a user reports one of the
   - A product failure fails as the product's verdict.
 - **CI compiles them on every run and never runs them.** The CI step is "Compile optional proofs (not run; troubleshooting kit)": `cargo test --release -p vox-tui --features optional-proofs --no-run`, with `-D warnings`. A change that breaks one is caught at once, not on the day it is needed.
 
+## Manual checks (Vox.app, macOS): run by a person before tagging
+
+No automated proof reaches these, so a person runs each of them before a release that ships Vox.app is tagged (ADR-014 M-33). A manual check is **never** reported as proven by automation, and nothing here passes because a proof was green. Each check is either run and recorded, or the tag waits.
+
+Run them on an Apple Silicon Mac with macOS 13 or later, using **the signed, notarized release candidate**: install it with `install.sh`, never a debug build. Use a scratch data root (`VOX_DATA_DIR` and `VOX_CONFIG_DIR` set to fresh directories) and a second node in another scratch data root as the peer. Never use a real data root.
+
+| Check | What the person does | What they must see |
+|---|---|---|
+| `manual.login_item` | Open Vox.app for the first time and accept its request to keep the daemon running. Open System Settings, General, Login Items. Quit Vox, log out, and log back in. | The first-run request says what the login item does: Vox keeps your rooms reachable while you are logged in, even with the app closed (M-8). Login Items lists Vox as allowed in the background. After logging back in, with the app still closed, the peer can read a post this node's room received. |
+| `manual.lan_helper` | In Vox.app, turn on the family LAN. Approve the helper in System Settings when it asks. | Before approval, the app says what approval grants: one root process that creates network interfaces for Vox and nothing else (M-12). System Settings lists the helper for approval. After approval the family LAN is offered, and before approval it was not. |
+| `manual.notification_under_focus` | Turn on a Focus, such as Do Not Disturb. From the peer, post an ordinary message, and then an urgent message addressed to this node. | Each notification is local and grouped under its room, and its message text is hidden by default (M-23, ADR-028 R-10). The ordinary message waits behind the Focus. Record whether the urgent one came through: M-23 allows it to be time-sensitive but does not require it. |
+| `manual.share_extension` | In Finder, or in another app such as Preview, choose Share, then "Share to Vox room", for a file. Choose a room, a To: and a note, and send it. Repeat with the Finder Services item. | The file appears on the room's timeline with that To: and note, and the peer can pull it (M-24, ADR-028 F-1). |
+| `manual.quick_look` | Pull a file the peer shared. Open it from its card. | It opens in Quick Look from the card, after verification (M-24, ADR-028 F-11). |
+| `manual.menu_bar_extra` | At first run, leave the menu bar extra off. Then turn it on in Vox.app. | It is off until turned on (M-22). Once on, it shows the node's state and its keyring window (for example `keyring open 23m`), rooms with messages addressed to this node, the services shared to it with copy buttons, its own shares with stop, and live tunnels (ADR-028 A-3, K-9). |
+
+### Recording a run
+
+Before the tag, the person who ran the checks adds one line per check to the release's tracking issue, in this form:
+
+```
+manual.<check> — v<version> candidate <sha> — run by <who> on <date>, macOS <version> — seen | not seen: <what was seen instead>
+```
+
+A `not seen` is a defect in this release. It is fixed before the tag, never carried forward (AGENTS.md, Releases). A check nobody ran is recorded as not run, and the tag waits.
+
 ## Running one
 
 - Run from the repository root, on a machine doing its ordinary work.
