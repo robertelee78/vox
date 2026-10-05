@@ -18,9 +18,22 @@
 //!   none of her later posts once carol has them (PRODUCT (staging) otherwise).
 //! - carol reads every post alice made after the re-key within [`PROMPT`] of the post.
 //! - dave, who joins through the anchor after the re-key, gets in and reads them within [`PROMPT`]
-//!   of his join.
+//!   of his join. alice trusted dave before the room was made, so the posts are his to read: the
+//!   room is forward-only, and a joiner trusted later reads only what follows that trust (the
+//!   second arm).
 //! - Every node reports the same epoch for the room, before and after the re-key (`vox status
 //!   --json`).
+//!
+//! **A second arm: a joiner alice trusts only after the re-key reads what follows her trust, and
+//! only that** (the room is forward-only: ADR-006, ADR-007 G-15a, V210-45). An independent check
+//! staged it this way — erin trusted, invited again and joined after alice's post-re-key posts —
+//! and found erin reading none of those posts for minutes. That is the rule: the key alice
+//! releases to erin starts where her trust decision stands in the room's order, so nothing sealed
+//! before it is erin's to read. Asserted: a post alice makes after trusting erin is read by erin
+//! within [`PROMPT`] of her join (red if not), and the posts sealed before alice's trust stay
+//! unread (pins forward-only). Mutant: after a re-key, a newly owed consent is never sent
+//! (`Node::deliver_owed_consents` owes nothing once the sender's generation is past 0): red as
+//! PRODUCT at "erin … must read" (and the first arm at dave's).
 //!
 //! **Mutant:** the re-key is not delivered to a member reached over a relay (in vox-core's
 //! `Node::deliver_rekeys_for`, `node/actor.rs`, a target whose connection is relayed is skipped):
@@ -439,5 +452,121 @@ fn a_member_reached_only_through_the_anchor_and_a_later_joiner_stay_in_step_afte
         epochs.iter().all(|e| *e == epochs[0]) && epochs[0] != u64::MAX,
         "PRODUCT: every node must report one epoch for the room, before and after the re-key: \
          {epochs:?}"
+    );
+}
+
+#[test]
+#[ignore = "an anchor and three vox daemons with production Argon2id; run in release"]
+fn a_joiner_trusted_only_after_a_rekey_reads_what_follows_the_trust_and_only_that() {
+    watchdog::arm();
+    family_split::assert_the_families_are_split();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let names = ["alice", "bob", "erin"];
+    let dirs: Vec<std::path::PathBuf> = names.iter().map(|n| tmp.path().join(n)).collect();
+    for d in &dirs {
+        std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
+    }
+    let _reaper = world::Reaper(dirs.clone());
+    let (alice, bob, erin) = (&dirs[0], &dirs[1], &dirs[2]);
+    let anchor = Anchor::start(&tmp.path().join("anchor"));
+    let mut fps = Vec::new();
+    for d in &dirs {
+        let (ok, out, err) = vox(d, &["id"], None);
+        assert!(ok, "PRODUCT (staging): vox id: {err}");
+        fps.push(out.trim().to_owned());
+    }
+    let v6 = Split::Families.guest_spec(&anchor).to_owned();
+    let _a = daemon(alice, "127.0.0.1:0", &[&anchor.v4_spec]);
+    let _b = daemon(bob, "127.0.0.1:0", &[&anchor.v4_spec]);
+    let (ok, _, err) = vox(alice, &["trust", "add", &fps[1], "--name", "bob"], None);
+    assert!(ok, "PRODUCT (staging): alice trusts bob: {err}");
+    let (ok, _, err) = vox(bob, &["trust", "add", &fps[0], "--name", "alice"], None);
+    assert!(ok, "PRODUCT (staging): bob trusts alice: {err}");
+    let (ok, _, err) = vox(
+        alice,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "rekeyed",
+        ],
+        Some(&format!("{ROOMPASS}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): room create: {err}");
+    let listed = vox(alice, &["room", "list"], None).1;
+    let room = listed
+        .split_whitespace()
+        .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
+        .expect("PRODUCT (staging): no room id in `vox room list` after `room create`")
+        .to_owned();
+    let (ok, link, err) = vox(alice, &["room", "invite", &room], None);
+    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    join(bob, link.trim(), "bob");
+    let (ok, _, err) = vox(alice, &["room", "post", &room, "BEFORE-REKEY"], None);
+    assert!(ok, "PRODUCT (staging): alice's post: {err}");
+    assert!(
+        until("bob reads alice's first post", 90, || reads(
+            bob,
+            &room,
+            "BEFORE-REKEY"
+        )),
+        "PRODUCT (staging): bob did not read alice's first post within 90 s"
+    );
+
+    // ---- the re-key, and posts sealed before erin is trusted ----
+    let (ok, out, err) = vox(alice, &["trust", "remove", &fps[1]], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox trust remove bob`: {out}{err}"
+    );
+    for text in AFTER {
+        let (ok, _, err) = vox(alice, &["room", "post", &room, text], None);
+        assert!(ok, "PRODUCT (staging): alice's post {text}: {err}");
+    }
+
+    // ---- erin, on [::1] only, trusted after all of that; a fresh invite; her join ----
+    let erin_d = daemon(erin, Split::Families.guest_listen(), &[&v6]);
+    let (ok, _, err) = vox(alice, &["trust", "add", &fps[2], "--name", "erin"], None);
+    assert!(ok, "PRODUCT (staging): alice trusts erin: {err}");
+    let (ok, _, err) = vox(erin, &["trust", "add", &fps[0], "--name", "alice"], None);
+    assert!(ok, "PRODUCT (staging): erin trusts alice: {err}");
+    let (ok, link, err) = vox(alice, &["room", "invite", &room], None);
+    assert!(ok, "PRODUCT (staging): the second invite: {err}");
+    let joined = Instant::now();
+    join(erin, link.trim(), "erin");
+    let (ok, _, err) = vox(alice, &["room", "post", &room, "AFTER-TRUST"], None);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's post after trusting erin: {err}"
+    );
+    let in_step = until(
+        "erin reads alice's post made after trusting her",
+        PROMPT.as_secs(),
+        || reads(erin, &room, "AFTER-TRUST"),
+    );
+    let took = joined.elapsed();
+    let shown = vox(erin, &["room", "read", &room], None).1;
+    let before_trust: Vec<&str> = std::iter::once("BEFORE-REKEY")
+        .chain(AFTER)
+        .filter(|t| shown.contains(*t))
+        .collect();
+    eprintln!(
+        "[proof] erin, trusted after the re-key: reads alice's post after her trust: {in_step} \
+         {:.1}s after her join; posts sealed before her trust that she reads: {before_trust:?}",
+        took.as_secs_f64()
+    );
+    assert!(
+        in_step,
+        "PRODUCT: erin, whom alice trusted only after the re-key, must read alice's post made \
+         after that trust within {PROMPT:?} of her join; she reads:\n{shown}\nher daemon \
+         said:\n{}",
+        erin_d.said()
+    );
+    assert!(
+        before_trust.is_empty(),
+        "PRODUCT: the room is forward-only: posts alice sealed before she trusted erin must stay \
+         unread to erin, yet she reads {before_trust:?}"
     );
 }
