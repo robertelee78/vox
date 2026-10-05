@@ -1328,8 +1328,6 @@ where
 ///   governance body nor a sender-key message;
 /// - `author-misbound` (V210-74): what it posts is a signed consent grant whose body names an
 ///   epoch 7 past the entry's own, so it classifies as governance and does not bind;
-/// - `old-row-ids` (V210-74): a room it reopens resumes its row ids from the log rows alone, as
-///   before V210-73, so its own store gets the collision that lost received messages.
 /// - `refuse-sessions` (PRD-001 R36, #85): it refuses every sync session a peer opens to it, with
 ///   the coded reason `EpochMismatch`, so the peer's session ends as the peer's refusal and the
 ///   correct node's log is what a proof reads.
@@ -1351,7 +1349,6 @@ pub mod mutant {
         ServeSlowly,
         StripPayload,
         AuthorUnclassifiable,
-        OldRowIds,
         AuthorMisbound,
         WithdrawUnentitled,
         AdminUnentitled,
@@ -1368,7 +1365,6 @@ pub mod mutant {
                 "serve-slowly" => Mode::ServeSlowly,
                 "strip-payload" => Mode::StripPayload,
                 "author-unclassifiable" => Mode::AuthorUnclassifiable,
-                "old-row-ids" => Mode::OldRowIds,
                 "author-misbound" => Mode::AuthorMisbound,
                 "withdraw-unentitled" => Mode::WithdrawUnentitled,
                 "admin-unentitled" => Mode::AdminUnentitled,
@@ -1450,7 +1446,6 @@ pub mod mutant {
             Mode::Correct
             | Mode::ServeSlowly
             | Mode::AuthorUnclassifiable
-            | Mode::OldRowIds
             | Mode::AuthorMisbound
             | Mode::WithdrawUnentitled
             | Mode::AdminUnentitled
@@ -1475,12 +1470,6 @@ pub mod mutant {
     #[must_use]
     pub fn misbound() -> bool {
         mode() == Mode::AuthorMisbound
-    }
-
-    /// Whether a reopened room resumes its row ids from the log rows alone (`old-row-ids`).
-    #[must_use]
-    pub fn old_row_ids() -> bool {
-        mode() == Mode::OldRowIds
     }
 
     /// The payload this build signs in place of `payload` when it posts: in
