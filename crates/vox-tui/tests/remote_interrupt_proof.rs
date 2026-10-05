@@ -1743,11 +1743,23 @@ fn a_wake_owed_when_the_daemon_died_is_sent_after_it_restarts() {
     // ---- bob's daemon, deaf: the message is stored, and nothing judges it ----
     let deaf_err = tmp.path().join("bob.daemon.deaf.err");
     r.workers[1].restart_daemon_as(support::VOX, &[("VOX_TEST_WAKE_DEAF", "1")], &deaf_err);
-    let said = std::fs::read_to_string(&deaf_err).unwrap_or_default();
+    // The wake loop says it is off once it starts, which can be after the daemon serves its
+    // socket: the line is waited for, never read once.
+    let said = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let said = std::fs::read_to_string(&deaf_err).unwrap_or_default();
+            if said.contains("the wake loop judges and sends nothing") || Instant::now() >= deadline
+            {
+                break said;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
     assert!(
         said.contains("the wake loop judges and sends nothing"),
-        "CANNOT MEASURE (staging not achieved): bob's daemon did not say its wake loop is off, so \
-         the window is not staged; it said:\n{said}"
+        "CANNOT MEASURE (staging not achieved): bob's daemon did not say within 30 s that its \
+         wake loop is off, so the window is not staged; it said:\n{said}"
     );
     post(
         &r.workers[0],
