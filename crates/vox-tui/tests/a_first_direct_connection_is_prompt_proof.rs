@@ -479,7 +479,10 @@ fn anchor_only_guest(w: &ForwardedWorld, name: &str) -> (std::path::PathBuf, Str
 /// service — which reaches the host the moment it starts. The host's only address dave can use is
 /// its record on the anchor's board (the forward it advertises); the host cannot dial dave at all
 /// (`[::1]`), so a dial-back cannot help either. Asserted: the forward reached the host, dave asked
-/// for **no** circuit to it, and the anchor carried none from the forward's start. Without the board
+/// for **no** circuit to it (his own `vox status --json`). The anchor's count of circuits carried
+/// from the forward's start, and the host's own circuits to dave, are printed: a host that cannot
+/// dial a guest takes its circuit at once (the decider, 2026-10-02 and 2026-10-03), so the anchor
+/// can carry one that is not dave's. Without the board
 /// read, the reach knows no address, its dial-back fails, and it bridges.
 ///
 /// Since ADR-026 dave's join leaves his node running in a daemon that learns the host's record, so
@@ -492,7 +495,7 @@ fn a_node_reads_the_board_before_bridging() {
     test_knobs::require(&["VOX_TEST_ADVERTISE"]);
     watchdog::arm();
     let mut w = ForwardedWorld::new(true);
-    let (dave, _dave_fp) = anchor_only_guest(&w, "dave");
+    let (dave, dave_fp) = anchor_only_guest(&w, "dave");
     let _reaper = world::Reaper(vec![dave.clone()]);
     // **Under one daemon per data root** (ADR-026) the join's daemon kept dave's node running, and
     // it learned the host's record from the board while it ran: a forward started then is its
@@ -524,6 +527,10 @@ fn a_node_reads_the_board_before_bridging() {
         "APPARATUS: dave's daemon still holds his data root after it was stopped by its pid"
     );
     let mark = w.anchor.mark();
+    // The host's own circuits to dave, counted from here: the host cannot dial dave (`[::1]`), so
+    // a reach of its own — to sync, or to deliver — takes a circuit at once, which is legitimate
+    // (the decider, 2026-10-02 and 2026-10-03). What the anchor carries is told apart by whose it is.
+    let host_before = circuits_asked(&w.host_dir, &dave_fp, "the host");
     let mut fwd = VoxProc::spawn(
         "dave-forward",
         &dave,
@@ -544,9 +551,11 @@ fn a_node_reads_the_board_before_bridging() {
     let dial_backs = reach_count(&dave, &w.host_fp, "dave's `vox forward`", "dial_backs");
     std::thread::sleep(Duration::from_secs(2));
     let carried = w.anchor.circuits_since(mark, Duration::from_secs(2));
+    let host_asked = circuits_asked(&w.host_dir, &dave_fp, "the host") - host_before;
     eprintln!(
         "[proof] dave's forward: {reached}; it asked for {asked} circuit(s) and {dial_backs} \
-         dial-back(s) to the host; the anchor carried up to {carried}"
+         dial-back(s) to the host; the host asked for {host_asked} circuit(s) to dave; the anchor \
+         carried up to {carried}"
     );
     let said = fwd.transcript();
     interrupt(&mut fwd, Duration::from_secs(15));
@@ -566,12 +575,16 @@ fn a_node_reads_the_board_before_bridging() {
          host's record when the forward started, so this run says nothing about reading the board \
          before bridging.\ndave:\n{said}"
     );
+    // The claim is dave's: he reads the board and goes direct, asking the anchor for nothing. His
+    // own status counts every circuit his node asks for. The anchor's count is printed, not
+    // asserted: it also carries what others ask for, such as the host's own circuit to dave, which
+    // a host that cannot dial a guest takes at once (the decider, 2026-10-02 and 2026-10-03).
     assert!(
-        read_the_board && asked == 0 && carried == 0,
+        read_the_board && asked == 0,
         "PRODUCT: dave's node held no address for the host, and the host's board record on the \
          anchor gave one dave could dial; it must read the board and go direct, yet it {} and \
-         asked for {asked} circuit(s) ({dial_backs} dial-back(s)), the anchor carrying up to \
-         {carried}.\ndave:\n{said}\nanchor:\n{}",
+         asked for {asked} circuit(s) ({dial_backs} dial-back(s)); the anchor carried up to \
+         {carried}, the host's own circuits to dave {host_asked}.\ndave:\n{said}\nanchor:\n{}",
         if read_the_board {
             "read the board"
         } else {
