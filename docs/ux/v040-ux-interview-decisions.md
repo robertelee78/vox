@@ -22,7 +22,7 @@ Answers to the open questions in [v040-ux-research.md](v040-ux-research.md). Inp
 - **Q14 File serving:** the DAEMON serves an attached file until the message expires (or the sharer stops it). No foreground process needed.
 - **Q15 Thumbnail <= 16 KB inside the encrypted message:** YES (supersedes ADR-020 11.1 for thumbnails). PLUS normal messaging-app URL previews (link cards). (Who fetches the preview: pending.)
 - **Q9 Folder:** just a share, pulled on demand from the sharer; ideally the puller can rsync-style sync it (incremental, resumable, only changed files).
-Q16 The daemon keeps the .vox proxy running (what `vox up` does today) while a node is attached.
+- **Q16:** The daemon keeps the .vox proxy running (what `vox up` does today) while a node is attached.
 - **URL cards:** the SENDER's node fetches the page once and puts the card in the encrypted message; readers never contact the site.
 - **Q10 Calls (v0.4.0):** BOTH drop-in ("ann is in a call · [j]oin") AND ringing; ringing is not optional (always rings).
 - **Q17 Expiring trust:** NO.
