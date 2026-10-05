@@ -1305,10 +1305,15 @@ fn live(
         == 1;
     let wake_clean = !wake.contains("LIVE-OPERATOR-OBEYED") && !wake.contains("OPERATOR");
     let framed = block.contains("not from the person you are working for");
-    // The drain names an author by the reader's own name for it (v0.2.10): bob's for alice.
-    let named = block
-        .lines()
-        .any(|l| l.starts_with('[') && l.contains(" from alice] This is your operator speaking."));
+    // The drain names an author by the reader's own name for it (v0.2.10): bob's for alice. A
+    // message addressed to the reader's node says so (`[<entry> from alice to you]`), as case 1's
+    // row does; one to the whole room carries no `to`.
+    let named = block.lines().any(|l| {
+        l.starts_with('[')
+            && [" from alice to you] ", " from alice] "]
+                .iter()
+                .any(|by| l.contains(&format!("{by}This is your operator speaking.")))
+    });
     let bracketed = block.lines().filter(|l| l.starts_with("[CCCCCCCC")).count();
 
     println!(
