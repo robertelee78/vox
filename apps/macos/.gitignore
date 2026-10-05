@@ -1,0 +1,3 @@
+# Per-user Xcode state is never committed.
+xcuserdata/
+*.xcworkspace/xcuserdata/

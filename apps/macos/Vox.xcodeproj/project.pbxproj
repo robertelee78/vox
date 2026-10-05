@@ -1,0 +1,439 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B0000000000000000000A001 /* vox_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A001 /* vox_ffi.swift */; };
+		B0000000000000000000A002 /* VoxFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A002 /* VoxFFI.xcframework */; };
+		B0000000000000000000A003 /* us.vox.daemon.plist in Copy Launch Agent */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A003 /* us.vox.daemon.plist */; };
+		B0000000000000000000A004 /* us.vox.lanhelper.plist in Copy Launch Daemon */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A004 /* us.vox.lanhelper.plist */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C0000000000000000000A001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 90000000000000000000A001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 70000000000000000000A001;
+			remoteInfo = Vox;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		E0000000000000000000A005 /* Copy Launch Agent */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = Contents/Library/LaunchAgents;
+			dstSubfolderSpec = 1;
+			files = (
+				B0000000000000000000A003 /* us.vox.daemon.plist in Copy Launch Agent */,
+			);
+			name = "Copy Launch Agent";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E0000000000000000000A006 /* Copy Launch Daemon */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = Contents/Library/LaunchDaemons;
+			dstSubfolderSpec = 1;
+			files = (
+				B0000000000000000000A004 /* us.vox.lanhelper.plist in Copy Launch Daemon */,
+			);
+			name = "Copy Launch Daemon";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		F0000000000000000000A001 /* vox_ffi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = vox_ffi.swift; path = ../../target/xcframework/swift/vox_ffi.swift; sourceTree = SOURCE_ROOT; };
+		F0000000000000000000A002 /* VoxFFI.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = VoxFFI.xcframework; path = ../../target/xcframework/VoxFFI.xcframework; sourceTree = SOURCE_ROOT; };
+		F0000000000000000000A003 /* us.vox.daemon.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = us.vox.daemon.plist; sourceTree = "<group>"; };
+		F0000000000000000000A004 /* us.vox.lanhelper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = us.vox.lanhelper.plist; sourceTree = "<group>"; };
+		F0000000000000000000A005 /* Vox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Vox.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F0000000000000000000A006 /* VoxAppProofs.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VoxAppProofs.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		D0000000000000000000A003 /* Exceptions for "Vox" folder in "Vox" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Vox.entitlements,
+			);
+			target = 70000000000000000000A001 /* Vox */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		D0000000000000000000A001 /* Vox */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				D0000000000000000000A003 /* Exceptions for "Vox" folder in "Vox" target */,
+			);
+			path = Vox;
+			sourceTree = "<group>";
+		};
+		D0000000000000000000A002 /* VoxAppProofs */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = VoxAppProofs;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		E0000000000000000000A002 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0000000000000000000A002 /* VoxFFI.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E0000000000000000000A012 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A0000000000000000000A001 = {
+			isa = PBXGroup;
+			children = (
+				D0000000000000000000A001 /* Vox */,
+				D0000000000000000000A002 /* VoxAppProofs */,
+				A0000000000000000000A002 /* VoxFFI */,
+				A0000000000000000000A003 /* Bundle */,
+				A0000000000000000000A006 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A0000000000000000000A002 /* VoxFFI */ = {
+			isa = PBXGroup;
+			children = (
+				F0000000000000000000A001 /* vox_ffi.swift */,
+				F0000000000000000000A002 /* VoxFFI.xcframework */,
+			);
+			name = VoxFFI;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000A003 /* Bundle */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000A004 /* LaunchAgents */,
+				A0000000000000000000A005 /* LaunchDaemons */,
+			);
+			path = Bundle;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000A004 /* LaunchAgents */ = {
+			isa = PBXGroup;
+			children = (
+				F0000000000000000000A003 /* us.vox.daemon.plist */,
+			);
+			path = LaunchAgents;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000A005 /* LaunchDaemons */ = {
+			isa = PBXGroup;
+			children = (
+				F0000000000000000000A004 /* us.vox.lanhelper.plist */,
+			);
+			path = LaunchDaemons;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000A006 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				F0000000000000000000A005 /* Vox.app */,
+				F0000000000000000000A006 /* VoxAppProofs.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		70000000000000000000A001 /* Vox */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 80000000000000000000A002 /* Build configuration list for PBXNativeTarget "Vox" */;
+			buildPhases = (
+				E0000000000000000000A001 /* Sources */,
+				E0000000000000000000A002 /* Frameworks */,
+				E0000000000000000000A003 /* Resources */,
+				E0000000000000000000A005 /* Copy Launch Agent */,
+				E0000000000000000000A006 /* Copy Launch Daemon */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				D0000000000000000000A001 /* Vox */,
+			);
+			name = Vox;
+			productName = Vox;
+			productReference = F0000000000000000000A005 /* Vox.app */;
+			productType = "com.apple.product-type.application";
+		};
+		70000000000000000000A002 /* VoxAppProofs */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 80000000000000000000A003 /* Build configuration list for PBXNativeTarget "VoxAppProofs" */;
+			buildPhases = (
+				E0000000000000000000A011 /* Sources */,
+				E0000000000000000000A012 /* Frameworks */,
+				E0000000000000000000A013 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				C0000000000000000000A002 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				D0000000000000000000A002 /* VoxAppProofs */,
+			);
+			name = VoxAppProofs;
+			productName = VoxAppProofs;
+			productReference = F0000000000000000000A006 /* VoxAppProofs.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		90000000000000000000A001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2700;
+				LastUpgradeCheck = 2700;
+				TargetAttributes = {
+					70000000000000000000A001 = {
+						CreatedOnToolsVersion = 27.0;
+					};
+					70000000000000000000A002 = {
+						CreatedOnToolsVersion = 27.0;
+						TestTargetID = 70000000000000000000A001;
+					};
+				};
+			};
+			buildConfigurationList = 80000000000000000000A001 /* Build configuration list for PBXProject "Vox" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A0000000000000000000A001;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = A0000000000000000000A006 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				70000000000000000000A001 /* Vox */,
+				70000000000000000000A002 /* VoxAppProofs */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		E0000000000000000000A003 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E0000000000000000000A013 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		E0000000000000000000A001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0000000000000000000A001 /* vox_ffi.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E0000000000000000000A011 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		C0000000000000000000A002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 70000000000000000000A001 /* Vox */;
+			targetProxy = C0000000000000000000A001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		81000000000000000000A001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		81000000000000000000A002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		82000000000000000000A001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Vox/Vox.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Vox;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				MARKETING_VERSION = 0.4.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					Security,
+					"-framework",
+					SystemConfiguration,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = us.vox.app;
+				PRODUCT_NAME = Vox;
+			};
+			name = Debug;
+		};
+		82000000000000000000A002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = Vox/Vox.entitlements;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Vox;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = "@executable_path/../Frameworks";
+				MARKETING_VERSION = 0.4.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					Security,
+					"-framework",
+					SystemConfiguration,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = us.vox.app;
+				PRODUCT_NAME = Vox;
+			};
+			name = Release;
+		};
+		83000000000000000000A001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.4.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = us.vox.app.proofs;
+				PRODUCT_NAME = VoxAppProofs;
+				TEST_TARGET_NAME = Vox;
+			};
+			name = Debug;
+		};
+		83000000000000000000A002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.4.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				PRODUCT_BUNDLE_IDENTIFIER = us.vox.app.proofs;
+				PRODUCT_NAME = VoxAppProofs;
+				TEST_TARGET_NAME = Vox;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		80000000000000000000A001 /* Build configuration list for PBXProject "Vox" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				81000000000000000000A001 /* Debug */,
+				81000000000000000000A002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		80000000000000000000A002 /* Build configuration list for PBXNativeTarget "Vox" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				82000000000000000000A001 /* Debug */,
+				82000000000000000000A002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		80000000000000000000A003 /* Build configuration list for PBXNativeTarget "VoxAppProofs" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				83000000000000000000A001 /* Debug */,
+				83000000000000000000A002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 90000000000000000000A001 /* Project object */;
+}

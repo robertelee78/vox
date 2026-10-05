@@ -4,9 +4,12 @@
 #
 #   scripts/brand-icon.sh
 #
-# Writes, next to the mark:
-#   vox-icon.svg               the mark on its plate (bg.base, macOS icon grid), for the docs;
-#   AppIcon.appiconset/        the macOS app icon, 16 to 1024 px, with its Contents.json.
+# Writes:
+#   assets/brand/vox-icon.svg  the mark on its plate (bg.base, macOS icon grid), for the docs;
+#   apps/macos/Vox/Assets.xcassets/AppIcon.appiconset/
+#                              the macOS app icon, 16 to 1024 px, with its Contents.json, in the
+#                              app's own asset catalogue (Xcode's asset compiler does not follow a
+#                              symbolic link, so it lives there and nowhere else).
 # Both are committed, so building the app needs no SVG renderer; run this again after changing
 # the mark. Needs `rsvg-convert` (librsvg: `brew install librsvg`).
 set -euo pipefail
@@ -15,7 +18,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAND="$ROOT/assets/brand"
 MARK="$BRAND/vox-mark.svg"
 ICON="$BRAND/vox-icon.svg"
-SET="$BRAND/AppIcon.appiconset"
+SET="$ROOT/apps/macos/Vox/Assets.xcassets/AppIcon.appiconset"
 
 if ! command -v rsvg-convert >/dev/null; then
     echo "brand-icon: rsvg-convert is not installed; run: brew install librsvg" >&2
