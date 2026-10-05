@@ -374,7 +374,7 @@ pub enum Error {
     /// a bad base32 digest, a malformed or over-long anchor list, a duplicate or
     /// unknown query field. A link is untrusted input from a chat message, so
     /// nothing about it is guessed. Carries a static reason.
-    #[error("malformed invite link: {0}")]
+    #[error("malformed room link: {0}")]
     MalformedLink(&'static str),
 
     /// An `--anchor` spec, or a line of the anchors file, could not be used: it is not
@@ -382,8 +382,8 @@ pub enum Error {
     /// base32, its port is not a number, or its host does not resolve.
     ///
     /// Its own variant because it was [`Error::MalformedLink`], which renders as
-    /// "malformed invite link" — so a person who mistyped `--anchor` was told their
-    /// invite link was wrong, and they had not given one. The two are different inputs
+    /// "malformed room link" — so a person who mistyped `--anchor` was told their
+    /// room link was wrong, and they had not given one. The two are different inputs
     /// arriving from different places and a person fixes them in different files.
     #[error("bad anchor: {0}")]
     MalformedAnchor(&'static str),

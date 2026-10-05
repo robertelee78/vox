@@ -8,8 +8,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
 
   newest    the timeline shows the room's newest message (m-070), not its first (m-001);
   hidden    characters a reader cannot see are shown, not hidden (#331): Alice's tag characters,
-            her zero-width-split word and her stray zero-width joiner each read as ⟨U+XXXX⟩
-            escapes; her family emoji 👨‍👩‍👧 is drawn whole: no escape on its row, and the TUI wrote
+            her zero-width-split word, her stray zero-width joiner and her bidi override each
+            read as ⟨U+XXXX⟩ escapes, one style (#331); her family emoji 👨‍👩‍👧 is drawn whole: no escape on its row, and the TUI wrote
             the cluster to the terminal unbroken, joiners and all. pyte splits a cluster into
             cells and the TUI's next text overwrites the cells it does not count, so the family's
             three people are read from the bytes the TUI wrote, not from pyte's cells, and how a
@@ -21,6 +21,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
             whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
             "← in-only" for Carol, though nothing comes in from her);
+  words     `:invite` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
+            decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
             the help line names none of them: the TUI offers only what vox supports (V210-155);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
@@ -180,6 +182,7 @@ try:
         "h-2": "h-2 pa\u200bss\u200cword end",
         "h-3": "h-3 a\u200db end",
         "h-4": "h-4 fam \U0001F468\u200d\U0001F469\u200d\U0001F467 end",
+        "h-5": "h-5 rlo \u202egnp.exe end",
     }
     for key, text in HIDDEN.items():
         p = run("alice", "room", "post", room, text)
@@ -188,7 +191,7 @@ try:
     def bob_ready():
         r = run("bob", "room", "read", room, "--limit", "500")
         ro = run("bob", "room", "roster", room)
-        return (r.returncode == 0 and f"m-{POSTS:03d}" in r.stdout and "h-4" in r.stdout and ro.returncode == 0
+        return (r.returncode == 0 and f"m-{POSTS:03d}" in r.stdout and "h-5" in r.stdout and ro.returncode == 0
                 and fp["alice"] in ro.stdout and fp["carol"] in ro.stdout)
     if not until(bob_ready, 120, 1):
         last = run("bob", "room", "roster", room)
@@ -223,7 +226,7 @@ try:
             if key in r[:112]:
                 return r[:112].rstrip()
         return None
-    tui.until(lambda: row_of("h-4") is not None, 20, 1)
+    tui.until(lambda: row_of("h-5") is not None, 20, 1)
     rows = {k: row_of(k) for k in HIDDEN}
     if any(v is None for v in rows.values()):
         product(f"bob's `vox tui` does not show every h- message: {rows!r}")
@@ -231,6 +234,7 @@ try:
         "h-1": "tags \u27e8U+E0068\u27e9\u27e8U+E0069\u27e9 end",
         "h-2": "pa\u27e8U+200B\u27e9ss\u27e8U+200C\u27e9word end",
         "h-3": "a\u27e8U+200D\u27e9b end",
+        "h-5": "rlo \u27e8U+202E\u27e9gnp.exe end",
     }
     shown = {k: want[k] in rows[k] for k in want}
     fam = rows["h-4"]
@@ -301,6 +305,24 @@ try:
     carol_label = label_of("carol")[0]
     claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
+
+    stage("words")
+    # Before `unknown`, whose short answers leave the line under the status bar one row again.
+    # The decider's words (#406): a room link and a passphrase, never an "invite link". `:invite`
+    # names what it gives a person, and `:join` asks for what a person was given.
+    tui.key(":invite\r", 2)
+    tui.until(lambda: "vox://" in "\n".join(tui.display()), 10, 0.5)
+    # The link wraps over the rows under the status bar: read them as one.
+    invite_said = " ".join(r.strip() for r in tui.display()[-4:])
+    tui.key(":join\r", 2)
+    join_prompt = "\n".join(r.rstrip() for r in tui.display() if r.strip())
+    tui.key("\x1b", 1)  # Esc: the prompt is left unanswered
+    said_both = invite_said + "\n" + join_prompt
+    claim("words", "room link: vox://" in invite_said and "room link (vox://" in join_prompt
+          and "invite link" not in said_both.lower(),
+          f":invite says {invite_said.strip()[:90]!r}; :join asks for "
+          f"{[r.strip() for r in join_prompt.splitlines() if 'link' in r][:2]!r}; "
+          f"'invite link' anywhere: {'invite link' in said_both.lower()}")
 
     stage("unknown")
     # Each answer is read after `:invite`, a command vox supports, has replaced the status line, so

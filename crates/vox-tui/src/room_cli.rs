@@ -992,16 +992,15 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
         );
     }
     let mut text = String::with_capacity(r.text.len());
-    // Characters a reader cannot see are shown as escapes (#331): `⟨U+E0041⟩`, never nothing.
-    for c in vox_agentcomms::envelope::reveal(&r.text).chars() {
+    // Characters a reader cannot see, and every other that could break or reorder the row (a
+    // carriage return, an escape sequence, U+2028, a bidi override), are shown as escapes,
+    // `⟨U+XXXX⟩`, the style the drain and the TUI use (#331). A newline is indented, a tab kept.
+    // A structured post is read as the drain and the TUI show it, not as its JSON (#406):
+    // `--json` keeps the envelope for programs.
+    let said = crate::agent_hook::words(&r.text);
+    for c in vox_agentcomms::envelope::reveal_keeping(&said, |c| c == '\n' || c == '\t').chars() {
         match c {
             '\n' => text.push_str("\n  | "),
-            '\t' => text.push('\t'),
-            // U+2028 and U+2029 break a line for a model or a JSON viewer, not a
-            // terminal, so they are escaped too (V210-123).
-            c if vox_agentcomms::envelope::breaks_lines(c) => {
-                text.push_str(&c.escape_unicode().to_string());
-            }
             c => text.push(c),
         }
     }

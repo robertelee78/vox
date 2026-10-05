@@ -1908,7 +1908,7 @@ impl NodeEvent {
             }
             NodeEvent::AddressNote { note, .. } => note.clone(),
             NodeEvent::InviteLink { channel_id, url } => {
-                format!("invite link for room {}: {url}", short(channel_id))
+                format!("room link for room {}: {url}", short(channel_id))
             }
             NodeEvent::Joined {
                 channel_id,
