@@ -240,29 +240,69 @@ fn tcp_bind_failure(addr: SocketAddr) -> Option<String> {
     bind_failure(addr, Socket::Tcp, fault)
 }
 
+/// The environment variable [`answer_first`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
+pub const TEST_ANSWER_FIRST_ENV: &str = "VOX_TEST_ANSWER_FIRST";
+
+/// Whether [`apply_saying_waits`] takes the node's answer **before reading anything it said**
+/// (`VOX_TEST_ANSWER_FIRST=1`, test-knobs only): the interleaving in which a waiting select took
+/// the answer first, which the select falls into only some of the time. A proof sets it so the
+/// case is staged every run, not one run in ten (#412). Without test-knobs, never.
+fn answer_first() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var(TEST_ANSWER_FIRST_ENV).as_deref() == Ok("1") {
+        return true;
+    }
+    false
+}
+
 pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome {
     let mut events = node.subscribe();
     let apply = node.apply(cmd);
     tokio::pin!(apply);
     let mut said = false;
-    loop {
-        tokio::select! {
-            out = &mut apply => return out,
-            ev = events.next(), if !said => match ev {
-                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
-                    eprintln!("{WAITING_FOR_PROFILE}");
-                    said = true;
-                }
-                // Said while the verb waits: the node picks its port as it unlocks (V210-167).
-                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
-                    eprintln!("vox: {note}");
-                }
-                Some(_) => {}
-                // The actor is gone; the apply answers for itself.
-                None => said = true,
-            },
+    let mut open = true;
+    let say = |ev: Option<vox_core::node::actor::EventStreamItem>, said: &mut bool| match ev {
+        Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
+            if !*said {
+                eprintln!("{WAITING_FOR_PROFILE}");
+                *said = true;
+            }
+            true
+        }
+        // Said while the verb waits: the node picks its port as it unlocks (V210-167), and says
+        // why a room it held does not reopen (#412).
+        Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
+            eprintln!("vox: {note}");
+            true
+        }
+        Some(_) => true,
+        // The actor is gone; the apply answers for itself.
+        None => false,
+    };
+    let out = if answer_first() {
+        // Staged: everything the node says before it answers is still on the stream.
+        (&mut apply).await
+    } else {
+        loop {
+            tokio::select! {
+                out = &mut apply => break out,
+                ev = events.next(), if open => open = say(ev, &mut said),
+            }
+        }
+    };
+    // **What the node said before it answered is said too.** Its notes go out before its answer
+    // (an unlock answers once its rooms' reopening is over, and a room that would not reopen is
+    // said before that), and a select that took the answer first left them unread: the daemon's
+    // log then never said why the room stayed closed (#412's proof, red about one run in ten;
+    // `VOX_TEST_ANSWER_FIRST` stages it every run).
+    while open {
+        match events.try_next() {
+            Some(ev) => open = say(Some(ev), &mut said),
+            None => break,
         }
     }
+    out
 }
 
 /// A `vox serve` spec, `<name>=<port>[/tcp|/udp]`: the port, and the service's tag — its name,
