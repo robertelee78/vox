@@ -50,6 +50,11 @@ pub async fn ensure_daemon(
         Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Silent { .. })) => {
             return Err(AppError::Usage(format!("{e}")))
         }
+        // **Root can use no daemon, and is told so at once** (ADR-026 C-1): starting one would
+        // only wait out the start bound and blame the start.
+        Err(e @ vox_core::error::Error::Ipc(vox_core::error::IpcHandshake::Root)) => {
+            return Err(AppError::Usage(format!("{e}")))
+        }
         Err(_) => {}
     }
     let log_path = account.log_file();

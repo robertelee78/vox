@@ -15,6 +15,15 @@
 //! 4. **Two clients, one daemon (proof 8, D-1, S-2).** Two `vox daemon --detach` at once end with
 //!    one daemon: one process holds `.daemon/lock`, and it exits on its own once idle.
 //!
+//! 5. **Root is told at once (C-1).** The daemon admits no uid 0, so a person running vox as root
+//!    (a container's default user) must be told that, at once, with what to do — not left to
+//!    wait out the 15 s start bound and read "the daemon did not start within 15 s" of a daemon
+//!    that was running. As root (uid 0 in a Linux user namespace, `unshare --user
+//!    --map-root-user`: no sudo), `vox serve` and `vox daemon` each end within 10 s saying vox is
+//!    running as root and to run it as an ordinary user. Linux only: elsewhere root needs sudo,
+//!    which no proof uses, and the case is CANNOT MEASURE. Mutation: the root checks taken out of
+//!    the client and the daemon turns it red with the old wait and its message.
+//!
 //! Not yet here (the verbs are clients only from #406): a foreground `vox serve` exiting when the
 //! daemon stops, and a request in flight answered "node detached" over the CLI.
 
@@ -869,5 +878,85 @@ fn a_hooks_output_closes_while_the_daemon_it_started_runs() {
                 "PRODUCT (staging): round {round}: the daemon did not leave once idle"
             );
         }
+    }
+}
+
+/// Run `vox args` as root — uid 0 in a new user namespace, which needs no sudo — to its end, or
+/// until `within` has passed (then it is killed by its pid). `None` when this machine has no
+/// unprivileged user namespaces.
+fn as_root(a: &Account, args: &[&str], within: Duration) -> Option<(Duration, String)> {
+    let probe = Command::new("unshare")
+        .args(["--user", "--map-root-user", "id", "-u"])
+        .output()
+        .ok()?;
+    if String::from_utf8_lossy(&probe.stdout).trim() != "0" {
+        return None;
+    }
+    let vox = a.cmd(args);
+    let mut c = Command::new("unshare");
+    c.env_clear();
+    for (k, v) in vox.get_envs() {
+        if let Some(v) = v {
+            c.env(k, v);
+        }
+    }
+    c.args(["--user", "--map-root-user", "--", VOX])
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let t0 = Instant::now();
+    let mut child = c.spawn().ok()?;
+    while t0.elapsed() < within && child.try_wait().ok().flatten().is_none() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let took = t0.elapsed();
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+    }
+    let out = child.wait_with_output().ok()?;
+    Some((
+        took,
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    ))
+}
+
+/// ADR-026 C-1, said: root is refused by every daemon, and told so at once (case 5 above).
+#[test]
+#[ignore = "real binaries; run in release"]
+fn root_is_told_at_once_that_it_cannot_use_the_daemon() {
+    watchdog::arm();
+    if !cfg!(target_os = "linux") {
+        panic!(
+            "CANNOT MEASURE: running vox as root without sudo needs a Linux user namespace; this \
+             is not Linux"
+        );
+    }
+    const WITHIN: Duration = Duration::from_secs(10);
+    let a = Account::new();
+    for args in [&["serve", "web=8080"][..], &["daemon"]] {
+        let Some((took, said)) = as_root(&a, args, Duration::from_secs(40)) else {
+            panic!(
+                "CANNOT MEASURE: this machine refuses an unprivileged user namespace \
+                 (`unshare --user --map-root-user`), so vox cannot be run as root without sudo"
+            );
+        };
+        println!(
+            "[proof] as root, `vox {}` ended after {took:?}: {said}",
+            args.join(" ")
+        );
+        assert!(
+            took < WITHIN
+                && said.contains("as root (uid 0)")
+                && said.contains("ordinary user")
+                && !said.contains("did not start within"),
+            "PRODUCT: as root, `vox {}` must say at once (within {WITHIN:?}) that vox is running \
+             as root and to run it as an ordinary user; it took {took:?} and said: {said}",
+            args.join(" ")
+        );
     }
 }

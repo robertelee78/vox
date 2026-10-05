@@ -87,6 +87,16 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         // waited for ever (#405, the two_hooks hang).
         close_inherited_fds();
     }
+    // **A daemon run as root would serve nobody** (ADR-026 C-1): it admits no uid 0, and a client
+    // of any other uid is not its user. Said at once, before the lock is taken or anything is read.
+    if vox_core::node::paths::my_uid() == 0 {
+        return Err(AppError::Usage(
+            "vox daemon will not run as root (uid 0): it admits no control connection from root, \
+             so a daemon run as root could serve nobody. Run vox as an ordinary user: in a \
+             container, set a non-root USER (for example `podman run --user 1000 …`)"
+                .into(),
+        ));
+    }
     // Refused before anything is read or unlocked: a metrics endpoint the network can
     // reach names every peer and room this node talks to (PRD-001 R38).
     if let Some(addr) = args.metrics {

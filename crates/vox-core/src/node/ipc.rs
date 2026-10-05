@@ -4147,6 +4147,12 @@ pub async fn open_as_noting(
 /// [`IpcHandshake::Unreachable`] if nothing is there or nothing listens;
 /// [`IpcHandshake::NotYours`] if it, or what serves it, belongs to someone else.
 pub async fn connect_own(path: &Path) -> Result<UnixStream> {
+    // **Root is refused before anything is tried** (ADR-026 C-1): the daemon admits no uid 0, so a
+    // root client was dropped without a word, and `vox serve` waited out its start bound and blamed
+    // the daemon's start.
+    if crate::node::paths::my_uid() == 0 {
+        return Err(Error::Ipc(IpcHandshake::Root));
+    }
     let unreachable = |e: std::io::Error| {
         Error::Ipc(IpcHandshake::Unreachable {
             reason: e.to_string(),
