@@ -291,8 +291,8 @@ Built. Proofs: `two_nodes_answer_at_one_address_proof` and `two_nodes_are_client
 (N-41, N-42, N-46), `node::presence` tests (N-43, N-44, N-45, in process),
 `the_daemon_reads_its_relay_limits_from_its_config` (N-45),
 `a_dial_that_reaches_another_node_names_no_one_proof` (N-47),
-`a_first_punched_connection_is_prompt_proof` (N-48). N-43's unmapping at the daemon's stop is not
-proved: it needs a gateway.
+`a_first_punched_connection_is_prompt_proof` (N-48). N-43's unmapping at the daemon's stop:
+`a_stopped_daemon_deletes_its_port_mappings_proof` (N-56), against a PCP stand-in.
 
 - **N-41.** The daemon, not a node, MUST bind the one UDP socket and QUIC endpoint of the machine's
   account, and run the dual-stack self-test once per bind.
@@ -321,10 +321,23 @@ proved: it needs a gateway.
 
 ### Network change and the mapping lifecycle (v0.3.1)
 
-N-49–N-52 are built in v0.3.1 (`nat::netwatch`, `NetPresence::changed`, `close_stranded`);
-proof: `a_network_change_is_noticed_and_acted_on_proof` on Linux, and its opt-in macOS form.
-N-53–N-57 are not built. Found by an outside review (2026-10-04) and confirmed in code at integrate
-`3d5263cf`:
+N-49–N-57 are built in v0.3.1. Proofs, each against the shipped binary:
+- N-49–N-52 (`nat::netwatch`, `NetPresence::changed`, `close_stranded`):
+  `a_network_change_is_noticed_and_acted_on_proof` on Linux, and its opt-in macOS form;
+- N-53: `vox_status_names_the_router_proof` (macOS: `route -n get [-inet6] default`; the Linux
+  `ip route` comparison is not yet a proof);
+- N-54: `vox_status_names_the_gateway_that_answered_proof`;
+- N-55: `a_port_mapping_keeps_its_nonce_proof`;
+- N-56, N-57: `a_stopped_daemon_deletes_its_port_mappings_proof`.
+
+The last three run against PCP, NAT-PMP and UPnP IGD stand-ins through the `test-knobs` overrides
+`VOX_TEST_GATEWAY` and `VOX_TEST_UPNP`. A UPnP grant keeps the router's control URL, so its
+deletion at stop needs no SSDP search. The stop also deletes what a gateway race may still hold:
+a loser's grant, and, by its nonce, what a request still unanswered may have made. A losing grant
+naming the winner's external address and port is the winner's own mapping (one router at two
+addresses) and is not deleted.
+
+Found by an outside review (2026-10-04) and confirmed in code at integrate `3d5263cf`:
 
 - Nothing listens for the operating system's network changes. `NetPresence::rediscover`
   (`presence.rs:390`) has no caller. The publish side runs at the presence's start, at a mapping's

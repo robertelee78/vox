@@ -132,6 +132,10 @@ pub struct NetPresence {
     advertised: watch::Sender<Option<EndpointList>>,
     /// The gateway mappings in force, renewed and retried per address family (N-43).
     mapping: Mutex<Mapping>,
+    /// What the last discovery or renewal asked, per family, and what answered (N-54).
+    asks: Mutex<crate::nat::reachability::GatewayAsks>,
+    /// The gateway races whose candidates may still hold something: deleted at stop (N-57).
+    races: Arc<crate::nat::reachability::Races>,
     /// The task that discovers, maps and renews.
     mapper: Mutex<Option<tokio::task::AbortHandle>>,
     /// Wakes the mapper for a discovery now.
@@ -153,6 +157,10 @@ pub struct NetPresence {
     changes: broadcast::Sender<Arc<NetChange>>,
     /// The last real change, for `vox status` (N-52).
     last_change: Mutex<Option<NetChange>>,
+    /// How many real changes of the machine's network this presence has seen, counted under the
+    /// mapping lock: a discovery that spans one is of the network before it, and its result is
+    /// not published (N-51).
+    generation: std::sync::atomic::AtomicU64,
     /// Why this machine's network changes are not heard, if they are not (N-49).
     unwatched: Mutex<Option<String>>,
     /// The task that hears the operating system's network events.
@@ -178,9 +186,15 @@ struct Mapping {
     /// When each family's timed lease runs out (unix seconds). Until then its mapped address is
     /// still advertised, even while its renewal is failing.
     expires: BTreeMap<bool, u64>,
-    /// The wait set after the last renewal that got nothing back for a family, doubling from
-    /// [`MAPPING_RETRY_SECS`] to [`MAPPING_RETRY_MAX_SECS`].
+    /// The wait set after the last discovery that got nothing back for a family whose lease had
+    /// run out, doubling from [`MAPPING_RETRY_SECS`] to [`MAPPING_RETRY_MAX_SECS`].
     retry: BTreeMap<bool, u64>,
+    /// When each family's timed lease was granted (unix seconds) and for how long: the
+    /// renewal schedule is fractions of it (N-55).
+    granted: BTreeMap<bool, (u64, u64)>,
+    /// How many renewals of each family's lease have failed in a row (N-55: retried at 3/4,
+    /// then 7/8 of the lifetime).
+    failures: BTreeMap<bool, u8>,
 }
 
 /// The first wait before a port-mapping renewal that got nothing back is tried again (V210-75),
@@ -191,16 +205,37 @@ const MAPPING_RETRY_SECS: u64 = 15;
 /// The longest wait between retries of a failed port-mapping renewal.
 const MAPPING_RETRY_MAX_SECS: u64 = 600;
 
-/// When `mappings` must be renewed: half the shortest timed lifetime, the interval RFC 6887
-/// §11.2.1 recommends. `None` if none is timed.
-fn renew_at(now: u64, mappings: &[PortMapping]) -> Option<u64> {
-    mappings
-        .iter()
-        .map(|m| m.lifetime_secs)
-        .filter(|l| *l > 0)
-        .min()
-        // `max(2)` keeps the interval at one second or more.
-        .map(|l| now + u64::from(l.max(2) / 2))
+/// The least time between two renewal attempts of one lease: RFC 6887 §11.2.1's 4 s (N-55), plus
+/// one, because the schedule is kept in whole seconds and an attempt started late in one second
+/// and the next early in another would otherwise be under 4 s apart.
+const RENEW_SPACING_SECS: u64 = 5;
+
+/// A uniformly random whole number of seconds in `lo..=hi`.
+fn uniform(lo: u64, hi: u64) -> u64 {
+    if hi <= lo {
+        return lo;
+    }
+    let r: [u8; 8] = crate::identity::rng::random_array().unwrap_or([0; 8]);
+    lo + u64::from_le_bytes(r) % (hi - lo + 1)
+}
+
+/// When a lease of `lifetime` seconds granted at `at` is first renewed: a uniformly random point
+/// in 1/2–5/8 of it (RFC 6887 §11.2.1, N-55), so clients behind one server do not renew in step.
+fn first_renewal(at: u64, lifetime: u64) -> u64 {
+    at + uniform(lifetime / 2, lifetime * 5 / 8).max(1)
+}
+
+/// When a lease of `lifetime` granted at `at` is tried again after `failures` failed renewals,
+/// the last started at `last`: at 3/4 of the lifetime, then 7/8 (N-55), never less than
+/// [`RENEW_SPACING_SECS`] after the last try. Past 7/8 it is the lease's end, where a discovery
+/// asks for a new mapping.
+fn retry_renewal(at: u64, lifetime: u64, failures: u8, last: u64) -> u64 {
+    let target = match failures {
+        1 => at + lifetime * 3 / 4,
+        2 => at + lifetime * 7 / 8,
+        _ => at + lifetime,
+    };
+    target.max(last + RENEW_SPACING_SECS)
 }
 
 /// Whether a mapping is the IPv6 pinhole (`true`) rather than the IPv4 mapping.
@@ -209,39 +244,56 @@ fn mapping_is_v6(m: &PortMapping) -> bool {
 }
 
 impl Mapping {
-    /// Take what a discovery or a renewal was granted, **per address family** (V210-75), and say
-    /// when the next renewal or retry is due.
+    /// Take what a discovery or a renewal (started at `started`) was granted, **per address
+    /// family** (V210-75), and say when the next renewal or retry is due.
     ///
-    /// A family granted again is held anew and renewed at half its lease. A family that was held,
-    /// or was already being retried, and got nothing back this time is retried after a backoff of
-    /// its own, and its mapping is kept, and still advertised, until its lease runs out: the
-    /// gateway most likely still holds it, and a lost reply is not a withdrawn mapping. The next
-    /// try is never later than that lease's end. A permanent grant (lifetime zero) is never
-    /// re-requested; it is deleted when the presence closes.
-    fn take(&mut self, fresh: &[PortMapping], now: u64) -> Option<u64> {
+    /// A family granted again is held anew and renewed at a random point in 1/2–5/8 of its lease
+    /// (N-55). A family whose renewal got nothing back is tried again at 3/4 and then 7/8 of the
+    /// lease, at least [`RENEW_SPACING_SECS`] apart, and its mapping is kept, and still
+    /// advertised, until its lease runs out: the gateway most likely still holds it, and a lost
+    /// reply is not a withdrawn mapping. Once the lease is over, a discovery asks again after a
+    /// backoff of its own. A permanent grant (lifetime zero) is never re-requested; it is deleted
+    /// when the presence closes.
+    fn take(&mut self, fresh: &[PortMapping], started: u64, now: u64) -> Option<u64> {
         let mut held = Vec::new();
         let mut due: Option<u64> = None;
         let mut sooner = |at: u64| due = Some(due.map_or(at, |d| d.min(at)));
         for v6 in [false, true] {
-            let granted = fresh.iter().find(|m| mapping_is_v6(m) == v6).copied();
-            let had = self.held.iter().find(|m| mapping_is_v6(m) == v6).copied();
+            let granted = fresh.iter().find(|m| mapping_is_v6(m) == v6).cloned();
+            let had = self.held.iter().find(|m| mapping_is_v6(m) == v6).cloned();
             if let Some(m) = granted {
+                let lifetime = u64::from(m.lifetime_secs);
                 held.push(m);
                 self.retry.remove(&v6);
-                if m.lifetime_secs > 0 {
-                    self.expires.insert(v6, now + u64::from(m.lifetime_secs));
-                    if let Some(at) = renew_at(now, &[m]) {
-                        sooner(at);
-                    }
+                self.failures.remove(&v6);
+                if lifetime > 0 {
+                    self.expires.insert(v6, now + lifetime);
+                    self.granted.insert(v6, (now, lifetime));
+                    sooner(first_renewal(now, lifetime));
                 } else {
                     self.expires.remove(&v6);
+                    self.granted.remove(&v6);
                 }
                 continue;
             }
-            if let Some(m) = had.filter(|m| m.lifetime_secs == 0) {
-                held.push(m);
+            if let Some(m) = had.as_ref().filter(|m| m.lifetime_secs == 0) {
+                held.push(m.clone());
                 continue;
             }
+            // A held lease whose renewal failed: kept, and tried again on the RFC's schedule.
+            if let (Some(m), Some(&expires), Some(&(at, lifetime))) =
+                (had.as_ref(), self.expires.get(&v6), self.granted.get(&v6))
+            {
+                if now < expires {
+                    let failures = self.failures.get(&v6).copied().unwrap_or(0) + 1;
+                    self.failures.insert(v6, failures);
+                    held.push(m.clone());
+                    sooner(retry_renewal(at, lifetime, failures, started).min(expires));
+                    continue;
+                }
+            }
+            self.failures.remove(&v6);
+            self.granted.remove(&v6);
             if had.is_none() && !self.retry.contains_key(&v6) {
                 continue; // never granted: no gateway for this family, nothing to keep alive
             }
@@ -271,6 +323,8 @@ impl Mapping {
         self.held.retain(|m| mapping_is_v6(m) != v6);
         self.expires.remove(&v6);
         self.retry.remove(&v6);
+        self.granted.remove(&v6);
+        self.failures.remove(&v6);
     }
 
     /// The mappings whose lease has not run out, offered again at a renewal so a family whose
@@ -285,7 +339,7 @@ impl Mapping {
                         .get(&mapping_is_v6(m))
                         .is_some_and(|at| now < *at)
             })
-            .copied()
+            .cloned()
             .collect()
     }
 }
@@ -315,6 +369,8 @@ impl NetPresence {
             accept,
             advertised: watch::channel(None).0,
             mapping: Mutex::new(Mapping::default()),
+            asks: Mutex::new(crate::nat::reachability::GatewayAsks::default()),
+            races: Arc::new(crate::nat::reachability::Races::default()),
             mapper: Mutex::new(None),
             rediscover: Arc::new(tokio::sync::Notify::new()),
             discoveries: std::sync::atomic::AtomicU64::new(0),
@@ -323,6 +379,7 @@ impl NetPresence {
             nearby: Mutex::new(None),
             changes: broadcast::channel(16).0,
             last_change: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
             unwatched: Mutex::new(None),
             watcher: Mutex::new(None),
         });
@@ -410,6 +467,13 @@ impl NetPresence {
         lock(&self.mapping).held.clone()
     }
 
+    /// What the last discovery or renewal asked, per address family, and which candidate
+    /// answered on which rung (N-54): what `vox status` names.
+    #[must_use]
+    pub fn gateway_asks(&self) -> crate::nat::reachability::GatewayAsks {
+        lock(&self.asks).clone()
+    }
+
     /// How many discoveries (the ladder's publish side, with its gateway requests) this presence
     /// has run.
     #[must_use]
@@ -448,6 +512,9 @@ impl NetPresence {
         self.refresh_observed();
         let leased = {
             let mut m = lock(&self.mapping);
+            // Any discovery running now read the network before this change.
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if change.went.iter().any(|ip| ip.is_ipv4()) {
                 m.forget(false);
             }
@@ -586,22 +653,28 @@ impl NetPresence {
         if let Some(watcher) = lock(&self.watcher).take() {
             watcher.abort();
         }
-        // A UPnP mapping the router granted only *permanently* (lifetime 0) would outlive the
-        // presence: it is deleted, best-effort, on its own task. Timed mappings of every kind
-        // expire by themselves (N-43: the daemon's stop unmaps; a node's detach never does).
-        for m in std::mem::take(&mut lock(&self.mapping).held) {
-            if m.method == crate::nat::portmap::Method::UpnpIgd && m.lifetime_secs == 0 {
-                tokio::spawn(async move {
-                    let _ = crate::nat::portmap::unmap_port_upnp(
-                        crate::nat::portmap::Protocol::Udp,
-                        m.internal_port,
-                    )
-                    .await;
-                });
-            }
+        // **Every mapping it holds is deleted** (N-56; N-43: the daemon's stop unmaps, a node's
+        // detach never does): timed ones, which would otherwise hold a port on the gateway for
+        // the rest of their lifetime, and a UPnP router's permanent one — and what a gateway
+        // race may still hold (N-57): a loser's grant not yet deleted, a winner not yet taken,
+        // and what a request still unanswered may have made, by its nonce. Best-effort, all at
+        // once, and bounded by UNMAP_PATIENCE in all, while the endpoint's closes leave.
+        let mut unmaps = tokio::task::JoinSet::new();
+        let held = std::mem::take(&mut lock(&self.mapping).held);
+        for m in held.into_iter().chain(self.races.to_delete()) {
+            unmaps.spawn(async move { crate::nat::portmap::unmap(&m).await });
         }
-        self.shared.close();
-        let _ = tokio::time::timeout(CLOSE_FLUSH, self.shared.wait_idle()).await;
+        let unmapped = async {
+            let _ = tokio::time::timeout(crate::nat::portmap::UNMAP_PATIENCE, async {
+                while unmaps.join_next().await.is_some() {}
+            })
+            .await;
+        };
+        let flushed = async {
+            self.shared.close();
+            let _ = tokio::time::timeout(CLOSE_FLUSH, self.shared.wait_idle()).await;
+        };
+        tokio::join!(unmapped, flushed);
     }
 }
 
@@ -622,29 +695,75 @@ impl Drop for NetPresence {
 
 /// **The presence's publish side** (ADR-012, N-43): compose what its nodes advertise — routable
 /// addresses, a gateway-mapped one when one can be had, loopback — once for the presence, then
-/// renew each granted mapping at half its lease and retry a family that got nothing back, until
+/// renew each granted mapping on RFC 6887's schedule (N-55) and retry a family that got nothing back, until
 /// the presence goes. A node asking for a discovery ([`NetPresence::rediscover`]) wakes it early.
 fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         loop {
             // Read at each discovery, not carried over: a network change lets go of a mapping
             // whose internal address is gone (`NetPresence::changed`).
-            let (bound, wake, leased) = {
+            let (bound, wake, leased, races) = {
                 let Some(p) = presence.upgrade() else { return };
                 let Ok(bound) = p.shared.local_addr() else {
                     return;
                 };
-                let leased = lock(&p.mapping).leased(unix_now());
-                (bound, Arc::clone(&p.rediscover), leased)
+                let (leased, generation) = {
+                    let m = lock(&p.mapping);
+                    (
+                        m.leased(unix_now()),
+                        p.generation.load(std::sync::atomic::Ordering::SeqCst),
+                    )
+                };
+                (
+                    bound,
+                    Arc::clone(&p.rediscover),
+                    (leased, generation),
+                    Arc::clone(&p.races),
+                )
             };
-            let (list, granted) =
-                crate::nat::reachability::advertise_endpoints(bound, &leased).await;
+            let (leased, generation) = leased;
+            let started = unix_now();
+            let (list, granted, asks) =
+                crate::nat::reachability::advertise_endpoints(bound, &leased, &races).await;
             let due = {
                 let Some(p) = presence.upgrade() else { return };
                 let now = unix_now();
-                let due = lock(&p.mapping).take(&granted, now);
+                let mut m = lock(&p.mapping);
+                // **A discovery that spanned a network change is of the network before it**: its
+                // addresses are the old ones, and publishing them would undo what the change
+                // advertised (N-51). Its grants are for the old network too: deleted, and the
+                // discovery runs again at once (the change asked for one).
+                if p.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                    // A renewal of a mapping still held is that mapping: kept, not deleted.
+                    let fresh: Vec<PortMapping> = granted
+                        .into_iter()
+                        .filter(|g| {
+                            !m.held.iter().any(|h| {
+                                h.method == g.method && h.server == g.server && h.nonce == g.nonce
+                            })
+                        })
+                        .collect();
+                    drop(m);
+                    p.races.release_winners();
+                    for stale in fresh {
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                crate::nat::portmap::UNMAP_PATIENCE,
+                                crate::nat::portmap::unmap(&stale),
+                            )
+                            .await;
+                        });
+                    }
+                    continue;
+                }
+                let due = m.take(&granted, started, now);
+                // The winners are held now: the races keep only what the stop must delete.
+                p.races.release_winners();
+                *lock(&p.asks) = asks;
                 p.discoveries
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Published under the mapping lock, which a change takes to count itself: a
+                // change either comes after this (and publishes after it) or is seen above.
                 p.advertised.send_replace(Some(list));
                 due
             };
