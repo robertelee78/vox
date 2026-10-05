@@ -204,7 +204,10 @@ def coord():
     """The shared slots' directory and count, as `~/vox-coord/run-slot.sh` names them; None where
     this machine has no shared queue."""
     try:
-        text = open(os.path.expanduser("~/vox-coord/run-slot.sh")).read()
+        # The real home, from the user database: the proof runs this driver with a temporary HOME,
+        # where `~` would name a directory that has no queue.
+        import pwd
+        text = open(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, "vox-coord/run-slot.sh")).read()
     except OSError:
         return None, 0
     d = re.search(r"^S=(\S+)", text, re.M)
