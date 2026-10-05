@@ -2,7 +2,7 @@
 //! four members of one room, each a real `vox lan up` — the shipped binary, driven as a person
 //! would (ADR-018, "Only real use of the product is a test"). The room is made the way a
 //! person makes it: an anchor (`vox node`), `vox id`, `vox trust add`, `vox daemon`,
-//! `vox room create`, `vox room invite`, `vox room join`; then each member runs
+//! `vox room create`, `vox room link`, `vox room join`; then each member runs
 //! `vox lan up <room> --allow 5000 --stats-file …`, a client of its own `vox daemon`, which runs
 //! the LAN (ADR-026 S-5). alice's daemon serves `--metrics 127.0.0.1:0`.
 //!
@@ -670,8 +670,8 @@ fn a_room_is_a_lan_for_its_trusted_members_and_nobody_else() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("room not listed: {list}"))
         .to_owned();
-    let (ok, link, err) = vox_once(&dirs[0], &args(&["room", "invite", &room]));
-    assert!(ok, "vox room invite: {err}");
+    let (ok, link, err) = vox_once(&dirs[0], &args(&["room", "link", &room]));
+    assert!(ok, "vox room link: {err}");
     for (n, d) in names.iter().zip(&dirs).skip(1) {
         let deadline = Instant::now() + SETUP;
         loop {

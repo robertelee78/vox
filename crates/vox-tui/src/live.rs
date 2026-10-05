@@ -109,7 +109,7 @@ pub struct DaemonCore {
     active: Option<Digest32>,
     /// Unread counts per room (incremented by events for rooms off screen).
     unread: BTreeMap<Digest32, usize>,
-    /// The most recent public notice: an invite link, a join, a consent, a detach.
+    /// The most recent public notice: a room link, a join, a trust grant, a detach.
     notice: Option<String>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
@@ -454,7 +454,7 @@ impl DaemonCore {
                 CommandStatus::Done
             }
             // **The link is the answer** (#406): set only as a notice, it sat under the "done" this
-            // command's own status puts over every notice, and `:invite` showed a person nothing to
+            // command's own status puts over every notice, and `:link` showed a person nothing to
             // give anyone. A room link is no secret: the passphrase travels apart.
             Ok(Frame::Link { url, .. }) => {
                 self.notice = Some(format!("room link: {url}"));

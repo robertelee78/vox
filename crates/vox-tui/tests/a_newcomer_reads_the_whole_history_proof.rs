@@ -19,7 +19,7 @@
 //! vox id; vox trust add …          # alice and bob consent to each other, before any daemon
 //! vox daemon                       # alice's node
 //! vox room create; vox room post   # 1,500 posts, each one a separate `vox room post`
-//! vox daemon; vox room join        # bob, cold, from alice's `vox room invite`
+//! vox daemon; vox room join        # bob, cold, from alice's `vox room link`
 //! vox room read --json --limit --since   # bob walks the room a page at a time
 //! ```
 //!
@@ -341,8 +341,8 @@ fn newcomer_reads_the_whole_history(posts: usize, page: usize) {
     );
 
     // ---- bob joins cold -------------------------------------------------------------------
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT: `vox room invite` failed: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: `vox room link` failed: {err}");
     let link = link.trim().to_owned();
     let bob_daemon = daemon(&bob, "bob");
     attached(&bob, "bob");

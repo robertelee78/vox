@@ -209,8 +209,8 @@ fn until_generations(dir: &Path, want: u64, secs: u64) -> u64 {
 }
 
 fn join(creator: &Path, joiner: &Path, room: &str) {
-    let (ok, link, err) = vox(creator, &["room", "invite", room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(creator, &["room", "link", room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         joiner,
         &[

@@ -277,7 +277,7 @@ fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
         .next()
         .unwrap()
         .to_owned();
-    let link = d.run(&["room", "invite", &room], "").trim().to_owned();
+    let link = d.run(&["room", "link", &room], "").trim().to_owned();
 
     // The app.
     let mut app = Command::new(&harness)

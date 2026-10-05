@@ -19,7 +19,7 @@
 //! vox id                     # bootstrap an identity, print the fingerprint
 //! vox daemon                 # hold the profile, serve the control socket
 //! vox room create            # a room, on the daemon
-//! vox room invite            # its address, to send to the other host
+//! vox room link            # its address, to send to the other host
 //! vox trust add <fpr>        # the decision: who may read me
 //! vox room join <address>    # the other host joins, through the anchor
 //! vox room post / read       # and they talk
@@ -258,10 +258,10 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
 
     let (ok, link, err) = vox(
         &alice_dir,
-        &["room".into(), "invite".into(), room.clone()],
+        &["room".into(), "link".into(), room.clone()],
         None,
     );
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let link = link.trim().to_owned();
     assert!(
         link.starts_with("vox://"),

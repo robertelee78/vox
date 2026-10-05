@@ -235,7 +235,7 @@ fn make_room(a: &Account, node: &str) -> String {
         .unwrap_or_else(|| panic!("APPARATUS: no room listed on {node}: {list}"))
 }
 
-/// The addresses an invite link gives for identity `fp` (its `b=` values after `a=<fp>`).
+/// The addresses an room link gives for identity `fp` (its `b=` values after `a=<fp>`).
 fn addresses_for(link: &str, fp: &str) -> Vec<String> {
     let Some((_, query)) = link.split_once('?') else {
         return Vec::new();
@@ -386,11 +386,11 @@ fn nodes_attached_at_once_all_serve_at_one_address_each_as_itself() {
         .iter()
         .zip(&rooms)
         .map(|(n, r)| {
-            let (ok, out, err) = a.run(&["room", "invite", "--node", n, r], "");
-            assert!(ok, "APPARATUS: room invite on {n}: {out}{err}");
+            let (ok, out, err) = a.run(&["room", "link", "--node", n, r], "");
+            assert!(ok, "APPARATUS: room link on {n}: {out}{err}");
             out.lines()
                 .find(|l| l.starts_with("vox://"))
-                .unwrap_or_else(|| panic!("APPARATUS: no invite link from {n}: {out}"))
+                .unwrap_or_else(|| panic!("APPARATUS: no room link from {n}: {out}"))
                 .trim()
                 .to_owned()
         })
@@ -533,11 +533,11 @@ fn a_kept_node_is_reached_again_at_its_address_after_a_restart() {
         l.starts_with("vox daemon: holding room")
     });
     let invite = |a: &Account| {
-        let (ok, out, err) = a.run(&["room", "invite", &room], "");
-        assert!(ok, "PRODUCT: room invite: {out}{err}");
+        let (ok, out, err) = a.run(&["room", "link", &room], "");
+        assert!(ok, "PRODUCT: room link: {out}{err}");
         out.lines()
             .find(|l| l.starts_with("vox://"))
-            .unwrap_or_else(|| panic!("PRODUCT: no invite link: {out}"))
+            .unwrap_or_else(|| panic!("PRODUCT: no room link: {out}"))
             .trim()
             .to_owned()
     };

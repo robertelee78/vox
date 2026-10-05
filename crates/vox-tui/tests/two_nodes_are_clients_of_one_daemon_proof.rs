@@ -6,7 +6,7 @@
 //! ```text
 //! vox node create a; vox node create b                   (data root D)
 //! vox --node a serve web=<echo port> --listen 127.0.0.1:0 (starts D's daemon; a held while it runs)
-//! vox node attach b; vox --node b room create bx; vox --node b room invite bx
+//! vox node attach b; vox --node b room create bx; vox --node b room link bx
 //! vox node create r                                     (data root R, the remote)
 //! vox --node r connect <a's address> --listen …; vox node attach r; vox --node r room join <b's link>
 //! vox trust add … (a and b trust r, r trusts b)
@@ -427,7 +427,7 @@ fn two_nodes_serve_and_post_through_one_daemon_and_keep_their_own_tunnels() {
         .expect("PRODUCT: b's room list does not show bx")
         .to_owned();
     let b_link = d
-        .ok("PRODUCT:", &["--node", "b", "room", "invite", &bx])
+        .ok("PRODUCT:", &["--node", "b", "room", "link", &bx])
         .lines()
         .next()
         .unwrap_or_default()

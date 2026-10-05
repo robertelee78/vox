@@ -249,14 +249,12 @@ fn carol(data: &Path, cfg: &Path, room: &str, tmp: &Path) -> String {
         ok,
         "PRODUCT (staging): `vox node attach carol` refused: {err}"
     );
-    let (ok, invite, err) = vox(data, cfg, &["room", "invite", room], None);
+    let (ok, invite, err) = vox(data, cfg, &["room", "link", room], None);
     let address = invite
         .lines()
         .find(|l| l.starts_with("vox://"))
         .unwrap_or_else(|| {
-            panic!(
-                "PRODUCT (staging): `vox room invite` printed no address: {invite:?} {err} ({ok})"
-            )
+            panic!("PRODUCT (staging): `vox room link` printed no address: {invite:?} {err} ({ok})")
         })
         .to_owned();
     let (ok, _, err) = vox(

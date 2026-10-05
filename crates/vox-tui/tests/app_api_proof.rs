@@ -369,7 +369,7 @@ fn scene() -> Scene {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("PRODUCT (staging): the room is not listed: {list}"))
         .to_owned();
-    let link = alice.run(&["room", "invite", &room]).trim().to_owned();
+    let link = alice.run(&["room", "link", &room]).trim().to_owned();
     join(&bob, &link);
     Scene {
         tmp,

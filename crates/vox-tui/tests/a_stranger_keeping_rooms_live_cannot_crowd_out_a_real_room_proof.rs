@@ -826,7 +826,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
             .find(|l| l.contains("first"))
             .and_then(|l| l.split_whitespace().next())
             .expect("PRODUCT (staging): the member does not list the room");
-        let (ok, link, err) = world::vox_once(&member_dir, &args(&["room", "invite", short]));
+        let (ok, link, err) = world::vox_once(&member_dir, &args(&["room", "link", short]));
         (ok, link.trim().to_owned(), err)
     };
     assert!(ok, "PRODUCT (staging): the member could not invite: {err}");

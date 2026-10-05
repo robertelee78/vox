@@ -268,10 +268,10 @@ impl Member {
             self.name
         );
         let room = self.room_id(name);
-        let (ok, link, err) = self.vox(&["room", "invite", &room], None);
+        let (ok, link, err) = self.vox(&["room", "link", &room], None);
         assert!(
             ok && link.trim().starts_with("vox://"),
-            "PRODUCT (staging): {} `vox room invite` {name}: {link}{err}",
+            "PRODUCT (staging): {} `vox room link` {name}: {link}{err}",
             self.name
         );
         (room, link.trim().to_owned())

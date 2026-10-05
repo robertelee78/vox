@@ -332,8 +332,8 @@ fn a_crash_inside_a_join_never_costs_the_member_the_room() {
             .map(str::to_owned)
             .find(|w| !before.contains(w))
             .expect("PRODUCT (staging): no new room id in the host's `room list`");
-        let (ok, link, err) = vox(&host, &["room", "invite", &room], None);
-        assert!(ok, "PRODUCT (staging): host{k}'s room invite: {err}");
+        let (ok, link, err) = vox(&host, &["room", "link", &room], None);
+        assert!(ok, "PRODUCT (staging): host{k}'s room link: {err}");
         let link = link.trim().to_owned();
         let join = || {
             vox(
@@ -536,8 +536,8 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
         .expect("PRODUCT (staging): no room id in the host's `room list`");
-    let (ok, link, err) = vox(&host, &["room", "invite", &short], None);
-    assert!(ok, "PRODUCT (staging): the host's room invite: {err}");
+    let (ok, link, err) = vox(&host, &["room", "link", &short], None);
+    assert!(ok, "PRODUCT (staging): the host's room link: {err}");
     let link = link.trim().to_owned();
     // The room's whole id, as its address carries it: `vox://<id>?…`.
     let room = link

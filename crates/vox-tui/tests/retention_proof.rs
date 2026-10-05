@@ -288,8 +288,8 @@ fn room(creator: &Path, joiner: &Path) -> String {
         .next()
         .expect("PRODUCT (staging): a room id in `vox room list`")
         .to_owned();
-    let (ok, link, err) = vox(creator, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(creator, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         joiner,
         &[
@@ -668,8 +668,8 @@ fn a_member_who_joins_after_messages_expired_catches_up() {
         let (ok, _, err) = vox(dir, &["trust", "add", other, "--name", name], None);
         assert!(ok, "PRODUCT (staging): vox trust add {name}: {err}");
     }
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         &carol,
         &[

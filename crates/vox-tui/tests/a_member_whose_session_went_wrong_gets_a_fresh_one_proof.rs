@@ -219,8 +219,8 @@ fn a_member_whose_session_went_wrong_is_offered_a_fresh_one() {
         .next()
         .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
-    let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "link", &prefix]));
+    assert!(ok, "PRODUCT (staging): room link: {err}");
     let link = link.trim().to_owned();
     let joined = (1..=6).any(|attempt| {
         let (ok, out, err) = vox_in(

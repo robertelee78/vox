@@ -277,8 +277,8 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("files is not listed: {list}"))
         .to_owned();
-    let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    let (ok, link, err) = vox(&alice.dir, &["room", "link", &room], None);
+    assert!(ok, "vox room link: {err}");
     for who in [&bob, &mallory] {
         let (ok, out, err) = vox(
             &who.dir,
@@ -503,8 +503,8 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("PRODUCT (staging): files is not listed: {list}"))
         .to_owned();
-    let (ok, link, err) = vox(&alice.dir, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(&alice.dir, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, out, err) = vox(
         &bob.dir,
         &[

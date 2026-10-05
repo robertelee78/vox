@@ -242,7 +242,7 @@ fn a_member_that_left_joins_again_and_is_a_member_again() {
         unreachable!()
     };
     let id = room.id.as_str();
-    let link = setup(bob, &["room", "invite", id]).stdout.trim().to_owned();
+    let link = setup(bob, &["room", "link", id]).stdout.trim().to_owned();
 
     let o = alice.vox(None, &["room", "leave", id]);
     assert!(o.ok, "PRODUCT: `vox room leave` was refused: {o:?}");
@@ -438,10 +438,7 @@ fn an_admin_the_creator_named_ends_a_room_and_then_it_takes_no_new_message() {
         unreachable!()
     };
     let id = room.id.as_str();
-    let link = setup(alice, &["room", "invite", id])
-        .stdout
-        .trim()
-        .to_owned();
+    let link = setup(alice, &["room", "link", id]).stdout.trim().to_owned();
 
     // Only the creator names admins.
     let o = bob.vox(None, &["room", "admin", "add", id, &carol.b32()]);
@@ -605,7 +602,7 @@ fn a_chosen_idle_end_ends_a_quiet_room_and_only_that_room() {
             panic!("PRODUCT (staging): the new room is not in alice's `vox room list`")
         });
     let short = line.split_whitespace().next().unwrap().to_owned();
-    let link = setup(alice, &["room", "invite", &short])
+    let link = setup(alice, &["room", "link", &short])
         .stdout
         .trim()
         .to_owned();

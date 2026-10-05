@@ -112,7 +112,7 @@ fn daemon(name: &str, data: &Path, port: u16, spec: &str, pass_file: &Path) -> V
 }
 
 /// Create room `name` on the running daemon at `data`, post `POSTS` messages, and return its
-/// full id (from the invite link), the link, and its short id from `vox room list`.
+/// full id (from the room link), the link, and its short id from `vox room list`.
 fn room_with_posts(data: &Path, name: &str, pass: &str) -> (String, String, String) {
     let (ok, out, err) = vox_in(
         data,
@@ -133,17 +133,17 @@ fn room_with_posts(data: &Path, name: &str, pass: &str) -> (String, String, Stri
             panic!("PRODUCT (staging): room {name} not listed after its create: {list}")
         })
         .to_owned();
-    let (ok, link, err) = vox_once(data, &args(&["room", "invite", &short]));
+    let (ok, link, err) = vox_once(data, &args(&["room", "link", &short]));
     assert!(
         ok,
-        "PRODUCT (staging): `vox room invite {name}` failed: {err}"
+        "PRODUCT (staging): `vox room link {name}` failed: {err}"
     );
     let link = link.trim().to_owned();
     let full = link
         .strip_prefix("vox://")
         .and_then(|rest| rest.get(..52))
         .unwrap_or_else(|| {
-            panic!("PRODUCT (staging): `vox room invite` printed no invite link: {link:?}")
+            panic!("PRODUCT (staging): `vox room link` printed no room link: {link:?}")
         })
         .to_owned();
     for n in 0..POSTS {

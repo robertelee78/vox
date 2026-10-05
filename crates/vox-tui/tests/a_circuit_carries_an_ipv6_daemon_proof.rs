@@ -585,8 +585,8 @@ fn two_members_dialling_each_other_through_one_relay_both_get_through() {
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("PRODUCT: no room id in `vox room list` after `room create`")
         .to_owned();
-    let (ok, link, err) = vox(alice_dir, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT: room invite: {err}");
+    let (ok, link, err) = vox(alice_dir, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT: room link: {err}");
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,

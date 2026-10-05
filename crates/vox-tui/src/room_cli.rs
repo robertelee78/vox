@@ -3784,7 +3784,7 @@ pub async fn retention(
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or no link is minted.
-pub async fn invite(paths: &Paths, room: &str) -> Result<(), AppError> {
+pub async fn link(paths: &Paths, room: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Invite { channel_id }).await {

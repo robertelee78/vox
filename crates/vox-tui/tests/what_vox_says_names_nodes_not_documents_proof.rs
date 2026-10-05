@@ -7,9 +7,11 @@
 //!
 //! Asserted, over the help of **every** subcommand (walked from `vox --help`, as clap lists them)
 //! and over what a running node says to `vox status`, `vox status --json`, a room it does not
-//! hold, `vox room invite` and `vox serve`:
+//! hold, `vox room link` and `vox serve`:
 //! - no "profile" (the node's old name);
 //! - no "channel" and no "consent": a person has rooms, and trusts a member (#406);
+//! - no "invite": a room has a room link, which `vox room link` prints; `vox room invite` is
+//!   refused as an unknown command (#406);
 //! - no reference to a design document (`ADR-…`, `PRD-…`, `V030-…`, `V210-…`, `M17.…`, `(#…)`);
 //! - every example `.vox` address has the one form that connects, `<service>.<node>.<room>.vox`:
 //!   four labels.
@@ -90,7 +92,10 @@ fn faults(text: &str) -> Vec<String> {
         if low.contains("profile") && !low.contains("bash_profile") {
             out.push(format!("says \"profile\": {}", line.trim()));
         }
-        if let Some(w) = ["channel", "consent"].iter().find(|w| low.contains(**w)) {
+        if let Some(w) = ["channel", "consent", "invite"]
+            .iter()
+            .find(|w| low.contains(**w))
+        {
             out.push(format!("says \"{w}\": {}", line.trim()));
         }
         let refs = ["ADR-", "PRD-", "V030-", "V210-", "V29-", "M17.", "(#"];
@@ -220,12 +225,18 @@ fn help_and_messages_name_the_node_and_no_design_document() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_default()
         .to_owned();
-    let (ok, said) = vox(tmp.path(), &["room", "invite", &room]);
+    let (ok, said) = vox(tmp.path(), &["room", "link", &room]);
     assert!(
         ok,
-        "PRODUCT (staging): vox room invite {room}: {said}\n{listed}"
+        "PRODUCT (staging): vox room link {room}: {said}\n{listed}"
     );
-    said_by_node.push(("vox room invite words".into(), said));
+    said_by_node.push(("vox room link words".into(), said));
+    // The old verb is gone, with no alias: clap refuses it as a command it does not know.
+    let (ok, said) = vox(tmp.path(), &["room", "invite", &room]);
+    assert!(
+        !ok && said.contains("unrecognized subcommand 'invite'"),
+        "PRODUCT: `vox room invite` must be refused as an unknown command, not run: ok {ok}: {said}"
+    );
     said_by_node.push(("vox serve web=9".into(), serve_says(tmp.path())));
     let _ = vox(tmp.path(), &["node", "detach", "a"]);
 
@@ -250,9 +261,9 @@ fn help_and_messages_name_the_node_and_no_design_document() {
     assert!(
         said_by_node
             .iter()
-            .filter(|(c, _)| ["vox room invite words", "vox serve web=9"].contains(&c.as_str()))
+            .filter(|(c, _)| ["vox room link words", "vox serve web=9"].contains(&c.as_str()))
             .all(|(_, t)| t.contains("passphrase")),
-        "PRODUCT (staging): `vox room invite` or `vox serve` said nothing of the passphrase: \
+        "PRODUCT (staging): `vox room link` or `vox serve` said nothing of the passphrase: \
          {said_by_node:?}"
     );
     assert!(

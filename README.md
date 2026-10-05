@@ -3,7 +3,7 @@
 **Private rooms for people and agents, with no server in the middle — and `ssh` to machines that
 have no public address.**
 
-Vox is for a small group that wants a private channel nobody else operates: no accounts, no phone
+Vox is for a small group that wants private rooms nobody else operates: no accounts, no phone
 numbers, no company holding your messages. The same overlay carries chat between people, work
 coordination between AI agents, and TCP between machines (`ssh` over Vox is the canonical case).
 
@@ -20,8 +20,8 @@ There are only four things:
 - **Nodes.** A node is one identity: a key pair Vox makes for you, known by its **fingerprint**. A
   person is a node; so is each AI agent. Names are local: you call a node whatever you like, and
   nobody else sees that name.
-- **Rooms.** A room is a shared, encrypted, replicated log. You get into one with its **address**
-  (a `vox://…` string) and its **passphrase**, sent by two different channels.
+- **Rooms.** A room is a shared, encrypted, replicated log. You get into one with its **room link**
+  (a `vox://…` string) and its **passphrase**, each sent a different way.
 - **Trust.** Being in a room lets you *see that* messages exist, not *read* them. Two nodes read
   each other only once **each trusts the other** (`vox trust add`). Trust is per node, not per room:
   once you and your mom trust each other, every room you share works, including rooms made later.
@@ -117,7 +117,7 @@ attached, that one. `--profile` is gone. Verbs that hold a session (`serve`, `co
 vox          # creates your identity on first run, then opens the terminal client
 ```
 
-In the client: `:new` creates a room, `:invite` prints its address, `:join` takes one, `:open` and
+In the client: `:new` creates a room, `:link` prints its room link, `:join` takes one, `:open` and
 `:close` open and close a room, `:leave` and `:end` leave it or end it for everyone. The client is a
 client of the daemon: `:attach` attaches your node, and `:node <name>` acts as another of your nodes.
 The members pane shows, for each member, whether you trust them and whether they can read you.
@@ -126,11 +126,12 @@ The members pane shows, for each member, whether you trust them and whether they
 
 Say you and your mom want a room. The first time, it takes six steps:
 
-1. **Swap fingerprints.** Each runs `vox id` and sends the result to the other (any channel — a
-   fingerprint is public).
+1. **Swap fingerprints.** Each runs `vox id` and sends the result to the other (any way you like —
+   a fingerprint is public).
 2. **Create.** One of you creates the room (`:new` in the client, or `vox room create`).
-3. **Get its address.** `:invite` (or `vox room invite <room>`) prints a `vox://…` address.
-4. **Send the address and the passphrase** — by two different channels.
+3. **Get its room link.** `:link` (or `vox room link <room>`) prints a `vox://…` room link.
+4. **Send the room link and the passphrase** — each a different way (in person, a call, a
+   different app).
 5. **Join.** The other runs `:join` (or `vox room join`).
 6. **Trust each other.** Each runs `vox trust add <the other's fingerprint> --name <a name>`.
 

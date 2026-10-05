@@ -173,7 +173,7 @@ fn an_always_on_member_is_the_rendezvous_and_relay_for_the_others() {
         .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
         .unwrap_or_else(|| panic!("PRODUCT (staging): C lists no room"))
         .to_owned();
-    let link = staged(&c_dir, &["room", "invite", &room], "")
+    let link = staged(&c_dir, &["room", "link", &room], "")
         .lines()
         .find(|l| l.starts_with("vox://"))
         .unwrap_or_else(|| panic!("PRODUCT (staging): no invitation for room {room}"))

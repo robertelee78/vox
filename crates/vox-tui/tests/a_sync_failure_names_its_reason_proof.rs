@@ -197,8 +197,8 @@ fn a_sync_that_did_not_complete_says_why() {
             panic!("PRODUCT: the room alice created is not in `vox room list`: {list}")
         })
         .to_owned();
-    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "link", &room]));
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
         &[

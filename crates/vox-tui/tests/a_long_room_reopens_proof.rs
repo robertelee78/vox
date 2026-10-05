@@ -17,7 +17,7 @@
 //! vox daemon                       # alice's node, no terminal
 //! vox room create; vox room post   # posts from one author, every one must succeed
 //! (kill the daemon) vox daemon     # restart: the room must open, and read back every row
-//! vox room invite / vox room join  # bob, cold
+//! vox room link / vox room join  # bob, cold
 //! vox room post (alice, after)      # bob must render it: his log holds her whole feed
 //! vox room read --json --limit/--since  # counted page by page, as an agent reads a long room
 //! ```
@@ -360,8 +360,8 @@ fn a_room_of(posts: usize, writers: usize, catch_up: Duration) {
     );
 
     // ---- bob joins cold and must read every row ------------------------------------------
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let link = link.trim().to_owned();
     let bob_daemon = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
     attached(&bob, "bob");

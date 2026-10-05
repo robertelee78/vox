@@ -240,6 +240,7 @@ fn an_anchor_upgraded_from_a_release_that_kept_room_pages_deletes_them() {
         .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
         .unwrap_or_else(|| panic!("CANNOT MEASURE (staging): A lists no room"))
         .to_owned();
+    // The previous release's verb; this build's is `vox room link`.
     let link = ok(&old, &a, &["room", "invite", &room], "")
         .lines()
         .find(|l| l.starts_with("vox://"))

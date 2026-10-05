@@ -905,8 +905,8 @@ fn a_detach_does_not_wait_out_a_joins_grind_and_leaves_no_passphrase() {
     );
     let (_, list) = run(&alice, "alice", &["room", "list"]);
     let prefix = list.split_whitespace().next().staged().to_owned();
-    let (ok, link) = run(&alice, "alice", &["room", "invite", &prefix]);
-    assert!(ok, "PRODUCT (staging): room invite: {link}");
+    let (ok, link) = run(&alice, "alice", &["room", "link", &prefix]);
+    assert!(ok, "PRODUCT (staging): room link: {link}");
     let link = link.lines().next().staged().trim().to_owned();
 
     // Bob's daemon, scanned, with his node's grind held long.

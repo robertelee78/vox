@@ -315,8 +315,8 @@ fn an_empty_identity_and_room_passphrase_are_accepted() {
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in `vox room list`: {listed:?}"))
         .to_owned();
-    let (ok, link, err) = vox(&alice, &s(&["room", "invite", &room]), None);
-    assert!(ok, "PRODUCT (staging): room invite failed: {err}");
+    let (ok, link, err) = vox(&alice, &s(&["room", "link", &room]), None);
+    assert!(ok, "PRODUCT (staging): room link failed: {err}");
     let link = link.trim().to_owned();
 
     // ---- claim 3: a wrong, non-empty passphrase is refused ----

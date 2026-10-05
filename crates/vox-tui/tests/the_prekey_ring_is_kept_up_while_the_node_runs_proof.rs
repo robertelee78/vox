@@ -214,7 +214,7 @@ impl Profile {
         p
     }
 
-    /// A new room's invite link: `vox room create`, then `vox room invite` by its id.
+    /// A new room's room link: `vox room create`, then `vox room link` by its id.
     fn room(&self, name: &str) -> String {
         let o = self.vox(
             &["room", "create", "--passphrase-file", "-", "--name", name],
@@ -233,12 +233,8 @@ impl Profile {
             .and_then(|l| l.split_whitespace().next())
             .unwrap_or_else(|| panic!("PRODUCT: room {name} not in `vox room list`: {}", o.stdout))
             .to_owned();
-        let o = self.vox(&["room", "invite", &id], None);
-        assert!(
-            o.ok,
-            "PRODUCT: room invite {name}: {}{}",
-            o.stdout, o.stderr
-        );
+        let o = self.vox(&["room", "link", &id], None);
+        assert!(o.ok, "PRODUCT: room link {name}: {}{}", o.stdout, o.stderr);
         o.stdout.trim().to_owned()
     }
 

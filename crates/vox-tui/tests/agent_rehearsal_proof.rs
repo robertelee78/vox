@@ -50,7 +50,7 @@
 //! ## Every participant is the shipped binary
 //!
 //! The nodes are real processes (`support/room.rs`): an anchor (`vox node`), a `vox daemon`
-//! per agent, the room made with `vox room create|invite|join`, each identity admitted with
+//! per agent, the room made with `vox room create|link|join`, each identity admitted with
 //! `vox trust add`, ready once each has rendered a post by the other. Each agent's OpenCode
 //! plugin is what `vox agent plugin opencode` prints, installed where a person puts it, and
 //! that plugin runs `vox agent hook` every turn. Nothing in this process runs a node.

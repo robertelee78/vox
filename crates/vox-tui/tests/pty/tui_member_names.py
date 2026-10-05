@@ -114,8 +114,8 @@ try:
     listed = run("alice", "room", "list")
     if not listed.stdout.split(): product(f"alice's `vox room list` shows no room after create: {listed.stderr.strip()}")
     room = listed.stdout.split()[0]
-    inv = run("alice", "room", "invite", room)
-    if inv.returncode != 0: product(f"alice's `vox room invite` failed: {inv.stderr.strip()}")
+    inv = run("alice", "room", "link", room)
+    if inv.returncode != 0: product(f"alice's `vox room link` failed: {inv.stderr.strip()}")
     link = inv.stdout.strip()
     for w in ("bob", "carol"):
         j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")

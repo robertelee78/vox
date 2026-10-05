@@ -14,7 +14,7 @@
 //!   cluster to the terminal unbroken, joiners and all. pyte splits a cluster into cells and keeps
 //!   only its first person, so the rest is read from the bytes the TUI wrote, and how a real
 //!   terminal draws the glyph is not seen;
-//! - `words`: `:invite` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
+//! - `words`: `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
 //!   never an "invite link" (the decider's words, #406);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
 //! - `scrolls`: PageUp brings m-001 into view, and End returns to m-071;
