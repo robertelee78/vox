@@ -54,7 +54,14 @@ pub struct Driven {
 }
 
 /// The words a driver's verdict line carries, after its tag.
-const VERDICTS: [&str; 5] = ["PASS", "RED", "APPARATUS", "HUNG at", "the TUI said done"];
+const VERDICTS: [&str; 6] = [
+    "PASS",
+    "RED",
+    "APPARATUS",
+    "HUNG at",
+    "the TUI said done",
+    "the TUI said what",
+];
 
 impl Driven {
     /// Whether the driver printed a verdict line of `tag`'s: a pass, a red, an apparatus

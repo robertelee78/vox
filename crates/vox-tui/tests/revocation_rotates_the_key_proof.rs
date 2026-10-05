@@ -46,6 +46,10 @@
 //! **reported spike** (`~/vox-coord/logs/ac-fix70/spike/rp17_attacker_arm_spike.rs`, run and
 //! reported in the candidate post), not on this gate.
 //!
+//! It also asserts what `vox trust remove` says (ADR-028 E-5): before it acts, a "vox: about to
+//! stop trusting" line, then a line naming both rooms bob is to read nothing new in; after, "vox: no
+//! longer trusting".
+//!
 //! ## The mutations that must turn it red
 //! - **Change the lock in one shared room only** (RP-20): `change_the_lock_against` in
 //!   `crates/vox-core/src/node/actor.rs` stops after the first room it revokes in. The other room
@@ -437,6 +441,27 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
         None,
     );
     assert!(ok, "PRODUCT: `vox trust remove` of bob failed: {o}{e}");
+    // It says what it is to stop before it acts, naming every room shared with bob, and what it
+    // did after (ADR-028 E-5).
+    eprintln!("[proof] `vox trust remove` said:\n{o}");
+    let lines: Vec<&str> = o.lines().collect();
+    let about = lines
+        .iter()
+        .position(|l| l.starts_with("vox: about to stop trusting"));
+    let rooms_named = about.and_then(|b| {
+        lines[b..]
+            .iter()
+            .position(|l| ROOMS.iter().all(|r| l.contains(&format!("{r:?}"))))
+            .map(|i| b + i)
+    });
+    let done = lines
+        .iter()
+        .position(|l| l.starts_with("vox: no longer trusting"));
+    assert!(
+        matches!((rooms_named, done), (Some(r), Some(d)) if r < d),
+        "PRODUCT: `vox trust remove` must say, before it acts, that bob is to read nothing new in \
+         {ROOMS:?}, and then what it did: {o}"
+    );
     let after_text = |name: &str, n: u32| format!("ONLY-CAROL-READS-THIS-{name} {n}");
     for (name, room) in &ids {
         for n in 1..=AFTER {

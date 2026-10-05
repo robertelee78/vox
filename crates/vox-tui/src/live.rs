@@ -1595,14 +1595,29 @@ impl CoreHandle for DaemonCore {
                 self.send(Request::CloseRoom { channel_id })
             }
             Command::LeaveRoom { channel_id } => {
-                // Answered once another member has the leave; the room is gone then.
+                // Answered once another member has the leave; the room is gone then. What it did
+                // is said, not "done" (ADR-028 E-5).
                 let status = self.send(Request::Leave { channel_id });
-                if matches!(status, CommandStatus::Done) && self.active == Some(channel_id) {
+                if !matches!(status, CommandStatus::Done) {
+                    return status;
+                }
+                if self.active == Some(channel_id) {
                     self.active = None;
                 }
-                status
+                CommandStatus::Said(
+                    "left the room: its other members see that you left; this node no longer \
+                     holds it"
+                        .to_owned(),
+                )
             }
-            Command::EndRoom { channel_id } => self.send(Request::End { channel_id }),
+            Command::EndRoom { channel_id } => match self.send(Request::End { channel_id }) {
+                CommandStatus::Done => CommandStatus::Said(
+                    "ended the room for everyone: every member's node takes no new message in it \
+                     once it has this, passes the end on, and deletes it"
+                        .to_owned(),
+                ),
+                other => other,
+            },
             Command::SelectChannel { channel_id } => {
                 // The room left counts from the newest row it showed: nothing seen is unread.
                 if let Some(t) = self

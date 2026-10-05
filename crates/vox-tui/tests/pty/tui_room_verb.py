@@ -8,15 +8,22 @@ while it runs, as a person's TUI would stay open.
 
 The TUI runs in a pty at 160x50 and its screen is read through the `pyte` terminal emulator: raw
 ANSI cannot be grepped, because the TUI repaints only what changed. The status line is reset with
-an unknown command (`:zzz`) first, so "done" afterwards can only be the verb's answer.
+an unknown command (`:zzz`) first, so what it says afterwards can only be the verb's answer.
+
+Each verb changes access, so the TUI says what it is to do before it acts and what it did after
+(ADR-028 E-5): `:<verb>` opens a confirmation whose title states the effect (CONFIRM below), the
+driver types the verb's word there, and the TUI then says what it did (SAID below) instead of a
+bare "done".
 
 Shaped as `tui_close_room.py` (V210-107, #302): **a TUI that does not do what the person typed is
 the product, not the apparatus.**
 
-Exit 0 = the TUI said "done" to the verb. 1 = a product red, with its screen: `RED: vox tui exited
-before it asked to unlock`, `RED: the TUI never unlocked`, `RED: the TUI refused :<verb>: <its
-words>` (the status line names an error, read from its words, not from any change on screen),
-`RED: no answer to :<verb>`, or `RED: vox tui exited at <stage>`; or `HUNG at <stage>` with the
+Exit 0 = the TUI asked to confirm the verb, stating its effect, and then said what it did. 1 = a
+product red, with its screen: `RED: vox tui exited before it asked to unlock`, `RED: the TUI never
+unlocked`, `RED: no confirmation stating the effect of :<verb>`, `RED: the TUI refused :<verb>:
+<its words>` (the status line names an error, read from its words, not from any change on screen),
+`RED: no answer to :<verb>`, `RED: the TUI said only done to :<verb>`, or `RED: vox tui exited at
+<stage>`; or `HUNG at <stage>` with the
 driver's stack (`vox_pty.py`, V210-54) — every wait here is bounded, so a driver past its budget is
 a TUI that stopped reading what was typed. 2 = apparatus only: pyte missing, the status line not
 reset by `:zzz` (the staging this driver needs), or the driver's own error. The first verdict
@@ -38,6 +45,17 @@ arm(BUDGET, TAG)
 
 env = {k: os.environ[k] for k in ("PATH", "HOME", "TMPDIR", "USER") if k in os.environ}
 env.update(VOX_DATA_DIR=DATA, VOX_CONFIG_DIR=CFG, TERM="xterm-256color")
+
+# What the confirmation must state before the verb acts, and what the TUI must say after it did
+# (ADR-028 E-5), for each verb.
+CONFIRMS = {
+    "leave": ("Leave this room?", "other members are to see that you left", "delete it"),
+    "end": ("End this room for everyone?", "take no new message in it", "delete it"),
+}
+SAYS = {
+    "leave": ("left the room", "other members see that you left", "no longer holds it"),
+    "end": ("ended the room for everyone", "takes no new message in it", "deletes it"),
+}
 
 # What the TUI's status line says when it refused a room verb (`UiError::message`): its words, so
 # an echo of the command box or any other repaint is never read as a refusal.
@@ -124,15 +142,31 @@ try:
     if "done" in status():
         give(2, f"APPARATUS: the status line still says done after :zzz:\n{tui.text()}")
     key(f":{VERB}\r", 1)
-    answered = tui.until(lambda: tui.closed or "done" in status() or refusal(), 30)
+    # Before it acts: a confirmation that says what the verb is to do.
+    screen = lambda: " ".join(" ".join(r.split()) for r in tui.display())
+    asked = tui.until(lambda: tui.closed or all(w in screen() for w in CONFIRMS[VERB]), 10)
+    gone_check()
+    if not asked:
+        give(1, f"RED: no confirmation stating the effect of :{VERB} ({CONFIRMS[VERB]!r}):\n{tui.text()}")
+    confirm = next((" ".join(r.split()) for r in tui.display() if CONFIRMS[VERB][0] in r), "")
+    print(f"{TAG} CONFIRM: {confirm.strip('│┌┐─ ')}")
+    key(f"{VERB}\r", 1)
+    said_all = lambda: all(w in " ".join(status().split()) for w in SAYS[VERB])
+    answered = tui.until(lambda: tui.closed or "done" in status() or said_all() or refusal(), 30)
     gone_check()
     said = refusal()
     if said:
         give(1, f"RED: the TUI refused :{VERB}: {said}:\n{tui.text()}")
     if not answered:
         give(1, f"RED: no answer to :{VERB} within 30s:\n{tui.text()}")
+    if not said_all():
+        give(1, f"RED: the TUI said only done to :{VERB}, not what it did ({SAYS[VERB]!r}):\n{tui.text()}")
+    # The answer is the line under the status bar, wrapped onto as many rows as it needs.
+    rows = tui.display()
+    at = next((i for i, r in enumerate(rows) if SAYS[VERB][0] in r), len(rows) - 1)
+    print(f"{TAG} SAID: {' '.join(' '.join(r.split()) for r in rows[at:])}")
     code = 0
-    print(f"{TAG} the TUI said done to :{VERB}")
+    print(f"{TAG} the TUI said what :{VERB} did")
     stage(f"hold {HOLD}s")
     tui.pump(HOLD)
     stage(":q")
