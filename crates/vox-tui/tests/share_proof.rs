@@ -260,6 +260,21 @@ fn arrives(path: &Path, want: &str, within: Duration) -> bool {
     false
 }
 
+/// Where `who`'s node puts what it pulls from `room` (ADR-028 F-4): `nodes/<node>/files/<room>/`,
+/// named by the room's whole id, of which `room` (as `vox room list` prints it) is the start.
+fn files_of(who: &Member, room: &str) -> PathBuf {
+    let (ok, out) = who.run(&["room", "link", room]);
+    assert!(ok, "PRODUCT (staging): {}'s room link: {out}", who.name);
+    let id = out
+        .trim()
+        .strip_prefix("vox://")
+        .and_then(|l| l.split(['?', '/', '@']).next())
+        .filter(|id| id.starts_with(room))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in {out:?}"))
+        .to_owned();
+    who.dir.join("nodes").join("default").join("files").join(id)
+}
+
 /// Every row `vox room read --json` shows `who`.
 fn rows_of(who: &Member, room: &str) -> Vec<serde_json::Value> {
     let (ok, out) = who.run(&["room", "read", room, "--json"]);
@@ -384,18 +399,8 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     carol.sees(&room, "hello from alice");
 
     // Where each node's pulls land (ADR-028 F-4): `<data root>/nodes/<node>/files/<room>/`.
-    let bob_dl = bob
-        .dir
-        .join("nodes")
-        .join("default")
-        .join("files")
-        .join(&room);
-    let carol_dl = carol
-        .dir
-        .join("nodes")
-        .join("default")
-        .join("files")
-        .join(&room);
+    let bob_dl = files_of(&bob, &room);
+    let carol_dl = files_of(&carol, &room);
 
     // **One message, addressed** (ADR-028 F-1): the note, who it is for and the urgent flag ride
     // in the share itself. And **the daemon serves it** (F-2): `vox share` returns once it does.
@@ -783,12 +788,7 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
     let tag = tag_of(&shared_said);
     // bob's node pulls it by itself first (ADR-028 F-3): that is the first fetch, so the slow curl
     // below is the last.
-    let bob_files = bob
-        .dir
-        .join("nodes")
-        .join("default")
-        .join("files")
-        .join(&room);
+    let bob_files = files_of(&bob, &room);
     assert!(
         arrives(&bob_files.join("big.bin"), &sha(&payload), SETUP),
         "PRODUCT (staging): bob's node never pulled the share by itself, so the slow fetch would \
