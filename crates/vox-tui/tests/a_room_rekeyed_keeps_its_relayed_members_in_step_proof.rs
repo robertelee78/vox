@@ -26,8 +26,8 @@
 //!
 //! **A second arm: a joiner alice trusts only after the re-key reads what follows her trust, and
 //! only that** (the room is forward-only: ADR-006, ADR-007 G-15a, V210-45). An independent check
-//! staged it this way — erin trusted, invited again and joined after alice's post-re-key posts —
-//! and found erin reading none of those posts for minutes. That is the rule: the key alice
+//! staged it this way — erin trusted, given the room link again and joined after alice's
+//! post-re-key posts — and found erin reading none of those posts for minutes. That is the rule: the key alice
 //! releases to erin starts where her trust decision stands in the room's order, so nothing sealed
 //! before it is erin's to read. Asserted: a post alice makes after trusting erin is read by erin
 //! within [`PROMPT`] of her join (red if not), and the posts sealed before alice's trust stay
@@ -335,8 +335,8 @@ fn a_member_reached_only_through_the_anchor_and_a_later_joiner_stay_in_step_afte
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("PRODUCT (staging): no room id in `vox room list` after `room create`")
         .to_owned();
-    let (ok, link, err) = vox(alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    let (ok, link, err) = vox(alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): room link: {err}");
     let link = link.trim().to_owned();
     join(bob, &link, "bob");
     join(carol, &link, "carol");
@@ -501,8 +501,8 @@ fn a_joiner_trusted_only_after_a_rekey_reads_what_follows_the_trust_and_only_tha
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("PRODUCT (staging): no room id in `vox room list` after `room create`")
         .to_owned();
-    let (ok, link, err) = vox(alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    let (ok, link, err) = vox(alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): room link: {err}");
     join(bob, link.trim(), "bob");
     let (ok, _, err) = vox(alice, &["room", "post", &room, "BEFORE-REKEY"], None);
     assert!(ok, "PRODUCT (staging): alice's post: {err}");
@@ -526,14 +526,14 @@ fn a_joiner_trusted_only_after_a_rekey_reads_what_follows_the_trust_and_only_tha
         assert!(ok, "PRODUCT (staging): alice's post {text}: {err}");
     }
 
-    // ---- erin, on [::1] only, trusted after all of that; a fresh invite; her join ----
+    // ---- erin, on [::1] only, trusted after all of that; a fresh room link; her join ----
     let erin_d = daemon(erin, Split::Families.guest_listen(), &[&v6]);
     let (ok, _, err) = vox(alice, &["trust", "add", &fps[2], "--name", "erin"], None);
     assert!(ok, "PRODUCT (staging): alice trusts erin: {err}");
     let (ok, _, err) = vox(erin, &["trust", "add", &fps[0], "--name", "alice"], None);
     assert!(ok, "PRODUCT (staging): erin trusts alice: {err}");
-    let (ok, link, err) = vox(alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): the second invite: {err}");
+    let (ok, link, err) = vox(alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): the second room link: {err}");
     let joined = Instant::now();
     join(erin, link.trim(), "erin");
     let (ok, _, err) = vox(alice, &["room", "post", &room, "AFTER-TRUST"], None);
