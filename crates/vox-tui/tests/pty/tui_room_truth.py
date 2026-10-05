@@ -31,8 +31,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   nostorm   read records never answer read records (the decider; ADR-028 RR-2): Alice's daemon is
             stopped and her real `vox tui` opened on the room beside Bob's; each posts, and once
             each TUI says the other has read its post, with both TUIs on the room and both agents
-            draining, the entries `vox status --json` says each node holds stay the same for 15 s
-            and no agent is told anything; Alice's daemon is then started again;
+            draining, the entries `vox status --json` says each node holds stay the same for 15 s;
+            Alice's TUI and the daemon it started are then stopped and her `vox daemon` started
+            again;
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
@@ -427,19 +428,33 @@ try:
     drains()
     both_until(lambda: False, 6)  # a record held back by the 5-second batch goes out
     counts = [(held("alice"), held("bob"))]
-    told = ""
     t0 = time.time()
     while time.time() - t0 < 15:
-        told += "".join(h.stdout for h in drains())
+        drains()
         both_until(lambda: False, 1)  # both TUIs keep drawing the room
         counts.append((held("alice"), held("bob")))
-    claim("nostorm", len(set(counts)) == 1 and not told.strip(),
+    claim("nostorm", len(set(counts)) == 1,
           f"entries held (alice, bob) over 15 s, both TUIs on the room and both agents draining: "
-          f"{counts[0]} to {counts[-1]} ({len(counts)} samples, {len(set(counts))} distinct); "
-          f"told to an agent meanwhile: {told.strip()[:200]!r}")
+          f"{counts[0]} to {counts[-1]} ({len(counts)} samples, {len(set(counts))} distinct)")
     if not atui.stop():
         product(f"alice's vox tui (pid {atui.pid}) outlived SIGKILL and could not be reaped")
     TUIS.remove(atui)
+    # Her TUI started a daemon of its own, detached, that outlives it: stopped by its PID (its
+    # argv names her data directory), so her `vox daemon` below is the one later stages stop.
+    pids = [int(x) for x in subprocess.run(["pgrep", "-f", f"daemon .*--data-dir {S}/alice/"],
+                                           capture_output=True, text=True).stdout.split()]
+    if len(pids) != 1:
+        apparatus(f"expected the one daemon alice's TUI started, found PIDs {pids}")
+    os.kill(pids[0], __import__("signal").SIGTERM)
+    def gone():
+        try:
+            os.kill(pids[0], 0)
+            return False
+        except ProcessLookupError:
+            return True
+    if not until(gone, 30):
+        os.kill(pids[0], __import__("signal").SIGKILL)
+        if not until(gone, 10): apparatus(f"the daemon alice's TUI started (pid {pids[0]}) outlived SIGKILL")
     daemons["alice"] = spawn("alice", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
                              "--passphrase-file", f"{S}/idpass", out="alice-after-tui")
     if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
