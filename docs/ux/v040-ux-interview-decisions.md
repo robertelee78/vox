@@ -27,3 +27,11 @@ Answers to the open questions in [v040-ux-research.md](v040-ux-research.md). Inp
 - **Q10 Calls (v0.4.0):** BOTH drop-in ("ann is in a call · [j]oin") AND ringing; ringing is not optional (always rings).
 - **Q17 Expiring trust:** NO.
 - **Q18 macOS Keychain may store a node's passphrase:** YES, opt-in per node.
+
+## Notes for the ADR-014 (macOS app) rewrite (2026-10-04)
+
+From an outside review, agreed by the decider for v0.4.0:
+- **The app is a Swift client of the daemon's control socket**, like every other client under ADR-026. It is not an in-process node over UniFFI, so ADR-014's UniFFI sections (1, 11.1) go; whether `crates/vox-ffi` keeps any use is decided in the rewrite.
+- **A small privileged helper, registered with `SMAppService` as a launchd daemon** and approved once in System Settings, creates the tunnel interface and passes its descriptor to the user-level daemon. It never sees keys or room data. It replaces the hand-started `sudo vox lan helper`.
+- **The user-level `vox daemon` is a login item** registered with `SMAppService`, so it runs before the app opens; quitting the app detaches its node (Q11).
+- **Offscreen screenshots of every window from demo data** for docs and release notes, never from a real data root. They show the look; they are not product proof. Localization (the reference does 8 languages) is not planned yet.
