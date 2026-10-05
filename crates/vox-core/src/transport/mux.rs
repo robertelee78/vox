@@ -535,12 +535,20 @@ impl AsyncUdpSocket for MuxSocket {
     /// word. At [`MAX_UDP_PAYLOAD`] 8 to 10 segments are 65,536 to 81,920 bytes: measured on a
     /// Linux host, every such batch vanished, quinn saw a run of large packets lost and nothing
     /// small, took it for a black hole, and sent at 1,200 bytes for its 60 s cooldown. On a
-    /// congested link vox then carried 0.18x a competing Cubic flow; capped, 1.39x.
+    /// congested link vox then carried 0.18x a competing Cubic flow; capped, 2.8x.
+    ///
+    /// Only Linux and Android send a batch as one GSO datagram. Apple's batched send
+    /// (`sendmsg_x`) carries each segment as its own datagram, so its batches stay as quinn-udp
+    /// sizes them.
     fn max_transmit_segments(&self) -> usize {
-        self.inner
-            .max_transmit_segments()
-            .min(MAX_UDP_DATAGRAM / usize::from(MAX_UDP_PAYLOAD))
-            .max(1)
+        let segments = self.inner.max_transmit_segments();
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            segments
+                .min(MAX_UDP_DATAGRAM / usize::from(MAX_UDP_PAYLOAD))
+                .max(1)
+        } else {
+            segments
+        }
     }
 
     fn max_receive_segments(&self) -> usize {
