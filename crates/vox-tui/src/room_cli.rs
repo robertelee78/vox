@@ -3574,7 +3574,7 @@ pub async fn join(
             .request(&Request::Join {
                 link: link.to_owned(),
                 local_name: local_name.to_owned(),
-                passphrase: String::new(),
+                passphrase: zeroize::Zeroizing::new(String::new()),
             })
             .await
         {
@@ -3605,7 +3605,7 @@ pub async fn join(
         .request(&Request::Join {
             link: link.to_owned(),
             local_name: local_name.to_owned(),
-            passphrase,
+            passphrase: zeroize::Zeroizing::new(passphrase),
         })
         .await
     {
@@ -3666,7 +3666,7 @@ pub async fn create(
     match client
         .request(&Request::Create {
             local_name: local_name.to_owned(),
-            passphrase,
+            passphrase: zeroize::Zeroizing::new(passphrase),
         })
         .await
     {
@@ -3736,7 +3736,7 @@ pub async fn retention(
         .request(&Request::SetRetention {
             channel_id,
             ttl,
-            identity_passphrase: identity_passphrase.to_owned(),
+            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
         })
         .await
     {
@@ -3837,11 +3837,11 @@ pub async fn link(paths: &Paths, room: &str) -> Result<(), AppError> {
 async fn keyring_change(
     client: &mut IpcClient,
     given: Option<String>,
-    request: impl Fn(String) -> Request,
+    request: impl Fn(zeroize::Zeroizing<String>) -> Request,
 ) -> Result<Frame, AppError> {
     let asked = given.is_none();
     let reply = client
-        .request(&request(given.unwrap_or_default()))
+        .request(&request(zeroize::Zeroizing::new(given.unwrap_or_default())))
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
     let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
@@ -3852,7 +3852,7 @@ async fn keyring_change(
             eprintln!("vox: {}", reason.lines().next().unwrap_or_default());
             let passphrase = crate::tunnel_cli::ask_identity_passphrase()?;
             client
-                .request(&request(passphrase))
+                .request(&request(zeroize::Zeroizing::new(passphrase)))
                 .await
                 .map_err(|e| AppError::Usage(e.to_string()))
         }
