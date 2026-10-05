@@ -11,7 +11,11 @@
 //! - `said`: D's log says the change exactly once, within 1 s of it;
 //! - `status`: D's `vox status --json` names the change, and lists B and not A, within 2 s;
 //! - `reads`: P reads a post D sends after the change within 5 s of it, not after
-//!   `SILENCE_IS_DEATH` (30 s).
+//!   `SILENCE_IS_DEATH` (30 s);
+//! - `router` (Linux only): before the move, the default route alone changes its next hop, with no
+//!   address coming or going, and D says that one change, naming the route, within 1 s (N-50,
+//!   N-53). The macOS form does not stage it, since it would change the machine's own default
+//!   route.
 //!
 //! **Linux** is the proof: an unprivileged user and network namespace, whose interfaces the
 //! driver changes itself. **macOS** is opt-in heavy (`VOX_PROOF_NETCHANGE_MACOS=1`): the driver
@@ -19,7 +23,8 @@
 //!
 //! **Mutations that must turn it red:** the event socket never opened (`NetWatch::open` returning
 //! its error) → `said`, `status`, `redial` and `reads` red; no redial of the stranded peers
-//! (`dial_stranded` doing nothing) → `redial` red.
+//! (`dial_stranded` doing nothing) → `redial` red; a default route's move ignored
+//! (`NetChange::between` comparing the addresses only) → `router` red.
 //!
 //! A `vox` step on the way that fails is `PRODUCT:`; the driver's own failures (no `unshare`, a
 //! crash) are APPARATUS, CANNOT MEASURE, never a pass.
@@ -32,6 +37,9 @@ mod watchdog;
 use std::process::Command;
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
+
+/// How many claims the driver makes here: `router` is staged on Linux only.
+const CLAIMS: usize = if cfg!(target_os = "linux") { 5 } else { 4 };
 
 /// Run the driver and judge what it printed.
 fn drive() {
@@ -53,8 +61,8 @@ fn drive() {
     let red: Vec<&&str> = claims.iter().filter(|l| l.contains(" RED:")).collect();
     match out.status.code() {
         Some(0) => assert!(
-            claims.len() == 4 && red.is_empty() && said.contains("netchange PASS"),
-            "APPARATUS: the driver exited 0 without four claims ok and a PASS: {said}"
+            claims.len() == CLAIMS && red.is_empty() && said.contains("netchange PASS"),
+            "APPARATUS: the driver exited 0 without {CLAIMS} claims ok and a PASS: {said}"
         ),
         Some(1) => panic!(
             "PRODUCT: a move to another network must be noticed and acted on at once; red: \

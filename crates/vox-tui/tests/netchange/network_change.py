@@ -20,7 +20,12 @@ B = 10.88.0.2, routes by it, and loses A: a move to another network. Each claim 
   redial     with nothing sent by either, D holds a new connection to P within 3 s: it found the
              connection it accepted stranded, closed it and dialled P again (N-51);
   reads      P reads a post D sends after that within 5 s of the change, not after
-             SILENCE_IS_DEATH (30 s).
+             SILENCE_IS_DEATH (30 s);
+  router     (Linux) before the move, the default route alone changes its next hop, no address
+             coming or going: D says that one change, naming the route, within 1 s (N-50, N-53).
+             The macOS form does not stage it: it would have to change the machine's own
+             default route; there the next hop is read by the reader `vox status` is proved
+             against (`vox_status_names_the_router_proof`).
 
 The staging forces what `reads` is about: P can reach D only at A, so the move strands the
 connection D accepted. D's log line for it (`accepted here) did not answer a probe after the
@@ -188,6 +193,20 @@ try:
     SAID = "vox: the network changed:"
     def said_lines():
         return [l for l in log("d").splitlines() if l.startswith(SAID)]
+    if LINUX:
+        # ---- router: the default route's next hop moves, and no address does ----
+        router_before = len(said_lines())
+        sh("ip", "route", "replace", "default", "via", "10.77.0.3", "dev", "d0")
+        rerouted = time.time()
+        WANT = "IPv4 default route 10.77.0.1 \u2192 10.77.0.3"
+        heard = until(lambda: len(said_lines()) > router_before, 1.0, 0.02)
+        took = time.time() - rerouted
+        time.sleep(2)
+        said = said_lines()[router_before:]
+        claim("router", heard and len(said) == 1 and WANT in said[0],
+              f"D said {len(said)} change(s) for a next-hop move alone"
+              + (f", the first {took:.2f} s after it" if heard else " within 1 s")
+              + f": {said}")
     said_before = len(said_lines())
     # When D first says a change, watched from before the move, every 20 ms.
     first_said = []
