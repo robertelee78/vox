@@ -53,6 +53,11 @@ pub enum StreamKind {
     /// dispatched: a stream that opens with this kind after the exchange closes the connection
     /// (requirement 33).
     Identity = 11,
+    /// **May a newcomer take a place in the room?** (V030-30, #366): the member answering a join
+    /// asks every member it holds a connection to, and admits the joiner only once every one has
+    /// promised it a place, so a room never exceeds its member cap. See `node::seatstream`.
+    /// Members only.
+    Seat = 12,
 }
 
 /// The largest kind frame we will read: `[kind]` is 2 bytes; anything bigger is
@@ -75,6 +80,7 @@ impl StreamKind {
             9 => Some(Self::App),
             10 => Some(Self::Agree),
             11 => Some(Self::Identity),
+            12 => Some(Self::Seat),
             _ => None,
         }
     }

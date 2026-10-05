@@ -945,6 +945,13 @@ pub enum Fault {
     /// a room can, so it could not admit the joiner. **Not [`Fault::Refused`]**, which reads as a
     /// wrong passphrase, and never a success: this was told it had joined, and exited 0.
     RoomFull,
+    /// The room's last place went to another newcomer joining at the same moment: a member asked
+    /// had already promised it (V030-30, #366). Nobody was admitted on this joiner's account.
+    SeatTaken,
+    /// A member online did not agree to the newcomer within the bound, or does not yet count the
+    /// answering member a member (V030-30, #366): every member online must agree before the room
+    /// takes a newcomer. The reason names the member.
+    SeatNotAgreed,
     /// A member accepted the passphrase and then could not admit the joiner: it was locked or
     /// closing mid-join, or its store refused the write (V210-128). **Not [`Fault::Refused`]**,
     /// whose advice is "usually the passphrase is wrong": this one was accepted.
@@ -1120,6 +1127,12 @@ impl Fault {
             Fault::RoomFull => {
                 "the room is full, so you were not admitted\n       your passphrase was accepted; the room takes no more members"
             }
+            Fault::SeatTaken => {
+                "another newcomer took the room's last place at the same moment, so you were not admitted\n       your passphrase was accepted; try again"
+            }
+            Fault::SeatNotAgreed => {
+                "a member of the room did not agree to take you in, so you were not admitted\n       every member online must agree before the room takes a newcomer; the member is named below\n       your passphrase was accepted; try again"
+            }
             Fault::NotAdmittedAfterJoin => {
                 "a member accepted your passphrase, then could not admit you, so you were not admitted\n       the member may have been locking or closing; run the join again while it is running"
             }
@@ -1285,6 +1298,8 @@ fault_names!(
     SolveTooSlow,
     MembersBusy,
     RoomFull,
+    SeatTaken,
+    SeatNotAgreed,
     NotAdmittedAfterJoin,
     Refused,
     NotAdmitted,

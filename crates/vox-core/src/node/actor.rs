@@ -497,6 +497,10 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::ReopenFinished => "answering an unlock whose rooms are held again",
         NetEvent::LockSettled => "answering a lock that has settled",
         NetEvent::JoinAdmit { .. } => "admitting a joiner before accepting it",
+        NetEvent::SeatReserve { .. } => "holding a room's place for a joiner",
+        NetEvent::SeatRelease { .. } => "freeing a place a joiner did not take",
+        NetEvent::SeatAsk { .. } => "answering whether a member's newcomer may take a place",
+        NetEvent::SeatAbort { .. } => "freeing a place promised to a member's newcomer",
         NetEvent::AgreeAsk { .. } => "answering whether this node holds a member's claim",
         NetEvent::AgreeFetch { .. } => "pulling what members hold for a claim's agreement",
         NetEvent::HandshakesQueued { .. } => "saying how a burst of connection attempts went",
@@ -1172,6 +1176,46 @@ enum NetEvent {
         /// admitted the joiner.
         ack: tokio::sync::oneshot::Sender<crate::error::Result<()>>,
     },
+    /// **The member answering a join holds a place for the joiner** (V030-30, #366), if the room
+    /// has one: its authors and every place promised and not yet settled leave one. Answered with
+    /// the members to ask, each a member this node holds a connection to; the place is held under
+    /// this node's own name until [`NetEvent::SeatRelease`], the joiner's admission, or
+    /// `seatstream::PROMISE_TTL`.
+    SeatReserve {
+        /// The room being joined.
+        channel_id: Digest32,
+        /// The joiner's fingerprint.
+        joiner: Digest32,
+        /// The room's epoch and the members to ask, or why there is no place: `RoomFull` at the
+        /// cap, `SeatTaken` when the places left are all promised.
+        ack: tokio::sync::oneshot::Sender<crate::error::Result<SeatsToAsk>>,
+    },
+    /// The place [`NetEvent::SeatReserve`] held for `joiner` is not taken: a member did not agree,
+    /// or the admission failed.
+    SeatRelease {
+        /// The room.
+        channel_id: Digest32,
+        /// The joiner.
+        joiner: Digest32,
+    },
+    /// Another member asks whether its newcomer may take a place in a room (V030-30, #366).
+    SeatAsk {
+        /// The member asking.
+        peer: Digest32,
+        /// Its question.
+        ask: crate::node::seatstream::Ask,
+        /// The stream's send half.
+        send: quinn::SendStream,
+        /// The stream's receive half, read for an abort.
+        recv: quinn::RecvStream,
+    },
+    /// The member that asked frees the place promised to its newcomer.
+    SeatAbort {
+        /// The member that asked.
+        peer: Digest32,
+        /// The room and newcomer.
+        abort: crate::node::seatstream::Abort,
+    },
     /// Another member asks whether this node holds a post it made, and which posts of some
     /// `type`s this node holds (V210-168). The actor checks the room and the member at once; a
     /// task waits for the post and answers.
@@ -1612,6 +1656,25 @@ async fn serve_typed(
                         peer,
                         channel_id,
                         epoch,
+                        send,
+                        recv,
+                    })
+                    .await;
+            });
+        }
+        // Read off the actor too: a member that opens a stream and says nothing waits on itself.
+        Ok(Inbound::Seat { peer, send, recv }) => {
+            state.failures = 0;
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut recv = recv;
+                let Ok(ask) = crate::node::seatstream::read_ask(&mut recv).await else {
+                    return;
+                };
+                let _ = tx
+                    .send(NetEvent::SeatAsk {
+                        peer,
+                        ask,
                         send,
                         recv,
                     })
@@ -2274,6 +2337,119 @@ const JOIN_ADDRESS_POLL: Duration = Duration::from_millis(250);
 /// retry inside it normally succeeds. A failure after it, or after the joiner has synced cleanly
 /// once, is reported as before.
 const JOINER_SEAL_GRACE: Duration = Duration::from_secs(60);
+
+/// **The asker's round** (V030-30, #366): hold a place for `joiner` in `channel_id`, ask every
+/// member this node holds a connection to, all at once, and come back with the streams of those
+/// that promised a place, to commit or abort once the admission is known. Any member that does not
+/// agree ends the round: every promise made is aborted, this node's own place freed, and the
+/// joiner refused with the strongest reason heard (full, then a place lost to another newcomer,
+/// then a member that did not agree), which this node's log names member by member.
+async fn seat_round(
+    tx: &mpsc::Sender<NetEvent>,
+    channel_id: Digest32,
+    joiner: Digest32,
+) -> crate::error::Result<Vec<quinn::SendStream>> {
+    use crate::node::seatstream::{abort, ask, Abort, Answer, Ask, Asked};
+    let stopped = || Error::JoinRefused("the member stopped before it admitted the joiner");
+    let (ack, wait) = tokio::sync::oneshot::channel();
+    if tx
+        .send(NetEvent::SeatReserve {
+            channel_id,
+            joiner,
+            ack,
+        })
+        .await
+        .is_err()
+    {
+        return Err(stopped());
+    }
+    let (epoch, members) = wait.await.unwrap_or_else(|_| Err(stopped()))?;
+    let question = Ask {
+        channel_id,
+        epoch,
+        joiner,
+    };
+    let mut asking = tokio::task::JoinSet::new();
+    for (member, conn) in members {
+        asking.spawn(async move { (member, ask(&conn, question).await) });
+    }
+    let mut promised = Vec::new();
+    let (mut full, mut taken, mut unagreed): (Option<u64>, bool, Option<(Digest32, bool)>) =
+        (None, false, None);
+    let mut said = Vec::new();
+    while let Some(done) = asking.join_next().await {
+        let Ok((member, asked)) = done else { continue };
+        let who = crate::node::network::short_id(member);
+        match asked {
+            Asked::Answered(Answer::Yes, send) => promised.push(send),
+            Asked::Answered(Answer::Full { members }, _) => {
+                said.push(format!("{who}: full at {members}"));
+                full = Some(full.unwrap_or(0).max(members));
+            }
+            Asked::Answered(Answer::Taken, _) => {
+                said.push(format!(
+                    "{who}: its last place is promised to another newcomer"
+                ));
+                taken = true;
+            }
+            Asked::Answered(Answer::NotHeld, _) => {
+                said.push(format!(
+                    "{who}: does not count this node a member of the room yet"
+                ));
+                unagreed.get_or_insert((member, false));
+            }
+            Asked::Gone => {
+                // Offline: its process is not there. It blocks nothing, and learns of the
+                // newcomer from a board when it returns.
+                said.push(format!(
+                    "{who}: offline (nothing heard from it in {}s), not counted",
+                    crate::node::seatstream::SILENT_IS_GONE.as_secs()
+                ));
+            }
+            Asked::Unanswered => {
+                said.push(format!(
+                    "{who}: no answer within {}s",
+                    crate::node::seatstream::SEAT_ANSWER_WITHIN.as_secs()
+                ));
+                unagreed.get_or_insert((member, true));
+            }
+        }
+    }
+    let refusal = match (full, taken, unagreed) {
+        (Some(members), _, _) => Some(Error::RoomFull { members }),
+        (None, true, _) => Some(Error::SeatTaken),
+        (None, false, Some((member, unanswered))) => {
+            Some(Error::SeatNotAgreed { member, unanswered })
+        }
+        (None, false, None) => None,
+    };
+    let Some(refusal) = refusal else {
+        return Ok(promised);
+    };
+    eprintln!(
+        "vox: a newcomer to room {} was not admitted — not every member agreed: {}",
+        crate::node::network::short_id(channel_id),
+        said.join("; ")
+    );
+    for send in promised {
+        abort(send, Abort { channel_id, joiner }).await;
+    }
+    let _ = tx.send(NetEvent::SeatRelease { channel_id, joiner }).await;
+    Err(refusal)
+}
+
+/// The room's epoch, and the members to ask for a newcomer's place, each with its connection.
+type SeatsToAsk = (u64, Vec<(Digest32, Arc<VoxConnection>)>);
+
+/// A place promised in a room to a newcomer (V030-30, #366): by whom it was asked, this node or
+/// another member, and until when it counts.
+#[derive(Debug, Clone, Copy)]
+struct SeatPromise {
+    /// The member that asked; this node's own fingerprint for a place it holds itself.
+    from: Digest32,
+    /// When it stops counting, unless the newcomer is an author by then.
+    until: std::time::Instant,
+}
 
 /// How many members a join will try when the link pins no responder.
 ///
@@ -3239,6 +3415,9 @@ const fn worth_another_responder(fault: Fault) -> bool {
             | Fault::SolveTooSlow
             // Every member holds the same room: another would refuse it as full too.
             | Fault::RoomFull
+            // Another member counts the same places, and asks the same members (V030-30).
+            | Fault::SeatTaken
+            | Fault::SeatNotAgreed
             // Every member of an ended room says the same (V030-08).
             | Fault::JoinedRoomEnded
     )
@@ -3679,6 +3858,11 @@ pub struct Node {
     /// so the last handle goes with the lock and "locked" keeps meaning *now* instead of *once
     /// this joiner gets bored*.
     join_tasks: tokio::task::JoinSet<()>,
+    /// **Places promised in each room** (V030-30, #366), `(room, newcomer)` → who asked and until
+    /// when: this node's own, held while it asks the others, and those it promised a member that
+    /// asked. Each counts against the room's cap until the newcomer is an author here, an abort
+    /// frees it, or it expires (`seatstream::PROMISE_TTL`).
+    seat_promises: BTreeMap<(Digest32, Digest32), SeatPromise>,
     /// Held for reading by every blocking thread that holds a secret ([`secret_blocking`]), and
     /// taken for writing by [`Node::lock_all`], which so waits for each to finish and wipe what
     /// it was given: an abort cannot stop a blocking thread (V210-94).
@@ -4192,6 +4376,7 @@ impl Node {
             passphrase_entered_at: Arc::default(),
             keyring_change_proved: false,
             join_tasks: tokio::task::JoinSet::new(),
+            seat_promises: BTreeMap::new(),
             secret_work: Arc::new(tokio::sync::RwLock::new(())),
             joining: std::collections::BTreeSet::new(),
             joins_answered: BTreeMap::new(),
@@ -6217,6 +6402,39 @@ impl Node {
                 }
             }
             NetEvent::AgreeAsk { peer, ask, send } => self.answer_agree(peer, ask, send).await,
+            NetEvent::SeatReserve {
+                channel_id,
+                joiner,
+                ack,
+            } => {
+                let held = self.reserve_seat(channel_id, joiner).await;
+                let _ = ack.send(held);
+            }
+            NetEvent::SeatRelease { channel_id, joiner } => {
+                let me = self.profile.as_ref().map(Profile::fingerprint);
+                if self
+                    .seat_promises
+                    .get(&(channel_id, joiner))
+                    .is_some_and(|p| Some(p.from) == me)
+                {
+                    self.seat_promises.remove(&(channel_id, joiner));
+                }
+            }
+            NetEvent::SeatAsk {
+                peer,
+                ask,
+                send,
+                recv,
+            } => self.answer_seat(peer, ask, send, recv).await,
+            NetEvent::SeatAbort { peer, abort } => {
+                if self
+                    .seat_promises
+                    .get(&(abort.channel_id, abort.joiner))
+                    .is_some_and(|p| p.from == peer)
+                {
+                    self.seat_promises.remove(&(abort.channel_id, abort.joiner));
+                }
+            }
             NetEvent::AgreeFetch { channel_id, peers } => {
                 self.sync_with(&channel_id, &peers).await;
             }
@@ -7213,6 +7431,10 @@ impl Node {
                         // Unreachable: the stream loop reads these and sends
                         // `NetEvent::AgreeAsk` once the question is in hand.
                     }
+                    Inbound::Seat { .. } => {
+                        // Unreachable: the stream loop reads these and sends
+                        // `NetEvent::SeatAsk` once the question is in hand.
+                    }
                     Inbound::Punch {
                         peer,
                         coordinator,
@@ -7488,8 +7710,13 @@ impl Node {
                     |identity| async move {
                         #[cfg(feature = "test-knobs")]
                         test_admission_gate().await;
+                        // **Every online member agrees first** (V030-30, #366): the place is held
+                        // here and promised by each member this node holds a connection to, or the
+                        // joiner is refused, saying why, before anything is admitted.
+                        let joiner = identity.fingerprint();
+                        let promised = seat_round(&admit_tx, channel_id, joiner).await?;
                         let (ack, wait) = tokio::sync::oneshot::channel();
-                        if admit_tx
+                        let admitted = if admit_tx
                             .send(NetEvent::JoinAdmit {
                                 channel_id,
                                 identity: Box::new(identity),
@@ -7507,7 +7734,23 @@ impl Node {
                             Err(Error::JoinRefused(
                                 "the member stopped before it admitted the joiner",
                             ))
+                        };
+                        let abort = crate::node::seatstream::Abort { channel_id, joiner };
+                        if admitted.is_ok() {
+                            // Committed: each promise stands until the newcomer reaches that
+                            // member from a board.
+                            promised
+                                .into_iter()
+                                .for_each(crate::node::seatstream::commit);
+                        } else {
+                            for send in promised {
+                                crate::node::seatstream::abort(send, abort).await;
+                            }
+                            let _ = admit_tx
+                                .send(NetEvent::SeatRelease { channel_id, joiner })
+                                .await;
                         }
+                        admitted
                     },
                 )
                 .await
@@ -10438,6 +10681,131 @@ impl Node {
     /// **A member's answer to another member's [`crate::node::agreestream::Ask`]** (V210-168):
     /// the room and the asker are checked here, at once; if the asked post has not reached this
     /// node, a sync with the asker is raised to pull it; a task waits for it and answers.
+    /// **Whether `channel_id` has a place for `joiner`** (V030-30, #366), counted the one way every
+    /// member counts it: its authors, and every place promised and not yet settled, other than
+    /// `joiner`'s own. `RoomFull` at the cap, `SeatTaken` when promises fill what is left. Expired
+    /// promises go first.
+    fn seat_count(
+        &mut self,
+        c: &ChannelState,
+        channel_id: &Digest32,
+        joiner: &Digest32,
+    ) -> crate::error::Result<()> {
+        let now = std::time::Instant::now();
+        self.seat_promises.retain(|_, p| p.until > now);
+        let authors = c.author_count();
+        let cap = crate::node::channel::max_authors();
+        if authors >= cap {
+            return Err(Error::RoomFull {
+                members: authors as u64,
+            });
+        }
+        let promised = self
+            .seat_promises
+            .keys()
+            .filter(|(room, j)| room == channel_id && j != joiner && !c.is_author(j))
+            .count();
+        if authors + promised >= cap {
+            return Err(Error::SeatTaken);
+        }
+        Ok(())
+    }
+
+    /// **The asker's first step** (V030-30, #366): hold a place for `joiner` under this node's own
+    /// name, and say which members to ask: every other member of the room this node holds a
+    /// connection to. A joiner already an author needs no place and no one asked.
+    async fn reserve_seat(
+        &mut self,
+        channel_id: Digest32,
+        joiner: Digest32,
+    ) -> crate::error::Result<SeatsToAsk> {
+        let Some(me) = self.profile.as_ref().map(Profile::fingerprint) else {
+            return Err(Error::Profile("locked"));
+        };
+        let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) else {
+            return Err(Error::Profile("no such room on this node"));
+        };
+        let c = shared.lock().await;
+        if c.is_author(&joiner) {
+            return Ok((c.epoch(), Vec::new()));
+        }
+        self.seat_count(&c, &channel_id, &joiner)?;
+        self.seat_promises.insert(
+            (channel_id, joiner),
+            SeatPromise {
+                from: me,
+                until: std::time::Instant::now() + crate::node::seatstream::PROMISE_TTL,
+            },
+        );
+        // Online is a connection held: a member not connected is not asked and blocks nothing; it
+        // learns of the newcomer from a board when it returns. Anchors are not members, so never
+        // asked.
+        let members = match self.net.as_ref() {
+            Some(net) => c
+                .members()
+                .into_iter()
+                .filter(|m| *m != me && *m != joiner)
+                .filter_map(|m| net.manager().existing(&m).map(|conn| (m, conn)))
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok((c.epoch(), members))
+    }
+
+    /// **A member's answer to another's newcomer** (V030-30, #366): a place promised, or why not.
+    /// A promised place waits, off the actor, for the asker's abort, which frees it.
+    async fn answer_seat(
+        &mut self,
+        peer: Digest32,
+        ask: crate::node::seatstream::Ask,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) {
+        use crate::node::seatstream::{answer_and_wait, Answer};
+        let answer = match self.channels.get(&ask.channel_id).map(Arc::clone) {
+            Some(shared) => {
+                let c = shared.lock().await;
+                if c.epoch() != ask.epoch || !c.is_member(&peer) {
+                    Answer::NotHeld
+                } else if c.is_author(&ask.joiner) {
+                    Answer::Yes
+                } else {
+                    match self.seat_count(&c, &ask.channel_id, &ask.joiner) {
+                        Ok(()) => {
+                            self.seat_promises.insert(
+                                (ask.channel_id, ask.joiner),
+                                SeatPromise {
+                                    from: peer,
+                                    until: std::time::Instant::now()
+                                        + crate::node::seatstream::PROMISE_TTL,
+                                },
+                            );
+                            Answer::Yes
+                        }
+                        Err(Error::RoomFull { members }) => Answer::Full { members },
+                        Err(_) => Answer::Taken,
+                    }
+                }
+            }
+            None => Answer::NotHeld,
+        };
+        // **Test-only** (`test-knobs`): a member online that never answers, its stream held open.
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(crate::node::seatstream::TEST_SEAT_SILENT_ENV).is_some() {
+            tokio::spawn(async move {
+                let _held = (send, recv);
+                tokio::time::sleep(crate::node::seatstream::PROMISE_TTL).await;
+            });
+            return;
+        }
+        let tx = self.net_tx.clone();
+        tokio::spawn(async move {
+            if let Some(abort) = answer_and_wait(send, recv, answer, ask).await {
+                let _ = tx.send(NetEvent::SeatAbort { peer, abort }).await;
+            }
+        });
+    }
+
     async fn answer_agree(
         &mut self,
         peer: Digest32,
@@ -14729,6 +15097,8 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::JoinSolveTooSlow { .. } => Fault::SolveTooSlow,
         Error::JoinResponderBusy | Error::JoinEndedForNewcomer => Fault::MembersBusy,
         Error::RoomFull { .. } => Fault::RoomFull,
+        Error::SeatTaken => Fault::SeatTaken,
+        Error::SeatNotAgreed { .. } => Fault::SeatNotAgreed,
         Error::JoinNotAdmitted => Fault::NotAdmittedAfterJoin,
         Error::JoinRoomEnded => Fault::JoinedRoomEnded,
         Error::JoinResponderLeft => Fault::ResponderLeft,

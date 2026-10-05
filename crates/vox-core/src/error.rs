@@ -413,6 +413,25 @@ pub enum Error {
         members: u64,
     },
 
+    /// **The room's last place went to another newcomer** (V030-30, #366): a member asked whether
+    /// this joiner may take a place had already promised the last one to another newcomer joining
+    /// at the same moment. Nobody was admitted on this joiner's account; it may try again.
+    #[error("another newcomer took the room's last place at the same moment")]
+    SeatTaken,
+
+    /// **A member online did not agree to the newcomer** (V030-30, #366): every member the
+    /// answering member holds a connection to must promise the joiner a place before it is
+    /// admitted, and `member` did not answer within `seatstream::SEAT_ANSWER_WITHIN`
+    /// (`unanswered`), or does not yet count the answering member a member of the room. The text
+    /// names `member` by its whole fingerprint, so a client can say it by its own name for it.
+    #[error("{}", seat_not_agreed(.member, *.unanswered))]
+    SeatNotAgreed {
+        /// The member that did not agree.
+        member: crate::hash::Digest32,
+        /// It gave no answer in time, rather than an answer of its own.
+        unanswered: bool,
+    },
+
     /// The member answering a join accepted the passphrase, and then could not admit the joiner:
     /// it was locked or closing mid-join, its store would not take the write, or it already holds
     /// another key under the joiner's fingerprint (V210-128). Not [`Error::JoinRefused`], which a
@@ -673,5 +692,20 @@ impl BindCause {
             Self::NotHere => "it is not an address of this machine — ",
             Self::Other => "",
         }
+    }
+}
+
+/// [`Error::SeatNotAgreed`]'s words.
+fn seat_not_agreed(member: &crate::hash::Digest32, unanswered: bool) -> String {
+    let who = crate::node::link::b32_encode(member);
+    if unanswered {
+        format!(
+            "member {who} did not answer within {}s, and every member online must agree before the room takes a newcomer",
+            crate::node::seatstream::SEAT_ANSWER_WITHIN.as_secs()
+        )
+    } else {
+        format!(
+            "member {who} does not yet count the member that answered the join a member of the room, and every member online must agree before the room takes a newcomer"
+        )
     }
 }

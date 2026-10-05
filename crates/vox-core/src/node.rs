@@ -58,6 +58,7 @@ pub mod presence;
 pub mod profile;
 pub mod resolver;
 pub mod retention;
+pub mod seatstream;
 pub mod snapshot;
 pub mod status;
 pub mod store;

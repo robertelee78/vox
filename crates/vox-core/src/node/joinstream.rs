@@ -100,6 +100,8 @@ const OP_ACCEPTED: u64 = 6;
 const OP_OPEN: u64 = 8;
 const OP_REJECTED: u64 = 7;
 const OP_FULL: u64 = 9;
+const OP_TAKEN: u64 = 10;
+const OP_NOT_AGREED: u64 = 11;
 
 /// Why a responder refused a join (see the module docs: deliberately coarse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +232,18 @@ pub enum JoinFrame {
         /// How many members the refusing member holds for the room.
         members: u64,
     },
+    /// The join was refused because the room's last place went to another newcomer joining at
+    /// the same moment (V030-30, #366). Sent where `Accepted` would have been.
+    Taken,
+    /// The join was refused because a member online did not agree to the newcomer (V030-30,
+    /// #366): it gave no answer in time (`unanswered`), or does not count the responder a member.
+    /// Sent where `Accepted` would have been, naming the member.
+    NotAgreed {
+        /// The member that did not agree.
+        member: Digest32,
+        /// It gave no answer in time.
+        unanswered: bool,
+    },
     /// **Step 8, joiner → responder:** one ratchet message with an empty plaintext,
     /// whose only job is to open the responder's sending direction (M17.6).
     ///
@@ -314,6 +328,15 @@ impl JoinFrame {
             Self::Full { members } => {
                 e.array(2).uint(OP_FULL).uint(*members);
             }
+            Self::Taken => {
+                e.array(1).uint(OP_TAKEN);
+            }
+            Self::NotAgreed { member, unanswered } => {
+                e.array(3)
+                    .uint(OP_NOT_AGREED)
+                    .bytes(member)
+                    .uint(u64::from(*unanswered));
+            }
         }
         e.finish()
     }
@@ -378,6 +401,11 @@ impl JoinFrame {
                 Self::Rejected(JoinReject::from_u8(v).ok_or(Error::MalformedJoin("reject reason"))?)
             }
             (OP_FULL, 2) => Self::Full { members: d.uint()? },
+            (OP_TAKEN, 1) => Self::Taken,
+            (OP_NOT_AGREED, 3) => Self::NotAgreed {
+                member: *take_fixed::<32>(&mut d, "not-agreed member")?,
+                unanswered: d.uint()? != 0,
+            },
             _ => return Err(Error::MalformedJoin("join frame op")),
         };
         d.finish()?;
@@ -772,6 +800,10 @@ pub async fn run_initiator(
         JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
         JoinFrame::Rejected(r) => return Err(rejected(r)),
         JoinFrame::Full { members } => return Err(Error::RoomFull { members }),
+        JoinFrame::Taken => return Err(Error::SeatTaken),
+        JoinFrame::NotAgreed { member, unanswered } => {
+            return Err(Error::SeatNotAgreed { member, unanswered })
+        }
         _ => return Err(Error::MalformedJoin("expected accepted")),
     };
     // Checked here, against the identity the handshake pinned, so a responder cannot
@@ -914,6 +946,10 @@ where
             if let Err(e) = admit_before_accepting(outcome.peer.identity.clone()).await {
                 let refusal = match e {
                     Error::RoomFull { members } => JoinFrame::Full { members },
+                    Error::SeatTaken => JoinFrame::Taken,
+                    Error::SeatNotAgreed { member, unanswered } => {
+                        JoinFrame::NotAgreed { member, unanswered }
+                    }
                     // The passphrase was accepted: never the refusal that reads as a wrong one.
                     _ => JoinFrame::Rejected(JoinReject::NotAdmitted),
                 };

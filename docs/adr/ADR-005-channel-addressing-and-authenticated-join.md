@@ -85,8 +85,9 @@ readable: who reads whom is decided by trust (ADR-007).
   mismatch or a policy refusal. `PowInvalid` and `Malformed` MAY stay distinguishable (they are
   structural).
 - **J-18.** The exchange MUST be ordered frames on a bi-stream typed `join` (ADR-016 M14.4):
-  CHALLENGE → SOLVE → SHARE → PROOF → PROOF → INIT, then ACCEPTED, REJECTED, or FULL for a room at its
-  member cap (ADR-007 G-22).
+  CHALLENGE → SOLVE → SHARE → PROOF → PROOF → INIT, then ACCEPTED, REJECTED, or, for a joiner the room
+  cannot take (ADR-007 G-22), FULL at its member cap, TAKEN when its last place went to another newcomer,
+  or NOT_AGREED naming a member online that did not agree.
 - **J-19. (M14.7c)** A node MUST hold a room's passphrase live while the room is open, because a CPace
   responder needs it at handshake time and nothing derived from it can stand in. It MUST be held in a
   zeroizing buffer and wiped from memory on lock and on close (under ADR-026, on detach and on close). A daemon's set of open rooms keeps it
