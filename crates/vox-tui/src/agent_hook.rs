@@ -42,6 +42,7 @@
 
 use std::io::Read as _;
 
+use vox_agentcomms::attention::CHATTER;
 use vox_core::hash::Digest32;
 use vox_core::node::ipc::{Frame, IpcClient};
 use vox_core::node::link::{b32_decode, b32_encode};
@@ -609,28 +610,6 @@ fn render_attributed(out: &mut String, entry: &Digest32, author: &str, to: &str,
     }
     out.push('\n');
 }
-
-/// The envelope types that are agents coordinating rather than talking (V030-18): presence,
-/// progress and the claim protocol. A request or a question (`assign`, `ask`, `answer`,
-/// `not-understood`) is conversation and is never counted away.
-const CHATTER: &[&str] = &[
-    vox_agentcomms::envelope::HELLO,
-    vox_agentcomms::envelope::BYE,
-    vox_agentcomms::envelope::work::STATUS,
-    vox_agentcomms::envelope::work::WORKING,
-    vox_agentcomms::envelope::work::BLOCKED,
-    vox_agentcomms::envelope::work::RESULT,
-    vox_agentcomms::envelope::work::FAILED,
-    vox_agentcomms::envelope::work::ACCEPT,
-    vox_agentcomms::envelope::work::DECLINE,
-    vox_agentcomms::envelope::work::ACK,
-    vox_agentcomms::claim::CLAIM,
-    vox_agentcomms::claim::RELEASE,
-    vox_agentcomms::claim::HANDOFF,
-    vox_agentcomms::claim::RENEW,
-    "ping",
-    "pong",
-];
 
 /// Bytes kept back from a room's share for its one line counting chatter (V030-18): every
 /// [`CHATTER`] kind with a two-digit count, and the room's label, fit in it.
