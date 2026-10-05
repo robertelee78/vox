@@ -28,7 +28,7 @@ pub enum PromptKind {
     CreateChannel,
     /// Open a closed channel: `[passphrase]` for `Prompt::target`.
     OpenChannel,
-    /// Join from a `vox://` invite link: `[link, name, passphrase]`.
+    /// Join from a `vox://` room link: `[link, name, passphrase]`.
     ///
     /// The link is shown as it is typed because it carries no secret (ADR-016); the
     /// channel passphrase that follows is masked, because it travels out of band and
@@ -703,7 +703,7 @@ pub enum Parsed {
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
-/// - `send <text…>`, `invite`.
+/// - `send <text…>`, `link`.
 ///
 /// **Create / join / attach / init are not one-line palette commands.** They require
 /// a passphrase, which ADR-015 mandates be entered through a **masked** prompt and
@@ -766,7 +766,7 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
             channel_id: channel,
         },
         // The link is public; it can be produced by a one-line command.
-        "invite" => Command::Invite {
+        "link" => Command::Invite {
             channel_id: channel,
         },
         _ => return None,

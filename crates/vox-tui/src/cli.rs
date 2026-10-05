@@ -442,12 +442,12 @@ enum RoomCmd {
     /// (the `retention` file in its config directory); the shorter wins. This is look and
     /// feel, not a security property: a modified node can keep everything.
     Retention(RetentionArgs),
-    /// Print a room's address, for someone else to `vox room join` with.
+    /// Print a room's link, for someone else to `vox room join` with.
     ///
-    /// The address is rendezvous information, not a credential — no passphrase,
+    /// The link is rendezvous information, not a credential — no passphrase,
     /// and joining with it grants nothing. Goes to stdout so it pipes; the
     /// warnings go to stderr so they do not.
-    Invite(RoomRefArgs),
+    Link(RoomRefArgs),
     /// Leave a room: the other members are told, then the room is deleted from this node.
     ///
     /// Waits up to 30 s for another member to take the news. If none can be told by then, it
@@ -1966,7 +1966,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Get(a) => &a.profile,
                 RoomCmd::Join(a) => &a.profile,
                 RoomCmd::Create(a) => &a.profile,
-                RoomCmd::Invite(a) => &a.profile,
+                RoomCmd::Link(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
                 RoomCmd::Leave(a) | RoomCmd::End(a) => &a.profile,
                 RoomCmd::Admin(a) => &a.profile,
@@ -2114,7 +2114,7 @@ pub fn run() -> ExitCode {
                             )
                             .await
                         }
-                        RoomCmd::Invite(a) => crate::room_cli::invite(&paths, &a.room).await,
+                        RoomCmd::Link(a) => crate::room_cli::link(&paths, &a.room).await,
                         RoomCmd::Leave(a) => crate::room_cli::leave(&paths, &a.room).await,
                         RoomCmd::End(a) => crate::room_cli::end(&paths, &a.room).await,
                         RoomCmd::Admin(a) => {

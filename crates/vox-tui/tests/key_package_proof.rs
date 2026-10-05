@@ -331,7 +331,7 @@ fn set_up(k: &mut Cast, before: &str) -> Daemon {
         .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
         .expect("CANNOT MEASURE (staging): a room id")
         .to_owned();
-    k.link = ok(&k.c, &["room", "invite", &k.room], "")
+    k.link = ok(&k.c, &["room", "link", &k.room], "")
         .lines()
         .find(|l| l.starts_with("vox://"))
         .expect("CANNOT MEASURE (staging): an address")
@@ -625,7 +625,7 @@ fn a_key_through_the_log_releases_what_a_direct_one_does() {
         .find(|w| w.len() >= 12 && w.chars().all(|ch| ch.is_ascii_alphanumeric()))
         .expect("CANNOT MEASURE (staging): a room id")
         .to_owned();
-    k.link = ok(&k.c, &["room", "invite", &k.room], "")
+    k.link = ok(&k.c, &["room", "link", &k.room], "")
         .lines()
         .find(|l| l.starts_with("vox://"))
         .expect("CANNOT MEASURE (staging): an address")

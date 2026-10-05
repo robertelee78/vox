@@ -134,7 +134,7 @@ async fn invite_and_join(h: &NodeHandle, channel_id: Digest32, joiner: &NodeHand
     let url = event(
         &mut events,
         Duration::from_secs(30),
-        "invite link",
+        "room link",
         |e| match e {
             NodeEvent::InviteLink { url, .. } => Some(url.clone()),
             _ => None,

@@ -2,7 +2,7 @@
 //! binary.
 //!
 //! A room's channelID is public: it is the `<room>` part of every `.vox` address shared in it,
-//! and it is in every invite link. A stranger with any valid Vox identity and that id can climb from `Unknown` to `PendingJoiner` by itself:
+//! and it is in every room link. A stranger with any valid Vox identity and that id can climb from `Unknown` to `PendingJoiner` by itself:
 //!
 //! 1. connect — any authenticated Vox identity is admitted;
 //! 2. open `Rendezvous`, which `Unknown` may;

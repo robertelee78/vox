@@ -274,8 +274,8 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
     {
         let _load = Load::start();
         for (name, d, _) in &procs {
-            let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-            assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+            let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "link", &room]));
+            assert!(ok, "PRODUCT (staging): vox room link: {err}");
             let (ok, out, err) = vox_in(
                 d,
                 &[

@@ -321,7 +321,7 @@ impl VoxNode {
         self.on_node(async move {
             let mut events = node.subscribe();
             outcome(
-                "inviting",
+                "making the room link",
                 node.apply(NodeCommand::Invite { channel_id }).await,
             )?;
             loop {

@@ -294,8 +294,8 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("PRODUCT (staging): the new room is not listed: {list}"))
         .to_owned();
-    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
+    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "link", &room]));
+    assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
     for (name, d) in &members[1..] {
         let (ok, out, err) = vox_in(
             d,
@@ -312,18 +312,18 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
         );
         assert!(ok, "PRODUCT (staging): {name}'s join failed: {out}{err}");
     }
-    // The room's full id, as `vox status --json` names it: the invite link carries it.
+    // The room's full id, as `vox status --json` names it: the room link carries it.
     let room_id = link
         .trim()
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
         .unwrap_or_else(|| {
-            panic!("APPARATUS: the proof cannot read the room id in the invite link {link}")
+            panic!("APPARATUS: the proof cannot read the room id in the room link {link}")
         })
         .to_owned();
     assert!(
         room_id.starts_with(&room),
-        "PRODUCT: the invite link names another room: {room_id} for {room}"
+        "PRODUCT: the room link names another room: {room_id} for {room}"
     );
 
     // ---- 1. everyone reads everyone's hello ----------------------------------------------------

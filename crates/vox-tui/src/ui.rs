@@ -467,7 +467,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " ↑/↓ select · Enter open · t tunnels · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
         }
         Screen::Channel => {
-            " Tab switch pane · Enter send · PgUp/PgDn scroll · :invite · : command · Esc back"
+            " Tab switch pane · Enter send · PgUp/PgDn scroll · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
     }

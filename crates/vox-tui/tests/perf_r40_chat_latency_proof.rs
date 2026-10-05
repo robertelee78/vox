@@ -251,7 +251,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("PRODUCT: a room id in `room list`")
         .to_owned();
-    let (ok, link, err) = vox(&alice_dir, &["room", "invite", &room], None);
+    let (ok, link, err) = vox(&alice_dir, &["room", "link", &room], None);
     assert!(ok, "PRODUCT (staging): invite: {err}");
     let (ok, _, err) = vox(
         &bob_dir,

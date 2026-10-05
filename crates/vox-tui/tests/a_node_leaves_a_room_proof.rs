@@ -105,8 +105,8 @@ fn a_node_leaves_a_room_and_the_others_see_it_gone() {
 
     // ---- 4. joining again works --------------------------------------------------------------
     let link = alice
-        .vox(None, &["room", "invite", &id])
-        .expect_ok("alice's `vox room invite`")
+        .vox(None, &["room", "link", &id])
+        .expect_ok("alice's `vox room link`")
         .stdout
         .trim()
         .to_owned();

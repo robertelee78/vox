@@ -336,8 +336,8 @@ fn taken_first_key_after(halt: Halt) {
         .next()
         .expect("PRODUCT (staging): the new room in `vox room list`")
         .to_owned();
-    let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "link", &prefix]));
+    assert!(ok, "PRODUCT (staging): room link: {err}");
     let link = link.trim().to_owned();
     let (joined, out, err) = vox_in(
         &mallory_dir,

@@ -394,8 +394,8 @@ fn a_disappearing_room_sheds_expired_signatures_reopens_and_a_newcomer_syncs_it(
     );
     let bob_d = daemon(bob, "bob", "127.0.0.1:0", &format!("{IDENTITY}\n"), None);
     attached(bob, "bob");
-    let (ok, link, err) = vox(alice, &["room", "invite", &room], None);
-    assert!(ok, "vox room invite: {err}");
+    let (ok, link, err) = vox(alice, &["room", "link", &room], None);
+    assert!(ok, "vox room link: {err}");
     let (ok, _, err) = vox(
         bob,
         &[

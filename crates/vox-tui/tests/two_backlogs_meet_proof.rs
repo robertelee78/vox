@@ -230,8 +230,8 @@ fn two_backlogs_that_meet_both_cross() {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("PRODUCT: room not listed: {list}"))
         .to_owned();
-    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "link", &room]));
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     for (name, d) in [("bob", &bob_dir), ("carol", &carol_dir)] {
         let (ok, out, err) = vox_in(
             d,

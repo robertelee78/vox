@@ -606,12 +606,8 @@ pub async fn room(tmp: &std::path::Path, names: &[&str]) -> Room {
         .next()
         .unwrap_or_else(|| panic!("PRODUCT: `vox room list` does not list the new room: {list:?}"))
         .to_owned();
-    let invite = first.vox(None, &["room", "invite", &id]);
-    let link = invite
-        .expect_ok("`vox room invite`")
-        .stdout
-        .trim()
-        .to_owned();
+    let invite = first.vox(None, &["room", "link", &id]);
+    let link = invite.expect_ok("`vox room link`").stdout.trim().to_owned();
     let host_err = tmp.join(format!("{}.daemon.err", workers[0].name));
     for w in &workers[1..] {
         // Asked once. A join turned away — even while the host is busy admitting another

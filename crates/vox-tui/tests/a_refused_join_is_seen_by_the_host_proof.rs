@@ -144,7 +144,7 @@ impl Person {
         assert!(ok, "PRODUCT (staging): `vox node attach`: {said}");
     }
 
-    /// A room, and an invite link to it.
+    /// A room, and an room link to it.
     fn room(&self) -> String {
         let rp = file(&self.dir, "room.pass", ROOM_PASS);
         let (ok, said) = run(
@@ -158,8 +158,8 @@ impl Person {
             .next()
             .unwrap_or_default()
             .to_owned();
-        let (ok, link) = run(&self.dir, &["room", "invite", &id]);
-        assert!(ok, "PRODUCT (staging): `vox room invite`: {link}");
+        let (ok, link) = run(&self.dir, &["room", "link", &id]);
+        assert!(ok, "PRODUCT (staging): `vox room link`: {link}");
         link.lines()
             .find(|l| l.starts_with("vox://"))
             .unwrap_or_else(|| panic!("PRODUCT (staging): no link in {link:?}"))

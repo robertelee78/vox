@@ -6,7 +6,7 @@
 //! `vox daemon`, which creates the room; then the members, each its own identity (`vox id`), its
 //! own `vox daemon` behind the anchor, which stays up for the whole proof. A few at a time, as
 //! production Argon2id and each join's proof of work allow, each member trusts the host, joins
-//! from the host's invite link **once** (a refused join is the product's red, never retried), and
+//! from the host's room link **once** (a refused join is the product's red, never retried), and
 //! the host trusts it, so the host's posts are sealed for every member (authors decide readers).
 //!
 //! **Asserted**, each timed and printed:

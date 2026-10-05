@@ -522,10 +522,7 @@ fn a_detach_keeps_the_other_nodes_tunnel_and_sync() {
         .expect("PRODUCT (staging): b's room list does not show bx")
         .to_owned();
     let b_link = d
-        .ok(
-            "PRODUCT (staging):",
-            &["--node", "b", "room", "invite", &bx],
-        )
+        .ok("PRODUCT (staging):", &["--node", "b", "room", "link", &bx])
         .lines()
         .next()
         .unwrap_or_default()

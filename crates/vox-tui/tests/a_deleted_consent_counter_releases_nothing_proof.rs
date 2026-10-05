@@ -398,8 +398,8 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     // ---- bob joins C and reads ------------------------------------------------------------------
     let _bob_daemon = daemon(&bob, "bob", &format!("{IDENTITY}\n"));
     attached(&bob, "bob");
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
     let (ok, _, err) = vox(
         &bob,
         &[

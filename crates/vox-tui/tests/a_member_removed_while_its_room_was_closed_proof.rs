@@ -233,8 +233,8 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
         .next()
         .expect("PRODUCT (staging): `vox room list` names no room after `vox room create`")
         .to_owned();
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
     for (d, who) in [(&bob, "bob"), (&carol, "carol")] {
         let (ok, _, err) = vox(
             d,

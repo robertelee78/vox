@@ -278,8 +278,8 @@ fn a_member_whose_connection_died_is_synced_again() {
             panic!("PRODUCT (staging): carol's `vox room list` names no room r: {list}")
         })
         .to_owned();
-    let (ok, link, err) = vox_once(&carol_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
+    let (ok, link, err) = vox_once(&carol_dir, &args(&["room", "link", &room]));
+    assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
         &[

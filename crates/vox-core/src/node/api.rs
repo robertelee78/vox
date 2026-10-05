@@ -1193,7 +1193,7 @@ impl Fault {
                 "that member is not an admin of the room\n       `vox room admin list` shows who is"
             }
             Fault::RoomFromBeforeV030 => {
-                "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
+                "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and give its members its room link (`vox room link`)"
             }
             Fault::NotOffered => {
                 "that service is not offered in this room\n       check its name: it is the tag that was given to `vox service add`"

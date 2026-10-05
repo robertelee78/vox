@@ -458,7 +458,7 @@ fn a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts() {
         .next()
         .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` shows no room: {list:?}"))
         .to_owned();
-    let link = staged(&data, &cfg, PERSON, &["room", "invite", &room], None)
+    let link = staged(&data, &cfg, PERSON, &["room", "link", &room], None)
         .trim()
         .to_owned();
     for (agent, agent_fp) in [(TRUSTED, &t_fp), (UNTRUSTED, &u_fp)] {

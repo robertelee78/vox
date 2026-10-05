@@ -419,15 +419,15 @@ fn two_fetches_at_once_share_one_dial() {
     let Some(label) = list.split_whitespace().next().map(str::to_owned) else {
         panic!("PRODUCT (staging): `vox room list` names no room: {list}{err}");
     };
-    let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
+    let (ok, link, err) = alice.vox(&["room", "link", &label]);
+    assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
     let link = link.trim().to_owned();
     let Some(room) = link
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
         .map(str::to_owned)
     else {
-        panic!("PRODUCT (staging): `vox room invite` printed no `vox://` link: {link}");
+        panic!("PRODUCT (staging): `vox room link` printed no `vox://` link: {link}");
     };
     // One join, no retry: a join that fails is a defect in joining, which is not what this proves,
     // and retrying would hide it.

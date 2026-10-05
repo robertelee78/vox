@@ -301,7 +301,7 @@ function wakeChannel(client, relayed) {
     log("wake: listening at " + path)
     return { path, token }
   } catch (e) {
-    log("wake: could not open the wake channel: " + e)
+    log("wake: could not open the wake socket: " + e)
     return null
   }
 }
