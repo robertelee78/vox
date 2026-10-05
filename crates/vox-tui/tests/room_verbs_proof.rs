@@ -21,8 +21,16 @@
 //! - **posting from stdin works**, which is how an agent sends a JSON envelope
 //!   without fighting shell quoting;
 //! - `room roster` names the member;
+//! - **`room post` refuses every raw claim-protocol message** (`claim`, `release`, `handoff`,
+//!   `renew`, and a `decline` naming a resource), says which verb to use, and neither the room nor
+//!   its work board holds any of them afterwards; **prose that only sounds like a claim** ("I'll
+//!   take the deploy") is posted and claims nothing; a `decline` with no resource, which refuses an
+//!   `assign` in conversation, is posted, not refused (ADR-021 §4);
 //! - the failures an operator will actually hit say something useful: no node
 //!   running, an unknown room, a malformed cursor.
+//!
+//! **Mutation** (RP-01): drop the raw-claim refusal from `post_cmd` and it goes red on the raw
+//! `claim`: it is posted.
 //!
 //! Production Argon2id once at setup; `#[ignore]`d in the debug suite.
 //!
@@ -225,6 +233,69 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(envelope));
     assert!(ok, "PRODUCT: room post from stdin failed: {err}");
 
+    // ---- every raw claim-protocol operation is refused (RP-01): it would lack the session, op
+    // id and version stamp that make it valid, and `vox room <kind>` sets them. All five kinds, a
+    // `decline` counting only when it names a resource ----
+    let raw_ops: Vec<(&str, String)> = ["claim", "release", "handoff", "renew", "decline"]
+        .iter()
+        .map(|kind| {
+            (
+                *kind,
+                format!(
+                    r#"{{"v":1,"type":"{kind}","from":"s","data":{{"resource":"deploy","op":"op-12345678"}}}}"#
+                ),
+            )
+        })
+        .collect();
+    for (kind, raw) in &raw_ops {
+        let (ok, out, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(raw));
+        assert!(
+            !ok,
+            "PRODUCT: `vox room post` accepted a raw `{kind}` operation; it must refuse it. It \
+             said: {out}{err}"
+        );
+        assert!(
+            err.contains(&format!("refusing a raw `{kind}`"))
+                && err.contains(&format!("vox room {kind}")),
+            "PRODUCT: the refusal must say it refused a raw `{kind}` and name `vox room {kind}`; \
+             it said: {err:?}"
+        );
+    }
+    // ---- prose that sounds like a claim is a message, and claims nothing ----
+    let (ok, _, err) = vox(
+        &data,
+        &cfg,
+        &["room", "post", &room_prefix, "I'll take the deploy"],
+        None,
+    );
+    assert!(ok, "PRODUCT: a prose post was refused: {err}");
+    // ---- a decline with no resource refuses an `assign` in conversation: not a claim
+    // operation, so it is posted ----
+    let decline = r#"{"v":1,"type":"decline","body":"not me"}"#;
+    let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(decline));
+    assert!(
+        ok,
+        "PRODUCT: a decline with no resource is conversation, not a claim operation, and must \
+         be posted; it said: {err:?}"
+    );
+    let (ok, board, err) = vox(
+        &data,
+        &cfg,
+        &["room", "board", &room_prefix, "--json"],
+        None,
+    );
+    assert!(ok, "PRODUCT: room board failed: {err}");
+    let board: serde_json::Value = serde_json::from_str(&board)
+        .unwrap_or_else(|e| panic!("PRODUCT: room board --json is not JSON ({e}): {board}"));
+    println!(
+        "[proof] the work board after the refused raw operations and a prose 'claim': {board}"
+    );
+    assert_eq!(
+        board["resources"].as_array().map(Vec::len),
+        Some(0),
+        "PRODUCT: nothing was claimed, yet the board shows a resource: {board}"
+    );
+
     // ---- the posts are in the node, not only in the exit code: a separate `vox` process reads
     // them back from the daemon ----
     let (ok, stored, err) = vox(&data, &cfg, &["room", "read", &room_prefix], None);
@@ -242,6 +313,34 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
                 .is_ok_and(|row| row["text"].as_str() == Some(envelope))
         }),
         "PRODUCT: the stdin-posted envelope did not arrive intact: {rows}"
+    );
+    // What each row says it is: none of the refused operations, by its text or by its kind (the
+    // conversational decline aside, which carries no resource).
+    let posted: Vec<serde_json::Value> = rows
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|row| {
+            row["text"]
+                .as_str()
+                .and_then(|t| serde_json::from_str(t).ok())
+        })
+        .collect();
+    for (kind, raw) in &raw_ops {
+        assert!(
+            !rows.contains(raw.as_str())
+                && !posted
+                    .iter()
+                    .any(|e| e["type"] == *kind && !e["data"]["resource"].is_null()),
+            "PRODUCT: the refused raw `{kind}` is in the room anyway: {rows}"
+        );
+    }
+    assert!(
+        stored.lines().any(|l| l.ends_with(" I'll take the deploy"))
+            && rows.lines().any(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .is_ok_and(|row| row["text"].as_str() == Some(decline))
+            }),
+        "PRODUCT: the prose post or the conversational decline is missing: {stored}\n{rows}"
     );
     assert!(
         // The addressee is named on the line after the row.

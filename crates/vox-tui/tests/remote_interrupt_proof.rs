@@ -55,6 +55,9 @@
 //!    not stall bob's wakes;
 //! 9. **a notice that is not taken stays owed**: a plugin socket that refuses the first prompt
 //!    gets the notice again once the hold (the profile's `agent_wake_hold`, here 6 s) has passed.
+//! 10. **an urgent message addressed to nobody wakes nobody** (RP-01, ADR-020 §6): posted the way a
+//!     person does it, `vox room post --urgent` with no `--to`, it reaches bob's node and his
+//!     session gets no notice — or one agent could interrupt the whole room.
 //!
 //! `an_idle_agent_is_told_when_a_reply_to_it_is_waiting` (V030-20): bob's session `asker` asks
 //! alice something, and alice answers (`--re`), each answer carrying a canary. The schedule is
@@ -103,7 +106,10 @@
 //! gate (V030-20 (1)); no generation, so a fresh reply is not announced (V030-20 (5)); the
 //! series held in memory (V030-20 (4)); a reply announced with no hops left (the exchange runs to
 //! its bound of twenty rounds); and the delivered-ahead record never written, ignored by the
-//! drain, ignored by the count, or a cursor moved past rows not shown ((8)). The pre-F15 loop — the daemon judging only `NewEntry` —
+//! drain, ignored by the count, or a cursor moved past rows not shown ((8)). An urgent broadcast let wake
+//! goes red at (10): the rule is held in three places, so the mutant drops all three (the empty-`to`
+//! checks in `node_tasks::may_wake` and `judge`, and `Envelope::may_interrupt` taking a broadcast as
+//! addressed); dropping it from `may_wake` alone stays green, as `judge` still refuses. The pre-F15 loop — the daemon judging only `NewEntry` —
 //! goes red at V030-15 (1).
 
 #![cfg(unix)]
@@ -460,6 +466,49 @@ fn an_urgent_message_from_another_node_interrupts_its_addressee() {
         &["room", "read", &room],
         |o| o.stdout.contains("SYNC-MARKER"),
     );
+    let _ = turn("hi");
+
+    // ---- (10) urgent and addressed to nobody: nothing. Posted with the CLI's own flags, as a
+    // person marks a message urgent; judged alone, before anything else is urgent ----
+    let o = alice.vox_in(
+        Some("session-alice"),
+        &["room", "post", &room, "--urgent", "--type", "ask", "-"],
+        Some("everyone: URGENT-BROADCAST is anyone there?"),
+    );
+    assert!(
+        o.ok,
+        "PRODUCT (staging): `vox room post --urgent` with no `--to` must post a broadcast; it \
+         said {o:?}"
+    );
+    until(
+        bob,
+        None,
+        "the urgent broadcast to reach bob's node",
+        &["room", "read", &room],
+        |o| o.stdout.contains("URGENT-BROADCAST"),
+    );
+    // Ten seconds after it landed: five sweeps of the daemon's two-second tick.
+    let (frames, stall) = collect(&inbox, Duration::from_secs(10), |_| false);
+    println!(
+        "[proof] (10) bob's session got {} frame(s) in 10s after an urgent broadcast: {:?}",
+        frames.len(),
+        contents(&frames)
+    );
+    assert!(
+        !(frames.is_empty() && stalled(stall, Duration::from_secs(10))),
+        "APPARATUS, CANNOT MEASURE: the collecting loop itself stalled {stall:?} of its 10 s \
+         window, so no wake cannot be judged"
+    );
+    check(
+        &mut failures,
+        frames.is_empty(),
+        format!(
+            "PRODUCT (10): an urgent message addressed to nobody must wake nobody; bob's session \
+             was sent {frames:?}; bob's daemon:\n{}",
+            bob_err()
+        ),
+    );
+    // bob's session reads it, as its next turn would, so the cases below start from a read room.
     let _ = turn("hi");
 
     // ---- (2) urgent, addressed to someone else; (3) addressed to bob, not urgent ----
