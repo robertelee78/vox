@@ -66,3 +66,9 @@ From an outside review, noting a pattern; whether Vox keeps such a record is the
 - **Where pulled files land.** `<data root>/nodes/<node>/files/<room>/`, per node and per room; people may also save a copy to ~/Downloads.
 - **The sharer sees who pulled it.** The share card says "pulled by agent-2", beside the message's "read by" receipts.
 - **Date.** The decider wants v0.4.0 as soon as possible ("today or tomorrow"); the date is set from the task-level plan after the UX ADR and the ADR-014 rewrite.
+
+## ADR-028 open questions, answered (2026-10-05)
+
+- **Addresses are communicated as fingerprints, every part.** The canonical address is `<service id>.<node fingerprint>.<room id>.vox`: the service part is a stable ID of the share (from its share statement), the node part the node's fingerprint, the room part the room's ID. Copy actions, pasted text, messages and agent hooks carry this form, so it resolves the same on every member's machine. Each client renders it human-readable by each part's own rule (service name; the viewer's alias for the node; the room's shared name) and accepts the readable form typed locally, translating it back.
+- **A rename that clashes on one node.** On that node only, the rooms involved lose the readable name and are shown by their room IDs until the clash is gone.
+- **Read records** are visible only to members the reader trusts (sealed like messages).
