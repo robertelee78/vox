@@ -78,7 +78,7 @@ pub enum Method {
 }
 
 /// A successfully established port mapping (ADR-012 step 2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PortMapping {
     /// The external port the gateway assigned.
     pub external_port: u16,
@@ -102,6 +102,9 @@ pub struct PortMapping {
     /// The node's routable address it was asked for: a renewal is for the same address only,
     /// and a new address is a new mapping with a new nonce (N-55, N-51).
     pub asked_for: Option<IpAddr>,
+    /// A UPnP router's control URL as the grant found it, so the deletion at stop goes straight
+    /// to it with no SSDP search, which alone may take longer than [`UNMAP_PATIENCE`] (N-56).
+    pub upnp: Option<std::sync::Arc<upnp::IgdGateway>>,
 }
 
 impl Method {
@@ -155,14 +158,13 @@ async fn exchange(
 /// nonce could not be generated.
 async fn try_pcp(
     socket: &UdpSocket,
-    gateway: SocketAddr,
     protocol: Protocol,
     client_ip: Ipv4Addr,
     internal_port: u16,
     suggested_external_port: u16,
     lifetime_secs: u32,
+    nonce: [u8; pcp::NONCE_LEN],
 ) -> Result<Option<PortMapping>> {
-    let nonce: [u8; pcp::NONCE_LEN] = random_array()?;
     let req = pcp::encode_map_request(
         &nonce,
         protocol,
@@ -185,9 +187,11 @@ async fn try_pcp(
             lifetime_secs: m.lifetime_secs,
             internal_port,
             method: Method::Pcp,
-            server: Some(gateway),
+            // The socket is connected to the gateway: its peer is the server that granted.
+            server: socket.peer_addr().ok(),
             nonce: Some(nonce),
             asked_for: None,
+            upnp: None,
         })),
         Err(_) => Ok(None),
     }
@@ -205,6 +209,31 @@ pub async fn map_port(
     internal_port: u16,
     suggested_external_port: u16,
     lifetime_secs: u32,
+) -> Result<PortMapping> {
+    let nonce: [u8; pcp::NONCE_LEN] = random_array()?;
+    map_port_with(
+        gateway,
+        protocol,
+        internal_port,
+        suggested_external_port,
+        lifetime_secs,
+        nonce,
+    )
+    .await
+}
+
+/// [`map_port`] with the PCP nonce given: a race draws each candidate's before asking, so the
+/// daemon's stop can delete what a request still unanswered may have made (N-56, N-57).
+///
+/// # Errors
+/// As [`map_port`].
+pub async fn map_port_with(
+    gateway: SocketAddr,
+    protocol: Protocol,
+    internal_port: u16,
+    suggested_external_port: u16,
+    lifetime_secs: u32,
+    nonce: [u8; pcp::NONCE_LEN],
 ) -> Result<PortMapping> {
     // Bind an ephemeral local UDP socket and connect it to the gateway so the OS
     // selects the source address (the PCP client IP) and recv only yields gateway
@@ -229,12 +258,12 @@ pub async fn map_port(
     // short-circuits.
     if let Some(m) = try_pcp(
         &socket,
-        gateway,
         protocol,
         client_ip,
         internal_port,
         suggested_external_port,
         lifetime_secs,
+        nonce,
     )
     .await?
     {
@@ -267,6 +296,7 @@ pub async fn map_port(
         server: Some(gateway),
         nonce: None,
         asked_for: None,
+        upnp: None,
     })
 }
 
@@ -292,7 +322,11 @@ pub async fn map_port_upnp(
     client_ip: Ipv4Addr,
     lifetime_secs: u32,
 ) -> Result<PortMapping> {
-    let gw = upnp::discover(client_ip, upnp::SSDP_MULTICAST, upnp::SSDP_TIMEOUT).await?;
+    let gw = match gateway::test_upnp() {
+        // A proof's SSDP stand-in, asked by unicast on loopback.
+        Some(target) => upnp::discover(Ipv4Addr::UNSPECIFIED, target, upnp::SSDP_TIMEOUT).await?,
+        None => upnp::discover(client_ip, upnp::SSDP_MULTICAST, upnp::SSDP_TIMEOUT).await?,
+    };
     let granted =
         upnp::add_port_mapping(&gw, protocol, port, port, client_ip, lifetime_secs).await?;
     let external = upnp::get_external_ip(&gw).await?;
@@ -305,18 +339,15 @@ pub async fn map_port_upnp(
         server: Some(gw.control_host),
         nonce: None,
         asked_for: Some(IpAddr::V4(client_ip)),
+        upnp: Some(std::sync::Arc::new(gw)),
     })
 }
 
 /// Remove a mapping [`map_port_upnp`] added. Best-effort: the gateway is found again
 /// by SSDP (from whichever interface the OS routes multicast on), which costs a search.
 pub async fn unmap_port_upnp(protocol: Protocol, port: u16) -> Result<()> {
-    let gw = upnp::discover(
-        Ipv4Addr::UNSPECIFIED,
-        upnp::SSDP_MULTICAST,
-        upnp::SSDP_TIMEOUT,
-    )
-    .await?;
+    let target = gateway::test_upnp().unwrap_or(upnp::SSDP_MULTICAST);
+    let gw = upnp::discover(Ipv4Addr::UNSPECIFIED, target, upnp::SSDP_TIMEOUT).await?;
     upnp::delete_port_mapping(&gw, protocol, port).await
 }
 
@@ -341,7 +372,7 @@ pub async fn open_ipv6_pinhole(
 
 /// [`open_ipv6_pinhole`] with the nonce given: a new pinhole's fresh one, or a held pinhole's own
 /// for its renewal (N-55).
-async fn pinhole_with(
+pub(crate) async fn pinhole_with(
     gateway: SocketAddr,
     protocol: Protocol,
     client_ip: Ipv6Addr,
@@ -383,6 +414,7 @@ async fn pinhole_with(
         server: Some(gateway),
         nonce: Some(nonce),
         asked_for: Some(IpAddr::V6(client_ip)),
+        upnp: None,
     })
 }
 
@@ -444,7 +476,7 @@ pub async fn renew(held: &PortMapping, lifetime_secs: u32) -> Result<PortMapping
                 external_port: m.external_port,
                 external_ip: m.external_ipv4().map(IpAddr::V4).or(held.external_ip),
                 lifetime_secs: m.lifetime_secs,
-                ..*held
+                ..held.clone()
             })
         }
         Method::NatPmp => {
@@ -463,7 +495,7 @@ pub async fn renew(held: &PortMapping, lifetime_secs: u32) -> Result<PortMapping
             Ok(PortMapping {
                 external_port: m.external_port,
                 lifetime_secs: m.lifetime_secs,
-                ..*held
+                ..held.clone()
             })
         }
         Method::PcpV6Pinhole => {
@@ -521,7 +553,11 @@ pub async fn unmap(m: &PortMapping) -> Result<()> {
             exchange(&socket, &req, "nat-pmp: deletion not answered").await?;
             Ok(())
         }
-        (Method::UpnpIgd, _, _) => unmap_port_upnp(protocol, m.external_port).await,
+        // The router the grant found, asked directly: no search at stop (N-56).
+        (Method::UpnpIgd, _, _) => match &m.upnp {
+            Some(gw) => upnp::delete_port_mapping(gw, protocol, m.external_port).await,
+            None => unmap_port_upnp(protocol, m.external_port).await,
+        },
         _ => Err(Error::PortMappingFailed("unmap: no server or nonce")),
     }
 }

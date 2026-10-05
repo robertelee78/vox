@@ -506,3 +506,23 @@ pub fn test_gateways() -> Option<Vec<std::net::SocketAddr>> {
 pub fn test_gateways() -> Option<Vec<std::net::SocketAddr>> {
     None
 }
+
+/// The environment variable [`test_upnp`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
+pub const TEST_UPNP_ENV: &str = "VOX_TEST_UPNP";
+
+/// **The UPnP override, for proofs only** (ADR-012 N-58): the address (`127.0.0.1:40003`) of a
+/// proof's SSDP stand-in, which UPnP's search is sent to by unicast in place of the multicast
+/// group. With [`test_gateways`] set and this unset, UPnP is not asked at all.
+#[cfg(feature = "test-knobs")]
+#[must_use]
+pub fn test_upnp() -> Option<std::net::SocketAddr> {
+    std::env::var(TEST_UPNP_ENV).ok()?.trim().parse().ok()
+}
+
+/// Without `test-knobs` there is no override: UPnP searches the multicast group.
+#[cfg(not(feature = "test-knobs"))]
+#[must_use]
+pub fn test_upnp() -> Option<std::net::SocketAddr> {
+    None
+}

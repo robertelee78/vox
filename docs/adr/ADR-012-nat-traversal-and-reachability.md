@@ -330,9 +330,12 @@ N-49–N-57 are built in v0.3.1. Proofs, each against the shipped binary:
 - N-55: `a_port_mapping_keeps_its_nonce_proof`;
 - N-56, N-57: `a_stopped_daemon_deletes_its_port_mappings_proof`.
 
-The last three run against a PCP stand-in through the `test-knobs` override `VOX_TEST_GATEWAY`. A
-UPnP deletion still finds the router by an SSDP search, which can take longer than
-`UNMAP_PATIENCE`.
+The last three run against PCP, NAT-PMP and UPnP IGD stand-ins through the `test-knobs` overrides
+`VOX_TEST_GATEWAY` and `VOX_TEST_UPNP`. A UPnP grant keeps the router's control URL, so its
+deletion at stop needs no SSDP search. The stop also deletes what a gateway race may still hold:
+a loser's grant, and, by its nonce, what a request still unanswered may have made. A losing grant
+naming the winner's external address and port is the winner's own mapping (one router at two
+addresses) and is not deleted.
 
 Found by an outside review (2026-10-04) and confirmed in code at integrate `3d5263cf`:
 

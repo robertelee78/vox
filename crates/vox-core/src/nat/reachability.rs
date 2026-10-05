@@ -21,7 +21,7 @@
 //! success.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -30,10 +30,7 @@ use tokio::task::JoinSet;
 use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::nat::multiaddr::{EndpointList, Multiaddr};
-use crate::nat::portmap::{
-    gateway, gateway_addr, gateway_addr_v6, map_port, open_ipv6_pinhole, Method, PortMapping,
-    Protocol,
-};
+use crate::nat::portmap::{gateway, gateway_addr, gateway_addr_v6, Method, PortMapping, Protocol};
 
 /// What one address family's gateway work asked, and what answered (ADR-012 N-54).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -232,6 +229,7 @@ pub async fn local_route_ip() -> Option<IpAddr> {
 pub async fn advertise_endpoints(
     bound: SocketAddr,
     leased: &[PortMapping],
+    races: &Races,
 ) -> (EndpointList, Vec<PortMapping>, GatewayAsks) {
     let bound_port = bound.port();
     let ips: Vec<IpAddr> = local_route_ips()
@@ -266,7 +264,7 @@ pub async fn advertise_endpoints(
                     && addr.is_some()
                     && m.asked_for == addr
             })
-            .copied()
+            .cloned()
     };
     let renew_v6 = renewable(true, v6.map(IpAddr::V6));
     let renew_v4 = renewable(false, v4.map(IpAddr::V4));
@@ -274,14 +272,14 @@ pub async fn advertise_endpoints(
         async {
             match (renew_v6, v6) {
                 (Some(m), _) => renew_one(&m).await,
-                (None, Some(a)) => pinhole_any(a, bound_port).await,
+                (None, Some(a)) => pinhole_any(a, bound_port, races).await,
                 (None, None) => (None, GatewayAsk::default()),
             }
         },
         async {
             match (renew_v4, v4) {
                 (Some(m), _) => renew_one(&m).await,
-                (None, Some(a)) => map_port_any(a, bound_port).await,
+                (None, Some(a)) => map_port_any(a, bound_port, races).await,
                 (None, None) => (None, GatewayAsk::default()),
             }
         },
@@ -404,10 +402,156 @@ fn compose_endpoints(
     })
 }
 
+/// One raced candidate, as a deletion needs it: the server, the PCP nonce it was asked with, the
+/// port, and (for a pinhole) the node's own address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Candidate {
+    server: SocketAddr,
+    nonce: [u8; crate::nat::portmap::pcp::NONCE_LEN],
+    internal_port: u16,
+    pinhole_for: Option<Ipv6Addr>,
+}
+
+impl Candidate {
+    /// The mapping a request of this candidate may have made: a PCP MAP (or pinhole) under its
+    /// nonce, which only this request could have created.
+    fn as_pcp(&self) -> PortMapping {
+        PortMapping {
+            external_port: 0,
+            external_ip: None,
+            lifetime_secs: 0,
+            internal_port: self.internal_port,
+            method: if self.pinhole_for.is_some() {
+                Method::PcpV6Pinhole
+            } else {
+                Method::Pcp
+            },
+            server: Some(self.server),
+            nonce: Some(self.nonce),
+            asked_for: self.pinhole_for.map(IpAddr::V6),
+            upnp: None,
+        }
+    }
+}
+
+/// Where one candidate of a race stands.
+#[derive(Clone, Debug)]
+enum Slot {
+    /// Its request may have left and no answer has come: the gateway may hold a mapping under
+    /// its nonce.
+    Asking(Candidate),
+    /// It won: the caller holds the mapping until the presence has taken it.
+    Won(PortMapping),
+    /// It lost and was granted: the grant is being deleted.
+    Granted(PortMapping),
+    /// Nothing of it is left to delete.
+    Done,
+}
+
+/// One race's candidates (N-57): where each stands, the tasks asking for them, and whether one
+/// of them won (a winner's router may be another candidate's too, at another address).
+#[derive(Default)]
+struct Race {
+    won: std::sync::atomic::AtomicBool,
+    slots: Mutex<Vec<Slot>>,
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+/// **Every race this presence ran whose candidates may still hold something** (ADR-012 N-56,
+/// N-57): a candidate still asking, a loser's grant not yet deleted, and a winner not yet taken
+/// by the presence. The daemon's stop deletes all of it ([`Races::to_delete`]), so a grant that
+/// comes while it stops, or that a request already sent will make, is not left on a gateway.
+#[derive(Default)]
+pub struct Races(Mutex<Vec<Arc<Race>>>);
+
+fn slots(race: &Race) -> std::sync::MutexGuard<'_, Vec<Slot>> {
+    race.slots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Races {
+    fn register(&self, race: Arc<Race>) {
+        let mut all = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        all.retain(|r| !slots(r).iter().all(|s| matches!(s, Slot::Done)));
+        all.push(race);
+    }
+
+    /// The winners are the presence's now (it took them as its mappings): nothing of them is
+    /// left to a race.
+    pub fn release_winners(&self) {
+        let mut all = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for r in all.iter() {
+            for s in slots(r).iter_mut() {
+                if matches!(s, Slot::Won(_)) {
+                    *s = Slot::Done;
+                }
+            }
+        }
+        all.retain(|r| !slots(r).iter().all(|s| matches!(s, Slot::Done)));
+    }
+
+    /// **What the stop must delete of the races** (N-56, N-57), taking it: each grant not yet
+    /// deleted or taken, and for each candidate still asking, the PCP mapping its nonce may have
+    /// made (deleting one that was never made is answered SUCCESS, RFC 6887 §15.1). A NAT-PMP
+    /// request has no nonce; one still asking is deleted by port only when its race had no
+    /// winner, since another candidate may be the winner's own router at another address.
+    pub fn to_delete(&self) -> Vec<PortMapping> {
+        let all = std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut out = Vec::new();
+        for r in all {
+            // Its candidates stop asking first: a request retransmitted after its deletion would
+            // make the mapping again.
+            for task in r
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain(..)
+            {
+                task.abort();
+            }
+            let taken = std::mem::take(&mut *slots(&r));
+            let won = r.won.load(std::sync::atomic::Ordering::SeqCst);
+            for s in taken {
+                match s {
+                    Slot::Won(m) | Slot::Granted(m) => out.push(m),
+                    Slot::Asking(c) => {
+                        out.push(c.as_pcp());
+                        if c.pinhole_for.is_none() && !won {
+                            out.push(PortMapping {
+                                method: Method::NatPmp,
+                                nonce: None,
+                                ..c.as_pcp()
+                            });
+                        }
+                    }
+                    Slot::Done => {}
+                }
+            }
+        }
+        out
+    }
+}
+
 /// Ask each candidate PCP server for an IPv6 pinhole on `port`, stopping at the first
 /// that grants one ([`gateway::server_candidates_v6`] supplies the order: the real
 /// default route, then the RFC 7723 anycast address), and say what was asked (N-54).
-async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> (Option<PortMapping>, GatewayAsk) {
+async fn pinhole_any(
+    client_ip: Ipv6Addr,
+    port: u16,
+    races: &Races,
+) -> (Option<PortMapping>, GatewayAsk) {
     let candidates: Vec<SocketAddr> = match gateway::test_gateways() {
         Some(list) => list.into_iter().filter(SocketAddr::is_ipv6).collect(),
         None => gateway::server_candidates_v6()
@@ -416,18 +560,31 @@ async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> (Option<PortMapping>, Ga
             .collect(),
     };
     let asked = candidates.iter().map(ToString::to_string).collect();
-    let won = first_success(candidates.into_iter().map(|server| async move {
-        open_ipv6_pinhole(
+    let mut raced = Vec::with_capacity(candidates.len());
+    for server in candidates {
+        let Ok(nonce) = crate::identity::rng::random_array() else {
+            continue;
+        };
+        let candidate = Candidate {
             server,
-            Protocol::Udp,
-            client_ip,
-            port,
-            PORT_MAP_LIFETIME_SECS,
-        )
-        .await
-        .ok()
-    }))
-    .await;
+            nonce,
+            internal_port: port,
+            pinhole_for: Some(client_ip),
+        };
+        raced.push((candidate, async move {
+            crate::nat::portmap::pinhole_with(
+                server,
+                Protocol::Udp,
+                client_ip,
+                port,
+                PORT_MAP_LIFETIME_SECS,
+                nonce,
+            )
+            .await
+            .ok()
+        }));
+    }
+    let won = first_success(raced, races).await;
     let ask = GatewayAsk::of(asked, won.as_ref());
     (won, ask)
 }
@@ -438,41 +595,62 @@ async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> (Option<PortMapping>, Ga
 /// tried last (ADR-012 rung 2's full order) — it finds the router by SSDP rather
 /// than by address, which is why it is not one of the raced candidates.
 ///
-/// A proof's gateway override ([`gateway::test_gateways`]) replaces the candidates and leaves
-/// UPnP out, so nothing but the proof's stand-in is asked.
-async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> (Option<PortMapping>, GatewayAsk) {
-    let (candidates, upnp): (Vec<SocketAddr>, bool) = match gateway::test_gateways() {
+/// A proof's gateway override ([`gateway::test_gateways`]) replaces the candidates, and UPnP is
+/// then asked only at the proof's own SSDP stand-in ([`gateway::test_upnp`]), so nothing but
+/// the proof's stand-ins is asked.
+async fn map_port_any(
+    client_ip: Ipv4Addr,
+    port: u16,
+    races: &Races,
+) -> (Option<PortMapping>, GatewayAsk) {
+    let (candidates, upnp): (Vec<SocketAddr>, Option<SocketAddr>) = match gateway::test_gateways() {
         Some(list) => (
             list.into_iter().filter(SocketAddr::is_ipv4).collect(),
-            false,
+            gateway::test_upnp(),
         ),
         None => (
             gateway::server_candidates_v4(client_ip)
                 .into_iter()
                 .map(|server| gateway_addr(IpAddr::V4(server)))
                 .collect(),
-            true,
+            Some(crate::nat::portmap::upnp::SSDP_MULTICAST),
         ),
     };
     let mut asked: Vec<String> = candidates.iter().map(ToString::to_string).collect();
-    let raced = first_success(candidates.into_iter().map(|server| async move {
-        map_port(server, Protocol::Udp, port, port, PORT_MAP_LIFETIME_SECS)
+    let mut raced = Vec::with_capacity(candidates.len());
+    for server in candidates {
+        let Ok(nonce) = crate::identity::rng::random_array() else {
+            continue;
+        };
+        let candidate = Candidate {
+            server,
+            nonce,
+            internal_port: port,
+            pinhole_for: None,
+        };
+        raced.push((candidate, async move {
+            crate::nat::portmap::map_port_with(
+                server,
+                Protocol::Udp,
+                port,
+                port,
+                PORT_MAP_LIFETIME_SECS,
+                nonce,
+            )
             .await
             .ok()
             .map(|m| PortMapping {
                 asked_for: Some(IpAddr::V4(client_ip)),
                 ..m
             })
-    }))
-    .await;
-    if raced.is_some() || !upnp {
-        let ask = GatewayAsk::of(asked, raced.as_ref());
-        return (raced, ask);
+        }));
     }
-    asked.push(format!(
-        "UPnP search {}",
-        crate::nat::portmap::upnp::SSDP_MULTICAST
-    ));
+    let won = first_success(raced, races).await;
+    let Some(target) = upnp.filter(|_| won.is_none()) else {
+        let ask = GatewayAsk::of(asked, won.as_ref());
+        return (won, ask);
+    };
+    asked.push(format!("UPnP search {target}"));
     let won =
         crate::nat::portmap::map_port_upnp(Protocol::Udp, port, client_ip, PORT_MAP_LIFETIME_SECS)
             .await
@@ -481,8 +659,22 @@ async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> (Option<PortMapping>, G
     (won, ask)
 }
 
-/// Run every future at once and return the first `Some`; **every other grant is deleted** as it
-/// comes (N-57).
+/// Whether `lost` is the same mapping as `won`, reached at another address of the same router:
+/// the same external address and port. `.1` and the anycast address are often one router, and a
+/// NAT-PMP request, which has no nonce, refreshes the mapping the winner holds there.
+///
+/// A grant with no external address (a NAT-PMP router that did not answer the address query)
+/// and the winner's port counts as the same: deleting the winner's own mapping would cut the
+/// node off, where leaving a stranger's grant only lets it expire.
+fn same_mapping(won: &PortMapping, lost: &PortMapping) -> bool {
+    lost.external_port == won.external_port
+        && (lost.external_ip.is_none()
+            || won.external_ip.is_none()
+            || lost.external_ip == won.external_ip)
+}
+
+/// Run every candidate at once and return the first grant; **every other grant is deleted** as
+/// it comes (N-57).
 ///
 /// Candidates are **raced**, not tried in turn: a candidate that is not a PCP server
 /// simply never answers, and its full retransmission schedule (~3.75 s) would
@@ -490,32 +682,61 @@ async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> (Option<PortMapping>, G
 /// one schedule. The losers are not abandoned mid-request: one whose request has left may
 /// already have been granted, and a grant left behind holds a port on that gateway for its
 /// whole lifetime. So they run on, off the caller's path, and each grant one of them gets is
-/// deleted at once ([`crate::nat::portmap::unmap`]).
-async fn first_success<F>(futures: impl Iterator<Item = F>) -> Option<PortMapping>
+/// deleted at once ([`crate::nat::portmap::unmap`]) — unless it is the winner's own mapping
+/// reached at another address ([`same_mapping`]). The race is registered in `races` throughout,
+/// so the daemon's stop deletes what a candidate still asking may hold (N-56).
+async fn first_success<F>(candidates: Vec<(Candidate, F)>, races: &Races) -> Option<PortMapping>
 where
     F: std::future::Future<Output = Option<PortMapping>> + Send + 'static,
 {
+    let race = Arc::new(Race {
+        slots: Mutex::new(candidates.iter().map(|(c, _)| Slot::Asking(*c)).collect()),
+        ..Race::default()
+    });
+    races.register(Arc::clone(&race));
     let mut set = JoinSet::new();
-    for f in futures {
-        set.spawn(f);
+    for (i, (_, f)) in candidates.into_iter().enumerate() {
+        let race = Arc::clone(&race);
+        let asking = Arc::clone(&race);
+        let task = set.spawn(async move {
+            let got = f.await;
+            if let Some(slot) = slots(&asking).get_mut(i) {
+                *slot = got.clone().map_or(Slot::Done, Slot::Granted);
+            }
+            (i, got)
+        });
+        race.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(task);
     }
     while let Some(joined) = set.join_next().await {
-        if let Ok(Some(m)) = joined {
-            if !set.is_empty() {
-                tokio::spawn(async move {
-                    while let Some(late) = set.join_next().await {
-                        if let Ok(Some(lost)) = late {
-                            let _ = tokio::time::timeout(
-                                crate::nat::portmap::UNMAP_PATIENCE,
-                                crate::nat::portmap::unmap(&lost),
-                            )
-                            .await;
-                        }
-                    }
-                });
-            }
-            return Some(m);
+        let Ok((i, Some(won))) = joined else {
+            continue;
+        };
+        race.won.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(slot) = slots(&race).get_mut(i) {
+            *slot = Slot::Won(won.clone());
         }
+        let winner = won.clone();
+        tokio::spawn(async move {
+            while let Some(late) = set.join_next().await {
+                let Ok((i, Some(lost))) = late else {
+                    continue;
+                };
+                if !same_mapping(&winner, &lost) {
+                    let _ = tokio::time::timeout(
+                        crate::nat::portmap::UNMAP_PATIENCE,
+                        crate::nat::portmap::unmap(&lost),
+                    )
+                    .await;
+                }
+                if let Some(slot) = slots(&race).get_mut(i) {
+                    *slot = Slot::Done;
+                }
+            }
+        });
+        return Some(won);
     }
     None
 }

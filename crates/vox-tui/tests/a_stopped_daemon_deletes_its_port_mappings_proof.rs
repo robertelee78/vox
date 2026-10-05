@@ -18,11 +18,29 @@
 //!   stand-in that answered receives a MAP with lifetime 0 and its grant's nonce within
 //!   [`UNMAP_PATIENCE`], and deletes it; the daemon exits cleanly.
 //!
+//! **Three more arms, each its own test:**
+//! - **a UPnP mapping is deleted at stop without a search** (N-56): a UPnP IGD stand-in
+//!   (`support/upnp_standin.rs`) answers SSDP at the edge of what UPnP allows (2.2 s; a device may
+//!   wait up to the search's MX, 2 s, plus the way back). The daemon maps through it (the PCP
+//!   stand-in it is pointed at is silent), and after SIGTERM the stand-in receives
+//!   `DeletePortMapping` for the port within [`UNMAP_PATIENCE`], with no search after the stop:
+//!   the grant's control URL was kept. Searching again at stop would cost the 2.2 s alone.
+//! - **a grant that comes while the daemon stops is deleted** (N-56, N-57): stand-in B answers
+//!   4 s late (it makes the mapping on receipt), A at once; A wins, and the daemon is stopped
+//!   while B's answer is still on its way. B receives a deletion with the nonce it was asked
+//!   with, within [`UNMAP_PATIENCE`] of the SIGTERM.
+//! - **one router asked at two addresses keeps its mapping**: one NAT-PMP-only stand-in named
+//!   twice (as `.1` and the anycast address can both be one router). Both candidates are granted
+//!   the one mapping, which has no nonce to tell them apart; the losing "grant" is the winner's own
+//!   mapping and is not deleted while the daemon runs; it is deleted at stop.
+//!
 //! **Which side a red is on.** A deletion that never comes, comes late, or carries another nonce
 //! is `PRODUCT:`. A machine with no IPv4 route (no IPv4 mapping asked) is `CANNOT MEASURE`.
 //!
 //! Mutations, each red as PRODUCT: no deletion at stop (`NetPresence::close` deleting nothing);
-//! a losing grant abandoned (`first_success` not deleting the late grants).
+//! a losing grant abandoned (`first_success` not deleting the late grants); a UPnP deletion that
+//! searches again (`unmap` ignoring the kept control URL); the races not settled at stop
+//! (`Races::to_delete` returning nothing); every losing grant deleted (`same_mapping` false).
 
 #![cfg(unix)]
 
@@ -38,6 +56,9 @@ mod test_knobs;
 #[path = "support/pcp_standin.rs"]
 mod pcp_standin;
 
+#[path = "support/upnp_standin.rs"]
+mod upnp_standin;
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -52,6 +73,11 @@ const SLACK: Duration = Duration::from_millis(500);
 
 /// `vox daemon` on a fresh profile at `data`, listening on `0.0.0.0`, pointed at `gateways`.
 fn daemon(data: &Path, gateways: &str) -> VoxProc {
+    daemon_env(data, &[("VOX_TEST_GATEWAY", gateways)])
+}
+
+/// `vox daemon` on a fresh profile at `data`, listening on `0.0.0.0`, with the knobs `env`.
+fn daemon_env(data: &Path, env: &[(&str, &str)]) -> VoxProc {
     world::mkdir(&data.join("cfg"));
     let (ok, _, err) = vox_once(data, &args(&["id"]));
     assert!(ok, "PRODUCT (staging): vox id failed: {err}");
@@ -68,10 +94,57 @@ fn daemon(data: &Path, gateways: &str) -> VoxProc {
             "--listen",
             "0.0.0.0:0",
         ]),
-        &[("VOX_TEST_GATEWAY", gateways)],
+        env,
     );
     d.expect_line("the daemon to start", |l| l.contains("control socket"));
     d
+}
+
+/// SIGTERM to the daemon `d`, by its pid; when it was sent, and how the daemon ended.
+fn stop(d: &mut VoxProc) -> (Instant, Option<std::process::ExitStatus>) {
+    let pid = d.child.id();
+    let at = Instant::now();
+    let killed = std::process::Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot signal the daemon {pid}: {e}"));
+    assert!(killed.success(), "APPARATUS: kill -TERM {pid} failed");
+    let exited = loop {
+        if let Some(status) = d.child.try_wait().unwrap_or(None) {
+            break Some(status);
+        }
+        if at.elapsed() > Duration::from_secs(30) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    (at, exited)
+}
+
+/// Wait up to `within` for `done`.
+fn wait(within: Duration, done: impl Fn() -> bool) -> bool {
+    let until = Instant::now() + within;
+    while !done() {
+        if Instant::now() > until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// A CANNOT MEASURE red unless this machine has an IPv4 default route.
+fn require_ipv4_route() {
+    let route = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    assert!(
+        route.contains("gateway"),
+        "CANNOT MEASURE (precondition unmet): no IPv4 default route, so no IPv4 mapping is asked \
+         for:\n{route}"
+    );
 }
 
 fn show(name: &str, log: &[Request], t0: Instant) -> String {
@@ -97,9 +170,12 @@ fn grant(log: &[Request]) -> Option<Request> {
         .cloned()
 }
 
-/// The first deletion in `log` (a MAP with lifetime 0).
+/// The first deletion in `log`: a map request with lifetime 0 (not another kind of request,
+/// which is logged with lifetime 0 too).
 fn deletion(log: &[Request]) -> Option<Request> {
-    log.iter().find(|r| r.lifetime == 0).cloned()
+    log.iter()
+        .find(|r| r.lifetime == 0 && !matches!(r.answer, Answer::NotPcp | Answer::Unsupported))
+        .cloned()
 }
 
 #[test]
@@ -261,5 +337,241 @@ fn a_stopped_daemon_deletes_its_mappings_and_a_losing_grant_at_once() {
     assert!(
         exited.is_some_and(|s| s.success()),
         "PRODUCT: the daemon did not exit cleanly after SIGTERM: {exited:?}"
+    );
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id; run on demand"]
+fn a_upnp_mapping_is_deleted_at_stop_without_a_search() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_GATEWAY", "VOX_TEST_UPNP"]);
+    require_ipv4_route();
+    let tmp = tempdir();
+    let data = tmp.path().join("node");
+    let _reaper = Reaper(vec![data.clone()]);
+    let pcp = Standin::start(7200);
+    pcp.set_silent(true);
+    let igd = upnp_standin::UpnpStandin::start(Duration::from_millis(2200));
+    let mut d = daemon_env(
+        &data,
+        &[
+            ("VOX_TEST_GATEWAY", &pcp.addr.to_string()),
+            ("VOX_TEST_UPNP", &igd.ssdp.to_string()),
+        ],
+    );
+    let t0 = Instant::now();
+    let show = || {
+        igd.log()
+            .iter()
+            .map(|a| {
+                format!(
+                    "  +{:.2}s {} {:?}",
+                    a.at.saturating_duration_since(t0).as_secs_f64(),
+                    a.what,
+                    a.port
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mapped = wait(Duration::from_secs(30), || {
+        igd.log().iter().any(|a| a.what == "AddPortMapping")
+    });
+    assert!(
+        mapped,
+        "PRODUCT: the daemon never mapped through the UPnP stand-in:\n{}",
+        show()
+    );
+    let port = igd
+        .log()
+        .iter()
+        .find(|a| a.what == "AddPortMapping")
+        .and_then(|a| a.port)
+        .unwrap_or_else(|| panic!("APPARATUS: the stand-in logged no port:\n{}", show()));
+    // The grant is held once `vox status` names it.
+    let named = wait(Duration::from_secs(15), || {
+        let (ok, out, _) = vox_once(&data, &args(&["status", "--json"]));
+        ok && serde_json::from_str::<Value>(&out)
+            .is_ok_and(|v| v["gateway"]["ipv4"]["answered"]["rung"].as_str() == Some("UPnP-IGD"))
+    });
+    assert!(
+        named,
+        "PRODUCT: `vox status` never named the UPnP grant:\n{}",
+        show()
+    );
+    let (stopped, exited) = stop(&mut d);
+    let deleted = wait(UNMAP_PATIENCE + Duration::from_secs(3), || {
+        igd.log().iter().any(|a| a.what == "DeletePortMapping")
+    });
+    let log = igd.log();
+    println!("[proof] the UPnP stand-in's log:\n{}", show());
+    let searched_after = log.iter().any(|a| a.what == "search" && a.at >= stopped);
+    let gone = log.iter().find(|a| a.what == "DeletePortMapping");
+    assert!(
+        deleted && gone.is_some_and(|a| a.port == Some(port)),
+        "PRODUCT: the daemon stopped and the UPnP mapping of port {port} was never deleted \
+         (N-56){}:\n{}",
+        if searched_after {
+            ", and it searched for the router again first"
+        } else {
+            ""
+        },
+        show()
+    );
+    let after = gone.map_or(Duration::MAX, |a| a.at.saturating_duration_since(stopped));
+    println!(
+        "[proof] DeletePortMapping {:.2}s after SIGTERM; a search after the stop: {searched_after}",
+        after.as_secs_f64()
+    );
+    assert!(
+        after <= UNMAP_PATIENCE + SLACK && !searched_after,
+        "PRODUCT: the UPnP deletion came {:.2}s after SIGTERM (N-56 bounds it at {}s){}:\n{}",
+        after.as_secs_f64(),
+        UNMAP_PATIENCE.as_secs(),
+        if searched_after {
+            ", after searching for the router again"
+        } else {
+            ""
+        },
+        show()
+    );
+    assert!(
+        exited.is_some_and(|s| s.success()),
+        "PRODUCT: the daemon did not exit cleanly: {exited:?}"
+    );
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id; run on demand"]
+fn a_grant_that_comes_while_the_daemon_stops_is_deleted() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_GATEWAY"]);
+    require_ipv4_route();
+    let tmp = tempdir();
+    let data = tmp.path().join("node");
+    let _reaper = Reaper(vec![data.clone()]);
+    let (a, b) = (Standin::start(7200), Standin::start(7200));
+    b.set_delay(Duration::from_secs(4));
+    let t0 = Instant::now();
+    let mut d = daemon(&data, &format!("{},{}", a.addr, b.addr));
+    let logs = || format!("{}\n{}", show("A", &a.log(), t0), show("B", &b.log(), t0));
+    // A grants at once and wins; B has the request and has not answered.
+    let asked = wait(Duration::from_secs(30), || {
+        grant(&a.log()).is_some() && !b.log().is_empty()
+    });
+    assert!(
+        asked,
+        "PRODUCT: both stand-ins were to be asked, A to grant:\n{}",
+        logs()
+    );
+    let named = wait(Duration::from_secs(3), || {
+        let (ok, out, _) = vox_once(&data, &args(&["status", "--json"]));
+        ok && serde_json::from_str::<Value>(&out).is_ok_and(|v| {
+            v["gateway"]["ipv4"]["answered"]["address"].as_str() == Some(&a.addr.to_string())
+        })
+    });
+    assert!(
+        named,
+        "PRODUCT: `vox status` never named A as the gateway that answered:\n{}",
+        logs()
+    );
+    let asked_b = b.log()[0].clone();
+    let (stopped, exited) = stop(&mut d);
+    assert!(
+        stopped < asked_b.at + Duration::from_secs(4),
+        "CANNOT MEASURE: the stop came after B's late answer, so no grant was on its way:\n{}",
+        logs()
+    );
+    wait(UNMAP_PATIENCE + Duration::from_secs(3), || {
+        deletion(&b.log()).is_some()
+    });
+    println!("[proof] the stand-ins' logs:\n{}", logs());
+    let gone = deletion(&b.log()).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: B's mapping, asked for and granted while the daemon stopped, was never \
+             deleted (N-56, N-57):\n{}",
+            logs()
+        )
+    });
+    let after = gone.at.saturating_duration_since(stopped);
+    println!(
+        "[proof] B's grant was deleted {:.2}s after SIGTERM",
+        after.as_secs_f64()
+    );
+    assert!(
+        gone.nonce == asked_b.nonce
+            && gone.answer == Answer::Deleted
+            && after <= UNMAP_PATIENCE + SLACK,
+        "PRODUCT: B's deletion must carry the nonce it was asked with, delete it, and come within \
+         {}s of the stop ({:.2}s):\n{}",
+        UNMAP_PATIENCE.as_secs(),
+        after.as_secs_f64(),
+        logs()
+    );
+    assert!(
+        exited.is_some_and(|s| s.success()),
+        "PRODUCT: the daemon did not exit cleanly: {exited:?}"
+    );
+}
+
+#[test]
+#[ignore = "real binaries and production Argon2id; run on demand"]
+fn one_router_asked_at_two_addresses_keeps_its_mapping() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_GATEWAY"]);
+    require_ipv4_route();
+    let tmp = tempdir();
+    let data = tmp.path().join("node");
+    let _reaper = Reaper(vec![data.clone()]);
+    let router = Standin::start_natpmp(7200);
+    let t0 = Instant::now();
+    let at = router.addr.to_string();
+    let mut d = daemon(&data, &format!("{at},{at}"));
+    let grants = || {
+        router
+            .log()
+            .iter()
+            .filter(|r| matches!(r.answer, Answer::Granted(_)))
+            .count()
+    };
+    let both = wait(Duration::from_secs(30), || grants() >= 2);
+    assert!(
+        both,
+        "PRODUCT: both candidates were to be granted the router's one NAT-PMP mapping:\n{}",
+        show("R", &router.log(), t0)
+    );
+    // Long enough for a losing grant's deletion to have come (it comes at once).
+    std::thread::sleep(UNMAP_PATIENCE + Duration::from_secs(1));
+    let early = deletion(&router.log());
+    println!(
+        "[proof] the router's log:\n{}",
+        show("R", &router.log(), t0)
+    );
+    assert!(
+        early.is_none(),
+        "PRODUCT: the daemon deleted its own mapping while it runs: the losing candidate was the \
+         winner's router at another address, granted the same mapping:\n{}",
+        show("R", &router.log(), t0)
+    );
+    let (stopped, exited) = stop(&mut d);
+    wait(UNMAP_PATIENCE + Duration::from_secs(3), || {
+        deletion(&router.log()).is_some()
+    });
+    let gone = deletion(&router.log()).unwrap_or_else(|| {
+        panic!(
+            "PRODUCT: the daemon stopped and never deleted its mapping (N-56):\n{}",
+            show("R", &router.log(), t0)
+        )
+    });
+    assert!(
+        gone.answer == Answer::Deleted
+            && gone.at.saturating_duration_since(stopped) <= UNMAP_PATIENCE + SLACK,
+        "PRODUCT: the mapping must be deleted within {}s of the stop:\n{}",
+        UNMAP_PATIENCE.as_secs(),
+        show("R", &router.log(), t0)
+    );
+    assert!(
+        exited.is_some_and(|s| s.success()),
+        "PRODUCT: the daemon did not exit cleanly: {exited:?}"
     );
 }
