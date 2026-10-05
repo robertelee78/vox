@@ -107,8 +107,8 @@ pub struct DaemonCore {
     asked: Option<Instant>,
     /// The room on screen (drives `ViewModel::active` and unread resets).
     active: Option<Digest32>,
-    /// Unread counts per room (incremented by events for rooms off screen).
-    unread: BTreeMap<Digest32, usize>,
+    /// Unread per room off screen, at three levels (ADR-028 R-8, #484).
+    unread: BTreeMap<Digest32, RoomUnread>,
     /// Rooms off screen that rows have arrived in since the last frame, and how many rows: each
     /// is a notification to raise, once per room (ADR-028 R-10).
     arrived: BTreeMap<Digest32, usize>,
@@ -134,6 +134,23 @@ pub struct DaemonCore {
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
     /// then, so a stop is never held behind an answer (ADR-026 S-4).
     stop: tokio_util::sync::CancellationToken,
+}
+
+/// **A room's unread, at three levels** (ADR-028 R-8, #484), for a room off screen.
+///
+/// Events say only how many rows came (`pending`); the rows since `cursor` are then read and each
+/// is counted as addressed to this node, new, or coordination ([`vox_agentcomms::attention::unread_level`]).
+/// With no cursor yet (a room not opened this session), only the newest `pending` rows count: the
+/// room's history is not unread.
+#[derive(Debug, Default)]
+struct RoomUnread {
+    to_you: usize,
+    new: usize,
+    coordination: usize,
+    /// The newest row counted or seen, by entry hash.
+    cursor: Option<Digest32>,
+    /// Rows the events announced and not yet read and counted.
+    pending: usize,
 }
 
 /// The room on screen's rows, in the room's order, and what they were projected as.
@@ -645,7 +662,7 @@ impl DaemonCore {
                     t.stale = true;
                 }
             } else if n > 0 {
-                *me.unread.entry(channel_id).or_insert(0) += n;
+                me.unread.entry(channel_id).or_default().pending += n;
                 *me.arrived.entry(channel_id).or_insert(0) += n;
             }
         };
@@ -755,6 +772,69 @@ impl DaemonCore {
                 self.ended
                     .get_or_insert(format!("the vox daemon stopped answering: {e}"));
             }
+        }
+    }
+
+    /// **Count what came to each room off screen, by level** (ADR-028 R-8, #484): read the rows
+    /// since its cursor and count each as addressed to this node, new, or coordination. This
+    /// node's own posts are not unread.
+    fn count_unread(&mut self) {
+        use vox_agentcomms::attention::{unread_level, UnreadLevel};
+        let me = self.snapshot.me;
+        let me_fp = me.map(|m| vox_core::node::link::b32_encode(&m));
+        let due: Vec<Digest32> = self
+            .unread
+            .iter()
+            .filter(|(cid, u)| {
+                u.pending > 0
+                    && Some(**cid) != self.active
+                    && self.snapshot.open.iter().any(|o| o.channel_id == **cid)
+            })
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in due {
+            let Some(cursor) = self.unread.get(&cid).map(|u| u.cursor) else {
+                continue;
+            };
+            let Some(conn) = self.conn.as_mut() else {
+                return;
+            };
+            let read = until_stopped(&self.rt, &self.stop, conn.client.read_rows(cid, cursor));
+            let Some(u) = self.unread.get_mut(&cid) else {
+                continue;
+            };
+            let mut rows = match read {
+                Some(Ok(Frame::Rows { rows })) => rows,
+                // A cursor the node no longer knows (the row expired): counted from the newest
+                // `pending` rows instead, on the next frame.
+                Some(Ok(_)) if cursor.is_some() => {
+                    u.cursor = None;
+                    continue;
+                }
+                _ => continue,
+            };
+            rows.sort_by_key(|r| r.arrival);
+            if cursor.is_none() {
+                // A room not seen this session: only what the events announced is unread.
+                let keep = u.pending.min(rows.len());
+                rows.drain(..rows.len() - keep);
+            }
+            for r in rows.iter().filter(|r| Some(r.author) != me) {
+                match unread_level(&r.text, me_fp.as_deref()) {
+                    UnreadLevel::ToYou => u.to_you += 1,
+                    UnreadLevel::New => u.new += 1,
+                    UnreadLevel::Coordination => u.coordination += 1,
+                }
+            }
+            if let Some(newest) = rows
+                .iter()
+                .filter(|r| !r.owed)
+                .map(|r| r.entry_hash)
+                .next_back()
+            {
+                u.cursor = Some(newest);
+            }
+            u.pending = 0;
         }
     }
 
@@ -958,7 +1038,9 @@ impl DaemonCore {
                     .local_name
                     .clone()
                     .unwrap_or_else(|| format!("(closed {})", short_id(&c.channel_id))),
-                unread: self.unread.get(&c.channel_id).copied().unwrap_or(0),
+                to_you: self.unread.get(&c.channel_id).map_or(0, |u| u.to_you),
+                unread: self.unread.get(&c.channel_id).map_or(0, |u| u.new),
+                coordination: self.unread.get(&c.channel_id).map_or(0, |u| u.coordination),
                 reachability: reachability(&c.channel_id),
             })
             .collect();
@@ -1242,6 +1324,7 @@ impl CoreHandle for DaemonCore {
             }
         }
         self.read_timeline();
+        self.count_unread();
         self.project()
     }
 
@@ -1376,6 +1459,20 @@ impl CoreHandle for DaemonCore {
             }
             Command::EndRoom { channel_id } => self.send(Request::End { channel_id }),
             Command::SelectChannel { channel_id } => {
+                // The room left counts from the newest row it showed: nothing seen is unread.
+                if let Some(t) = self
+                    .timeline
+                    .as_ref()
+                    .filter(|t| Some(t.channel_id) != channel_id)
+                {
+                    self.unread.insert(
+                        t.channel_id,
+                        RoomUnread {
+                            cursor: t.cursor,
+                            ..RoomUnread::default()
+                        },
+                    );
+                }
                 self.active = channel_id;
                 if let Some(cid) = channel_id {
                     self.unread.remove(&cid);
