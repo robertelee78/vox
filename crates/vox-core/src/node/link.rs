@@ -332,15 +332,15 @@ impl InviteLink {
     ) -> Result<Self> {
         if anchors.is_empty() {
             return Err(Error::MalformedLink(
-                "invite link names nowhere to reach the room",
+                "the link names nowhere to reach the room",
             ));
         }
         if anchors.len() > MAX_LINK_ANCHORS {
-            return Err(Error::MalformedLink("invite link anchor count"));
+            return Err(Error::MalformedLink("anchor count"));
         }
         for (i, a) in anchors.iter().enumerate() {
             if anchors[..i].iter().any(|b| b.id == a.id) {
-                return Err(Error::MalformedLink("invite link duplicate anchor"));
+                return Err(Error::MalformedLink("duplicate anchor"));
             }
         }
         Ok(Self {
@@ -380,12 +380,12 @@ impl InviteLink {
     pub fn parse(text: &str) -> Result<Self> {
         let rest = text
             .strip_prefix(LINK_SCHEME)
-            .ok_or(Error::MalformedLink("invite link scheme"))?;
+            .ok_or(Error::MalformedLink("scheme"))?;
         let (id_part, query) = match rest.split_once('?') {
             Some((id, q)) => (id, Some(q)),
             None => (rest, None),
         };
-        let channel_id = b32_decode(id_part, "invite link channelID")?;
+        let channel_id = b32_decode(id_part, "room link channelID")?;
         // Anchors are built as they are read: an `a=` opens one, the `b=`s that
         // follow belong to it.
         let mut anchors: Vec<BootstrapNode> = Vec::new();
@@ -396,57 +396,55 @@ impl InviteLink {
          -> Result<()> {
             if let Some((id, addrs)) = current {
                 let endpoints = EndpointList::new(addrs)
-                    .map_err(|_| Error::MalformedLink("invite link anchor addresses"))?;
+                    .map_err(|_| Error::MalformedLink("anchor addresses"))?;
                 let node = BootstrapNode::new(id, endpoints)
-                    .map_err(|_| Error::MalformedLink("invite link anchor has no address"))?;
+                    .map_err(|_| Error::MalformedLink("anchor has no address"))?;
                 anchors.push(node);
             }
             Ok(())
         };
         for field in query.unwrap_or("").split('&').filter(|f| !f.is_empty()) {
-            let (key, value) = field
-                .split_once('=')
-                .ok_or(Error::MalformedLink("invite link field"))?;
+            let (key, value) = field.split_once('=').ok_or(Error::MalformedLink("field"))?;
             match key {
                 "a" => {
                     close(current.take(), &mut anchors)?;
                     if anchors.len() >= MAX_LINK_ANCHORS {
-                        return Err(Error::MalformedLink("invite link anchor count"));
+                        return Err(Error::MalformedLink("anchor count"));
                     }
-                    let id = b32_decode(value, "invite link anchor")?;
+                    let id = b32_decode(value, "room link anchor")?;
                     if anchors.iter().any(|a| a.id == id) {
-                        return Err(Error::MalformedLink("invite link duplicate anchor"));
+                        return Err(Error::MalformedLink("duplicate anchor"));
                     }
                     current = Some((id, Vec::new()));
                 }
                 "b" => {
                     let Some((_, addrs)) = current.as_mut() else {
-                        return Err(Error::MalformedLink("invite link address before anchor"));
+                        return Err(Error::MalformedLink("address before anchor"));
                     };
                     if addrs.len() >= MAX_ENDPOINTS {
-                        return Err(Error::MalformedLink("invite link anchor addresses"));
+                        return Err(Error::MalformedLink("anchor addresses"));
                     }
                     addrs.push(
                         Multiaddr::parse(value)
-                            .map_err(|_| Error::MalformedLink("invite link anchor address"))?,
+                            .map_err(|_| Error::MalformedLink("anchor address"))?,
                     );
                 }
                 "r" => {
                     if responder.is_some() {
-                        return Err(Error::MalformedLink("invite link duplicate responder"));
+                        return Err(Error::MalformedLink("duplicate responder"));
                     }
-                    responder = Some(b32_decode(value, "invite link responder")?);
+                    responder = Some(b32_decode(value, "room link responder")?);
                 }
                 // An unknown key is refused rather than ignored: a future field
                 // must not be silently dropped by an older client, and a link with
                 // a smuggled extra parameter is not this link.
-                _ => return Err(Error::MalformedLink("invite link unknown field")),
+                _ => return Err(Error::MalformedLink("unknown field")),
             }
         }
         close(current.take(), &mut anchors)?;
         if anchors.is_empty() {
             return Err(Error::MalformedLink(
-                "invite link names nowhere to reach the room",
+                "the link names nowhere to reach the room",
             ));
         }
         Ok(Self {

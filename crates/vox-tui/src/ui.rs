@@ -282,7 +282,7 @@ fn render_timeline(
             // Characters a reader cannot see are shown as escapes (#331).
             let body = m.body.as_deref().map_or_else(
                 || UNDECRYPTABLE_MARKER.to_owned(),
-                vox_agentcomms::envelope::reveal,
+                |b| vox_agentcomms::envelope::reveal_keeping(b, |c| c == '\n' || c == '\t'),
             );
             let mut spans = Vec::with_capacity(3);
             if m.late {
