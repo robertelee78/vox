@@ -149,14 +149,22 @@ impl NetWatch {
     ///
     /// # Errors
     /// The socket failed: nothing more will be heard on it.
+    ///
+    /// **Only a relevant event extends the wait** (#413). macOS writes the routing socket far more
+    /// than the kinds counted here: measured idle, 143 reads in 20 s, mostly `RTM_LOSING` and
+    /// `RTM_MISS`, 138 of them under 500 ms apart, and more while a connection to a removed
+    /// address keeps missing. Any read restarted the wait, so a burst was not "settled" until
+    /// the machine went quiet for [`NETWORK_SETTLE`], which it may not do for as long as that
+    /// connection lasts: a move to another network was never noticed, and nothing was redialled.
     pub async fn settled(&mut self) -> std::io::Result<()> {
         while !self.read_relevant().await? {}
+        let mut quiet_from = tokio::time::Instant::now() + NETWORK_SETTLE;
         loop {
-            match tokio::time::timeout(NETWORK_SETTLE, self.read_relevant()).await {
+            match tokio::time::timeout_at(quiet_from, self.read_relevant()).await {
                 Err(_) => return Ok(()),
-                Ok(r) => {
-                    r?;
-                }
+                Ok(Ok(true)) => quiet_from = tokio::time::Instant::now() + NETWORK_SETTLE,
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => return Err(e),
             }
         }
     }

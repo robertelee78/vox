@@ -38,13 +38,28 @@ is one `ip -batch`. Nothing outside the namespace is touched and no privilege is
 
 **macOS** (opt-in heavy, the operator runs it): the addresses are aliases on `lo0`, and the
 operating system routes by A because a host route to 192.0.2.1 (TEST-NET-1, the address
-`local_route_ips` asks the route to) goes through A; the move adds B, points that route at B and
-removes A. Every change is made with `sudo` (the operator's prompt; run `sudo -v` first) and
-undone at the end. The machine's own default route and real interfaces are never touched. `vox`
-itself runs as the operator, never as root: a daemon refuses a control connection from uid 0.
+`local_route_ips` asks the route to) goes through A; the move adds B, deletes that route and adds
+it afresh through B, and removes A. Every change is made with `sudo` (the operator's prompt; run
+`sudo -v` first) and undone at the end. The machine's own default route and real interfaces are
+never touched. `vox` itself runs as the operator, never as root: a daemon refuses a control
+connection from uid 0.
 
-Exit 0 = pass, 1 = red, 2 = apparatus or CANNOT MEASURE. A `vox` step on the way that fails is the
-product's red (`PRODUCT:`). Every process is recorded and stopped by PID.
+**Why this mirrors a real move.** What vox reads of the network is what it would read on Wi-Fi:
+the routing socket's messages (`RTM_NEWADDR`, `RTM_DELADDR`, `RTM_ADD`, `RTM_DELETE`, whatever the
+interface) and the source address the kernel picks for a probe to 192.0.2.1. A real move deletes
+the old route and adds a new one, so the steering route is deleted and added, never changed in
+place: `route change` moved its gateway and left it the old source (`rt_ifa`), so the probe still
+read A after the move, the network had not changed in the one way vox reads, and the run judged
+the product on a scene it had not staged.
+
+**Every staged step is checked from the OS's own view** before any claim is judged, and quoted:
+the addresses the OS shows, the route to 192.0.2.1, and the source a connected UDP probe to it
+gets (what `local_route_ips` reads). A before the move, B after it, A gone: anything else is
+APPARATUS, CANNOT MEASURE, quoting what the OS showed, and no claim is made.
+
+Exit 0 = pass, 1 = red, 2 = apparatus or CANNOT MEASURE. A `vox` step that fails is the product's
+red: `PRODUCT (staging):` before the move (the scene was not reached, and what vox said is quoted),
+`PRODUCT:` after it. Every process is recorded and stopped by PID.
 """
 import json, os, re, subprocess, sys, tempfile, threading, time, traceback
 
@@ -73,6 +88,7 @@ if LINUX:
 
 TAG = "netchange"
 S = tempfile.mkdtemp(prefix="vox-netchange-")
+MOVED = False  # set at the move: a product red before it is one of the staging's steps
 PROCS = []
 code = 2
 results = {}
@@ -124,8 +140,47 @@ def move():
     else:
         UNDO.append(["sudo", "ifconfig", "lo0", "-alias", "10.88.0.2"])
         sh("sudo", "ifconfig", "lo0", "alias", "10.88.0.2/32")
-        sh("sudo", "route", "-n", "change", "-host", "192.0.2.1", "10.88.0.2")
+        # Deleted and added, as a real move does: a route changed in place keeps its old source.
+        sh("sudo", "route", "-n", "delete", "-host", "192.0.2.1")
+        sh("sudo", "route", "-n", "add", "-host", "192.0.2.1", "10.88.0.2")
         sh("sudo", "ifconfig", "lo0", "-alias", "10.77.0.2")
+
+TEST_ADDRS = ("10.77.0.2", "10.88.0.2", "10.99.0.2")
+
+def os_view():
+    """What the OS shows of the staging: which test addresses it has, its route to 192.0.2.1, and
+    the source a connected UDP probe to 192.0.2.1:9 gets (what vox's `local_route_ips` reads; no
+    datagram is sent)."""
+    import socket
+    if LINUX:
+        listed = subprocess.run(["ip", "-4", "-o", "addr"], capture_output=True, text=True).stdout
+        route = subprocess.run(["ip", "route", "get", "192.0.2.1"], capture_output=True, text=True)
+    else:
+        listed = subprocess.run(["ifconfig", "lo0"], capture_output=True, text=True).stdout
+        route = subprocess.run(["route", "-n", "get", "192.0.2.1"], capture_output=True, text=True)
+    have = {a for a in TEST_ADDRS if re.search(rf"inet {re.escape(a)}[/ ]", listed)}
+    try:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.connect(("192.0.2.1", 9))
+        probe = u.getsockname()[0]
+        u.close()
+    except OSError as e:
+        probe = f"no route ({e})"
+    route_said = " ".join((route.stdout + route.stderr).split())
+    return {"have": sorted(have), "probe": probe, "route": route_said}
+
+def staged(when, probe, present, absent):
+    """The staging is what the claims assume, from the OS's own view, or APPARATUS."""
+    v = os_view()
+    print(f"{TAG} OS view {when}: addresses {v['have']}; a probe to 192.0.2.1 leaves from "
+          f"{v['probe']}; route: {v['route'][:300]}", flush=True)
+    wrong = []
+    if v["probe"] != probe:
+        wrong.append(f"a probe to 192.0.2.1 leaves from {v['probe']}, not {probe}")
+    wrong += [f"{a} is missing" for a in present if a not in v["have"]]
+    wrong += [f"{a} is still there" for a in absent if a in v["have"]]
+    if wrong:
+        raise Apparatus(f"CANNOT MEASURE, staging not achieved {when}: " + "; ".join(wrong))
 
 UNDO = []
 
@@ -156,6 +211,7 @@ def log(w):
 
 try:
     setup()
+    staged("before the move", "10.77.0.2", ["10.77.0.2", "10.99.0.2"], ["10.88.0.2"])
     for w in ("d", "p"):
         for d in ("data", "cfg"):
             os.makedirs(f"{S}/{w}/{d}")
@@ -234,6 +290,9 @@ try:
     # ---- the move ----
     move()
     moved = time.time()
+    # Checked before any claim is judged; the claims' clocks start at the move itself.
+    staged("after the move", "10.88.0.2", ["10.88.0.2", "10.99.0.2"], ["10.77.0.2"])
+    MOVED = True
     # ---- redial: with nothing sent, D holds a new connection to P within 3 s ----
     redialled = until(lambda: held_to_p() not in (None, before), 3, 0.1)
     now = held_to_p()
@@ -277,7 +336,7 @@ except Apparatus as a:
     print(f"{TAG} APPARATUS: {a}", flush=True)
     code = 2
 except Product as e:
-    print(f"{TAG} PRODUCT: {e}", flush=True)
+    print(f"{TAG} {'PRODUCT' if MOVED else 'PRODUCT (staging)'}: {e}", flush=True)
     print(f"{TAG} RED", flush=True)
     code = 1
 except subprocess.TimeoutExpired as t:

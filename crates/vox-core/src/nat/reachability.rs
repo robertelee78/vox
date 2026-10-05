@@ -948,6 +948,8 @@ async fn connect_dialable(
 ///   refused by the kernel.
 /// - A loopback-bound socket reaches loopback only, and a link-local-bound IPv6 socket reaches
 ///   its link only: the source address has no route anywhere else.
+/// - A socket bound to another particular IPv6 address does not dial `::1`: it can send there, but
+///   no answer comes back (#414).
 #[must_use]
 pub fn can_send_to(local: SocketAddr, to: SocketAddr) -> bool {
     match local.ip() {
@@ -958,8 +960,12 @@ pub fn can_send_to(local: SocketAddr, to: SocketAddr) -> bool {
         IpAddr::V6(l) => match to {
             SocketAddr::V4(_) => false,
             SocketAddr::V6(t) => {
+                // Loopback to loopback only, both ways: a socket on another IPv6 address can send to
+                // `::1`, but the answer cannot come back, as the kernel refuses `::1` as the source
+                // of a datagram to a non-loopback address (measured, macOS; #414). IPv4 differs:
+                // `127.0.0.1` answers an address of this box.
                 t.ip().to_ipv4_mapped().is_none()
-                    && (!l.is_loopback() || t.ip().is_loopback())
+                    && l.is_loopback() == t.ip().is_loopback()
                     && (!l.is_unicast_link_local() || t.ip().is_unicast_link_local())
             }
         },

@@ -2628,11 +2628,30 @@ impl Joiner {
                     Err(_) => {}           // the grace is up: the loop takes the best answer
                 }
             }
-            if tokio::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline || self.no_way_to_a_board() {
                 return None;
             }
             tokio::time::sleep(Node::BOARD_RETRY).await;
         }
+    }
+
+    /// **No way to any board, and none can appear** (#414): no route names an address this
+    /// node's socket can dial, and nobody could carry a circuit — no connection, no dial under
+    /// way, no anchor known. A link's places are fixed for the join, so waiting out
+    /// [`Node::BOARD_PATIENCE`] could only end the same way: a guest on a routable IPv6 address
+    /// given only `[::1]` waited 30 s and was told the host "did not answer", having asked
+    /// nothing.
+    fn no_way_to_a_board(&self) -> bool {
+        let manager = self.net.manager();
+        self.routes.iter().all(|(_, endpoints)| {
+            crate::nat::reachability::dialable_candidates(
+                manager.endpoint(),
+                &crate::nat::reachability::direct_candidates(endpoints),
+            )
+            .is_empty()
+        }) && manager.peers().is_empty()
+            && !manager.any_direct_dial_under_way()
+            && self.net.policy().snapshot().anchor_count() == 0
     }
 
     /// Every board this join tried, each named as the room's host or an anchor, with the
@@ -2701,9 +2720,25 @@ impl Joiner {
         // kept for a join whose board answered and whose members did not.
         let Some(board) = self.reach_a_board().await else {
             steps.took("board (unreached)", t);
+            // Asked nobody: not "no answer", but why it could not ask (#414).
+            let why = if self.no_way_to_a_board() {
+                let local = self
+                    .net
+                    .manager()
+                    .endpoint()
+                    .local_addr()
+                    .map_or_else(|_| "?".to_owned(), |a| a.to_string());
+                format!(
+                    "this node's socket ({local}) cannot send to any address the link gives — {} \
+                     — and no anchor or member is connected to carry a circuit",
+                    self.boards_tried()
+                )
+            } else {
+                format!("no answer from {}", self.boards_tried())
+            };
             return Err(JoinerLost {
                 fault: Fault::BoardUnreachable,
-                why: vec![format!("no answer from {}", self.boards_tried())],
+                why: vec![why],
                 steps: JoinSteps::default(),
             });
         };

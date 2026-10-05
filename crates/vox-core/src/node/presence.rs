@@ -826,8 +826,14 @@ fn spawn_watcher(
         let mut before = NetShape::now().await;
         loop {
             if let Err(e) = watch.settled().await {
+                // Said once, as a failure to open is said at start: from here a move to another
+                // network is noticed only when a peer is lost.
+                let why = format!("the network event socket failed: {e}");
+                eprintln!(
+                    "vox: {why}; a move to another network is noticed only when a peer is lost"
+                );
                 if let Some(p) = presence.upgrade() {
-                    *lock(&p.unwatched) = Some(format!("the network event socket failed: {e}"));
+                    *lock(&p.unwatched) = Some(why);
                 }
                 return;
             }

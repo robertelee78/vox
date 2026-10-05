@@ -87,34 +87,61 @@ const NOT_HERE: &str = "the nonce kept on renewal, and the deletion at stop seen
 const NOT_AUTHORIZED: u8 = 2;
 
 /// The machine's IPv4 default gateway, as the operating system says it.
+///
+/// Asked again for up to 10 s: one `route -n get default` once printed no gateway while the
+/// machine had one (the next run passed), so a single answer is not taken as the machine's. What
+/// the command said, its status and its stderr included, is in the message when none comes.
 fn default_gateway() -> Ipv4Addr {
     let (cmd, args_): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("/sbin/route", &["-n", "get", "default"])
     } else {
         ("ip", &["-4", "route", "show", "default"])
     };
-    let out = std::process::Command::new(cmd)
-        .args(args_)
-        .output()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run {cmd}: {e}"));
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let found = if cfg!(target_os = "macos") {
-        text.lines()
-            .find_map(|l| l.trim().strip_prefix("gateway:").map(str::trim))
-            .map(str::to_owned)
-    } else {
-        text.split_whitespace()
-            .skip_while(|w| *w != "via")
-            .nth(1)
-            .map(str::to_owned)
-    };
-    found
-        .and_then(|g| g.parse().ok())
-        .unwrap_or_else(|| {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut said = Vec::new();
+    loop {
+        let out = std::process::Command::new(cmd)
+            .args(args_)
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot run {cmd}: {e}"));
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let found = if cfg!(target_os = "macos") {
+            text.lines()
+                .find_map(|l| l.trim().strip_prefix("gateway:").map(str::trim))
+                .map(str::to_owned)
+        } else {
+            text.split_whitespace()
+                .skip_while(|w| *w != "via")
+                .nth(1)
+                .map(str::to_owned)
+        };
+        if let Some(g) = found.and_then(|g| g.parse().ok()) {
+            if !said.is_empty() {
+                eprintln!(
+                    "[proof] `{cmd} {}` gave the gateway {g} after {} answer(s) without one:\n{}",
+                    args_.join(" "),
+                    said.len(),
+                    said.join("\n")
+                );
+            }
+            return g;
+        }
+        said.push(format!(
+            "{}; stdout: {text:?}; stderr: {:?}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+        if std::time::Instant::now() > deadline {
             panic!(
-                "CANNOT MEASURE (precondition unmet): this machine has no IPv4 default gateway:\n{text}"
-            )
-        })
+                "CANNOT MEASURE (precondition unmet): this machine has no IPv4 default gateway \
+                 (`{cmd} {}`, asked {} times over 10 s):\n{}",
+                args_.join(" "),
+                said.len(),
+                said.join("\n")
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 /// This machine's address towards `server`: a connected UDP socket's source, no packet sent.
