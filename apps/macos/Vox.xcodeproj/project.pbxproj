@@ -11,6 +11,8 @@
 		B0000000000000000000A002 /* VoxFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A002 /* VoxFFI.xcframework */; };
 		B0000000000000000000A003 /* us.vox.daemon.plist in Copy Launch Agent */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A003 /* us.vox.daemon.plist */; };
 		B0000000000000000000A004 /* us.vox.lanhelper.plist in Copy Launch Daemon */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A004 /* us.vox.lanhelper.plist */; };
+		B0000000000000000000A005 /* VoxTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A007 /* VoxTokens.swift */; };
+		B0000000000000000000A006 /* VoxTokens.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A008 /* VoxTokens.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -55,6 +57,8 @@
 		F0000000000000000000A004 /* us.vox.lanhelper.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = us.vox.lanhelper.plist; sourceTree = "<group>"; };
 		F0000000000000000000A005 /* Vox.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Vox.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0000000000000000000A006 /* VoxAppProofs.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VoxAppProofs.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F0000000000000000000A007 /* VoxTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = VoxTokens.swift; path = ../../target/theme/VoxTokens.swift; sourceTree = SOURCE_ROOT; };
+		F0000000000000000000A008 /* VoxTokens.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = VoxTokens.xcassets; path = ../../target/theme/VoxTokens.xcassets; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -108,6 +112,7 @@
 				D0000000000000000000A001 /* Vox */,
 				D0000000000000000000A002 /* VoxAppProofs */,
 				A0000000000000000000A002 /* VoxFFI */,
+				A0000000000000000000A007 /* Theme */,
 				A0000000000000000000A003 /* Bundle */,
 				A0000000000000000000A006 /* Products */,
 			);
@@ -120,6 +125,15 @@
 				F0000000000000000000A002 /* VoxFFI.xcframework */,
 			);
 			name = VoxFFI;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000A007 /* Theme */ = {
+			isa = PBXGroup;
+			children = (
+				F0000000000000000000A007 /* VoxTokens.swift */,
+				F0000000000000000000A008 /* VoxTokens.xcassets */,
+			);
+			name = Theme;
 			sourceTree = "<group>";
 		};
 		A0000000000000000000A003 /* Bundle */ = {
@@ -163,6 +177,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 80000000000000000000A002 /* Build configuration list for PBXNativeTarget "Vox" */;
 			buildPhases = (
+				E0000000000000000000A007 /* Generate Theme */,
 				E0000000000000000000A001 /* Sources */,
 				E0000000000000000000A002 /* Frameworks */,
 				E0000000000000000000A003 /* Resources */,
@@ -246,6 +261,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B0000000000000000000A006 /* VoxTokens.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -258,12 +274,39 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		E0000000000000000000A007 /* Generate Theme */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 0;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(PROJECT_DIR)/../../assets/theme/vox-tokens.json",
+			);
+			name = "Generate Theme";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(PROJECT_DIR)/../../target/theme/VoxTokens.swift",
+				"$(PROJECT_DIR)/../../target/theme/VoxTokens.xcassets",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			showEnvVarsInLog = 0;
+			shellScript = "# The app's colours, faces and motion, generated from the one token file (ADR-028 L-1).\nset -eu\nROOT=\"$PROJECT_DIR/../..\"\nPATH=\"$HOME/.cargo/bin:$PATH\"\ncargo run -q --manifest-path \"$ROOT/Cargo.toml\" -p vox-theme -- swift \"$ROOT/assets/theme/vox-tokens.json\" \"$ROOT/target/theme\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		E0000000000000000000A001 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				B0000000000000000000A001 /* vox_ffi.swift in Sources */,
+				B0000000000000000000A005 /* VoxTokens.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -332,6 +375,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Vox/Vox.entitlements;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -357,6 +401,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Vox/Vox.entitlements;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;

@@ -6,6 +6,7 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -14,7 +15,7 @@ struct RootView: View {
                 ProgressView("Reaching the vox daemon…")
             case let .unreachable(said):
                 Text("Vox could not reach the vox daemon.")
-                    .font(.headline)
+                    .font(Theme.heading)
                 Said(text: said)
                 Button("Try Again") { Task { await model.start() } }
                     .accessibilityIdentifier("retry")
@@ -30,6 +31,9 @@ struct RootView: View {
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .font(Theme.text)
+        .contentSurface()
+        .animation(Theme.motion(reduced: reduceMotion), value: model.phase)
     }
 }
 
@@ -38,7 +42,7 @@ private struct Said: View {
     let text: String
 
     var body: some View {
-        Label(text, systemImage: "exclamationmark.triangle")
+        StateMark(kind: .danger, words: text)
             .textSelection(.enabled)
             .accessibilityIdentifier("said")
             .accessibilityLabel("Failed: \(text)")
@@ -51,10 +55,11 @@ private struct Chooser: View {
     let model: AppModel
 
     var body: some View {
-        Text("Which node is this app?").font(.headline)
+        Text("Which node is this app?").font(Theme.heading)
         Text(
             "Vox acts as one node on this Mac: everything you post, trust and share is that node's."
         )
+        .secondaryText()
         if nodes.isEmpty {
             Text("There is no node on this Mac yet. Make one in Terminal with `vox node create <name>`, then try again.")
             Button("Try Again") { Task { await model.start() } }
@@ -78,8 +83,8 @@ private struct PassphraseForm: View {
     @State private var field = SecureFieldHolder()
 
     var body: some View {
-        Text("Attach node \(node)").font(.headline)
-        Text("Type node \(node)'s identity passphrase.")
+        Text("Attach node \(node)").font(Theme.heading)
+        Text("Type node \(node)'s identity passphrase.").secondaryText()
         SecureInput(holder: field) { submit() }
             .frame(width: 320)
             .accessibilityIdentifier("passphrase")
@@ -104,12 +109,13 @@ private struct Attached: View {
     let fingerprint: String
 
     var body: some View {
-        Label("Node \(node) — attached", systemImage: "checkmark.circle")
-            .font(.headline)
+        Text("Node \(node)").font(Theme.heading)
+        StateMark(kind: .plain, words: "attached")
             .accessibilityIdentifier("attached")
             .accessibilityLabel("Node \(node), attached")
+        Text("FINGERPRINT").font(Theme.eyebrow).secondaryText()
         Text(fingerprint)
-            .font(.system(.body, design: .monospaced))
+            .font(Theme.mono)
             .textSelection(.enabled)
             .accessibilityIdentifier("fingerprint")
     }

@@ -15,6 +15,8 @@ struct VoxApp: App {
         Window("Vox", id: "main") {
             RootView(model: delegate.model)
                 .frame(minWidth: 520, minHeight: 360)
+                // Dark is the one theme (ADR-028 L-2).
+                .preferredColorScheme(.dark)
         }
     }
 }
