@@ -28,6 +28,8 @@ pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 /// who was offline, or a sync that caught up (ADR-023 decision 1). It sits in its true place in
 /// history; without the marker it would go unseen above what the reader already read.
 pub const LATE_MARKER: &str = "[late] ";
+/// What begins the line under a message this node sent that names who has read it (ADR-028 R-6).
+pub const READ_BY: &str = "read by ";
 
 /// Where a member stands with you, in words: whether you trust it, and whether it reads you here.
 /// Nothing for yourself.
@@ -306,8 +308,19 @@ fn render_timeline(
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(body));
-            Line::from(spans)
+            // Under a message it sent, who has read it (ADR-028 R-6). Lines run newest first
+            // here, so it goes before the message's own.
+            let read_by = (!m.read_by.is_empty()).then(|| {
+                Line::from(Span::styled(
+                    format!("  {READ_BY}{}", m.read_by),
+                    Style::default().add_modifier(Modifier::DIM),
+                ))
+            });
+            read_by
+                .into_iter()
+                .chain(std::iter::once(Line::from(spans)))
         })
+        .flatten()
         .chain(notices.rev());
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines

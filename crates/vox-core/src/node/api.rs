@@ -484,6 +484,11 @@ pub struct ChannelDetail {
     /// Entries this node refused here as at or below their author's checkpoint since it opened
     /// the room (ADR-023 decision 3).
     pub refused_below_checkpoint: u64,
+    /// Who has read this node's own recent messages, as the read records it can open say
+    /// (ADR-028 RR-3, R-6): `(entry, readers)` for each of its newest
+    /// [`crate::node::channel::READ_BY_SHOWN`] messages that any member is known to have read,
+    /// oldest first. A member whose records this node cannot open is in none of them.
+    pub read_by: Vec<(Digest32, Vec<Digest32>)>,
 }
 
 /// The node's latest-wins view (published over a `watch`).

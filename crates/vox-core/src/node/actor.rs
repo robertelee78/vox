@@ -304,6 +304,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         received_key_generations: ch.received_key_generations(),
         frozen,
         refused_below_checkpoint,
+        read_by: ch.read_by_own(),
     }
 }
 
