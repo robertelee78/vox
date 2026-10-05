@@ -51,6 +51,8 @@ pub struct MemberView {
 /// the entry is render-gated *to you*; otherwise an honest non-leaking marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageView {
+    /// The message's entry hash.
+    pub entry_hash: Digest32,
     /// The author's composite-identity fingerprint (public).
     pub author: Digest32,
     /// The author's local nickname.

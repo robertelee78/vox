@@ -123,6 +123,8 @@ pub struct DaemonCore {
     notice: Option<String>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
+    /// The messages already told to the node as shown (ADR-028 RR-1).
+    marked: std::collections::BTreeSet<Digest32>,
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -273,6 +275,7 @@ impl DaemonCore {
             notify_off,
             notice: None,
             timeline: None,
+            marked: std::collections::BTreeSet::new(),
             ended: None,
             stop,
         };
@@ -830,6 +833,7 @@ impl DaemonCore {
             names.join(", ")
         };
         let view_of = |r: &MessageRow| MessageView {
+            entry_hash: r.entry_hash,
             author: r.author,
             author_nick: if me == Some(r.author) {
                 "you".to_owned()
@@ -1193,6 +1197,38 @@ impl CoreHandle for DaemonCore {
 
     fn apply(&mut self, command: Command) -> CommandStatus {
         self.apply_noting(command, &mut || {})
+    }
+
+    fn shown(&mut self, entries: &[Digest32]) {
+        let Some(cid) = self.active else {
+            return;
+        };
+        // Each message is told to the node once; the node keeps what it has recorded.
+        let new: Vec<Digest32> = entries
+            .iter()
+            .filter(|h| !self.marked.contains(*h))
+            .copied()
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let request = Request::MarkRead {
+            channel_id: cid,
+            entries: new.clone(),
+        };
+        match until_stopped(&self.rt, &self.stop, conn.client.request(&request)) {
+            Some(Ok(Frame::Ok)) => self.marked.extend(new),
+            Some(Ok(Frame::NodeDetached { .. })) => self.detached(),
+            // Not taken this time (a room not synced yet, say): asked again with the next frame.
+            Some(Ok(_)) | None => {}
+            Some(Err(e)) => {
+                self.ended
+                    .get_or_insert(format!("the vox daemon stopped answering: {e}"));
+            }
+        }
     }
 
     fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
