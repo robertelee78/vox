@@ -135,28 +135,42 @@ named: read records, the room's shared name, the decision record and the token f
 
 ### 5. Files
 
-- **F-1.** Dropping, pasting or attaching a file or folder in a room MUST be the whole of sharing
-  it: the client hands it to the daemon, which hashes it, serves it on a room-bound service and
-  posts the announcement (ADR-020 11.3). No foreground process is needed.
-- **F-2.** The daemon MUST serve an attached file until its announcement expires under the room's
-  retention, the sharer stops it, the sharer leaves the room, or the room ends. When it stops, every
-  receiver's client MUST treat the offer as gone, and a node whose retention removes the
-  announcement MUST delete its received copy's thumbnail and preview.
-- **F-3.** An image announcement MUST carry a thumbnail of at most 16 KB, a BlurHash and the image's
+Files and folders are temporary hand-offs between members, not a way to keep code in step: agents
+keep code in sync through GitHub.
+
+- **F-1.** A share MUST be a message, addressed like one. `vox share ROOM PATH [--to NODE]…
+  [--urgent] [-m NOTE]` MUST post one announcement carrying the note, the addressees (`to`, as
+  whole fingerprints, ADR-020 4.6) and the urgent flag, besides the name, size and SHA-256
+  (ADR-020 11.3). The note and the addressee MUST travel in the share itself, never as a separate
+  message. Dropping, pasting or attaching a file or folder in either client MUST do the same, with
+  the composer's To: and urgent switch (W-4).
+- **F-2.** The daemon MUST hash and serve the share on a room-bound service until the message
+  expires under the room's retention, the sharer stops it, the sharer leaves the room, or the room
+  ends. No foreground process is needed; `vox share` returns once the daemon serves.
+- **F-3.** A node MUST pull a share automatically when it is addressed to that node, or to no one,
+  and the sharer is in its keyring. Any other share MUST show as a card (name, size, note, sharer,
+  addressees, whether the sharer is online) that the person may pull with `vox room get` or the
+  card's action. Every pull MUST be verified (ADR-020 11.4) before it is shown or saved.
+- **F-4.** Pulled files MUST land in `<data root>/nodes/<node>/files/<room>/`. A person MAY also
+  save a copy elsewhere, for example `~/Downloads`; that copy is theirs and outlives the message.
+- **F-5.** When a share's message expires, every node MUST delete its pulled copy under
+  `files/<room>/`, its thumbnail and its preview, and the sharer's daemon MUST stop serving it.
+- **F-6.** An agent's node MUST give its agent, through its hook (ADR-020 6.6), the share's note and
+  the local path of the pulled copy. `--urgent` MUST wake an addressed agent as any addressed urgent
+  message does (ADR-020 6.2).
+- **F-7.** The sharer's card MUST show who has pulled the share, by alias, from its own daemon's
+  record of completed, verified fetches, beside the message's read receipts: `pulled by agent-2 ·
+  read by ann`.
+- **F-8.** A shared folder's announcement MUST carry a file list with each file's hash and size.
+  Pulling it again MUST fetch only new or changed files, and an interrupted pull MUST resume. The
+  sharer's folder is the source; there MUST be no live or two-way sync.
+- **F-9.** An image announcement MUST carry a thumbnail of at most 16 KB, a BlurHash and the image's
   dimensions inside the encrypted message, so a reader sees a preview while the sharer is offline.
-- **F-4.** A message carrying a URL MUST carry a link card (title, description, an image of at most
+- **F-10.** A message carrying a URL MUST carry a link card (title, description, an image of at most
   16 KB) fetched once by the **sender's** node and placed in the encrypted message. A reader's node
   MUST NOT contact the linked site.
-- **F-5.** A receiver's node MUST pull automatically only from sharers in its keyring, and only
-  within per-room rules whose default is images up to 10 MB; everything else MUST show as an offer
-  card with name, size, sharer and whether the sharer is online. Every pull MUST be verified
-  (ADR-020 11.4) before it is shown or saved.
-- **F-6.** The TUI MUST show images inline where the terminal supports it (kitty, iTerm2, sixel,
+- **F-11.** The TUI MUST show images inline where the terminal supports it (kitty, iTerm2, sixel,
   then half-blocks), only after verification; the app MUST show them inline and offer Quick Look.
-- **F-7.** A shared folder MUST be pulled on demand. Its announcement MUST carry a file list with
-  each file's hash and size; pulling it again MUST fetch only new or changed files, and an
-  interrupted pull MUST resume. The sharer's folder is the source; there MUST be no two-way or
-  automatic sync.
 
 ### 6. Read records
 
@@ -317,7 +331,7 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-015 6.4 | "The invite QR" | The room link QR (R-4) |
 | ADR-015 6.5 | "until members consent" | "until members trust you" (E-2) |
 | ADR-015 §7 (7.1–7.5) | Consent states, `:show`/`:hide`, Block | Removed (K-2, K-6) |
-| ADR-015 8.2 | Files via `vox room send`/`get` | F-1–F-7 |
+| ADR-015 8.2 | Files via `vox room send`/`get` | F-1–F-11 |
 | ADR-015 9.1 | "acts as the node the person picks (`:node <name>`)" | Acts only as the node it was opened with (E-4) |
 | ADR-015 14.1 | "verification, consent and Block render as colour, glyph and label" | Trust renders as glyph, weight and label (E-6, L-4) |
 | ADR-016 NR-17a | "A room's local name MUST live only in its sealed manifest" | The room's shared name lives on the log (R-1) |
@@ -326,9 +340,11 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-017 12.8 | Statement carries name, transport, shared or withdrawn | Also the detected kind (S-2) |
 | ADR-020 3.10 | "Not built" | Built by read records (§6) |
 | ADR-020 4.9a, last sentence | "It MUST NOT say a reply is overdue: a node cannot see another node's reads" | A node sees the reads it can open (RR-3); still no "overdue" claim |
-| ADR-020 11.1 | "File bytes MUST NOT enter the log" | Except a thumbnail and a link card of at most 16 KB each inside the encrypted message (F-3, F-4) |
-| ADR-020 11.6 | Share ends after `--count`, `--for` or ^C | The daemon serves until expiry, stop, leave or end (F-2) |
-| ADR-020 11.6 | A folder served as one tar | A file list with hashes, incremental and resumable (F-7) |
+| ADR-020 11.1 | "File bytes MUST NOT enter the log" | Except a thumbnail and a link card of at most 16 KB each inside the encrypted message (F-9, F-10) |
+| ADR-020 11.6 | Share ends after `--count`, `--for` or ^C | The daemon serves until expiry, stop, leave or end (F-2); a share is addressed like a message (F-1) |
+| ADR-020 11.6 | A folder served as one tar | A file list with hashes, incremental and resumable (F-8) |
+| ADR-020 11.5 | Default destination `downloads` setting, else `~/Downloads` | `<data root>/nodes/<node>/files/<room>/`; a person may save a copy elsewhere (F-4) |
+| ADR-020 11.2 | The receiver pulls when asked | Pulled automatically when addressed to this node or to no one, from a keyring member (F-3) |
 | ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
 
 ## Open for the decider
@@ -353,6 +369,8 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 - Read records add one small entry per reader per room every few seconds of reading, and expose to
   trusted members when each message was seen.
 - The daemon holds file offers and the proxy for as long as a node is attached.
+- Every member keyring-trusted by a sharer pulls an unaddressed share at once, so a large
+  unaddressed share costs every such member its size in transfer and disk until it expires.
 - Thumbnails and link cards put up to 32 KB of non-text bytes into a message; the sender's node
   contacts the linked site.
 - The release carries two signed artifacts on macOS, updated as one.
