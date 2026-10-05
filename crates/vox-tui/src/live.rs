@@ -124,6 +124,8 @@ pub struct DaemonCore {
     notify_off: bool,
     /// The most recent public notice: a room link, a join, a trust grant, a detach.
     notice: Option<String>,
+    /// The names two rooms here share, each already said once (ADR-028 R-3).
+    clashes_said: std::collections::BTreeSet<String>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
     /// The messages already told to the node as shown (ADR-028 RR-1).
@@ -326,6 +328,7 @@ impl DaemonCore {
             notify_to,
             notify_off,
             notice: None,
+            clashes_said: std::collections::BTreeSet::new(),
             timeline: None,
             marked: std::collections::BTreeSet::new(),
             mark_refused: None,
@@ -1038,6 +1041,20 @@ impl DaemonCore {
                 Reachability::Offline
             }
         };
+        // **Two rooms of one name are each shown by their room ID** (ADR-028 R-3), and why is said
+        // once, when it starts.
+        let names_here = || snap.rooms.iter().map(|r| r.name.as_deref());
+        let clashing = crate::room_cli::clashing_names(names_here().flatten());
+        for name in &clashing {
+            if self.clashes_said.insert((*name).to_owned()) {
+                self.notice = Some(format!(
+                    "{} rooms here are called {name}, so each is shown by its room ID until one \
+                     is renamed",
+                    names_here().filter(|n| *n == Some(*name)).count()
+                ));
+            }
+        }
+        self.clashes_said.retain(|n| clashing.contains(n.as_str()));
         let mut channels: Vec<ChannelSummary> = snap
             .rooms
             .iter()
@@ -1045,7 +1062,11 @@ impl DaemonCore {
                 open: c.open,
                 channel_id: c.channel_id,
                 name: match (&c.name, c.open) {
-                    (Some(n), _) => n.clone(),
+                    (Some(n), _) => vox_core::node::resolver::room_shown_here(
+                        Some(n),
+                        &c.channel_id,
+                        names_here(),
+                    ),
                     (None, true) => vox_core::node::resolver::room_shown(None, &c.channel_id),
                     (None, false) => format!("(closed {})", short_id(&c.channel_id)),
                 },
@@ -1084,7 +1105,11 @@ impl DaemonCore {
                 .find(|d| d.channel_id == cid)
                 .map(|d| ChannelView {
                     channel_id: d.channel_id,
-                    name: vox_core::node::resolver::room_shown(d.name.as_deref(), &d.channel_id),
+                    name: vox_core::node::resolver::room_shown_here(
+                        d.name.as_deref(),
+                        &d.channel_id,
+                        names_here(),
+                    ),
                     notices: d
                         .notices
                         .iter()

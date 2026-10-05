@@ -139,6 +139,25 @@ pub fn room_shown(name: Option<&str>, channel_id: &Digest32) -> String {
     }
 }
 
+/// How a room is named to a person on a node whose rooms are called `names_here` (ADR-028 R-3):
+/// as [`room_shown`] does, except that a name two rooms here have shows the room's whole id
+/// instead, until one is renamed.
+#[must_use]
+pub fn room_shown_here<'a>(
+    name: Option<&str>,
+    channel_id: &Digest32,
+    names_here: impl IntoIterator<Item = Option<&'a str>>,
+) -> String {
+    match name {
+        Some(n)
+            if !n.is_empty() && names_here.into_iter().filter(|h| *h == Some(n)).count() > 1 =>
+        {
+            b32_encode(channel_id)
+        }
+        _ => room_shown(name, channel_id),
+    }
+}
+
 /// What a name that is not `<service>.<node>.<room>.vox` resolves to: nothing. The sentence is
 /// for this machine's operator and names no service.
 fn nothing(hostname: &str) -> String {
