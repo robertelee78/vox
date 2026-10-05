@@ -263,9 +263,9 @@ offer can also mean missing trust; a hash failure means the received bytes do no
 signed announcement, not that the check should be disabled.
 
 **Check:** identify the sender and exact offer; ask whether `room send` or `share` is still
-running (a `share` with `--count` or `--for` stops by itself). In this release a fetch from an
-offer that has stopped can fail with a connection error such as `reading the reply: Connection
-reset by peer`. Inspect any reported size/hash or stall reason. If `--out` already exists, that
+running (a `share` with `--count` or `--for` stops by itself). A fetch from an offer that has
+stopped says `the offer of FILE is gone: NAME no longer serves it`; one whose sender cannot be
+reached says `the offer of FILE cannot be collected now` and gives the reason. Inspect any reported size/hash or stall reason. If `--out` already exists, that
 is local destination protection, not a transfer failure.
 
 **Fix:** have the sender re-offer the intended unchanged file if needed, then fetch again.

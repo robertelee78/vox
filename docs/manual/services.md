@@ -38,9 +38,18 @@ Several shares can be named at once, such as `vox serve ssh=22 dns=53/udp`; `--a
 endpoint other than `127.0.0.1:PORT`, and `--name` sets your local name for the new room (default
 `service`). A bare port is refused: `"22" has no name: every shared service is named`.
 
-`serve` then says who can reach it: **the nodes you have trusted, once they join**. Someone with
-the link and the passphrase who is not in your keyring reaches nothing. In this release `serve`
-states that rule; it does not yet list the members who can and cannot reach the service.
+`serve` then says who can reach it: **a member of this room you have trusted**. Someone with
+the link and the passphrase who is not in your keyring reaches nothing. It names them, by your
+names for them, and says it again as members join:
+
+```text
+who can reach it: a member of this room you have trusted (`vox trust add`)
+  a joiner with the address and the passphrase reaches NOTHING until then
+  can reach it now: nobody yet
+  in the room and cannot (not trusted): nobody
+```
+
+After a trusted member joins, it prints `can reach it now: ann`.
 
 On the guest:
 
