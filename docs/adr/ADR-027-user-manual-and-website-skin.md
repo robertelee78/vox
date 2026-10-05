@@ -7,7 +7,7 @@
 **Tags**: documentation, user-experience, website, troubleshooting
 **Related**: ADR-001, ADR-018, ADR-020, ADR-021, ADR-026
 
-ADR-026 is on `rearch/v030`; its existence is not a claim that those commands are released.
+ADR-026 ships in v0.3.0: `integrate/v0.3.0`, the v0.3.0 release candidate, contains `rearch/v030`.
 
 ## Context
 
@@ -20,8 +20,9 @@ publication. The manual may live in `docs/manual` in Vox. Its website must autom
 the canonical Markdown, following the existing hf2q.us pattern, rather than maintain a copied
 or manually pinned body of prose. Both repositories' changes must be committed and pushed.
 
-Research found three incompatible command surfaces: released v0.2.10, the older divergent
-`integrate/v0.3.0`, and node-based `rearch/v030`. A moving documentation source does not mean a
+Research found three incompatible command surfaces: released v0.2.10, an older
+`integrate/v0.3.0`, and node-based `rearch/v030`. `integrate/v0.3.0` has since merged
+`rearch/v030` and is the v0.3.0 release candidate, so v0.3.0 is the node-based surface. A moving documentation source does not mean a
 development command works in an installed release. Source code and observed behavior decide
 what instructions claim; an accepted but unimplemented ADR does not.
 
@@ -61,8 +62,8 @@ recipient's independently retained copy.
 
 ### D3 — Tell the truth about versions and evidence
 
-Every page shows applicability. Released v0.2.10 instructions are separate from a clearly marked
-development chapter for `rearch/v030`; the obsolete integration prototype is not a default guide.
+Every page shows applicability. The task chapters describe v0.3.0; readers coming from v0.2.10
+get a clearly marked chapter of what changed, so v0.2.10 instructions are never mixed into them.
 The installer follows the established `https://voxlux.us/install.sh` transport; GitHub remains
 the executable source of truth. Updating the manual must not change installer promotion policy.
 
