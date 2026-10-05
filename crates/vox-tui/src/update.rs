@@ -39,11 +39,19 @@ use sha2::{Digest, Sha256};
 
 use crate::app::AppError;
 
+#[cfg(target_os = "macos")]
+mod bundle;
+
 /// The repository releases are published from.
 const REPO: &str = "robertelee78/vox";
 
 /// Record identity. A file that does not say exactly this is not a vox release record.
 const RECORD_KIND: &str = "vox.standalone-release";
+/// The app's record identity (ADR-014 M-27): `app-<channel>-<triple>.json`, the same schema.
+#[cfg(target_os = "macos")]
+const APP_RECORD_KIND: &str = "vox.app-release";
+#[cfg(target_os = "macos")]
+const APP_PACKAGE: &str = "Vox.app";
 /// The record schema this binary understands.
 const RECORD_SCHEMA: u32 = 1;
 /// Marker identity.
@@ -70,6 +78,8 @@ const ROLLBACK_PARTIAL: &str = ".vox-rollback.partial";
 const MAX_RECORD_BYTES: usize = 4 * 1024;
 const MAX_MARKER_BYTES: usize = 4 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_APP_BYTES: u64 = 512 * 1024 * 1024;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 /// Only the macOS trust path reads a signature report, so this bound is macOS-only too.
 #[cfg(target_os = "macos")]
@@ -125,25 +135,32 @@ impl ReleaseRecord {
     /// # Errors
     /// [`AppError::Usage`] if the bytes are not strict schema-1 JSON, if the record's identity
     /// is not `vox`/`channel`/`target`, or if any field is not canonical.
-    fn validate(bytes: &[u8], channel: &str, target: &str) -> Result<Validated, AppError> {
+    fn validate(
+        bytes: &[u8],
+        identity: (&str, &str),
+        channel: &str,
+        target: &str,
+        max_size: u64,
+    ) -> Result<Validated, AppError> {
+        let (kind, package) = identity;
         if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
             return Err(usage("release record size is outside the supported bound"));
         }
         let record: Self = serde_json::from_slice(bytes)
             .map_err(|_| usage("release record is not strict schema-1 JSON"))?;
-        if record.kind != RECORD_KIND
+        if record.kind != kind
             || record.schema_version != RECORD_SCHEMA
-            || record.package != "vox"
+            || record.package != package
             || record.channel != channel
             || record.target != target
         {
             return Err(usage(format!(
-                "release record identity does not match vox/{channel}/{target}"
+                "release record identity does not match {package}/{channel}/{target}"
             )));
         }
         let version = semver::Version::parse(&record.version)
             .map_err(|_| usage("release record version is not SemVer"))?;
-        if record.size == 0 || record.size > MAX_BINARY_BYTES {
+        if record.size == 0 || record.size > max_size {
             return Err(usage("release record size is outside the supported bound"));
         }
         let mut sha256 = [0_u8; 32];
@@ -214,12 +231,10 @@ impl Marker {
 /// The target triple this binary was built for, or `"unsupported"`.
 #[must_use]
 pub fn target_triple() -> &'static str {
-    // Only the three targets ADR-015 ships are recognised; anything else has no release and
-    // says so rather than guessing at an asset name.
+    // Only the targets a release ships are recognised (ADR-014 M-26a: no Intel macOS); anything
+    // else has no release and says so rather than guessing at an asset name.
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "aarch64-apple-darwin"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         "x86_64-unknown-linux-gnu"
     } else {
@@ -234,6 +249,14 @@ pub enum Channel {
     Standalone {
         /// The directory holding `vox`, the marker, and `.vox-previous`.
         install_dir: PathBuf,
+        /// The release channel the marker names.
+        channel: String,
+    },
+    /// On macOS, the `vox` inside a Vox.app that `install.sh` installed (ADR-014 M-28): the
+    /// marker is beside the bundle, and an update replaces the whole bundle (M-29).
+    Bundle {
+        /// The folder holding `Vox.app`, the marker, and `.Vox.app.previous`.
+        apps_dir: PathBuf,
         /// The release channel the marker names.
         channel: String,
     },
@@ -257,6 +280,15 @@ pub enum Channel {
 /// marker is a broken install, not an unmanaged binary, and saying so beats guessing.
 pub fn detect_channel(exe: &Path) -> Result<Channel, AppError> {
     let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    if let Some(apps_dir) = bundle_apps_dir(&exe) {
+        let marker = apps_dir.join(MARKER_NAME);
+        if marker.is_file() {
+            return Ok(Channel::Bundle {
+                channel: Marker::read(&marker)?.channel,
+                apps_dir,
+            });
+        }
+    }
     if let Some(dir) = exe.parent() {
         let marker = dir.join(MARKER_NAME);
         if marker.is_file() {
@@ -274,6 +306,70 @@ pub fn detect_channel(exe: &Path) -> Result<Channel, AppError> {
         return Ok(Channel::Source { exe });
     }
     Ok(Channel::Unmanaged { exe })
+}
+
+/// The folder holding the bundle, when `exe` is `<folder>/Vox.app/Contents/Helpers/vox` on macOS.
+fn bundle_apps_dir(exe: &Path) -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let helpers = exe.parent()?;
+    let contents = helpers.parent()?;
+    let bundle = contents.parent()?;
+    let named = |p: &Path, name: &str| p.file_name().is_some_and(|n| n == name);
+    (named(exe, ACTIVE_NAME)
+        && named(helpers, "Helpers")
+        && named(contents, "Contents")
+        && named(bundle, "Vox.app"))
+    .then(|| bundle.parent().map(Path::to_path_buf))
+    .flatten()
+}
+
+// ---------------------------------------------------------------- where releases come from
+
+/// The releases every request is made under: GitHub's, in every build a person installs.
+///
+/// A build with `test-knobs` reads `VOX_TEST_RELEASE_BASE`, a loopback
+/// `http://127.0.0.1:<port>/releases`, so `update_proof` can drive a real update against a local
+/// release (#453). An environment variable that moves where a binary fetches its own replacement
+/// would be a vulnerability in a shipped build; no shipped build has this one (V210-105).
+fn releases_base() -> String {
+    #[cfg(feature = "test-knobs")]
+    if let Some(base) = test_release_base() {
+        return base;
+    }
+    format!("https://github.com/{REPO}/releases")
+}
+
+#[cfg(feature = "test-knobs")]
+fn test_release_base() -> Option<String> {
+    std::env::var("VOX_TEST_RELEASE_BASE")
+        .ok()
+        .filter(|b| b.starts_with("http://127.0.0.1:"))
+}
+
+/// Whether this run fetches from a test-knobs loopback release rather than GitHub.
+fn testing_against_loopback() -> bool {
+    #[cfg(feature = "test-knobs")]
+    {
+        test_release_base().is_some()
+    }
+    #[cfg(not(feature = "test-knobs"))]
+    {
+        false
+    }
+}
+
+/// Whether Apple must vouch for a candidate. Always, except against a test-knobs loopback
+/// release, whose bytes are a fixture rather than a release; there `VOX_TEST_APPLE_VERIFY=1`
+/// turns the check back on, which is how the proof measures that it refuses unsigned bytes.
+#[cfg(target_os = "macos")]
+fn apple_required() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os("VOX_TEST_APPLE_VERIFY").is_some() {
+        return true;
+    }
+    !testing_against_loopback()
 }
 
 // ---------------------------------------------------------------- transport
@@ -328,6 +424,9 @@ fn github_redirects() -> reqwest::redirect::Policy {
 /// than erroring, so without this a stopped redirect would be read as a response body.
 fn require_github_origin(response: &Response) -> Result<(), AppError> {
     let url = response.url();
+    if testing_against_loopback() && url.as_str().starts_with(&releases_base()) {
+        return Ok(());
+    }
     if url.scheme() != "https"
         || !matches!(
             url.host_str(),
@@ -388,8 +487,38 @@ fn read_bounded(response: Response, maximum: usize) -> Result<Vec<u8>, AppError>
 /// [`AppError::Usage`] if the platform has no release, the transfer fails or leaves GitHub, or
 /// the record does not validate.
 fn fetch_record(channel: &str, target: &str) -> Result<Validated, AppError> {
-    let name = format!("{channel}-{target}.json");
-    let url = format!("https://github.com/{REPO}/releases/latest/download/{name}");
+    fetch_named(
+        &format!("{channel}-{target}.json"),
+        (RECORD_KIND, "vox"),
+        channel,
+        target,
+        MAX_BINARY_BYTES,
+    )
+}
+
+/// Fetch and validate the newest Vox.app record for `channel` and this target.
+///
+/// # Errors
+/// As [`fetch_record`].
+#[cfg(target_os = "macos")]
+fn fetch_app_record(channel: &str, target: &str) -> Result<Validated, AppError> {
+    fetch_named(
+        &format!("app-{channel}-{target}.json"),
+        (APP_RECORD_KIND, APP_PACKAGE),
+        channel,
+        target,
+        MAX_APP_BYTES,
+    )
+}
+
+fn fetch_named(
+    name: &str,
+    identity: (&str, &str),
+    channel: &str,
+    target: &str,
+    max_size: u64,
+) -> Result<Validated, AppError> {
+    let url = format!("{}/latest/download/{name}", releases_base());
     let response = client(RECORD_TIMEOUT, github_redirects())?
         .get(&url)
         .header(ACCEPT_ENCODING, "identity")
@@ -404,7 +533,7 @@ fn fetch_record(channel: &str, target: &str) -> Result<Validated, AppError> {
         other => other,
     })?;
     let bytes = read_bounded(response, MAX_RECORD_BYTES)?;
-    ReleaseRecord::validate(&bytes, channel, target)
+    ReleaseRecord::validate(&bytes, identity, channel, target, max_size)
 }
 
 /// Stream the asset into `destination`, hashing as it arrives.
@@ -412,10 +541,15 @@ fn fetch_record(channel: &str, target: &str) -> Result<Validated, AppError> {
 /// The size bound is enforced **during** the transfer, not after it: a server that keeps
 /// sending is cut off at the first byte past what the record promised, rather than being
 /// allowed to fill the disk and fail the comparison afterwards.
-fn download_asset(release: &Validated, destination: &mut fs::File) -> Result<(), AppError> {
+fn download_asset(
+    release: &Validated,
+    asset: &str,
+    destination: &mut fs::File,
+) -> Result<(), AppError> {
     let url = format!(
-        "https://github.com/{REPO}/releases/download/v{}/vox-{}",
-        release.version_text, release.target
+        "{}/download/v{}/{asset}",
+        releases_base(),
+        release.version_text
     );
     let mut response = client(ASSET_TIMEOUT, github_redirects())?
         .get(&url)
@@ -748,6 +882,9 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
     let exe = std::env::current_exe()
         .map_err(|e| usage(format!("cannot locate the running binary: {e}")))?;
     let installed = detect_channel(&exe)?;
+    if let Channel::Bundle { apps_dir, channel } = &installed {
+        return run_bundle(apps_dir, channel, &exe, check_only, rollback);
+    }
 
     if rollback {
         let (install_dir, _) = owned(installed, "`vox update --rollback` will not touch it")?;
@@ -757,14 +894,14 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
     // The channel comes from the install's marker; a binary this tooling does not own still
     // gets to *ask* what the default channel holds, which is what `--check` is for.
     let channel = match &installed {
-        Channel::Standalone { channel, .. } => channel.clone(),
+        Channel::Standalone { channel, .. } | Channel::Bundle { channel, .. } => channel.clone(),
         Channel::Source { .. } | Channel::Unmanaged { .. } => DEFAULT_CHANNEL.to_owned(),
     };
     let target = target_triple();
     if target == "unsupported" {
         return Err(usage(
-            "this platform has no vox release (releases are built for x86_64 Linux and both macOS \
-             architectures)",
+            "this platform has no vox release (releases are built for x86_64 Linux and for Apple \
+             Silicon Macs on macOS 13 or later)",
         ));
     }
 
@@ -802,7 +939,11 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
         .prefix("vox-update.")
         .tempfile()
         .map_err(AppError::Io)?;
-    download_asset(&release, downloading.as_file_mut())?;
+    download_asset(
+        &release,
+        &format!("vox-{}", release.target),
+        downloading.as_file_mut(),
+    )?;
     downloading
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o555))
@@ -829,6 +970,27 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A Vox.app install: the whole bundle is updated or rolled back (ADR-014 M-29).
+#[cfg(target_os = "macos")]
+fn run_bundle(
+    apps_dir: &Path,
+    channel: &str,
+    exe: &Path,
+    check_only: bool,
+    rollback: bool,
+) -> Result<(), AppError> {
+    if rollback {
+        bundle::rollback(apps_dir, exe)
+    } else {
+        bundle::update(apps_dir, channel, exe, check_only)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn run_bundle(_: &Path, _: &str, _: &Path, _: bool, _: bool) -> Result<(), AppError> {
+    Err(usage("a Vox.app install exists only on macOS"))
+}
+
 /// The install directory and channel this tooling owns, or a refusal naming the way forward.
 fn owned(installed: Channel, what: &str) -> Result<(PathBuf, String), AppError> {
     match installed {
@@ -836,6 +998,10 @@ fn owned(installed: Channel, what: &str) -> Result<(PathBuf, String), AppError> 
             install_dir,
             channel,
         } => Ok((install_dir, channel)),
+        Channel::Bundle { apps_dir, .. } => Err(usage(format!(
+            "{} holds Vox.app, which is updated as a whole, so {what}",
+            apps_dir.display()
+        ))),
         Channel::Source { exe } => Err(usage(format!(
             "{} is a build from source, so {what}.\n       \
              Update it the way you built it:  git pull && cargo build --release",
