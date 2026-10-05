@@ -54,6 +54,7 @@ use tokio::sync::mpsc;
 
 use crate::error::Result;
 use crate::hash::Digest32;
+use crate::transport::quic::MAX_UDP_PAYLOAD;
 
 /// How many outbound datagrams a circuit will queue before dropping. A relay stream
 /// that cannot keep up is a slow path, and QUIC on a slow path drops packets — it
@@ -63,6 +64,10 @@ pub const CIRCUIT_QUEUE: usize = 256;
 /// How many inbound datagrams, across all circuits, are held for the endpoint before
 /// the oldest is dropped.
 const INBOX_LIMIT: usize = 1024;
+
+/// The most one UDP send may carry over IPv4: 65,535 less the IP and UDP headers. A GSO batch
+/// larger than this is refused by the kernel ([`MuxSocket`]'s `max_transmit_segments`).
+const MAX_UDP_DATAGRAM: usize = 65_507;
 
 /// The range circuit addresses are allocated inside: `240.0.0.0/4`, reserved by RFC 1112
 /// §4 and never routed on the public internet.
@@ -522,8 +527,20 @@ impl AsyncUdpSocket for MuxSocket {
         self.inner.local_addr()
     }
 
+    /// No more segments in one send than fit in one UDP datagram at the largest size this
+    /// endpoint sends.
+    ///
+    /// On Linux quinn sends up to 10 segments in one GSO `sendmsg`, and a send over 65,507 bytes
+    /// fails with `EMSGSIZE`, which quinn-udp takes for a refused MTU probe and drops without a
+    /// word. At [`MAX_UDP_PAYLOAD`] 8 to 10 segments are 65,536 to 81,920 bytes: measured on a
+    /// Linux host, every such batch vanished, quinn saw a run of large packets lost and nothing
+    /// small, took it for a black hole, and sent at 1,200 bytes for its 60 s cooldown. On a
+    /// congested link vox then carried 0.18x a competing Cubic flow; capped, 1.39x.
     fn max_transmit_segments(&self) -> usize {
-        self.inner.max_transmit_segments()
+        self.inner
+            .max_transmit_segments()
+            .min(MAX_UDP_DATAGRAM / usize::from(MAX_UDP_PAYLOAD))
+            .max(1)
     }
 
     fn max_receive_segments(&self) -> usize {
