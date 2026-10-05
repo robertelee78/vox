@@ -131,6 +131,8 @@ pub struct NetPresence {
     advertised: watch::Sender<Option<EndpointList>>,
     /// The gateway mappings in force, renewed and retried per address family (N-43).
     mapping: Mutex<Mapping>,
+    /// What the last discovery or renewal asked, per family, and what answered (N-54).
+    asks: Mutex<crate::nat::reachability::GatewayAsks>,
     /// The task that discovers, maps and renews.
     mapper: Mutex<Option<tokio::task::AbortHandle>>,
     /// Wakes the mapper for a discovery now.
@@ -296,6 +298,7 @@ impl NetPresence {
             accept,
             advertised: watch::channel(None).0,
             mapping: Mutex::new(Mapping::default()),
+            asks: Mutex::new(crate::nat::reachability::GatewayAsks::default()),
             mapper: Mutex::new(None),
             rediscover: Arc::new(tokio::sync::Notify::new()),
             discoveries: std::sync::atomic::AtomicU64::new(0),
@@ -378,6 +381,13 @@ impl NetPresence {
     #[must_use]
     pub fn port_mappings(&self) -> Vec<PortMapping> {
         lock(&self.mapping).held.clone()
+    }
+
+    /// What the last discovery or renewal asked, per address family, and which candidate
+    /// answered on which rung (N-54): what `vox status` names.
+    #[must_use]
+    pub fn gateway_asks(&self) -> crate::nat::reachability::GatewayAsks {
+        lock(&self.asks).clone()
     }
 
     /// How many discoveries (the ladder's publish side, with its gateway requests) this presence
@@ -556,7 +566,7 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                 };
                 (bound, Arc::clone(&p.rediscover))
             };
-            let (list, granted) =
+            let (list, granted, asks) =
                 crate::nat::reachability::advertise_endpoints(bound, &leased).await;
             let due = {
                 let Some(p) = presence.upgrade() else { return };
@@ -567,6 +577,7 @@ fn spawn_mapper(presence: std::sync::Weak<NetPresence>) -> tokio::task::AbortHan
                     leased = m.leased(now);
                     due
                 };
+                *lock(&p.asks) = asks;
                 p.discoveries
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 p.advertised.send_replace(Some(list));

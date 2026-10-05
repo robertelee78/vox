@@ -93,7 +93,32 @@ pub struct PortMapping {
     pub internal_port: u16,
     /// Which protocol rung granted the mapping.
     pub method: Method,
+    /// The server that granted it, where a renewal and the deletion go (N-55, N-56): the PCP or
+    /// NAT-PMP server's address, or a UPnP router's control address.
+    pub server: Option<SocketAddr>,
+    /// The PCP mapping nonce it was created with (RFC 6887 §11.1), which every renewal and the
+    /// deletion carry (N-55); `None` for NAT-PMP and UPnP, which have none.
+    pub nonce: Option<[u8; pcp::NONCE_LEN]>,
+    /// The node's routable address it was asked for: a renewal is for the same address only,
+    /// and a new address is a new mapping with a new nonce (N-55, N-51).
+    pub asked_for: Option<IpAddr>,
 }
+
+impl Method {
+    /// The rung's name as `vox status` says it (N-54): `PCP`, `NAT-PMP`, `UPnP-IGD`, `pinhole`.
+    #[must_use]
+    pub fn rung(self) -> &'static str {
+        match self {
+            Method::Pcp => "PCP",
+            Method::NatPmp => "NAT-PMP",
+            Method::UpnpIgd => "UPnP-IGD",
+            Method::PcpV6Pinhole => "pinhole",
+        }
+    }
+}
+
+/// How long the daemon's stop waits, in all, for its mappings' deletions (N-56).
+pub const UNMAP_PATIENCE: Duration = Duration::from_secs(2);
 
 /// RFC-style retransmission schedule (RFC 6886 §3.1 / RFC 6887 §8.1.1): start at
 /// 250 ms and double, a few times, before giving up on a rung.
@@ -130,6 +155,7 @@ async fn exchange(
 /// nonce could not be generated.
 async fn try_pcp(
     socket: &UdpSocket,
+    gateway: SocketAddr,
     protocol: Protocol,
     client_ip: Ipv4Addr,
     internal_port: u16,
@@ -159,6 +185,9 @@ async fn try_pcp(
             lifetime_secs: m.lifetime_secs,
             internal_port,
             method: Method::Pcp,
+            server: Some(gateway),
+            nonce: Some(nonce),
+            asked_for: None,
         })),
         Err(_) => Ok(None),
     }
@@ -200,6 +229,7 @@ pub async fn map_port(
     // short-circuits.
     if let Some(m) = try_pcp(
         &socket,
+        gateway,
         protocol,
         client_ip,
         internal_port,
@@ -234,6 +264,9 @@ pub async fn map_port(
         lifetime_secs: m.lifetime_secs,
         internal_port,
         method: Method::NatPmp,
+        server: Some(gateway),
+        nonce: None,
+        asked_for: None,
     })
 }
 
@@ -269,6 +302,9 @@ pub async fn map_port_upnp(
         lifetime_secs: granted,
         internal_port: port,
         method: Method::UpnpIgd,
+        server: Some(gw.control_host),
+        nonce: None,
+        asked_for: Some(IpAddr::V4(client_ip)),
     })
 }
 
@@ -299,6 +335,20 @@ pub async fn open_ipv6_pinhole(
     port: u16,
     lifetime_secs: u32,
 ) -> Result<PortMapping> {
+    let nonce: [u8; pcp::NONCE_LEN] = random_array()?;
+    pinhole_with(gateway, protocol, client_ip, port, lifetime_secs, nonce).await
+}
+
+/// [`open_ipv6_pinhole`] with the nonce given: a new pinhole's fresh one, or a held pinhole's own
+/// for its renewal (N-55).
+async fn pinhole_with(
+    gateway: SocketAddr,
+    protocol: Protocol,
+    client_ip: Ipv6Addr,
+    port: u16,
+    lifetime_secs: u32,
+    nonce: [u8; pcp::NONCE_LEN],
+) -> Result<PortMapping> {
     if !gateway.is_ipv6() {
         return Err(Error::PortMappingFailed("pinhole: gateway is not IPv6"));
     }
@@ -310,7 +360,6 @@ pub async fn open_ipv6_pinhole(
         .connect(gateway)
         .await
         .map_err(|_| Error::PortMappingFailed("pinhole: connect failed"))?;
-    let nonce: [u8; pcp::NONCE_LEN] = random_array()?;
     let request = pcp::encode_map_request_pinhole(&nonce, protocol, client_ip, port, lifetime_secs);
     let resp = exchange(&socket, &request, "pinhole: no response").await?;
     let m = pcp::parse_map_response(&resp, &nonce, protocol, port)?;
@@ -331,6 +380,9 @@ pub async fn open_ipv6_pinhole(
         lifetime_secs: m.lifetime_secs,
         internal_port: port,
         method: Method::PcpV6Pinhole,
+        server: Some(gateway),
+        nonce: Some(nonce),
+        asked_for: Some(IpAddr::V6(client_ip)),
     })
 }
 

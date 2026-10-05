@@ -180,6 +180,9 @@ pub struct GatewayStatus {
 pub struct GatewayFamily {
     /// The next hop and the interface it leaves by; `None` with no default route of the family.
     pub next_hop: Option<crate::nat::portmap::gateway::Hop>,
+    /// The gateway candidates the last discovery or renewal asked, and which answered on which
+    /// rung (N-54).
+    pub ask: crate::nat::reachability::GatewayAsk,
 }
 
 impl GatewayFamily {
@@ -192,7 +195,21 @@ impl GatewayFamily {
                 h.index
             )
         });
-        format!("{{\"next_hop\":{hop}}}")
+        let asked = self
+            .ask
+            .asked
+            .iter()
+            .map(|a| q(a))
+            .collect::<Vec<_>>()
+            .join(",");
+        let answered = self
+            .ask
+            .answered
+            .as_ref()
+            .map_or("null".to_owned(), |(at, m)| {
+                format!("{{\"address\":{},\"rung\":{}}}", q(at), q(m.rung()))
+            });
+        format!("{{\"next_hop\":{hop},\"asked\":[{asked}],\"answered\":{answered}}}")
     }
 }
 

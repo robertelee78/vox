@@ -170,6 +170,25 @@ fn render(v: &Value) -> String {
             }
         };
         let _ = writeln!(o, "  {family}  {said}");
+        // Who was asked for a mapping, and who answered on which rung (N-54).
+        let asked: Vec<&str> = g["asked"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let answer = &g["answered"];
+        let line = if asked.is_empty() {
+            "no gateway asked".to_owned()
+        } else if answer.is_null() {
+            format!("asked {}: none answered", asked.join(", "))
+        } else {
+            format!(
+                "asked {}: {} answered at {}",
+                asked.join(", "),
+                s(answer, "rung"),
+                s(answer, "address")
+            )
+        };
+        let _ = writeln!(o, "        {line}");
     }
     // **One listing of tunnels** (V210-81): each live tunnel once, from the node's one list,
     // whichever way it was opened. A forward is listed apart: it is a door, not a tunnel.

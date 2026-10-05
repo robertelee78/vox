@@ -479,3 +479,30 @@ pub mod macos {
         })
     }
 }
+
+/// The environment variable [`test_gateways`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
+pub const TEST_GATEWAY_ENV: &str = "VOX_TEST_GATEWAY";
+
+/// **The gateway override, for proofs only** (ADR-012 N-58): a comma-separated list of PCP
+/// server addresses (`127.0.0.1:40001,127.0.0.1:40002`) that replaces every candidate the
+/// machine would ask — the default route, `.1`, the anycast addresses and UPnP's SSDP search —
+/// so a proof's PCP stand-in is the only server asked. IPv4 entries are the IPv4 candidates and
+/// IPv6 entries the pinhole's. Unset, empty or unparsable is `None`: the real candidates.
+#[cfg(feature = "test-knobs")]
+#[must_use]
+pub fn test_gateways() -> Option<Vec<std::net::SocketAddr>> {
+    let text = std::env::var(TEST_GATEWAY_ENV).ok()?;
+    let list: Vec<std::net::SocketAddr> = text
+        .split(',')
+        .filter_map(|a| a.trim().parse().ok())
+        .collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// Without `test-knobs` there is no override: the real candidates, always.
+#[cfg(not(feature = "test-knobs"))]
+#[must_use]
+pub fn test_gateways() -> Option<Vec<std::net::SocketAddr>> {
+    None
+}

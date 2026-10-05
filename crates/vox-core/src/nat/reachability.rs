@@ -31,8 +31,44 @@ use crate::error::{Error, Result};
 use crate::hash::Digest32;
 use crate::nat::multiaddr::{EndpointList, Multiaddr};
 use crate::nat::portmap::{
-    gateway, gateway_addr, gateway_addr_v6, map_port, open_ipv6_pinhole, PortMapping, Protocol,
+    gateway, gateway_addr, gateway_addr_v6, map_port, open_ipv6_pinhole, Method, PortMapping,
+    Protocol,
 };
+
+/// What one address family's gateway work asked, and what answered (ADR-012 N-54).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayAsk {
+    /// Every candidate asked, in the order tried: a PCP or NAT-PMP server as `address:port`, and
+    /// UPnP's search as `UPnP search <multicast address>`. Empty when the family was not asked
+    /// (no routable address of it).
+    pub asked: Vec<String>,
+    /// The candidate that granted a mapping, and on which rung; `None` when none did.
+    pub answered: Option<(String, Method)>,
+}
+
+/// [`GatewayAsk`] for both families: what `vox status` names (N-54).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatewayAsks {
+    /// The IPv4 mapping's candidates.
+    pub ipv4: GatewayAsk,
+    /// The IPv6 pinhole's candidates.
+    pub ipv6: GatewayAsk,
+}
+
+impl GatewayAsk {
+    /// The ask over `asked`, answered by `won` if it granted.
+    fn of(asked: Vec<String>, won: Option<&PortMapping>) -> Self {
+        Self {
+            asked,
+            answered: won.map(|m| {
+                (
+                    m.server.map_or_else(|| "?".to_owned(), |s| s.to_string()),
+                    m.method,
+                )
+            }),
+        }
+    }
+}
 use crate::transport::quic::{VoxConnection, VoxEndpoint};
 
 /// The Happy-Eyeballs "Connection Attempt Delay" (RFC 8305 §5): how long to wait
@@ -196,7 +232,7 @@ pub async fn local_route_ip() -> Option<IpAddr> {
 pub async fn advertise_endpoints(
     bound: SocketAddr,
     leased: &[PortMapping],
-) -> (EndpointList, Vec<PortMapping>) {
+) -> (EndpointList, Vec<PortMapping>, GatewayAsks) {
     let bound_port = bound.port();
     let ips: Vec<IpAddr> = local_route_ips()
         .await
@@ -214,17 +250,17 @@ pub async fn advertise_endpoints(
     // The two families' gateway work runs at once: each is a few seconds of
     // retransmissions against candidates that may not answer, and they are
     // independent. Serialising them would double the wait for a dual-stack host.
-    let (pinhole, mapped) = tokio::join!(
+    let ((pinhole, ask_v6), (mapped, ask_v4)) = tokio::join!(
         async {
             match v6 {
                 Some(a) => pinhole_any(a, bound_port).await,
-                None => None,
+                None => (None, GatewayAsk::default()),
             }
         },
         async {
             match v4 {
                 Some(a) => map_port_any(a, bound_port).await,
-                None => None,
+                None => (None, GatewayAsk::default()),
             }
         },
     );
@@ -234,7 +270,11 @@ pub async fn advertise_endpoints(
         .find(|m| m.method != crate::nat::portmap::Method::PcpV6Pinhole)
         .filter(|_| v4.is_some());
     let list = compose_endpoints(bound, v6, v4, mapped.as_ref().or(held_v4));
-    (list, pinhole.into_iter().chain(mapped).collect())
+    let asks = GatewayAsks {
+        ipv4: ask_v4,
+        ipv6: ask_v6,
+    };
+    (list, pinhole.into_iter().chain(mapped).collect(), asks)
 }
 
 /// Whether a socket bound to `bound` receives datagrams sent to `ip`: any address of its family
@@ -304,24 +344,30 @@ fn compose_endpoints(
 
 /// Ask each candidate PCP server for an IPv6 pinhole on `port`, stopping at the first
 /// that grants one ([`gateway::server_candidates_v6`] supplies the order: the real
-/// default route, then the RFC 7723 anycast address).
-async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> Option<PortMapping> {
-    first_success(
-        gateway::server_candidates_v6()
+/// default route, then the RFC 7723 anycast address), and say what was asked (N-54).
+async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> (Option<PortMapping>, GatewayAsk) {
+    let candidates: Vec<SocketAddr> = match gateway::test_gateways() {
+        Some(list) => list.into_iter().filter(SocketAddr::is_ipv6).collect(),
+        None => gateway::server_candidates_v6()
             .into_iter()
-            .map(|(server, scope)| async move {
-                open_ipv6_pinhole(
-                    gateway_addr_v6(server, scope),
-                    Protocol::Udp,
-                    client_ip,
-                    port,
-                    PORT_MAP_LIFETIME_SECS,
-                )
-                .await
-                .ok()
-            }),
-    )
-    .await
+            .map(|(server, scope)| gateway_addr_v6(server, scope))
+            .collect(),
+    };
+    let asked = candidates.iter().map(ToString::to_string).collect();
+    let won = first_success(candidates.into_iter().map(|server| async move {
+        open_ipv6_pinhole(
+            server,
+            Protocol::Udp,
+            client_ip,
+            port,
+            PORT_MAP_LIFETIME_SECS,
+        )
+        .await
+        .ok()
+    }))
+    .await;
+    let ask = GatewayAsk::of(asked, won.as_ref());
+    (won, ask)
 }
 
 /// Ask each candidate gateway to forward `port`, stopping at the first that grants a
@@ -329,27 +375,48 @@ async fn pinhole_any(client_ip: Ipv6Addr, port: u16) -> Option<PortMapping> {
 /// [`crate::nat::portmap::map_port`]; if none grants one, **UPnP-IGD** is
 /// tried last (ADR-012 rung 2's full order) — it finds the router by SSDP rather
 /// than by address, which is why it is not one of the raced candidates.
-async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> Option<PortMapping> {
-    let raced = first_success(gateway::server_candidates_v4(client_ip).into_iter().map(
-        |server| async move {
-            map_port(
-                gateway_addr(IpAddr::V4(server)),
-                Protocol::Udp,
-                port,
-                port,
-                PORT_MAP_LIFETIME_SECS,
-            )
+///
+/// A proof's gateway override ([`gateway::test_gateways`]) replaces the candidates and leaves
+/// UPnP out, so nothing but the proof's stand-in is asked.
+async fn map_port_any(client_ip: Ipv4Addr, port: u16) -> (Option<PortMapping>, GatewayAsk) {
+    let (candidates, upnp): (Vec<SocketAddr>, bool) = match gateway::test_gateways() {
+        Some(list) => (
+            list.into_iter().filter(SocketAddr::is_ipv4).collect(),
+            false,
+        ),
+        None => (
+            gateway::server_candidates_v4(client_ip)
+                .into_iter()
+                .map(|server| gateway_addr(IpAddr::V4(server)))
+                .collect(),
+            true,
+        ),
+    };
+    let mut asked: Vec<String> = candidates.iter().map(ToString::to_string).collect();
+    let raced = first_success(candidates.into_iter().map(|server| async move {
+        map_port(server, Protocol::Udp, port, port, PORT_MAP_LIFETIME_SECS)
             .await
             .ok()
-        },
-    ))
+            .map(|m| PortMapping {
+                asked_for: Some(IpAddr::V4(client_ip)),
+                ..m
+            })
+    }))
     .await;
-    if raced.is_some() {
-        return raced;
+    if raced.is_some() || !upnp {
+        let ask = GatewayAsk::of(asked, raced.as_ref());
+        return (raced, ask);
     }
-    crate::nat::portmap::map_port_upnp(Protocol::Udp, port, client_ip, PORT_MAP_LIFETIME_SECS)
-        .await
-        .ok()
+    asked.push(format!(
+        "UPnP search {}",
+        crate::nat::portmap::upnp::SSDP_MULTICAST
+    ));
+    let won =
+        crate::nat::portmap::map_port_upnp(Protocol::Udp, port, client_ip, PORT_MAP_LIFETIME_SECS)
+            .await
+            .ok();
+    let ask = GatewayAsk::of(asked, won.as_ref());
+    (won, ask)
 }
 
 /// Run every future at once and return the first `Some`, abandoning the rest.
