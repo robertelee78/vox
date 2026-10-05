@@ -12,12 +12,16 @@
 //! (`vault.cbor`) could not be written and to check that the data directory is writable, and says
 //! neither "reopen the channel" nor the store; afterwards no `vault.cbor` exists.
 //!
+//! **The first run says a node has no backup** (ADR-028 K-8, #477): the first-run prompt, before
+//! anything is typed, says there is no backup of a node and that a lost machine means a new one,
+//! which everyone who trusts the old one untrusts.
+//!
 //! Which side a red is on: whatever `vox tui` did or failed to do is `PRODUCT:` (the driver's
 //! `RED: PRODUCT`, `HUNG at`, the wrong words). Only the driver's own machinery and the staging
 //! directories are `APPARATUS:`.
 //!
-//! Mutation that must turn it red: the TUI's create path mapping every failure to its generic
-//! `UiError::Storage` again.
+//! Mutations that must turn it red: the TUI's create path mapping every failure to its generic
+//! `UiError::Storage` again; the first-run prompt without its note.
 
 #![cfg(unix)]
 
@@ -83,6 +87,17 @@ fn a_tui_names_the_identity_file_it_could_not_write() {
         "APPARATUS: the TUI driver's own machinery failed (exit {:?}, stage {:?}): {said}",
         out.code,
         out.stage
+    );
+    let first_run = said
+        .lines()
+        .find_map(|l| l.strip_prefix("cargo FIRST RUN: "))
+        .unwrap_or_default();
+    assert!(
+        first_run.contains("there is no backup of a node")
+            && first_run.contains("if this machine is lost")
+            && first_run.contains("untrust it"),
+        "PRODUCT: the TUI's first run must say a node has no backup and what a lost machine \
+         means: it showed {first_run:?}"
     );
     let answer = said
         .lines()

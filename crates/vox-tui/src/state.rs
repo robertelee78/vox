@@ -61,6 +61,16 @@ impl PromptKind {
         }
     }
 
+    /// What the prompt says under its field, before the person goes on: making a node says it
+    /// has no backup (ADR-028 K-8).
+    #[must_use]
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            PromptKind::CreateIdentity => Some(crate::ident::NO_BACKUP),
+            _ => None,
+        }
+    }
+
     /// The prompt's title.
     #[must_use]
     pub fn title(self) -> &'static str {

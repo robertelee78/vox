@@ -4026,7 +4026,10 @@ pub fn print_identity(
         let passphrase = zeroize::Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
             paths, flag, file,
         )?);
-        crate::client::create_identity(paths, &passphrase)?
+        let made = crate::client::create_identity(paths, &passphrase)?;
+        // On stderr: stdout is the fingerprint alone, for a pipe.
+        eprintln!("vox: {}", crate::ident::NO_BACKUP);
+        made
     };
     // The whole fingerprint, alone on the line, so it pipes and pastes without editing.
     println!("{}", vox_core::node::link::b32_encode(&fingerprint));

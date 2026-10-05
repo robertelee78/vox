@@ -37,6 +37,11 @@
 //! aside: 1 and 2); a failed vault write reported as the store's (3); a failed attempt leaving its
 //! store behind (3); a failed attempt leaving the vault it renamed into place (4).
 //!
+//! **Making a node says it has no backup** (ADR-028 K-8, #477): the first `vox id` that makes an
+//! identity, and `vox node create`, each say there is no backup of a node and that a lost machine
+//! means a new one, which everyone who trusts the old one untrusts. Mutation: either sentence
+//! removed.
+//!
 //! **On review only**: the order of the writes. No staging through the binary fails the store's
 //! first write without something already at its path, which the move aside clears; the order is
 //! what keeps any other failure there from leaving a vault behind.
@@ -252,6 +257,30 @@ fn an_identity_made_over_a_leftover_store_unlocks() {
         first.ok,
         "PRODUCT (staging): the first vox id: {}{}",
         first.stdout, first.stderr
+    );
+    // Making a node says it has no backup, and what a lost machine means (ADR-028 K-8).
+    let no_backup = |said: &str| {
+        said.contains("there is no backup of a node")
+            && said.contains("if this machine is lost")
+            && said.contains("untrust it")
+    };
+    assert!(
+        no_backup(&first.stderr),
+        "PRODUCT: the `vox id` that made a node must say it has no backup: {:?}",
+        first.stderr
+    );
+    // In a data root of its own: a second node here would leave the daemon below none to choose.
+    let spare = Profile::new(tmp.path(), "spare").vox(&["node", "create", "spare"]);
+    eprintln!(
+        "[proof] vox node create spare said: {}{}",
+        spare.stdout, spare.stderr
+    );
+    assert!(
+        spare.ok && no_backup(&spare.stderr),
+        "PRODUCT: `vox node create` must say a node has no backup: ok={} {}{}",
+        spare.ok,
+        spare.stdout,
+        spare.stderr
     );
     let (answers, what) = p.daemon_answers();
     assert!(

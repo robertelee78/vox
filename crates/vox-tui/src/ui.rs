@@ -94,16 +94,31 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
 /// The masked onboarding/attach prompt: the current field's label and its
 /// **masked** value (one `•` per character for secret fields), never the text.
 fn render_prompt(frame: &mut Frame, area: Rect, p: &Prompt) {
-    let h = 5.min(area.height);
+    // A note gets the rows it wraps onto at this width, under the field.
+    let note_rows = p.kind.note().map_or(0, |n| {
+        u16::try_from(
+            n.chars()
+                .count()
+                .div_ceil(usize::from(area.width.saturating_sub(2).max(1))),
+        )
+        .unwrap_or(u16::MAX)
+    });
+    let h = 5u16.saturating_add(note_rows).min(area.height);
     let y = area.height.saturating_sub(h);
     let overlay = Rect::new(area.x, y, area.width, h);
     let step = format!("{}/{}", p.step + 1, p.kind.fields().len());
-    let body = vec![
-        Line::from(format!("{} ({step}): {}", p.label(), p.display())),
-        Line::from("Enter: next/submit · Esc: cancel"),
-    ];
-    let widget =
-        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(p.kind.title()));
+    let mut body = vec![Line::from(format!(
+        "{} ({step}): {}",
+        p.label(),
+        p.display()
+    ))];
+    if let Some(note) = p.kind.note() {
+        body.push(Line::from(note));
+    }
+    body.push(Line::from("Enter: next/submit · Esc: cancel"));
+    let widget = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(p.kind.title()));
     frame.render_widget(widget, overlay);
 }
 
