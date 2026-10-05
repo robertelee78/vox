@@ -298,7 +298,7 @@ fn a_daemon_serves_agent_sessions_with_no_terminal_and_survives_sighup() {
 
 /// Make the profile a person makes: `vox id`, a `vox daemon` holding it while `vox room
 /// create` makes the room, then that daemon stopped with SIGTERM and reaped. Returns the
-/// room's full id, from its invite link.
+/// room's full id, from its room link.
 fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
     let (ok, fp, err) = vox(data, cfg, &["id"]);
     assert!(ok, "PRODUCT (staging): `vox id` failed: {err}");
@@ -355,13 +355,13 @@ fn make_profile(data: &std::path::Path, cfg: &std::path::Path) -> String {
         .next()
         .unwrap_or_else(|| panic!("PRODUCT (staging): no room in `vox room list`: {listed:?}"))
         .to_owned();
-    let (ok, link, err) = vox(data, cfg, &["room", "invite", &label]);
-    assert!(ok, "PRODUCT (staging): `vox room invite` failed: {err}");
+    let (ok, link, err) = vox(data, cfg, &["room", "link", &label]);
+    assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
     let room = link
         .trim()
         .strip_prefix("vox://")
         .and_then(|l| l.split('?').next())
-        .unwrap_or_else(|| panic!("PRODUCT (staging): no invite link naming the room: {link:?}"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room link naming the room: {link:?}"))
         .to_owned();
 
     // Stopped as a service manager stops it, and waited for: the proof proper starts from

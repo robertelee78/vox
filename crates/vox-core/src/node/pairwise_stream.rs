@@ -142,21 +142,21 @@ impl PairwiseFrame {
                 channel_id: d
                     .bytes()?
                     .try_into()
-                    .map_err(|_| Error::MalformedBundle("pairwise channel_id length"))?,
+                    .map_err(|_| Error::MalformedBundle("pairwise room id length"))?,
                 sealed: d.bytes()?.to_vec(),
             },
             (OP_SKDM, 3) => Self::Skdm {
                 channel_id: d
                     .bytes()?
                     .try_into()
-                    .map_err(|_| Error::MalformedBundle("pairwise channel_id length"))?,
+                    .map_err(|_| Error::MalformedBundle("pairwise room id length"))?,
                 sealed: d.bytes()?.to_vec(),
             },
             (OP_HELLO, 3) => Self::Hello {
                 channel_id: d
                     .bytes()?
                     .try_into()
-                    .map_err(|_| Error::MalformedBundle("pairwise channel_id length"))?,
+                    .map_err(|_| Error::MalformedBundle("pairwise room id length"))?,
                 initial: d.bytes()?.to_vec(),
             },
             _ => return Err(Error::MalformedBundle("pairwise frame op")),

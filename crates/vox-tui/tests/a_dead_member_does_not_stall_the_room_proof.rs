@@ -338,7 +338,7 @@ fn a_dead_member_does_not_stall_the_room() {
         })
         .to_owned();
     let link = alice
-        .vox(&["room", "invite", &room], None)
+        .vox(&["room", "link", &room], None)
         .1
         .trim()
         .to_owned();

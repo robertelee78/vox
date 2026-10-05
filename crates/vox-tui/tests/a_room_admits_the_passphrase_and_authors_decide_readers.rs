@@ -303,8 +303,8 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in `vox room list`: {listed:?}"))
         .to_owned();
-    let (ok, link, err) = vox(&alice, &s(&["room", "invite", &room]), None);
-    assert!(ok, "PRODUCT (staging): room invite failed: {err}");
+    let (ok, link, err) = vox(&alice, &s(&["room", "link", &room]), None);
+    assert!(ok, "PRODUCT (staging): room link failed: {err}");
     let link = link.trim().to_owned();
 
     // ---- claim 1: a wrong passphrase is refused, and the refusal names the passphrase ----

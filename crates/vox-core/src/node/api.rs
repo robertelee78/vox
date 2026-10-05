@@ -1020,7 +1020,7 @@ pub enum Fault {
     /// v0.3.0 does not read it, and the room is made again (decider, 2026-09-29, #226).
     RoomFromBeforeV030,
     /// A service removal named a tag this room does not offer. Not [`Fault::UnknownChannel`],
-    /// which said "no such room in this profile" about a room that was right there (V210-83).
+    /// which said "no such room on this node" about a room that was right there (V210-83).
     NotOffered,
     /// A share named a service this node already shares in the room under that name (V030-25):
     /// names are unique per node per room, because the name is the address.
@@ -1053,9 +1053,9 @@ impl Fault {
     pub fn explain(self) -> &'static str {
         match self {
             Fault::NoIdentity => {
-                "this profile has no identity yet\n       create one with `vox id` (or start `vox tui`)"
+                "this node has no identity yet\n       create one with `vox id` (or start `vox tui`)"
             }
-            Fault::IdentityExists => "this profile already has an identity",
+            Fault::IdentityExists => "this node already has an identity",
             Fault::Locked => {
                 "the identity is locked\n       unlock it: pipe the identity passphrase to `vox daemon`, or run `vox tui`"
             }
@@ -1064,7 +1064,7 @@ impl Fault {
                 "changing who you trust needs your identity passphrase again: it was last entered more than 30 minutes ago\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
             }
             Fault::UnknownChannel => {
-                "no such room in this profile\n       `vox room list` shows the rooms it holds"
+                "no such room on this node\n       `vox room list` shows the rooms it holds"
             }
             Fault::ChannelNotOpen => {
                 "that room is not open on this node\n       open it with its passphrase: a line `<room> <passphrase>` to `vox daemon`, or in `vox tui`"
@@ -1082,20 +1082,20 @@ impl Fault {
                 })
             }
             Fault::Storage => {
-                "the profile's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
+                "the node's store could not be read or written\n       check free disk space, and that the data directory is writable and its files undamaged"
             }
             Fault::ProfileBusy => {
-                "another vox holds this profile open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
+                "another vox holds this node open, and only one at a time may write it\n       run this again once that one is done; a `vox daemon` or `vox tui` holds it until stopped, and the `vox room …` verbs ask it instead"
             }
             Fault::RetentionFileUnwritable => {
                 "your retention for this room could not be saved: the node's retention file (`retention`, in its configuration directory) could not be written\n       check free disk space, and that the configuration directory is writable; then run it again"
             }
             Fault::IdentityFileUnwritable => {
-                "the profile's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
+                "the node's identity file (vault.cbor) could not be written, so no identity was made\n       check free disk space, and that the data directory is writable; then run it again"
             }
             Fault::SealedUnreadable => {
-                "the identity passphrase is right, but this profile's trust keyring, pending \
-                 consents or prekey ring will not open under it\n       the store was altered, \
+                "the identity passphrase is right, but this node's trust keyring, pending \
+                 trust grants or prekey ring will not open under it\n       the store was altered, \
                  or copied from another identity's profile"
             }
             Fault::ShuttingDown => "the node is shutting down",
@@ -1131,7 +1131,7 @@ impl Fault {
                 "that member is not admitted to the room on this node yet\n       it is, once this node syncs their records; then try again"
             }
             Fault::NotConsented => {
-                "there is nothing to withdraw: that identity was never trusted or consented to, or already is not"
+                "there is nothing to withdraw: that identity was never trusted, or already is not"
             }
             Fault::NotTrusted => {
                 "that identity is not in your trust keyring, so it is given no key to read you\n       run `vox trust add <fingerprint>` if you mean it to read you"
@@ -1147,7 +1147,7 @@ impl Fault {
             }
             Fault::BindFailed => "a local address it was asked to use could not be listened on",
             Fault::AlreadyMember => {
-                "this profile already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
+                "this node already holds that room — there is nothing to join\n       `vox room list` shows it; open it with its passphrase if it is closed"
             }
             Fault::RoomNotSynced => {
                 "this room was joined and has not yet synced with another member, so nothing can be written to it\n       try again once a member is reachable"
@@ -1186,7 +1186,7 @@ impl Fault {
                 "that member is not an admin of the room\n       `vox room admin list` shows who is"
             }
             Fault::RoomFromBeforeV030 => {
-                "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and invite its members"
+                "this room was made by vox before v0.3.0, and its message format changed, so this vox cannot open it\n       make the room again (`vox room create`) and give its members its room link (`vox room link`)"
             }
             Fault::NotOffered => {
                 "that service is not offered in this room\n       check its name: it is the tag that was given to `vox service add`"

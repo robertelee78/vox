@@ -318,7 +318,7 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("a room id")
         .to_owned();
-    let (ok, link, err) = vox(&alice_dir, &["room", "invite", &room], None);
+    let (ok, link, err) = vox(&alice_dir, &["room", "link", &room], None);
     assert!(ok, "invite: {err}");
 
     let (ok, _, err) = vox(

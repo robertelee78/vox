@@ -4,7 +4,7 @@
 //! Every participant is the shipped binary, driven as a person would (ADR-018, "Only real use
 //! of the product is a test"): an anchor (`vox node`), and alice and bob, each a `vox daemon`
 //! made with `vox id`, trusting each other with `vox trust add`, sharing one room made with
-//! `vox room create`, `vox room invite` and `vox room join`. What the proof reads is what a
+//! `vox room create`, `vox room link` and `vox room join`. What the proof reads is what a
 //! person can read: `vox status --json`, and what the daemon prints.
 //!
 //! alice's node is set (`notify-command` in its own `config/config`, ADR-026 F-2) to hand
@@ -287,8 +287,8 @@ fn scene(
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("PRODUCT (staging): the room alice made is not listed: {list}"))
         .to_owned();
-    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "invite", &room]));
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox_once(&alice_dir, &args(&["room", "link", &room]));
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let deadline = Instant::now() + SETUP;
     loop {
         let (ok, out, err) = vox_in(

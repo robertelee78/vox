@@ -31,16 +31,25 @@ vox serve ssh=22
 ```
 
 `serve` creates a room, shares `127.0.0.1:22` in it as `ssh`, and keeps running. It prints the
-room ID, the room link, a generated room passphrase (`^ send this by a different channel than the
-address`) and the address the service answers on, with fingerprints in the node and room places.
+room ID, the room link, a generated room passphrase (`^ send this another way than the address (in
+person, a call, a different app)`) and the address the service answers on, with fingerprints in the node and room places.
 Send the link and the passphrase separately. Protect this output: it includes the room passphrase.
 Several shares can be named at once, such as `vox serve ssh=22 dns=53/udp`; `--at` names a local
 endpoint other than `127.0.0.1:PORT`, and `--name` sets your local name for the new room (default
 `service`). A bare port is refused: `"22" has no name: every shared service is named`.
 
-`serve` then says who can reach it: **the nodes you have trusted, once they join**. Someone with
-the link and the passphrase who is not in your keyring reaches nothing. In this release `serve`
-states that rule; it does not yet list the members who can and cannot reach the service.
+`serve` then says who can reach it: **a member of this room you have trusted**. Someone with
+the link and the passphrase who is not in your keyring reaches nothing. It names them, by your
+names for them, and says it again as members join:
+
+```text
+who can reach it: a member of this room you have trusted (`vox trust add`)
+  a joiner with the address and the passphrase reaches NOTHING until then
+  can reach it now: nobody yet
+  in the room and cannot (not trusted): nobody
+```
+
+After a trusted member joins, it prints `can reach it now: ann`.
 
 On the guest:
 
@@ -117,8 +126,7 @@ vox forward ssh.robertgpt.family.vox 127.0.0.1:2222
 It prints `forwarding 127.0.0.1:2222 to ssh on ssh.robertgpt.family.vox` and runs until Ctrl-C.
 It is a client of the daemon, so nothing else needs stopping. Point the tool at loopback port
 2222; for SSH, `ssh -p 2222 SSH_USER@127.0.0.1`. Do not bind a forward publicly unless you
-explicitly intend other local-network users to access it. The older three-part form, room then
-member then service, is gone in this release.
+explicitly intend other local-network users to access it.
 
 `vox status` lists live tunnels under `tunnels`. `vox tunnel close MEMBER [SERVICE]`, or
 `vox tunnel close --id NUMBER`, closes them.

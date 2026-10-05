@@ -92,7 +92,7 @@ struct Daemon {
     child: Child,
     data: PathBuf,
     cfg: PathBuf,
-    /// The room's full base32 key, from its invite link.
+    /// The room's full base32 key, from its room link.
     room_key: String,
     /// This identity's fingerprint, as `vox id` prints it.
     fingerprint: String,
@@ -165,14 +165,14 @@ impl Daemon {
             .next()
             .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` named no room: {list:?}"))
             .to_owned();
-        let (ok, link, err) = hook(&data, &cfg, &["room", "invite", &label], "");
-        assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
+        let (ok, link, err) = hook(&data, &cfg, &["room", "link", &label], "");
+        assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
         let room_key = link
             .trim()
             .strip_prefix("vox://")
             .and_then(|l| l.split('?').next())
             .unwrap_or_else(|| {
-                panic!("PRODUCT (staging): `vox room invite` printed no link: {link:?}")
+                panic!("PRODUCT (staging): `vox room link` printed no link: {link:?}")
             })
             .to_owned();
         Self {

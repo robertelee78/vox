@@ -356,8 +356,8 @@ fn removing_one_member_rotates_the_key_in_every_shared_room_and_keeps_the_others
         );
         assert!(ok, "PRODUCT (staging): vox room create {name} failed: {e}");
         let room = room_id(&alice, name);
-        let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
-        assert!(ok, "PRODUCT (staging): vox room invite {name} failed: {e}");
+        let (ok, link, e) = alice.vox(&["room", "link", &room], None);
+        assert!(ok, "PRODUCT (staging): vox room link {name} failed: {e}");
         join(&bob, link.trim(), name);
         join(&carol, link.trim(), name);
         rooms.push((name, room));

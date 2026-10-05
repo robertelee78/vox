@@ -47,9 +47,9 @@ vox room list
 
 A new node prints `no rooms`. If you see `no vox daemon is running for this data root, so node
 robertgpt is not attached`, run `vox node attach robertgpt` again; see
-[the node is not attached](troubleshooting.md#no-node-is-running-for-this-profile).
+[the node is not attached](troubleshooting.md#the-node-is-not-attached).
 
-## 3. One person creates and invites
+## 3. One person creates the room and shares its link
 
 The person creating the room runs:
 
@@ -63,12 +63,13 @@ person's identity passphrase. `room create` prints `vox: created family`. Copy t
 `vox room list`, for example `bmbkjywlgzar  family`. In examples below, replace `ROOM_ID` with it:
 
 ```sh
-vox room invite ROOM_ID
+vox room link ROOM_ID
 ```
 
-The command is still called `invite`; what it prints is the **room link**, a `vox://…` address,
-on standard output. Its other lines go to standard error: they describe how the link names this
-host and remind you that the link grants nothing by itself.
+`room link` prints the **room link**, a `vox://…` address, on standard output. Its other lines
+go to standard error: they describe how the link names this host, say `send the passphrase
+another way than this address (in person, a call, a different app)`, and remind you that the
+link grants nothing by itself.
 
 Send the complete link to the other person. Send or say the room passphrase by a different way.
 Keep a room member online for the join. If both hosts cannot reach each other directly, read
@@ -154,7 +155,7 @@ nodes.
 
 On the room list: `:new` creates a room and `:join` takes a room link, both through a masked
 passphrase prompt; Enter or `:open` opens the selected room; `t` or `:tunnels` lists live
-tunnels. In a room: `:invite` prints its link, `:close` closes it on this node, `:leave` leaves
+tunnels. In a room: `:link` prints its link, `:close` closes it on this node, `:leave` leaves
 it, `:end` ends it for everyone (creator or admin only), and `:back` or Esc returns to the list.
 `:quit` exits. The members pane states trust in words, such as `trusted · reads you`. Use the
 same fingerprints and room IDs whichever client you choose.

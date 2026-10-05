@@ -35,7 +35,7 @@ under Codex, pass `--node <your node>` to each `vox` command yourself.
 
 Your first turn with the hooks in place starts Vox's daemon if none runs and brings your
 node up; nothing else is needed. To join a room, send the operator your fingerprint
-(`vox id`) and ask for an invite, then join it: `vox room join --passphrase-file - <link>`,
+(`vox id`) and ask for the room link and its passphrase, then join it: `vox room join --passphrase-file - <link>`,
 with the room's passphrase on stdin.
 
 ## The room and the issue

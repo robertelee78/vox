@@ -11,7 +11,7 @@
 //! One member being away is not the room being gone.
 //!
 //! ## The staging
-//! 1. Alice creates the room and mints the link with `vox room invite`. A link minted by a
+//! 1. Alice creates the room and mints the link with `vox room link`. A link minted by a
 //!    node **pins that node** (`r=<alice>`), so Alice is, by the product's own rule, the first
 //!    member any joiner reaches for. The proof asserts the pin is there rather than hoping.
 //! 2. Bob joins, and Alice and Bob trust each other; the room is ready when each has rendered
@@ -319,7 +319,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
         .next()
         .expect("PRODUCT: the new room in `vox room list`")
         .to_owned();
-    let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
+    let (ok, link, e) = alice.vox(&["room", "link", &room], None);
     assert!(ok, "PRODUCT (staging): invite: {e}");
     let link = link.trim().to_owned();
     let pinned = link
@@ -329,7 +329,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     assert_eq!(
         pinned.as_deref(),
         Some(alice.fp.as_str()),
-        "PRODUCT (staging): the link `vox room invite` printed does not pin alice, so alice is not \
+        "PRODUCT (staging): the link `vox room link` printed does not pin alice, so alice is not \
          provably the first member a join reaches for: {link}"
     );
 

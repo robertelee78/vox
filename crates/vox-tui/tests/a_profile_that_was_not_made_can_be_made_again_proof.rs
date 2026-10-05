@@ -7,7 +7,7 @@
 //! open that one ("store is missing the identity fingerprint") — and the repair its comment
 //! promised did not exist. And `vox id` in a profile whose vault was gone made the new identity
 //! **over** the old store, full of what was sealed under the old identity: the new one then never
-//! unlocked ("this profile's trust keyring, pending consents or prekey ring will not open").
+//! unlocked ("this node's trust keyring, pending consents or prekey ring will not open").
 //!
 //! The store is now written first and the vault last, so a failure leaves no identity; and a store
 //! with no vault beside it is moved aside (kept, renamed `store.redb.orphaned-<secs>`), never

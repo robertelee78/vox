@@ -68,23 +68,15 @@ Vox process when it is safe to interrupt its rooms and services. Agent coordinat
 participants to run the same Vox version; update the group deliberately, not one worker in
 the middle of a claim.
 
-## Data from an earlier release
-
-Vox reads only data in this version's layout. A data directory a release before v0.3.0 wrote is
-refused by every command, saying it is not a Vox data directory this version reads, and is left
-exactly as it was. Start Vox with a new data directory (`--data-dir` or `VOX_DATA_DIR`), or move
-the old one aside; identities and rooms are made again.
-
 ## Roll back the binary
 
 ```sh
 vox update --rollback
 ```
 
-This restores the binary retained by the updater. It is **not a state-directory rollback**,
-and does not guarantee that an older binary reads data a newer one wrote. Read
-the target release's compatibility notes before crossing a format or major command-surface
-change. Do not open valuable state with a guessed older executable.
+This restores the binary retained by the updater. It is **not a state-directory rollback**:
+your nodes and rooms stay as the replaced binary left them, and the restored binary is not
+guaranteed to read them. Do not open valuable state with a guessed executable.
 
 ## Remove shell integration or the executable
 
@@ -107,6 +99,4 @@ Follow [Your first shared room](first-room.md). If installation fails, keep the 
 use [Get help safely](getting-help.md); never paste signing bypasses or secrets into a retry.
 
 Source: [installer](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/install.sh),
-[update implementation](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/update.rs),
-[profile-to-node move](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-core/src/node/layout.rs)
-and [the pre-v0.3.0 room refusal](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-core/src/node/api.rs).
+and [update implementation](https://github.com/robertelee78/vox/blob/82523cebc870a29e0947b0cb7c20b4563d233966/crates/vox-tui/src/update.rs).

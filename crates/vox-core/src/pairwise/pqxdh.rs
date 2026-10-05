@@ -313,7 +313,7 @@ pub fn accept(
     floor: SuiteFloor,
 ) -> Result<ResponderHandshake> {
     if &message.channel_id != channel_id || message.epoch != epoch {
-        return Err(Error::MalformedBundle("pqxdh-init channel/epoch mismatch"));
+        return Err(Error::MalformedBundle("pqxdh-init room/epoch mismatch"));
     }
     // Floor-gated downgrade rejection (ADR-003).
     floor.check(message.suite_id)?;

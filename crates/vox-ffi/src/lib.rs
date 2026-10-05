@@ -164,7 +164,7 @@ impl VoxNode {
         let node = rt
             .spawn(async move {
                 let paths = Paths::resolve("default", Some(&dir), Some(&dir.join("config")))
-                    .map_err(|e| failed(format!("profile directory: {e}")))?;
+                    .map_err(|e| failed(format!("node directory: {e}")))?;
                 let node = Node::spawn_networked(paths, bind)
                     .map_err(|e| failed(format!("starting the node: {e}")))?;
                 let secret = Secret::new(passphrase.into_bytes());
@@ -321,7 +321,7 @@ impl VoxNode {
         self.on_node(async move {
             let mut events = node.subscribe();
             outcome(
-                "inviting",
+                "making the room link",
                 node.apply(NodeCommand::Invite { channel_id }).await,
             )?;
             loop {

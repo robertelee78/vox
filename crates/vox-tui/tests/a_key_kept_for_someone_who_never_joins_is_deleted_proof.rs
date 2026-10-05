@@ -11,7 +11,7 @@
 //! ```text
 //! vox id; vox trust add dave …, bob …   # alice trusts dave (who never joins) and bob
 //! vox daemon; vox room create; post     # alice's room, kept forever (no retention)
-//! vox room invite / join                # bob joins and reads
+//! vox room link / join                # bob joins and reads
 //! vox trust remove bob                  # rotates alice's sender key: two generations
 //! (restart alice, clock stepped 29 days) # control: both still held
 //! (restart alice, clock stepped 31 days) # the claim: only the live one is held
@@ -241,8 +241,8 @@ fn a_key_kept_for_someone_who_never_joins_is_deleted_after_thirty_days() {
         .next()
         .expect("PRODUCT (staging): vox room list shows no room after create")
         .to_owned();
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         &bob,
         &[

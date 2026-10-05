@@ -416,7 +416,7 @@ impl Genesis {
     pub fn accept_for_channel(&self, expected_channel_id: &Digest32) -> Result<()> {
         if !self.matches_channel_id(expected_channel_id) {
             return Err(Error::MalformedGovernance(
-                "genesis hash != expected channelID",
+                "genesis hash != expected room id",
             ));
         }
         self.verify()

@@ -240,8 +240,8 @@ fn retrust(freeze: Duration, through_log: bool) {
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in `vox room list`: {listed:?}"))
         .to_owned();
-    let (ok, link, err) = vox(alice_dir, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): room invite failed: {err}");
+    let (ok, link, err) = vox(alice_dir, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): room link failed: {err}");
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,

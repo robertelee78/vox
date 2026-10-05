@@ -332,8 +332,8 @@ fn a_crash_inside_a_join_never_costs_the_member_the_room() {
             .map(str::to_owned)
             .find(|w| !before.contains(w))
             .expect("PRODUCT (staging): no new room id in the host's `room list`");
-        let (ok, link, err) = vox(&host, &["room", "invite", &room], None);
-        assert!(ok, "PRODUCT (staging): host{k}'s room invite: {err}");
+        let (ok, link, err) = vox(&host, &["room", "link", &room], None);
+        assert!(ok, "PRODUCT (staging): host{k}'s room link: {err}");
         let link = link.trim().to_owned();
         let join = || {
             vox(
@@ -536,8 +536,8 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
         .find(|w| w.len() >= 8 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .map(str::to_owned)
         .expect("PRODUCT (staging): no room id in the host's `room list`");
-    let (ok, link, err) = vox(&host, &["room", "invite", &short], None);
-    assert!(ok, "PRODUCT (staging): the host's room invite: {err}");
+    let (ok, link, err) = vox(&host, &["room", "link", &short], None);
+    assert!(ok, "PRODUCT (staging): the host's room link: {err}");
     let link = link.trim().to_owned();
     // The room's whole id, as its address carries it: `vox://<id>?…`.
     let room = link
@@ -696,12 +696,20 @@ fn a_room_held_closed_is_opened_by_joining_it_again() {
 /// **A room the daemon does not reopen says why** (#412): a remembered room whose reopen fails
 /// is held closed, and the daemon's log names it and what refused it — a closed room with no word
 /// was one nobody could tell how to get back. The failure is driven by `VOX_TEST_REOPEN_FAILS`
-/// (test-knobs only), which makes every reopen fail with the reason it carries. Mutation: the note
-/// not sent; the room is closed and the log silent.
+/// (test-knobs only), which makes every reopen fail with the reason it carries.
+///
+/// **The note is said before the unlock's answer**, and the daemon used to take the answer first
+/// about one run in ten and never read it: the log stayed silent. `VOX_TEST_ANSWER_FIRST`
+/// (test-knobs only) stages that interleaving every run: the daemon takes the node's answer to
+/// its unlock before reading anything the node said, so only reading what was said before the
+/// answer, after it, puts the note in the log.
+///
+/// Mutations, each red every run: the note not sent; the read of what was said before the answer
+/// removed (`apply_saying_waits` without its drain).
 #[test]
 #[ignore = "a real vox daemon, production Argon2id; CI runs it in release"]
 fn a_room_that_does_not_reopen_says_why() {
-    test_knobs::require(&["VOX_TEST_REOPEN_FAILS"]);
+    test_knobs::require(&["VOX_TEST_REOPEN_FAILS", "VOX_TEST_ANSWER_FIRST"]);
     watchdog::arm_for_debug_total(Duration::from_millis(300_000), 2);
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let alice = tmp.path().join("alice");
@@ -726,12 +734,19 @@ fn a_room_that_does_not_reopen_says_why() {
 
     let why = "the test knob refused it";
     let knob = std::path::PathBuf::from(why);
+    // The daemon takes the node's answer to its unlock before reading anything the node said
+    // (VOX_TEST_ANSWER_FIRST): the interleaving that lost the note, staged every run rather than
+    // one run in ten. What the node said before it answered must still reach the log.
+    let first_answer = std::path::PathBuf::from("1");
     let _second = daemon(
         &alice,
         port,
         "",
         "alice",
-        &[("VOX_TEST_REOPEN_FAILS", &knob)],
+        &[
+            ("VOX_TEST_REOPEN_FAILS", &knob),
+            ("VOX_TEST_ANSWER_FIRST", &first_answer),
+        ],
     );
     let listed = attached(&alice, "alice");
     let said = std::fs::read_to_string(alice.join("daemon-alice.err")).unwrap_or_default();

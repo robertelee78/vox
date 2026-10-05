@@ -14,7 +14,7 @@
 //! vox id; vox trust add …               # alice and bob, consenting to each other
 //! vox daemon                            # identity passphrase ONLY, both times, every time
 //! vox room create / post                # alice's room, one post
-//! vox room invite / vox room join       # bob joins it (the join path remembers too)
+//! vox room link / vox room join       # bob joins it (the join path remembers too)
 //! (kill -9 both daemons) vox daemon     # a crash: both rooms must be open again
 //! (kill -TERM alice) vox daemon         # a clean stop: the same
 //! ```
@@ -240,8 +240,8 @@ fn a_restarted_daemon_holds_every_room_it_held_without_a_room_passphrase() {
     assert!(ok, "PRODUCT (staging): vox room post failed: {err}");
     reads(&alice, "alice", "start", &room, Some(POST));
 
-    let (ok, link, err) = vox(&alice, &["room", "invite", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room invite failed: {err}");
+    let (ok, link, err) = vox(&alice, &["room", "link", &room], None);
+    assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,

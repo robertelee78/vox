@@ -129,7 +129,7 @@ impl SenderChain {
         let channel_id: Digest32 = d
             .bytes()?
             .try_into()
-            .map_err(|_| Error::MalformedBundle("sender chain state channel_id"))?;
+            .map_err(|_| Error::MalformedBundle("sender chain state room id"))?;
         let epoch = d.uint()?;
         let author_id: Digest32 = d
             .bytes()?
@@ -396,7 +396,7 @@ impl ReceiverChain {
         let channel_id: Digest32 = d
             .bytes()?
             .try_into()
-            .map_err(|_| Error::MalformedBundle("receiver chain state channel_id"))?;
+            .map_err(|_| Error::MalformedBundle("receiver chain state room id"))?;
         let epoch = d.uint()?;
         let author_id: Digest32 = d
             .bytes()?

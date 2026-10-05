@@ -243,7 +243,7 @@ fn run(split: Split, check: fn(&mut Anchor, &str)) -> (Vec<Duration>, Vec<Durati
         .find(|w| w.len() >= 12 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("PRODUCT: a room id in `room list`")
         .to_owned();
-    let (ok, link, err) = vox(&alice_dir, &["room", "invite", &room], None);
+    let (ok, link, err) = vox(&alice_dir, &["room", "link", &room], None);
     assert!(ok, "PRODUCT (staging): invite: {err}");
     let (ok, _, err) = vox(
         &bob_dir,

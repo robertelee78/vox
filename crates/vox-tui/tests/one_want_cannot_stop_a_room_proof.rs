@@ -338,8 +338,8 @@ fn an_absurd_want_does_not_stop_the_room_it_names() {
         quiet = quiet.max(took);
     }
     println!("[proof] baseline: the slowest of {HELD} staging posts took {quiet:?}");
-    let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "invite", &prefix]));
-    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    let (ok, link, err) = vox_once(&victim_dir, &args(&["room", "link", &prefix]));
+    assert!(ok, "PRODUCT (staging): room link: {err}");
     let link = link.trim().to_owned();
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.

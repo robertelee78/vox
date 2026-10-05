@@ -355,7 +355,7 @@ pub enum Error {
     /// node rather than of a second one. Collapsing it into a generic storage failure is
     /// how a person came to be told "store open: Database already open. Cannot acquire
     /// lock." for the ordinary act of running a command while their daemon was up.
-    #[error("another vox already has this profile open")]
+    #[error("another vox already has this node open")]
     ProfileBusy,
 
     /// The node's persistent store (ADR-016) failed an operation: opening or
@@ -472,7 +472,7 @@ pub enum Error {
     /// A profile lifecycle state error (ADR-016 §Profile): no identity in the
     /// profile, an identity already present, or an operation that needs the
     /// unlocked identity while the profile is locked. Carries a static reason.
-    #[error("profile: {0}")]
+    #[error("node: {0}")]
     Profile(&'static str),
 
     /// A data root this version does not read: it holds a profile folder of a vox before
@@ -489,7 +489,7 @@ pub enum Error {
     /// no home directory, a directory that could not be created with the required
     /// mode, or an I/O failure on the vault file. Carries a static reason plus the
     /// OS message.
-    #[error("profile path {op}: {detail}")]
+    #[error("node path {op}: {detail}")]
     Path {
         /// What was being attempted.
         op: &'static str,

@@ -127,7 +127,7 @@ try:
     c = run("alice", "room", "create", "--passphrase-file", "-", "--name", "m", stdin="room pass")
     if c.returncode != 0: staging(f"alice's `vox room create` failed: {c.stderr.strip()}")
     room = run("alice", "room", "list").stdout.split()[0]
-    link = run("alice", "room", "invite", room).stdout.strip()
+    link = run("alice", "room", "link", room).stdout.strip()
     for w in ("bob", "carol"):
         j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")
         if j.returncode != 0: staging(f"{w}'s `vox room join` failed: {j.stderr.strip()}")

@@ -19,7 +19,7 @@
 //! responder — across two rooms.
 //!
 //! ## The staging
-//! 1. Alice creates **two** rooms; her `vox room invite` links pin her, so she is the member
+//! 1. Alice creates **two** rooms; her `vox room link` links pin her, so she is the member
 //!    that answers every join. Bob and Carol join both (a set-up join is retried, as
 //!    `support/room.rs` does, for the separate known host-busy refusal).
 //! 2. After the joins: **Bob trusts Carol only — never Alice.** Alice trusts Bob and Carol;
@@ -343,7 +343,7 @@ fn make_room(alice: &Member, name: &str) -> (String, String) {
             panic!("PRODUCT (staging): alice's `vox room list` does not show {name}: {listed}")
         })
         .to_owned();
-    let (ok, link, e) = alice.vox(&["room", "invite", &room], None);
+    let (ok, link, e) = alice.vox(&["room", "link", &room], None);
     assert!(ok, "PRODUCT (staging): invite {name}: {e}");
     let link = link.trim().to_owned();
     assert!(

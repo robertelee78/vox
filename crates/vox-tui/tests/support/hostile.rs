@@ -317,7 +317,7 @@ pub fn daemon_on(name: &str, data: &Path, listen: &str, spec: &str, pass_file: &
     panic!("PRODUCT (staging): {name}'s daemon never answered `vox room list`");
 }
 
-/// Create room `name` on the daemon at `data`; returns its id and an invite link.
+/// Create room `name` on the daemon at `data`; returns its id and an room link.
 pub fn create_room(data: &Path, name: &str, pass: &str) -> (Digest32, String) {
     let (ok, out, err) = vox_in(
         data,
@@ -333,13 +333,13 @@ pub fn create_room(data: &Path, name: &str, pass: &str) -> (Digest32, String) {
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| panic!("PRODUCT (staging): room {name} not listed: {list}"))
         .to_owned();
-    let (ok, link, err) = vox_once(data, &args(&["room", "invite", &short]));
-    assert!(ok, "PRODUCT (staging): vox room invite {name}: {err}");
+    let (ok, link, err) = vox_once(data, &args(&["room", "link", &short]));
+    assert!(ok, "PRODUCT (staging): vox room link {name}: {err}");
     let link = link.trim().to_owned();
     let full = link
         .strip_prefix("vox://")
         .and_then(|rest| rest.get(..52))
-        .unwrap_or_else(|| panic!("PRODUCT (staging): an invite link, not {link:?}"));
+        .unwrap_or_else(|| panic!("PRODUCT (staging): an room link, not {link:?}"));
     let id = vox_core::node::link::b32_decode(full, "room id").expect("PRODUCT: a room id");
     (id, link)
 }

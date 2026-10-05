@@ -233,9 +233,20 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         stored.lines().any(|l| l.ends_with(" first from the cli")),
         "PRODUCT: the node does not have the posted message: {stored}"
     );
+    // The text form shows a structured post as words (#406); `--json` carries what was posted.
+    let (ok, rows, err) = vox(&data, &cfg, &["room", "read", &room_prefix, "--json"], None);
+    assert!(ok, "PRODUCT: room read --json failed: {err}");
     assert!(
-        stored.lines().any(|l| l.ends_with(envelope)),
-        "PRODUCT: the stdin-posted envelope did not arrive intact: {stored}"
+        rows.lines().any(|l| {
+            serde_json::from_str::<serde_json::Value>(l)
+                .is_ok_and(|row| row["text"].as_str() == Some(envelope))
+        }),
+        "PRODUCT: the stdin-posted envelope did not arrive intact: {rows}"
+    );
+    assert!(
+        // The addressee is named on the line after the row.
+        stored.contains(" assign: port the codec\n  (to you)"),
+        "PRODUCT: `vox room read` does not show the assign as words: {stored}"
     );
 
     // ---- read, and use the printed hash as a cursor ----

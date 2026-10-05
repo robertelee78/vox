@@ -198,7 +198,7 @@ fn order_key(id: &str) -> Vec<usize> {
 /// `addrs`; every other entry, alice's own included, kept.
 fn with_anchor_at(link: &str, anchor_id: &str, addrs: &[String]) -> String {
     let (head, query) = link.split_once('?').unwrap_or_else(|| {
-        panic!("PRODUCT: the invite link `vox room invite` printed has no query: {link:?}")
+        panic!("PRODUCT: the room link `vox room link` printed has no query: {link:?}")
     });
     let mut out = Vec::new();
     let mut in_anchor = false;
@@ -341,7 +341,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     let invite = |room: &str| {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let (_, out, _) = vox(&alice_dir, &["room", "invite", room], None);
+            let (_, out, _) = vox(&alice_dir, &["room", "link", room], None);
             let out = out.trim().to_owned();
             if out.contains(&format!("a={anchor_id}")) && out.contains(&real_addr) {
                 break out;

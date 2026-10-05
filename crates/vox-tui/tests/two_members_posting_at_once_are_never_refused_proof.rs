@@ -378,10 +378,10 @@ fn two_members_posting_at_once_are_never_refused() {
     let Some(room) = list.split_whitespace().next().map(str::to_owned) else {
         panic!("PRODUCT (staging): alice's `vox room list` names no room: {list}{err}");
     };
-    let (ok, link, err) = alice.vox(&["room", "invite", &room], None);
+    let (ok, link, err) = alice.vox(&["room", "link", &room], None);
     assert!(
         ok,
-        "PRODUCT (staging): alice's `vox room invite` failed: {err}"
+        "PRODUCT (staging): alice's `vox room link` failed: {err}"
     );
     let link = link.trim().to_owned();
     // One join, no retry: a join that fails is a defect in joining, which is not what this proves,

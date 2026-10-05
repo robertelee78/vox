@@ -11,8 +11,7 @@ nodes. Losing identity data is not solved by asking a central operator to reset 
 
 In v0.3.0 one daemon per data root hosts every node on the machine, and each node runs in full
 while it is attached. A command names the node it acts as with `--node`; with only one node
-attached, it acts as that one. v0.2.10's `--profile` is gone; see
-[Coming from v0.2.10](development.md).
+attached, it acts as that one.
 
 ## A room is a shared space
 

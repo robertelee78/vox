@@ -9,7 +9,7 @@
 //! `already answering 16 joins`.
 //!
 //! **What this drives, with real binaries.** An anchor (`vox node`); alice (`vox id`,
-//! `vox daemon`, `vox room create`, `vox room invite`), the member; carol (`vox id`, `vox daemon`,
+//! `vox daemon`, `vox room create`, `vox room link`), the member; carol (`vox id`, `vox daemon`,
 //! `vox room join`), the real joiner; and the stranger's own `vox daemon`s, which run
 //! `vox room join` against alice's rooms with `VOX_TEST_SOLVE_AT_LEAST_MS` set to an hour — the
 //! product's test-only floor on a joiner's own grind (V210-87), inert when unset. A join that
@@ -404,7 +404,7 @@ struct Staged {
     strangers: Vec<Who>,
     stranger_errs: Vec<PathBuf>,
     alice_err: PathBuf,
-    /// One invite link per room of alice's.
+    /// One room link per room of alice's.
     links: Vec<String>,
 }
 
@@ -569,14 +569,10 @@ fn stage(
                 panic!("PRODUCT (staging): room {name} not in `vox room list`: {list}")
             })
             .to_owned();
-        let link = alice
-            .vox(&["room", "invite", &id], None)
-            .1
-            .trim()
-            .to_owned();
+        let link = alice.vox(&["room", "link", &id], None).1.trim().to_owned();
         assert!(
             !link.is_empty(),
-            "PRODUCT (staging): no invite link for room {name}"
+            "PRODUCT (staging): no room link for room {name}"
         );
         links.push(link);
     }

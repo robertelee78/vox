@@ -199,7 +199,7 @@ impl RendezvousRecord {
             return Err(Error::MalformedRendezvous("rendezvous wire arity"));
         }
         let author_id = take_digest(&mut d, "rendezvous author_id length")?;
-        let channel_id = take_digest(&mut d, "rendezvous channel_id length")?;
+        let channel_id = take_digest(&mut d, "rendezvous room id length")?;
         let epoch = d.uint()?;
         let endpoints = EndpointList::decode_from(&mut d)?;
         let seq = d.uint()?;
@@ -381,7 +381,7 @@ impl PreJoinRecord {
             .bytes()?
             .try_into()
             .map_err(|_| Error::MalformedRendezvous("pre-join asserted_pubkey length"))?;
-        let channel_id = take_digest(&mut d, "pre-join channel_id length")?;
+        let channel_id = take_digest(&mut d, "pre-join room id length")?;
         let bundle_bytes = d.bytes()?;
         if bundle_bytes.len() > MAX_PREKEY_BUNDLE_BYTES {
             return Err(Error::SizeLimitExceeded("pre-join prekey bundle"));
@@ -649,7 +649,7 @@ impl JoinWitness {
         if d.array()? != 7 {
             return Err(Error::MalformedRendezvous("join-witness wire arity"));
         }
-        let channel_id = take_digest(&mut d, "join-witness channel_id length")?;
+        let channel_id = take_digest(&mut d, "join-witness room id length")?;
         let epoch = d.uint()?;
         let joiner_id = take_digest(&mut d, "join-witness joiner_id length")?;
         let witness_id = take_digest(&mut d, "join-witness witness_id length")?;
@@ -699,7 +699,7 @@ impl JoinWitness {
         }
         if self.channel_id != *channel_id {
             return Err(Error::MalformedRendezvous(
-                "join-witness binds another channel",
+                "join-witness binds another room",
             ));
         }
         if self.epoch != epoch {
@@ -847,7 +847,7 @@ impl MemberBundleRecord {
         if let Some(w) = admission.witness() {
             if w.joiner_id != author_id || w.channel_id != *channel_id || w.epoch != epoch {
                 return Err(Error::MalformedRendezvous(
-                    "member-bundle witness does not bind this author, channel and epoch",
+                    "member-bundle witness does not bind this author, room and epoch",
                 ));
             }
         }
@@ -911,7 +911,7 @@ impl MemberBundleRecord {
             return Err(Error::MalformedRendezvous("member-bundle wire arity"));
         }
         let author_id = take_digest(&mut d, "member-bundle author_id length")?;
-        let channel_id = take_digest(&mut d, "member-bundle channel_id length")?;
+        let channel_id = take_digest(&mut d, "member-bundle room id length")?;
         let epoch = d.uint()?;
         let bundle_bytes = d.bytes()?;
         if bundle_bytes.len() > MAX_PREKEY_BUNDLE_BYTES {

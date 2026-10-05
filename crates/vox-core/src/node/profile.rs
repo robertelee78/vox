@@ -106,16 +106,16 @@ impl Profile {
         let vault_file = paths.vault_file();
         let lock = lock_dir(
             &paths.profile_dir,
-            "lock the profile to create its identity",
+            "lock the node to create its identity",
             waiting,
             &|| {
                 vault_file
                     .is_file()
-                    .then_some(Error::Profile("identity already exists in this profile"))
+                    .then_some(Error::Profile("identity already exists on this node"))
             },
         )?;
         if Self::exists(&paths) {
-            return Err(Error::Profile("identity already exists in this profile"));
+            return Err(Error::Profile("identity already exists on this node"));
         }
         let root = SoftwareRootSigner::generate()?;
         let dh = X25519IdentityKey::generate()?;
@@ -207,7 +207,7 @@ impl Profile {
     /// as long as the profile is open; `waiting` is called once if that takes over a second.
     pub fn open_noting(paths: Paths, waiting: LockWaitNotice<'_>) -> Result<Self> {
         if !paths.vault_file().is_file() {
-            return Err(Error::Profile("no identity in this profile"));
+            return Err(Error::Profile("no identity on this node"));
         }
         let lock = lock_profile(&paths, waiting)?;
         let vault = read_vault(&paths)?;
@@ -424,7 +424,7 @@ pub fn lock_profile(paths: &Paths, waiting: LockWaitNotice<'_>) -> Result<std::f
     let socket = paths.socket_file();
     lock_dir(
         &paths.profile_dir,
-        "lock the profile to open it",
+        "lock the node to open it",
         waiting,
         &|| (holder_serves(&socket) || attached_on_daemon(paths)).then_some(Error::ProfileBusy),
     )
@@ -474,7 +474,7 @@ pub fn open_letting_go<T>(open: impl Fn() -> Result<T>) -> Result<T> {
 /// Another handle on the same profile lock: the lock is released only when every handle is.
 pub fn clone_lock(lock: &std::fs::File) -> Result<std::fs::File> {
     lock.try_clone().map_err(|e| Error::Path {
-        op: "keep the profile's lock",
+        op: "keep the node's lock",
         detail: e.to_string(),
     })
 }
@@ -549,7 +549,7 @@ fn lock_dir(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     #[cfg(feature = "test-knobs")]
-    test_pause(TEST_LOCK_HOLD_ENV, "holding the profile lock");
+    test_pause(TEST_LOCK_HOLD_ENV, "holding the node lock");
     Ok(handle)
 }
 

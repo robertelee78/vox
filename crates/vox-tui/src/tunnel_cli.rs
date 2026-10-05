@@ -141,13 +141,13 @@ pub fn identity_passphrase_for(
     // **Without a terminal there is nobody to ask twice.**
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Err(AppError::Usage(
-            "this profile has no identity yet, and there is no terminal to ask at.\n\
+            "this node has no identity yet, and there is no terminal to ask at.\n\
              \x20      Make one at a terminal with `vox id`, or give its new passphrase with \
              --identity-passphrase-file <path> (`-` reads stdin) or VOX_IDENTITY_PASSPHRASE."
                 .into(),
         ));
     }
-    println!("vox: this profile has no identity yet; creating one.");
+    println!("vox: this node has no identity yet; creating one.");
     let first = prompt_passphrase("new identity passphrase")?;
     let again = prompt_passphrase("again")?;
     if first != again {
@@ -164,8 +164,7 @@ pub fn identity_passphrase_for(
 /// under tmux or a service manager is resumed its own way.
 /// It names the cause in the words a refusal uses (`Fault::ProfileBusy`, V210-114), so a person
 /// sees one phrase for one cause.
-pub const WAITING_FOR_PROFILE: &str =
-    "vox: waiting: another vox holds this profile open, and only \
+pub const WAITING_FOR_PROFILE: &str = "vox: waiting: another vox holds this node open, and only \
      one at a time may write it\n       this goes on as soon as that one is done; if that vox is \
      stopped (e.g. with Ctrl-Z), resume it";
 
@@ -241,29 +240,69 @@ fn tcp_bind_failure(addr: SocketAddr) -> Option<String> {
     bind_failure(addr, Socket::Tcp, fault)
 }
 
+/// The environment variable [`answer_first`] reads. **Test-only.**
+#[cfg(feature = "test-knobs")]
+pub const TEST_ANSWER_FIRST_ENV: &str = "VOX_TEST_ANSWER_FIRST";
+
+/// Whether [`apply_saying_waits`] takes the node's answer **before reading anything it said**
+/// (`VOX_TEST_ANSWER_FIRST=1`, test-knobs only): the interleaving in which a waiting select took
+/// the answer first, which the select falls into only some of the time. A proof sets it so the
+/// case is staged every run, not one run in ten (#412). Without test-knobs, never.
+fn answer_first() -> bool {
+    #[cfg(feature = "test-knobs")]
+    if std::env::var(TEST_ANSWER_FIRST_ENV).as_deref() == Ok("1") {
+        return true;
+    }
+    false
+}
+
 pub async fn apply_saying_waits(node: &NodeHandle, cmd: NodeCommand) -> Outcome {
     let mut events = node.subscribe();
     let apply = node.apply(cmd);
     tokio::pin!(apply);
     let mut said = false;
-    loop {
-        tokio::select! {
-            out = &mut apply => return out,
-            ev = events.next(), if !said => match ev {
-                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
-                    eprintln!("{WAITING_FOR_PROFILE}");
-                    said = true;
-                }
-                // Said while the verb waits: the node picks its port as it unlocks (V210-167).
-                Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
-                    eprintln!("vox: {note}");
-                }
-                Some(_) => {}
-                // The actor is gone; the apply answers for itself.
-                None => said = true,
-            },
+    let mut open = true;
+    let say = |ev: Option<vox_core::node::actor::EventStreamItem>, said: &mut bool| match ev {
+        Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::WaitingForProfile)) => {
+            if !*said {
+                eprintln!("{WAITING_FOR_PROFILE}");
+                *said = true;
+            }
+            true
+        }
+        // Said while the verb waits: the node picks its port as it unlocks (V210-167), and says
+        // why a room it held does not reopen (#412).
+        Some(vox_core::node::actor::EventStreamItem::Event(NodeEvent::NodeNote { note })) => {
+            eprintln!("vox: {note}");
+            true
+        }
+        Some(_) => true,
+        // The actor is gone; the apply answers for itself.
+        None => false,
+    };
+    let out = if answer_first() {
+        // Staged: everything the node says before it answers is still on the stream.
+        (&mut apply).await
+    } else {
+        loop {
+            tokio::select! {
+                out = &mut apply => break out,
+                ev = events.next(), if open => open = say(ev, &mut said),
+            }
+        }
+    };
+    // **What the node said before it answered is said too.** Its notes go out before its answer
+    // (an unlock answers once its rooms' reopening is over, and a room that would not reopen is
+    // said before that), and a select that took the answer first left them unread: the daemon's
+    // log then never said why the room stayed closed (#412's proof, red about one run in ten;
+    // `VOX_TEST_ANSWER_FIRST` stages it every run).
+    while open {
+        match events.try_next() {
+            Some(ev) => open = say(Some(ev), &mut said),
+            None => break,
         }
     }
+    out
 }
 
 /// A `vox serve` spec, `<name>=<port>[/tcp|/udp]`: the port, and the service's tag — its name,
@@ -720,10 +759,10 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         // locked node, has an identity to join as; it was told to run `vox id`, which would make
         // a second one.
         Some(Fault::Locked) => {
-            "this profile's identity is locked: a lock stopped the join, or it was locked already\n       unlock it (open `vox tui`, or start `vox daemon`), then run the join again"
+            "this node's identity is locked: a lock stopped the join, or it was locked already\n       unlock it (open `vox tui`, or start `vox daemon`), then run the join again"
         }
         Some(Fault::NoIdentity) => {
-            "this profile has no identity yet, so there is nobody to join as\n       run `vox id` to make one"
+            "this node has no identity yet, so there is nobody to join as\n       run `vox id` to make one"
         }
         // Joining a room this node already holds used to say `Failed(IdentityExists)`.
         Some(Fault::AlreadyMember) => Fault::AlreadyMember.explain(),
@@ -1066,7 +1105,9 @@ pub async fn serve(
     println!("room       {}", b32_encode(&channel_id));
     println!("address    {url}");
     println!("passphrase {}", passphrase.as_str());
-    println!("           ^ send this by a different channel than the address");
+    println!(
+        "           ^ send this another way than the address (in person, a call, a different app)"
+    );
     println!();
     // The address with the fingerprints in the node and room places: what any member can use
     // as printed, or with its own aliases for this node and this room (V030-25).
@@ -1084,36 +1125,98 @@ pub async fn serve(
             b32_encode(&channel_id)
         );
     }
-    // **Not "anyone who joins with both".** That was true of the withdrawn model, where a
-    // room's genesis authorized every admitted member and joining WAS the authorization
-    // (ADR-017 decision 3 as revised, M17.7).
+    // **Who can reach it, by name, and who in the room cannot** (ADR-017 4.2): the reach rule is
+    // the host's keyring — a member reaches the service once this node trusts it — so each list
+    // is said, not just the rule, and said again whenever it changes.
     println!();
-    println!("who can reach it: the identities you have trusted, once they join.");
+    println!("who can reach it: a member of this room you have trusted (`vox trust add`)");
     println!("  a joiner with the address and the passphrase reaches NOTHING until then");
-    println!("  ask them for `vox id`, then run `vox trust add <fingerprint>`");
-    println!("  `vox trust list` shows who you have decided about");
+    let mut aux = crate::client::open(&held.at).await?;
+    let mut said = audience(&mut aux, channel_id, held.me.as_ref()).await;
+    print!("{said}");
     println!("Ctrl-C to stop");
 
     // Until stopped: report who reaches the service. The service itself cannot say — every Vox
-    // client arrives at it from loopback (ADR-017 decision 6).
-    Err(follow(&mut held, events, |ev| match ev {
-        NodeEvent::TunnelServed {
-            client,
-            service_tag,
-            ..
-        } => println!(
-            "vox: {} reached {service_tag:?}",
-            crate::ident::author_id(client)
-        ),
-        NodeEvent::PeerJoined {
-            channel_id: c,
-            peer,
-        } if *c == channel_id => {
-            println!("vox: {} joined", crate::ident::author_id(peer));
+    // client arrives at it from loopback.
+    let mut events = events;
+    let closed = crate::client::hold_until_closed(&mut held.client);
+    tokio::pin!(closed);
+    loop {
+        tokio::select! {
+            why = &mut closed => return Err(why),
+            ev = events.next() => match ev {
+                Ok(Some(Frame::Event(ev))) => {
+                    let changed = match &ev {
+                        NodeEvent::TunnelServed { client, service_tag, .. } => {
+                            println!(
+                                "vox: {} reached {service_tag:?}",
+                                crate::ident::author_id(client)
+                            );
+                            false
+                        }
+                        NodeEvent::PeerJoined { channel_id: c, peer } if *c == channel_id => {
+                            println!("vox: {} joined", crate::ident::author_id(peer));
+                            true
+                        }
+                        NodeEvent::Consented { channel_id: c, .. }
+                        | NodeEvent::Revoked { channel_id: c, .. } => *c == channel_id,
+                        _ => false,
+                    };
+                    say_if_it_explains_a_failure(&ev);
+                    if changed {
+                        let now = audience(&mut aux, channel_id, held.me.as_ref()).await;
+                        if now != said {
+                            print!("{now}");
+                            said = now;
+                        }
+                    }
+                }
+                Ok(Some(_)) => {}
+                // The subscription ends with the node; the holding connection says why.
+                Ok(None) | Err(_) => return Err((&mut closed).await),
+            },
         }
-        _ => {}
-    })
-    .await)
+    }
+}
+
+/// Who in `channel_id` can reach this node's services and who cannot (ADR-017 4.2), by name:
+/// each other member this node trusts, by the name it gave them, and each it does not, by
+/// fingerprint — the one thing a person needs to `vox trust add` them. Two lines.
+async fn audience(
+    client: &mut vox_core::node::ipc::IpcClient,
+    channel_id: Digest32,
+    me: Option<&Digest32>,
+) -> String {
+    let members = match client.request(&Request::Roster { channel_id }).await {
+        Ok(Frame::Members { members }) => members,
+        _ => return "  (who is in the room could not be read just now)\n".to_owned(),
+    };
+    let trusted = match client.trusted("").await {
+        Ok(Frame::Trusted { entries }) => entries,
+        _ => Vec::new(),
+    };
+    let (mut can, mut cannot) = (Vec::new(), Vec::new());
+    for m in members.iter().filter(|m| Some(*m) != me) {
+        if trusted.iter().any(|(fp, _)| fp == m) {
+            can.push(crate::ident::name_in(&trusted, m));
+        } else {
+            cannot.push(b32_encode(m));
+        }
+    }
+    let list = |v: &[String]| v.join(", ");
+    format!(
+        "  can reach it now: {}\n  in the room and cannot (not trusted): {}\n",
+        if can.is_empty() {
+            "nobody yet".to_owned()
+        } else {
+            list(&can)
+        },
+        if cannot.is_empty() {
+            "nobody".to_owned()
+        } else {
+            list(&cannot)
+        }
+    )
 }
 
 /// `vox connect <address>` — join the room an address names, and print the name its services

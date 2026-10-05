@@ -17,7 +17,7 @@
 //! being restarted, and the proof of that is a room joined *through* the anchor
 //! afterwards, not a log line saying it noticed:
 //!
-//! 1. Alice creates a room after the rewrite, and `vox room invite` must come to name the
+//! 1. Alice creates a room after the rewrite, and `vox room link` must come to name the
 //!    anchor's real port. That shows only that the room's *record* took the new address
 //!    (the record is filled from configuration whether or not anything was reached), so it
 //!    is a step, not the claim.
@@ -342,7 +342,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
         if started.elapsed() > FOLLOW_PATIENCE {
             break false;
         }
-        let (_, out, _) = vox(&data, &cfg, &["room", "invite", &room]);
+        let (_, out, _) = vox(&data, &cfg, &["room", "link", &room]);
         last = out.clone();
         if out.contains(&format!("/udp/{real_port}")) {
             break true;
@@ -596,7 +596,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
 /// the link and how many entries were dropped.
 fn only_anchor(link: &str, anchor_id: &str) -> (String, usize) {
     let (head, query) = link.split_once('?').unwrap_or_else(|| {
-        panic!("PRODUCT: `vox room invite` printed a link with no query: {link:?}")
+        panic!("PRODUCT: `vox room link` printed a link with no query: {link:?}")
     });
     let mut kept = Vec::new();
     let mut keeping = false;

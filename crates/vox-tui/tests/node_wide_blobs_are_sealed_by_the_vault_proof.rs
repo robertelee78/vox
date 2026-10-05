@@ -211,7 +211,13 @@ fn shared_room(exe: &Path, host: &Path, guest: &Path, name: &str) -> String {
             panic!("PRODUCT: `vox room list` does not name the room {name:?} just created: {list}")
         })
         .to_owned();
-    let link = ok(exe, host, &["room", "invite", &room], None);
+    // `vox room link` in this build; the previous release names it `invite`.
+    let link_verb = if exe == Path::new(VOX) {
+        "link"
+    } else {
+        "invite"
+    };
+    let link = ok(exe, host, &["room", link_verb, &room], None);
     let join = [
         &["room", "join"][..],
         from_stdin,

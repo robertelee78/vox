@@ -5,7 +5,7 @@
 //! them:
 //! - **Pre-join slots.** A pre-join record needs nothing but a key — a joiner has no membership,
 //!   passphrase or proof of work yet — and a room's id is public (it is in every `.vox` address and
-//!   in every invite link). A full bucket of 256 refused every later pre-join, so strangers
+//!   in every room link). A full bucket of 256 refused every later pre-join, so strangers
 //!   who put 256 of them on a room's boards refused every real joiner for the two hours the
 //!   records live.
 //! - **Geneses.** A board took a genesis from any peer, up to 4096, and never let one go. A

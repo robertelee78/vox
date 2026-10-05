@@ -418,10 +418,10 @@ impl Member {
     }
 
     pub fn invite(&self, room: &str) -> String {
-        let (ok, link, err) = self.vox(&["room", "invite", room], None);
+        let (ok, link, err) = self.vox(&["room", "link", room], None);
         assert!(
             ok,
-            "PRODUCT: {}'s `vox room invite` failed.\nstdout:\n{link}\nstderr:\n{err}",
+            "PRODUCT: {}'s `vox room link` failed.\nstdout:\n{link}\nstderr:\n{err}",
             self.name
         );
         link.trim().to_owned()

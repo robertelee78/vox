@@ -426,8 +426,8 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             panic!("PRODUCT: `vox room list` names no room after a create: {listed}{list_err}")
         })
         .to_owned();
-    let (ok, link, err) = alice.vox(&["room", "invite", &label]);
-    assert!(ok, "PRODUCT (staging): room invite: {err}");
+    let (ok, link, err) = alice.vox(&["room", "link", &label]);
+    assert!(ok, "PRODUCT (staging): room link: {err}");
     let link = link.trim().to_owned();
     let room = link
         .strip_prefix("vox://")
