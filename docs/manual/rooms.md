@@ -25,14 +25,14 @@ has not opened it. See [closed-room recovery](troubleshooting.md#the-room-is-clo
 
 ```sh
 vox room create --name family
-vox room invite ROOM_ID
+vox room link ROOM_ID
 ```
 
 Create asks for a new room passphrase and confirmation; an empty one is allowed, but then anyone
 with the link can join. Without `--name` the local name is `room`. `--idle-end 1w` makes the room
 end by itself after a week with nothing said in it; it is off unless given.
 
-`room invite` prints the **room link** (`vox://…`) on standard output, so it can be piped; its
+`room link` prints the **room link** (`vox://…`) on standard output, so it can be piped; its
 notes go to standard error. Send the link one way and the passphrase another. The new member runs:
 
 ```sh

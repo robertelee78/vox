@@ -7,7 +7,7 @@ not a chapter in the public navigation manifest. Source inspection is not an exe
 
 | Label | Exact source revision | Use |
 |---|---|---|
-| v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8`; review fixes at `c142ddd3293bfd1273cfd5737a673bcceb93dfc9` (built, rechecked) | Task chapters, troubleshooting, the v0.3.0 command check |
+| v0.3.0 | `82523cebc870a29e0947b0cb7c20b4563d233966` (built); manual merged at `c24a260dee708a340df5544f80a4518823e261a8`; review fixes at `c142ddd3293bfd1273cfd5737a673bcceb93dfc9` and `vox room link` at `d01c2c767c9ae295d1ed9aabdf66b73838c8f266` (each built, rechecked) | Task chapters, troubleshooting, the v0.3.0 command check |
 | Released v0.2.10 | `8d95a381f14d6bbb45f714d75f64e57d2f5dbf96` | "Coming from v0.2.10"; the profile-to-node move check |
 | `rearch/v030` | `2d8385d4f90891c96843f32d6d002bc1b69aac1e` | Superseded label: an ancestor of the v0.3.0 baseline, which ships it |
 | Manual branch base | `412303a3` plus accepted ADR-027 | Canonical prose; website resolves moving main once per build |
@@ -31,7 +31,7 @@ later parser or implementation may invalidate both an example and its troublesho
 | install: target, record, digest, signature, destination, `update --check`/`--rollback` | `install.sh`; `crates/vox-tui/src/update.rs`; `vox update --help` |
 | install: profiles move to `nodes/<name>/`; pre-v0.3.0 rooms refused | `crates/vox-core/src/node/layout.rs`; `crates/vox-tui/src/client.rs:81`; `crates/vox-core/src/node/api.rs:1196` |
 | nodes, daemon, selection order, attach/detach | `docs/adr/ADR-026-daemon-and-nodes.md` (C-3, L-2, L-3, S-2); `crates/vox-tui/src/client.rs:319`; `crates/vox-core/src/node/daemonipc.rs:324`; `crates/vox-tui/src/daemon.rs:596` |
-| first-room / rooms: create, invite, join, roster, post, read | `crates/vox-tui/src/cli.rs` (`RoomCmd`); `crates/vox-tui/src/room_cli.rs` |
+| first-room / rooms: create, room link, join, roster, post, read | `crates/vox-tui/src/cli.rs` (`RoomCmd`); `crates/vox-tui/src/room_cli.rs` |
 | rooms: read row format, `  \| ` continuation, hidden characters | `crates/vox-tui/src/room_cli.rs` (`plain_row`, `row_json`); `crates/vox-text/src/lib.rs` |
 | rooms: retention, admin, end, idle end, leave | `crates/vox-tui/src/cli.rs` (`Retention`, `Admin`, `End`, `--idle-end`); `docs/adr/ADR-023-room-lifecycle.md` RL-2, RL-8; `crates/vox-core/src/node/api.rs:1131`, `:1178`, `:1184` |
 | keyring: scope, rename, history, 30-minute window | `crates/vox-tui/src/cli.rs` (`TrustCmd`); `crates/vox-core/src/node/actor.rs:1967` (`KEYRING_WINDOW_SECS = 30 * 60`); `crates/vox-tui/src/ui.rs` (`trust_label`) |
@@ -64,7 +64,8 @@ are replaced by placeholders.
 | | `vox node attach robertgpt --passphrase-file EMPTY` | `vox: node robertgpt attached`; then `vox node list` → `robertgpt attached   FINGERPRINT`, `vox room list` → `no rooms` |
 | `vox id` prints the fingerprint | `vox id` | the fingerprint alone on one line |
 | Create | `vox room create --name family --passphrase-file ROOM_PASS` | `vox: created family` / `` `vox room list` shows its id; that id is what agents pass as --room `` ; list → `bmbkjywlgzar  family` |
-| The room link goes to stdout | `vox room invite bmbkjywlgzar` | stdout: `vox://bmbkjywlgzar…?a=…&b=…&r=…`; stderr: how the link names this host, `send the passphrase by a different channel than this address`, `joining grants nothing — use vox trust add to decide who reads you` |
+| The room link goes to stdout (rechecked at `d01c2c76`) | `vox room link y5mdh6dvqnle` | stdout: `vox://y5mdh6dvqnle…?a=…&b=…&r=…`; stderr: how the link names this host, `send the passphrase another way than this address (in person, a call, a different app)`, `joining grants nothing — use vox trust add to decide who reads you`; B joined with it: `vox: joined family` |
+| `vox room invite` is gone (`d01c2c76`) | `vox room invite y5mdh6dvqnle` | `error: unrecognized subcommand 'invite'` (exit 2) |
 | Join | `vox room join 'ROOM_LINK' --name family --passphrase-file ROOM_PASS` (B) | `vox: joined family` / `you read a member once you trust it and it trusts you: vox trust add`; roster lists both fingerprints |
 | Trust scope is stated | `vox trust add FINGERPRINT --name ann` | `trusting eldco374… as "ann"` / `it may now read what you write in every room you share — now and later` / `and you read what it writes, once it trusts you too` / `and reach every service you bind to a room you are both in` |
 | Receipt both ways | A posts `hello from robertGPT`; B `room read`; B posts; A `room read` | B: `wezorchin… robertGPT hello from robertGPT`; A: `wezorchin… you hello from robertGPT` and `ea6ldny… ann hello back from ann` |
@@ -91,7 +92,7 @@ are replaced by placeholders.
 | Share a folder | `vox share ROOM ./shared --count 1` (A); `vox room get ROOM shared.tar --dir ./incoming` (B) | `sharing shared.tar (4096 bytes)` with a curl line through `vox up`; `./incoming/shared.tar (4096 bytes) verified`; the share then printed `no longer sharing shared.tar (fetched 1 time(s))` and exited |
 | A stopped offer is said to be gone (rechecked at `c142ddd3`) | `vox share ROOM ./report.txt --count 1`, one get, then the same get again (B) | first: `./incoming/report.txt (18 bytes) verified`; again: `vox: the offer of report.txt is gone: robertGPT no longer serves it. The announcement stays in the room, but the file is served only while robertGPT shares it; ask them to share it again` (exit 1); the unreachable-sender wording `the offer of … cannot be collected now` is from source (`room_cli.rs`), not run |
 | Named shares only | `vox serve 18080` | `"18080" has no name: every shared service is named, and reached as <name>.<node>.<room>.vox` / `name it as <name>=<port>, e.g. vox serve ssh=22` (exit 1) |
-| `serve` and `connect` | `vox serve web2=18080 --name svc` (A); `vox connect 'ROOM_LINK' --passphrase-file PASS --name svc` (B) | room, address, `passphrase …-…-…` with `^ send this by a different channel than the address`, `sharing 127.0.0.1:18080 as web2.FINGERPRINT.ROOM_ID.vox`, `who can reach it: a member of this room you have trusted (vox trust add)`, `can reach it now: nobody yet`, `in the room and cannot (not trusted): nobody`, and after B joined `can reach it now: ann` (audience lines rechecked at `c142ddd3`); B: `joined. vox service list 743wt6obkyej shows what is shared here`; `curl --socks5-hostname` to `web2.robertgpt.svc.vox` returned the page |
+| `serve` and `connect` | `vox serve web2=18080 --name svc` (A); `vox connect 'ROOM_LINK' --passphrase-file PASS --name svc` (B) | room, address, `passphrase …-…-…` with `^ send this another way than the address (in person, a call, a different app)` (rechecked at `d01c2c76`), `sharing 127.0.0.1:18080 as web2.FINGERPRINT.ROOM_ID.vox`, `who can reach it: a member of this room you have trusted (vox trust add)`, `can reach it now: nobody yet`, `in the room and cannot (not trusted): nobody`, and after B joined `can reach it now: ann` (audience lines rechecked at `c142ddd3`); B: `joined. vox service list 743wt6obkyej shows what is shared here`; `curl --socks5-hostname` to `web2.robertgpt.svc.vox` returned the page |
 | `lan up` needs the helper | `vox lan up ROOM` | `no LAN helper is answering on /var/run/vox-lan.sock. … start it in another terminal with sudo vox lan helper` (exit 1); the helper was not run (no sudo) |
 | `tunnel close` | `vox tunnel close --id 999` | `no live tunnel matches that — vox status lists them, with their numbers` (exit 1) |
 | Agents need `--node` | `vox agent plugin claude`; `vox agent hook` | both `error: the following required arguments were not provided: --node <NODE>` (exit 2) |
@@ -129,9 +130,10 @@ manual now quotes the fixed output:
   online; each member's last_seen says when it was last heard from`.
 - `vox serve` now names who can reach the service and who in the room cannot (ADR-017 4.2).
 
-Still as quoted, and outside those seven: `vox room invite` and `vox serve` tell the sharer to
-send the passphrase `by a different channel than this address`; the top-level `vox --help` line
-still mentions `consent`. During the `c142ddd3` recheck, `vox serve`'s output also printed once,
+At `d01c2c76` `vox room invite` became `vox room link` (no alias; `:link` in the TUI, `state.rs`),
+and the passphrase advice became `another way than this address (in person, a call, a different
+app)`. None of the 64 `--help` pages at `d01c2c76` contains `invite`, `channel` or `consent`.
+During the `c142ddd3` recheck, `vox serve`'s output also printed once,
 after B joined, `sync of room … did not complete — sync failed: the peer refused: epoch mismatch`;
 B's join and the audience line both succeeded, and it was not investigated further.
 
@@ -140,7 +142,8 @@ B's join and the audience line both succeeded, and it was not investigated furth
 The v0.3.0 rewrite keeps every fragment whose heading is still true. These v0.2.10 fragments
 were retired because their headings would now be false; a published website needs a redirect or
 compatible anchor for each (ADR-027 D1): `agents.md#give-the-agent-its-own-profile-and-room`,
-`first-room.md#2-each-person-keeps-a-daemon-running`, `keyring.md#names-and-versions`,
+`first-room.md#2-each-person-keeps-a-daemon-running`,
+`first-room.md#3-one-person-creates-and-invites` (at `d01c2c76`, when `invite` left the product), `keyring.md#names-and-versions`,
 `reference.md#select-the-same-profile`. The troubleshooting headings `No node is running for
 this profile` and `Another Vox process is using this profile` are kept, with their v0.3.0
 meaning, so existing links still land.
@@ -149,7 +152,7 @@ meaning, so existing links still land.
 
 The independent verifier `manual_practice_research` checked the v0.2.10 edition with the
 published v0.2.10 executable in two disposable roots on 2026-10-04: identity before the daemon,
-an empty room list, create/invite/join/trust, receipt both ways, a wrong room passphrase's
+an empty room list, create, room link, join, trust, receipt both ways, a wrong room passphrase's
 refusal, and closed-room recovery in the TUI. That record applies to v0.2.10 only; the
 [reader proof](research/manual-reader-proof-2026-10-04.md) holds it.
 

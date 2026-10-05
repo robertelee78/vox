@@ -38,6 +38,7 @@ is no rollback of that move.
 | `vox id --profile family` creates an identity | `vox node create NAME`; `vox id` prints the fingerprint |
 | Keep `vox daemon --profile family` running | `vox node attach NAME` starts the daemon in the background |
 | `vox tui` only with the daemon stopped; `:lock`, `:unlock` | The TUI is a daemon client and runs alongside everything; no lock |
+| `vox room invite ROOM_ID` | `vox room link ROOM_ID`; in the TUI `:link` |
 | `vox serve 22` | `vox serve ssh=22`: every service is named |
 | `vox up ROOM_ID` | `vox up` carries every room the node holds |
 | `vox forward ROOM_ID HOST TAG LOCAL` | `vox forward SERVICE.NODE.ROOM.vox LOCAL` |
