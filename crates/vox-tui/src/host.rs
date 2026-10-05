@@ -63,6 +63,9 @@ pub struct Defaults {
     pub listen: String,
     /// How long a node's stop may take before it is left (the daemon's shutdown patience).
     pub patience: Duration,
+    /// Where the daemon's `.vox` proxy listens while a node is attached (ADR-028 S-5); `None`
+    /// runs none.
+    pub proxy: Option<std::net::SocketAddr>,
 }
 
 /// The daemon's router. Cheap to clone; every clone is the same router.
@@ -88,6 +91,8 @@ struct Inner {
     unfinished_stop: AtomicBool,
     /// Open connections to the account socket.
     connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// The daemon's `.vox` proxy, run while any node is attached (ADR-028 S-5).
+    proxy: Option<Arc<crate::daemon_proxy::DaemonProxy>>,
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -218,7 +223,10 @@ impl Router {
     /// A router for `account`'s nodes, on `rt`.
     #[must_use]
     pub fn new(account: Account, rt: Handle, defaults: Defaults) -> Self {
-        Self {
+        let proxy = defaults
+            .proxy
+            .map(|bind| Arc::new(crate::daemon_proxy::DaemonProxy::new(bind)));
+        let router = Self {
             inner: Arc::new(Inner {
                 account,
                 rt,
@@ -232,8 +240,31 @@ impl Router {
                 serve_only: Mutex::default(),
                 unfinished_stop: AtomicBool::new(false),
                 connections: Arc::default(),
+                proxy,
             }),
+        };
+        router.follow_attached_with_the_proxy();
+        router
+    }
+
+    /// The proxy runs while any node is attached: bound at the first attach, stopped at the last
+    /// detach. Driven by the router's own events, on a task of its own, so no attach or detach
+    /// waits on a bind. It holds the router weakly, so it ends with the router.
+    fn follow_attached_with_the_proxy(&self) {
+        if self.inner.proxy.is_none() {
+            return;
         }
+        let mut events = self.inner.events.subscribe();
+        let weak = Arc::downgrade(&self.inner);
+        self.inner.rt.spawn(async move {
+            proxy_follow(&weak);
+            loop {
+                match events.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => proxy_follow(&weak),
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
     }
 
     /// The daemon's own metrics (attached nodes, panics).
@@ -345,8 +376,17 @@ impl Router {
             hold: g
                 .hold
                 .map(|h| Box::new(h) as Box<dyn std::any::Any + Send + Sync>),
-            // `vox lan up`: the daemon asks the root helper for the device itself (S-5).
-            extension: Some(std::sync::Arc::new(crate::lan_cli::LanUp)),
+            // `vox lan up`: the daemon asks the root helper for the device itself (S-5); and
+            // `vox up`: the daemon says where its proxy is (ADR-028 S-5).
+            extension: Some(std::sync::Arc::new(DaemonExtension {
+                proxy: self.inner.proxy.as_ref().map(|proxy| {
+                    let weak = Arc::downgrade(&self.inner);
+                    crate::daemon_proxy::ProxyReport {
+                        proxy: Arc::clone(proxy),
+                        up: Arc::new(move || proxy_follow(&weak)),
+                    }
+                }),
+            })),
             notes: g.notes,
         })
     }
@@ -1199,6 +1239,59 @@ impl Dispatch for Router {
 /// the daemon process): concurrent attaches, holders and the implicit detach, a session's end with
 /// its detach, a detach answering connections "node detached", and one node's panic leaving the
 /// other running. Production Argon2id: run in release.
+/// Bring the proxy up if any node is attached, down if none is.
+fn proxy_follow(weak: &std::sync::Weak<Inner>) {
+    let Some(inner) = weak.upgrade() else {
+        return;
+    };
+    let Some(proxy) = inner.proxy.clone() else {
+        return;
+    };
+    let router = Router { inner };
+    if router.attached_handles().is_empty() {
+        proxy.down();
+    } else {
+        let nodes_of = Arc::downgrade(&router.inner);
+        proxy.up(
+            &router.inner.rt,
+            crate::daemon_proxy::Nodes(Arc::new(move || {
+                nodes_of
+                    .upgrade()
+                    .map(|inner| Router { inner }.attached_handles())
+                    .unwrap_or_default()
+            })),
+        );
+    }
+}
+
+/// The requests the daemon serves itself on a node's connection (ADR-026 S-5): `vox lan up`, and
+/// `vox up`'s question about the proxy.
+struct DaemonExtension {
+    proxy: Option<crate::daemon_proxy::ProxyReport>,
+}
+
+impl vox_core::node::ipc::Extension for DaemonExtension {
+    fn claims(&self, body: &[u8]) -> bool {
+        crate::lan_cli::LanUp.claims(body)
+            || (self.proxy.is_some() && crate::daemon_proxy::ProxyReport::claims(body))
+    }
+
+    fn serve(
+        &self,
+        body: Vec<u8>,
+        stream: tokio::net::UnixStream,
+        handle: NodeHandle,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        match &self.proxy {
+            Some(report) if crate::daemon_proxy::ProxyReport::claims(&body) => {
+                let report = report.clone();
+                Box::pin(async move { report.serve(stream).await })
+            }
+            _ => crate::lan_cli::LanUp.serve(body, stream, handle),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,6 +1342,7 @@ mod tests {
                 anchor_specs: Vec::new(),
                 listen: String::new(),
                 patience: Duration::from_secs(5),
+                proxy: None,
             },
         )
     }

@@ -509,6 +509,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) => "resolving a .vox name",
         NetEvent::UpAll { .. } => "bringing the proxy up for every room",
+        NetEvent::MemberDialer(_) => "lending the proxy its dialer",
     }
 }
 
@@ -870,6 +871,9 @@ enum NetEvent {
     /// A `.vox` name is being resolved (PRD-001 R20): answer with a snapshot of this
     /// node's rooms and keyring names.
     Names(oneshot::Sender<crate::node::resolver::VoxResolver>),
+    /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
+    /// name that resolved to one of this node's rooms.
+    MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
     /// Bring the SOCKS proxy up across every room this node holds, for a `vox up` that
     /// asked over the control socket; refusals and cut sessions go to `report`.
     UpAll {
@@ -3519,6 +3523,22 @@ impl NodeHandle {
                 report,
                 reply,
             })
+            .await
+            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?;
+        rx.await
+            .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?
+    }
+
+    /// This node's way of reaching a member of one of its rooms, for the daemon's proxy
+    /// (ADR-028 S-5), which carries every attached node's rooms on one port and dials through
+    /// the node that holds the room a name resolved to.
+    ///
+    /// # Errors
+    /// If the node has stopped or is not networked.
+    pub async fn member_dialer(&self) -> crate::error::Result<MemberDialer> {
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::MemberDialer(reply))
             .await
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?;
         rx.await
@@ -7395,6 +7415,21 @@ impl Node {
                 reply,
             } => {
                 let _ = reply.send(self.bring_up_all(bind, report).await);
+            }
+            NetEvent::MemberDialer(reply) => {
+                let _ = reply.send(
+                    self.net
+                        .as_ref()
+                        .map(|net| {
+                            MemberDialer(NodeDialer {
+                                net: Arc::clone(net),
+                                channel_id: None,
+                            })
+                        })
+                        .ok_or(crate::error::Error::Unreachable(
+                            "the node is not networked",
+                        )),
+                );
             }
             NetEvent::AppDial(crate::node::app::AppDial {
                 channel_id,
@@ -14642,7 +14677,11 @@ struct NodeDialer {
 }
 
 impl crate::node::up::HostDialer for NodeDialer {
-    async fn connection(&self, host: &Digest32) -> crate::error::Result<Arc<VoxConnection>> {
+    async fn connection(
+        &self,
+        host: &Digest32,
+        _channel_id: &Digest32,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
         // `reach` returns a live connection when there is one and otherwise runs the whole
         // ADR-012 ladder, so this is both "give me the connection" and "make one". The
         // endpoint hints come from the board, which is also why this must happen per
@@ -14654,6 +14693,20 @@ impl crate::node::up::HostDialer for NodeDialer {
             None => self.net.board_endpoints_any(host),
         };
         self.net.reach(*host, &endpoints).await
+    }
+}
+
+/// A node's way of reaching a member, lent to the daemon's proxy ([`NodeHandle::member_dialer`]):
+/// the same ladder `vox forward` and the node's own proxy dial through.
+pub struct MemberDialer(NodeDialer);
+
+impl crate::node::up::HostDialer for MemberDialer {
+    async fn connection(
+        &self,
+        host: &Digest32,
+        channel_id: &Digest32,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
+        self.0.connection(host, channel_id).await
     }
 }
 

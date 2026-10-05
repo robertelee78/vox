@@ -63,7 +63,10 @@ pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 /// handler blocks the progress it is waiting for. Binding immediately and dialling on demand
 /// removes the race instead of timing it.
 pub trait HostDialer: Send + Sync {
-    /// A connection to `host`, dialling if this node has none.
+    /// A connection to `host`, a member of the room `channel_id`, dialling if there is none.
+    ///
+    /// The room is the one the name resolved to: a proxy that carries several nodes' rooms (the
+    /// daemon's, ADR-028 S-5) dials through the node that holds it.
     ///
     /// The error carries **which rung failed** — no candidates, the relay refused, the target
     /// never answered. Every rung already produces a specific error, and a proxy that reduced
@@ -72,6 +75,7 @@ pub trait HostDialer: Send + Sync {
     fn connection(
         &self,
         host: &Digest32,
+        channel_id: &Digest32,
     ) -> impl core::future::Future<Output = Result<Arc<VoxConnection>>> + Send;
 }
 
@@ -223,6 +227,7 @@ const HOST_POLL: Duration = Duration::from_millis(250);
 async fn reach_host_with_patience<D: HostDialer>(
     dialer: &D,
     host: &Digest32,
+    channel_id: &Digest32,
 ) -> Result<Arc<VoxConnection>> {
     let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
     // The **last** reason, not a generic one. Every rung of the ladder already produces a
@@ -232,7 +237,7 @@ async fn reach_host_with_patience<D: HostDialer>(
     // diagnosis needed a debugger. Keeping the last one costs a String and turns the same
     // five minutes into a sentence.
     loop {
-        let last = match dialer.connection(host).await {
+        let last = match dialer.connection(host, channel_id).await {
             Ok(conn) => return Ok(conn),
             Err(e) => e,
         };
@@ -303,7 +308,7 @@ pub async fn open_tunnel<D: HostDialer>(
     let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
     loop {
         let attempt = async {
-            let conn = reach_host_with_patience(dialer, host).await?;
+            let conn = reach_host_with_patience(dialer, host, channel_id).await?;
             let credit = conn.carry_tunnel(service_tag, true)?;
             let (mut send, mut recv) = crate::transport::streams::open_typed(
                 &conn,

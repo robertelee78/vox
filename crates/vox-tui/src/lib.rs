@@ -26,6 +26,7 @@ pub mod codex_trust;
 pub mod coord;
 pub mod daemon;
 pub mod daemon_client;
+pub mod daemon_proxy;
 pub mod doctor;
 pub mod host;
 pub mod ident;

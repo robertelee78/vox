@@ -63,6 +63,15 @@ impl NameRequest {
     }
 }
 
+/// The answer to [`NameRequest::Up`]: the proxy listens at `bound`. The daemon sends it
+/// (ADR-028 S-5), from the proxy it runs while a node is attached.
+#[must_use]
+pub fn up_bound(bound: SocketAddr) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(T_UP_BOUND).text(&bound.to_string());
+    e.finish()
+}
+
 fn error(reason: String) -> Vec<u8> {
     Frame::Error { reason }.to_bytes()
 }

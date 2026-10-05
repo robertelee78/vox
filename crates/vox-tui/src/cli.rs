@@ -596,6 +596,9 @@ pub struct DaemonArgs {
     /// exit once nothing is attached and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
+    /// Where the `.vox` SOCKS5 proxy listens while a node is attached. Loopback only.
+    #[arg(long, env = "VOX_PROXY", default_value = crate::daemon_proxy::DEFAULT_PROXY)]
+    pub proxy: SocketAddr,
 }
 
 /// `vox tunnel …`.

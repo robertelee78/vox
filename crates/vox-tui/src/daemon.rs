@@ -145,7 +145,13 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         stop_requested("vox daemon")
     });
     let named = named_node(args)?;
-    let Some(serving) = take_account(&account, &rt, args.profile.listen, &args.profile.anchors)?
+    let Some(serving) = take_account(
+        &account,
+        &rt,
+        args.profile.listen,
+        &args.profile.anchors,
+        args.proxy,
+    )?
     else {
         return already_running(args, &account, rt, &mut stop, named);
     };
@@ -264,6 +270,7 @@ pub(crate) fn take_account(
     rt: &tokio::runtime::Runtime,
     listen: std::net::SocketAddr,
     anchor_specs: &[String],
+    proxy: std::net::SocketAddr,
 ) -> Result<Option<Serving>, AppError> {
     // **A data root this version does not read is refused before the lock is taken** (#423):
     // the lock and the pid are writes, and a refused root is left exactly as it was.
@@ -318,6 +325,7 @@ pub(crate) fn take_account(
             anchor_specs: anchor_specs.to_vec(),
             listen: listen.to_string(),
             patience: shutdown_patience(),
+            proxy: Some(proxy),
         },
     );
     // Staged in proofs only: the window in which a daemon holds the lock and serves nothing yet.

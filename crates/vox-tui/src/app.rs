@@ -571,7 +571,14 @@ pub fn run_node(
     let node = crate::client::name_of(&paths)?;
     // **`vox node` is a daemon with one headless node in the anchor role** (ADR-026 N-5), not a
     // process of another kind: it holds the account, serves its socket, and attaches the node.
-    let Some(serving) = crate::daemon::take_account(&account, &rt, listen, &anchor_specs)? else {
+    let Some(serving) = crate::daemon::take_account(
+        &account,
+        &rt,
+        listen,
+        &anchor_specs,
+        crate::daemon_proxy::configured()?,
+    )?
+    else {
         return Err(AppError::Refused {
             code: 1,
             message: format!(
