@@ -107,6 +107,39 @@ impl Drop for Daemon {
 
 impl Daemon {
     fn start(root: &Path) -> Self {
+        let mut d = Self::start_bare(root);
+        let (data, cfg) = (d.data.clone(), d.cfg.clone());
+        let (ok, _, err) = hook(
+            &data,
+            &cfg,
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "agents",
+            ],
+            "channel passphrase",
+        );
+        assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
+        let (_, list, _) = hook(&data, &cfg, &["room", "list"], "");
+        let label = list
+            .split_whitespace()
+            .next()
+            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` named no room: {list:?}"))
+            .to_owned();
+        d.room_key = d
+            .link(&label)
+            .strip_prefix("vox://")
+            .and_then(|l| l.split('?').next())
+            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room link` printed no link"))
+            .to_owned();
+        d
+    }
+
+    /// A daemon holding an identity and no room yet: `vox id`, then `vox daemon`.
+    fn start_bare(root: &Path) -> Self {
         let (data, cfg) = (root.join("data"), root.join("cfg"));
         std::fs::create_dir_all(&cfg).expect("APPARATUS: cannot make the profile directory");
         let pass = root.join("identity.pass");
@@ -145,43 +178,20 @@ impl Daemon {
             );
             std::thread::sleep(Duration::from_millis(250));
         }
-        let (ok, _, err) = hook(
-            &data,
-            &cfg,
-            &[
-                "room",
-                "create",
-                "--passphrase-file",
-                "-",
-                "--name",
-                "agents",
-            ],
-            "channel passphrase",
-        );
-        assert!(ok, "PRODUCT (staging): vox room create failed: {err}");
-        let (_, list, _) = hook(&data, &cfg, &["room", "list"], "");
-        let label = list
-            .split_whitespace()
-            .next()
-            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` named no room: {list:?}"))
-            .to_owned();
-        let (ok, link, err) = hook(&data, &cfg, &["room", "link", &label], "");
-        assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
-        let room_key = link
-            .trim()
-            .strip_prefix("vox://")
-            .and_then(|l| l.split('?').next())
-            .unwrap_or_else(|| {
-                panic!("PRODUCT (staging): `vox room link` printed no link: {link:?}")
-            })
-            .to_owned();
         Self {
             child,
             data,
             cfg,
-            room_key,
+            room_key: String::new(),
             fingerprint,
         }
+    }
+
+    /// `vox room link` for the room `label` names, as printed.
+    fn link(&self, label: &str) -> String {
+        let (ok, link, err) = hook(&self.data, &self.cfg, &["room", "link", label], "");
+        assert!(ok, "PRODUCT (staging): vox room link failed: {err}");
+        link.trim().to_owned()
     }
 
     /// Post `text` to the room exactly as given, through `vox room post … -` (stdin).
@@ -1501,5 +1511,283 @@ fn a_structured_post_reads_alike_for_a_person_and_an_agent() {
     assert!(
         json.contains("\\\"type\\\":\\\"assign\\\""),
         "PRODUCT: `vox room read --json` must still carry the envelope for programs:\n{json}"
+    );
+}
+
+/// Every entry `d` holds for its room, as `vox room read --hashes` prints them: hash → clock (ms).
+fn held_entries(d: &Daemon) -> std::collections::BTreeMap<String, u64> {
+    let label: String = d.room_key.chars().take(12).collect();
+    let (ok, out, err) = hook(&d.data, &d.cfg, &["room", "read", &label, "--hashes"], "");
+    assert!(
+        ok,
+        "PRODUCT (staging): vox room read --hashes failed: {err}"
+    );
+    out.lines()
+        .filter_map(|l| {
+            let (h, clock) = l.split_once(' ')?;
+            Some((h.to_owned(), clock.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// The rows `vox room read --json` shows on `d`: (entry hash, text).
+fn shown_rows(d: &Daemon) -> Vec<(String, String)> {
+    let label: String = d.room_key.chars().take(12).collect();
+    let (ok, out, err) = hook(&d.data, &d.cfg, &["room", "read", &label, "--json"], "");
+    assert!(ok, "PRODUCT (staging): vox room read --json failed: {err}");
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| {
+            (
+                v["entry_hash"].as_str().unwrap_or_default().to_owned(),
+                v["text"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// One turn's drain for a Codex-shaped `session` on `d`'s node, in `d`'s room: what it injected.
+fn drain_as(d: &Daemon, session: &str) -> String {
+    let room: String = d.room_key.chars().take(8).collect();
+    let (ok, out, err) = hook(
+        &d.data,
+        &d.cfg,
+        &[
+            "agent", "hook", "--node", "default", "--room", &room, "--format", "codex",
+        ],
+        &codex_input(session),
+    );
+    assert!(ok, "PRODUCT: the hook failed: {err}");
+    out
+}
+
+/// ADR-028 §6 (#503) — **a drain posts read records, and nobody is shown one.**
+///
+/// Two real daemons, alice and bob, each trusting the other, in alice's room. alice posts with
+/// `vox room post`; bob's agent drains them into its turn, which posts a read record in bob's feed
+/// (RR-1, RR-2). The records reach alice — she holds every entry bob holds — and then:
+///
+/// 1. **never a message** (RR-4): alice's `vox room read` shows exactly her posts, `vox room
+///    board --json` counts exactly them, a new session's drain on alice's node is told exactly
+///    them ("4 new"), and its next turn is told nothing; bob's own next drain is told only the
+///    one new post.
+/// 2. **batched** (RR-2): the first drain's record goes at once; a second drain within 5 s adds
+///    no record until 5 s after the first, and then one record names what it drained. The clocks
+///    `vox room read --hashes` prints for the two records are at least 5 s apart.
+///
+/// A record is an entry bob holds that is neither one held before the drains nor a row his
+/// `vox room read` shows: bob posts nothing else.
+///
+/// **Mutant**: render a read record as a text row (its entry hashes as the text). Red on (1):
+/// alice's `vox room read` shows rows she did not post.
+#[test]
+#[ignore = "two daemons with production Argon2id; drives the real binary; CI runs it in release"]
+fn a_drain_posts_read_records_that_nobody_is_shown() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let alice = Daemon::start(&tmp.path().join("alice"));
+    let mut bob = Daemon::start_bare(&tmp.path().join("bob"));
+    for (who, other, name) in [(&alice, &bob, "bob"), (&bob, &alice, "alice")] {
+        let pass = who
+            .data
+            .parent()
+            .expect("APPARATUS: a root")
+            .join("identity.pass");
+        let (ok, _, err) = hook(
+            &who.data,
+            &who.cfg,
+            &[
+                "trust",
+                "add",
+                &other.fingerprint,
+                "--name",
+                name,
+                "--identity-passphrase-file",
+                pass.to_str().expect("APPARATUS: a UTF-8 path"),
+            ],
+            "",
+        );
+        assert!(ok, "PRODUCT (staging): vox trust add {name} failed: {err}");
+    }
+    let label: String = alice.room_key.chars().take(12).collect();
+    let link = alice.link(&label);
+    let (ok, _, err) = hook(
+        &bob.data,
+        &bob.cfg,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &link,
+            "--name",
+            "agents",
+        ],
+        "channel passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): bob could not join alice's room: {err}"
+    );
+    bob.room_key.clone_from(&alice.room_key);
+
+    // bob reads every post alice makes, so what follows is about read records, not delivery.
+    let reads_all = |d: &Daemon, texts: &[&str], within: Duration| -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            let rows = shown_rows(d);
+            if texts.iter().all(|t| rows.iter().any(|(_, r)| r == t)) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let posts = ["read-me one", "read-me two", "read-me three"];
+    for p in posts {
+        alice.post(p);
+    }
+    assert!(
+        reads_all(&bob, &posts, Duration::from_secs(90)),
+        "PRODUCT (staging): bob never read alice's three posts in 90 s; he shows {:?}",
+        shown_rows(&bob)
+    );
+    let before = held_entries(&bob);
+    let records = |d: &Daemon| -> Vec<(String, u64)> {
+        let rows: std::collections::BTreeSet<String> =
+            shown_rows(d).into_iter().map(|(h, _)| h).collect();
+        held_entries(d)
+            .into_iter()
+            .filter(|(h, _)| !before.contains_key(h) && !rows.contains(h))
+            .collect()
+    };
+
+    // ---- (2) batched: the first record at once ----
+    let out = drain_as(&bob, "reader");
+    assert!(
+        posts.iter().all(|p| out.contains(p)),
+        "PRODUCT (staging): bob's drain did not show alice's posts: {out}"
+    );
+    let first_at = Instant::now();
+    let deadline = first_at + Duration::from_secs(3);
+    while records(&bob).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let first = records(&bob);
+    assert_eq!(
+        first.len(),
+        1,
+        "PRODUCT: bob's first drain must post one read record at once; within 3 s he holds \
+         {first:?} besides the room's rows"
+    );
+
+    // A second drain within the 5 s: nothing more yet.
+    alice.post("read-me four");
+    assert!(
+        reads_all(&bob, &["read-me four"], Duration::from_secs(3)),
+        "APPARATUS: staging not achieved: alice's fourth post did not reach bob within 3 s, so a \
+         second drain could not be made inside the 5-second batch"
+    );
+    let out = drain_as(&bob, "reader");
+    let second_drain = first_at.elapsed();
+    assert!(
+        second_drain < Duration::from_secs(4),
+        "APPARATUS: staging not achieved: bob's second drain came {second_drain:?} after the \
+         first record, not inside the 5-second batch"
+    );
+    assert!(
+        out.contains(&format!(
+            "{}1 new message(s)",
+            vox_tui::agent_hook::ROOM_AND_ISSUE
+        )) && out.contains("read-me four"),
+        "PRODUCT: bob's own next turn must be told only alice's new post, never a read record; \
+         it was told: {out}"
+    );
+    let now = records(&bob);
+    assert_eq!(
+        now.len(),
+        1,
+        "PRODUCT: a second drain {second_drain:?} after the first record posted another record at \
+         once: bob holds {now:?}; at most one per room per 5 s"
+    );
+    let deadline = first_at + Duration::from_secs(10);
+    while records(&bob).len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let both = records(&bob);
+    assert_eq!(
+        both.len(),
+        2,
+        "PRODUCT: the second drain's read record never went out within 10 s of the first: bob \
+         holds {both:?}"
+    );
+    let (lo, hi) = (
+        both.iter().map(|(_, c)| *c).min().unwrap_or(0),
+        both.iter().map(|(_, c)| *c).max().unwrap_or(0),
+    );
+    assert!(
+        hi - lo >= 5_000,
+        "PRODUCT: bob's two read records are {} ms apart by their clocks; at most one per room \
+         per 5 s: {both:?}",
+        hi - lo
+    );
+
+    // ---- (1) never a message: once alice holds both records ----
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let held = held_entries(&alice);
+        if both.iter().all(|(h, _)| held.contains_key(h)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): bob's read records did not reach alice in 60 s: she holds {held:?}, \
+             his records are {both:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let all = [
+        "read-me one",
+        "read-me two",
+        "read-me three",
+        "read-me four",
+    ];
+    let rows: Vec<String> = shown_rows(&alice).into_iter().map(|(_, t)| t).collect();
+    assert_eq!(
+        rows, all,
+        "PRODUCT: alice's `vox room read` must show her four posts and nothing else; it shows \
+         {rows:?}"
+    );
+    let (ok, board, err) = hook(
+        &alice.data,
+        &alice.cfg,
+        &["room", "board", &label, "--json"],
+        "",
+    );
+    assert!(ok, "PRODUCT (staging): vox room board --json failed: {err}");
+    let counted = serde_json::from_str::<serde_json::Value>(board.trim())
+        .ok()
+        .and_then(|v| v["position"]["entries"].as_u64());
+    assert_eq!(
+        counted,
+        Some(4),
+        "PRODUCT: alice's room must count her four posts, never a read record; \
+         `vox room board --json` said {board}"
+    );
+    let out = drain_as(&alice, "watcher");
+    assert!(
+        out.contains(&format!(
+            "{}4 new message(s)",
+            vox_tui::agent_hook::ROOM_AND_ISSUE
+        )) && all.iter().all(|p| out.contains(p)),
+        "PRODUCT: a new session on alice's node must be told her four posts and nothing else; it \
+         was told: {out}"
+    );
+    let out = drain_as(&alice, "watcher");
+    assert!(
+        out.trim().is_empty(),
+        "PRODUCT: a read record must never reach an agent's turn; alice's next turn was told: {out}"
     );
 }

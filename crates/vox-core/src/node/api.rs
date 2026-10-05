@@ -674,6 +674,15 @@ pub enum NodeCommand {
         /// The text.
         text: String,
     },
+    /// Note that these entries of an open channel were shown to this node's person, or drained
+    /// into its agent's turn (ADR-028 RR-1). The node posts a read record naming them, at most
+    /// one per room per 5 seconds (RR-2).
+    MarkRead {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The entries shown.
+        entries: Vec<Digest32>,
+    },
     /// Produce a `vox://` invite link for a channel this node holds open, naming this
     /// node, and any anchors the room uses, as where to reach the room, with this node as
     /// responder. The link arrives as

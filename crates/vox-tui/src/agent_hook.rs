@@ -43,7 +43,7 @@
 use std::io::Read as _;
 
 use vox_core::hash::Digest32;
-use vox_core::node::ipc::{Frame, IpcClient};
+use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::link::{b32_decode, b32_encode};
 use vox_core::node::paths::Paths;
 
@@ -1489,8 +1489,47 @@ async fn drain(
 
     for (d, shown) in drains.iter().zip(shown_in) {
         d.commit(paths, &input.session_id, shown);
+        mark_read(&mut client, d, shown).await;
     }
     Ok(())
+}
+
+/// Tell the node which of `d`'s news were drained into this turn, so it posts a read record for
+/// them (ADR-028 RR-1). A message not received yet was not drained. Best effort, after the cursor
+/// is saved: a node that cannot take it costs the members a `read by`, never the turn.
+async fn mark_read(client: &mut IpcClient, d: &RoomDrain, shown: usize) {
+    let Ok(channel_id) = b32_decode(&d.key, "room") else {
+        return;
+    };
+    let entries: Vec<Digest32> = d.fresh[..shown]
+        .iter()
+        .filter(|r| !r.owed)
+        .map(|r| r.entry_hash)
+        .collect();
+    for chunk in entries.chunks(vox_core::node::content::MAX_READ_HASHES) {
+        let request = Request::MarkRead {
+            channel_id,
+            entries: chunk.to_vec(),
+        };
+        match client.request(&request).await {
+            Ok(Frame::Ok) => {}
+            Ok(Frame::Error { reason }) => {
+                eprintln!("vox agent hook: could not record what was read: {reason}");
+                return;
+            }
+            Ok(other) => {
+                eprintln!(
+                    "vox agent hook: could not record what was read: {}",
+                    crate::client::unexpected(&other)
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("vox agent hook: could not record what was read: {e}");
+                return;
+            }
+        }
+    }
 }
 
 /// Read one room for this session: the page past its cursor, what of it is news, and the
