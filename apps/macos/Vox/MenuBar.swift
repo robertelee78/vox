@@ -73,7 +73,7 @@ struct MenuBarContent: View {
                 NSApp.windows.first { $0.identifier?.rawValue.contains("main") ?? false }?
                     .makeKeyAndOrderFront(nil)
             }
-            Button("Hide This Menu Bar Item") { app.menuBar = false }
+            Button("Hide This Menu Bar Item") { app.showMenuBar(false) }
         }
         .padding(12)
         .frame(width: 320)

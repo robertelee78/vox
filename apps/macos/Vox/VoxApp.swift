@@ -22,7 +22,7 @@ struct VoxApp: App {
         // Off until the person turns it on (M-22).
         MenuBarExtra("Vox", systemImage: "bubble.left.and.bubble.right",
                      isInserted: Binding(get: { delegate.model.menuBar },
-                                         set: { delegate.model.menuBar = $0 })) {
+                                         set: { delegate.model.showMenuBar($0) })) {
             MenuBarContent(app: delegate.model)
                 .preferredColorScheme(.dark)
         }

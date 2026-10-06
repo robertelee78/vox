@@ -27,8 +27,15 @@ final class AppModel: ObservableObject {
 
     @Published private(set) var phase: Phase = .starting
     /// Whether the menu bar extra is shown: off until the person turns it on (M-22).
-    @Published var menuBar = MenuBarChoice.on() {
-        didSet { MenuBarChoice.set(menuBar) }
+    @Published private(set) var menuBar = MenuBarChoice.on()
+
+    /// Show or hide the menu bar extra, and keep the choice. Setting the value it already has does
+    /// nothing: SwiftUI sets a MenuBarExtra's `isInserted` on its updates, and a change notice for
+    /// each of those started another update, so the main thread never went idle.
+    func showMenuBar(_ on: Bool) {
+        guard on != menuBar else { return }
+        menuBar = on
+        MenuBarChoice.set(on)
     }
     /// The node acted as, once attached: what the main window shows.
     @Published private(set) var node: NodeModel?
