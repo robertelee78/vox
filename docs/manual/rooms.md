@@ -156,6 +156,20 @@ set `notify-command = PROGRAM` in the node's own `config/config` file, else in y
 `config` (see [Commands and local state](reference.md)), or set `VOX_NOTIFY_COMMAND`. Vox runs it
 as `PROGRAM TITLE BODY`.
 
+### Replies
+
+A reply names the one message it answers (`--re` on the command line; Ctrl-R on a selected
+message in the TUI). The TUI shows a reply with that message quoted in one line above it, for
+example `┆ alice: the lexer first`, and Enter on the reply jumps to the message it quotes, however
+far back it is. There are no threads to open: a reply quotes one message, and that is all.
+
+### When someone joins
+
+When a node joins a room, each member's TUI says so and names which of the nodes in its keyring
+trust the newcomer, for example `FINGERPRINT (not in keyring) joined. alice trusts it.` or
+`FINGERPRINT (not in keyring) joined. No one you trust trusts it yet.` This adds nothing to your keyring: it tells you whom to ask before
+you decide.
+
 ### Characters you cannot see
 
 `room read` shows characters a reader could not otherwise see instead of printing them, each as
@@ -195,8 +209,9 @@ vox room retention ROOM_ID 1w
 
 The duration is `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. It applies to
 **everything already in the room**, on every member as the change reaches them: shortening it
-deletes older messages. It asks for no passphrase. Vox says plainly that a
-modified node can keep everything: retention is housekeeping, not a security property.
+deletes older messages. It asks for no passphrase. Before it acts, Vox says what it is to do:
+`vox: about to set how long "family" keeps messages: 1 week`. It says plainly that a modified node
+can keep everything: retention is housekeeping, not a security property.
 
 A member who is not an admin can only keep less on its own node. The same command then reports
 `set your own retention for … this node keeps its messages for 1 hour` and that nothing changed
@@ -224,7 +239,9 @@ from your keyring or retrieve copies they already retained.
 vox room leave ROOM_ID
 ```
 
-Vox reports `left room "family"` and that the other members see that you left. The command
+Vox first says what leaving is to do (`vox: about to leave room "family" (ROOM_ID): its other
+members are to see that you left, and this node is to delete it with everything it holds of it`),
+then reports `left room "family"` and that the other members see that you left. The command
 waits up to 30 seconds for another member to take the departure. If nobody can, it reports
 that the node will leave once someone can be told. A timeout is not a completed remote
 notification. Keep the node online if you want the pending departure delivered, and check its
@@ -235,6 +252,11 @@ reported result and room list. Joining again later with the room link works.
 ```sh
 vox room end ROOM_ID
 ```
+
+Vox first says `vox: about to end "family" for everyone: every member's node is to take no new
+message in it and delete it`, then `ended ROOM_ID for everyone`. In the TUI, `:leave` and `:end`
+open a confirmation that says the same, and act only once you type the word `leave` or `end`;
+anything else does nothing and says so.
 
 Only the creator or an admin may; anyone else is refused with `cannot end: only the room's
 creator, or an admin it delegated, may do that`. Ending is not a leave: every member's node takes

@@ -53,7 +53,19 @@ prints each trusted fingerprint and your name for it.
 
 This grants the node access governed by your trust decision across **all shared rooms**,
 including ones you join later, and reach to every service you share in a room you are both in.
-Vox states this when you add it. It is not just permission for the currently open room or one
+Vox states this before it acts and again after, naming the rooms you share:
+
+```text
+vox: about to trust 3jnhi236j2ktt7zgzs4iixoy7s as "ann"
+     it is to read what you write in "family", and in any room you share with it later
+     and to reach your services in a room you share, once you offer one
+vox: trusting 3jnhi236j2ktt7zgzs4iixoy7s as "ann"
+     it may now read what you write in "family" — now and later
+     and you read what it writes, once it trusts you too
+     and reach every service you bind to a room you are both in
+```
+
+It is not just permission for the currently open room or one
 file. The other node makes its own independent decision to trust you. For a conversation,
 confirm a message can be read in each direction.
 
@@ -90,6 +102,11 @@ The TUI shows trust by glyph, weight and words, never by colour alone:
 - `⇄ alice`, bold: alice is in your keyring and her node trusts yours too;
 - `→ dave`, bold: dave is in your keyring, and his node does not trust yours;
 - `· ` and 26 characters of a fingerprint, plain: a node not in your keyring.
+
+Where two nodes in your keyring have names that differ only in case, such as `alice` and
+`Alice`, each is shown with `#` and the first six characters of its fingerprint, `alice#6tvrsb`
+and `Alice#lhk6xo`, everywhere the TUI and `vox room read` name them. In the composer,
+`@alice#6tvrsb` picks one of them.
 
 Under each name a line says `in keyring · reads you` or `in keyring · cannot read you yet`, or
 `not in keyring · still reads you` or `not in keyring · you don't read each other`. Where the
@@ -131,7 +148,13 @@ vox trust remove FULL_FINGERPRINT
 vox trust list
 ```
 
-Vox reports `your sender key is rotated and everyone still trusted is re-keyed`. Verify the
+Before it acts, Vox says what the node is to lose: `it is to read nothing you write from now on
+in "family"; what it already read stays read`, `and to reach none of your services from now on: it
+loses ssh in "family"`, and which of its live sessions into your services are to be cut. After,
+it reports `your sender key is rotated and everyone still trusted is re-keyed`, the sessions it
+cut (`cut: tunnel 1: ann reaching your ssh`, or `cut: none was open`), and that your own sessions
+into the other node's services are untouched: those are the other node's keyring's to grant, not
+yours. Verify the
 fingerprint is absent from `vox trust list`, and inspect any affected service or conversation
 from the other side if you need operational confirmation. Do not run this as an experiment on a
 family member's or production agent's identity.
