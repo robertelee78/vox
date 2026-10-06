@@ -660,7 +660,7 @@ try:
     tui.until(lambda: len(notes()) > before, 30, 0.5)
     tui.pump(6)  # time for a second notification, were the room's messages not grouped
     raised = notes()[before:]
-    claim("notify", len(raised) == 1 and raised[0].startswith("Vox: m |") and "alice" in raised[0]
+    claim("notify", len(raised) == 1 and raised[0].startswith("Vox: family |") and "alice" in raised[0]
           and "secret" not in raised[0] and "do not show" not in raised[0],
           f"notifications for three messages in a room off screen: {raised!r}")
 
