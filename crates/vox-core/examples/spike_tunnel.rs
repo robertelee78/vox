@@ -103,6 +103,7 @@ async fn host() {
     // to enforce `dial:echo` from the capability lattice; that model is withdrawn.
     match session::accept(send, recv, &client_id, |cid, tag| {
         (*cid == channel_id && tag == "echo").then_some(session::HostService {
+            tag: "echo".to_owned(),
             endpoint: echo_addr,
             offered: std::sync::Arc::new(tokio::sync::watch::Sender::new(
                 [("echo".to_owned(), echo_addr)].into_iter().collect(),

@@ -212,6 +212,10 @@ pub async fn request(
 /// hold that channel and offer that service"; whether the *peer* may reach it is still
 /// [`accept`]'s to enforce.
 pub struct HostService {
+    /// The service's tag as the host offers it: its name, or `udp/<name>`. The dialer may have
+    /// named it by its share fingerprint instead (ADR-028 S-1); everything after resolution
+    /// uses this.
+    pub tag: String,
     /// The local address the service listens on.
     pub endpoint: SocketAddr,
     /// The identities this host has decided may reach it: its **trust keyring** entries
@@ -381,6 +385,7 @@ where
     };
     let (
         Some(HostService {
+            tag,
             endpoint: target,
             reachers,
             offered,
@@ -397,7 +402,7 @@ where
     };
     // Authorized, and not before: the host learns who reached what, and learns nothing
     // about a refusal it did not grant.
-    let watch = match served(&req.channel_id, &req.service_tag) {
+    let watch = match served(&req.channel_id, &tag) {
         Ok(watch) => watch,
         Err(e) => {
             let status = if matches!(e, Error::TunnelLimit(_)) {
@@ -411,14 +416,14 @@ where
         }
     };
 
-    if crate::tunnel::udp::is_udp(&req.service_tag) {
-        let cut = withdrawn(reachers, offered, *client_id, req.service_tag.clone());
+    if crate::tunnel::udp::is_udp(&tag) {
+        let cut = withdrawn(reachers, offered, *client_id, tag.clone());
         let Some(udp) = udp else {
             write_frame(&mut send, &[TunnelStatus::Denied.as_byte()]).await?;
             let _ = send.finish();
             return Err(Error::TunnelDenied("udp not served here"));
         };
-        return accept_udp(send, recv, udp, client_id, target, &req.service_tag, cut).await;
+        return accept_udp(send, recv, udp, client_id, target, &tag, cut).await;
     }
 
     let tcp = match TcpStream::connect(target).await {
@@ -432,7 +437,7 @@ where
         }
     };
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
-    let cut = withdrawn(reachers, offered, *client_id, req.service_tag);
+    let cut = withdrawn(reachers, offered, *client_id, tag);
     splice_until(send, recv, tcp, cut, watch).await
 }
 

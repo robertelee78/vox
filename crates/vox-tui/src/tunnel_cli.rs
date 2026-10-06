@@ -377,6 +377,11 @@ pub fn print_services(
 /// The refusal for an address whose share the room's log does not carry, or `None` when it does
 /// (V030-25, PRD-001 R23: said at once, on this side).
 fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
+    // A canonical address names its share by fingerprint, which the sharer resolves itself: this
+    // node's copy of the log may simply be behind (ADR-028 S-1), so the host is asked.
+    if room.by_unknown_fingerprint() && room.share == ShareState::Absent {
+        return None;
+    }
     match room.share {
         ShareState::Stated => None,
         ShareState::Absent => Some(AppError::Usage(format!(

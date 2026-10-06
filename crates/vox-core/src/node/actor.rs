@@ -14093,6 +14093,9 @@ impl Node {
     async fn host_snapshot(&mut self) -> crate::node::tunnel::HostSnapshot {
         self.refresh_reachers().await;
         let mut out = crate::node::tunnel::HostSnapshot::new();
+        let Some(me) = self.net.as_ref().map(|n| n.local_id()) else {
+            return out;
+        };
         for (cid, shared) in &self.channels {
             if shared.lock().await.services().is_empty() {
                 continue;
@@ -14106,6 +14109,7 @@ impl Node {
                 crate::node::tunnel::ChannelServices {
                     offered: Arc::clone(offered),
                     reachers: Arc::clone(reachers),
+                    me,
                 },
             );
         }

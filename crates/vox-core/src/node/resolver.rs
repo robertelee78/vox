@@ -63,6 +63,17 @@ pub struct ServiceRoom {
     pub share: ShareState,
 }
 
+impl ServiceRoom {
+    /// Whether the address named its service by a share fingerprint this node's copy of the
+    /// room's log does not hold (ADR-028 S-1): only the sharer can say what it names, so a client
+    /// asks it rather than refusing on its own copy, which may be behind (a member that slept
+    /// while the share was made).
+    #[must_use]
+    pub fn by_unknown_fingerprint(&self) -> bool {
+        self.share != ShareState::Stated && b32_decode(&self.service, "vox service").is_ok()
+    }
+}
+
 /// What this node's copy of a room's log says of the share an address names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareState {
