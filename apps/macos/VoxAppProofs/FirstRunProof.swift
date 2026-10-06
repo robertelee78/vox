@@ -711,7 +711,16 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the note must travel in the share itself, as one message; bob's `vox room read --json` has \(bobRows.count) row(s) with it: \(bobRows)")
         // Bob's copy, read outside the runner's sandbox (by the stager): its size and SHA-256
         // against what was attached.
-        let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(room)/for-bob.bin")
+        // A pull is filed under the room's full ID; `room` is the short one `vox room list` prints.
+        // The full ID opens the room's vox:// link.
+        let roomLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        let fullRoom = String(roomLink.dropFirst("vox://".count).prefix { $0 != "?" && $0 != "/" })
+        guard fullRoom.count == 52 else {
+            throw Apparatus("the room's full ID could not be read from its link \(roomLink)")
+        }
+        let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(fullRoom)/for-bob.bin")
         let want = stager.run(["/usr/bin/shasum", "-a", "256", file.path], env: [:]).out
             .split(separator: " ").first.map(String.init) ?? ""
         guard !want.isEmpty else { throw Apparatus("the proof could not hash the file it attached, \(file.path)") }
@@ -725,7 +734,7 @@ final class FirstRunProof: XCTestCase {
         if got != want {
             let there = stager.run(["/bin/ls", "-lR", URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files").path], env: [:]).out
             let pulls = run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out
-            XCTFail("PRODUCT: the file attached To: bob must be pulled by bob's node, byte for byte, into \(bobCopy.path) within 120 s; it holds \(got.isEmpty ? "nothing" : "sha256 \(got)"); bob's files: \(there.isEmpty ? "none" : there); bob's room read: \(pulls.suffix(1200))")
+            XCTFail("PRODUCT: the file attached To: bob must be pulled by bob's node, byte for byte, into \(bobCopy.path) within 120 s; it holds \(got.isEmpty ? "nothing" : "sha256 \(got)"); bob's files: \(there.isEmpty ? "none" : there.replacingOccurrences(of: "\n", with: " ⏎ ")); bob's room read: \(pulls.suffix(1200))")
         }
         let pulledBytes: Data? = got == want ? bytes : nil
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
