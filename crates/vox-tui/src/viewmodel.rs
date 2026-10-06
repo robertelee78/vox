@@ -108,8 +108,13 @@ pub struct ChannelSummary {
     pub channel_id: Digest32,
     /// The local, user-assigned channel name.
     pub local_name: String,
-    /// Count of unread decryptable entries.
+    /// Unread messages addressed to this node (their `to` names it): the first level (ADR-028
+    /// R-8, #484).
+    pub to_you: usize,
+    /// Other unread messages: the second level.
     pub unread: usize,
+    /// Unread coordination traffic (presence, progress, claims), counted only: the third level.
+    pub coordination: usize,
     /// Channel reachability.
     pub reachability: Reachability,
 }

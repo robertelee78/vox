@@ -139,10 +139,19 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
             } else {
                 "  "
             };
-            let unread = if c.unread > 0 {
-                format!(" ({} unread)", c.unread)
-            } else {
+            // The three unread levels (ADR-028 R-8, #484): to this node first.
+            let levels: Vec<String> = [
+                (c.to_you > 0).then(|| format!("to you {}", c.to_you)),
+                (c.unread > 0).then(|| format!("{} new", c.unread)),
+                (c.coordination > 0).then(|| format!("{} coordination", c.coordination)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let unread = if levels.is_empty() {
                 String::new()
+            } else {
+                format!(" ({})", levels.join(" · "))
             };
             let lock = if c.open { "" } else { " 🔒" };
             ListItem::new(format!(
@@ -152,7 +161,10 @@ fn render_channel_list(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiSta
             ))
         })
         .collect();
-    let title = format!("node {} · Rooms (Enter: open · : command)", vm.node);
+    let title = format!(
+        "node {} · Rooms (Enter: open · Ctrl-N: next room to you · : command)",
+        vm.node
+    );
     // The room list is the screen's one pane, so it holds the focus (ADR-028 L-3).
     let list = List::new(items).block(focus_block(
         Block::default().borders(Borders::ALL).title(title),

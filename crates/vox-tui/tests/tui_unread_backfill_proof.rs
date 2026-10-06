@@ -39,8 +39,14 @@
 //! it — counted by `SenderKeyReceived.backfilled` (`live.rs`). This proof runs the order the
 //! product produces; the badge must read 1 either way.
 //!
+//! **Three levels and a key** (ADR-028 R-8, #484). Then alice, in a second room bob joins
+//! (`chatty`), says something to the room and posts a status, and in `mission` posts to bob
+//! (`--to`). Asserted: mission reads "to you 1", chatty "1 new · 1 coordination" and nothing to
+//! bob, and Ctrl-N opens mission, the room with a message addressed to bob, passing over chatty.
+//!
 //! Mutations: `--history now` for alice's grant, or the backfill on grant arrival removed —
-//! the row never renders and the badge stays at 0.
+//! the row never renders and the badge stays at 0. An addressed message counted as plain new
+//! (`unread_level` never `ToYou`): mission reads "2 new", not "to you 1", and Ctrl-N opens nothing.
 
 #![cfg(unix)]
 
@@ -423,13 +429,13 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     let home = tui.line_for("home").expect("home's line");
     eprintln!("badge: {mission:?} / {home:?}");
     assert!(
-        mission.contains("(1 unread)"),
+        mission.contains("(1 new)"),
         "one message became readable in mission while home was on screen, so its badge must \
-         read (1 unread) — not 0 and not 2. It reads: {mission:?}\nscreen:\n{}",
+         read (1 new) — not 0 and not 2. It reads: {mission:?}\nscreen:\n{}",
         tui.text()
     );
     assert!(
-        !home.contains("unread"),
+        !home.contains(" new"),
         "home, the room that was on screen, has nothing unread: {home:?}"
     );
 
@@ -437,10 +443,128 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     std::thread::sleep(Duration::from_secs(5));
     let settled = tui.line_for("mission").expect("mission's line");
     assert!(
-        settled.contains("(1 unread)"),
+        settled.contains("(1 new)"),
         "the badge moved after the room settled; each row counts once: {settled:?}"
     );
     eprintln!("badge after settling: {settled:?}");
+
+    // ---- three levels, and a key to the room addressed to bob (ADR-028 R-8, #484) ----------
+    // A second room of alice's, `chatty`, which bob joins: there alice says something to the room
+    // and posts a status (coordination); in `mission` she posts to bob. Each is first read on
+    // bob's node, so the screen is judged on rows bob holds.
+    let (ok, _, err) = vox(
+        &alice_dir,
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "chatty",
+        ],
+        Some("chatty passphrase\n"),
+    );
+    assert!(ok, "PRODUCT (staging): alice creates chatty: {err}");
+    let listed = until(&alice_dir, "chatty to appear", &["room", "list"], |o| {
+        o.contains("chatty")
+    });
+    let chatty = listed
+        .lines()
+        .find(|l| l.contains("chatty"))
+        .and_then(|l| l.split_whitespace().next())
+        .expect("chatty's id")
+        .to_owned();
+    let (ok, chatty_link, err) = vox(&alice_dir, &["room", "link", &chatty], None);
+    assert!(ok, "PRODUCT (staging): chatty's link: {err}");
+    let (ok, _, err) = vox(
+        &bob_dir,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            chatty_link.trim(),
+            "--name",
+            "chatty",
+        ],
+        Some("chatty passphrase\n"),
+    );
+    assert!(ok, "PRODUCT (staging): bob joins chatty: {err}");
+    for (room, args, marker) in [
+        (&chatty, vec!["CHATTY-SAID to the room"], "CHATTY-SAID"),
+        (
+            &chatty,
+            // A structured post names its session: a proof's children inherit none.
+            vec![
+                "--type",
+                "status",
+                "--session",
+                "unread-proof",
+                "CHATTY-STATUS lexer next",
+            ],
+            "CHATTY-STATUS",
+        ),
+        (
+            &room,
+            vec![
+                "--to",
+                bob_fp.as_str(),
+                "--session",
+                "unread-proof",
+                "MISSION-TO-BOB please look",
+            ],
+            "MISSION-TO-BOB",
+        ),
+    ] {
+        let mut argv = vec!["room", "post", room.as_str()];
+        argv.extend(args.iter().copied());
+        let (ok, _, err) = vox(&alice_dir, &argv, None);
+        assert!(ok, "PRODUCT (staging): alice posts {marker}: {err}");
+        let t0 = Instant::now();
+        while !vox(&bob_dir, &["room", "read", "--json", room], None)
+            .1
+            .contains(marker)
+        {
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "CANNOT MEASURE: bob's node never held {marker} within 60 s"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    let t0 = Instant::now();
+    let (mission, chatty_line) = loop {
+        let (m, c) = (tui.line_for("mission"), tui.line_for("chatty"));
+        if let (Some(m), Some(c)) = (&m, &c) {
+            if m.contains("to you 1") && c.contains("1 new · 1 coordination") {
+                break (m.clone(), c.clone());
+            }
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "PRODUCT: the list does not count the levels: mission must read \"to you 1\" (alice \
+             wrote to bob) and chatty \"1 new · 1 coordination\"; it reads {m:?} / {c:?}\nscreen:\n{}",
+            tui.text()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(
+        !chatty_line.contains("to you"),
+        "PRODUCT: chatty has nothing addressed to bob, and reads {chatty_line:?}"
+    );
+    println!("[proof] levels: {mission:?} / {chatty_line:?}");
+    // Ctrl-N: the next room with a message addressed to bob is mission, whichever order the list
+    // has; chatty, with only new messages, is passed over.
+    tui.keys(b"\x0e");
+    let shown = tui.expect("a room on screen after Ctrl-N", 10, |t| {
+        !t.contains("Rooms (Enter")
+    });
+    assert!(
+        shown.contains("MISSION-TO-BOB"),
+        "PRODUCT: Ctrl-N must open the room with a message addressed to bob (mission); the \
+         screen:\n{shown}"
+    );
+    println!("[proof] Ctrl-N opened mission, the room with a message to bob");
 
     drop(tui);
     drop(alice);

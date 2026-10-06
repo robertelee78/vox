@@ -308,6 +308,22 @@ impl UiState {
             Mode::Prompt(_) => return self.on_prompt_key(key),
             Mode::Normal => {}
         }
+        // **Ctrl-N: the next room with a message addressed to this node** (ADR-028 R-8, #484),
+        // from the room list or a room, after the one selected and round again: a room with only
+        // new messages is passed over.
+        if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let n = vm.channels.len();
+            let next = (1..=n)
+                .map(|k| (self.selected_channel + k) % n.max(1))
+                .find(|i| vm.channels.get(*i).is_some_and(|c| c.to_you > 0));
+            return match next {
+                Some(i) => {
+                    self.selected_channel = i;
+                    self.open_selected(vm)
+                }
+                None => Action::Redraw,
+            };
+        }
         // The composer, when focused, owns printable keys, Backspace and Enter.
         if self.screen == Screen::Channel && self.focus == Focus::Composer {
             match key.code {
