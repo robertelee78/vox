@@ -26,6 +26,13 @@
 //!    which no proof uses, and the case is CANNOT MEASURE. Mutation: the root checks taken out of
 //!    the client and the daemon turns it red with the old wait and its message.
 //!
+//! 6. **The login item's daemon waits its turn (ADR-014 M-9).** `vox daemon --no-node`, what
+//!    Vox.app's launch agent runs, started while a daemon a client started is running, is still
+//!    there 3 s later, and once that daemon stops it holds `.daemon/lock` and answers `vox node
+//!    list`. launchd restarts the agent only after a crash, so one that exited 0 left Vox.app,
+//!    waiting for the login item's daemon, with none. Mutation: `--no-node` exits 0 when a daemon
+//!    is running, as before, turns it red at the 3 s check.
+//!
 //! Not yet here (the verbs are clients only from #406): a foreground `vox serve` exiting when the
 //! daemon stops, and a request in flight answered "node detached" over the CLI.
 
@@ -514,7 +521,10 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
     );
     // Once the grace has passed with no node and no client, it exits as before.
     assert!(
-        wait_until(Duration::from_secs(20).saturating_sub(served.elapsed()), || !alive(pid)),
+        wait_until(
+            Duration::from_secs(20).saturating_sub(served.elapsed()),
+            || !alive(pid)
+        ),
         "PRODUCT: the auto-started daemon with no node and no client did not exit within 20 s of \
          serving\nlog:\n{}",
         a.log()
@@ -569,6 +579,53 @@ fn a_daemon_on_an_empty_root_starts_with_no_node() {
         status.success(),
         "PRODUCT: the daemon with no node did not stop cleanly on SIGTERM ({status}):\n{}",
         said()
+    );
+}
+
+/// ADR-014 M-9: the login item's daemon, started while another daemon serves the account, waits
+/// for it and then serves (proof 6 in this file's list).
+#[test]
+#[ignore = "real binaries; run in release"]
+fn the_login_items_daemon_waits_for_the_running_one_and_then_serves() {
+    watchdog::arm();
+    let a = Account::new();
+    let (ok, out, err) = a.run(&["daemon", "--detach"], "");
+    assert!(ok, "APPARATUS: vox daemon --detach: {out}{err}");
+    let first = a
+        .lock_pid()
+        .unwrap_or_else(|| panic!("APPARATUS: no daemon holds the lock after --detach: {out}"));
+    let mut managed = Daemon::start(&a, &["--no-node"], &[]);
+    managed.expect(
+        "that a daemon is already running",
+        Duration::from_secs(20),
+        |l| l.contains("a daemon is already running"),
+    );
+    let pid = managed.child.id();
+    std::thread::sleep(Duration::from_secs(3));
+    if let Some(status) = managed.child.try_wait().unwrap() {
+        stop_pid(first);
+        panic!(
+            "PRODUCT: `vox daemon --no-node`, the login item's daemon, exited ({status}) while \
+             another daemon ran; launchd restarts it only after a crash, so Vox.app finds no \
+             daemon once the running one stops. It said:\n{}",
+            managed.said()
+        );
+    }
+    // The running daemon stops, as one a client started does once nothing uses it.
+    stop_pid(first);
+    assert!(
+        !alive(first),
+        "APPARATUS: the first daemon ({first}) did not stop on SIGTERM within 15 s"
+    );
+    let took = wait_until(Duration::from_secs(20), || a.lock_pid() == Some(pid));
+    let (answered, list, list_err) = a.run(&["node", "list"], "");
+    let lock = a.lock_pid();
+    let said = managed.stop();
+    assert!(
+        took && answered && lock == Some(pid),
+        "PRODUCT: once the running daemon stopped, the login item's daemon ({pid}) did not serve \
+         the account within 20 s (the lock names {lock:?}; `vox node list` answered {answered}: \
+         {list}{list_err}). It said:\n{said}"
     );
 }
 

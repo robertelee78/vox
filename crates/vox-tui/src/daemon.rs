@@ -158,15 +158,48 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         stop_requested("vox daemon")
     });
     let named = named_node(args)?;
-    let Some(serving) = take_account(
-        &account,
-        &rt,
-        args.profile.listen,
-        &args.profile.anchors,
-        args.proxy,
-    )?
-    else {
-        return already_running(args, &account, rt, &mut stop, named);
+    let take = || {
+        take_account(
+            &account,
+            &rt,
+            args.profile.listen,
+            &args.profile.anchors,
+            args.proxy,
+        )
+    };
+    let serving = match take()? {
+        Some(serving) => serving,
+        None if args.no_node => {
+            // **A service manager's daemon waits its turn** (ADR-014 M-9): the login item's
+            // launch agent restarts it only after a crash, so one that exited 0 because a daemon
+            // a client started was running left nothing behind once that daemon went, and Vox.app,
+            // waiting for the login item's daemon, found none until the next login. It waits for
+            // the account instead, and serves once the running daemon stops.
+            eprintln!(
+                "vox daemon: a daemon is already running for {}; this one serves once it stops",
+                account.data_root.display()
+            );
+            loop {
+                let signal = rt.block_on(async {
+                    tokio::select! {
+                        signal = &mut stop => Some(signal),
+                        () = tokio::time::sleep(Duration::from_millis(250)) => None,
+                    }
+                });
+                if let Some(signal) = signal {
+                    say(format_args!(
+                        "vox daemon: stopped by {} while it waited",
+                        signal.name()
+                    ));
+                    return Ok(());
+                }
+                if let Some(serving) = take()? {
+                    eprintln!("vox daemon: the daemon that was running stopped; this one serves");
+                    break serving;
+                }
+            }
+        }
+        None => return already_running(args, &account, rt, &mut stop, named),
     };
     let router = serving.router.clone();
     router.attach_kept();
@@ -665,15 +698,7 @@ fn already_running(
             account.data_root.display()
         )
     };
-    if args.login_item {
-        // Not done: launchd starts the login item again after a failed exit, ten seconds on, so
-        // it serves once the daemon running now (started by `vox` or the app) has gone.
-        return Err(AppError::Refused {
-            code: 75,
-            message: running("; the login item tries again in 10 s"),
-        });
-    }
-    if args.as_detached || args.no_node {
+    if args.as_detached {
         eprintln!("vox daemon: {}", running(""));
         return Ok(());
     }
