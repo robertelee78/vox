@@ -379,7 +379,7 @@ pub fn print_services(
 fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
     // A canonical address names its share by fingerprint, which the sharer resolves itself: this
     // node's copy of the log may simply be behind (ADR-028 S-1), so the host is asked.
-    if room.by_unknown_fingerprint() && room.share == ShareState::Absent {
+    if room.by_unknown_fingerprint() {
         return None;
     }
     match room.share {
