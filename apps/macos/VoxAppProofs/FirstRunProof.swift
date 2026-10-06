@@ -808,6 +808,14 @@ final class FirstRunProof: XCTestCase {
         let landed = Key.showing("NEEDS-YOU-9")
         present(ui, landed, timeout: 15,
                 "⌘J from room aaa must open mission, the room that needs alice, with its message NEEDS-YOU-9")
+        // Shown means on screen (hittable), not only built: a lazy timeline builds rows beyond
+        // its visible part too.
+        let inViewUntil = Date().addingTimeInterval(10)
+        while Date() < inViewUntil && !el(ui, landed).isHittable { Thread.sleep(forTimeInterval: 0.2) }
+        if !el(ui, landed).isHittable {
+            keepTree(ui, "NEEDS-YOU-9 was not in view")
+            XCTFail("PRODUCT: ⌘J must open mission with its newest message, NEEDS-YOU-9, in view; it is in the timeline but not on screen")
+        }
         // To: is the room's own: bob ticked in mission is not carried into aaa.
         let to = Key.id("compose-to")
         present(ui, to, timeout: 10, "the composer must offer To:")

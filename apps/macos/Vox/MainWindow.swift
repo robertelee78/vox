@@ -201,6 +201,15 @@ private struct RoomView: View {
                                 })
                                 markSeen()
                             }
+                            // A room opens at its newest message: loaded before the view
+                            // appeared, its count never changed and it stayed at the top, so the
+                            // newest rows were never in view, and never read.
+                            .onAppear {
+                                if let last = model.messages.last {
+                                    scroller.scrollTo(last.id, anchor: .bottom)
+                                }
+                                newest = model.messages.last?.id
+                            }
                             .onChange(of: model.messages.count) { _ in
                                 let following = newest == nil || inView.contains(newest ?? "")
                                 if following, let last = model.messages.last {
