@@ -236,6 +236,35 @@ fn echo_service() -> u16 {
     port
 }
 
+/// An `sshd` stand-in that greets with an SSH banner, so the sharer's node detects it as `ssh`
+/// (ADR-028 S-2), and reports on the channel the first line each client sends: a real `ssh`
+/// client that reached it sends its own `SSH-2.0-…` banner.
+fn ssh_banner_service() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the ssh stand-in");
+    let port = listener
+        .local_addr()
+        .expect("APPARATUS: the ssh stand-in's address")
+        .port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                if s.write_all(b"SSH-2.0-VoxProofStandIn\r\n").is_err() {
+                    return;
+                }
+                let mut line = String::new();
+                if BufReader::new(&s).read_line(&mut line).is_ok() && !line.is_empty() {
+                    let _ = tx.send(line.trim().to_owned());
+                }
+            });
+        }
+    });
+    (port, rx)
+}
+
 /// Speak RFC 1928 to `proxy`, asking it to CONNECT to `host:port` **by name** — which is
 /// the `socks5h` behaviour `vox up` requires, and the reason a `.vox` name never reaches
 /// a resolver.
@@ -559,6 +588,104 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         "PRODUCT: the host should name the service that was reached: {reached}"
     );
 
+    // ---- ADR-028 S-3 (#490): a command copied from `vox service list` works on another member's
+    // machine. The host shares an ssh stand-in; its own listing gives the ssh command, with the
+    // canonical address; the guest pastes it into a real `ssh`, pointed at its own `.vox` proxy
+    // by the block its own listing prints. The stand-in must hear the ssh client's banner.
+    let (ssh_port, ssh_heard) = ssh_banner_service();
+    let (ok, out, err) = vox_once(
+        &host_dir,
+        &[
+            "service".into(),
+            "add".into(),
+            room.clone(),
+            "nas-ssh".into(),
+            format!("127.0.0.1:{ssh_port}"),
+        ],
+    );
+    assert!(ok, "PRODUCT (staging): the host shares nas-ssh: {out}{err}");
+    let listing = |dir: &std::path::Path, want: &dyn Fn(&str) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let (ok, out, err) = vox_once(dir, &["service".into(), "list".into(), room.clone()]);
+            if ok && want(&out) {
+                return out;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: `vox service list` never showed what was expected: {out}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    let host_list = listing(&host_dir, &|o| {
+        o.lines()
+            .any(|l| l.trim_start().starts_with("ssh ") && l.contains("ssh $USER@"))
+    });
+    let copied = host_list
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("ssh "))
+        .map(|c| c.trim().to_owned())
+        .unwrap_or_default();
+    let guest_list = listing(&guest_dir, &|o| {
+        o.contains("ProxyCommand") && o.contains("nas-ssh.")
+    });
+    let block: String = guest_list
+        .lines()
+        .skip_while(|l| !l.contains("add this to ~/.ssh/config"))
+        .skip(1)
+        .take_while(|l| l.starts_with("    "))
+        .map(|l| format!("{}\n", l.trim_start()))
+        .collect();
+    let ssh_dir = tempfile::tempdir().expect("APPARATUS: a directory for ssh's files");
+    let config = ssh_dir.path().join("config");
+    std::fs::write(&config, &block).expect("APPARATUS: write the ssh config");
+    // The pasted command, run by a shell as a person's would be; only where ssh keeps its own
+    // files, and that it never prompts, is the proof's.
+    let pasted = copied.replacen(
+        "ssh ",
+        &format!(
+            "ssh -F {} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+             -o ConnectTimeout=60 ",
+            config.display()
+        ),
+        1,
+    );
+    let ssh_out = Command::new("sh")
+        .args(["-c", &pasted])
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: run ssh");
+    let heard = ssh_heard.recv_timeout(Duration::from_secs(5)).ok();
+    eprintln!(
+        "[test] S-3: the host's listing:\n{host_list}\nthe guest's ssh config block:\n{block}\n\
+         pasted: {pasted}\nssh said: {}\nthe ssh stand-in heard: {heard:?}",
+        String::from_utf8_lossy(&ssh_out.stderr)
+    );
+    assert!(
+        copied.starts_with("ssh $USER@") && copied.ends_with(".vox") && block.contains("ProxyCommand"),
+        "PRODUCT: `vox service list` must give an ssh share's ssh command, and the ~/.ssh/config \
+         block for this machine's proxy; the host's said:\n{host_list}\nthe guest's said:\n{guest_list}"
+    );
+    assert!(
+        heard.as_deref().is_some_and(|h| h.starts_with("SSH-2.0-")),
+        "PRODUCT: the ssh command copied from the host's `vox service list` ({copied}), pasted on \
+         the guest's machine, must reach the ssh service; the service heard {heard:?}, and ssh said: \
+         {}",
+        String::from_utf8_lossy(&ssh_out.stderr)
+    );
+    // What it needs, and that it holds: the host trusts the guest, and is online.
+    let trust_line = guest_list
+        .lines()
+        .skip_while(|l| !l.contains("nas-ssh."))
+        .find(|l| l.contains("needs") && l.contains("trusts this node"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        trust_line.ends_with(": yes"),
+        "PRODUCT: the guest's listing must say the host trusts it: {trust_line:?}\n{guest_list}"
+    );
+
     drop(up);
 
     // ---- the control: an UNTRUSTED joiner reaches nothing (M17.7) ----
@@ -643,6 +770,23 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         l.starts_with("! ") && l.contains("the host refused")
     });
     eprintln!("[test] the stranger's vox up said: {why}");
+    // ADR-028 S-3: its listing names the condition that does not hold, before it tries.
+    let (_, stranger_list, _) = vox_once(
+        &stranger_dir,
+        &["service".into(), "list".into(), room.clone()],
+    );
+    let stranger_needs = stranger_list
+        .lines()
+        .skip_while(|l| !l.contains("nas-ssh."))
+        .find(|l| l.contains("needs") && l.contains("trusts this node"))
+        .unwrap_or_default()
+        .to_owned();
+    eprintln!("[test] S-3: the stranger's listing:\n{stranger_list}");
+    assert!(
+        stranger_needs.contains(": NO") && stranger_needs.contains("must trust this node"),
+        "PRODUCT: the untrusted joiner's `vox service list` must name what is missing, that the \
+         host does not trust it: {stranger_needs:?}\n{stranger_list}"
+    );
 
     drop(stranger_up);
     drop(host);
