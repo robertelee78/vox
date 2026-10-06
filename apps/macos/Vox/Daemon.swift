@@ -11,16 +11,15 @@ enum Daemon {
     /// How long the login item's daemon, or one started here, is waited for (ADR-026 S-2).
     static let patience: TimeInterval = 15
 
-    /// A client of the account's daemon. When none answers: with the login item on, launchd's
-    /// daemon is waited for and nothing is started here; otherwise the bundle's `vox` starts one,
-    /// as `vox` does (`vox daemon --detach`, ADR-026 S-2), which starts none if one runs.
+    /// A client of the account's daemon. When none answers, the bundle's `vox` starts one as
+    /// `vox` does (`vox daemon --detach`, ADR-026 S-2), which starts none if one runs: also with
+    /// the login item on, whose daemon may not be running (stopped, refused, or not loaded yet),
+    /// and with which it cannot make a second (D-1: one holds the account's lock).
     static func reach() async throws -> VoxClient {
         if let client = try? await VoxClient.open(dataRoot: "") {
             return client
         }
-        if loginItem.status != .enabled {
-            try await startAsVoxDoes()
-        }
+        try await startAsVoxDoes()
         let until = Date().addingTimeInterval(patience)
         var last: Error?
         while Date() < until {
