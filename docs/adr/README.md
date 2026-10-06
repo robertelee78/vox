@@ -39,6 +39,7 @@ primitive) precedes ADR-007 (consent, which is stored on the log) in build order
 | [024](ADR-024-tapered-congestion-control.md) | Tapered Congestion Control (Cubic → loss-aware Cubic → BBR, both ways) | 011 |
 | [025](ADR-025-sync-scheduling-switch-not-hub.md) | Sync Is Scheduled Like a Switch, Not a Hub (full duplex, receive classes, backoff kinds) | 008, 011, 016 |
 | [026](ADR-026-daemon-and-nodes.md) | The Daemon and the Nodes That Use It (one presence per account, nodes attach and detach) | 002, 010, 011, 012, 016 |
+| [029](ADR-029-sessions-and-the-repo-room.md) | Sessions, and the Room a Session Works In (a Session per harness session; drive; talking to one session; the room map; setup) — accepted for v0.4.0 | 020, 021, 026, 028 |
 | [028](ADR-028-one-experience-keyring-rooms-services-files.md) | One Experience (keyring, rooms, services and files in the TUI and the app; look; install) — accepted for v0.4.0 | 005, 007, 014, 015, 016, 017, 020, 023, 026 |
 
 ## Tiers

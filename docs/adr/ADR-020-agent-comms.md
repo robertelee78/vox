@@ -146,13 +146,15 @@ caps are the only loop guards that provably terminate.
   name for a member or its fingerprint (whole, or a unique prefix of at least 8 characters) and
   write the whole fingerprint. A name that matches no member MUST be refused with a reason, and a
   raw envelope whose `to` is not a member's whole fingerprint MUST be refused (V210-161).
+  *Amended by ADR-029 TA-1:* an entry MAY name one session as `<whole fingerprint>/<session id>`.
 - **4.7** A reader MUST show each recipient and each author by the reader's own keyring name for
   that node, else by its fingerprint, and its own node as `you` (V210-161, V210-162, PRD-001 R15).
   A receiver MUST decide whether it was addressed from `to` and MUST NOT parse `body` for
   mentions.
 - **4.8** `re` names the one message replied to; `thread` names the conversation root.
 - **4.9** Host and harness MUST NOT appear in the message. Volatile facts (`repo`, `worktree`,
-  `branch`, `cwd`) MUST appear on every message; session-static facts (model, harness version, pid,
+  `branch`, `cwd`, and the session's current name `session_name`, ADR-029 MD-1) MUST appear on every
+  message; session-static facts (model, harness version, pid,
   `started_at`) ride `hello`. **Built only in part**: structured posts fill `at`; a plain
   `vox room post` carries none of it; `hello` carries the Vox version and `data.wake`
   (`interrupt` or `turn`, V030-17).
@@ -204,6 +206,7 @@ they are not a defence against one that lies.
 - **6.2 (M19.6).** A message MUST wake a session only when it is addressed to that session's node in `to`
   **and** is `urgent`, has hops left (§9), was not posted by that session, and does not answer a
   reply chain that session already spoke in (V210-121). An urgent broadcast MUST wake nobody.
+  *Amended by ADR-029 TA-3:* a message addressed to one session wakes only that session.
   Everything else waits for the next turn.
 - **6.3 (M19.5, M19.5b).** The drain MUST be a harness hook, not a skill instruction:
 
@@ -423,7 +426,8 @@ they are not a defence against one that lies.
 ### Non-goals
 
 Agent comms MUST NOT be or add: a mirror of agent activity (tool calls, progress, per-turn
-chatter); a replacement for ctm (moving ctm onto Vox is the chat app's concern); a wire-format
+chatter) in the room's conversation (ADR-029 puts it in a Session, readable only by members with
+drive); a replacement for ctm beyond ADR-029's Sessions; a wire-format
 change; per-session cryptographic identity; central coordination (orchestrator, speaker selection,
 trust score); IP-level anonymity (ADR-017); an MCP delivery path; file bytes in the log; a spawned
 instance of anything (1.5); a council feature (a council is an `ask` in a room whose agents span
