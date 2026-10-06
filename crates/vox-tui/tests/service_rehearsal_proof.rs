@@ -374,7 +374,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     //
     //    Since ADR-026 the host makes its node first (C-3: a verb acts as a node that
     //    exists), and the trust is made with that node attached (L-2).
-    let (ok, host_id, err) = vox_once(&host_dir, &["id".into()]);
+    let (ok, _, err) = vox_once(&host_dir, &["id".into()]);
     assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let (ok, guest_id, err) = vox_once(&guest_dir, &["id".into()]);
     assert!(
@@ -386,22 +386,6 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         guest_fp.len(),
         52,
         "PRODUCT: a fingerprint is 52 base32 characters, alone on the line: {guest_fp:?}"
-    );
-    // The guest names the host in its own words, so the readable addresses on the two machines
-    // differ (ADR-028 S-1a): a copied command works there only if it carries the canonical one.
-    let (ok, out, err) = vox_once(
-        &guest_dir,
-        &[
-            "trust".into(),
-            "add".into(),
-            host_id.trim().to_owned(),
-            "--name".into(),
-            "nas-box".into(),
-        ],
-    );
-    assert!(
-        ok,
-        "PRODUCT (staging): the guest names the host: {out}{err}"
     );
     let (ok, out, err) = vox_once(
         &host_dir,
@@ -604,11 +588,10 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         "PRODUCT: the host should name the service that was reached: {reached}"
     );
 
-    // ---- ADR-028 S-3 (#490): a command copied from `vox service list` works on another member's
-    // machine. The host shares an ssh stand-in; its own listing gives the ssh command, with the
-    // canonical address; the guest pastes it into a real `ssh`, pointed at its own `.vox` proxy
-    // by the block its own listing prints. The stand-in must hear the ssh client's banner.
-    let (ssh_port, ssh_heard) = ssh_banner_service();
+    // ---- ADR-028 S-3 (#490): what reaching a share needs, and whether it holds, as the guest's
+    // `vox service list` says it (a copied command reaching the service across members' own
+    // names is a_service_is_reached_only_by_its_address_proof's).
+    let (ssh_port, _ssh_heard) = ssh_banner_service();
     let (ok, out, err) = vox_once(
         &host_dir,
         &[
@@ -634,78 +617,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
             std::thread::sleep(Duration::from_millis(500));
         }
     };
-    let host_list = listing(&host_dir, &|o| {
-        o.lines()
-            .any(|l| l.trim_start().starts_with("ssh ") && l.contains("ssh $USER@"))
-    });
-    let copied = host_list
-        .lines()
-        .find_map(|l| l.trim_start().strip_prefix("ssh "))
-        .map(|c| c.trim().to_owned())
-        .unwrap_or_default();
-    let guest_list = listing(&guest_dir, &|o| {
-        o.contains("ProxyCommand") && o.contains("nas-ssh.")
-    });
-    let block: String = guest_list
-        .lines()
-        .skip_while(|l| !l.contains("add this to ~/.ssh/config"))
-        .skip(1)
-        .take_while(|l| l.starts_with("    "))
-        .map(|l| format!("{}\n", l.trim_start()))
-        .collect();
-    let ssh_dir = tempfile::tempdir().expect("APPARATUS: a directory for ssh's files");
-    let config = ssh_dir.path().join("config");
-    std::fs::write(&config, &block).expect("APPARATUS: write the ssh config");
-    // The pasted command, run by a shell as a person's would be; only where ssh keeps its own
-    // files, and that it never prompts, is the proof's.
-    let pasted = copied.replacen(
-        "ssh ",
-        &format!(
-            "ssh -F {} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-             -o ConnectTimeout=60 ",
-            config.display()
-        ),
-        1,
-    );
-    let ssh_out = Command::new("sh")
-        .args(["-c", &pasted])
-        .stdin(Stdio::null())
-        .output()
-        .expect("APPARATUS: run ssh");
-    let heard = ssh_heard.recv_timeout(Duration::from_secs(5)).ok();
-    eprintln!(
-        "[test] S-3: the host's listing:\n{host_list}\nthe guest's ssh config block:\n{block}\n\
-         pasted: {pasted}\nssh said: {}\nthe ssh stand-in heard: {heard:?}",
-        String::from_utf8_lossy(&ssh_out.stderr)
-    );
-    assert!(
-        copied.starts_with("ssh $USER@") && copied.ends_with(".vox") && block.contains("ProxyCommand"),
-        "PRODUCT: `vox service list` must give an ssh share's ssh command, and the ~/.ssh/config \
-         block for this machine's proxy; the host's said:\n{host_list}\nthe guest's said:\n{guest_list}"
-    );
-    assert!(
-        heard.as_deref().is_some_and(|h| h.starts_with("SSH-2.0-")),
-        "PRODUCT: the ssh command copied from the host's `vox service list` ({copied}), pasted on \
-         the guest's machine, must reach the ssh service; the service heard {heard:?}, and ssh said: \
-         {}",
-        String::from_utf8_lossy(&ssh_out.stderr)
-    );
-    // The copy must carry the canonical address because the readable one differs between the two
-    // machines: each names the room, and the host, in its own words (ADR-028 S-1a).
-    let readable = |list: &str| {
-        list.lines()
-            .find(|l| l.trim_start().starts_with("nas-ssh.") && l.contains("  by "))
-            .and_then(|l| l.split_whitespace().next())
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let (host_readable, guest_readable) = (readable(&host_list), readable(&guest_list));
-    assert!(
-        !host_readable.is_empty() && !guest_readable.is_empty() && host_readable != guest_readable,
-        "APPARATUS: the host and the guest must name nas-ssh differently, or a copy of the readable \
-         address would work too and this would not show the canonical one is what travels: host \
-         {host_readable:?}, guest {guest_readable:?}"
-    );
+    let guest_list = listing(&guest_dir, &|o| o.contains("nas-ssh."));
     // What it needs, and that it holds: the host trusts the guest, and is online.
     let trust_line = guest_list
         .lines()
