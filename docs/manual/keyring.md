@@ -108,15 +108,36 @@ Where two nodes in your keyring have names that differ only in case, such as `al
 and `Alice#lhk6xo`, everywhere the TUI and `vox room read` name them. In the composer,
 `@alice#6tvrsb` picks one of them.
 
-Under each name a line says `in keyring · reads you` or `in keyring · cannot read you yet`, or
-`not in keyring · still reads you` or `not in keyring · you don't read each other`. Where the
-terminal takes only ASCII, the glyphs are `<>`, `->` and `.`. The words describe local trust and
+Under each name a line says where the two of you stand: `trusted both ways`, `waiting for the
+other side` (you trust it, it does not trust you yet), or `not in keyring: trust to read each
+other`; `not in keyring · still reads you` for a node you removed that still holds your key from
+before. There is no other trust state: no "verified", and no block. Removing a node from your
+keyring is how you stop reading it and being read by it. Where the terminal takes only ASCII, the
+glyphs are `<>`, `->` and `.`. The words describe local trust and
 whether the other member can read your messages in that room. They are not read receipts for
 an individual message.
 
 Select a member with the arrow keys while the members pane has the focus, and its card is drawn
 under it: the whole fingerprint in groups of four, beside five rows of art drawn from the
 fingerprint, as a quick visual check. Compare the groups themselves before you trust a node.
+
+## Trust from the TUI
+
+In the TUI, trust is one action wherever it matters: `t` on a member in the members pane, or
+`:trust` and the start of a fingerprint, which the TUI offers beside a node not in your keyring:
+on its messages (`(not in keyring · :trust spezmg3w)`), on the line saying it joined, and on a
+service it shares. Each opens the same prompt. It shows the node's fingerprint in groups beside
+its art, and asks for:
+
+1. their fingerprint, as they gave it to you: paste or type it; spaces, dashes and case do not
+   count;
+2. your name for them;
+3. your identity passphrase, or Enter alone while the keyring is open.
+
+If what you pasted is not this node's fingerprint, nothing is added, and the TUI says so and shows
+both: `not trusted: the fingerprint you were given is not this node's — do not trust it; ask them
+for theirs again another way. given: … · this node: …`. A wrong identity passphrase adds nothing
+either: `the identity passphrase does not match`. When they match, it says `you now trust frank`.
 
 ## See your keyring in the TUI
 

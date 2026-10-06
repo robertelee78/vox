@@ -38,6 +38,27 @@ vox: shared in family (pym47virdp2b)
 
 `NODE.ROOM.vox` and `ROOM.vox` reach nothing.
 
+On a member's machine, `vox service list` also gives the commands for each service's kind, ready
+to copy, with its canonical address in them, and what each needs, with whether it holds now:
+
+```text
+  ssh.robertgpt.family.vox  by robertgpt  ssh
+    SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox
+      ssh     ssh $USER@SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox
+      forward vox forward SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox 127.0.0.1:2222
+      then    ssh -p 2222 $USER@127.0.0.1
+      needs   robertgpt trusts this node (as the room's log says): yes
+      needs   this node is attached: yes
+      needs   the .vox proxy is running on 127.0.0.1:1080: yes
+      needs   robertgpt is online: yes
+  for ssh by address, add this to ~/.ssh/config once:
+    Host *.vox
+        ProxyCommand nc -X 5 -x 127.0.0.1:1080 %h %p
+```
+
+A `needs` line that says `no` names what to fix first. In the TUI, the same commands are in the
+room's Shared pane, and `y` copies the selected one to your clipboard.
+
 ## A port shared into a new room
 
 On the host, with SSH already listening on loopback port 22:
@@ -101,7 +122,12 @@ share it? [y/N]
 ```
 
 Anything but `y` stops with `not shared`, and nothing is created. On `y` it goes on as
-`vox serve ssh=22` does. Run as yourself, the list may miss another user's services, root's
+`vox serve ssh=22` does.
+
+In the TUI, `:serve` in a room does the same into that room: it lists what listens here, and
+Enter on one shows the preview, `share python3.13 0.0.0.0:51529 tcp (every interface) as
+python3-13: members will reach it as python3-13.…family.vox`, who can reach it and who cannot, and
+any warning, then `Enter: share it in this room · Esc: back to the list`. Run as yourself, the list may miss another user's services, root's
 among them; name such a service as `NAME=PORT`.
 
 On the guest:
