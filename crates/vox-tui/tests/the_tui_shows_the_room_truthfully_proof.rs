@@ -44,6 +44,8 @@
 //!   Ctrl-R and sends q-answer. His post's `re` names q-mid, and the TUI shows it under "┆ alice:
 //!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485);
 //! - `jump`: Bob selects q-answer and presses Enter, and q-mid is scrolled to and selected;
+//! - `address`: a canonical address Alice posts reads as Bob's node writes it, "open
+//!   nas-web.alice.family.vox please" (ADR-028 S-1a, #488);
 //! - `consent`: who reads whom, in words (ADR-028 R-5, #481): Carol, whom Bob never trusted, reads
 //!   "not in keyring: trust to read each other", Dave, whom he trusts and who trusts nobody,
 //!   "waiting for the other side", and Alice "trusted both ways" (the pane said "consented" for
@@ -120,7 +122,7 @@
 //!
 //! Each claim turns red against a product that restores its defect: the timeline drawn from the
 //! top, a scroll not clamped to the oldest line, the room's own lines (who named it) not drawn,
-//! every member shown `Trust::Trusted`, a stub command restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
+//! an address in a message left canonical, every member shown `Trust::Trusted`, a stub command restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
 //! as not having read, every message marked read whether drawn or not, a message called held by a
 //! node that has not said it holds it, a read record named by a read record, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
@@ -135,7 +137,7 @@
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
 //! a pasted fingerprint that is not the node's let through to the keyring (`trust`), or an image
 //! drawn before this node's copy is verified (`inline`). It passes only on the script's PASS with
-//! all 36 claims ok.
+//! all 37 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -231,7 +233,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (36 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (37 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -245,8 +247,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (36, 36),
-                "APPARATUS: the driver said PASS without all 36 claims ok: {said}"
+                (37, 37),
+                "APPARATUS: the driver said PASS without all 37 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

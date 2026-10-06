@@ -1042,6 +1042,20 @@ fn row_value(
     })
 }
 
+/// This node's names for its rooms, their members and shares, and its keyring, as its snapshot
+/// gives them: what an address is written readable with (ADR-028 S-1a). None when the node does
+/// not say, so an address is left canonical.
+async fn names_in(client: &mut IpcClient) -> vox_core::node::resolver::VoxResolver {
+    let body = vox_core::node::snapshot::request_body();
+    let Ok(reply) = client.exchange(&body).await else {
+        return vox_core::node::resolver::VoxResolver::new();
+    };
+    match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
+        Ok(Some(snap)) => vox_core::node::resolver::VoxResolver::of_snapshot(&snap),
+        _ => vox_core::node::resolver::VoxResolver::new(),
+    }
+}
+
 /// Who has read this node's own recent messages in `room`, and who has pulled its shares there
 /// whole (ADR-028 R-6, F-7), by entry, from one snapshot of the node. Empty when it does not say.
 async fn own_in(
@@ -1272,8 +1286,11 @@ pub async fn read(
             );
         }
         let take = if take == 0 { usize::MAX } else { take };
+        // An address in a message, readable in this node's names (ADR-028 S-1a); `--json` keeps
+        // the canonical form a program copies (S-1).
+        let names = names_in(&mut client).await;
         for r in rows.iter().filter(|r| r.late || !only_late).take(take) {
-            let _ = writeln!(out, "{}", plain_row(r));
+            let _ = writeln!(out, "{}", names.readable_in(&plain_row(r)));
             // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
             if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
                 let _ = writeln!(out, "  {line}");
