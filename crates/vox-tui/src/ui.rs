@@ -41,22 +41,26 @@ pub const SELECTED_MARKER: &str = "▶ ";
 /// The mark before a reply's quote of the message it answers, on the row above it.
 pub const QUOTE_MARKER: &str = "  ┆ ";
 
-/// Where a member stands with you, in words: whether your keyring names it, and whether it reads
-/// you here. Nothing for yourself.
+/// Where a member stands with you, in words: who reads whom, and what is still to do (ADR-028
+/// R-5, #481), the states `vox room join` names ([`crate::ident::Reading`]). Nothing for yourself.
 #[must_use]
 pub fn trust_label(t: Trust) -> Option<&'static str> {
     match t {
         Trust::You => None,
         Trust::Trusted {
-            reads_you: true, ..
-        } => Some("in keyring · reads you"),
+            trusts_you: true,
+            reads_you: true,
+        } => Some("trusted both ways"),
         Trust::Trusted {
-            reads_you: false, ..
-        } => Some("in keyring · cannot read you yet"),
+            trusts_you: true,
+            reads_you: false,
+        } => Some("trusted both ways · cannot read you yet"),
+        Trust::Trusted {
+            trusts_you: false, ..
+        } => Some("waiting for the other side"),
+        // A member untrusted after it took your key still holds it: said first.
         Trust::NotTrusted { reads_you: true } => Some("not in keyring · still reads you"),
-        Trust::NotTrusted { reads_you: false } => {
-            Some("not in keyring · you don't read each other")
-        }
+        Trust::NotTrusted { reads_you: false } => Some("not in keyring: trust to read each other"),
     }
 }
 

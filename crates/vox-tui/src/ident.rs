@@ -323,3 +323,66 @@ pub fn recipients(to: &[String], me: Option<&Digest32>, trusted: &[(Digest32, St
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+/// **Who reads whom between this node and one other member** (ADR-028 R-5, #481): whether the
+/// member is in this node's keyring, and whether its trust in this node has reached it. The three
+/// states every client says on joining, with what each person still has to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// Each trusts the other: they read each other.
+    BothWays,
+    /// This node trusts the member, whose trust in this node has not reached it (yet): neither
+    /// reads the other until it does. Whether the member has trusted it is not known here.
+    Waiting,
+    /// The member is not in this node's keyring; `trusts_you` when it already trusts this node.
+    NotInKeyring {
+        /// The member's trust in this node has reached it.
+        trusts_you: bool,
+    },
+}
+
+impl Reading {
+    /// The state from the keyring (`in_keyring`) and the room's log (`trusts_you`).
+    #[must_use]
+    pub fn of(in_keyring: bool, trusts_you: bool) -> Self {
+        match (in_keyring, trusts_you) {
+            (true, true) => Reading::BothWays,
+            (true, false) => Reading::Waiting,
+            (false, trusts_you) => Reading::NotInKeyring { trusts_you },
+        }
+    }
+
+    /// The state's glyph (ADR-028 L-4): `⇄`, `→`, or `·`.
+    #[must_use]
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Reading::BothWays => "⇄",
+            Reading::Waiting => "→",
+            Reading::NotInKeyring { .. } => "·",
+        }
+    }
+
+    /// The state in words, and what is still to do: `name` is how this node names the member,
+    /// `fp` and `me` the member's and this node's whole fingerprints, as `vox trust add` takes
+    /// them.
+    #[must_use]
+    pub fn say(self, name: &str, fp: &str, me: &str) -> String {
+        match self {
+            Reading::BothWays => "trusted both ways: you read each other".to_owned(),
+            Reading::Waiting => format!(
+                "waiting for the other side: you trust {name}; {name}'s trust in you has not \
+                 reached this node yet. Until it does neither reads the other; if they have not \
+                 trusted you, they run `vox trust add {me}`"
+            ),
+            Reading::NotInKeyring { trusts_you } => format!(
+                "not in keyring{}: to read each other, `vox trust add {fp} --name NAME`{}",
+                if trusts_you { ", trusts you" } else { "" },
+                if trusts_you {
+                    ""
+                } else {
+                    ", and they trust you"
+                }
+            ),
+        }
+    }
+}

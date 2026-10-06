@@ -28,6 +28,16 @@
 //! 3. each posts the moment bob's join returns, and each must read the other in `second` within
 //!    [`ROOM_BOUND`].
 //!
+//! ## 3. ADR-028 R-5 (#481) — a join says who reads whom, member by member, and what is left to do
+//!
+//! Journey 2 with a third person, carol, who joins `first` before bob and whom bob never trusts,
+//! and with bob trusting alice **before** he joins `first`, alice trusting him only after. Bob's
+//! `vox room join` of `first` must list alice as `→ alice — waiting for the other side` with the
+//! `vox trust add` alice runs (bob's fingerprint), and carol as `· … — not in keyring` with the
+//! `vox trust add` bob runs (carol's fingerprint); his join of `second`, alice's trust in him
+//! settled, lists alice as `⇄ alice — trusted both ways`. Mutation: the waiting state omitted
+//! (a member bob trusts that has not trusted him read as trusted both ways): `PRODUCT`.
+//!
 //! **The mutation that must turn (2) red:** a key released only into the rooms that were open when
 //! trust was decided (`release_key_to` refusing any other room). The first room still works; the
 //! second does not, and the red says `PRODUCT`.
@@ -278,8 +288,9 @@ impl Member {
     }
 
     /// Join `link` as the room `name`, once, as a person does: a join turned away is a red of its
-    /// own, quoting the join and both daemons' logs (`logs`), never retried past.
-    fn join(&self, link: &str, name: &str, logs: &dyn Fn() -> String) {
+    /// own, quoting the join and both daemons' logs (`logs`), never retried past. What the join
+    /// printed is returned.
+    fn join(&self, link: &str, name: &str, logs: &dyn Fn() -> String) -> String {
         let (ok, out, err) = self.vox(
             &["room", "join", "--passphrase-file", "-", link],
             Some(ROOM_PASS),
@@ -291,6 +302,7 @@ impl Member {
             self.name,
             logs()
         );
+        out
     }
 
     fn post(&self, room: &str, text: &str) {
@@ -413,7 +425,7 @@ fn a_trusted_joiner_reads_what_the_host_posts_right_after_the_join() {
 }
 
 #[test]
-#[ignore = "a real anchor and two real daemons with production Argon2id; run by hand, on demand, in release"]
+#[ignore = "a real anchor and three real daemons with production Argon2id; run by hand, on demand, in release"]
 fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust_step() {
     watchdog::arm();
     let tmp = harness(tempfile::tempdir(), "a temp dir");
@@ -421,21 +433,45 @@ fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust
     let (_anchor, spec) = anchor(root);
 
     // ---- the first room: all six steps ----
-    let members = [Member::new(root, "alice"), Member::new(root, "bob")];
+    let members = [
+        Member::new(root, "alice"),
+        Member::new(root, "bob"),
+        Member::new(root, "carol"),
+    ];
     // 1. Each has an identity, and they swap fingerprints.
     let fps: Vec<String> = members.iter().map(Member::fingerprint).collect();
     let _daemons: Vec<Proc> = members
         .iter()
         .map(|m| m.daemon(&spec, &root.join(format!("{}.err", m.name))))
         .collect();
-    let [alice, bob] = &members;
+    let [alice, bob, carol] = &members;
     let logs = || logs(root, &members);
-    // 2.–5. Alice creates and invites; the link and passphrase are sent; bob joins.
+    // 2.–5. Alice creates and invites; the link and passphrase are sent; carol joins, then bob,
+    // who trusts alice first (#481); carol nobody trusts.
     let (first, link) = alice.create("first");
-    bob.join(&link, "first", &logs);
-    // 6. Each trusts the other.
-    alice.trust(bob, &fps[1]);
+    carol.join(&link, "first", &logs);
     bob.trust(alice, &fps[0]);
+    let said = bob.join(&link, "first", &logs);
+    // **Who reads whom, right away** (ADR-028 R-5, #481).
+    let line_for = |said: &str, key: &str| {
+        said.lines()
+            .find(|l| l.contains(key) && l.contains(" — "))
+            .map(|l| l.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let (to_alice, to_carol) = (line_for(&said, "alice"), line_for(&said, &fps[2][..26]));
+    eprintln!("[proof] bob's join of first: {to_alice:?} / {to_carol:?}");
+    assert!(
+        to_alice.starts_with("→ alice — waiting for the other side")
+            && to_alice.contains(&format!("vox trust add {}", fps[1]))
+            && to_carol.starts_with(&format!("· {} — not in keyring", &fps[2][..26]))
+            && to_carol.contains(&format!("vox trust add {} --name", fps[2])),
+        "PRODUCT: bob's `vox room join` of first must list alice, whom he trusts and who has not \
+         trusted him, as waiting for the other side, with the `vox trust add` she runs, and carol, \
+         not in his keyring, with the one he runs; it printed:\n{said}"
+    );
+    // 6. Each trusts the other (bob already has).
+    alice.trust(bob, &fps[1]);
     alice.post(&first, "alice in the first room");
     bob.post(&first, "bob in the first room");
     let (first_ab, first_ab_saw) = bob.reads(&first, "alice in the first room", ROOM_BOUND);
@@ -452,8 +488,15 @@ fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust
 
     // ---- the second room: create, invite, send, join — no fingerprint swap, no trust ----
     let (second, link) = alice.create("second");
-    bob.join(&link, "second", &logs);
+    let said = bob.join(&link, "second", &logs);
     let joined = Instant::now();
+    let to_alice = line_for(&said, "alice");
+    eprintln!("[proof] bob's join of second: {to_alice:?}");
+    assert!(
+        to_alice.starts_with("⇄ alice — trusted both ways"),
+        "PRODUCT: bob's `vox room join` of second, with alice and bob trusting each other, must \
+         list alice as trusted both ways; it printed:\n{said}"
+    );
     // The moment the join returns, as people would.
     alice.post(&second, "alice in the second room");
     bob.post(&second, "bob in the second room");
