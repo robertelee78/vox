@@ -29,10 +29,11 @@
 //! let in by the one before (the host lets in A1, A1 lets in A2, … A8 lets in R), with only the one
 //! answering online at each join, then the anchor stopped. A joiner J let in by R has not admitted
 //! R's record when its join is done (its room lists the host and itself), so nothing but the join
-//! itself says R is a member. R stops too. J's own `vox status
-//! --json` must not list R, a member, among its anchors: a node kept as an anchor is dialled
-//! directly only and passed over by the sync. Mutation: the join no longer records R as a member
-//! (`note_member`), red PRODUCT.
+//! itself and R's link (which marks each member it names, `m=`) say R and A1 are members. R stops
+//! too. J's own `vox status --json` must list no member — R, which let it in, nor A1, which R's
+//! link names at its address — among its anchors: a node kept as an anchor is dialled directly only
+//! and passed over by the sync. Mutations, each red PRODUCT: the join no longer records R as a
+//! member (`note_member`); the link's member role ignored (A1 listed).
 //!
 //! **A red names its side.** The report's content is PRODUCT. A `vox` step that fails while the
 //! world is set is PRODUCT (staging), as the harness labels it; the test's own sockets and
@@ -369,13 +370,27 @@ fn unreachable_anchor_check(
         "[test] j's anchors: {}\nj's join said:\n{joined}",
         v["anchors"]
     );
-    let listed = v["anchors"]
+    // No member of the room — r, which let j in, nor a1, which r's link names at its address —
+    // is among j's anchors.
+    let names: Vec<(String, String)> = ws[..j].iter().map(|w| (w.name.clone(), w.b32())).collect();
+    let listed: Vec<&str> = v["anchors"]
         .as_array()
-        .is_some_and(|a| a.iter().any(|x| x["id"].as_str() == Some(r_fp.as_str())));
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x["id"].as_str())
+                .filter_map(|id| {
+                    names
+                        .iter()
+                        .find(|(_, fp)| fp == id)
+                        .map(|(n, _)| n.as_str())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     assert!(
-        !listed,
-        "PRODUCT: j's `vox status --json` lists r ({r_short}), the member that let it in, among \
-         its anchors: {}",
+        listed.is_empty(),
+        "PRODUCT: j's `vox status --json` lists members of the room among its anchors: {listed:?} \
+         (r {r_short} let it in). Its anchors: {}",
         v["anchors"]
     );
 }

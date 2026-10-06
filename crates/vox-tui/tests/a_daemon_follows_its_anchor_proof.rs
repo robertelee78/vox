@@ -599,6 +599,9 @@ fn only_anchor(link: &str, anchor_id: &str) -> (String, usize) {
             if !keeping {
                 dropped += 1;
             }
+        } else if let Some(id) = part.strip_prefix("m=") {
+            // A member mark stays only with the entry it marks.
+            keeping = id == anchor_id;
         } else if part.starts_with("r=") {
             keeping = true;
         }

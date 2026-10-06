@@ -2,7 +2,7 @@
 //! ADR-005's magnet-link design.
 //!
 //! ```text
-//! vox://<channelID-base32>?a=<anchor-fingerprint-base32>&b=<multiaddr>[&b=<multiaddr>…][&a=…&b=…][&r=<responder-fingerprint-base32>]
+//! vox://<channelID-base32>?a=<anchor-fingerprint-base32>&b=<multiaddr>[&b=<multiaddr>…][&a=…&b=…][&m=<member-fingerprint-base32>…][&r=<responder-fingerprint-base32>]
 //! ```
 //!
 //! It carries **only** what is needed to find the swarm: the channelID, one or more
@@ -11,6 +11,13 @@
 //! names each, host or anchor) — and optionally a pin of the responder's identity
 //! fingerprint. An anchor is needed only to bridge hosts that cannot otherwise reach
 //! each other (ADR-012); a link from a host with none names only the host.
+//!
+//! ## A member is marked a member
+//! An `a=` entry is a place to reach the room: an anchor, or a member at its address (the
+//! inviting host, or another member whose address the room keeps, V210-167). Each `m=` names an
+//! `a=` entry that is a **member** of the room (V030-51), so a joiner never keeps a member as an
+//! anchor — dialled direct only, passed over by the sync — before it has admitted that member's
+//! record. An `m=` that names no `a=` entry is refused.
 //!
 //! ## Anchors are named, not just addressed
 //! ADR-011 pins the expected identity on every dial; there is no "connect to whoever
@@ -319,6 +326,9 @@ pub struct InviteLink {
     /// joiner joins through that member specifically; otherwise through any member
     /// the board names.
     pub responder: Option<Digest32>,
+    /// The entries of [`Self::anchors`] that are members of the room, not anchors (`m=`,
+    /// V030-51).
+    pub members: Vec<Digest32>,
 }
 
 impl InviteLink {
@@ -329,6 +339,7 @@ impl InviteLink {
         channel_id: Digest32,
         anchors: Vec<BootstrapNode>,
         responder: Option<Digest32>,
+        members: Vec<Digest32>,
     ) -> Result<Self> {
         if anchors.is_empty() {
             return Err(Error::MalformedLink(
@@ -343,11 +354,21 @@ impl InviteLink {
                 return Err(Error::MalformedLink("duplicate anchor"));
             }
         }
+        if members.iter().any(|m| !anchors.iter().any(|a| a.id == *m)) {
+            return Err(Error::MalformedLink("member names no entry"));
+        }
         Ok(Self {
             channel_id,
             anchors,
             responder,
+            members,
         })
+    }
+
+    /// Whether the entry `id` is marked a member of the room (`m=`), not an anchor.
+    #[must_use]
+    pub fn names_member(&self, id: &Digest32) -> bool {
+        self.members.contains(id)
     }
 
     /// Render the link.
@@ -367,6 +388,12 @@ impl InviteLink {
                 out.push_str("b=");
                 out.push_str(&addr.to_string());
             }
+        }
+        for m in &self.members {
+            out.push(sep);
+            sep = '&';
+            out.push_str("m=");
+            out.push_str(&b32_encode(m));
         }
         if let Some(r) = &self.responder {
             out.push(sep);
@@ -391,6 +418,7 @@ impl InviteLink {
         let mut anchors: Vec<BootstrapNode> = Vec::new();
         let mut current: Option<(Digest32, Vec<Multiaddr>)> = None;
         let mut responder = None;
+        let mut members: Vec<Digest32> = Vec::new();
         let close = |current: Option<(Digest32, Vec<Multiaddr>)>,
                      anchors: &mut Vec<BootstrapNode>|
          -> Result<()> {
@@ -429,6 +457,16 @@ impl InviteLink {
                             .map_err(|_| Error::MalformedLink("anchor address"))?,
                     );
                 }
+                "m" => {
+                    let id = b32_decode(value, "room link member")?;
+                    if members.contains(&id) {
+                        return Err(Error::MalformedLink("duplicate member"));
+                    }
+                    if members.len() >= MAX_LINK_ANCHORS {
+                        return Err(Error::MalformedLink("member count"));
+                    }
+                    members.push(id);
+                }
                 "r" => {
                     if responder.is_some() {
                         return Err(Error::MalformedLink("duplicate responder"));
@@ -447,10 +485,14 @@ impl InviteLink {
                 "the link names nowhere to reach the room",
             ));
         }
+        if members.iter().any(|m| !anchors.iter().any(|a| a.id == *m)) {
+            return Err(Error::MalformedLink("member names no entry"));
+        }
         Ok(Self {
             channel_id,
             anchors,
             responder,
+            members,
         })
     }
 }

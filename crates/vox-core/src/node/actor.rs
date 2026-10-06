@@ -8253,11 +8253,25 @@ impl Node {
             return Outcome::Failed(Fault::UnknownChannel);
         }
         let anchors = self.link_boards(channel_id).await;
-        let link =
-            match crate::node::link::InviteLink::new(*channel_id, anchors, Some(net.local_id())) {
-                Ok(l) => l,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
+        // Each entry that is a member of the room — this node, and any other whose address the
+        // room keeps — is marked one, so a joiner never keeps it as an anchor (V030-51).
+        let me = net.local_id();
+        let members: Vec<Digest32> = match self.channels.get(channel_id).map(Arc::clone) {
+            Some(shared) => {
+                let channel = shared.lock().await;
+                anchors
+                    .iter()
+                    .map(|a| a.id)
+                    .filter(|id| *id == me || channel.is_known_member(id))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let link = match crate::node::link::InviteLink::new(*channel_id, anchors, Some(me), members)
+        {
+            Ok(l) => l,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
         let _ = self.event_tx.send(NodeEvent::InviteLink {
             channel_id: *channel_id,
             url: link.to_url(),
@@ -9005,7 +9019,12 @@ impl Node {
             self.profile.as_ref(),
             self.channels.get(&parsed.channel_id).map(Arc::clone),
         ) {
-            let _ = shared.lock().await.note_member(profile.store(), responder);
+            let mut channel = shared.lock().await;
+            let _ = channel.note_member(profile.store(), responder);
+            // And every member the link marks one (`m=`).
+            for member in parsed.members.iter().filter(|m| **m != me) {
+                let _ = channel.note_member(profile.store(), *member);
+            }
         }
         // The link's anchors are this channel's anchors from now on (persisted, so a
         // restart still knows where the swarm's board is), together with our own.
