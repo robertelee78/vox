@@ -38,7 +38,9 @@ relies on is ADR-028 K-14.
   (`claude -p`, `codex exec`, a non-interactive OpenCode run) MUST NOT get one.
 - **SE-2.** A Session's identity MUST be the harness's own session id (Claude Code's
   `session_id`, Codex's thread id, OpenCode's `ses_…` id); Vox MUST NOT mint one. A sub-agent's
-  activity MUST belong to its parent's Session.
+  activity MUST belong to its parent's Session, never a Session of its own: each of its entries
+  MUST be labelled with the sub-agent's type, its completion MUST be shown with its result on
+  request (Details), and it ends when its parent does (as ctm does, its ADR-013).
 - **SE-3.** A Session MUST be labelled with the viewer's alias for its node (ADR-028 K-3), the
   session's current name (§5 MD-1) and the session's short id (the first 8 characters of its id),
   for example

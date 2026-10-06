@@ -11,9 +11,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 **Inputs**: [docs/ux/v040-ux-research.md](../ux/v040-ux-research.md) and the decider's answers in
 [docs/ux/v040-ux-interview-decisions.md](../ux/v040-ux-interview-decisions.md) (2026-10-03, 2026-10-04,
 2026-10-05, including the answers to this ADR's first draft's open questions, and 2026-10-06 for
-§2a); the website's app study (`voxlux.us` `src/components/Experience.astro`); the session
-grid of Bromure's agent-coding interface (`/opt/bromure/Sources/AgentCoding`, `RoomStage.swift`,
-`AgentSessions.swift`) as a reference for W-2–W-4.
+§2a); the website's app study (`voxlux.us` `src/components/Experience.astro`).
 
 ## Context
 
@@ -343,26 +341,16 @@ structure for both clients; the TUI renders the same regions in text.
   Session waiting on this node, ADR-029 CL-2),
   **active** (new messages, or a
   member holding a claim), and **quiet**. A key MUST move to the next room that needs the person.
-- **W-3.** A room whose members include agents' nodes MUST offer a **lanes** view: one column per
-  member, each that member's posts in this room (a filter of the room's own timeline, not a second
-  record), headed by its alias, trust glyph and one state chip. The state MUST be derived only from
-  what the room already carries:
-  - **Needs you**: a message from it addressed to this node, unread, or its latest `ask` or
-    `blocked` addressed to this node unanswered;
-  - **Working**: it holds a claim (ADR-021 §4) and its latest work post is `working` or `accept`;
-  - **Ready**: a session of it announced itself (`hello`) and it holds no claim;
-  - **Done**: its latest work post is `result`, or it released its claim;
-  - **Away**: no session announced, or its node not connected.
-  Each lane MUST show what changed since the person last looked (`read by` and new posts) and fold
-  coordination traffic into one counted line (ADR-020 6.6).
-- **W-4.** Under the lanes, the room's composer MUST carry a **To:** selector of members (written as
-  fingerprints into `to`, ADR-020 4.6) and an urgent switch (ADR-020 4.5). There MUST be no hidden
+- **W-3.** *Removed (the decider, 2026-10-06):* there MUST be no lanes view. A room shows its own
+  conversation and its Sessions (ADR-029 §8): Vox has rooms, nodes and Sessions.
+- **W-4.** The room's composer MUST carry a **To:** selector of members and of their open Sessions
+  (written into `to`, ADR-020 4.6 as amended by ADR-029 TA-1) and an urgent switch (ADR-020 4.5). There MUST be no hidden
   coordinator: the composer posts as this node, into this room, like any message.
 - **W-5.** "Add to room" MUST show the room link with a copy action and a reminder to send the
   passphrase another way; a node joins only by its own `vox room join` (ADR-005 J-1). The client
   MUST NOT join, trust or act for another node.
 - **W-6.** A client MUST NOT show an agent's tool calls, thoughts or turn-by-turn activity in the
-  room's timeline or lanes. *Amended by ADR-029 SC-4:* that activity is shown only in the session's
+  room's timeline. *Amended by ADR-029 SC-4:* that activity is shown only in the session's
   Session, to members with drive. Progress stays on the GitHub issue (ADR-021).
 
 ### 10. The app's shell (input to the ADR-014 rewrite)

@@ -96,8 +96,9 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
 - **M-14.** The timeline MUST show service cards, file offers with thumbnails, link cards, `read
   by` and `pulled by` lines, retention lines and late rows inline (ADR-028 R-6, R-7, F-7, F-9,
   F-10).
-- **M-15.** A room with agents' nodes as members MUST offer the lanes view (ADR-028 W-3–W-6), with
-  the To: selector and urgent switch in the composer.
+- **M-15.** The composer MUST carry the To: selector and the urgent switch (ADR-028 W-4), and a
+  room MUST list its Sessions (ADR-029 §8). There MUST be no lanes view (ADR-028 W-3, removed by the
+  decider, 2026-10-06).
 - **M-16.** The keyring view MUST list the nodes in the keyring by alias with fingerprint art and
   grouped fingerprint, and offer add (paste or type the fingerprint), rename, compare and
   remove, each stating its effect first (ADR-028 K-1–K-6, E-5).
@@ -123,13 +124,12 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   | ⌘⇧K | Keyring view |
   | ⌘⇧S | Services view |
   | ⌘⇧D | Decision record |
-  | ⌘⇧L | Lanes view of this room |
   | ⌘R | Reply to the selected message |
   | ⌘↩ | Send urgent |
 
 - **M-21.** The menus MUST be: File (New Room, Join Room…, Attach File…, Share Service…); Room
   (Copy Room Link, Rename…, Retention…, Admins…, Leave, End for Everyone…); Node (Attach, Detach,
-  Show Fingerprint); Keyring (Add…, Compare…, Rename…, Remove…); View (Room, Lanes, Keyring,
+  Show Fingerprint); Keyring (Add…, Compare…, Rename…, Remove…); View (Room, Keyring,
   Services, Decision Record).
 - **M-22.** A menu bar extra MUST follow ADR-028 A-3, offered at first run and off unless the person
   turns it on.

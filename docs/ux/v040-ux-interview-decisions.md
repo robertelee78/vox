@@ -102,3 +102,10 @@ Input to ADR-029. Sessions are in v0.4.0.
 - **The room a session works in** comes from a per-machine file like `~/.ssh/config`: `/path/to/repo` → room link + passphrase, readable by every node on the machine. Only the exact start path matters ("I never start a new session directly from a work tree"); the room stays the same for the session's life, whatever branch, worktree or other repository's files it touches. With no entry, the operator tells it which room. A manual change moves the session; "I don't plan to do that."
 - **Setup** detects the installed harnesses and creates one node per harness, plus an optional node for the person on macOS or iOS, and prints each node's fingerprint with facts about the node.
 - **Clients:** the TUI and the macOS app, kept in sync; the iOS app is not designed yet.
+
+## Lanes removed; ctm rules confirmed (2026-10-06)
+
+- **No lanes.** "I don't know what a lane is. I want to kill the lane. I want rooms, nodes, sessions. Lanes was never asked for." ADR-028 W-3 is removed, with the built TUI lanes view and the app's planned one.
+- **A sub-agent's activity belongs to its parent's Session**, as in ctm.
+- **A message to a session that has ended is refused**, and the sender told.
+- **No self-contradicting documents.** Every issue bound to an amended ADR is to point at the current text.
