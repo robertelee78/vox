@@ -38,7 +38,7 @@
 //!     member that could sync with him is stopped (SIGSTOP), and his `vox forward` must say it is
 //!     waiting for the room's first sync, then reach nas-web once they resume. A
 //!     forward that never waited is CANNOT MEASURE (the staging did not happen), not a pass.
-//! 12b. The canonical address pasted on a member whose copy of the room is behind: carol, synced,
+//!     And pasted on a member whose copy of the room is behind: carol, synced,
 //!     sleeps (SIGSTOP) while alice shares `nas-www`; with alice and bob stopped too she wakes
 //!     holding no such share, and her proxy and `vox forward` must still reach it once alice is
 //!     back, because alice's node resolves its own share fingerprint.
