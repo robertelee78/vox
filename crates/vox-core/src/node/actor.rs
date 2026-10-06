@@ -6255,7 +6255,7 @@ impl Node {
             let mut own = BootstrapSet::new();
             let mut members = std::collections::BTreeSet::new();
             for n in channel.anchors().nodes() {
-                if channel.is_author(&n.id) {
+                if channel.is_known_member(&n.id) {
                     members.insert(n.id);
                 } else {
                     let _ = own.add(n.clone());
@@ -8349,6 +8349,22 @@ impl Node {
             .collect()
     }
 
+    /// The anchors `room`'s address names: [`Self::named_anchors`] less the members it names.
+    /// **A member the address names is a member at an address, never an anchor** (V030-51,
+    /// AGENTS.md "Anchors"): the address carries members' addresses too (V210-167), and a member
+    /// was said to be an anchor that "has not taken" the room it is in.
+    async fn named_anchors_not_members(&self, room: &Digest32) -> Vec<Digest32> {
+        let named = self.named_anchors(room).await;
+        let Some(shared) = self.channels.get(room) else {
+            return named;
+        };
+        let channel = shared.lock().await;
+        named
+            .into_iter()
+            .filter(|id| !channel.is_known_member(id))
+            .collect()
+    }
+
     /// The routes of this node's own an address would name: what it advertises.
     fn own_routes(&self) -> Vec<crate::nat::multiaddr::Multiaddr> {
         self.net
@@ -8413,7 +8429,7 @@ impl Node {
         let short = crate::node::network::short_id;
         let routes = self.own_routes();
         let pending: Vec<Digest32> = self
-            .named_anchors(&room)
+            .named_anchors_not_members(&room)
             .await
             .into_iter()
             .filter(|b| !self.on_board.contains(&(room, *b)))
@@ -8758,7 +8774,7 @@ impl Node {
         if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
             let channel = shared.lock().await;
             for n in named.nodes() {
-                if channel.is_author(&n.id) {
+                if channel.is_known_member(&n.id) {
                     members.push((n.id, n.endpoints.direct_candidates()));
                 }
             }
@@ -8847,7 +8863,7 @@ impl Node {
             let mut channel = shared.lock().await;
             let mut kept = BootstrapSet::new();
             for n in named.nodes() {
-                if answered.contains(&n.id) || !channel.is_author(&n.id) {
+                if answered.contains(&n.id) || !channel.is_known_member(&n.id) {
                     let _ = kept.add(n.clone());
                 }
             }
@@ -8856,13 +8872,13 @@ impl Node {
             }
             let mut own = BootstrapSet::new();
             for n in channel.anchors().nodes() {
-                if !channel.is_author(&n.id) {
+                if !channel.is_known_member(&n.id) {
                     let _ = own.add(n.clone());
                 }
             }
             self.room_anchors.insert(room, own);
             for n in named.nodes() {
-                if !channel.is_author(&n.id) {
+                if !channel.is_known_member(&n.id) {
                     anchors.push((n.id, n.endpoints.direct_candidates()));
                 }
             }
@@ -8982,6 +8998,15 @@ impl Node {
         self.refresh_reachers().await;
         self.adopt_join_session(parsed.channel_id, responder, joined.session, true)
             .await;
+        // **The member that answered the join is a member, not an anchor** (V030-51): the link
+        // names it with an address, as it names the room's anchors, and its record may not be
+        // among those admitted yet. Recorded first, so the anchors adopted below leave it out.
+        if let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(&parsed.channel_id).map(Arc::clone),
+        ) {
+            let _ = shared.lock().await.note_member(profile.store(), responder);
+        }
         // The link's anchors are this channel's anchors from now on (persisted, so a
         // restart still knows where the swarm's board is), together with our own.
         let mut learned = BootstrapSet::new();

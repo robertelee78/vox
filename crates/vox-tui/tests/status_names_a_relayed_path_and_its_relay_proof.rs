@@ -10,6 +10,10 @@
 //!   anchor's fingerprint;
 //! - `vox status`: the host's line says `relayed via <the anchor's short id>`.
 //!
+//! And the guest's own `vox room link`, whose address names the host's address as it names the
+//! anchor's, never calls the host an anchor (V030-51). Mutation: the note names every entry of the
+//! address as an anchor — red, PRODUCT.
+//!
 //! **A joiner restarted before its first sync reaches its host through the relay** (V030-51,
 //! #517). A second joiner, Late, joins the same room over the relay; the moment its join got in,
 //! its leg drops everything it sends, so the room's first sync cannot happen, and `vox connect`
@@ -21,6 +25,15 @@
 //! a synced one (`reach_members_of` returning for any anchored room) — the forward waits out its
 //! 180 s for the first sync, red PRODUCT.
 //!
+//! **The member that let a joiner in is never its anchor** (V030-51). A room of eleven, each member
+//! let in by the one before (the host lets in A1, A1 lets in A2, … A8 lets in R), with only the one
+//! answering online at each join, then the anchor stopped. A joiner J let in by R has not admitted
+//! R's record when its join is done (its room lists the host and itself), so nothing but the join
+//! itself says R is a member. R stops too. J's own `vox status
+//! --json` must not list R, a member, among its anchors: a node kept as an anchor is dialled
+//! directly only and passed over by the sync. Mutation: the join no longer records R as a member
+//! (`note_member`), red PRODUCT.
+//!
 //! **A red names its side.** The report's content is PRODUCT. A `vox` step that fails while the
 //! world is set is PRODUCT (staging), as the harness labels it; the test's own sockets and
 //! processes are APPARATUS.
@@ -29,12 +42,18 @@
 //! Production Argon2id on three profiles and a real ADR-005 proof of work. CI runs it in release.
 
 #![cfg(unix)]
+// Both harness supports, the two-node world and the room of workers, carry their own copy of the
+// data-root layout helpers.
+#![allow(clippy::duplicate_mod)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
 #[path = "support/world.rs"]
 mod world;
+
+#[path = "support/room.rs"]
+mod room;
 
 use std::time::{Duration, Instant};
 
@@ -110,6 +129,22 @@ fn status_names_a_relayed_path_and_its_relay() {
     assert!(
         text.contains(&format!("relayed via {short}")),
         "PRODUCT: `vox status` must say the path is relayed, and through whom"
+    );
+
+    // **A member is never called an anchor** (V030-51, AGENTS.md "Anchors"): the guest's own room
+    // link names the host's address, as it names the anchor's, and what `vox room link` says of
+    // the anchors it names must not call the host, a member, one of them.
+    let (ok, link, said) = vox_once(&guest, &args(&["room", "link", &w.room]));
+    assert!(
+        ok && link.trim().starts_with("vox://"),
+        "PRODUCT (staging): the guest's `vox room link` gave no link: {link}{said}"
+    );
+    let host_short: String = w.host_fp.chars().take(12).collect();
+    eprintln!("[test] the guest's `vox room link` said:\n{said}");
+    assert!(
+        !said.contains(&host_short),
+        "PRODUCT: the guest's `vox room link` named the host {host_short}, a member of the room, \
+         among its anchors:\n{said}"
     );
 }
 
@@ -219,5 +254,128 @@ fn a_joiner_restarted_before_its_first_sync_reaches_its_host_through_the_relay()
     assert_eq!(
         back, b"after a restart",
         "PRODUCT: late's forward must echo what it was sent"
+    );
+}
+
+#[test]
+#[ignore = "real binaries, production Argon2id and eleven proofs of work; CI runs it in release"]
+fn the_member_that_let_a_joiner_in_is_never_its_anchor() {
+    watchdog::arm_for(Duration::from_secs(1500));
+    let tmp = world::tempdir();
+    let tmp = tmp.path();
+    let (anchor, spec) = room::spawn_anchor(tmp);
+    let names = [
+        "host", "a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "r", "j",
+    ];
+    let mut ws: Vec<room::Worker> = names.iter().map(|n| room::worker(tmp, n)).collect();
+    let err = |n: &str| tmp.join(format!("{n}.daemon.err"));
+    room::start_daemon(&mut ws[0], &spec, &err("host"));
+    ws[0]
+        .vox_in(
+            None,
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                "chain",
+            ],
+            Some(room::ROOM_PASS),
+        )
+        .expect_ok("the host's `vox room create`");
+    let id = ws[0]
+        .vox(None, &["room", "list"])
+        .stdout
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("PRODUCT (staging): the host's `vox room list` lists no room"))
+        .to_owned();
+    // Each joins through the one before, the only member online then, so each was let in by it.
+    for i in 1..names.len() {
+        let link = ws[i - 1]
+            .vox(None, &["room", "link", &id])
+            .expect_ok(&format!("{}'s `vox room link`", names[i - 1]))
+            .stdout
+            .trim()
+            .to_owned();
+        if names[i] == "j" {
+            // Nothing else can tell J about R from here on: no anchor, no other member.
+            drop(anchor);
+            break;
+        }
+        room::start_daemon(&mut ws[i], &spec, &err(names[i]));
+        ws[i]
+            .vox_in(
+                None,
+                &["room", "join", "--passphrase-file", "-", &link],
+                Some(room::ROOM_PASS),
+            )
+            .expect_ok(&format!(
+                "{}'s `vox room join` through {}",
+                names[i],
+                names[i - 1]
+            ));
+        ws[i - 1].stop_daemon();
+    }
+    unreachable_anchor_check(&mut ws, &id, &spec, &err);
+}
+
+/// J joins through R, the only member online, R stops, and J's report must not list R among its
+/// anchors.
+fn unreachable_anchor_check(
+    ws: &mut [room::Worker],
+    id: &str,
+    spec: &str,
+    err: &dyn Fn(&str) -> std::path::PathBuf,
+) {
+    let (r, j) = (ws.len() - 2, ws.len() - 1);
+    let link = ws[r]
+        .vox(None, &["room", "link", id])
+        .expect_ok("r's `vox room link`")
+        .stdout
+        .trim()
+        .to_owned();
+    room::start_daemon(&mut ws[j], spec, &err("j"));
+    ws[j]
+        .vox_in(
+            None,
+            &["room", "join", "--passphrase-file", "-", &link],
+            Some(room::ROOM_PASS),
+        )
+        .expect_ok("j's `vox room join` through r");
+    let r_fp = ws[r].b32();
+    let r_short: String = r_fp.chars().take(12).collect();
+    // Who let j in, in its daemon's own words: "join got in — …, <r>: exchange …".
+    let said = std::fs::read_to_string(err("j")).unwrap_or_default();
+    let joined = said
+        .lines()
+        .find(|l| l.contains("join got in"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        joined.contains(&format!("{r_short}: exchange")),
+        "APPARATUS: j's daemon does not say r ({r_short}) let it in, so who let it in was not \
+         staged:\n{said}"
+    );
+    ws[r].stop_daemon();
+    let report = ws[j].vox(None, &["status", "--json"]);
+    let v: serde_json::Value =
+        serde_json::from_str(report.expect_ok("j's `vox status --json`").stdout.trim())
+            .unwrap_or_else(|e| {
+                panic!("PRODUCT: `vox status --json` is not JSON ({e}): {report:?}")
+            });
+    eprintln!(
+        "[test] j's anchors: {}\nj's join said:\n{joined}",
+        v["anchors"]
+    );
+    let listed = v["anchors"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|x| x["id"].as_str() == Some(r_fp.as_str())));
+    assert!(
+        !listed,
+        "PRODUCT: j's `vox status --json` lists r ({r_short}), the member that let it in, among \
+         its anchors: {}",
+        v["anchors"]
     );
 }
