@@ -453,19 +453,11 @@ fn assert_full(geneses: usize, others: usize) {
 
 /// A real `vox room join` of `link` from `dir`, which must succeed within the bound. A join that
 /// fails and a join that succeeds too slowly are told apart.
-fn real_join(dir: &Path, link: &str, name: &str, what: &str) {
+fn real_join(dir: &Path, link: &str, what: &str) {
     let t0 = Instant::now();
     let (ok, out, err) = vox_in(
         dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link,
-            "--name",
-            name,
-        ],
+        &["room", "join", "--passphrase-file", "-", link],
         ROOM_PASS,
     );
     let took = t0.elapsed();
@@ -540,7 +532,6 @@ fn a_stranger_keeping_its_rooms_live_does_not_crowd_out_a_new_room() {
     real_join(
         &joiner_dir,
         &second_link,
-        "second",
         "a room created after a stranger's live flood",
     );
 }
@@ -654,7 +645,6 @@ fn a_stranger_resending_a_rooms_records_does_not_get_it_evicted() {
     real_join(
         &joiner_dir,
         &link,
-        "first",
         "the room in use after a stranger re-sent its records and flooded the anchor",
     );
 }
@@ -748,7 +738,6 @@ fn a_stranger_reseeding_a_restarted_anchor_does_not_get_a_room_evicted() {
     real_join(
         &joiner_dir,
         &link,
-        "first",
         "the room in use after a stranger re-seeded the restarted anchor and flooded it",
     );
 }
@@ -783,15 +772,7 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     let member = daemon("member", &member_dir, 0, &spec, &pass_file);
     let (ok, out, err) = vox_in(
         &member_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &creator_link,
-            "--name",
-            "first",
-        ],
+        &["room", "join", "--passphrase-file", "-", &creator_link],
         ROOM_PASS,
     );
     assert!(
@@ -909,7 +890,6 @@ fn a_non_creator_members_republish_keeps_a_room_credited() {
     real_join(
         &joiner_dir,
         &member_link,
-        "first",
         "a room whose creator is away, after a stranger re-seeded the restarted anchor and flooded it",
     );
 }

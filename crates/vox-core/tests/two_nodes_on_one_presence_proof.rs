@@ -116,12 +116,12 @@ async fn event<T>(
     }
 }
 
-/// A room `h` holds by its local name.
+/// A room `h` holds by its name.
 fn room(h: &NodeHandle, name: &str) -> Digest32 {
     h.view()
         .channels
         .iter()
-        .find(|c| c.local_name.as_deref() == Some(name))
+        .find(|c| c.name.as_deref() == Some(name))
         .map(|c| c.channel_id)
         .unwrap_or_else(|| panic!("PRODUCT (staging): no room {name}"))
 }
@@ -145,7 +145,6 @@ async fn invite_and_join(h: &NodeHandle, channel_id: Digest32, joiner: &NodeHand
     let join = joiner
         .apply(NodeCommand::JoinChannel {
             link: url,
-            local_name: format!("joined-{:02x}{:02x}", channel_id[0], channel_id[1]),
             passphrase: Secret::new(pass.as_bytes().to_vec()),
         })
         .await;
@@ -232,7 +231,7 @@ async fn detaching_one_node_leaves_the_others_tunnel_and_sync_moving() {
     let pass_b = vox_core::node::passphrase::generate(6).expect("APPARATUS: passphrase");
     let served = b
         .apply(NodeCommand::Serve {
-            local_name: "b-room".into(),
+            room: "b-room".into(),
             passphrase: Secret::new(pass_b.as_bytes().to_vec()),
             name: "echo".into(),
             port: service.port(),
@@ -257,7 +256,7 @@ async fn detaching_one_node_leaves_the_others_tunnel_and_sync_moving() {
     let pass_a = vox_core::node::passphrase::generate(6).expect("APPARATUS: passphrase");
     let made = a
         .apply(NodeCommand::CreateChannel {
-            local_name: "a-room".into(),
+            name: "a-room".into(),
             passphrase: Secret::new(pass_a.as_bytes().to_vec()),
         })
         .await;

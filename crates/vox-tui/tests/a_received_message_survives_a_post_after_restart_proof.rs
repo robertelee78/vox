@@ -220,15 +220,7 @@ fn a_received_message_survives_a_restart_a_post_and_a_restart() {
     let b = daemon(&bob, "bob-start");
     let (ok, _, err) = vox(
         &bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "kept",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join failed: {err}");

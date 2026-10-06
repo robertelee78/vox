@@ -127,7 +127,7 @@ try:
     if inv.returncode != 0: product(f"alice's `vox room link` failed: {inv.stderr.strip()}")
     link = inv.stdout.strip()
     for w in ("bob", "carol"):
-        j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")
+        j = run(w, "room", "join", "--passphrase-file", "-", link, stdin="room pass")
         if j.returncode != 0: product(f"{w}'s `vox room join` failed: {j.stderr.strip()}")
     for (who, name) in (("alice", "alice"), ("erin", "erin")):
         t = run("bob", "trust", "add", fp[who], "--name", name, "--identity-passphrase-file", f"{S}/idpass")

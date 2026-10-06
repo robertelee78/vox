@@ -316,15 +316,7 @@ fn join(creator: &Path, joiner: &Path, room: &str) {
     assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         joiner,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "r",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join: {err}");

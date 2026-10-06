@@ -238,15 +238,7 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
     for (d, who) in [(&bob, "bob"), (&carol, "carol")] {
         let (ok, _, err) = vox(
             d,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link.trim(),
-                "--name",
-                "c",
-            ],
+            &["room", "join", "--passphrase-file", "-", link.trim()],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(

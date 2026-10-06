@@ -265,15 +265,7 @@ fn a_room_with_hundreds_of_consents_is_joined_promptly() {
             let started = Instant::now();
             let (ok, out, err) = vox_in(
                 data,
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    &link,
-                    "--name",
-                    "team",
-                ],
+                &["room", "join", "--passphrase-file", "-", &link],
                 ROOM_PASS,
             );
             if !ok {

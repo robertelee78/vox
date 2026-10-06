@@ -69,7 +69,7 @@ do {
     try await client.subscribe(listener: Listener())
 
     let room = try await client.joinRoom(
-        link: link, name: "calls", passphrase: try Passphrase(bytes: Data(args[5].utf8)))
+        link: link, passphrase: try Passphrase(bytes: Data(args[5].utf8)))
     say("JOINED \(room)")
     // Within the keyring window the attach opened: no passphrase is asked for.
     try await client.trustAdd(fingerprint: peer, name: "peer", identityPassphrase: nil)

@@ -352,15 +352,7 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     // One join, no retry: a join that fails is the product's failure, and #217's busy-host
     // refusal is fixed (V210-43), so nothing known excuses one.
     let (ok, out, err) = bob.vox_with(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
     );
     assert!(

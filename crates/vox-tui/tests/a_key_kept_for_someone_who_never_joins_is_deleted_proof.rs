@@ -245,15 +245,7 @@ fn a_key_kept_for_someone_who_never_joins_is_deleted_after_thirty_days() {
     assert!(ok, "PRODUCT (staging): vox room link: {err}");
     let (ok, _, err) = vox(
         &bob,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "r",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some(&format!("{ROOMPASS}\n")),
     );
     assert!(ok, "PRODUCT (staging): vox room join: {err}");

@@ -278,15 +278,7 @@ fn a_member_that_just_joined_is_not_refused_by_its_anchor() {
             assert!(ok, "PRODUCT (staging): vox room link: {err}");
             let (ok, out, err) = vox_in(
                 d,
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    link.trim(),
-                    "--name",
-                    "family",
-                ],
+                &["room", "join", "--passphrase-file", "-", link.trim()],
                 &format!("{ROOM_PASS}\n"),
             );
             assert!(ok, "PRODUCT: {name}'s `vox room join` failed: {out}{err}");

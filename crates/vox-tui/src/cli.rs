@@ -404,13 +404,14 @@ enum RoomCmd {
     /// Show what is held or pending, by whom, until when — and whether coordination
     /// is refused because a participant runs another vox version.
     Board(RoomBoardArgs),
-    /// Join a room from a `vox://` address, over a running node.
+    /// Join a room from a `vox://` address, over a running node. The room keeps its own name,
+    /// the one its creator or an admin gave it.
     ///
     /// The passphrase is asked for at the terminal, or read from `--passphrase-file`
     /// (`-` reads stdin); never argv, which anything that can run `ps` would see:
     ///
     /// ```text
-    /// echo 'the room passphrase' | vox room join --passphrase-file - vox://… --name mission
+    /// echo 'the room passphrase' | vox room join --passphrase-file - vox://…
     /// ```
     ///
     /// This is what makes agent comms usable on a host with no terminal: `vox
@@ -418,9 +419,15 @@ enum RoomCmd {
     /// onto it. Joining grants nothing — whether anyone can read you is their
     /// decision, made with `vox trust`.
     Join(JoinRoomArgs),
-    /// Create a room on a running node. Passphrase at the terminal, or from
-    /// `--passphrase-file` (`-` reads stdin).
+    /// Create a room on a running node, under a name every member sees. Passphrase at the
+    /// terminal, or from `--passphrase-file` (`-` reads stdin).
     Create(CreateRoomArgs),
+    /// Give a room a new name, for every member. Only the room's creator or an admin may, and it
+    /// asks for the identity passphrase for that reason.
+    ///
+    /// The name is one DNS label (a-z, 0-9 and `-`), because it is the room part of every service
+    /// address in the room.
+    Rename(RenameArgs),
     /// Set how long the room keeps messages: `1h`, `1w`, `1m` (a month), a number of
     /// seconds, or `forever`.
     ///
@@ -467,9 +474,6 @@ pub struct JoinRoomArgs {
     pub profile: NodeArgs,
     /// The `vox://` address you were given.
     pub link: String,
-    /// A local name for the room. Never leaves this device.
-    #[arg(long, default_value = "room")]
-    pub name: String,
     /// Read the room passphrase from this file; `-` reads it from stdin. Without it, it is
     /// asked for at the terminal, and with no terminal the command fails at once.
     #[arg(long)]
@@ -481,8 +485,10 @@ pub struct JoinRoomArgs {
 pub struct CreateRoomArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
-    /// A local name for the room. Never leaves this device.
-    #[arg(long, default_value = "room")]
+    /// The room's name, which every member sees: one DNS label (a-z, 0-9 and `-`), because it
+    /// is the room part of every service address in it. Its creator or an admin can change it
+    /// with `vox room rename`.
+    #[arg(long)]
     pub name: String,
     /// Read the new room's passphrase from this file; `-` reads it from stdin. Without it, it
     /// is asked for twice at the terminal, and with no terminal the command fails at once.
@@ -505,6 +511,23 @@ pub struct AdminArgs {
     pub room: String,
     /// The member, by fingerprint or a unique prefix of it (for `add` and `remove`).
     pub member: Option<String>,
+}
+
+/// `vox room rename`
+#[derive(Args, Debug, Clone)]
+pub struct RenameArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room: its name, or its id or a unique prefix of it.
+    pub room: String,
+    /// The new name: one DNS label (a-z, 0-9 and `-`).
+    pub name: String,
+    /// **Refused**, as on `vox trust add`: a command line is world-readable.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox room retention`
@@ -1563,7 +1586,8 @@ pub struct ServeArgs {
     /// The local endpoint to carry connections to, when it is not `127.0.0.1:<port>`.
     #[arg(long)]
     pub at: Option<SocketAddr>,
-    /// A local name for the room (this device only; never leaves it).
+    /// The room's name, which every member sees: one DNS label (a-z, 0-9 and `-`), the room
+    /// part of each service's address.
     #[arg(long, default_value = "service")]
     pub name: String,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
@@ -1602,9 +1626,6 @@ pub struct ConnectArgs {
     /// file has an owner and a mode, where a command line has neither.
     #[arg(long)]
     pub passphrase_file: Option<std::path::PathBuf>,
-    /// A local name for the room (this device only).
-    #[arg(long, default_value = "service")]
-    pub name: String,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
@@ -1971,7 +1992,6 @@ pub fn run() -> ExitCode {
                     &args.profile,
                     pass(args.identity_passphrase, args.identity_passphrase_file),
                     &args.address,
-                    &args.name,
                     &room_pp,
                     &steps,
                 )
@@ -1998,6 +2018,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Create(a) => &a.profile,
                 RoomCmd::Link(a) => &a.profile,
                 RoomCmd::Retention(a) => &a.profile,
+                RoomCmd::Rename(a) => &a.profile,
                 RoomCmd::Leave(a) | RoomCmd::End(a) => &a.profile,
                 RoomCmd::Admin(a) => &a.profile,
             };
@@ -2123,13 +2144,8 @@ pub fn run() -> ExitCode {
                                 .await
                         }
                         RoomCmd::Join(a) => {
-                            crate::room_cli::join(
-                                &paths,
-                                &a.link,
-                                &a.name,
-                                a.passphrase_file.as_deref(),
-                            )
-                            .await
+                            crate::room_cli::join(&paths, &a.link, a.passphrase_file.as_deref())
+                                .await
                         }
                         RoomCmd::Create(a) => {
                             crate::room_cli::create(
@@ -2146,6 +2162,14 @@ pub fn run() -> ExitCode {
                         RoomCmd::Admin(a) => {
                             crate::room_cli::admin(&paths, &a.action, &a.room, a.member.as_deref())
                                 .await
+                        }
+                        RoomCmd::Rename(a) => {
+                            let identity = crate::tunnel_cli::identity_passphrase_for(
+                                &paths,
+                                a.identity_passphrase.clone(),
+                                a.identity_passphrase_file.clone(),
+                            )?;
+                            crate::room_cli::rename(&paths, &a.room, &a.name, &identity).await
                         }
                         RoomCmd::Retention(a) => {
                             let identity = crate::tunnel_cli::identity_passphrase_for(

@@ -4,9 +4,11 @@
 //!
 //! ## What a channel is, at rest
 //! Under the channel's SEK (ADR-010), sealed segments in the profile store:
-//! - `KeyMaterial 0` — the **manifest**: `[1, genesis_wire, local_name, created,
-//!   epoch]`. The genesis is the trust anchor (ADR-007); `local_name` is this
-//!   device's label, never protocol state.
+//! - `KeyMaterial 0` — the **manifest**: `[2, genesis_wire, name_hint, created,
+//!   epoch]`. The genesis is the trust anchor (ADR-007); `name_hint` is the room's shared
+//!   name as this node first heard it (its own at creation, the responder's at a join), shown
+//!   only until the log, which decides the name, names the room (ADR-028 R-1). A version-1
+//!   manifest held a per-member local name, which no longer exists, and is read without it.
 //! - `KeyMaterial 1` — this identity's **sender chain** state
 //!   ([`SenderChain::to_state`]), advanced and re-sealed on every append.
 //! - `LogDb n` (`n ≥ 1`, arrival order) — one ADR-008 log entry's wire bytes.
@@ -265,8 +267,9 @@ const DELIVERED_VERSION: u64 = 1;
 const SERVICES_VERSION: u64 = 2;
 /// The most services one channel may offer — a sanity bound on host config.
 pub const MAX_SERVICES: usize = 64;
-/// Manifest encoding version.
-const MANIFEST_VERSION: u64 = 1;
+/// Manifest encoding version. **2 holds the shared name's hint** where 1 held a per-member local
+/// name (ADR-028 R-1 removed those); 1 is still read, without its name.
+const MANIFEST_VERSION: u64 = 2;
 /// Plaintext-cache row encoding version.
 /// Version of the plaintext rendering cache. **2 stores the timestamp in milliseconds**, and is the
 /// only version this build reads: version 1 (seconds) was an earlier release's (#423).
@@ -317,7 +320,8 @@ pub fn max_authors() -> usize {
     #[cfg(not(feature = "test-knobs"))]
     MAX_AUTHORS
 }
-/// Cap on a local channel name.
+/// Cap on a room's name as a manifest or a request carries it: a version-1 manifest's local name
+/// could be this long; a room name is at most [`crate::governance::name::MAX_ROOM_NAME`].
 pub const MAX_LOCAL_NAME_LEN: usize = 128;
 
 /// The ADR-005 join binding parameters for a channel, derived from its **genesis**
@@ -601,6 +605,20 @@ pub struct Rendered {
     pub owed: bool,
 }
 
+/// One line a person is told about the room, in its timeline but not a message (ADR-028 E-5):
+/// `ann renamed the room to family`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomNotice {
+    /// The log entry it comes from.
+    pub entry_hash: Digest32,
+    /// Who did it.
+    pub author: Digest32,
+    /// When, as its author's entry claims, milliseconds since the Unix epoch.
+    pub created_millis: u64,
+    /// What they did, without who: `renamed the room to family`.
+    pub what: String,
+}
+
 /// How many more of an author's entries must have expired since its last checkpoint before it
 /// posts another (ADR-023 decision 3): 32. A checkpoint is itself a signed entry of about the
 /// size it saves on one skeleton, so one per 32 costs about 3% of what it frees, and a room
@@ -650,7 +668,9 @@ const SKIPPED_KEPT: usize = 64;
 pub struct ChannelState {
     channel_id: Digest32,
     genesis: Genesis,
-    local_name: String,
+    /// The room's shared name as this node first heard it, shown only while the log names it not
+    /// (ADR-028 R-1); empty for none.
+    name_hint: String,
     created: u64,
     epoch: u64,
     sek: Sek,
@@ -811,7 +831,7 @@ impl std::fmt::Debug for ChannelState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChannelState")
             .field("channel_id", &crate::hash::Hex(&self.channel_id))
-            .field("local_name", &self.local_name)
+            .field("name", &self.name())
             .field("epoch", &self.epoch)
             .field("entries", &self.dag.len())
             .field("authors", &self.authors.len())
@@ -822,12 +842,12 @@ impl std::fmt::Debug for ChannelState {
     }
 }
 
-fn manifest_bytes(genesis: &Genesis, local_name: &str, created: u64, epoch: u64) -> Vec<u8> {
+fn manifest_bytes(genesis: &Genesis, name_hint: &str, created: u64, epoch: u64) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(5)
         .uint(MANIFEST_VERSION)
         .bytes(&genesis.to_wire())
-        .text(local_name)
+        .text(name_hint)
         .uint(created)
         .uint(epoch);
     e.finish()
@@ -838,7 +858,8 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
     if d.array()? != 5 {
         return Err(Error::MalformedAtRest("room manifest arity"));
     }
-    if d.uint()? != MANIFEST_VERSION {
+    let version = d.uint()?;
+    if version != MANIFEST_VERSION && version != 1 {
         return Err(Error::MalformedAtRest("room manifest version"));
     }
     let genesis = Genesis::from_wire(d.bytes()?)?;
@@ -846,7 +867,12 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
     if name.len() > MAX_LOCAL_NAME_LEN {
         return Err(Error::SizeLimitExceeded("room local name"));
     }
-    let name = name.to_owned();
+    // Version 1's name was this member's own, which ADR-028 R-1 removed: never shown.
+    let name = if version == 1 {
+        String::new()
+    } else {
+        name.to_owned()
+    };
     let created = d.uint()?;
     let epoch = d.uint()?;
     d.finish()?;
@@ -1351,13 +1377,13 @@ impl ChannelState {
     /// chain. Persists the wrap, manifest and chain atomically.
     pub fn create(
         profile: &Profile,
-        local_name: &str,
+        name: &str,
         channel_passphrase: &[u8],
         now_secs: u64,
     ) -> Result<Self> {
         Self::create_with_profile(
             profile,
-            local_name,
+            name,
             channel_passphrase,
             now_secs,
             Argon2Profile::default(),
@@ -1367,18 +1393,18 @@ impl ChannelState {
     /// [`ChannelState::create`] with an explicit Argon2id profile (tests).
     pub fn create_with_profile(
         profile: &Profile,
-        local_name: &str,
+        name: &str,
         channel_passphrase: &[u8],
         now_secs: u64,
         argon2: Argon2Profile,
     ) -> Result<Self> {
-        let (genesis, sek) = Self::create_genesis(profile, local_name, now_secs)?;
+        let (genesis, sek) = Self::create_genesis(profile, name, now_secs)?;
         let signer = profile.signer()?;
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
         Self::create_from_sealed(
             profile,
-            local_name,
+            name,
             channel_passphrase,
             genesis,
             sek,
@@ -1395,14 +1421,11 @@ impl ChannelState {
     /// last step.
     ///
     /// # Errors
-    /// A local name over the limit, no unlocked signer, or a genesis or key that cannot be made.
-    pub fn create_genesis(
-        profile: &Profile,
-        local_name: &str,
-        now_secs: u64,
-    ) -> Result<(Genesis, Sek)> {
-        if local_name.len() > MAX_LOCAL_NAME_LEN {
-            return Err(Error::SizeLimitExceeded("room local name"));
+    /// A name that is not a room name ([`crate::governance::name::room_name`]), no unlocked
+    /// signer, or a genesis or key that cannot be made.
+    pub fn create_genesis(profile: &Profile, name: &str, now_secs: u64) -> Result<(Genesis, Sek)> {
+        if crate::governance::name::room_name(name).as_deref() != Ok(name) {
+            return Err(Error::MalformedGovernance("room name is not a DNS label"));
         }
         let signer = profile.signer()?;
         let policy = ChannelPolicy {
@@ -1421,7 +1444,7 @@ impl ChannelState {
     /// No unlocked signer, a segment that cannot be sealed, or a store write that fails.
     pub fn create_from_sealed(
         profile: &Profile,
-        local_name: &str,
+        name: &str,
         channel_passphrase: &[u8],
         genesis: Genesis,
         sek: Sek,
@@ -1448,7 +1471,7 @@ impl ChannelState {
             mint_seq,
         )?;
 
-        let manifest = manifest_bytes(&genesis, local_name, now_secs, epoch);
+        let manifest = manifest_bytes(&genesis, name, now_secs, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
         let sender_seg = seal_segment(
             &sek,
@@ -1503,10 +1526,10 @@ impl ChannelState {
         admission.admit(channel_id, epoch, me);
         let origin_ms = genesis.body.created.saturating_mul(1_000);
         let evaluator = Arc::new(Self::build_evaluator(&genesis, &authors, &[], now_secs)?);
-        Ok(Self {
+        let mut room = Self {
             channel_id,
             genesis,
-            local_name: local_name.to_owned(),
+            name_hint: name.to_owned(),
             passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created: now_secs,
             epoch,
@@ -1554,7 +1577,12 @@ impl ChannelState {
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             readmitted: BTreeSet::new(),
-        })
+        };
+        // The room's name is stated on its log as its first entry after the genesis, so every
+        // member that joins reads it there (ADR-028 R-1).
+        let statement = crate::governance::name::RoomName::build(signer, &channel_id, epoch, name)?;
+        room.append_governance(profile, &statement.to_wire(), now_secs)?;
+        Ok(room)
     }
 
     /// Open a channel from the store: double-lock unwrap of the SEK, then rebuild
@@ -1597,7 +1625,7 @@ impl ChannelState {
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_MANIFEST)?
             .ok_or(Error::MalformedAtRest("room manifest missing"))?;
         let manifest = open_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest_seg)?;
-        let (genesis, local_name, created, epoch) = parse_manifest(&manifest)?;
+        let (genesis, name_hint, created, epoch) = parse_manifest(&manifest)?;
         genesis.verify()?;
         if genesis.channel_id() != *channel_id {
             return Err(Error::MalformedAtRest("room manifest genesis mismatch"));
@@ -1950,7 +1978,7 @@ impl ChannelState {
         Ok(Self {
             channel_id: *channel_id,
             genesis,
-            local_name,
+            name_hint,
             passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created,
             epoch,
@@ -2036,20 +2064,12 @@ impl ChannelState {
         )
     }
 
-    /// What must hold before a joined room is made: a name within the limit, an unlocked signer,
-    /// a genesis that verifies and names this room, and no copy of the room already in the profile.
+    /// What must hold before a joined room is made: an unlocked signer, a genesis that verifies
+    /// and names this room, and no copy of the room already in the profile.
     ///
     /// # Errors
     /// The first of those that does not hold.
-    pub fn join_checks(
-        profile: &Profile,
-        genesis: &Genesis,
-        channel_id: &Digest32,
-        local_name: &str,
-    ) -> Result<()> {
-        if local_name.len() > MAX_LOCAL_NAME_LEN {
-            return Err(Error::SizeLimitExceeded("room local name"));
-        }
+    pub fn join_checks(profile: &Profile, genesis: &Genesis, channel_id: &Digest32) -> Result<()> {
         profile.signer()?;
         genesis.verify()?;
         if genesis.channel_id() != *channel_id {
@@ -2081,13 +2101,14 @@ impl ChannelState {
         profile: &Profile,
         genesis: &Genesis,
         channel_id: &Digest32,
-        local_name: &str,
+        name_hint: Option<&str>,
         channel_passphrase: &[u8],
         now_secs: u64,
         sealed: (Sek, crate::atrest::SekWrap),
         own_admission: Admission,
     ) -> Result<Self> {
-        Self::join_checks(profile, genesis, channel_id, local_name)?;
+        Self::join_checks(profile, genesis, channel_id)?;
+        let name_hint = name_hint.unwrap_or_default();
         let (sek, wrap) = sealed;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
@@ -2110,7 +2131,7 @@ impl ChannelState {
         authors.insert(creator, genesis.body.creator_pubkey.clone());
         authors.insert(me, signer.public_key());
 
-        let manifest = manifest_bytes(genesis, local_name, now_secs, epoch);
+        let manifest = manifest_bytes(genesis, name_hint, now_secs, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
         let sender_seg = seal_segment(
             &sek,
@@ -2194,7 +2215,7 @@ impl ChannelState {
         Ok(Self {
             channel_id: *channel_id,
             genesis: genesis.clone(),
-            local_name: local_name.to_owned(),
+            name_hint: name_hint.to_owned(),
             passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
             created: now_secs,
             epoch,
@@ -6108,10 +6129,67 @@ impl ChannelState {
         self.channel_id
     }
 
-    /// The local (device-only) channel name.
+    /// The room's shared name (ADR-028 R-1): what its log says, else the name this node heard
+    /// when it made or joined the room, else `None` (a room made before rooms had names, until
+    /// an admin names it).
     #[must_use]
-    pub fn local_name(&self) -> &str {
-        &self.local_name
+    pub fn name(&self) -> Option<&str> {
+        self.evaluator
+            .room_name()
+            .or_else(|| Some(self.name_hint.as_str()).filter(|n| !n.is_empty()))
+    }
+
+    /// What a person is told happened to the room, in the room's order (ADR-028 E-5): each name
+    /// an admin gave it. One line each in the timeline, never a message: no reader, cursor or
+    /// agent counts them.
+    #[must_use]
+    pub fn notices(&self) -> Vec<RoomNotice> {
+        self.evaluator
+            .name_statements()
+            .iter()
+            .enumerate()
+            .map(|(i, n)| RoomNotice {
+                entry_hash: n.entry_hash,
+                author: n.author,
+                created_millis: self
+                    .dag
+                    .get_by_hash(&n.entry_hash)
+                    .map_or(0, |e| e.skeleton.claimed_ms),
+                what: if i == 0 {
+                    format!("named the room {}", n.name)
+                } else {
+                    format!("renamed the room to {}", n.name)
+                },
+            })
+            .collect()
+    }
+
+    /// Whether `who` may name the room: its creator or an admin (ADR-028 R-1).
+    #[must_use]
+    pub fn may_rename(&self, who: &Digest32) -> bool {
+        self.evaluator
+            .grants(who, &crate::governance::capability::Capability::Policy)
+            .is_granted()
+    }
+
+    /// Name the room `name` for every member (ADR-028 R-1): append a room-name statement. Only
+    /// the creator or an admin may; anyone else is refused here rather than writing an entry
+    /// every other node would ignore. `name` must already be a room name
+    /// ([`crate::governance::name::room_name`]).
+    ///
+    /// # Errors
+    /// Not an admin, not a room name, or an append that fails.
+    pub fn set_name(&mut self, profile: &Profile, name: &str, now_secs: u64) -> Result<()> {
+        let signer = profile.signer()?;
+        if !self.may_rename(&signer.fingerprint()) {
+            return Err(Error::MalformedGovernance(
+                "only the room's creator or an admin may rename it",
+            ));
+        }
+        let statement =
+            crate::governance::name::RoomName::build(signer, &self.channel_id, self.epoch, name)?;
+        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        Ok(())
     }
 
     /// Creation time recorded in the manifest.

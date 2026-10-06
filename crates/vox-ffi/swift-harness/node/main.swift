@@ -61,7 +61,7 @@ do {
     say("FP \(node.fingerprint())")
     node.subscribe(listener: Listener())
 
-    let room = try await node.joinRoom(link: link, name: "calls", passphrase: roomPassphrase)
+    let room = try await node.joinRoom(link: link, passphrase: roomPassphrase)
     say("JOINED \(room)")
     try await node.trust(fingerprint: daemon, name: "daemon")
     // A room just joined is written to only once it has synced with a member (V210-164): the

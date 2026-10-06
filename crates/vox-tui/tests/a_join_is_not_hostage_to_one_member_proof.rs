@@ -335,15 +335,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
 
     // ---- bob joins; alice and bob read each other ----
     let (ok, o, e) = bob.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "team",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(&format!("{ROOM_PASS}\n")),
     );
     assert!(
@@ -389,15 +381,7 @@ fn a_room_is_still_joinable_when_the_first_member_tried_is_offline() {
     // ---- carol joins with alice's own link: one attempt ----
     let t0 = Instant::now();
     let (ok, o, e) = carol.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "team",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(&format!("{ROOM_PASS}\n")),
     );
     let took = t0.elapsed();

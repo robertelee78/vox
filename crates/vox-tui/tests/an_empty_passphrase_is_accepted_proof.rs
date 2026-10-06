@@ -322,15 +322,7 @@ fn an_empty_identity_and_room_passphrase_are_accepted() {
     // ---- claim 3: a wrong, non-empty passphrase is refused ----
     let (ok, out, err) = vox(
         &carol,
-        &s(&[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "open",
-        ]),
+        &s(&["room", "join", "--passphrase-file", "-", &link]),
         Some("not empty\n"),
     );
     assert!(
@@ -346,15 +338,7 @@ fn an_empty_identity_and_room_passphrase_are_accepted() {
     // ---- claim 4: no passphrase joins, and the two read each other ----
     let (ok, out, err) = vox(
         &bob,
-        &s(&[
-            "room",
-            "join",
-            "--passphrase-file",
-            &empty_file,
-            &link,
-            "--name",
-            "open",
-        ]),
+        &s(&["room", "join", "--passphrase-file", &empty_file, &link]),
         None,
     );
     assert!(

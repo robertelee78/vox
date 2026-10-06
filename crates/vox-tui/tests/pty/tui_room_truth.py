@@ -21,7 +21,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             his TUI has not drawn yet, is read by nobody;
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
-            lines): m-011 is the first line shown, not m-001 still;
+            lines): the oldest line is "alice named the room m", above m-001, so m-010 is the first
+            message shown, not m-001 still;
+  renamed   Alice renames the room while Bob's TUI is open, and his timeline says so in one
+            line, by his name for her: "alice renamed the room to family" (ADR-028 R-1, E-5);
   consent   Carol, whom Bob never trusted, reads "not in keyring · you don't read each other";
             Alice, whom he did, "in keyring · reads you" (V210-155: once
             "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
@@ -78,11 +81,11 @@ and exits 1. An exception in the driver itself prints `APPARATUS: driver crashed
 traceback and exits 2. Every process is recorded and killed by PID. Bounded throughout
 (`vox_pty.py`, V210-54).
 """
-import json, os, re, subprocess, sys, time, traceback
+import json, os, re, signal, subprocess, sys, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
+from vox_pty import Gone, Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
 
 # The colours the TUI is built from (ADR-028 L-1), read as pyte reads a cell: lowercase hex.
 TOKENS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -233,7 +236,7 @@ try:
     link = inv.stdout.strip()
     # Bob and Carol join at once, as two people given the link might: so the budget holds one
     # join's worth of JOIN_SECS, not two.
-    joins = {w: subprocess.Popen([VOX, "room", "join", "--passphrase-file", "-", link, "--name", "m"], env=env(w),
+    joins = {w: subprocess.Popen([VOX, "room", "join", "--passphrase-file", "-", link], env=env(w),
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True) for w in ("bob", "carol", "dave")}
     PROCS.extend(joins.values())
@@ -376,12 +379,26 @@ try:
     if not tui.until(lambda: first_shown() == 1, 5, 0.2):
         product(f"bob's `vox tui`: PageUp past the top did not show m-001 first within 5 s "
                 f"(first shown: {first_shown()})")
+    # The room's oldest line is the one that says who named it (ADR-028 E-5), above m-001.
+    named_on_top = "alice named the room m" in timeline()
     tui.key("\x1b[6~", 0)  # PageDown, once
-    tui.until(lambda: first_shown() == 11, 3, 0.2)
+    tui.until(lambda: first_shown() == 10, 3, 0.2)
     moved = first_shown()
-    claim("clamp", moved == 11, f"first line after one PageDown from past the top: m-{moved or 0:03d}")
+    claim("clamp", named_on_top and moved == 10,
+          f"the naming line above m-001 at the top: {named_on_top}; first message after one "
+          f"PageDown from past the top: m-{moved or 0:03d}")
     tui.key("\x1b[F", 0)  # End
     tui.until(lambda: has(timeline(), f"m-{POSTS + 1:03d}"), 5, 0.2)
+
+    stage("renamed")
+    # The room's creator renames it; the room's one name reaches Bob's node, and his timeline says
+    # who renamed it and to what, by his name for her (he trusts her as "alice").
+    r = run("alice", "room", "rename", room, "family", "--identity-passphrase-file", f"{S}/idpass")
+    if r.returncode != 0: product(f"alice's `vox room rename` failed: {r.stderr.strip()}")
+    said = "alice renamed the room to family"
+    renamed = tui.until(lambda: said in timeline(), 60, 1)
+    claim("renamed", renamed, f"{said!r} in bob's timeline within 60 s: {renamed}; its last rows: "
+          f"{[r.strip() for r in timeline().splitlines() if r.strip()][-3:]!r}")
 
     tui.key("\t", 1)   # timeline -> composer
     tui.key("\t", 1)   # composer -> members
@@ -643,7 +660,7 @@ try:
     tui.until(lambda: len(notes()) > before, 30, 0.5)
     tui.pump(6)  # time for a second notification, were the room's messages not grouped
     raised = notes()[before:]
-    claim("notify", len(raised) == 1 and raised[0].startswith("Vox: m |") and "alice" in raised[0]
+    claim("notify", len(raised) == 1 and raised[0].startswith("Vox: family |") and "alice" in raised[0]
           and "secret" not in raised[0] and "do not show" not in raised[0],
           f"notifications for three messages in a room off screen: {raised!r}")
 
@@ -658,7 +675,7 @@ try:
         s = side()
         heads = [i for i, r in enumerate(s) if r == "needs you (1)"]
         under = s[heads[0] + 1] if heads and heads[0] + 1 < len(s) else ""
-        return (bool(heads) and under.lstrip("▶ ").startswith("m ") and "to you 1" in under
+        return (bool(heads) and under.lstrip("▶ ").startswith("family ") and "to you 1" in under
                 and "spare  detached" in s and "default  attached" in s
                 and bool(s) and s[0] == "node default · attached")
     tui.until(regions, 30, 1)
@@ -772,6 +789,17 @@ except Product as e:
 except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
+except Gone as g:
+    # The driver stops a TUI only through `Tui.stop`, never while it still drives it: a signal
+    # that ended one came from outside the product (APPARATUS); a TUI that exited on its own, a
+    # panic included, is the product's red, quoted.
+    if g.signal is not None and g.signal in (signal.SIGTERM, signal.SIGKILL, signal.SIGHUP, signal.SIGINT):
+        print(f"{TAG} APPARATUS: the TUI was stopped from outside the driver: {g}")
+        code = 2
+    else:
+        print(f"{TAG} PRODUCT: a `vox tui` ended while in use: {g}")
+        print(f"{TAG} RED")
+        code = 1
 except subprocess.TimeoutExpired as t:
     # A `vox` verb that never returned is a red of its own, named, not a driver with no verdict.
     print(f"{TAG} RED: `vox {' '.join(t.cmd[1:3])}` did not return within {t.timeout:.0f} s")

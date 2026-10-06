@@ -488,15 +488,7 @@ fn follow(dead_ports: &[u16], bad_line: bool) {
     let (joined, _, join_error) = vox_stdin(
         &bob_data,
         &bob_cfg,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         Some(ROOM_PASS),
     );
     println!(

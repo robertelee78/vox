@@ -232,18 +232,10 @@ fn connected_notes(err: &Path, anchor: &str) -> usize {
 }
 
 /// One `vox room join`, as a person runs it: once. A join turned away is the product's answer.
-fn join(dir: &Path, link: &str, name: &str) -> (bool, String) {
+fn join(dir: &Path, link: &str) -> (bool, String) {
     let (ok, out, err) = vox(
         dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link,
-            "--name",
-            name,
-        ],
+        &["room", "join", "--passphrase-file", "-", link],
         Some(ROOM_PASS),
     );
     (ok, format!("{}{}", out.trim(), err.trim()))
@@ -395,7 +387,7 @@ fn a_shared_anchor_is_redialled_at_every_rooms_address() {
     );
     assert!(ok, "PRODUCT (staging): bob trusts alice: {err}");
     for (link, name) in [(&stale_link, "one"), (&good_link, "two")] {
-        let (joined, said) = join(&bob_dir, link, name);
+        let (joined, said) = join(&bob_dir, link);
         println!("[proof] bob joined {name}: {joined}");
         assert!(
             joined,

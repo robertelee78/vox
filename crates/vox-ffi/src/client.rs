@@ -793,7 +793,8 @@ impl VoxClient {
         })
     }
 
-    /// Create a room named `name` (this device's name for it) under `passphrase`; returns its id.
+    /// Create a room named `name`, its one shared name (ADR-028 R-1), under `passphrase`; returns
+    /// its id.
     ///
     /// # Errors
     /// The node's refusal.
@@ -804,28 +805,26 @@ impl VoxClient {
     ) -> Result<String, VoxError> {
         let before = self.room_list().await?;
         let req = Request::Create {
-            local_name: name,
+            name,
             passphrase: passphrase.copy(),
         };
         on_held!(self, |c| done(c, &req).await)?;
         self.new_room(before, "the room was created").await
     }
 
-    /// Join a room from its `vox://` link with its passphrase, naming it `name` here; returns its
-    /// id.
+    /// Join a room from its `vox://` link with its passphrase; returns its id. The room keeps the
+    /// name its members gave it (ADR-028 R-1).
     ///
     /// # Errors
     /// The node's refusal, with where the join stopped.
     pub async fn join_room(
         &self,
         link: String,
-        name: String,
         passphrase: Arc<Passphrase>,
     ) -> Result<String, VoxError> {
         let before = self.room_list().await?;
         let req = Request::Join {
             link,
-            local_name: name,
             passphrase: passphrase.copy(),
         };
         on_held!(self, |c| done(c, &req).await)?;

@@ -341,15 +341,7 @@ fn taken_first_key_after(halt: Halt) {
     let link = link.trim().to_owned();
     let (joined, out, err) = vox_in(
         &mallory_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "team",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
     );
     assert!(

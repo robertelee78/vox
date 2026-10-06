@@ -14,8 +14,8 @@ vox room list
 vox room roster ROOM_ID
 ```
 
-Use the room ID or an unambiguous prefix accepted by the command. Do not assume a local name
-is interchangeable with an ID. The roster shows membership; your keyring shows your trust
+Use the room's name, its ID, or an unambiguous prefix of its ID. A room has one name, the same
+on every member's node. The roster shows membership; your keyring shows your trust
 decisions. Being present in one does not imply the other.
 
 `no rooms` means this node holds no rooms. A closed room is different: the node holds it, but
@@ -29,19 +29,33 @@ vox room link ROOM_ID
 ```
 
 Create asks for a new room passphrase and confirmation; an empty one is allowed, but then anyone
-with the link can join. Without `--name` the local name is `room`. `--idle-end 1w` makes the room
+with the link can join. `--name` is required: it is the room's name for every member, and the room
+part of every service address in it, so it is one DNS label: 1 to 63 of `a-z`, `0-9` and `-`, not
+starting or ending with `-` (`Family` becomes `family`; `our room` is refused, saying why). `--idle-end 1w` makes the room
 end by itself after a week with nothing said in it; it is off unless given.
 
 `room link` prints the **room link** (`vox://…`) on standard output, so it can be piped; its
 notes go to standard error. Send the link one way and the passphrase another. The new member runs:
 
 ```sh
-vox room join 'ROOM_LINK' --name family
+vox room join 'ROOM_LINK'
 ```
 
-Join asks for the room passphrase. With no terminal, provide it explicitly through
+The joiner gives no name: the room keeps the one its creator gave it. Join asks for the room passphrase. With no terminal, provide it explicitly through
 `--passphrase-file`; `-` selects stdin. Do not put a secret in a command-line argument or
 paste it into an agent conversation merely to get through a prompt.
+
+## Rename a room
+
+```sh
+vox room rename family home
+```
+
+Only the room's creator, or an admin it named, may rename it; anyone else is refused, saying so.
+It asks for the identity passphrase, as `vox room retention` does. The new name reaches every
+member as the room syncs, and each member's timeline in `vox tui` says who renamed it and to what:
+`bob renamed the room to home`. Service addresses follow the name: `ssh.nas.home.vox`, and the old
+`ssh.nas.family.vox` then leads nowhere. In `vox tui`, `:rename home` does the same.
 
 Joining a room your node already holds updates where it finds the room's members; it is not
 refused. Confirm with `room list` and `room roster`, then compare and exchange trust as needed.

@@ -43,8 +43,8 @@ use zeroize::Zeroizing;
 
 use crate::app::CoreHandle;
 use crate::viewmodel::{
-    ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, Reachability,
-    SyncStatus, Trust, UiError, ViewModel,
+    ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, NoticeView,
+    Reachability, SyncStatus, Trust, UiError, ViewModel,
 };
 use vox_agentcomms::attention::{group, RoomGroup};
 
@@ -593,7 +593,7 @@ impl DaemonCore {
                 .rooms
                 .iter()
                 .find(|r| r.channel_id == cid)
-                .and_then(|r| r.local_name.clone())
+                .and_then(|r| r.name.clone())
                 .unwrap_or_else(|| vox_core::node::link::b32_encode(&cid)[..12].to_owned());
             let note = crate::notify::Note {
                 title: format!("Vox: {room}"),
@@ -1044,10 +1044,11 @@ impl DaemonCore {
             .map(|c| ChannelSummary {
                 open: c.open,
                 channel_id: c.channel_id,
-                local_name: c
-                    .local_name
-                    .clone()
-                    .unwrap_or_else(|| format!("(closed {})", short_id(&c.channel_id))),
+                name: match (&c.name, c.open) {
+                    (Some(n), _) => n.clone(),
+                    (None, true) => vox_core::node::resolver::room_shown(None, &c.channel_id),
+                    (None, false) => format!("(closed {})", short_id(&c.channel_id)),
+                },
                 to_you: self.unread.get(&c.channel_id).map_or(0, |u| u.to_you),
                 unread: self.unread.get(&c.channel_id).map_or(0, |u| u.new),
                 coordination: self.unread.get(&c.channel_id).map_or(0, |u| u.coordination),
@@ -1083,7 +1084,23 @@ impl DaemonCore {
                 .find(|d| d.channel_id == cid)
                 .map(|d| ChannelView {
                     channel_id: d.channel_id,
-                    local_name: d.local_name.clone(),
+                    name: vox_core::node::resolver::room_shown(d.name.as_deref(), &d.channel_id),
+                    notices: d
+                        .notices
+                        .iter()
+                        .map(|n| NoticeView {
+                            timestamp: n.created_millis / 1_000,
+                            text: format!(
+                                "{} {}",
+                                if me == Some(n.author) {
+                                    "you".to_owned()
+                                } else {
+                                    crate::ident::member_name(&snap.trusted, &n.author)
+                                },
+                                n.what
+                            ),
+                        })
+                        .collect(),
                     members: d
                         .members
                         .iter()
@@ -1128,7 +1145,7 @@ impl DaemonCore {
                     shared: {
                         let mut names = vox_core::node::resolver::VoxResolver::new();
                         for o in &snap.open {
-                            names.add_room(o.channel_id, &o.local_name, &o.members);
+                            names.add_room(o.channel_id, o.name.as_deref(), &o.members);
                         }
                         for (fp, petname) in &snap.trusted {
                             names.name(*fp, petname);
@@ -1440,12 +1457,18 @@ impl CoreHandle for DaemonCore {
                 self.attach(Some(Zeroizing::new(passphrase.expose_secret().to_owned())))
             }
             Command::UseNode { name } => self.use_node(&name),
-            Command::CreateChannel {
-                local_name,
-                passphrase,
-            } => self.send(Request::Create {
-                local_name,
+            Command::CreateChannel { name, passphrase } => self.send(Request::Create {
+                name,
                 passphrase: Zeroizing::new(secret(&passphrase)),
+            }),
+            Command::RenameRoom {
+                channel_id,
+                name,
+                identity_passphrase,
+            } => self.send(Request::RenameRoom {
+                channel_id,
+                name,
+                identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
             }),
             Command::OpenChannel {
                 channel_id,
@@ -1528,13 +1551,8 @@ impl CoreHandle for DaemonCore {
                 }
                 status
             }
-            Command::Join {
-                local_name,
+            Command::Join { link, passphrase } => self.send(Request::Join {
                 link,
-                passphrase,
-            } => self.send(Request::Join {
-                link,
-                local_name,
                 passphrase: Zeroizing::new(secret(&passphrase)),
             }),
             Command::Invite { channel_id } => self.send(Request::Invite { channel_id }),

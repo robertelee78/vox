@@ -310,15 +310,7 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
     // ---- claim 1: a wrong passphrase is refused, and the refusal names the passphrase ----
     let (ok, out, err) = vox(
         &carol,
-        &s(&[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "mission",
-        ]),
+        &s(&["room", "join", "--passphrase-file", "-", &link]),
         Some("not the passphrase\n"),
     );
     assert!(
@@ -334,15 +326,7 @@ fn a_room_admits_the_passphrase_and_each_author_decides_who_reads_them() {
     for (name, d) in [("bob", &bob), ("carol", &carol)] {
         let (ok, out, err) = vox(
             d,
-            &s(&[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "mission",
-            ]),
+            &s(&["room", "join", "--passphrase-file", "-", &link]),
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(

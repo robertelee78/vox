@@ -255,15 +255,7 @@ fn r40_a_message_between_two_online_nodes_arrives_in_under_a_second_direct() {
     assert!(ok, "PRODUCT (staging): invite: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "chat",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         Some("room passphrase\n"),
     );
     assert!(

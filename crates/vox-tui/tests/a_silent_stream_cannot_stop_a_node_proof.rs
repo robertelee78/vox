@@ -340,15 +340,7 @@ fn a_member_holding_silent_sync_streams_does_not_stop_the_node() {
     let link = link.trim().to_owned();
     let (joined, out, err) = vox_in(
         &mallory_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "team",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         ROOM_PASS,
     );
     assert!(

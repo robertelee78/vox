@@ -28,12 +28,15 @@ pub enum PromptKind {
     CreateChannel,
     /// Open a closed channel: `[passphrase]` for `Prompt::target`.
     OpenChannel,
-    /// Join from a `vox://` room link: `[link, name, passphrase]`.
+    /// Join from a `vox://` room link: `[link, passphrase]`. The room keeps its own name.
     ///
     /// The link is shown as it is typed because it carries no secret (ADR-016); the
     /// channel passphrase that follows is masked, because it travels out of band and
     /// is the one thing the link deliberately does not contain.
     JoinChannel,
+    /// Rename the room `Prompt::target` for every member: `[name, identity passphrase]`
+    /// (ADR-028 R-1), as `vox room rename` asks.
+    RenameRoom,
 }
 
 impl PromptKind {
@@ -45,7 +48,8 @@ impl PromptKind {
             PromptKind::CreateIdentity => &["new identity passphrase", "confirm passphrase"],
             PromptKind::CreateChannel => &["room name", "room passphrase", "confirm passphrase"],
             PromptKind::OpenChannel => &["room passphrase"],
-            PromptKind::JoinChannel => &["room link (vox://…)", "room name", "room passphrase"],
+            PromptKind::JoinChannel => &["room link (vox://…)", "room passphrase"],
+            PromptKind::RenameRoom => &["new room name", "identity passphrase"],
         }
     }
 
@@ -53,10 +57,10 @@ impl PromptKind {
     #[must_use]
     pub fn is_secret(self, i: usize) -> bool {
         match self {
-            // A channel's local name is not a secret.
-            PromptKind::CreateChannel => i != 0,
-            // Neither the link nor the local name is; only the passphrase.
-            PromptKind::JoinChannel => i == 2,
+            // A room's name is not a secret.
+            PromptKind::CreateChannel | PromptKind::RenameRoom => i != 0,
+            // The link is not; only the passphrase.
+            PromptKind::JoinChannel => i == 1,
             _ => true,
         }
     }
@@ -80,6 +84,7 @@ impl PromptKind {
             PromptKind::CreateChannel => "Create room",
             PromptKind::OpenChannel => "Open room",
             PromptKind::JoinChannel => "Join room",
+            PromptKind::RenameRoom => "Rename room",
         }
     }
 }
@@ -529,12 +534,16 @@ impl UiState {
                 })
             }
             PromptKind::CreateChannel => {
-                let name = p.fields[0].trim().to_owned();
-                if name.is_empty() {
-                    self.status_message = Some("room name is required".into());
-                    self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateChannel, None));
-                    return Action::Redraw;
-                }
+                // One DNS label, as every member sees it (ADR-028 R-1, R-2): said before the
+                // passphrase is checked.
+                let name = match vox_core::governance::name::room_name(&p.fields[0]) {
+                    Ok(name) => name,
+                    Err(why) => {
+                        self.status_message = Some(why);
+                        self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateChannel, None));
+                        return Action::Redraw;
+                    }
+                };
                 if p.fields[1].as_str() != p.fields[2].as_str() {
                     self.status_message = Some("passphrases do not match — try again".into());
                     let mut again = Prompt::new(PromptKind::CreateChannel, None);
@@ -545,26 +554,39 @@ impl UiState {
                 }
                 self.status_message = no_passphrase_note(&p.fields[1]);
                 Action::Dispatch(Command::CreateChannel {
-                    local_name: name,
+                    name,
                     passphrase: secret(&p.fields[1]),
                 })
             }
             PromptKind::JoinChannel => {
                 let link = p.fields[0].trim().to_owned();
-                let name = p.fields[1].trim().to_owned();
-                if link.is_empty() || name.is_empty() {
-                    self.status_message = Some("a link and a room name are required".into());
-                    let mut again = Prompt::new(PromptKind::JoinChannel, None);
-                    again.fields[0] = Zeroizing::new(link);
-                    self.mode = Mode::Prompt(again);
+                if link.is_empty() {
+                    self.status_message = Some("a room link is required".into());
+                    self.mode = Mode::Prompt(Prompt::new(PromptKind::JoinChannel, None));
                     return Action::Redraw;
                 }
-                self.status_message = no_passphrase_note(&p.fields[2]);
+                self.status_message = no_passphrase_note(&p.fields[1]);
                 Action::Dispatch(Command::Join {
-                    local_name: name,
                     link,
-                    passphrase: secret(&p.fields[2]),
+                    passphrase: secret(&p.fields[1]),
                 })
+            }
+            PromptKind::RenameRoom => {
+                let Some(channel_id) = p.target else {
+                    return Action::Redraw;
+                };
+                match vox_core::governance::name::room_name(&p.fields[0]) {
+                    Ok(name) => Action::Dispatch(Command::RenameRoom {
+                        channel_id,
+                        name,
+                        identity_passphrase: secret(&p.fields[1]),
+                    }),
+                    Err(why) => {
+                        self.status_message = Some(why);
+                        self.mode = Mode::Prompt(Prompt::new(PromptKind::RenameRoom, p.target));
+                        Action::Redraw
+                    }
+                }
             }
         }
     }
@@ -664,7 +686,11 @@ impl UiState {
                     Some(Parsed::CloseTunnel) => self.close_selected_tunnel(vm),
                     Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
                     Some(Parsed::Prompt(kind, name)) => {
-                        let mut p = Prompt::new(kind, None);
+                        // A rename is of the room on screen.
+                        let target = (kind == PromptKind::RenameRoom)
+                            .then(|| self.active_channel_id(vm))
+                            .flatten();
+                        let mut p = Prompt::new(kind, target);
                         if let Some(n) = name {
                             p.fields[0] = Zeroizing::new(n);
                             p.step = 1;
@@ -765,7 +791,7 @@ pub enum Parsed {
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
-/// - `send <text…>`, `link`.
+/// - `send <text…>`, `link`, `rename [name]` (opens a prompt for the identity passphrase).
 ///
 /// **Create / join / attach / init are not one-line palette commands.** They require
 /// a passphrase, which ADR-015 mandates be entered through a **masked** prompt and
@@ -828,6 +854,14 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         "end" => Command::EndRoom {
             channel_id: channel,
         },
+        // The room's new name is not secret; the identity passphrase that follows is, so like
+        // `new` it opens the masked prompt.
+        "rename" => {
+            return Some(Parsed::Prompt(
+                PromptKind::RenameRoom,
+                Some(rest.to_owned()).filter(|r| !r.is_empty()),
+            ))
+        }
         // The link is public; it can be produced by a one-line command.
         "link" => Command::Invite {
             channel_id: channel,

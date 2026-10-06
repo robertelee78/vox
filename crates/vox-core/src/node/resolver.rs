@@ -8,7 +8,7 @@
 //!   service's fingerprint ([`crate::governance::share::service_fingerprint`]).
 //! - **`<node>`** is **this machine's** alias for the sharing node — the name it was given in this
 //!   node's trust keyring — or its fingerprint.
-//! - **`<room>`** is **this machine's** alias for the room — its local name — or its id.
+//! - **`<room>`** is the room's shared name (ADR-028 R-1), the same on every member, or its id.
 //!
 //! **The canonical form travels** (ADR-028 S-1): `<service fingerprint>.<node fingerprint>.<room
 //! id>.vox` ([`canonical_address`]) is what is copied, posted, handed to an agent or carried in a
@@ -78,7 +78,7 @@ pub enum ShareState {
 /// One room this machine holds, as naming needs it.
 #[derive(Debug, Clone, Default)]
 struct NamedRoom {
-    /// This machine's local name for it, as a DNS label.
+    /// Its shared name (ADR-028 R-1), a DNS label; empty for a room no admin has named.
     label: String,
     /// Its current members.
     members: Vec<Digest32>,
@@ -129,6 +129,16 @@ pub fn canonical_address(channel_id: &Digest32, host: &Digest32, name: &str) -> 
     )
 }
 
+/// How a room is named to a person: its shared name (ADR-028 R-1), or the first 12 characters of
+/// its id for a room no admin has named.
+#[must_use]
+pub fn room_shown(name: Option<&str>, channel_id: &Digest32) -> String {
+    match name {
+        Some(n) if !n.is_empty() => n.to_owned(),
+        _ => b32_encode(channel_id).chars().take(12).collect(),
+    }
+}
+
 /// What a name that is not `<service>.<node>.<room>.vox` resolves to: nothing. The sentence is
 /// for this machine's operator and names no service.
 fn nothing(hostname: &str) -> String {
@@ -142,10 +152,11 @@ impl VoxResolver {
         Self::default()
     }
 
-    /// Add a room this machine holds, under its local name, with its members.
-    pub fn add_room(&mut self, channel_id: Digest32, local_name: &str, members: &[Digest32]) {
+    /// Add a room this machine holds, under its shared name (ADR-028 R-1; `None` for a room no
+    /// admin has named, which only its id names), with its members.
+    pub fn add_room(&mut self, channel_id: Digest32, name: Option<&str>, members: &[Digest32]) {
         let room = self.rooms.entry(channel_id).or_default();
-        room.label = label_of(local_name);
+        room.label = name.map(label_of).unwrap_or_default();
         room.members = members.to_vec();
     }
 

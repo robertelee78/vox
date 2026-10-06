@@ -1055,6 +1055,8 @@ pub async fn serve(
     waiting: &Waiting,
 ) -> Result<(), AppError> {
     // Parsed before anything is created: a typo must not leave a half-made room.
+    let name = vox_core::governance::name::room_name(name)
+        .map_err(|why| AppError::Usage(format!("cannot create the room: {why}")))?;
     let mut services: Vec<(u16, String)> = Vec::with_capacity(specs.len());
     for spec in specs {
         let (port, label) = named_spec(spec)?;
@@ -1130,7 +1132,7 @@ pub async fn serve(
     ok_or(
         held.client
             .request(&Request::Create {
-                local_name: name.to_owned(),
+                name: name.clone(),
                 passphrase: zeroize::Zeroizing::new(passphrase.as_str().to_owned()),
             })
             .await,
@@ -1453,7 +1455,6 @@ pub async fn connect(
     args: &crate::client::NodeArgs,
     pass: crate::client::Pass,
     url: &str,
-    name: &str,
     room_passphrase: &str,
     waiting: &Waiting,
 ) -> Result<(), AppError> {
@@ -1463,7 +1464,6 @@ pub async fn connect(
     waiting.on("the node to take the join");
     let request = Request::Join {
         link: url.to_owned(),
-        local_name: name.to_owned(),
         // Canonicalization is the node's, at its one boundary — see `actor::room_passphrase`.
         passphrase: zeroize::Zeroizing::new(room_passphrase.to_owned()),
     };

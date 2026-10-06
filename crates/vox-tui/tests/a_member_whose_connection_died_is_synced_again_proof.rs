@@ -282,15 +282,7 @@ fn a_member_whose_connection_died_is_synced_again() {
     assert!(ok, "PRODUCT (staging): `vox room link` failed: {err}");
     let (ok, out, err) = vox_in(
         &bob_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link.trim(),
-            "--name",
-            "r",
-        ],
+        &["room", "join", "--passphrase-file", "-", link.trim()],
         "room pass",
     );
     assert!(

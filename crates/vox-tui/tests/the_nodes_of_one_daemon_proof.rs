@@ -555,8 +555,6 @@ fn a_detach_keeps_the_other_nodes_tunnel_and_sync() {
             "room",
             "join",
             &b_link,
-            "--name",
-            "bx",
             "--passphrase-file",
             &r_bx_pf,
         ],

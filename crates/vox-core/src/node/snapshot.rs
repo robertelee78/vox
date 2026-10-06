@@ -24,8 +24,9 @@ const T_SNAPSHOT_REPLY: u64 = 4411;
 pub struct RoomSnap {
     /// The room.
     pub channel_id: Digest32,
-    /// Its local name, known only while it is open (it is sealed under the room's key).
-    pub local_name: Option<String>,
+    /// Its shared name (ADR-028 R-1), known only while it is open (it is sealed under the room's
+    /// key), and `None` for a room no admin has named.
+    pub name: Option<String>,
     /// Whether it is open.
     pub open: bool,
 }
@@ -35,8 +36,8 @@ pub struct RoomSnap {
 pub struct OpenRoomSnap {
     /// The room.
     pub channel_id: Digest32,
-    /// Its local name.
-    pub local_name: String,
+    /// Its shared name (ADR-028 R-1); `None` for a room no admin has named.
+    pub name: Option<String>,
     /// Its members, in fingerprint order.
     pub members: Vec<Digest32>,
     /// Who this identity consents to reading it here, in fingerprint order.
@@ -54,6 +55,8 @@ pub struct OpenRoomSnap {
     /// Where this node's own recent messages are: `(entry, how many of the other members' nodes
     /// hold it)` ([`crate::node::api::ChannelDetail::held`]).
     pub held: Vec<(Digest32, u64)>,
+    /// What a person is told happened to the room, in its order (ADR-028 E-5).
+    pub notices: Vec<crate::node::channel::RoomNotice>,
 }
 
 /// One node as a client draws it.
@@ -95,7 +98,7 @@ impl NodeSnapshot {
                 .iter()
                 .map(|c| RoomSnap {
                     channel_id: c.channel_id,
-                    local_name: c.local_name.clone(),
+                    name: c.name.clone(),
                     open: c.open,
                 })
                 .collect(),
@@ -104,7 +107,7 @@ impl NodeSnapshot {
                 .iter()
                 .map(|d| OpenRoomSnap {
                     channel_id: d.channel_id,
-                    local_name: d.local_name.clone(),
+                    name: d.name.clone(),
                     members: d.members.clone(),
                     consented: d.consented.clone(),
                     consenting: d.consenting.clone(),
@@ -112,6 +115,7 @@ impl NodeSnapshot {
                     equivocations: d.equivocations.clone(),
                     read_by: d.read_by.clone(),
                     held: d.held.clone(),
+                    notices: d.notices.clone(),
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
@@ -137,13 +141,15 @@ impl NodeSnapshot {
         for r in &self.rooms {
             e.array(4)
                 .bytes(&r.channel_id)
-                .uint(u64::from(r.local_name.is_some()))
-                .text(r.local_name.as_deref().unwrap_or_default())
+                .uint(u64::from(r.name.is_some()))
+                .text(r.name.as_deref().unwrap_or_default())
                 .uint(u64::from(r.open));
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(9).bytes(&o.channel_id).text(&o.local_name);
+            e.array(10)
+                .bytes(&o.channel_id)
+                .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
             digests(&mut e, &o.consented);
             digests(&mut e, &o.consenting);
@@ -167,6 +173,14 @@ impl NodeSnapshot {
             e.array(o.held.len());
             for (entry, n) in &o.held {
                 e.array(2).bytes(entry).uint(*n);
+            }
+            e.array(o.notices.len());
+            for n in &o.notices {
+                e.array(4)
+                    .bytes(&n.entry_hash)
+                    .bytes(&n.author)
+                    .uint(n.created_millis)
+                    .text(&n.what);
             }
         }
         e.array(self.trusted.len());
@@ -232,15 +246,16 @@ impl NodeSnapshot {
             let open = d.uint().map_err(bad("ipc snapshot room open"))? != 0;
             rooms.push(RoomSnap {
                 channel_id,
-                local_name: named.then_some(name),
+                name: named.then_some(name),
                 open,
             });
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 9, "ipc snapshot open room")?;
+            want(&mut d, 10, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
-            let local_name = d.text().map_err(bad("ipc snapshot open name"))?.to_owned();
+            let name = Some(d.text().map_err(bad("ipc snapshot open name"))?.to_owned())
+                .filter(|n| !n.is_empty());
             let members = read_digests(&mut d)?;
             let consented = read_digests(&mut d)?;
             let consenting = read_digests(&mut d)?;
@@ -280,9 +295,19 @@ impl NodeSnapshot {
                 let entry = digest(&mut d)?;
                 held.push((entry, d.uint().map_err(bad("ipc snapshot held count"))?));
             }
+            let mut notices = Vec::new();
+            for _ in 0..d.array().map_err(bad("ipc snapshot notices"))? {
+                want(&mut d, 4, "ipc snapshot notice")?;
+                notices.push(crate::node::channel::RoomNotice {
+                    entry_hash: digest(&mut d)?,
+                    author: digest(&mut d)?,
+                    created_millis: d.uint().map_err(bad("ipc snapshot notice time"))?,
+                    what: d.text().map_err(bad("ipc snapshot notice"))?.to_owned(),
+                });
+            }
             open.push(OpenRoomSnap {
                 channel_id,
-                local_name,
+                name,
                 members,
                 consented,
                 consenting,
@@ -290,6 +315,7 @@ impl NodeSnapshot {
                 equivocations,
                 read_by,
                 held,
+                notices,
             });
         }
         let mut trusted = Vec::new();
@@ -431,18 +457,18 @@ mod tests {
             rooms: vec![
                 RoomSnap {
                     channel_id: [2; 32],
-                    local_name: Some("ops".into()),
+                    name: Some("ops".into()),
                     open: true,
                 },
                 RoomSnap {
                     channel_id: [3; 32],
-                    local_name: None,
+                    name: None,
                     open: false,
                 },
             ],
             open: vec![OpenRoomSnap {
                 channel_id: [2; 32],
-                local_name: "ops".into(),
+                name: Some("ops".into()),
                 members: vec![[1; 32], [4; 32]],
                 consented: vec![[4; 32]],
                 consenting: vec![[4; 32]],
@@ -455,6 +481,7 @@ mod tests {
                 equivocations: vec![([4; 32], 7)],
                 read_by: vec![([5; 32], vec![[4; 32]])],
                 held: vec![([5; 32], 1)],
+                notices: Vec::new(),
             }],
             trusted: vec![([4; 32], "bob".into())],
             connected_peers: vec![[4; 32]],

@@ -281,15 +281,7 @@ impl Member {
     /// own, quoting the join and both daemons' logs (`logs`), never retried past.
     fn join(&self, link: &str, name: &str, logs: &dyn Fn() -> String) {
         let (ok, out, err) = self.vox(
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link,
-                "--name",
-                name,
-            ],
+            &["room", "join", "--passphrase-file", "-", link],
             Some(ROOM_PASS),
         );
         assert!(

@@ -305,7 +305,7 @@ impl Who {
 
     /// `vox room join <link>` left running: a stranger's join, which never finishes. What it says,
     /// if it does end, goes to `said`.
-    fn join_in_background(&self, link: &str, name: &str, said: Option<&Path>) -> Proc {
+    fn join_in_background(&self, link: &str, said: Option<&Path>) -> Proc {
         let to = || match said {
             Some(p) => Stdio::from(
                 std::fs::OpenOptions::new()
@@ -317,15 +317,7 @@ impl Who {
             None => Stdio::null(),
         };
         let mut child = self
-            .command(&[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link,
-                "--name",
-                name,
-            ])
+            .command(&["room", "join", "--passphrase-file", "-", link])
             .stdin(Stdio::piped())
             .stdout(to())
             .stderr(to())
@@ -724,9 +716,7 @@ fn alice_counts(s: &Staged) -> (usize, usize, String) {
 fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, case: &str) {
     let mut held: Vec<Proc> = holds
         .iter()
-        .map(|&(who, room)| {
-            s.strangers[who].join_in_background(&s.links[room], &format!("s{room}"), None)
-        })
+        .map(|&(who, room)| s.strangers[who].join_in_background(&s.links[room], None))
         .collect();
 
     let done = AtomicBool::new(false);
@@ -757,8 +747,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
                 }
                 let n = churned.fetch_add(1, Ordering::SeqCst);
                 let said = s.dir.join(format!("churn-{case}-{n}.out"));
-                let mut join =
-                    s.strangers[churner].join_in_background(&s.links[room], "churn", Some(&said));
+                let mut join = s.strangers[churner].join_in_background(&s.links[room], Some(&said));
                 let sent = Instant::now();
                 while join.0.try_wait().ok().flatten().is_none() && sent.elapsed() < ARRIVAL {
                     std::thread::sleep(Duration::from_millis(100));
@@ -812,15 +801,7 @@ fn run(s: &Staged, holds: &[(usize, usize)], churner: usize, churn_room: usize, 
 
         let t = Instant::now();
         let (ok, out, err) = s.carol.vox(
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &s.links[0],
-                "--name",
-                "real",
-            ],
+            &["room", "join", "--passphrase-file", "-", &s.links[0]],
             Some(ROOM_PASS),
         );
         let took = t.elapsed();
@@ -1028,26 +1009,12 @@ fn a_join_ended_for_another_is_told_the_member_is_busy() {
         .map(|room| s.dir.join(format!("held-{room}.out")))
         .collect();
     let mut held: Vec<Proc> = (0..SLOTS)
-        .map(|room| {
-            s.strangers[0].join_in_background(
-                &s.links[room],
-                &format!("s{room}"),
-                Some(&said[room]),
-            )
-        })
+        .map(|room| s.strangers[0].join_in_background(&s.links[room], Some(&said[room])))
         .collect();
     std::thread::sleep(HOLD_SETTLE);
     let t = Instant::now();
     let (ok, out, err) = s.carol.vox(
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &s.links[SLOTS],
-            "--name",
-            "real",
-        ],
+        &["room", "join", "--passphrase-file", "-", &s.links[SLOTS]],
         Some(ROOM_PASS),
     );
     let took = t.elapsed();
@@ -1167,7 +1134,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
         ],
     );
     let mut held: Vec<Proc> = (0..SLOTS)
-        .map(|room| s.strangers[0].join_in_background(&s.links[room], &format!("s{room}"), None))
+        .map(|room| s.strangers[0].join_in_background(&s.links[room], None))
         .collect();
     // The precondition, from the stranger's own daemon: all sixteen joins sent a solution, which
     // alice verified before answering, so all sixteen holds have done their work.
@@ -1212,15 +1179,7 @@ fn worked_holds(case: &str, how: (&'static str, String), said: &str) {
     let admitted = loop {
         let at = first_worked.elapsed();
         let (ok, out, err) = s.carol.vox(
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &s.links[SLOTS],
-                "--name",
-                "real",
-            ],
+            &["room", "join", "--passphrase-file", "-", &s.links[SLOTS]],
             Some(ROOM_PASS),
         );
         let said = format!("{out}{err}");

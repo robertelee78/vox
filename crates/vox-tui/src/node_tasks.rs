@@ -511,7 +511,7 @@ fn tend(
                             .channels
                             .iter()
                             .find(|c| c.channel_id == d.channel_id)
-                            .and_then(|c| c.local_name.clone())
+                            .and_then(|c| c.name.clone())
                             .unwrap_or_default();
                         crate::agent_hook::Owed {
                             room_label: label[..12.min(label.len())].to_owned(),

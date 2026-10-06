@@ -25,6 +25,11 @@
 //! 3. An unknown room and an unknown node are refused, and an alias already in use is refused, each with
 //!    a sentence saying which.
 //! 4. A node that is no longer trusted has no name.
+//! 7. **A room has one shared name** (ADR-028 R-1). alice joins with no name of her own and lists
+//!    each room under its creator's name; her rename of a room she is no admin of is refused;
+//!    bob's rename of family to *home* reaches her, `22.nas.home.vox` then reaches bob and
+//!    `22.nas.family.vox` leads nowhere. **Mutation:** a member keeps the name it heard at its
+//!    join over the log's (`ChannelState::name`), and alice still lists family.
 //!
 //! 5. **A service added to a running daemon is offered without a restart** (V030-06, #238). bob and
 //!    carol add theirs with `vox service add` while their daemons run; `vox service add` asks the
@@ -265,15 +270,7 @@ impl Member {
     fn join(&self, link: &str, local: &str, pass: &str) {
         let (ok, out, err) = vox(
             &self.dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link,
-                "--name",
-                local,
-            ],
+            &["room", "join", "--passphrase-file", "-", link],
             Some(&format!("{pass}\n")),
         );
         assert!(
@@ -649,6 +646,76 @@ fn a_local_name_reaches_the_node_it_names() {
         Err(2),
         "PRODUCT: carol is no longer trusted, so no name reaches her"
     );
+    // (7) **One shared name** (ADR-028 R-1). alice named neither room when she joined (a join
+    // takes no name): she lists each under the name its creator gave it. She is no admin of
+    // family, so her rename is refused; bob's reaches her, and the address follows it.
+    let (_, alice_rooms, _) = vox(&alice.dir, &["room", "list"], None);
+    let alice_renames = vox(&alice.dir, &["room", "rename", &family, "den"], None);
+    let bob_renames = vox(&bob.dir, &["room", "rename", &family, "home"], None);
+    let started = Instant::now();
+    let mut renamed = String::new();
+    while started.elapsed() < SETUP {
+        renamed = vox(&alice.dir, &["room", "list"], None).1;
+        if renamed
+            .lines()
+            .any(|l| l.starts_with(&family) && l.contains(" home"))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let home_bob = who_answers(proxy, "22.nas.home.vox");
+    let old_name = alice.forward("22.nas.family.vox");
+    eprintln!(
+        "alice's rooms: {alice_rooms:?}\nalice renames: {alice_renames:?}\nbob renames: \
+         {bob_renames:?}\nalice's rooms after {} ms: {renamed:?}\n22.nas.home.vox: {home_bob:?}\n\
+         22.nas.family.vox: {old_name:?}",
+        started.elapsed().as_millis()
+    );
+    assert!(
+        alice_rooms
+            .lines()
+            .any(|l| l.starts_with(&family) && l.contains(" family"))
+            && alice_rooms
+                .lines()
+                .any(|l| l.starts_with(&work) && l.contains(" work")),
+        "PRODUCT: alice, who named no room, does not list family and work under their creators' \
+         names: {alice_rooms:?}"
+    );
+    assert!(
+        !alice_renames.0
+            && alice_renames
+                .2
+                .contains("only the room's admin may change that"),
+        "PRODUCT: alice is no admin of family, and her rename must be refused saying so: \
+         {alice_renames:?}"
+    );
+    assert!(
+        bob_renames.0,
+        "PRODUCT: bob made family and must be able to rename it: {bob_renames:?}"
+    );
+    assert!(
+        renamed
+            .lines()
+            .any(|l| l.starts_with(&family) && l.contains(" home"))
+            && !renamed.contains(" family"),
+        "PRODUCT: bob renamed family to home, and alice still lists it as before after {} s: \
+         {renamed:?}",
+        SETUP.as_secs()
+    );
+    assert_eq!(
+        home_bob,
+        Ok("bob".into()),
+        "PRODUCT: after the rename 22.nas.home.vox does not reach bob's service"
+    );
+    assert!(
+        !old_name.0
+            && old_name
+                .1
+                .contains("no room on this machine is called `family`"),
+        "PRODUCT: the room's old name must lead nowhere once it is renamed: {old_name:?}"
+    );
+
     // (5) No daemon was restarted: bob's and carol's are the processes that ran when their
     // services were added, and still run.
     assert_eq!(

@@ -50,6 +50,15 @@ pub struct MemberView {
     pub trust: Trust,
 }
 
+/// One line the timeline tells about the room, not a message (ADR-028 E-5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoticeView {
+    /// When, seconds since the Unix epoch, as a message's `timestamp` is.
+    pub timestamp: u64,
+    /// The whole line: `ann renamed the room to family`.
+    pub text: String,
+}
+
 /// A timeline entry as surfaced to the UI. Carries decrypted display text only when
 /// the entry is render-gated *to you*; otherwise an honest non-leaking marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,8 +118,8 @@ pub struct ChannelSummary {
     pub open: bool,
     /// The channelID (`SHA-256(genesis)`).
     pub channel_id: Digest32,
-    /// The local, user-assigned channel name.
-    pub local_name: String,
+    /// The room's shared name (ADR-028 R-1), or its short id while it has none or is closed.
+    pub name: String,
     /// Unread messages addressed to this node (their `to` names it): the first level (ADR-028
     /// R-8, #484).
     pub to_you: usize,
@@ -130,8 +139,11 @@ pub struct ChannelSummary {
 pub struct ChannelView {
     /// The channelID.
     pub channel_id: Digest32,
-    /// The local channel name.
-    pub local_name: String,
+    /// The room's shared name (ADR-028 R-1), or its short id while it has none.
+    pub name: String,
+    /// What a person is told happened to the room, in its order, each with who did it, by
+    /// this node's name for them: `ann renamed the room to family` (ADR-028 E-5).
+    pub notices: Vec<NoticeView>,
     /// The members, in display order.
     pub members: Vec<MemberView>,
     /// The render-gated timeline, oldest-first. Shared with the core, which adds a new
@@ -473,22 +485,29 @@ pub enum Command {
         /// The channel now on screen, if any.
         channel_id: Option<Digest32>,
     },
-    /// Create a channel with a local name and an out-of-band passphrase.
+    /// Create a room under its shared name (ADR-028 R-1) with an out-of-band passphrase.
     CreateChannel {
-        /// The local name for the new channel.
-        local_name: String,
+        /// The room's name, one DNS label.
+        name: String,
         /// The channel passphrase (out-of-band; redacted/zeroized).
         passphrase: SecretString,
     },
     /// Join a channel from a `vox://` invite link plus the passphrase, which travels
     /// out of band and is deliberately **not** in the link (ADR-016).
     Join {
-        /// The local name to give the joined channel.
-        local_name: String,
         /// The `vox://` invite link.
         link: String,
         /// The channel passphrase (out-of-band; redacted/zeroized).
         passphrase: SecretString,
+    },
+    /// Name a room for every member (ADR-028 R-1); its creator or an admin only.
+    RenameRoom {
+        /// The room.
+        channel_id: Digest32,
+        /// The new name, one DNS label.
+        name: String,
+        /// The identity passphrase, as `vox room rename` asks for it (redacted/zeroized).
+        identity_passphrase: SecretString,
     },
     /// Ask for a `vox://` invite link for a channel this node holds open. The link
     /// comes back as a notice; it carries no secret.

@@ -362,7 +362,7 @@ try:
     link = ok("d", "room", "link", room).strip()
     if "10.77.0.2" not in link:
         raise Apparatus(f"D's invite link does not name A (10.77.0.2), so P would not dial it there: {link}")
-    ok("p", "room", "join", "--passphrase-file", "-", link, "--name", "r", stdin="room pass\n", secs=490)
+    ok("p", "room", "join", "--passphrase-file", "-", link, stdin="room pass\n", secs=490)
     ok("d", "trust", "add", fp["p"], "--name", "p", "--identity-passphrase-file", f"{S}/idpass")
     ok("p", "trust", "add", fp["d"], "--name", "d", "--identity-passphrase-file", f"{S}/idpass")
     ok("d", "room", "post", room, "BEFORE-THE-MOVE")

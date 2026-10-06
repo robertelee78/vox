@@ -245,15 +245,7 @@ fn retrust(freeze: Duration, through_log: bool) {
     for d in [bob_dir, carol_dir] {
         let (ok, _, err) = vox(
             d,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link.trim(),
-                "--name",
-                "late",
-            ],
+            &["room", "join", "--passphrase-file", "-", link.trim()],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "PRODUCT (staging): a join failed: {err}");

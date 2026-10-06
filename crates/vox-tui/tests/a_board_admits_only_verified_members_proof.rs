@@ -387,15 +387,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         let d = daemon(name, dir, 0, &spec, &pass_file);
         let (ok, out, err) = vox_in(
             dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "team",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             ROOM_PASS,
         );
         assert!(

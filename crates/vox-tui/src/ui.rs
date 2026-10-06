@@ -21,7 +21,9 @@ use vox_core::hash::Digest32;
 
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
 use crate::theme;
-use crate::viewmodel::{MemberView, MessageView, Reachability, SyncStatus, Trust, ViewModel};
+use crate::viewmodel::{
+    MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
+};
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
 pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
@@ -249,7 +251,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         let closed = if c.open { "" } else { " (closed)" };
         let (reach, reach_style) = reachability_label(c.reachability);
         items.push(ListItem::new(Line::from(vec![
-            Span::raw(format!("{marker}{}{closed}{unread}  [", c.local_name)),
+            Span::raw(format!("{marker}{}{closed}{unread}  [", c.name)),
             Span::styled(reach, reach_style),
             Span::raw("]"),
         ])));
@@ -364,6 +366,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         body[0],
         &channel.held_back,
         channel.timeline.as_slice(),
+        &channel.notices,
         ui.timeline_scroll,
         focused(ui, Focus::Timeline),
     );
@@ -409,6 +412,7 @@ fn render_timeline(
     area: Rect,
     held_back: &[String],
     timeline: &[MessageView],
+    room_notices: &[NoticeView],
     scroll: usize,
     focus: bool,
 ) -> (usize, Vec<Digest32>) {
@@ -419,70 +423,61 @@ fn render_timeline(
             theme::strong(theme::DANGER),
         ))
     });
-    // Built newest first and only as far back as the window reaches (V210-120): every frame built
-    // a line for every message the room had ever held, so a long room cost each frame its history.
-    let lines = timeline
-        .iter()
-        .rev()
-        .flat_map(|m| {
-            // Characters a reader cannot see are shown as escapes (#331).
-            let body = m.body.as_deref().map_or_else(
-                || UNDECRYPTABLE_MARKER.to_owned(),
-                |b| vox_agentcomms::envelope::reveal_keeping(b, |c| c == '\n' || c == '\t'),
-            );
-            let mut spans = Vec::with_capacity(3);
-            if m.late {
-                // In its true place, above rows already read: say so, or it goes unseen.
-                spans.push(Span::styled(
-                    LATE_MARKER,
-                    Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
-                ));
-            }
-            spans.push(Span::styled(
-                if m.addressed.is_empty() {
-                    format!("{}: ", m.author_nick)
-                } else {
-                    format!("{} {}: ", m.author_nick, m.addressed)
-                },
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(body));
-            // Under a message it sent, who has read it, or where it is while nobody is known to
-            // have (ADR-028 R-6). Lines run newest first here, so it goes before the message's own.
-            let under = if m.read_by.is_empty() {
-                m.whereabouts.clone()
-            } else {
-                format!("{READ_BY}{}", m.read_by)
-            };
-            let read_by = (!under.is_empty()).then(|| {
-                Line::from(Span::styled(
-                    format!("  {under}"),
-                    Style::default().add_modifier(Modifier::DIM),
-                ))
-            });
-            read_by
-                .into_iter()
-                .chain(std::iter::once(Line::from(spans)))
-                .map(move |l| (Some(m.entry_hash), l))
-        })
-        .chain(notices.rev().map(|l| (None, l)));
+    // What happened to the room, one line each among the messages by time (ADR-028 E-5): `ann
+    // renamed the room to family`. Never a message: no author, nothing to reply to.
+    let notice_line = |n: &NoticeView| {
+        Line::from(Span::styled(
+            format!("· {}", n.text),
+            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ))
+    };
+    let mut said = room_notices.iter().rev().peekable();
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
     // are wrapped here, not by the widget, so the count the window is taken from is the count
-    // drawn; only as many as the window reaches back are.
+    // drawn. Built newest first and only as far back as the window reaches (V210-120): every
+    // frame built a line for every message the room had ever held, so a long room cost each
+    // frame its history.
     let width = usize::from(area.width.saturating_sub(2)).max(1);
     let height = usize::from(area.height.saturating_sub(2));
     let want = height.saturating_add(scroll);
     let mut rows: Vec<Line> = Vec::new();
     // Which message each row belongs to, so the frame can say which messages it showed.
     let mut owners: Vec<Option<Digest32>> = Vec::new();
-    for (owner, l) in lines {
+    let mut push = |rows: &mut Vec<Line<'static>>, owner: Option<Digest32>, l: Line<'static>| {
         for row in wrap(l, width).into_iter().rev() {
             rows.push(row);
             owners.push(owner);
         }
+    };
+    let mut reached_oldest = true;
+    for m in timeline.iter().rev() {
         if rows.len() >= want {
+            reached_oldest = false;
             break;
+        }
+        while let Some(n) = said.next_if(|n| n.timestamp > m.timestamp) {
+            push(&mut rows, None, notice_line(n));
+        }
+        // Under a message it sent, who has read it, or where it is while nobody is known to
+        // have (ADR-028 R-6). Rows run newest first here, so it goes before the message's own.
+        let under = if m.read_by.is_empty() {
+            m.whereabouts.clone()
+        } else {
+            format!("{READ_BY}{}", m.read_by)
+        };
+        if !under.is_empty() {
+            let l = Line::from(Span::styled(
+                format!("  {under}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            push(&mut rows, Some(m.entry_hash), l);
+        }
+        push(&mut rows, Some(m.entry_hash), message_line(m));
+    }
+    if reached_oldest {
+        for l in said.map(notice_line).chain(notices.rev()) {
+            push(&mut rows, None, l);
         }
     }
     rows.reverse();
@@ -503,6 +498,33 @@ fn render_timeline(
     let p = Paragraph::new(shown).block(pane_block(title, focus));
     frame.render_widget(p, area);
     (scroll, on_screen)
+}
+
+/// One message as the timeline draws it: who, to whom, and what it says.
+fn message_line(m: &MessageView) -> Line<'static> {
+    // Characters a reader cannot see are shown as escapes (#331).
+    let body = m.body.as_deref().map_or_else(
+        || UNDECRYPTABLE_MARKER.to_owned(),
+        |b| vox_agentcomms::envelope::reveal_keeping(b, |c| c == '\n' || c == '\t'),
+    );
+    let mut spans = Vec::with_capacity(3);
+    if m.late {
+        // In its true place, above rows already read: say so, or it goes unseen.
+        spans.push(Span::styled(
+            LATE_MARKER,
+            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ));
+    }
+    spans.push(Span::styled(
+        if m.addressed.is_empty() {
+            format!("{}: ", m.author_nick)
+        } else {
+            format!("{} {}: ", m.author_nick, m.addressed)
+        },
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(body));
+    Line::from(spans)
 }
 
 /// `line` broken into rows of at most `width` display columns, its styles kept.

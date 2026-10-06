@@ -299,15 +299,7 @@ fn an_equivocation_is_caught_said_held_back_and_kept() {
     for (name, d) in &members[1..] {
         let (ok, out, err) = vox_in(
             d,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link.trim(),
-                "--name",
-                "eq",
-            ],
+            &["room", "join", "--passphrase-file", "-", link.trim()],
             "room pass",
         );
         assert!(ok, "PRODUCT (staging): {name}'s join failed: {out}{err}");

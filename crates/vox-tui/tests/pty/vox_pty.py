@@ -23,7 +23,7 @@ SIGKILL, then `waitpid(pid, 0)` without reading the pty: the TUI waited for the 
 the driver waited for the TUI to exit, for ever. Any output the TUI drew after the driver's last
 read was enough.
 """
-import faulthandler, fcntl, os, select, signal, struct, sys, termios, time
+import faulthandler, fcntl, os, re, select, signal, struct, sys, termios, time
 
 PY = os.environ.get("VOX_PYTE_PATH", "")  # where `pyte` is importable from, if not installed
 if PY:
@@ -131,6 +131,17 @@ def reap(pid, secs, drain=None):
         time.sleep(0.05)
 
 
+class Gone(Exception):
+    """The TUI ended while the driver still drove it. `signal` is the signal that ended it (None
+    when it exited); `code` its exit status (None when a signal ended it); `tail` the last it
+    wrote, a panic message included, since its stderr is the pty."""
+
+    def __init__(self, what, signal_, code, tail):
+        self.signal, self.code, self.tail = signal_, code, tail
+        how = f"killed by signal {signal_}" if signal_ is not None else f"exited with status {code}"
+        super().__init__(f"{what}: the TUI is gone, {how}; the last it wrote: {tail!r}")
+
+
 class Tui:
     """`vox tui` in a pty of `cols`x`rows`, its screen read through pyte."""
 
@@ -179,8 +190,38 @@ class Tui:
             self.stream.feed(data)
 
     def key(self, s, wait=1.0):
-        os.write(self.fd, s.encode())
+        if self.closed:
+            raise self.gone(f"before typing {s!r}")
+        try:
+            os.write(self.fd, s.encode())
+        except OSError as e:
+            raise self.gone(f"typing {s!r} failed ({e})")
         self.pump(wait)
+
+    def gone(self, what):
+        """A `Gone` for a TUI that has ended: how it ended (waited for at most 5 s, reading its
+        pty meanwhile) and the last of what it wrote, escapes removed."""
+        st = {}
+
+        def ended():
+            self.pump(0.05)
+            try:
+                done, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return True
+            if done:
+                st["status"] = status
+            return bool(done)
+
+        end = time.time() + 5
+        while not ended() and time.time() < end:
+            pass
+        status = st.get("status")
+        sig = os.WTERMSIG(status) if status is not None and os.WIFSIGNALED(status) else None
+        code = os.WEXITSTATUS(status) if status is not None and os.WIFEXITED(status) else None
+        text = bytes(self.raw[-4000:]).decode("utf-8", "replace")
+        text = re.sub(r"\x1b(\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*\x07|[()][0-9A-B]|[=>78])", "", text)
+        return Gone(what, sig, code, " ".join(text.split())[-600:])
 
     def display(self):
         return self.screen.display

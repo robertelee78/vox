@@ -144,19 +144,11 @@ fn flood_batch(
     })
 }
 
-fn join(dir: &std::path::Path, link: &str, name: &str) -> (bool, Duration, String) {
+fn join(dir: &std::path::Path, link: &str) -> (bool, Duration, String) {
     let t0 = Instant::now();
     let (ok, out, err) = vox_in(
         dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            link,
-            "--name",
-            name,
-        ],
+        &["room", "join", "--passphrase-file", "-", link],
         ROOM_PASS,
     );
     (ok, t0.elapsed(), format!("{out}{err}"))
@@ -308,9 +300,9 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
 
     // ---- 3. real joins, through the flooded nodes ------------------------------------------
     let _joiner = daemon("joiner", &joiner_dir, 0, &spec, &pass_file);
-    let (ok1, took1, said1) = join(&joiner_dir, &link, "first");
+    let (ok1, took1, said1) = join(&joiner_dir, &link);
     println!("[proof] join of the flooded room: ok={ok1} in {took1:?}");
-    let (ok2, took2, said2) = join(&joiner_dir, &second_link, "second");
+    let (ok2, took2, said2) = join(&joiner_dir, &second_link);
     println!("[proof] join of the room created after the genesis flood: ok={ok2} in {took2:?}");
     let _ = room;
     assert!(

@@ -338,6 +338,8 @@ const T_END: u64 = 32;
 const T_IDLE_END: u64 = 33;
 const T_SET_ADMIN: u64 = 34;
 const T_ADMINS: u64 = 35;
+/// `[36, channel_id, name, identity_passphrase]` — [`Request::RenameRoom`] (ADR-028 R-1).
+const T_RENAME_ROOM: u64 = 36;
 /// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
 const T_ROOM_ENDED: u64 = 2440;
 const T_ROOM_REMOVED: u64 = 2441;
@@ -496,15 +498,13 @@ pub enum Request {
     Join {
         /// The `vox://` address.
         link: String,
-        /// A local name for the room; never leaves this device.
-        local_name: String,
         /// The room's passphrase, which the link does not carry.
         passphrase: zeroize::Zeroizing<String>,
     },
     /// Create a room on this node.
     Create {
-        /// A local name for the room; never leaves this device.
-        local_name: String,
+        /// The room's shared name, one DNS label (ADR-028 R-1, R-2).
+        name: String,
         /// The room's passphrase.
         passphrase: zeroize::Zeroizing<String>,
     },
@@ -557,6 +557,16 @@ pub enum Request {
         channel_id: Digest32,
         /// Seconds a message body is kept; `0` keeps it forever.
         ttl: u64,
+        /// The identity passphrase, proving this is the operator and not an agent.
+        identity_passphrase: zeroize::Zeroizing<String>,
+    },
+    /// Name a room for every member (ADR-028 R-1); its creator or an admin only. Requires the
+    /// identity passphrase, as [`Request::SetRetention`] does: it changes what every member sees.
+    RenameRoom {
+        /// The room.
+        channel_id: Digest32,
+        /// The new name, one DNS label.
+        name: String,
         /// The identity passphrase, proving this is the operator and not an agent.
         identity_passphrase: zeroize::Zeroizing<String>,
     },
@@ -844,22 +854,22 @@ impl Request {
             Request::StopForward { local } => {
                 e.array(2).uint(T_STOP_FORWARD).text(local);
             }
-            Request::Join {
-                link,
-                local_name,
-                passphrase,
+            Request::Join { link, passphrase } => {
+                e.array(3).uint(T_JOIN).text(link).text(passphrase);
+            }
+            Request::Create { name, passphrase } => {
+                e.array(3).uint(T_CREATE).text(name).text(passphrase);
+            }
+            Request::RenameRoom {
+                channel_id,
+                name,
+                identity_passphrase,
             } => {
                 e.array(4)
-                    .uint(T_JOIN)
-                    .text(link)
-                    .text(local_name)
-                    .text(passphrase);
-            }
-            Request::Create {
-                local_name,
-                passphrase,
-            } => {
-                e.array(3).uint(T_CREATE).text(local_name).text(passphrase);
+                    .uint(T_RENAME_ROOM)
+                    .bytes(channel_id)
+                    .text(name)
+                    .text(identity_passphrase);
             }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
@@ -1177,6 +1187,18 @@ impl Request {
                     identity_passphrase,
                 })
             }
+            (T_RENAME_ROOM, 4) => {
+                let channel_id = digest(&mut d)?;
+                let name = text(&mut d, "ipc room name")?;
+                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
+                Ok(Request::RenameRoom {
+                    channel_id,
+                    name,
+                    identity_passphrase,
+                })
+            }
             (T_RETENTION, 4) => {
                 let channel_id = digest(&mut d)?;
                 let ttl = d.uint().map_err(|_| Error::MalformedBundle("ipc ttl"))?;
@@ -1297,27 +1319,19 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::StopForward { local })
             }
-            (T_JOIN, 4) => {
+            (T_JOIN, 3) => {
                 let link = text(&mut d, "ipc join link")?;
-                let local_name = text(&mut d, "ipc join name")?;
                 let passphrase = secret_text(&mut d, "ipc join passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Join {
-                    link,
-                    local_name,
-                    passphrase,
-                })
+                Ok(Request::Join { link, passphrase })
             }
             (T_CREATE, 3) => {
-                let local_name = text(&mut d, "ipc create name")?;
+                let name = text(&mut d, "ipc create name")?;
                 let passphrase = secret_text(&mut d, "ipc create passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Create {
-                    local_name,
-                    passphrase,
-                })
+                Ok(Request::Create { name, passphrase })
             }
             (T_INVITE, 2) => {
                 let channel_id = digest(&mut d)?;
@@ -3502,6 +3516,22 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
+        Request::RenameRoom {
+            channel_id,
+            name,
+            identity_passphrase,
+        } => match verify_operator(handle, identity_passphrase).await {
+            Err(f) => f,
+            Ok(()) => match handle
+                .apply(crate::node::api::NodeCommand::RenameRoom { channel_id, name })
+                .await
+            {
+                crate::node::api::Outcome::Done => Frame::Ok,
+                other => Frame::Error {
+                    reason: other.to_string(),
+                },
+            },
+        },
         Request::SetRetention {
             channel_id,
             ttl,
@@ -3883,7 +3913,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
             Some(detail) => Frame::Services {
-                room: detail.local_name.clone(),
+                room: crate::node::resolver::room_shown(detail.name.as_deref(), &channel_id),
                 services: detail
                     .services
                     .iter()
@@ -4081,7 +4111,6 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         Request::Join {
             link,
-            local_name,
             mut passphrase,
         } => {
             // Subscribe before asking: a failed join's steps and responders' reasons are raised
@@ -4091,7 +4120,6 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             match handle
                 .apply(crate::node::api::NodeCommand::JoinChannel {
                     link,
-                    local_name,
                     passphrase: crate::node::api::Secret::new(
                         std::mem::take(&mut *passphrase).into_bytes(),
                     ),
@@ -4142,11 +4170,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             }
         }
         Request::Create {
-            local_name,
+            name,
             mut passphrase,
         } => match handle
             .apply(crate::node::api::NodeCommand::CreateChannel {
-                local_name,
+                name,
                 passphrase: crate::node::api::Secret::new(
                     std::mem::take(&mut *passphrase).into_bytes(),
                 ),
@@ -4319,7 +4347,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 .map(|c| {
                     (
                         c.channel_id,
-                        c.local_name.clone().unwrap_or_default(),
+                        c.name.clone().unwrap_or_default(),
                         c.open,
                         c.over.clone().unwrap_or_default(),
                     )

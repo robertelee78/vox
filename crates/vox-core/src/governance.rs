@@ -34,6 +34,8 @@
 //! - [`policy`] — policy-update (`0x0006`, kind = policy-update): the room's retention
 //!   (TTL) only. The rotation kind under the same tag, a passphrase-rotation / epoch
 //!   bump no command ever wrote, is reserved and refused (V030-32).
+//! - [`name`] — room name (`0x001F`): the room's one shared name (ADR-028 R-1), set by the
+//!   creator or an admin.
 //!
 //! ## The deterministic evaluator (the release-gated core)
 //! - [`entry`] — the evaluator-ready [`entry::GovEntry`]: a decoded body plus its
@@ -86,6 +88,7 @@ pub mod evaluator;
 pub mod genesis;
 pub mod lifecycle;
 pub mod membership;
+pub mod name;
 pub mod policy;
 pub mod presence;
 pub mod share;

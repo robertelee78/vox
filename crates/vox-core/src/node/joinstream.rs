@@ -221,6 +221,10 @@ pub enum JoinFrame {
     Accepted {
         /// `JoinWitness::body_bytes` — the witness, signed by the responder.
         witness: Vec<u8>,
+        /// The room's shared name as the responder holds it (ADR-028 R-1), empty when it holds
+        /// none. Said only after the passphrase is proved, so a link alone does not tell it. The
+        /// joiner uses it until the room's log, which is what decides the name, reaches it.
+        name: String,
     },
     /// The join was refused.
     Rejected(JoinReject),
@@ -316,8 +320,8 @@ impl JoinFrame {
             Self::Init { message } => {
                 e.array(2).uint(OP_INIT).bytes(message);
             }
-            Self::Accepted { witness } => {
-                e.array(2).uint(OP_ACCEPTED).bytes(witness);
+            Self::Accepted { witness, name } => {
+                e.array(3).uint(OP_ACCEPTED).bytes(witness).text(name);
             }
             Self::Open { sealed } => {
                 e.array(2).uint(OP_OPEN).bytes(sealed);
@@ -389,8 +393,9 @@ impl JoinFrame {
             (OP_INIT, 2) => Self::Init {
                 message: d.bytes()?.to_vec(),
             },
-            (OP_ACCEPTED, 2) => Self::Accepted {
+            (OP_ACCEPTED, 3) => Self::Accepted {
                 witness: d.bytes()?.to_vec(),
+                name: d.text()?.to_owned(),
             },
             (OP_OPEN, 2) => Self::Open {
                 sealed: d.bytes()?.to_vec(),
@@ -567,6 +572,9 @@ pub struct JoinOutcome {
     /// `true` when the one-time prekey had already been consumed (the session's
     /// forward-secrecy bonus is downgraded, never its confidentiality).
     pub last_resort_grade: bool,
+    /// On the **joiner**, the room's shared name as the responder said it (ADR-028 R-1), if it is
+    /// a room name at all; `None` on the responder, and when the responder holds none.
+    pub room_name: Option<String>,
     /// How long **this side** spent solving the proof of work: the joiner's own CPU, on its own
     /// machine, and random in length by design (ADR-005). Zero on the responder. Said apart from
     /// the rest of the exchange, so a slow join shows whether it waited on the responder or on
@@ -796,8 +804,14 @@ pub async fn run_initiator(
     .await?;
 
     // 7. ACCEPTED, carrying the responder's witness to this join (M17.6).
-    let witness = match recv_frame(&mut recv).await? {
-        JoinFrame::Accepted { witness } => JoinWitness::from_body(&witness)?,
+    let (witness, room_name) = match recv_frame(&mut recv).await? {
+        JoinFrame::Accepted { witness, name } => (
+            JoinWitness::from_body(&witness)?,
+            // Only a name that is one: anything else is not shown, and the log decides anyway.
+            crate::governance::name::room_name(&name)
+                .ok()
+                .filter(|n| *n == name),
+        ),
         JoinFrame::Rejected(r) => return Err(rejected(r)),
         JoinFrame::Full { members } => return Err(Error::RoomFull { members }),
         JoinFrame::Taken => return Err(Error::SeatTaken),
@@ -827,6 +841,7 @@ pub async fn run_initiator(
         peer,
         witness,
         last_resort_grade: false,
+        room_name,
         solved_in,
     })
 }
@@ -896,7 +911,8 @@ pub async fn refuse_join_as(mut send: SendStream, reason: JoinReject) {
 /// acceptance frame goes out**, and awaited. That ordering is the whole reason it exists. An
 /// `Err` is an admission that did not happen: the joiner is refused instead of accepted —
 /// [`JoinFrame::Full`] for a room already full, [`JoinReject::NotAdmitted`] otherwise, never the
-/// refusal a wrong passphrase gets — and the exchange returns that error.
+/// refusal a wrong passphrase gets — and the exchange returns that error. An `Ok` carries the
+/// room's shared name, which the acceptance tells the joiner (ADR-028 R-1).
 ///
 /// The joiner treats `Accepted` as "I am in", and the very next thing it does is publish its
 /// records to this node's board. Those records are refused unless this node has already admitted
@@ -923,7 +939,7 @@ pub async fn run_responder<F, Fut>(
 ) -> Result<JoinOutcome>
 where
     F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: std::future::Future<Output = Result<Option<String>>>,
 {
     let exchange = responder_exchange(&mut send, &mut recv, peer_fp, cfg, store, ring);
     // **Ended for a newcomer, and told so** (V210-92). The slot this exchange holds can be given
@@ -943,20 +959,23 @@ where
             // is in only if it was: an admission that failed was dropped here, so a joiner the
             // room could not take (it was full) heard `Accepted`, exited 0, and was a member of
             // nothing.
-            if let Err(e) = admit_before_accepting(outcome.peer.identity.clone()).await {
-                let refusal = match e {
-                    Error::RoomFull { members } => JoinFrame::Full { members },
-                    Error::SeatTaken => JoinFrame::Taken,
-                    Error::SeatNotAgreed { member, unanswered } => {
-                        JoinFrame::NotAgreed { member, unanswered }
-                    }
-                    // The passphrase was accepted: never the refusal that reads as a wrong one.
-                    _ => JoinFrame::Rejected(JoinReject::NotAdmitted),
-                };
-                let _ = send_frame(&mut send, &refusal).await;
-                let _ = send.finish();
-                return Err(e);
-            }
+            let name = match admit_before_accepting(outcome.peer.identity.clone()).await {
+                Ok(name) => name,
+                Err(e) => {
+                    let refusal = match e {
+                        Error::RoomFull { members } => JoinFrame::Full { members },
+                        Error::SeatTaken => JoinFrame::Taken,
+                        Error::SeatNotAgreed { member, unanswered } => {
+                            JoinFrame::NotAgreed { member, unanswered }
+                        }
+                        // The passphrase was accepted: never the refusal that reads as a wrong one.
+                        _ => JoinFrame::Rejected(JoinReject::NotAdmitted),
+                    };
+                    let _ = send_frame(&mut send, &refusal).await;
+                    let _ = send.finish();
+                    return Err(e);
+                }
+            };
             // The witness `responder_exchange` minted beside the verification that
             // justifies it. The joiner keeps it: it is what makes that key admissible
             // to anyone else (M17.6).
@@ -964,6 +983,7 @@ where
                 &mut send,
                 &JoinFrame::Accepted {
                     witness: outcome.witness.body_bytes(),
+                    name: name.unwrap_or_default(),
                 },
             )
             .await?;
@@ -1173,6 +1193,7 @@ async fn responder_after_work(
         peer,
         witness,
         last_resort_grade,
+        room_name: None,
         solved_in: std::time::Duration::ZERO,
     })
 }

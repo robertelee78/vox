@@ -129,7 +129,7 @@ try:
     room = run("alice", "room", "list").stdout.split()[0]
     link = run("alice", "room", "link", room).stdout.strip()
     for w in ("bob", "carol"):
-        j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")
+        j = run(w, "room", "join", "--passphrase-file", "-", link, stdin="room pass")
         if j.returncode != 0: staging(f"{w}'s `vox room join` failed: {j.stderr.strip()}")
     stage("each node's own names")
     trust("alice", "bob", "bob")

@@ -432,15 +432,7 @@ impl Member {
     pub fn join(&self, link: &str, name: &str) {
         let t0 = Instant::now();
         let (ok, out, err) = self.vox(
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link,
-                "--name",
-                name,
-            ],
+            &["room", "join", "--passphrase-file", "-", link],
             Some(ROOM_PASS),
         );
         assert!(

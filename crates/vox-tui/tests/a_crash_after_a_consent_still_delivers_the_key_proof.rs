@@ -348,15 +348,7 @@ fn a_crash_at_any_point_of_a_consent_still_delivers_the_key() {
         let bob_port = listening_port(&bob);
         let (ok, _, err) = vox(
             &bob,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "r",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "PRODUCT (staging): bob{k} could not join: {err}");
@@ -646,15 +638,7 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
         let join = |dir: &Path| {
             vox(
                 dir,
-                &[
-                    "room",
-                    "join",
-                    "--passphrase-file",
-                    "-",
-                    &link,
-                    "--name",
-                    &format!("h{k}"),
-                ],
+                &["room", "join", "--passphrase-file", "-", &link],
                 Some(&format!("{ROOMPASS}\n")),
             )
         };

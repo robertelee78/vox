@@ -288,15 +288,7 @@ fn posts_until_read(
 fn join(m: &Member, link: &str, name: &str) {
     let joined = (1..=6).any(|attempt| {
         let (ok, o, e) = m.vox(
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                link,
-                "--name",
-                name,
-            ],
+            &["room", "join", "--passphrase-file", "-", link],
             Some(&format!("{ROOM_PASS}\n")),
         );
         if !ok {

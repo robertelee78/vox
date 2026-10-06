@@ -159,7 +159,7 @@ them explicitly — a command that needs one and cannot get it fails at once and
 
 ```
 vox daemon --passphrase-file ~/.config/vox/id.pass      # or VOX_IDENTITY_PASSPHRASE
-echo "$ROOM_PASS" | vox room join --passphrase-file - vox://… --name family
+echo "$ROOM_PASS" | vox room join --passphrase-file - vox://…
 ```
 
 A passphrase is never taken from the command line, where `ps` would show it.

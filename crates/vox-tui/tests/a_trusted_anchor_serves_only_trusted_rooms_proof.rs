@@ -142,15 +142,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         let d = daemon(name, dir, 0, &spec, &pass_file);
         let (ok, out, err) = vox_in(
             dir,
-            &[
-                "room",
-                "join",
-                "--passphrase-file",
-                "-",
-                &link,
-                "--name",
-                "team",
-            ],
+            &["room", "join", "--passphrase-file", "-", &link],
             ROOM_PASS,
         );
         println!("[proof] {name} joins the trusted creator's room: ok={ok}");

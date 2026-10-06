@@ -80,13 +80,14 @@ Keep a room member online for the join. If both hosts cannot reach each other di
 The other person runs this, replacing `ROOM_LINK` with the complete link received, in quotes:
 
 ```sh
-vox room join 'ROOM_LINK' --name family
+vox room join 'ROOM_LINK'
 vox room list
 ```
 
 Enter the **room** passphrase at its prompt. Success prints `vox: joined family`. Joining keeps
 the room on this node; it does not give either person permission to read the other's messages.
-The name `family` is local: the two people may choose different names for the same room.
+The name `family` is the room's own, the same for both people: the joiner does not choose one.
+The room's creator, or an admin it named, can change it with `vox room rename`.
 
 Both people can inspect membership:
 
