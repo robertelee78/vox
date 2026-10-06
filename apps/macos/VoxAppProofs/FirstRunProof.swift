@@ -694,19 +694,40 @@ final class FirstRunProof: XCTestCase {
         let noteField = Key.id("attach-note")
         type(ui, noteField, "FOR-BOB-NOTE", "the note field")
         tap(ui, Key.id("attach-send"), "Send")
-        let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(room)/for-bob.bin")
-        var pulledBytes: Data?
-        let pullUntil = Date().addingTimeInterval(120)
-        while Date() < pullUntil && pulledBytes == nil {
-            pulledBytes = try? Data(contentsOf: bobCopy)
-            if pulledBytes == nil { Thread.sleep(forTimeInterval: 0.5) }
+        // Premise: the share reached the room, as bob's own node reads it (the app's send is the
+        // product's; a room that never carries it is the product's red too, said as that).
+        var bobRows: [Substring] = []
+        let sharedUntil = Date().addingTimeInterval(60)
+        while Date() < sharedUntil && bobRows.isEmpty {
+            bobRows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+                .split(separator: "\n").filter { $0.contains("FOR-BOB-NOTE") }
+            if bobRows.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
         }
-        XCTAssertEqual(pulledBytes, bytes,
-                       "PRODUCT: a file attached To: bob must be pulled by bob's node, byte for byte, into \(bobCopy.path); it holds \(pulledBytes?.count ?? -1) bytes")
-        let bobRows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
-            .split(separator: "\n").filter { $0.contains("FOR-BOB-NOTE") }
+        if bobRows.isEmpty {
+            let alices = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
+            XCTFail("PRODUCT: the file attached in the app, with its note FOR-BOB-NOTE, never reached the room as bob's node reads it in 60 s; alice's node reads: \(alices.suffix(1500))")
+        }
         XCTAssertTrue(bobRows.count == 1 && bobRows[0].contains("for-bob.bin"),
                       "PRODUCT: the note must travel in the share itself, as one message; bob's `vox room read --json` has \(bobRows.count) row(s) with it: \(bobRows)")
+        // Bob's copy, read outside the runner's sandbox (by the stager): its size and SHA-256
+        // against what was attached.
+        let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(room)/for-bob.bin")
+        let want = stager.run(["/usr/bin/shasum", "-a", "256", file.path], env: [:]).out
+            .split(separator: " ").first.map(String.init) ?? ""
+        guard !want.isEmpty else { throw Apparatus("the proof could not hash the file it attached, \(file.path)") }
+        var got = ""
+        let pullUntil = Date().addingTimeInterval(120)
+        while Date() < pullUntil && got != want {
+            got = stager.run(["/usr/bin/shasum", "-a", "256", bobCopy.path], env: [:]).out
+                .split(separator: " ").first.map(String.init) ?? ""
+            if got != want { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        if got != want {
+            let there = stager.run(["/bin/ls", "-lR", URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files").path], env: [:]).out
+            let pulls = run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out
+            XCTFail("PRODUCT: the file attached To: bob must be pulled by bob's node, byte for byte, into \(bobCopy.path) within 120 s; it holds \(got.isEmpty ? "nothing" : "sha256 \(got)"); bob's files: \(there.isEmpty ? "none" : there); bob's room read: \(pulls.suffix(1200))")
+        }
+        let pulledBytes: Data? = got == want ? bytes : nil
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
 
         // (7) Lanes. Working without a claim is not working.

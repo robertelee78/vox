@@ -154,7 +154,19 @@ fi
 TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 python3 scripts/app-proof-stager.py "$SCRATCH/stager.port" "$TOKEN" &
 STAGER=$!
-trap 'kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null; trap_unregister; rm -rf "$SCRATCH"' EXIT
+# A run that goes red keeps its scratch data root (the daemon's log, every node's files) for
+# reading the red; a green run removes it.
+finish() {
+    local status=$?
+    kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null
+    trap_unregister
+    if [ "$status" -ne 0 ]; then
+        echo "app-proofs: kept for reading the red: $SCRATCH" >&2
+    else
+        rm -rf "$SCRATCH"
+    fi
+}
+trap finish EXIT
 for _ in $(seq 1 100); do [ -s "$SCRATCH/stager.port" ] && break; sleep 0.1; done
 [ -s "$SCRATCH/stager.port" ] || {
     echo "app-proofs: APPARATUS: the stager did not start" >&2
