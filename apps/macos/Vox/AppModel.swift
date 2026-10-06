@@ -3,6 +3,9 @@
 import Foundation
 @MainActor
 final class AppModel: ObservableObject {
+    /// The one model: the app observes it, and its delegate starts it and quits it.
+    static let shared = AppModel()
+
     /// Where the app is, from launch to an attached node.
     enum Phase: Equatable {
         /// First run: whether to keep the daemon running while the person is logged in (M-8).

@@ -75,7 +75,7 @@ private struct Said: View {
 
 /// First run: whether the daemon keeps running while the person is logged in (ADR-014 M-8).
 private struct LoginItemQuestion: View {
-    let model: AppModel
+    @ObservedObject var model: AppModel
 
     var body: some View {
         Text("Keep Vox running while you're logged in?").font(Theme.heading)
@@ -99,7 +99,7 @@ private struct LoginItemQuestion: View {
 /// The login item waits for the person in System Settings; the app opens it and goes on.
 private struct LoginItemApproval: View {
     let said: String?
-    let model: AppModel
+    @ObservedObject var model: AppModel
 
     var body: some View {
         Text("Allow Vox in Login Items").font(Theme.heading)
@@ -122,7 +122,7 @@ private struct LoginItemApproval: View {
 /// First run: which node this app acts as (ADR-028 E-4).
 private struct Chooser: View {
     let nodes: [String]
-    let model: AppModel
+    @ObservedObject var model: AppModel
 
     var body: some View {
         Text("Which node is this app?").font(Theme.heading)
@@ -149,7 +149,7 @@ private struct Chooser: View {
 private struct PassphraseForm: View {
     let node: String
     let said: String?
-    let model: AppModel
+    @ObservedObject var model: AppModel
     @State private var field = SecureFieldHolder()
     /// ADR-028 K-10: off until the person turns it on, for this node.
     @State private var keepInKeychain = false

@@ -5,46 +5,40 @@
 // client holds it.
 
 import AppKit
-import Combine
 import SwiftUI
 
 @main
 struct VoxApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+    /// The app's model, the one the delegate starts and quits, observed here: the menu bar
+    /// extra's `isInserted` is read again when the person turns it on or off.
+    @StateObject private var model = AppModel.shared
 
     var body: some Scene {
         Window("Vox", id: "main") {
-            RootView(model: delegate.model)
+            RootView(model: model)
                 // The sidebar (260) and the inspector (240) leave the room 400 or more: room
                 // for the composer's field beside its To: and Urgent controls.
                 .frame(minWidth: 900, minHeight: 360)
                 // Dark is the one theme (ADR-028 L-2).
                 .preferredColorScheme(.dark)
         }
-        .commands { VoxCommands(app: delegate.model) }
+        .commands { VoxCommands(app: model) }
         // Off until the person turns it on (M-22).
         MenuBarExtra("Vox", systemImage: "bubble.left.and.bubble.right",
-                     isInserted: Binding(get: { delegate.model.menuBar },
-                                         set: { delegate.model.showMenuBar($0) })) {
-            MenuBarContent(app: delegate.model)
+                     isInserted: Binding(get: { model.menuBar },
+                                         set: { model.showMenuBar($0) })) {
+            MenuBarContent(app: model)
                 .preferredColorScheme(.dark)
         }
         .menuBarExtraStyle(.window)
     }
 }
 
-/// The app's lifecycle: start on launch, let go of the node on quit. Observed by the app, which
-/// reads the menu bar choice from it: a change of that choice is passed on, and nothing else.
+/// The app's lifecycle: start on launch, let go of the node on quit.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
-    let model = AppModel()
-    private var menuBarChanges: AnyCancellable?
-
-    override init() {
-        super.init()
-        menuBarChanges = model.$menuBar.removeDuplicates().dropFirst()
-            .sink { [weak self] _ in self?.objectWillChange.send() }
-    }
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var model: AppModel { AppModel.shared }
     /// SIGTERM, SIGHUP and SIGINT, each a clean quit (ADR-026 S-4).
     private var stops: [DispatchSourceSignal] = []
 
