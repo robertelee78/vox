@@ -48,8 +48,8 @@ The selector can be the announced name (`photos.tar` for a shared folder), a SHA
 service tag. If names collide, use the more specific identifier from the offer. Do not assume
 similarly named files from different authors are interchangeable.
 
-Without `--dir` or `--out`, Vox uses the node's configured downloads location, or
-`~/Downloads`. The sender's filename is made safe for local placement. In a destination
+Without `--dir` or `--out`, the file lands in the node's files directory for the room,
+`<data root>/nodes/<node>/files/<room id>/`, and `vox room get` prints its full path. The sender's filename is made safe for local placement. In a destination
 directory, an existing name causes a numbered alternative, such as `report (1).pdf`, rather
 than replacement.
 

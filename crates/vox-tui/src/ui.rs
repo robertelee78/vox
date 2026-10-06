@@ -34,6 +34,8 @@ pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 pub const LATE_MARKER: &str = "[late] ";
 /// What begins the line under a message this node sent that names who has read it (ADR-028 R-6).
 pub const READ_BY: &str = "read by ";
+/// What leads the list of who pulled a share whole (ADR-028 F-7).
+pub const PULLED_BY: &str = "pulled by ";
 
 /// The mark before the message selected in the timeline (ADR-028 R-9, #485).
 pub const SELECTED_MARKER: &str = "▶ ";
@@ -514,10 +516,16 @@ fn render_timeline(
         }
         // Under a message it sent, who has read it, or where it is while nobody is known to
         // have (ADR-028 R-6). Rows run newest first here, so it goes before the message's own.
-        let under = if m.read_by.is_empty() {
+        // `pulled by agent-2 · read by ann` (ADR-028 F-7).
+        let read = if m.read_by.is_empty() {
             m.whereabouts.clone()
         } else {
             format!("{READ_BY}{}", m.read_by)
+        };
+        let under = match (m.pulled_by.is_empty(), read.is_empty()) {
+            (true, _) => read,
+            (false, true) => format!("{PULLED_BY}{}", m.pulled_by),
+            (false, false) => format!("{PULLED_BY}{} \u{b7} {read}", m.pulled_by),
         };
         if !under.is_empty() {
             let l = Line::from(Span::styled(

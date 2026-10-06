@@ -24,7 +24,8 @@
 //! `vox share` runs (red: bob's curl gets nothing after it exits); a share keeps a fresh hop budget
 //! (red: the folder's announcement carries the default, not its parent's less one); pull a share
 //! addressed to another node (red: bob's node pulls carol's); pull whatever the disk has free (red:
-//! bob's node and `vox room get` try a 2^60-byte share).
+//! bob's node and `vox room get` try a 2^60-byte share); count a fetch cut short as pulled (red:
+//! alice's card says carol pulled report.bin).
 
 #![cfg(unix)]
 
@@ -427,6 +428,24 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     let auto = arrives(&bob_dl.join("report.bin"), &sha(&payload), TIMEOUT);
     // Fetch 2: bob, with curl through his own `vox up` — after `vox share` has exited.
     let (curl_ok, curled) = curl(bob_proxy, &url);
+    // carol, whom alice trusts, starts a fetch and gives up on it two seconds in: not a pull.
+    let (_carol_up, carol_proxy) = carol.up();
+    let carol_cut = Command::new("curl")
+        .args([
+            "-s",
+            "--limit-rate",
+            "20k",
+            "--max-time",
+            "2",
+            "--socks5-hostname",
+            &carol_proxy.to_string(),
+            &url,
+            "-o",
+            "/dev/null",
+        ])
+        .status()
+        .map(|s| s.code())
+        .unwrap_or_default();
     // mallory: the same URL through her own proxy, and `vox room get`. Neither is a fetch.
     let (mal_curl_ok, mal_curled) = curl(mal_proxy, &url);
     let (mal_get_ok, mal_get_said) = mallory.run(&["room", "get", &room, "report.bin"]);
@@ -457,6 +476,48 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     // the announcement, asks again.
     let (late_ok, late_said) = bob.run(&["room", "get", &room, "report.bin"]);
     eprintln!("[proof] bob's get after the share ended (ok {late_ok}): {late_said}");
+
+    // **The sharer's card says who pulled it** (ADR-028 F-7): bob, whose three fetches were whole;
+    // not carol, who gave up on hers, nor mallory, who could not open it. Read on alice's own
+    // `vox room read`, the line under the share's row.
+    let (_, alice_reads) = alice.run(&["room", "read", &room]);
+    // The row's own lines: the row, then its indented continuations (who it is to, who pulled it).
+    let pulled_line = alice_reads
+        .lines()
+        .skip_while(|l| !l.contains("file offered: report.bin"))
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .map(str::trim)
+        .find(|l| l.starts_with("pulled by"))
+        .unwrap_or_default()
+        .to_owned();
+    // And it is the daemon's record, kept across restarts: alice's daemon stops and starts again,
+    // twice, so what one start reads from disk is what the next one reads too.
+    for _ in 0..2 {
+        alice.daemon = None;
+        alice.start(&spec);
+    }
+    let restarted_until = Instant::now() + TIMEOUT;
+    let pulled_after_restart = loop {
+        let (_, reads) = alice.run(&["room", "read", &room]);
+        let line = reads
+            .lines()
+            .skip_while(|l| !l.contains("file offered: report.bin"))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .map(str::trim)
+            .find(|l| l.starts_with("pulled by"))
+            .unwrap_or_default()
+            .to_owned();
+        if !line.is_empty() || Instant::now() >= restarted_until {
+            break line;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    eprintln!(
+        "[proof] carol's cut-short curl exited {carol_cut:?}; alice reads under report.bin: \
+         {pulled_line:?}; after her daemon restarted: {pulled_after_restart:?}"
+    );
 
     // **A share for someone else is a card, not a pull** (F-3): carol's node pulls what alice
     // shares with her; bob's node, which reads it too, leaves it — and shows it naming carol —
@@ -660,6 +721,17 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
             && huge_get_said.contains("free on the disk holding"),
         "PRODUCT: `vox room get` must refuse a share larger than the disk's free space before \
          dialling, saying why; it said (ok {huge_get_ok}): {huge_get_said}"
+    );
+    assert!(
+        pulled_line == "pulled by bob",
+        "PRODUCT: alice's card for report.bin must say it was pulled by bob alone (carol gave up on \
+         her fetch, curl exit {carol_cut:?}; mallory could not open it); alice read: \
+         {alice_reads}"
+    );
+    assert!(
+        pulled_after_restart == "pulled by bob",
+        "PRODUCT: who pulled report.bin is alice's daemon's record and must outlive restarts; \
+         after two, under report.bin alice read {pulled_after_restart:?}"
     );
     // #494: served by the daemon once `vox share` has exited.
     assert!(

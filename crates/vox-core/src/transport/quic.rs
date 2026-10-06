@@ -1660,6 +1660,9 @@ pub struct TunnelWatch {
     /// How long its owner gives it with bytes waiting before it is closed as stuck, as the
     /// owner had it when the tunnel opened.
     stuck_after: std::time::Duration,
+    /// For a tunnel this node serves, the local address of its connection to the service: how
+    /// the service can ask which member a connection is (ADR-028 F-7, [`tunnel_peer_at`]).
+    local: Arc<Mutex<Option<SocketAddr>>>,
 }
 
 impl TunnelWatch {
@@ -1670,7 +1673,13 @@ impl TunnelWatch {
             why: Arc::new(Mutex::new(None)),
             owner,
             stuck_after,
+            local: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Record the local address of a served tunnel's connection to its service.
+    pub fn set_local(&self, at: Option<SocketAddr>) {
+        *lock(&self.local) = at;
     }
 
     /// The node this end of the tunnel is.
@@ -1834,7 +1843,7 @@ pub struct LiveTunnel {
     pub id: u64,
     /// The member at the other end.
     pub peer: Digest32,
-    /// The service it reaches: a port, or a `vox room send` offer's tag.
+    /// The service it reaches: a port, or a share's tag.
     pub service: String,
     /// Whether this node opened it (to reach the member's service), rather than serving it.
     pub outbound: bool,
@@ -1882,6 +1891,17 @@ pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// The member at the other end of the tunnel `owner` serves whose connection to its service comes
+/// from `from`: what a service on this machine sees as its client's address. `None` for a
+/// connection no tunnel made.
+#[must_use]
+pub fn tunnel_peer_at(owner: &Digest32, from: SocketAddr) -> Option<Digest32> {
+    lock(&LIVE)
+        .values()
+        .find(|t| t.owner == *owner && !t.outbound && *lock(&t.watch.local) == Some(from))
+        .map(|t| t.peer)
 }
 
 /// Every tunnel the node `owner` carries now, oldest first.

@@ -207,17 +207,21 @@ comes of it — a fix, a candidate, a verdict — is recorded on the issue.
 
 ## Sending a file
 
-Bytes never go through the log. `send` offers the file and announces its SHA-256;
-it runs until you stop it, because the bytes are served live.
+Bytes never go through the log. `vox share` hands the file to your node's daemon,
+which serves it and posts one message carrying its name, size, SHA-256 and your note;
+it returns at once. Address it like a message.
 
 ```bash
-vox room send 774jx5ejeztm ./target/debug/report.json   # runs until interrupted
+vox share 774jx5ejeztm ./target/debug/report.json --to bob -m "the report you asked for"
 vox room get 774jx5ejeztm report.json --dir ./incoming   # or --out ./report.json
 ```
 
-Without `--dir` or `--out`, `get` puts the file in `~/Downloads`. It never
-overwrites anything: a taken name becomes `report (1).json`, and an `--out` that
-exists is refused. It verifies against the announced hash and **refuses a transfer
+A share addressed to your node, or to no one, is pulled for you: your turn shows
+its note and the local path of the verified copy. Any other share you fetch with
+`vox room get`. Without `--dir` or `--out`, `get` puts the file in your node's
+files directory for the room and prints its full path. It never overwrites
+anything: a taken name becomes `report (1).json`, and an `--out` that exists is
+refused. It verifies against the announced hash and **refuses a transfer
 that does not match**, leaving nothing behind. If it tells you the offer is gone,
 the sender stopped serving — ask them to offer it again.
 
