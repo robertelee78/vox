@@ -192,6 +192,45 @@ pub struct OfferedService {
     pub local: String,
 }
 
+/// A file or folder this node shares, as `vox share list` shows it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FileShare {
+    /// The room-bound service it is served on.
+    pub tag: String,
+    /// The name it is announced under.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its SHA-256, hex.
+    pub sha256: String,
+    /// The announcement's message id, or empty if the daemon did not see it land.
+    pub entry: String,
+    /// Completed fetches since this node started serving it.
+    pub fetched: u64,
+}
+
+/// A share this node pulled by itself and verified (ADR-028 F-3, F-4).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PulledFile {
+    /// The announcement's message id.
+    pub entry: String,
+    /// Where the verified copy is, under the node's files directory.
+    pub path: String,
+    /// When it was announced, seconds since the Unix epoch.
+    pub created: u64,
+}
+
+fn file_share(row: vox_core::node::shares::ShareRow) -> FileShare {
+    FileShare {
+        tag: row.tag,
+        name: shown_name(&row.name),
+        size: row.size,
+        sha256: row.sha256,
+        entry: row.entry,
+        fetched: row.fetched,
+    }
+}
+
 /// What the app hears from the node it acts as.
 #[uniffi::export(with_foreign)]
 pub trait ClientListener: Send + Sync {
@@ -223,6 +262,10 @@ pub struct VoxClient {
     runtime: Mutex<Option<Runtime>>,
     rt: Handle,
     socket: PathBuf,
+    /// The account's data root and config directory: where each node's pulled files and pull
+    /// records are.
+    data_root: PathBuf,
+    config_dir: PathBuf,
     held: Slot,
 }
 
@@ -482,6 +525,8 @@ impl VoxClient {
             runtime: Mutex::new(Some(runtime)),
             rt,
             socket,
+            data_root: account.data_root.clone(),
+            config_dir: account.config_dir.clone(),
             held: Arc::new(tokio::sync::Mutex::new(None)),
         }))
     }
@@ -1069,6 +1114,144 @@ impl VoxClient {
                 return Err(failed(format!("this app has no forward bound at {local}")));
             };
             done(&mut carrier, &Request::StopForward { local }).await
+        })
+        .await
+    }
+
+    /// Share the file or folder at `path` in `room`, addressed like a message (`vox share`):
+    /// `to` members' fingerprints (empty: the room), a `note`, `re` the message it answers, and
+    /// `urgent`. The daemon hashes and serves it and posts its announcement; it serves it until
+    /// the message expires, it is stopped, this node leaves the room or the room ends, or after
+    /// `count` fetches or `for_secs` seconds when either is not 0.
+    ///
+    /// # Errors
+    /// A path that cannot be read, a malformed id, or the node's refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn share(
+        &self,
+        room: String,
+        path: String,
+        to: Vec<String>,
+        note: String,
+        re: String,
+        urgent: bool,
+        count: u64,
+        for_secs: u64,
+    ) -> Result<FileShare, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        // The daemon reads the path: made whole here.
+        let path = std::fs::canonicalize(&path).map_err(|e| failed(format!("{path}: {e}")))?;
+        let mut to_fps = Vec::with_capacity(to.len());
+        for t in &to {
+            to_fps.push(b32_encode(&digest(t, "addressee's fingerprint")?));
+        }
+        if !re.is_empty() {
+            digest(&re, "message id")?;
+        }
+        // The note is the message's body; with none, the daemon says what is shared.
+        let note = note.trim().to_owned();
+        let mut env = vox_agentcomms::envelope::Envelope::new(vox_core::node::shares::FILE, &note);
+        env.to = to_fps;
+        env.urgent = urgent;
+        env.re = (!re.is_empty()).then(|| re.trim().to_owned());
+        if !note.is_empty() {
+            env.data = serde_json::json!({ "note": note });
+        }
+        on_held!(self, |c| {
+            // **A share is a post, and follows a post's hop rule** (ADR-020 §9), as `vox share`.
+            if let Some(re) = env.re.clone() {
+                let chain = reply_chain(c, channel_id, &re).await?;
+                env.hops = vox_agentcomms::envelope::reply_hops_by(&re, |h| {
+                    let hash = vox_core::node::link::b32_decode(h.trim(), "re").ok()?;
+                    chain.get(&hash).cloned()
+                });
+            }
+            let req = Request::Share {
+                channel_id,
+                path: path.to_string_lossy().into_owned(),
+                envelope: env.to_text(),
+                count,
+                for_secs,
+            };
+            match ask(c, &req).await? {
+                Frame::Shares { shares } => shares
+                    .into_iter()
+                    .next()
+                    .map(file_share)
+                    .ok_or_else(|| failed("the vox daemon did not say what it shares")),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// This node's shares in `room` (`vox share list`).
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal.
+    pub async fn shares(&self, room: String) -> Result<Vec<FileShare>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::ShareList { channel_id }).await? {
+                Frame::Shares { shares } => Ok(shares.into_iter().map(file_share).collect()),
+                other => Err(unexpected(&other)),
+            }
+        )
+    }
+
+    /// Stop this node's shares in `room` that `selector` names: a name, a tag, or a prefix of a
+    /// SHA-256 or of the announcement's id (`vox share stop`). Answers those stopped.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (no share matches).
+    pub async fn share_stop(
+        &self,
+        room: String,
+        selector: String,
+    ) -> Result<Vec<FileShare>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let req = Request::ShareStop {
+            channel_id,
+            selector,
+        };
+        on_held!(self, |c| match ask(c, &req).await? {
+            Frame::Shares { shares } => Ok(shares.into_iter().map(file_share).collect()),
+            other => Err(unexpected(&other)),
+        })
+    }
+
+    /// What this node pulled by itself in `room` and verified, oldest first, each where `vox room
+    /// get` puts it: `<data root>/nodes/<node>/files/<room>/`.
+    ///
+    /// # Errors
+    /// No node attached, or a malformed id.
+    pub async fn pulled(&self, room: String) -> Result<Vec<PulledFile>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let held = Arc::clone(&self.held);
+        let (data_root, config_dir) = (self.data_root.clone(), self.config_dir.clone());
+        self.on_rt(async move {
+            let node = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.node.clone())
+                .ok_or_else(not_attached)?;
+            let account = Account::of(Some(&data_root), Some(&config_dir))
+                .map_err(|e| failed(format!("data root: {e}")))?;
+            let paths = account
+                .node_paths(&node)
+                .map_err(|e| failed(format!("node {node}: {e}")))?;
+            let mut pulled: Vec<PulledFile> = vox_core::node::pulls::recorded(&paths)
+                .into_iter()
+                .filter(|p| p.room == channel_id)
+                .map(|p| PulledFile {
+                    entry: b32_encode(&p.entry),
+                    path: p.path.to_string_lossy().into_owned(),
+                    created: p.created,
+                })
+                .collect();
+            pulled.sort_by_key(|p| p.created);
+            Ok(pulled)
         })
         .await
     }

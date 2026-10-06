@@ -32,6 +32,8 @@ vox-agentcomms = { path = "../vox-agentcomms" }
 # A fingerprint as a person reads it, with its art (ADR-028 K-1, L-9): the one renderer the CLI
 # and the TUI draw too.
 vox-text = { path = "../vox-text" }
+# A share's note, in its announcement's data (ADR-028 F-1).
+serde_json.workspace = true
 zeroize.workspace = true
 uniffi.workspace = true
 tokio.workspace = true
