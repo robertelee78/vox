@@ -35,6 +35,7 @@ pub mod content;
 pub mod coordstream;
 pub mod daemonipc;
 pub mod decisions;
+pub mod folder;
 pub mod headless;
 pub mod ipc;
 pub mod joinslots;

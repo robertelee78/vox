@@ -14,7 +14,11 @@
 //! trusted: she can neither read the announcement nor open the service, and her attempts are not
 //! fetches. A share alice addresses to carol is pulled by carol's node, and shows on bob as a card
 //! naming carol until bob pulls it with `vox room get`. After three fetches (`--count 3`) the daemon stops serving it by itself, and a late pull is told
-//! the offer is gone. A folder is shared as one tar, arrives as a valid one, and after `vox share
+//! the offer is gone. A folder of ten files is shared listed, not packed (ADR-028 F-8): bob's first
+//! get fetches all ten; after one changes and alice shares it again, his get fetches that one
+//! alone; a file he changed in his copy is kept and said to be; a get cut short with two of six
+//! large files landed resumes with the other four; a folder of more than 100,000 files is refused.
+//! After `vox share
 //! stop` a pull is told it is gone. A share alice leaves behind when she leaves the room ends.
 //!
 //! The folder is shared as a reply to the report's announcement (`--re`): it carries that entry
@@ -25,7 +29,8 @@
 //! (red: the folder's announcement carries the default, not its parent's less one); pull a share
 //! addressed to another node (red: bob's node pulls carol's); pull whatever the disk has free (red:
 //! bob's node and `vox room get` try a 2^60-byte share); count a fetch cut short as pulled (red:
-//! alice's card says carol pulled report.bin).
+//! alice's card says carol pulled report.bin); refetch every file of a folder (red: the re-pull
+//! says 10 fetched).
 
 #![cfg(unix)]
 
@@ -35,6 +40,7 @@ mod world;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -317,9 +323,12 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         .collect();
     let file = tmp.path().join("report.bin");
     std::fs::write(&file, &payload).unwrap();
+    // Ten files, one in a folder of its own.
     let folder = tmp.path().join("photos");
     std::fs::create_dir_all(folder.join("2026")).unwrap();
-    std::fs::write(folder.join("a.txt"), b"first").unwrap();
+    for i in 0..9 {
+        std::fs::write(folder.join(format!("f{i}.txt")), format!("file {i}")).unwrap();
+    }
     std::fs::write(folder.join("2026").join("b.txt"), b"second").unwrap();
 
     let anchor_dir = tmp.path().join("anchor");
@@ -586,10 +595,10 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         .collect();
     let (huge_get_ok, huge_get_said) = bob.run(&["room", "get", &room, "huge.bin"]);
 
-    // A folder, as one tar, shared as a reply to the report's announcement; then stopped by hand
-    // (`vox share stop`). **A share follows a post's hop rule** (ADR-020 §9): a reply carries its
-    // `re` and spends a hop of its parent's budget, so agents sharing back and forth cannot wake
-    // each other for ever.
+    // **A folder is listed, not packed** (ADR-028 F-8), shared as a reply to the report's
+    // announcement and addressed to carol, so bob pulls it by hand. **A share follows a post's hop
+    // rule** (ADR-020 §9): a reply carries its `re` and spends a hop of its parent's budget, so
+    // agents sharing back and forth cannot wake each other for ever.
     let report_entry = announcements
         .first()
         .and_then(|a| a["entry_hash"].as_str())
@@ -598,31 +607,132 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     let report_hops = announcements
         .first()
         .and_then(|a| a["envelope"]["hops"].as_u64());
-    let (folder_ok, folder_said) = alice.run(&[
-        "share",
-        &room,
-        folder.to_str().unwrap(),
-        "--for",
-        "120s",
-        "--re",
-        &report_entry,
-    ]);
+    let photos_rows = |who: &Member| {
+        rows_of(who, &room)
+            .into_iter()
+            .filter(|r| {
+                r["envelope"]["type"] == "file" && r["envelope"]["data"]["name"] == "photos"
+            })
+            .collect::<Vec<_>>()
+    };
+    // alice shares the folder (again), and bob reads that announcement: the `n`th of the folder.
+    let share_photos = |extra: &[&str], n: usize| {
+        let mut argv = vec!["share", &room, folder.to_str().unwrap(), "--to", "carol"];
+        argv.extend_from_slice(extra);
+        let (ok, said) = alice.run(&argv);
+        assert!(ok, "PRODUCT (staging): vox share of a folder: {said}");
+        let until = Instant::now() + TIMEOUT;
+        while photos_rows(&bob).len() < n {
+            assert!(
+                Instant::now() < until,
+                "PRODUCT (staging): bob never read the folder's announcement number {n}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        said
+    };
+    let stat = |dir: &Path| -> BTreeMap<String, (u64, std::time::SystemTime, Vec<u8>)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut out = BTreeMap::new();
+        for name in (0..9)
+            .map(|i| format!("f{i}.txt"))
+            .chain(std::iter::once("2026/b.txt".to_owned()))
+        {
+            if let Ok(m) = std::fs::metadata(dir.join(&name)) {
+                let bytes = std::fs::read(dir.join(&name)).unwrap_or_default();
+                out.insert(name, (m.ino(), m.modified().unwrap(), bytes));
+            }
+        }
+        out
+    };
+    let folder_said = share_photos(&["--re", &report_entry], 1);
+    let folder_row = photos_rows(&bob).into_iter().next();
+    let bob_photos = bob_dl.join("photos");
+    let (pull1_ok, pull1) = bob.run(&["room", "get", &room, "photos"]);
+    let first = stat(&bob_photos);
+    // One file of ten changes, alice shares the folder again, and bob pulls it again.
+    std::fs::write(folder.join("f3.txt"), b"file 3, revised").unwrap();
+    share_photos(&[], 2);
+    let (pull2_ok, pull2) = bob.run(&["room", "get", &room, "photos"]);
+    let second = stat(&bob_photos);
+    // bob edits his copy of f5; alice shares the folder once more, unchanged: bob's edit is his.
+    std::fs::write(bob_photos.join("f5.txt"), b"bob's own edit").unwrap();
+    share_photos(&[], 3);
+    let (pull3_ok, pull3) = bob.run(&["room", "get", &room, "photos"]);
+    let bob_f5 = std::fs::read_to_string(bob_photos.join("f5.txt")).unwrap_or_default();
+    let (stop_ok, stop_said) = alice.run(&["share", "stop", &room, "photos"]);
+    let (stopped_get_ok, stopped_get_said) = bob.run(&["room", "get", &room, "photos"]);
+
+    // **A pull cut short resumes**: bob's get of a folder of six large files is stopped once two
+    // have landed, and his next get fetches only the rest.
+    let big = tmp.path().join("big");
+    std::fs::create_dir_all(&big).unwrap();
+    for i in 0..6u8 {
+        let bytes: Vec<u8> = (0..24 * 1024 * 1024u32)
+            .map(|b| (b.wrapping_mul(31) >> 5) as u8 ^ i)
+            .collect();
+        std::fs::write(big.join(format!("part{i}.bin")), bytes).unwrap();
+    }
+    let (big_ok, big_said) = alice.run(&["share", &room, big.to_str().unwrap(), "--to", "carol"]);
     assert!(
-        folder_ok,
-        "PRODUCT (staging): vox share of a folder: {folder_said}"
+        big_ok,
+        "PRODUCT (staging): vox share of the large folder: {big_said}"
     );
-    bob.sees(&room, "photos.tar");
-    let folder_row = rows_of(&bob, &room)
-        .into_iter()
-        .find(|r| r["envelope"]["type"] == "file" && r["envelope"]["data"]["name"] == "photos.tar");
-    let (tar_ok, tar_said) = bob.run(&["room", "get", &room, "photos.tar"]);
-    let listing = Command::new("tar")
-        .args(["-tf", bob_dl.join("photos.tar").to_str().unwrap()])
-        .output()
-        .unwrap();
-    let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
-    let (stop_ok, stop_said) = alice.run(&["share", "stop", &room, "photos.tar"]);
-    let (stopped_get_ok, stopped_get_said) = bob.run(&["room", "get", &room, "photos.tar"]);
+    bob.sees(&room, "big/");
+    let bob_big = bob_dl.join("big");
+    let landed_in = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    };
+    let mut cut_get = Command::new(VOX)
+        .args(["room", "get", &room, "big"])
+        .env("VOX_DATA_DIR", &bob.dir)
+        .env("VOX_CONFIG_DIR", bob.dir.join("cfg"))
+        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: start bob's get of the large folder");
+    let cut_until = Instant::now() + TIMEOUT;
+    let cut = loop {
+        if landed_in(&bob_big).len() >= 2 {
+            let _ = cut_get.kill();
+            let _ = cut_get.wait();
+            break true;
+        }
+        if cut_get.try_wait().ok().flatten().is_some() || Instant::now() >= cut_until {
+            let _ = cut_get.kill();
+            let _ = cut_get.wait();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let before_resume = landed_in(&bob_big);
+    let (resume_ok, resume_said) = bob.run(&["room", "get", &room, "big"]);
+    let resumed = landed_in(&bob_big);
+
+    // **A folder holds at most 100,000 files**: one more is refused, saying so. (Its list is
+    // served, not carried in the message, so an ordinary folder of any size passes.)
+    let many = tmp.path().join("many");
+    for chunk in 0..101 {
+        let d = many.join(format!("{chunk:03}"));
+        std::fs::create_dir_all(&d).unwrap();
+        for i in 0..1000 {
+            if chunk * 1000 + i > 100_000 {
+                break;
+            }
+            std::fs::write(d.join(format!("{i:03}")), b"").unwrap();
+        }
+    }
+    let (many_ok, many_said) = alice.run(&["share", &room, many.to_str().unwrap()]);
 
     // And one left behind when alice leaves the room: leaving ends it (F-2).
     let left_file = tmp.path().join("notes.txt");
@@ -644,8 +754,10 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
          {}\nmallory curl: ok {mal_curl_ok}, {} bytes; mallory get: ok {mal_get_ok}: \
          {mal_get_said}fetches counted before bob's get: {fetches_before_get:?}\nbob reads: \
          {announcements:?} ({carrying_note} row(s) carry the note)\nbob's get: ok {get_ok}: \
-         {get_said}landed {} ({} bytes, sha {})\nshare ended {ended}\nfolder get: ok {tar_ok}: \
-         {tar_said}tar lists:\n{listing}\nstop: ok {stop_ok}: {stop_said}get after stop: ok \
+         {get_said}landed {} ({} bytes, sha {})\nshare ended {ended}\nfolder shared: {folder_said}\
+         pulls: (ok {pull1_ok}) {pull1}(ok {pull2_ok}) {pull2}(ok {pull3_ok}) {pull3}\
+         cut after {before_resume:?} (cut {cut}); resume (ok {resume_ok}): {resume_said}100001 \
+         files (ok {many_ok}): {many_said}\nstop: ok {stop_ok}: {stop_said}get after stop: ok \
          {stopped_get_ok}: {stopped_get_said}\nafter leave (ended {left_ended}): ok \
          {after_leave_ok}: {after_leave_said}",
         curled.len(),
@@ -786,27 +898,61 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
          less one ({report_hops:?} - 1, as `vox room post` does); bob read the folder's \
          announcement as: {folder_env:?}"
     );
+    // F-8: the first pull fetches all ten; a re-pull after one changed fetches that one alone,
+    // leaving the nine as they were; a file bob changed is his; a cut pull resumes.
     assert!(
-        tar_ok,
-        "PRODUCT: the folder share must be collectable: {tar_said}"
+        pull1_ok && pull1.contains("(10 files: 10 fetched, 0 already here)") && first.len() == 10,
+        "PRODUCT: bob's first get of the folder must fetch its ten files; it said (ok \
+         {pull1_ok}): {pull1}"
     );
-    for entry in [
-        "photos/",
-        "photos/a.txt",
-        "photos/2026/",
-        "photos/2026/b.txt",
-    ] {
-        assert!(
-            listing.lines().any(|l| l == entry),
-            "PRODUCT: the tar must hold {entry}"
-        );
-    }
+    let untouched = first
+        .iter()
+        .filter(|(name, _)| name.as_str() != "f3.txt")
+        .all(|(name, was)| second.get(name) == Some(was));
     assert!(
-        stop_ok && stop_said.contains("no longer sharing photos.tar"),
+        pull2_ok && pull2.contains("(10 files: 1 fetched, 9 already here)") && untouched,
+        "PRODUCT: after one file of ten changed, bob's get must fetch that file alone and leave \
+         the nine as they were (untouched: {untouched}); it said (ok {pull2_ok}): {pull2}"
+    );
+    assert_eq!(
+        second.get("f3.txt").map(|(_, _, b)| b.as_slice()),
+        Some(&b"file 3, revised"[..]),
+        "PRODUCT: bob's copy of the changed file must hold its new bytes"
+    );
+    assert!(
+        pull3_ok
+            && pull3.contains("photos/f5.txt was changed here; not replaced")
+            && pull3.contains("(10 files: 0 fetched, 9 already here)")
+            && bob_f5 == "bob's own edit",
+        "PRODUCT: a file bob changed in his copy must be kept and said to be; his get said (ok \
+         {pull3_ok}): {pull3}; f5.txt holds {bob_f5:?}"
+    );
+    assert!(
+        cut,
+        "APPARATUS (staging not achieved): bob's get of the large folder was not cut with two \
+         files landed (it finished, or none landed within {TIMEOUT:?}); landed: {before_resume:?}"
+    );
+    let resumed_said = format!(
+        "(6 files: {} fetched, {} already here)",
+        6 - before_resume.len(),
+        before_resume.len()
+    );
+    assert!(
+        resume_ok && resume_said.contains(&resumed_said) && resumed.len() == 6,
+        "PRODUCT: bob's get after one cut short with {before_resume:?} in place must fetch only \
+         the rest, {resumed_said}; it said (ok {resume_ok}): {resume_said}"
+    );
+    assert!(
+        !many_ok && many_said.contains("the most a shared folder may hold"),
+        "PRODUCT: a folder of more than 100,000 files must be refused, saying so; `vox share` \
+         said (ok {many_ok}): {many_said}"
+    );
+    assert!(
+        stop_ok && stop_said.contains("no longer sharing photos"),
         "PRODUCT: `vox share stop` must stop the folder share; it said: {stop_said}"
     );
     assert!(
-        gone(stopped_get_ok, &stopped_get_said, "photos.tar"),
+        gone(stopped_get_ok, &stopped_get_said, "photos"),
         "PRODUCT: a pull after `vox share stop` must be told the offer is gone; bob's `vox room \
          get` said (ok {stopped_get_ok}): {stopped_get_said}"
     );

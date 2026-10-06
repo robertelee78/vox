@@ -1689,13 +1689,14 @@ impl Frame {
             Frame::Shares { shares } => {
                 e.array(2).uint(T_SHARES).array(shares.len());
                 for r in shares {
-                    e.array(6)
+                    e.array(7)
                         .text(&r.tag)
                         .text(&r.name)
                         .uint(r.size)
                         .text(&r.sha256)
                         .text(&r.entry)
-                        .uint(r.fetched);
+                        .uint(r.fetched)
+                        .uint(r.files);
                 }
             }
         }
@@ -2249,7 +2250,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             for _ in 0..count {
                 if d.array()
                     .map_err(|_| Error::MalformedIpc("ipc share row"))?
-                    != 6
+                    != 7
                 {
                     return Err(Error::MalformedIpc("ipc share row arity"));
                 }
@@ -2263,6 +2264,9 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 let fetched = d
                     .uint()
                     .map_err(|_| Error::MalformedIpc("ipc share fetched"))?;
+                let files = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc share files"))?;
                 shares.push(crate::node::shares::ShareRow {
                     tag,
                     name,
@@ -2270,6 +2274,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     sha256,
                     entry,
                     fetched,
+                    files,
                 });
             }
             return Ok(Frame::Shares { shares });

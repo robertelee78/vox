@@ -598,12 +598,15 @@ pub(crate) fn words(text: &str) -> String {
     };
     if e.kind == crate::room_cli::FILE {
         if let (Some(name), Some(size)) = (e.data["name"].as_str(), e.data["size"].as_u64()) {
+            // A folder says how many files it lists (ADR-028 F-8).
+            let what = match e.data["files"].as_u64() {
+                Some(files) => format!("folder offered: {name}/ ({files} files, {size} bytes)"),
+                None => format!("file offered: {name} ({size} bytes)"),
+            };
             // The note travels in the share itself (ADR-028 F-1), and is read with it.
             return match e.data["note"].as_str().map(str::trim) {
-                Some(note) if !note.is_empty() => {
-                    format!("file offered: {name} ({size} bytes): {note}")
-                }
-                _ => format!("file offered: {name} ({size} bytes)"),
+                Some(note) if !note.is_empty() => format!("{what}: {note}"),
+                _ => what,
             };
         }
     }

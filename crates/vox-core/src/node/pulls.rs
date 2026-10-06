@@ -22,7 +22,7 @@
 //! under the retention this node applies to the room, the daemon deletes the copy and its record.
 //! A copy the person put elsewhere (`--dir`, `--out`) is theirs and is never recorded.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -134,6 +134,9 @@ struct Offer {
     http: bool,
     /// When it was announced, seconds.
     created: u64,
+    /// How many files a folder lists (ADR-028 F-8); `None` for a file. Its list is fetched from
+    /// the sharer, and taken only if its SHA-256 is `sha256`.
+    files: Option<u64>,
 }
 
 /// A pull, as it is recorded once done.
@@ -147,27 +150,100 @@ pub struct Pulled {
     pub path: PathBuf,
     /// When it was announced, seconds.
     pub created: u64,
+    /// For a folder (ADR-028 F-8): who shared it and under what name, so pulling it again goes
+    /// to the same place; `None` for a file.
+    pub folder: Option<(Digest32, String)>,
+    /// For a folder, every file this pull left in place as listed, `(path, sha256)`: what a later
+    /// pull of it may replace, and what its message's end deletes.
+    pub files: Vec<(String, String)>,
 }
 
 impl Pulled {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "room": b32_encode(&self.room),
             "entry": b32_encode(&self.entry),
             "path": self.path.to_string_lossy(),
             "created": self.created,
-        })
+        });
+        if let Some((author, name)) = &self.folder {
+            v["author"] = b32_encode(author).into();
+            v["folder"] = name.clone().into();
+            v["files"] = self
+                .files
+                .iter()
+                .map(|(p, h)| serde_json::json!([p, h]))
+                .collect();
+        }
+        v
     }
 
     fn from_json(v: &serde_json::Value) -> Option<Self> {
         let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+        let folder = match (s("author"), s("folder")) {
+            (Some(a), Some(n)) => Some((b32_decode(a, "pull record author").ok()?, n.to_owned())),
+            _ => None,
+        };
+        let files = v
+            .get("files")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        let e = e.as_array()?;
+                        Some((
+                            e.first()?.as_str()?.to_owned(),
+                            e.get(1)?.as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(Self {
             room: b32_decode(s("room")?, "pull record room").ok()?,
             entry: b32_decode(s("entry")?, "pull record entry").ok()?,
             path: PathBuf::from(s("path")?),
             created: v.get("created").and_then(serde_json::Value::as_u64)?,
+            folder,
+            files,
         })
     }
+}
+
+/// Where a folder `name` shared by `author` in `room` is pulled to under `base`: where an earlier
+/// pull of it went, so pulling it again fetches only what changed (ADR-028 F-8); else `name`, or
+/// the first of `name (1)`, `name (2)` … not already there. With what that earlier pull left in
+/// place, `(path, sha256)`.
+#[must_use]
+pub fn folder_dir(
+    paths: &Paths,
+    base: &Path,
+    room: &Digest32,
+    author: &Digest32,
+    name: &str,
+) -> (PathBuf, BTreeMap<String, String>) {
+    let name = safe_file_name(name);
+    let earlier: Vec<Pulled> = recorded(paths)
+        .into_iter()
+        .chain(records_in(&pending_dir(paths)).into_iter().map(|(_, p)| p))
+        .filter(|p| {
+            p.room == *room
+                && p.path.parent() == Some(base)
+                && p.folder.as_ref() == Some(&(*author, name.clone()))
+        })
+        .collect();
+    if let Some(first) = earlier.first() {
+        let mut prior = BTreeMap::new();
+        for p in earlier.iter().filter(|p| p.path == first.path) {
+            prior.extend(p.files.iter().cloned());
+        }
+        return (first.path.clone(), prior);
+    }
+    let free = (0..1000)
+        .map(|n| base.join(numbered(&name, n)))
+        .find(|d| std::fs::symlink_metadata(d).is_err())
+        .unwrap_or_else(|| base.join(&name));
+    (free, BTreeMap::new())
 }
 
 /// Every pull this node has recorded.
@@ -178,7 +254,46 @@ pub fn recorded(paths: &Paths) -> Vec<Pulled> {
 
 /// Every pull this node has recorded, with the file that records it.
 fn records(paths: &Paths) -> Vec<(PathBuf, Pulled)> {
-    let Ok(dir) = std::fs::read_dir(paths.pulls_dir()) else {
+    records_in(&paths.pulls_dir())
+}
+
+/// Where a folder pull under way is recorded until it completes: so one cut short is resumed in
+/// the same place, and its files go with its message as a finished pull's do (ADR-028 F-5, F-8).
+fn pending_dir(paths: &Paths) -> PathBuf {
+    paths.pulls_dir().join("pending")
+}
+
+/// A folder pull is under way: `pulled` names its folder and every file it lists.
+///
+/// # Errors
+/// It cannot be recorded.
+pub fn begin(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
+    let dir = pending_dir(paths);
+    crate::node::paths::create_private_dir(&dir)
+        .and_then(|()| {
+            crate::node::paths::write_private_file(
+                &dir.join(format!("{}.json", b32_encode(&pulled.entry))),
+                pulled.to_json().to_string().as_bytes(),
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// A folder pull completed: recorded as done, with what it left in place.
+///
+/// # Errors
+/// It cannot be recorded.
+pub fn finish(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
+    record(paths, pulled)?;
+    let _ = std::fs::remove_file(
+        pending_dir(paths).join(format!("{}.json", b32_encode(&pulled.entry))),
+    );
+    Ok(())
+}
+
+/// Every record in `dir`, with the file that holds it.
+fn records_in(dir: &Path) -> Vec<(PathBuf, Pulled)> {
+    let Ok(dir) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     dir.filter_map(Result::ok)
@@ -295,7 +410,8 @@ fn hex(bytes: &[u8]) -> String {
 
 /// The share `text` announces, if it is one this node may pull: a `file` announcement addressed to
 /// `me` or to no one. `None` for anything else, for good.
-fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool)> {
+#[allow(clippy::type_complexity)]
+fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool, Option<u64>)> {
     let v: serde_json::Value = serde_json::from_str(text.trim_start()).ok()?;
     if v.get("type").and_then(serde_json::Value::as_str) != Some(crate::node::shares::FILE) {
         return None;
@@ -318,14 +434,28 @@ fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool)>
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    let sha256 = sha256.to_ascii_lowercase();
+    let size = d.get("size").and_then(serde_json::Value::as_u64)?;
+    // A folder says how many files its list holds (ADR-028 F-8); the list is fetched and checked
+    // against the announced SHA-256 before anything else is.
+    let files = match d.get("files") {
+        None => None,
+        Some(v) => {
+            Some(v.as_u64()?).filter(|n| (1..=crate::node::folder::MAX_FILES as u64).contains(n))
+        }
+    };
+    if d.get("files").is_some() && files.is_none() {
+        return None;
+    }
     Some((
         s("name")?,
-        d.get("size").and_then(serde_json::Value::as_u64)?,
-        sha256.to_ascii_lowercase(),
+        size,
+        sha256,
         s("tag")?,
         d.get("http")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        files,
     ))
 }
 
@@ -396,7 +526,8 @@ impl Pulls {
                         never.push(r.entry_hash);
                         continue;
                     }
-                    let Some((name, size, sha256, tag, http)) = offer_in(&r.text, &me_b32) else {
+                    let Some((name, size, sha256, tag, http, files)) = offer_in(&r.text, &me_b32)
+                    else {
                         never.push(r.entry_hash);
                         continue;
                     };
@@ -422,6 +553,7 @@ impl Pulls {
                         tag,
                         http,
                         created,
+                        files,
                     });
                 }
             }
@@ -500,6 +632,9 @@ impl Pulls {
     async fn pull(&self, offer: &Offer) -> Result<(), String> {
         let dir = room_dir(&self.paths, &offer.room);
         crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+        if let Some(count) = offer.files {
+            return self.pull_folder(offer, &dir, count).await;
+        }
         let bound = match self
             .apply(NodeCommand::Forward {
                 channel_id: offer.room,
@@ -530,16 +665,69 @@ impl Pulls {
                 entry: offer.entry,
                 path,
                 created: offer.created,
+                folder: None,
+                files: Vec::new(),
             },
         )
+    }
+
+    /// Pull a folder (ADR-028 F-8) into `base`: where an earlier pull of it went, fetching only
+    /// what is not already there as listed. A pull cut short is not recorded, so it is tried again,
+    /// and that try keeps every file the first one finished.
+    async fn pull_folder(&self, offer: &Offer, base: &Path, count: u64) -> Result<(), String> {
+        let (dir, prior) = folder_dir(&self.paths, base, &offer.room, &offer.author, &offer.name);
+        crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+        let bound = match self
+            .apply(NodeCommand::Forward {
+                channel_id: offer.room,
+                host: offer.author,
+                service_tag: offer.tag.clone(),
+                local: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            })
+            .await
+        {
+            Outcome::Bound(local) => local,
+            other => return Err(other.to_string()),
+        };
+        let mut pull = Pulled {
+            room: offer.room,
+            entry: offer.entry,
+            path: dir.clone(),
+            created: offer.created,
+            folder: Some((offer.author, safe_file_name(&offer.name))),
+            files: Vec::new(),
+        };
+        let pulled = match crate::node::folder::fetch_list(bound, &offer.sha256, count).await {
+            Ok(list) => {
+                pull.files = list
+                    .iter()
+                    .map(|f| (f.path.clone(), f.sha256.clone()))
+                    .collect();
+                match begin(&self.paths, &pull) {
+                    Ok(()) => crate::node::folder::pull(bound, &dir, &list, &prior).await,
+                    Err(e) => Err((e, crate::node::folder::Pulled::default())),
+                }
+            }
+            Err(e) => Err((e, crate::node::folder::Pulled::default())),
+        };
+        let _ = self.apply(NodeCommand::StopForward { local: bound }).await;
+        let done = pulled.map_err(|(e, _)| {
+            // A folder made for a pull that put nothing in it goes again.
+            let _ = std::fs::remove_dir(&dir);
+            e
+        })?;
+        pull.files = done.placed;
+        finish(&self.paths, &pull)
     }
 
     /// Delete every pulled copy whose message has expired here, and its record (ADR-028 F-5).
     /// A room this node does not hold open is left until it does: its retention is not known.
     fn expire(&self) {
         let now = now_secs();
-        // Read before the view is borrowed: a borrow held holds up the node's next view.
-        let all = records(&self.paths);
+        // Read before the view is borrowed: a borrow held holds up the node's next view. A folder
+        // pull cut short is one too: its files go with its message.
+        let mut all = records(&self.paths);
+        all.extend(records_in(&pending_dir(&self.paths)));
         if all.is_empty() {
             return;
         }
@@ -548,7 +736,7 @@ impl Pulls {
             if view.locked {
                 return;
             }
-            all.into_iter()
+            all.iter()
                 .filter(|(_, p)| {
                     view.open_channels.iter().any(|d| {
                         d.channel_id == p.room
@@ -556,17 +744,28 @@ impl Pulls {
                             && now >= p.created.saturating_add(d.retention)
                     })
                 })
+                .cloned()
                 .collect()
         };
         let files = self.paths.files_dir();
+        let due_files: HashSet<PathBuf> = due.iter().map(|(f, _)| f.clone()).collect();
         for (file, p) in due {
             // Only what lies in the node's files directory is the node's to delete.
-            if p.path.starts_with(&files)
+            let ours = p.path.starts_with(&files)
                 && !p
                     .path
                     .components()
-                    .any(|c| c == std::path::Component::ParentDir)
-            {
+                    .any(|c| c == std::path::Component::ParentDir);
+            if ours && p.folder.is_some() {
+                // **A folder copy goes with the last message that put it there**: a newer pull of
+                // the same folder, whose message has not expired, keeps it.
+                let still_held = all
+                    .iter()
+                    .any(|(f, o)| !due_files.contains(f) && o.path == p.path);
+                if !still_held {
+                    remove_folder_copy(&p.path, &p.files);
+                }
+            } else if ours {
                 match std::fs::remove_file(&p.path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -577,6 +776,33 @@ impl Pulls {
             let _ = std::fs::remove_file(file);
         }
     }
+}
+
+/// Delete a pulled folder copy at `dir`: each file this pull placed, `(path, sha256)`, that is
+/// still as it placed it (one the person changed is theirs, and stays), then every folder that
+/// leaves empty, `dir` too.
+fn remove_folder_copy(dir: &Path, placed: &[(String, String)]) {
+    let mut parents = BTreeSet::new();
+    for (path, sha) in placed {
+        if !crate::node::folder::safe_path(path) {
+            continue;
+        }
+        let file = dir.join(path);
+        let unchanged = std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file())
+            && crate::node::folder::digest(&file).is_ok_and(|(now, _)| now == *sha);
+        if unchanged && std::fs::remove_file(&file).is_ok() {
+            let mut at = file.parent();
+            while let Some(p) = at.filter(|p| p.starts_with(dir) && *p != dir) {
+                parents.insert(p.to_path_buf());
+                at = p.parent();
+            }
+        }
+    }
+    // Deepest first, so a folder is empty by the time it is tried.
+    for p in parents.iter().rev() {
+        let _ = std::fs::remove_dir(p);
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// Link a verified `.part` into `dir` under `name` or the first free variant of it, never
