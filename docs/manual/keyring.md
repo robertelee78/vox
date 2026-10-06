@@ -85,13 +85,35 @@ removal has real access and key-rotation consequences.
 
 ## Understand the member pane
 
-The TUI shows trust by glyph, weight and words. A node in your keyring is drawn bold with `→`,
-and its line says `in keyring · reads you` or `in keyring · cannot read you yet`. A node not in
-your keyring is drawn plain with `·` and named by its fingerprint. Its line says
+The TUI shows trust by glyph, weight and words, never by colour alone:
+
+- `⇄ alice`, bold: alice is in your keyring and her node trusts yours too;
+- `→ dave`, bold: dave is in your keyring, and his node does not trust yours;
+- `· ` and 26 characters of a fingerprint, plain: a node not in your keyring.
+
+Under each name a line says `in keyring · reads you` or `in keyring · cannot read you yet`, or
 `not in keyring · still reads you` or `not in keyring · you don't read each other`. Where the
-terminal takes only ASCII, the glyphs are `->` and `.`. The words describe local trust and
+terminal takes only ASCII, the glyphs are `<>`, `->` and `.`. The words describe local trust and
 whether the other member can read your messages in that room. They are not read receipts for
 an individual message.
+
+Select a member with the arrow keys while the members pane has the focus, and its card is drawn
+under it: the whole fingerprint in groups of four, beside five rows of art drawn from the
+fingerprint, as a quick visual check. Compare the groups themselves before you trust a node.
+
+## See your keyring in the TUI
+
+On the room list, `k` opens the keyring view: every node you trust, by your name for it, with its
+card. Esc returns to the list.
+
+```text
+  alice
+    ◥◥◥◥◣◣◣◣◤◤  m4ol surt bsra fsq2 djll
+    ◣◣◤◤◥◥◥◥◣◣  wj6f vgoo fiu2 ns76 6n3u
+    ◣◣◥◥◣◣◣◣◥◥  ljvt gbvy lkkq
+    ◤◤◥◥◤◤◢◢◣◣
+    ◥◥◥◥◤◤◥◥◥◥
+```
 
 If the state and your expectation differ, check each person's selected node and keyring,
 then connectivity. Do not add an unfamiliar fingerprint simply to silence a warning.
