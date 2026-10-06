@@ -55,6 +55,11 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             what sharing it does before it is shared: its address, that alice can reach it, and
             the warning that it listens on every interface; Enter shares it, and Alice's `vox
             service list` lists it (ADR-028 S-4, #491);
+  retention while both TUIs are open, Alice runs `vox room retention <room> 1w`: each header,
+            which said "⏱ forever", says "⏱ 1 week", and each timeline gains one line, "you set
+            the room's retention to 1 week: messages older than 1 week are removed from now on"
+            on Alice's and the same naming alice on Bob's (ADR-028 R-7, #483); and a focused
+            pane's border names it once ("Members [focus]", never "MembersMembers [focus]");
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant` and `:revoke`
@@ -485,7 +490,8 @@ try:
     def focus(pane):
         """Tab until `pane`'s title says it has the focus."""
         for _ in range(4):
-            if any(f"{pane} [focus]" in r for r in tui.display()):
+            # The title may say more after the pane's name (the timeline's retention, #483).
+            if any(re.search(rf"\u250c{pane}[^\u2510]*\[focus\]", r) for r in tui.display()):
                 return
             tui.key("\t", 0.3)
         product(f"Tab never gave bob's {pane} the focus; screen:\n" + tui.text())
@@ -740,6 +746,32 @@ try:
     claim("nostorm", len(set(counts)) == 1,
           f"entries held (alice, bob) over 15 s, both TUIs on the room and both agents draining: "
           f"{counts[0]} to {counts[-1]} ({len(counts)} samples, {len(set(counts))} distinct)")
+    stage("retention")
+    # A retention change is one line in each member's timeline, saying who set what and what it
+    # does from now on; the room's header always says the retention (ADR-028 R-7, #483).
+    def header(t):
+        return next((bare(r) for r in t.display() if "Timeline ·" in r), "")
+    def says(t, want):
+        # The line wraps across rows of the narrow timeline: read the pane as one text, without
+        # the spaces a wrap may have taken from either side of a break.
+        text = "".join(bare(r) for r in pane(t.display(), "Timeline")).replace(" ", "")
+        return want.replace(" ", "") in text
+    before = (header(atui), header(tui))
+    r = run("alice", "room", "retention", room, "1w", "--identity-passphrase-file", f"{S}/idpass")
+    if r.returncode != 0: product(f"alice's `vox room retention {room} 1w` failed: {r.stderr.strip()}")
+    LINE = "set the room's retention to 1 week: messages older than 1 week are removed from now on"
+    both_until(lambda: says(atui, f"you {LINE}") and says(tui, f"alice {LINE}")
+               and "⏱ 1 week" in header(atui) and "⏱ 1 week" in header(tui), 60)
+    after = (header(atui), header(tui))
+    # A focused pane names itself once on its border: "Members [focus]", never "MembersMembers".
+    once = all(h.count("Timeline") == 1 and h.count("Members") == 1 for h in after) \
+        and any("[focus]" in h for h in after)
+    claim("retention", all("⏱ forever" in h for h in before) and all("⏱ 1 week" in h for h in after)
+          and says(atui, f"you {LINE}") and says(tui, f"alice {LINE}") and once,
+          f"headers (alice, bob) before: {before!r}; after: {after!r}; alice's timeline says "
+          f"'you {LINE}': {says(atui, f'you {LINE}')}; bob's says 'alice {LINE}': "
+          f"{says(tui, f'alice {LINE}')}; each pane's title once on its border: {once}")
+
     if not atui.stop():
         product(f"alice's vox tui (pid {atui.pid}) outlived SIGKILL and could not be reaped")
     TUIS.remove(atui)

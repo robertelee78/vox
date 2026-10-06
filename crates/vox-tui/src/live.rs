@@ -1289,6 +1289,7 @@ impl DaemonCore {
                         &d.channel_id,
                         names_here(),
                     ),
+                    retention: vox_core::node::retention::describe(d.retention),
                     notices: d
                         .notices
                         .iter()

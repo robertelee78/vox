@@ -159,6 +159,9 @@ pub struct ChannelView {
     /// What a person is told happened to the room, in its order, each with who did it, by
     /// this node's name for them: `ann renamed the room to family` (ADR-028 E-5).
     pub notices: Vec<NoticeView>,
+    /// The retention this node applies here, as a person reads it ("1 week", "forever"): what the
+    /// room's header always shows (ADR-028 R-7).
+    pub retention: String,
     /// The members, in display order.
     pub members: Vec<MemberView>,
     /// The render-gated timeline, oldest-first. Shared with the core, which adds a new

@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks thirty claims, each
+//! 160x50. It checks thirty-one claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -24,6 +24,10 @@
 //! - `serve`: Bob's `:serve <port>`, for a service the driver listens on on every interface, says
 //!   before sharing it its address, that alice can reach it and that it listens on every
 //!   interface; Enter shares it, and Alice's `vox service list` lists it (ADR-028 S-4, #491);
+//! - `retention`: with both TUIs open, Alice sets the room's retention to 1 week: each header, which
+//!   said "⏱ forever", says "⏱ 1 week", and each timeline shows one line saying who set it and
+//!   that messages older than that are removed from now on (ADR-028 R-7, #483); and a focused
+//!   pane's border names it once;
 //! - `words`: `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
 //!   never an "invite link" (the decider's words, #406);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
@@ -105,12 +109,13 @@
 //! carries the message text or is raised per message, a room with a message to Bob grouped other
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`), a join line naming a
-//! trusted member that has not granted the newcomer (`newcomer`), the share flow's every-interface
+//! trusted member that has not granted the newcomer (`newcomer`), a retention change with no line in
+//! the timeline or a focused pane titled twice (`retention`), the share flow's every-interface
 //! warning left out (`serve`), a quote of the thread's root rather than `re`, Enter on a reply not
 //! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
 //! a pasted fingerprint that is not the node's let through to the keyring (`trust`). It passes only
-//! on the script's PASS with all 30 claims ok.
+//! on the script's PASS with all 31 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -206,7 +211,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (30 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (31 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -220,8 +225,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (30, 30),
-                "APPARATUS: the driver said PASS without all 30 claims ok: {said}"
+                (31, 31),
+                "APPARATUS: the driver said PASS without all 31 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
