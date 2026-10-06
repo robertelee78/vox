@@ -319,7 +319,9 @@ impl Shares {
     ) -> Arc<Self> {
         let shares = Arc::new(Self {
             pulled: Arc::new(std::sync::Mutex::new(PulledBook::load(
-                paths.shares_dir().join("pulled-by.json"),
+                // Beside the share records, not among them: `restore` reads every `*.json` there
+                // as one, and removes what is not.
+                paths.shares_dir().join("pulled-by").join("book.json"),
             ))),
             paths,
             cmd,

@@ -491,7 +491,33 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         .find(|l| l.starts_with("pulled by"))
         .unwrap_or_default()
         .to_owned();
-    eprintln!("[proof] carol's cut-short curl exited {carol_cut:?}; alice reads under report.bin: {pulled_line:?}");
+    // And it is the daemon's record, kept across restarts: alice's daemon stops and starts again,
+    // twice, so what one start reads from disk is what the next one reads too.
+    for _ in 0..2 {
+        alice.daemon = None;
+        alice.start(&spec);
+    }
+    let restarted_until = Instant::now() + TIMEOUT;
+    let pulled_after_restart = loop {
+        let (_, reads) = alice.run(&["room", "read", &room]);
+        let line = reads
+            .lines()
+            .skip_while(|l| !l.contains("file offered: report.bin"))
+            .skip(1)
+            .take_while(|l| l.starts_with("  "))
+            .map(str::trim)
+            .find(|l| l.starts_with("pulled by"))
+            .unwrap_or_default()
+            .to_owned();
+        if !line.is_empty() || Instant::now() >= restarted_until {
+            break line;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    eprintln!(
+        "[proof] carol's cut-short curl exited {carol_cut:?}; alice reads under report.bin: \
+         {pulled_line:?}; after her daemon restarted: {pulled_after_restart:?}"
+    );
 
     // **A share for someone else is a card, not a pull** (F-3): carol's node pulls what alice
     // shares with her; bob's node, which reads it too, leaves it — and shows it naming carol —
@@ -701,6 +727,11 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         "PRODUCT: alice's card for report.bin must say it was pulled by bob alone (carol gave up on \
          her fetch, curl exit {carol_cut:?}; mallory could not open it); alice read: \
          {alice_reads}"
+    );
+    assert!(
+        pulled_after_restart == "pulled by bob",
+        "PRODUCT: who pulled report.bin is alice's daemon's record and must outlive restarts; \
+         after two, under report.bin alice read {pulled_after_restart:?}"
     );
     // #494: served by the daemon once `vox share` has exited.
     assert!(
