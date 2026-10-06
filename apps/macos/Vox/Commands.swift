@@ -31,49 +31,61 @@ struct VoxAction: Identifiable {
 
 extension NodeModel {
     /// Every action, in menu order (M-21), with the M-20 keys.
-    func actions() -> [VoxAction] {
-        let inRoom = roomOnScreen != nil
+    func actions() -> [VoxAction] { VoxAction.all(self) }
+}
+
+extension VoxAction {
+    /// Every action, in menu order (M-21), with the M-20 keys: of `node`, or, before a node is
+    /// attached, each listed and none enabled. The menus are never empty: SwiftUI leaves out a
+    /// menu that is empty when the app opens and does not bring it back later, and the File menu
+    /// went missing that way.
+    @MainActor static func all(_ node: NodeModel?) -> [VoxAction] {
+        let live = node != nil
+        let inRoom = node?.roomOnScreen != nil
         let digits: [VoxAction] = (1...9).map { n in
-            VoxAction("View", "Room \(n)", KeyEquivalent(Character("\(n)"))) {
-                Task { await self.showRoom(at: n) }
+            VoxAction("View", "Room \(n)", KeyEquivalent(Character("\(n)")), enabled: live) {
+                Task { await node?.showRoom(at: n) }
             }
         }
         return [
-            VoxAction("File", "New Room…", "n") { self.sheet = .newRoom },
-            VoxAction("File", "Join Room…", "j", [.command, .shift]) { self.sheet = .joinRoom },
-            VoxAction("File", "Attach File…", "o", enabled: inRoom) { self.attachAsked += 1 },
+            VoxAction("File", "New Room…", "n", enabled: live) { node?.sheet = .newRoom },
+            VoxAction("File", "Join Room…", "j", [.command, .shift], enabled: live) {
+                node?.sheet = .joinRoom
+            },
+            VoxAction("File", "Attach File…", "o", enabled: inRoom) { node?.attachAsked += 1 },
             VoxAction("Room", "Copy Room Link", "l", enabled: inRoom) {
-                Task { await self.copyRoomLink() }
+                Task { await node?.copyRoomLink() }
             },
-            VoxAction("Room", "Retention…", enabled: inRoom) { self.sheet = .retention },
-            VoxAction("Room", "Admins…", enabled: inRoom) { self.sheet = .admins },
+            VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
+            VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
             VoxAction("Room", "Reply to Selected Message", "r",
-                      enabled: inRoom && selectedMessage != nil) {
-                self.replyTo = self.messages.first { $0.id == self.selectedMessage }
+                      enabled: inRoom && node?.selectedMessage != nil) {
+                node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
-            VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { self.urgentAsked += 1 },
+            VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { node?.urgentAsked += 1 },
             VoxAction("Room", "Copy Selected Service's Command", "c", [.command, .shift],
-                      enabled: selectedService != nil) { self.copyServiceCommand() },
-            VoxAction("Room", "Next Room That Needs You", "j") {
-                Task { await self.nextNeedingYou() }
+                      enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
+            VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
+                Task { await node?.nextNeedingYou() }
             },
-            VoxAction("Room", "Leave…", enabled: inRoom) { self.sheet = .leave },
-            VoxAction("Room", "End for Everyone…", enabled: inRoom) { self.sheet = .end },
-            VoxAction("Node", "Show Fingerprint", "i") { self.sheet = .fingerprint },
-            VoxAction("Keyring", "Add…") { Task { await self.show(.keyring) } },
-            VoxAction("Keyring", "Compare…") { Task { await self.show(.keyring) } },
-            VoxAction("Keyring", "Rename…") { Task { await self.show(.keyring) } },
-            VoxAction("Keyring", "Remove…") { Task { await self.show(.keyring) } },
-            VoxAction("View", "Command Palette", "k") { self.sheet = .palette },
-            VoxAction("View", "Room", enabled: inRoom) { self.showLanes = false },
-            VoxAction("View", "Lanes", "l", [.command, .shift], enabled: inRoom && roomHasAgents) {
-                self.showLanes = true
+            VoxAction("Room", "Leave…", enabled: inRoom) { node?.sheet = .leave },
+            VoxAction("Room", "End for Everyone…", enabled: inRoom) { node?.sheet = .end },
+            VoxAction("Node", "Show Fingerprint", "i", enabled: live) { node?.sheet = .fingerprint },
+            VoxAction("Keyring", "Add…", enabled: live) { Task { await node?.show(.keyring) } },
+            VoxAction("Keyring", "Compare…", enabled: live) { Task { await node?.show(.keyring) } },
+            VoxAction("Keyring", "Rename…", enabled: live) { Task { await node?.show(.keyring) } },
+            VoxAction("Keyring", "Remove…", enabled: live) { Task { await node?.show(.keyring) } },
+            VoxAction("View", "Command Palette", "k", enabled: live) { node?.sheet = .palette },
+            VoxAction("View", "Room", enabled: inRoom) { node?.showLanes = false },
+            VoxAction("View", "Lanes", "l", [.command, .shift],
+                      enabled: inRoom && node?.roomHasAgents == true) {
+                node?.showLanes = true
             },
-            VoxAction("View", "Keyring", "k", [.command, .shift]) {
-                Task { await self.show(.keyring) }
+            VoxAction("View", "Keyring", "k", [.command, .shift], enabled: live) {
+                Task { await node?.show(.keyring) }
             },
-            VoxAction("View", "Decision Record", "d", [.command, .shift]) {
-                Task { await self.show(.decisions) }
+            VoxAction("View", "Decision Record", "d", [.command, .shift], enabled: live) {
+                Task { await node?.show(.decisions) }
             },
         ] + digits
     }
@@ -100,13 +112,33 @@ struct VoxCommands: Commands {
     @ViewBuilder
     private func items(_ menu: String) -> some View {
         if let node = app.node {
-            ForEach(node.actions().filter { $0.menu == menu }) { action in
-                let button = Button(action.title) { action.run() }.disabled(!action.enabled)
-                if let key = action.key {
-                    button.keyboardShortcut(key, modifiers: action.modifiers)
-                } else {
-                    button
-                }
+            NodeMenuItems(node: node, menu: menu)
+        } else {
+            MenuItems(actions: VoxAction.all(nil), menu: menu)
+        }
+    }
+}
+
+/// A menu's items of an attached node, kept current as the node changes (a room shown, a message
+/// selected).
+private struct NodeMenuItems: View {
+    @ObservedObject var node: NodeModel
+    let menu: String
+
+    var body: some View { MenuItems(actions: node.actions(), menu: menu) }
+}
+
+private struct MenuItems: View {
+    let actions: [VoxAction]
+    let menu: String
+
+    var body: some View {
+        ForEach(actions.filter { $0.menu == menu }) { action in
+            let button = Button(action.title) { action.run() }.disabled(!action.enabled)
+            if let key = action.key {
+                button.keyboardShortcut(key, modifiers: action.modifiers)
+            } else {
+                button
             }
         }
     }
