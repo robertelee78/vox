@@ -48,14 +48,37 @@ pub fn equivocation_notice(name: &str, seq: u64) -> String {
     )
 }
 
-/// A member's name where the keyring is known: the petname the operator gave it, or its
-/// fingerprint at [`AUTHOR_CHARS`] followed by [`NOT_IN_KEYRING`].
+/// How many fingerprint characters follow an alias that another node's alias equals but for case.
+pub const CLASH_SUFFIX: usize = 6;
+
+/// `fp`'s alias as a person reads it (ADR-028 K-4): the alias, and, when another node in the
+/// keyring has the same alias but for case ("Ann" and "ann"), `#` and the first [`CLASH_SUFFIX`]
+/// characters of the fingerprint, so the two are never taken for one. `None` when `fp` has no
+/// alias.
+#[must_use]
+pub fn alias_of(trusted: &[(Digest32, String)], fp: &Digest32) -> Option<String> {
+    let (_, alias) = trusted.iter().find(|(id, _)| id == fp)?;
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return None;
+    }
+    let clash = trusted
+        .iter()
+        .any(|(id, other)| id != fp && other.trim().to_lowercase() == alias.to_lowercase());
+    Some(if clash {
+        let mut suffix = b32_encode(fp);
+        suffix.truncate(CLASH_SUFFIX);
+        format!("{alias}#{suffix}")
+    } else {
+        alias.to_owned()
+    })
+}
+
+/// A member's name where the keyring is known: its alias ([`alias_of`]), or its fingerprint at
+/// [`AUTHOR_CHARS`] followed by [`NOT_IN_KEYRING`].
 #[must_use]
 pub fn member_name(trusted: &[(Digest32, String)], fp: &Digest32) -> String {
-    match trusted.iter().find(|(id, _)| id == fp) {
-        Some((_, petname)) if !petname.trim().is_empty() => petname.clone(),
-        _ => format!("{} {NOT_IN_KEYRING}", author_id(fp)),
-    }
+    alias_of(trusted, fp).unwrap_or_else(|| format!("{} {NOT_IN_KEYRING}", author_id(fp)))
 }
 
 /// This process's copy of the node's names for its members: `(fingerprint, name)`.
@@ -118,11 +141,9 @@ pub fn author_for(trusted: &[(Digest32, String)], me: Option<&Digest32>, fp: &Di
 /// [`name_of`] against `trusted`.
 #[must_use]
 pub fn name_in(trusted: &[(Digest32, String)], fp: &Digest32) -> String {
-    match trusted.iter().find(|(id, _)| id == fp) {
-        Some((_, n)) if !n.trim().is_empty() => {
-            vox_agentcomms::envelope::shown(n.trim(), vox_agentcomms::envelope::SHOWN_NAME)
-        }
-        _ => author_id(fp),
+    match alias_of(trusted, fp) {
+        Some(n) => vox_agentcomms::envelope::shown(&n, vox_agentcomms::envelope::SHOWN_NAME),
+        None => author_id(fp),
     }
 }
 
@@ -203,6 +224,76 @@ pub fn resolve_member(
             many.len()
         )),
     }
+}
+
+/// Who `text`, typed in the TUI's composer, addresses (ADR-028 K-4): each `@alias` resolved to
+/// the whole fingerprint of the room member it names, as `to` carries it. An alias is matched
+/// exactly first, then without regard to case; `@alias#abc123` picks among nodes whose aliases
+/// differ only by case, by the start of the fingerprint, as their names are shown. Punctuation
+/// after the alias (`@ann,`) is not part of it.
+///
+/// # Errors
+/// A sentence saying which `@alias` names no member of the room, or more than one.
+pub fn addressed_in(
+    text: &str,
+    members: &[Digest32],
+    trusted: &[(Digest32, String)],
+) -> Result<Vec<String>, String> {
+    let mut to: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let Some(at) = word.strip_prefix('@') else {
+            continue;
+        };
+        let at = at.trim_end_matches(|c: char| ",.;:!?)".contains(c));
+        if at.is_empty() {
+            continue;
+        }
+        let (alias, prefix) = match at.split_once('#') {
+            Some((a, p)) => (a, Some(p.to_ascii_lowercase())),
+            None => (at, None),
+        };
+        let fits = |fp: &Digest32| {
+            prefix
+                .as_ref()
+                .is_none_or(|p| b32_encode(fp).starts_with(p))
+        };
+        let exact: Vec<Digest32> = trusted
+            .iter()
+            .filter(|(fp, n)| n.trim() == alias && fits(fp))
+            .map(|(fp, _)| *fp)
+            .collect();
+        let named = if exact.len() == 1 {
+            exact
+        } else {
+            trusted
+                .iter()
+                .filter(|(fp, n)| n.trim().to_lowercase() == alias.to_lowercase() && fits(fp))
+                .map(|(fp, _)| *fp)
+                .collect()
+        };
+        let fp = match named.as_slice() {
+            [fp] => *fp,
+            [] => return Err(format!("no node in your keyring is called @{at}")),
+            many => {
+                let said: Vec<String> = many
+                    .iter()
+                    .map(|fp| format!("@{}", alias_of(trusted, fp).unwrap_or_default()))
+                    .collect();
+                return Err(format!(
+                    "@{at} could be {}: write the one you mean",
+                    said.join(" or ")
+                ));
+            }
+        };
+        if !members.contains(&fp) {
+            return Err(format!("@{at} is not a member of this room"));
+        }
+        let fp = b32_encode(&fp);
+        if !to.contains(&fp) {
+            to.push(fp);
+        }
+    }
+    Ok(to)
 }
 
 /// The node one entry of an envelope's `to` names: a whole fingerprint, written exactly as

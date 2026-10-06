@@ -366,6 +366,27 @@ impl UiState {
                     let Some(channel_id) = self.active_channel_id(vm) else {
                         return Action::Redraw;
                     };
+                    // `@alias` addresses a member (ADR-028 K-4): the whole fingerprint goes into
+                    // `to`. One that names nobody, or more than one, keeps the text to fix.
+                    let members: Vec<Digest32> = vm
+                        .active
+                        .as_ref()
+                        .map(|c| c.members.iter().map(|m| m.id).collect())
+                        .unwrap_or_default();
+                    let to = match crate::ident::addressed_in(&text, &members, &vm.keyring) {
+                        Ok(to) => to,
+                        Err(why) => {
+                            self.status_message = Some(why);
+                            return Action::Redraw;
+                        }
+                    };
+                    let text = if to.is_empty() {
+                        text
+                    } else {
+                        let mut e = vox_agentcomms::envelope::Envelope::say(&text);
+                        e.to = to;
+                        e.to_text()
+                    };
                     self.composer.clear();
                     return Action::Dispatch(Command::SendText { channel_id, text });
                 }

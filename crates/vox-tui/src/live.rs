@@ -1114,10 +1114,8 @@ impl DaemonCore {
                                 nickname: if is_me {
                                     "you".to_owned()
                                 } else {
-                                    match snap.trusted.iter().find(|(t, _)| t == m) {
-                                        Some((_, name)) if !name.trim().is_empty() => name.clone(),
-                                        _ => crate::ident::author_id(m),
-                                    }
+                                    crate::ident::alias_of(&snap.trusted, m)
+                                        .unwrap_or_else(|| crate::ident::author_id(m))
                                 },
                                 // Off the keyring and the room's log: this node releases its key
                                 // only to a member its keyring trusts (V210-148), and takes a
