@@ -411,9 +411,15 @@ private struct LinkCardView: View {
             VStack(alignment: .leading, spacing: 2) {
                 if !card.title.isEmpty { Text(card.title).fontWeight(.bold) }
                 if !card.description.isEmpty { Text(card.description).secondaryText().lineLimit(3) }
-                if let url = URL(string: card.url) {
+                // Clickable only for http and https (a whitelist): the link is the peer's, and any
+                // other scheme (file:, an app's own) is drawn as text, never opened.
+                if let url = URL(string: card.url),
+                   ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
                     Link(card.url, destination: url).font(Theme.eyebrow).lineLimit(1)
                         .truncationMode(.middle)
+                } else {
+                    Text(card.url).font(Theme.eyebrow).lineLimit(1).truncationMode(.middle)
+                        .textSelection(.enabled)
                 }
             }
         }
