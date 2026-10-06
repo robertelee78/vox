@@ -72,6 +72,10 @@ private struct LoginItemQuestion: View {
         Text("Vox keeps your rooms reachable while you are logged in, even with the app closed.")
             .secondaryText()
             .accessibilityIdentifier("login-item-why")
+        // M-22: offered here, at first run, and off unless the person turns it on.
+        Toggle("Show Vox in the menu bar", isOn: Binding(get: { model.menuBar },
+                                                         set: { model.menuBar = $0 }))
+            .accessibilityIdentifier("menu-bar-offer")
         HStack {
             Button("Keep Running") { Task { await model.answerLoginItem(keep: true) } }
                 .keyboardShortcut(.defaultAction)

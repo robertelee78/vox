@@ -440,3 +440,43 @@ private final class Listener: ClientListener, @unchecked Sendable {
         Task { @MainActor [weak model] in model?.stopped(text) }
     }
 }
+
+// The menu bar extra's facts (M-22, A-3), here for the client they are read with.
+extension NodeModel {
+    /// The services shared to this node, its own shares and its live tunnels, across its rooms.
+    func menuBarFacts() async -> MenuBarFacts {
+        var facts = MenuBarFacts()
+        for room in rooms where room.open {
+            if let listed = try? await client.services(room: room.id) {
+                facts.services += listed.shared.filter { $0.by != "you" }
+                    .map { .init(address: $0.address, by: $0.by) }
+            }
+            if let mine = try? await client.shares(room: room.id) {
+                facts.shares += mine.map {
+                    .init(room: room.id, roomName: room.name, name: $0.name, tag: $0.tag)
+                }
+            }
+        }
+        if let report = try? await client.status(),
+           let json = try? JSONSerialization.jsonObject(with: Data(report.utf8)) as? [String: Any],
+           let tunnels = json["tunnels"] as? [[String: Any]] {
+            let names = Dictionary(trusted.map { ($0.fingerprint, $0.name) }) { a, _ in a }
+            facts.tunnels = tunnels.compactMap { t in
+                guard let id = t["id"] as? Int, let peer = t["peer"] as? String,
+                      let service = t["service"] as? String else { return nil }
+                return .init(id: id, peer: names[peer] ?? String(peer.prefix(12)), service: service,
+                             outbound: (t["direction"] as? String) == "out")
+            }
+        }
+        return facts
+    }
+
+    /// Stop one of this node's shares.
+    func stopShare(_ share: MenuBarFacts.Share) async {
+        do {
+            _ = try await client.shareStop(room: share.room, selector: share.tag)
+        } catch {
+            said = sentence(error)
+        }
+    }
+}

@@ -26,6 +26,10 @@ final class AppModel: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .starting
+    /// Whether the menu bar extra is shown: off until the person turns it on (M-22).
+    @Published var menuBar = MenuBarChoice.on() {
+        didSet { MenuBarChoice.set(menuBar) }
+    }
     /// The node acted as, once attached: what the main window shows.
     @Published private(set) var node: NodeModel?
     private var client: VoxClient?
