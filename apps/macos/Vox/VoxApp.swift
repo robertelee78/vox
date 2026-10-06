@@ -40,8 +40,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             source.resume()
             stops.append(source)
         }
+        // The Finder Services item (M-24).
+        services = ServicesProvider(app: model)
+        NSApp.servicesProvider = services
         Task { await model.start() }
     }
+
+    private var services: ServicesProvider?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true

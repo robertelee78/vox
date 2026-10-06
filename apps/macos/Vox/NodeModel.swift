@@ -57,6 +57,12 @@ final class NodeModel: ObservableObject {
     @Published private(set) var messages: [RoomMessage] = []
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
+    /// Where this node's verified copy of each share it pulled in the room on screen is, by the
+    /// share's message id (ADR-028 F-3, F-4): what its card opens with Quick Look.
+    @Published private(set) var pulled: [String: String] = [:]
+    /// A file handed to Vox from elsewhere (the Finder Services item, M-24), waiting for the room
+    /// on screen to take it: its To: and note are asked there.
+    @Published var incoming: URL?
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
     /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
@@ -274,6 +280,20 @@ final class NodeModel: ObservableObject {
         await show(.room(room.id))
     }
 
+    /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
+    /// fingerprints; none: the room) with `note`, in one message (ADR-028 F-1). Whether it was.
+    func attach(_ url: URL, to: [String], note: String) async -> Bool {
+        guard case let .room(id) = selection else { return false }
+        do {
+            _ = try await client.share(room: id, path: url.path, to: to, note: note, re: "",
+                                       urgent: false, count: 0, forSecs: 0)
+            return true
+        } catch {
+            said = sentence(error)
+            return false
+        }
+    }
+
     /// Post `text` to the room on screen.
     func post(_ text: String) async {
         guard case let .room(id) = selection else { return }
@@ -323,6 +343,9 @@ final class NodeModel: ObservableObject {
                 guard let self, case .room(room) = self.selection else { return }
                 if let reads = try? await self.client.readBy(room: room) {
                     self.readBy = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
+                }
+                if let copies = try? await self.client.pulled(room: room) {
+                    self.pulled = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }

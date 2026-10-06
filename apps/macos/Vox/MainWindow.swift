@@ -103,6 +103,10 @@ private struct RoomView: View {
     let room: String
     @State private var draft = ""
     @StateObject private var window = WindowSeen()
+    /// A file dropped, pasted or chosen, waiting for its To: and note.
+    @State private var attaching: Attaching?
+    /// The pulled copy Quick Look shows.
+    @State private var looking: URL?
     /// The rows inside the visible part of the timeline, as last measured.
     @State private var inView: Set<String> = []
 
@@ -127,7 +131,8 @@ private struct RoomView: View {
                             LazyVStack(alignment: .leading, spacing: 10) {
                                 ForEach(model.messages, id: \.id) { message in
                                     MessageRow(message: message, me: model.me,
-                                               readBy: model.readBy[message.id] ?? [])
+                                               readBy: model.readBy[message.id] ?? [],
+                                               pulled: model.pulled[message.id]) { looking = $0 }
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         .reportsFrame(of: message.id)
                                         .id(message.id)
@@ -154,16 +159,51 @@ private struct RoomView: View {
                 }
                 .background(WindowReader(seen: window))
                 .onChange(of: window.seen) { _ in markSeen() }
-                Divider()
-                TextField("Say something to the room", text: $draft)
-                    .textFieldStyle(.plain)
-                    .padding(12)
-                    .onSubmit {
-                        let text = draft
-                        draft = ""
-                        Task { await model.post(text) }
+                // A file dropped on the timeline, or pasted into it, is attached (M-24, F-1).
+                .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                    firstFile(in: providers) { attaching = Attaching(url: $0) }
+                }
+                .onPasteCommand(of: [.fileURL]) { providers in
+                    _ = firstFile(in: providers) { attaching = Attaching(url: $0) }
+                }
+                .accessibilityIdentifier("timeline")
+                .sheet(item: $attaching) { file in
+                    AttachSheet(model: model, file: file) { attaching = nil }
+                }
+                .quickLookPreview($looking)
+                .onChange(of: model.incoming) { url in
+                    if let url {
+                        attaching = Attaching(url: url)
+                        model.incoming = nil
                     }
-                    .accessibilityIdentifier("compose")
+                }
+                .onAppear {
+                    if let url = model.incoming {
+                        attaching = Attaching(url: url)
+                        model.incoming = nil
+                    }
+                }
+                Divider()
+                HStack(spacing: 8) {
+                    Button {
+                        if let url = chooseFile() { attaching = Attaching(url: url) }
+                    } label: {
+                        Image(systemName: "paperclip")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Attach a file or folder")
+                    .accessibilityLabel("Attach a file or folder")
+                    .accessibilityIdentifier("attach")
+                    TextField("Say something to the room", text: $draft)
+                        .textFieldStyle(.plain)
+                        .onSubmit {
+                            let text = draft
+                            draft = ""
+                            Task { await model.post(text) }
+                        }
+                        .accessibilityIdentifier("compose")
+                }
+                .padding(12)
             }
             Divider()
             Inspector(model: model, room: room)
@@ -186,6 +226,10 @@ private struct MessageRow: View {
     let me: String
     /// Who has read it, when it is this node's own (R-6).
     let readBy: [String]
+    /// Where this node's verified copy of the file it shares is, once pulled.
+    let pulled: String?
+    /// Open a pulled copy with Quick Look.
+    let look: (URL) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -200,7 +244,7 @@ private struct MessageRow: View {
                 }
             }
             if let file = message.file {
-                FileCard(file: file)
+                FileCard(file: file, pulled: pulled, look: look)
             }
             if message.file == nil || !(message.file?.note.isEmpty ?? true) {
                 Text(message.owed ? "not received yet" : shownText)
@@ -228,6 +272,9 @@ private struct MessageRow: View {
 /// signed announcement states them.
 private struct FileCard: View {
     let file: FileOffer
+    /// This node's verified copy, once pulled (F-3, F-4).
+    let pulled: String?
+    let look: (URL) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -239,11 +286,22 @@ private struct FileCard: View {
                 Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
                     + "  ·  sha256 \(file.sha256.prefix(16))…")
                     .font(Theme.mono).secondaryText()
+                if let pulled {
+                    // Opened only once verified: a copy is linked into place only after its size
+                    // and SHA-256 matched the signed announcement (F-11).
+                    HStack {
+                        Button("Quick Look") { look(URL(fileURLWithPath: pulled)) }
+                            .accessibilityIdentifier("quick-look-\(file.name)")
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: pulled)])
+                        }
+                    }
+                }
             }
         }
         .padding(8)
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
-        .accessibilityElement(children: .ignore)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("file-\(file.name)")
         .accessibilityLabel("\(file.folder ? "folder" : "file") \(file.name), \(file.size) bytes")
     }

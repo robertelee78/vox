@@ -22,12 +22,16 @@
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
 //    removing it says what untrusting does first, and only then removes it.
-// 6. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
+//    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
+//    in the share's announcement, never a message of its own.
+// 7. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (6) goes red. A room with a message
+// place of the app's hold), and quitting leaves it attached: (7) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
-// the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red.
+// the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
+// of its own: (6) goes red.
 
 import XCTest
 
@@ -290,7 +294,43 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: once untrusted, carol must be gone from the keyring view and from `vox trust list`; it said: \(after5)")
         print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
 
-        // (6) Quitting detaches it.
+        // (6) Attach a file to the room, To: bob, with a note.
+        ui.descendants(matching: .any)["room-mission"].click()
+        let file = scratch.appendingPathComponent("for-bob.bin")
+        let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
+        try bytes.write(to: file)
+        let attachButton = ui.buttons["attach"]
+        XCTAssertTrue(attachButton.waitForExistence(timeout: 10), "PRODUCT: the room offers no Attach")
+        attachButton.click()
+        // The open panel: go to the file's path, then Attach.
+        ui.typeKey("g", modifierFlags: [.command, .shift])
+        ui.typeText(file.path + "\r")
+        let choose = ui.buttons["Attach"].firstMatch
+        XCTAssertTrue(choose.waitForExistence(timeout: 10), "APPARATUS: the open panel did not show")
+        choose.click()
+        let toBob = ui.descendants(matching: .any)["attach-to-bob"]
+        XCTAssertTrue(toBob.waitForExistence(timeout: 10), "PRODUCT: attaching a file asks no To:")
+        toBob.click()
+        let noteField = ui.textFields["attach-note"]
+        noteField.click()
+        noteField.typeText("FOR-BOB-NOTE")
+        ui.buttons["attach-send"].click()
+        let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(room)/for-bob.bin")
+        var pulledBytes: Data?
+        let pullUntil = Date().addingTimeInterval(120)
+        while Date() < pullUntil && pulledBytes == nil {
+            pulledBytes = try? Data(contentsOf: bobCopy)
+            if pulledBytes == nil { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        XCTAssertEqual(pulledBytes, bytes,
+                       "PRODUCT: a file attached To: bob must be pulled by bob's node, byte for byte, into \(bobCopy.path); it holds \(pulledBytes?.count ?? -1) bytes")
+        let bobRows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            .split(separator: "\n").filter { $0.contains("FOR-BOB-NOTE") }
+        XCTAssertTrue(bobRows.count == 1 && bobRows[0].contains("for-bob.bin"),
+                      "PRODUCT: the note must travel in the share itself, as one message; bob's `vox room read --json` has \(bobRows.count) row(s) with it: \(bobRows)")
+        print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
+
+        // (7) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
