@@ -6,7 +6,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 M24.1–M24.5 (#154–#158, all closed). The code is `crates/vox-core/src/transport/congestion.rs`
 (`VoxCubic`, `PathSignals`, `IdleRestart`), `taper.rs` (the tier switch) and `vox_bbr.rs`
 (`VoxBbr`). `quic.rs` installs `IdleRestartConfig`, which wraps `taper::Tapered`, on every
-connection. The proof is `perf_r41_tunnel_throughput_proof` and its ADR-024 arms (`taper_arms`).
+connection. Receiver overflow (RO-1–RO-7) is `overflow.rs`, `crates/vox-sockdrops`, and the skip
+and undo in `taper.rs`. The proof is `perf_r41_tunnel_throughput_proof`, its ADR-024 arms
+(`taper_arms`) and its R41a arm.
 Not built: no race against kernel TCP (TC-2). The cases under "Known limits" are unmeasured.
 **Date**: 2026-09-25
 **Deciders**: Robert E. Lee <robert@agidreams.us>
@@ -177,6 +179,47 @@ evidence either way.
   with it: the next transfer starts in tier 1.
 - **IR-2.** The tier-3 lockout MUST survive an idle restart (`Tier3Backoff`).
 
+### Receiver overflow (R41a, #218)
+
+A receiver behind a short socket buffer that stops reading for a moment overflows its own socket,
+and its sender's tier 1 read every such loss as congestion: with a 416 KiB buffer (a container on
+a host that keeps Linux's default `net.core.rmem_max`) and the receiver stopped 20 ms in every
+100 ms, R41's WAN arm carried 9–10% of raw. The path was never congested.
+
+- **RO-1 (the count).** A receiver MUST read its endpoint socket's own drop count (Linux
+  `SO_MEMINFO`, `SK_MEMINFO_DROPS`), every `SAMPLE_EVERY` (5 ms) while the socket is receiving and
+  never while it is idle. The read MUST be the one `getsockopt` in `crates/vox-sockdrops`, the only
+  Vox crate that allows `unsafe`. Where the kernel keeps no per-socket count (macOS), nothing MUST
+  be read or sent, and nothing changes.
+- **RO-2 (the wire).** The count MUST travel in a QUIC DATAGRAM on flow `3`, a unidirectional
+  stream id that no flow can bind: `varint 3 ‖ varint 0 ‖ varint epoch ‖ varint drops`. `epoch` is
+  drawn at random when the socket is bound; `drops` is the cumulative count. Any other kind on flow
+  3 MUST be dropped and counted as an unknown flow.
+- **RO-3 (who is told).** Each direct connection MUST send its peer the count when it has changed
+  and the peer has sent on that connection since the last report. A connection over a relay
+  circuit MUST NOT send one.
+- **RO-4 (credit).** A report's increase over the last report of the same epoch, in packets, is
+  credit, filed in the connection's `OverflowLedger`. Credit MUST expire one smoothed round trip
+  after it arrives, never sooner than `CREDIT_FLOOR` (10 ms).
+- **RO-5 (skip and undo).** A loss of packets in tier 1 or 2, not persistent congestion, with no
+  queue building (SG-2), whose packets (lost bytes over the path MTU, rounded up) the credit covers
+  MUST cost no cut. A cut whose loss the credit covers within one smoothed round trip of the cut
+  MUST be undone: window, slow-start threshold, Cubic's curve and HyStart++'s phase restored to just
+  before it, its recovery period kept, never to a window lower than the current one. Credit MUST be
+  spent oldest first, all or nothing per loss. An ECN mark, persistent congestion, a loss with a
+  queue building and any loss in tier 3 MUST NOT be covered.
+- **RO-6 (signals).** A covered loss MUST be taken out of `PathSignals` (the loss share, the cap,
+  the trend and the climb counts), so overflow neither climbs a tier nor holds one.
+- **RO-7 (status).** `vox status --json` MUST give each peer's `overflow`: reports sent and
+  received, unspent credit, cuts skipped and cuts undone.
+
+Known limits: one socket serves every peer, so an overflow is reported to each active sender and
+each may spend it on its own losses; a covered loss that coincided with congestion showing no queue
+is forgiven. A receiver can claim overflow it did not have and so keep its sender from cutting
+toward it; persistent congestion still cuts. Where receive offload (GRO) coalesces datagrams, one
+drop counts one, so credit is short and Vox falls back toward cutting. Neither bound is measurable
+by a speed arm (SP-4); both are review-checked.
+
 ### Proof (M24.2, R41)
 
 - **PR-1.** Each arm MUST be driven through the shipped binary and judged by the speed a person
@@ -224,6 +267,11 @@ evidence either way.
   - The changing arms MUST hold as PR-5 states.
   - No switch between tiers MAY stall a transfer.
   - Every proof MUST drive the shipped binary and be mutation-checked.
+- **PR-13 (R41a).** On Linux, at 1 Gbit/s and 50 ms, with the receiving host granted 416 KiB
+  (`VOX_TEST_UDP_RCVBUF_CAP`) and its daemon stopped 20 ms in every 100 ms, the tunnel MUST carry at
+  least `STALLED_FLOOR` (50%) of raw TCP through the same stalls. It is CANNOT MEASURE off Linux,
+  when the short buffer was not granted, when the kernel counted no receive overflow, or when the
+  stopper or the emulator ran late.
 - **PR-12 (opt-in).** R41 is a heavy proof. It is opt-in behind the cargo feature `optional-proofs`
   (#301) and listed in `docs/release/optional-proofs.md`. It MUST NOT be part of every build, CI run
   or release run (ADR-018). Without the feature, a stand-in MUST say it was not run.

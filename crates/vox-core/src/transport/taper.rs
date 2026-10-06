@@ -81,7 +81,10 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerMetrics};
 use quinn_proto::RttEstimator;
 
-use super::congestion::{PathSignals, VoxCubic, GENTLE_LOSS_CAP, TREND_BYTES};
+use std::sync::Arc;
+
+use super::congestion::{CutState, PathSignals, VoxCubic, GENTLE_LOSS_CAP, TREND_BYTES};
+use super::overflow::{OverflowLedger, CREDIT_FLOOR, PENDING_MAX};
 use super::vox_bbr::{RateSeed, VoxBbr};
 
 /// The rounds a climb from tier 1 looks back over…
@@ -248,11 +251,28 @@ pub(crate) struct Tapered {
     queued: Streak,
     quiet: Streak,
     loss_gone: Streak,
+    /// The peer's overflow reports (ADR-024 RO-4), and the losses still waiting for one to cover
+    /// them, oldest first.
+    ledger: Arc<OverflowLedger>,
+    pending: std::collections::VecDeque<Pending>,
+}
+
+/// A loss the receiver may yet report as its own socket's overflow (ADR-024 RO-5): when it came,
+/// how many packets it was, the round [`PathSignals`] filed it in and how, and the window before
+/// the cut it cost, if it cost one.
+#[derive(Debug, Clone)]
+struct Pending {
+    at: Instant,
+    packets: u64,
+    round: u64,
+    lost_bytes: u64,
+    congestion: bool,
+    before: Option<CutState>,
 }
 
 impl Tapered {
     /// A connection's controller: tier 1, Cubic in slow start.
-    pub(crate) fn new(now: Instant, current_mtu: u16) -> Self {
+    pub(crate) fn new(now: Instant, current_mtu: u16, ledger: Arc<OverflowLedger>) -> Self {
         Self {
             tier_id: TierId::One,
             tier: Tier::Cubic(VoxCubic::new(now, current_mtu)),
@@ -271,6 +291,8 @@ impl Tapered {
             queued: Streak::default(),
             quiet: Streak::default(),
             loss_gone: Streak::default(),
+            ledger,
+            pending: std::collections::VecDeque::new(),
         }
     }
 
@@ -280,10 +302,43 @@ impl Tapered {
         now: Instant,
         current_mtu: u16,
         backoff: Tier3Backoff,
+        ledger: Arc<OverflowLedger>,
     ) -> Self {
-        let mut tapered = Self::new(now, current_mtu);
+        let mut tapered = Self::new(now, current_mtu, ledger);
         tapered.backoff = backoff;
         tapered
+    }
+
+    /// How long a report's credit stays good: one smoothed round trip, never under
+    /// [`CREDIT_FLOOR`] (ADR-024 RO-4).
+    fn credit_life(&self) -> Duration {
+        self.signals.srtt().max(CREDIT_FLOOR)
+    }
+
+    /// Spend the peer's overflow reports on the losses waiting for them, oldest first (ADR-024
+    /// RO-5, RO-6): each one covered within a round trip is taken out of the path signals, and the
+    /// cut it cost is undone. One older than that is let go: its cut stands.
+    fn settle_pending(&mut self, now: Instant) {
+        let life = self.credit_life();
+        while self
+            .pending
+            .front()
+            .is_some_and(|p| now.saturating_duration_since(p.at) > life)
+        {
+            self.pending.pop_front();
+        }
+        while let Some(p) = self.pending.front() {
+            if !self.ledger.take(p.packets, now, life) {
+                break;
+            }
+            let p = self.pending.pop_front().unwrap_or_else(|| unreachable!());
+            self.signals.forgive(p.round, p.lost_bytes, p.congestion);
+            if let (Some(before), Tier::Cubic(cubic)) = (&p.before, &mut self.tier) {
+                if cubic.undo_cut(before) {
+                    self.ledger.note_undone();
+                }
+            }
+        }
     }
 
     /// The tier-3 lockout, for an idle restart to hand on.
@@ -442,6 +497,10 @@ impl Tapered {
         };
         if let Some(tier) = replacement {
             self.tier = tier;
+            // A cut taken in the tier just left belongs to it: nothing is undone into another.
+            for p in &mut self.pending {
+                p.before = None;
+            }
         }
         if let Tier::Cubic(cubic) = &mut self.tier {
             cubic.set_loss_aware(to != TierId::One);
@@ -532,6 +591,11 @@ impl Controller for Tapered {
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
     ) {
+        // A report that has come since the last batch is spent before this batch's round is
+        // judged, so overflow neither climbs a tier nor holds one (RO-6).
+        if !self.pending.is_empty() {
+            self.settle_pending(now);
+        }
         let rounds = self.signals.rounds();
         self.signals
             .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
@@ -553,13 +617,43 @@ impl Controller for Tapered {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
+        // **The receiver's own overflow is not congestion** (ADR-024 RO-5). Only a loss of packets
+        // (not an ECN mark), not persistent congestion, in a Cubic tier, and with no queue
+        // building may be covered by a report: a queue says the path is congested, whatever the
+        // receiver's socket did.
+        let coverable = lost_bytes > 0
+            && !is_persistent_congestion
+            && matches!(self.tier, Tier::Cubic(_))
+            && !self.signals.queue_building();
+        let packets = lost_bytes.div_ceil(u64::from(self.mtu).max(1));
+        if coverable && self.ledger.take(packets, now, self.credit_life()) {
+            // Reported before it was seen: it costs no cut and is not recorded at all.
+            self.ledger.note_skipped();
+            return;
+        }
         // PathSignals judges whether this loss is congestion, in one place for every tier.
+        let round = self.signals.round_now();
         let congestion = self
             .signals
             .on_loss(now, lost_bytes, is_persistent_congestion);
         match &mut self.tier {
             Tier::Cubic(cubic) => {
-                cubic.on_loss(now, sent, is_persistent_congestion, lost_bytes, congestion)
+                let before = cubic.cut_state();
+                let cut =
+                    cubic.on_loss(now, sent, is_persistent_congestion, lost_bytes, congestion);
+                if coverable {
+                    if self.pending.len() == PENDING_MAX {
+                        self.pending.pop_front();
+                    }
+                    self.pending.push_back(Pending {
+                        at: now,
+                        packets,
+                        round,
+                        lost_bytes,
+                        congestion,
+                        before: cut.then_some(before),
+                    });
+                }
             }
             Tier::Bbr(bbr) => {
                 bbr.on_congestion_event(now, sent, is_persistent_congestion, lost_bytes)

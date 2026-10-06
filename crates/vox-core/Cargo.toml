@@ -12,6 +12,9 @@ repository.workspace = true
 # What a peer says in a connection close goes through the same sanitiser as an author's name
 # (V210-154).
 vox-text = { path = "../vox-text" }
+# A UDP socket's own drop count, for the receiver-overflow report (#218, ADR-024 RO-1): the one
+# getsockopt the safe dependencies do not offer, in the one crate that allows `unsafe`.
+vox-sockdrops = { path = "../vox-sockdrops" }
 # The structured-post index (V210-120) reads a body's `type`: generic JSON, no app vocabulary.
 serde_json.workspace = true
 sha2.workspace = true

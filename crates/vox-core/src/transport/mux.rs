@@ -151,6 +151,8 @@ pub struct MuxSocket {
     /// Whether the socket underneath is IPv6, and so what family a circuit's datagrams must be
     /// handed up in (see [`Self::as_seen`]).
     ipv6: bool,
+    /// See [`Self::received`].
+    received: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default)]
@@ -242,7 +244,14 @@ impl MuxSocket {
             origins: Mutex::new(HashMap::new()),
             carriers: Mutex::new(HashMap::new()),
             inbox: Mutex::new(Inbox::default()),
+            received: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// How many receive batches the real socket underneath has handed up so far (circuits' are not
+    /// counted): what tells the overflow sampler the socket is in use (ADR-024 RO-1).
+    pub(crate) fn received(&self) -> u64 {
+        self.received.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a circuit to `peer` at a freshly allocated address. An earlier circuit to the same
@@ -520,7 +529,12 @@ impl AsyncUdpSocket for MuxSocket {
             }
             inbox.waker = Some(cx.waker().clone());
         }
-        self.inner.poll_recv(cx, bufs, meta)
+        let got = self.inner.poll_recv(cx, bufs, meta);
+        if let Poll::Ready(Ok(n)) = &got {
+            self.received
+                .fetch_add(*n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        got
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {

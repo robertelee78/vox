@@ -39,6 +39,8 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 use quinn_proto::RttEstimator;
 
+use super::overflow::OverflowLedger;
+
 /// How long a connection must have sent nothing before its next send starts from a fresh
 /// controller. Long enough that the gaps inside one transfer (an application pausing between
 /// writes, a request/response exchange) never trigger it; short enough that a new transfer
@@ -56,13 +58,27 @@ pub struct IdleRestartConfig;
 
 impl ControllerFactory for IdleRestartConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let ledger = Arc::new(OverflowLedger::default());
         Box::new(IdleRestart {
-            inner: super::taper::Tapered::new(now, current_mtu),
+            inner: super::taper::Tapered::new(now, current_mtu, Arc::clone(&ledger)),
             mtu: current_mtu,
             last_sent: None,
             srtt: Duration::ZERO,
+            ledger,
         })
     }
+}
+
+/// The overflow ledger of `conn`'s congestion controller, when it is Vox's (ADR-024 RO-4): where
+/// the connection's datagram reader files the peer's overflow reports. Asked afresh each time,
+/// since quinn builds a new controller when a connection moves to a new path.
+#[must_use]
+pub fn overflow_ledger(conn: &quinn::Connection) -> Option<Arc<OverflowLedger>> {
+    conn.congestion_state()
+        .into_any()
+        .downcast::<IdleRestart>()
+        .ok()
+        .map(|r| Arc::clone(&r.ledger))
 }
 
 /// The tapered controller, rebuilt at tier 1 when the connection goes idle (keeping only its tier-3
@@ -72,6 +88,9 @@ struct IdleRestart {
     mtu: u16,
     last_sent: Option<Instant>,
     srtt: Duration,
+    /// The peer's overflow reports (ADR-024 RO-4): the connection's for its whole life, handed to
+    /// each controller an idle restart builds.
+    ledger: Arc<OverflowLedger>,
 }
 
 impl Controller for IdleRestart {
@@ -85,6 +104,7 @@ impl Controller for IdleRestart {
                 now,
                 self.mtu,
                 self.inner.tier3_backoff(),
+                Arc::clone(&self.ledger),
             );
         }
         self.last_sent = Some(now);
@@ -144,6 +164,7 @@ impl Controller for IdleRestart {
             mtu: self.mtu,
             last_sent: self.last_sent,
             srtt: self.srtt,
+            ledger: Arc::clone(&self.ledger),
         })
     }
 
@@ -206,6 +227,15 @@ enum Phase {
     SlowStart,
     Css { baseline: Duration, rounds: u32 },
     Done,
+}
+
+/// What [`VoxCubic::undo_cut`] restores: the window and the state a cut changed.
+#[derive(Debug, Clone)]
+pub(crate) struct CutState {
+    window: u64,
+    ssthresh: u64,
+    state: CubicState,
+    phase: Phase,
 }
 
 /// Cubic's state across the connection (RFC 8312 §4).
@@ -309,6 +339,9 @@ impl VoxCubic {
     /// A loss, already classified: `congestion` is what [`PathSignals::on_loss`] answered. Cubic's
     /// cut for congestion, for persistent congestion, for an ECN mark (`lost_bytes == 0`), and
     /// whenever tier 2 is off; no cut otherwise.
+    ///
+    /// Whether the window was cut: not when tier 2 let the loss go, nor for a later loss of a
+    /// flight already cut for.
     pub(crate) fn on_loss(
         &mut self,
         now: Instant,
@@ -316,20 +349,54 @@ impl VoxCubic {
         is_persistent_congestion: bool,
         lost_bytes: u64,
         congestion: bool,
-    ) {
+    ) -> bool {
         if self.loss_aware && !congestion && !is_persistent_congestion && lost_bytes > 0 {
-            return;
+            return false;
         }
-        self.cut(now, sent, is_persistent_congestion, BETA_CUBIC);
+        self.cut(now, sent, is_persistent_congestion, BETA_CUBIC)
+    }
+
+    /// What a cut changes, taken just before it, for [`Self::undo_cut`].
+    pub(crate) fn cut_state(&self) -> CutState {
+        CutState {
+            window: self.window,
+            ssthresh: self.ssthresh,
+            state: self.state.clone(),
+            phase: self.phase,
+        }
+    }
+
+    /// Take back a cut whose loss the receiver reported as its own socket's overflow (ADR-024
+    /// RO-5): the window, the slow-start threshold, Cubic's curve and HyStart++'s phase as they
+    /// were just before it, as Linux TCP's undo restores a reduction a later signal showed to be
+    /// spurious (RFC 3708, Eifel). The recovery period stays, so the rest of the same flight's
+    /// losses do not cut again. Never lower than the window now: an earlier cut already undone
+    /// is not cut again by undoing a later one. Whether it restored anything.
+    pub(crate) fn undo_cut(&mut self, before: &CutState) -> bool {
+        if before.window <= self.window {
+            return false;
+        }
+        self.window = before.window;
+        self.ssthresh = before.ssthresh;
+        self.state = before.state.clone();
+        self.phase = before.phase;
+        true
     }
 
     /// Cubic's multiplicative decrease with `beta` (RFC 8312 §4.5-4.6), once per recovery period.
-    fn cut(&mut self, now: Instant, sent: Instant, is_persistent_congestion: bool, beta: f64) {
+    /// Whether it cut.
+    fn cut(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        beta: f64,
+    ) -> bool {
         if self
             .recovery_start_time
             .is_some_and(|recovery_start_time| sent <= recovery_start_time)
         {
-            return;
+            return false;
         }
         // Loss ends HyStart++ whatever its phase: from here it is Cubic's.
         self.phase = Phase::Done;
@@ -351,6 +418,7 @@ impl VoxCubic {
             self.state.cwnd_inc = 0;
             self.window = self.minimum_window();
         }
+        true
     }
 
     fn minimum_window(&self) -> u64 {
@@ -488,7 +556,7 @@ impl Controller for VoxCubic {
         is_persistent_congestion: bool,
         _lost_bytes: u64,
     ) {
-        self.cut(now, sent, is_persistent_congestion, BETA_CUBIC);
+        let _ = self.cut(now, sent, is_persistent_congestion, BETA_CUBIC);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -741,6 +809,42 @@ impl PathSignals {
             self.round_gentle += 1;
         }
         congestion
+    }
+
+    /// The number of the round now running: what [`Self::forgive`] is told a loss came in.
+    pub(crate) fn round_now(&self) -> u64 {
+        self.rounds
+    }
+
+    /// Take back a loss recorded by [`Self::on_loss`] in round `round`, as `congestion` or not:
+    /// the receiver reported it as its own socket's overflow (ADR-024 RO-6), so it counts toward
+    /// neither the loss share, the cap, the trend nor a climb. A round already past the
+    /// [`TREND_ROUNDS`] kept is gone, and nothing is taken.
+    pub(crate) fn forgive(&mut self, round: u64, lost_bytes: u64, congestion: bool) {
+        let back = self.rounds.saturating_sub(round);
+        if back == 0 {
+            self.round_lost = self.round_lost.saturating_sub(lost_bytes);
+            if congestion {
+                self.round_queued = self.round_queued.saturating_sub(1);
+            } else {
+                self.round_gentle = self.round_gentle.saturating_sub(1);
+            }
+            return;
+        }
+        let Ok(back) = usize::try_from(back) else {
+            return;
+        };
+        let Some(at) = self.recent.len().checked_sub(back) else {
+            return;
+        };
+        if let Some(r) = self.recent.get_mut(at) {
+            r.lost = r.lost.saturating_sub(lost_bytes);
+            if congestion {
+                r.queued_losses = r.queued_losses.saturating_sub(1);
+            } else {
+                r.gentle_losses = r.gentle_losses.saturating_sub(1);
+            }
+        }
     }
 
     /// The base round trip: the smallest sample of the last [`BASE_RTT_WINDOW`], or the minimum of
