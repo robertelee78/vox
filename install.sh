@@ -33,6 +33,10 @@ INSTALL_DIR="${VOX_INSTALL_DIR:-$HOME/.local/bin}"
 CHANNEL="${VOX_CHANNEL:-stable}"
 MARKER=".vox-standalone.json"
 SYSTEM_APPS="${VOX_APPLICATIONS_DIR:-/Applications}"
+# The CLI is a link into the bundle, made in INSTALL_DIR: a relative path would resolve against
+# INSTALL_DIR and dangle, so both must be absolute.
+case "$SYSTEM_APPS" in /*) ;; *) printf 'vox install: VOX_APPLICATIONS_DIR must be an absolute path, not %s\n' "$SYSTEM_APPS" >&2; exit 1 ;; esac
+case "$INSTALL_DIR" in /*) ;; *) printf 'vox install: VOX_INSTALL_DIR must be an absolute path, not %s\n' "$INSTALL_DIR" >&2; exit 1 ;; esac
 # TLS is mandatory except against an explicit loopback test base.
 case "$BASE" in
   https://*) CURL_PROTO="--proto =https --proto-redir =https --tlsv1.2" ;;
@@ -98,7 +102,11 @@ fi
 # `-f` is not optional: without it a 404 exits 0 and writes the body ("Not Found") into the
 # output file, which would then be read as the release record.
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/vox-install.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT INT TERM
+# On any exit, the bundle a cut-short swap moved aside goes back (see `restore_app`), then the
+# scratch goes. An interrupt exits: without `exit` the script carried on with $tmp deleted.
+restore_app() { :; }
+trap 'restore_app; rm -rf "$tmp"' EXIT
+trap 'exit 130' INT TERM
 curl -fsSL $CURL_PROTO --max-filesize 4096 \
   -o "$tmp/record.json" "${BASE}/latest/download/${RECORD}" \
   || fail "could not fetch release record ${RECORD} (no ${CHANNEL} release for ${TARGET} yet?)"
@@ -218,25 +226,81 @@ if [ "$os" = Darwin ]; then
     apple_signed "$helper" "$APPLE_IDENTIFIER" "Vox.app's vox"
     say "verified: Vox.app and its vox, Developer ID $APPLE_TEAM_ID, notarized"
   fi
+  # It runs, and says its version, before anything already installed is touched.
+  ran=$("$helper" --version 2>/dev/null || true)
+  [ "$ran" = "vox $version" ] \
+    || fail "the vox inside Vox.app reports ${ran:-nothing}, not vox $version; nothing was installed"
 
   # --- install the bundle --------------------------------------------------------------
   # Copied beside its destination, then renamed into place; the bundle it replaces is kept as
   # .Vox.app.previous. Leftovers of a run that was cut short may be read-only, so they are made
-  # writable before they are removed.
+  # writable before they are removed, and a leftover that will not go stops the install.
+  #
+  # **One install or update at a time** (`vox update` takes the same lock): the swap runs under
+  # `lockf` on .vox-standalone.lock in the applications folder, so this and a `vox update` never
+  # remove each other's partial or previous bundle halfway.
+  #
+  # **No moment without Vox.app that a failure can leave behind**: between moving the old bundle
+  # aside and the new one landing, any exit (an error, Ctrl-C, a kill other than SIGKILL) puts the
+  # old one back, and a later step that fails puts it back too.
   mkdir -p "$APPS"
-  for leftover in "$APPS/.Vox.app.partial" "$APPS/.Vox.app.previous.partial"; do
-    if [ -e "$leftover" ]; then chmod -R u+w "$leftover" && rm -rf "$leftover"; fi
-  done
-  /usr/bin/ditto "$new_app" "$APPS/.Vox.app.partial" || fail "could not copy Vox.app into $APPS"
-  if [ -e "$APPS/Vox.app" ]; then
-    if [ -e "$APPS/.Vox.app.previous" ]; then
-      chmod -R u+w "$APPS/.Vox.app.previous" && rm -rf "$APPS/.Vox.app.previous"
+  gone() { # <path>: removed, or the install stops
+    if [ -e "$1" ] || [ -L "$1" ]; then
+      chmod -R u+w "$1" 2>/dev/null || true
+      rm -rf "$1" 2>/dev/null || true
+      [ ! -e "$1" ] && [ ! -L "$1" ] || fail "could not remove $1; remove it and run this again"
     fi
-    mv "$APPS/Vox.app" "$APPS/.Vox.app.previous"
+  }
+  cat >"$tmp/swap.sh" <<'SWAP'
+set -eu
+APPS=$1 NEW=$2 MARKER=$3 CHANNEL=$4
+fail() { printf 'vox install: %s\n' "$*" >&2; exit 1; }
+gone() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    chmod -R u+w "$1" 2>/dev/null || true
+    rm -rf "$1" 2>/dev/null || true
+    [ ! -e "$1" ] && [ ! -L "$1" ] || fail "could not remove $1; remove it and run this again"
   fi
-  printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
-    "$CHANNEL" >"$APPS/$MARKER"
-  mv "$APPS/.Vox.app.partial" "$APPS/Vox.app"
+}
+moved=0
+put_back() {
+  if [ "$moved" = 1 ] && [ ! -e "$APPS/Vox.app" ] && [ -e "$APPS/.Vox.app.previous" ]; then
+    mv "$APPS/.Vox.app.previous" "$APPS/Vox.app" \
+      && printf 'vox install: the swap was cut short; the Vox.app that was installed is back\n' >&2
+  fi
+}
+trap put_back EXIT
+trap 'exit 130' INT TERM
+gone "$APPS/.Vox.app.partial"
+gone "$APPS/.Vox.app.previous.partial"
+/usr/bin/ditto "$NEW" "$APPS/.Vox.app.partial" || fail "could not copy Vox.app into $APPS"
+printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
+  "$CHANNEL" >"$APPS/.marker.partial" || fail "could not write $APPS/$MARKER"
+if [ -e "$APPS/Vox.app" ]; then
+  gone "$APPS/.Vox.app.previous"
+  mv "$APPS/Vox.app" "$APPS/.Vox.app.previous" || fail "could not move the installed Vox.app aside"
+  moved=1
+fi
+mv "$APPS/.Vox.app.partial" "$APPS/Vox.app" || fail "could not put the new Vox.app in place"
+moved=0
+mv -f "$APPS/.marker.partial" "$APPS/$MARKER" || fail "could not write $APPS/$MARKER"
+SWAP
+  rc=0
+  /usr/bin/lockf -k -t 0 "$APPS/.vox-standalone.lock" /bin/sh "$tmp/swap.sh" \
+    "$APPS" "$new_app" "$MARKER" "$CHANNEL" || rc=$?
+  [ "$rc" = 0 ] || {
+    [ "$rc" = 75 ] && fail "another install or a \`vox update\` is changing $APPS/Vox.app now; run this again when it is done"
+    exit "$rc"
+  }
+  # From here, a failure puts the bundle that was installed back (and the link with it).
+  restore_app() {
+    if [ "${linked_ok:-0}" != 1 ] && [ -e "$APPS/.Vox.app.previous" ]; then
+      gone "$APPS/.Vox.app.failed"
+      mv "$APPS/Vox.app" "$APPS/.Vox.app.failed" 2>/dev/null \
+        && mv "$APPS/.Vox.app.previous" "$APPS/Vox.app" \
+        && printf 'vox install: the install failed after Vox.app was replaced; the Vox.app that was installed is back\n' >&2
+    fi
+  }
   say "installed: $APPS/Vox.app (Vox $version)"
 
   # --- link the CLI into it --------------------------------------------------------------
@@ -250,7 +314,10 @@ if [ "$os" = Darwin ]; then
   installed=$("$INSTALL_DIR/vox" --version 2>/dev/null || true)
   [ "$installed" = "vox $version" ] \
     || fail "$INSTALL_DIR/vox reports ${installed:-nothing}, not vox $version (on macOS see: codesign -dv $APPS/Vox.app)"
+  linked_ok=1
   say "linked: $INSTALL_DIR/vox -> $APPS/Vox.app/Contents/Helpers/vox ($installed)"
+  # As `vox update` says it: a running app or daemon keeps the old code until restarted.
+  say "restart Vox and the vox daemon to run vox $version: both keep running what they started with until they are restarted"
 else
   # --- vox (Linux, unchanged by ADR-014) -----------------------------------------------------
   fetch_asset "$ASSET" "$size" "$sha256" "$tmp/$ASSET"

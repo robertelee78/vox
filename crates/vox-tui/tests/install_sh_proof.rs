@@ -776,6 +776,92 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 format!("exit_ok={ok}, requests to the release server={fetched}, said {text:?}"),
             ));
         }
+
+        // ---- macOS: a failure after the swap puts the installed Vox.app back; one install or
+        // `vox update` at a time; a relative folder is refused up front (services2's review) ----
+        // The installed bundle carries a file the release does not, so whether it is the one that
+        // was installed, or the release's, is read off the bundle itself.
+        let installed_before = |home: &Path| {
+            let (ok, _) = run_installer(&server, home, "stable");
+            let mark = system_apps(home).join("Vox.app/Contents/installed-before");
+            ok && std::fs::write(&mark, b"the bundle that was installed").is_ok()
+        };
+        let still_the_old = |home: &Path| {
+            system_apps(home)
+                .join("Vox.app/Contents/installed-before")
+                .exists()
+        };
+        {
+            // The link step fails after the swap: VOX_INSTALL_DIR names a file, not a folder.
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            if installed_before(home) {
+                let not_a_dir = home.join("not-a-folder");
+                std::fs::write(&not_a_dir, b"a file").staged();
+                let not_a_dir = not_a_dir.to_string_lossy().into_owned();
+                let (ok, text) =
+                    run_installer_env(&server, home, "stable", &[("VOX_INSTALL_DIR", &not_a_dir)]);
+                let back = still_the_old(home);
+                claims.push(claim(
+                    "install.a_failure_after_the_swap_puts_the_app_back",
+                    !ok && back && text.contains("the Vox.app that was installed is back"),
+                    format!("exit_ok={ok}, the installed Vox.app back={back}, said {text:?}"),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.a_failure_after_the_swap_puts_the_app_back",
+                    "the first install, which the failing one would replace, did not happen",
+                ));
+            }
+        }
+        {
+            // A `vox update` (or another install) holds the lock: lockf, as `vox update`'s flock.
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            if installed_before(home) {
+                let lock = system_apps(home).join(".vox-standalone.lock");
+                let mut holder = Command::new("/usr/bin/lockf")
+                    .args(["-k"])
+                    .arg(&lock)
+                    .args(["sleep", "60"])
+                    .spawn()
+                    .staged();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let (ok, text) = run_installer(&server, home, "stable");
+                let _ = holder.kill();
+                let _ = holder.wait();
+                let back = still_the_old(home);
+                claims.push(claim(
+                    "install.waits_for_a_running_update",
+                    !ok && back && text.contains("another install or a `vox update` is changing"),
+                    format!("exit_ok={ok}, the installed Vox.app untouched={back}, said {text:?}"),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.waits_for_a_running_update",
+                    "the first install, which the waiting one would replace, did not happen",
+                ));
+            }
+        }
+        {
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            let before = server.requests();
+            let (ok, text) = run_installer_env(
+                &server,
+                home,
+                "stable",
+                &[("VOX_APPLICATIONS_DIR", "relative/Applications")],
+            );
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let fetched = server.requests() - before;
+            claims.push(claim(
+                "install.refuses_a_relative_applications_folder",
+                !ok && fetched == 0
+                    && text.contains("VOX_APPLICATIONS_DIR must be an absolute path"),
+                format!("exit_ok={ok}, requests to the release server={fetched}, said {text:?}"),
+            ));
+        }
     }
 
     report(&claims, &receipts, &allowed);
