@@ -178,12 +178,14 @@ try:
     # The art's rows: ten facet characters, two per cell; the grouped fingerprint is beside them.
     art = lambda rows: [m.group(0) for m in (re.search(r"[◢◣◤◥]{10}", r) for r in rows) if m]
     grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
+    # The selected row is the marker, Alice's trust glyph, then her name: "▶ ⇄ alice" (L-4).
+    picked = lambda r: re.search(r"▶ \S+ ?alice\b", r) is not None
     for _ in range(4):
-        if any("▶ alice" in r for r in members()):
+        if any(picked(r) for r in members()):
             break
         tui.key("\x1b[B", 1)  # Down: the next member
     rows = [r.rstrip() for r in members()]
-    at = next((i for i, r in enumerate(rows) if "▶ alice" in r), None)
+    at = next((i for i, r in enumerate(rows) if picked(r)), None)
     under = rows[at + 1:at + 8] if at is not None else []
     card_art = art(under)
     first_groups = grouped(fp["alice"])[:24]

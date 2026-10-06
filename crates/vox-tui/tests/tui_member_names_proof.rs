@@ -68,8 +68,8 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
             panic!("PRODUCT: a `vox` step before the TUI's members pane failed: {said}")
         }
         Some(1) if said.contains("cargo RED") => panic!(
-            "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters + \"(not in \
-             keyring)\", and draw each node's own card in the members pane and the keyring view: \
+            "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters with \"not in \
+             keyring\" under them, and draw each node's own card in the members pane and the keyring view: \
              {said}"
         ),
         _ => panic!(
