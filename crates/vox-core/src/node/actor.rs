@@ -9468,6 +9468,15 @@ impl Node {
         // this instant is judged by the set as it stands when its request lands (M17.11).
         self.refresh_reachers().await;
         self.deliver_owed_consents(Some(fingerprint)).await;
+        // A key that reached this node by the log from the member just trusted was held
+        // (V210-118): taken now.
+        let rooms: Vec<Digest32> = self.channels.keys().copied().collect();
+        for channel_id in rooms {
+            if let Some(shared) = self.channels.get(&channel_id).map(Arc::clone) {
+                shared.lock().await.release_held_packages();
+            }
+            self.install_key_packages(&channel_id).await;
+        }
         self.publish().await;
         Outcome::Done
     }
@@ -11509,6 +11518,15 @@ impl Node {
                 continue;
             };
             let author = skdm.body.author_id;
+            // **A node reads only the members its owner trusts** (V210-118), whichever path the
+            // key took. The pairwise path refused a key from an untrusted author, and this one,
+            // the log's, took it: a member trusted by someone whose node was down when trusted
+            // (its key then goes by the log) was read by a node that never trusted it. Held, not
+            // dropped, so the key is taken once the owner trusts its author.
+            if !self.trust.is_trusted(&author) {
+                shared.lock().await.hold_package(package);
+                continue;
+            }
             let installed = {
                 let Some(profile) = self.profile.as_ref() else {
                     return;
