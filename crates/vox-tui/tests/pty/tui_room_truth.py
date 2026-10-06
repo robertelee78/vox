@@ -516,7 +516,10 @@ try:
     stage("copies")
     tui.key("\t", 1)   # members -> shared
     shared_pane = lambda: [row.rstrip() for row in pane(tui.display(), "Shared")]
-    if not tui.until(lambda: any("▶" in r and "nas-ssh." in r for r in shared_pane()), 30, 1):
+    # Selected: its row is the one with "y copies:" under it (the marker can fall outside a
+    # narrow pane's cut).
+    if not tui.until(lambda: any("nas-ssh." in r for r in shared_pane())
+                     and any("y copies:" in r for r in shared_pane()), 30, 1):
         product("bob's `vox tui` never showed alice's nas-ssh selected in the room's Shared pane: "
                 + repr(shared_pane()))
     mark = len(tui.raw)
