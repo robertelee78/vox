@@ -67,10 +67,35 @@ corresponding XDG/platform config location; it is not necessarily the same root 
 Inside the data root:
 
 - `nodes/NAME/` holds one node: identity material such as `vault.cbor`, the room store
-  `store.redb`, and that node's own `config/`, cursors and agent sessions.
+  `store.redb`, and that node's own `config/`, cursors and agent sessions. `files/ROOM_ID/` holds
+  the shares it pulled (see [Send and receive files](files.md)), and `decisions/` its decision
+  record (below).
 - `.daemon/` holds the daemon's lock, its control socket `vox.sock`, the port it reuses, the list
   of nodes kept attached (`attach`), its `config`, and `log`, where a daemon started in the
   background writes its output.
+
+### The decision record
+
+Each node writes down every refusal and every change of access it decides: a join or a tunnel it
+refused, a session it cut, a node added to or removed from its keyring, a share it stopped. One
+JSON line per decision goes to `nodes/NAME/decisions/YYYY-MM-DD.jsonl`, one file per UTC day,
+readable by your account only. Files older than 14 days are deleted, and the record is never sent
+anywhere. A line looks like this:
+
+```json
+{"alias":"ann","asked":"to stop trusting a member","at_ms":1791266648587,"by":"kdbctelrwq73b3cclgfyt33oeofci4euoxemuzbw6w5w7niozx4q","decided":"untrusted","why":"this node's person removed them from the keyring: they read nothing new from it and reach none of its services"}
+```
+
+`by` is the fingerprint of the node the decision was about, `alias` your name for it if you gave
+one, and `why` the node's own words, for example `join proof-of-possession failed` for a wrong
+room passphrase. A line never holds message text, a file's name or contents, a passphrase or a
+key. A refusal that can repeat many times a minute, such as a refused stream, is written the
+first time; its repeats in the next hour are counted and written as one line when the hour is
+over. To see who was refused today:
+
+```sh
+grep '"decided":"refused"' "DATA_ROOT/nodes/NAME/decisions/$(date -u +%F).jsonl"
+```
 
 These are not caches to remove when a join is refused. The source creates private
 directories/files on supported Unix systems; still protect the account and machine that can use
