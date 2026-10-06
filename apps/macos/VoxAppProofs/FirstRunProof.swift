@@ -67,6 +67,11 @@
 // Untrust that leaves a member's live sessions running: (11) goes red. An app that counts
 // nothing from before it opened (no seeding from VoxClient.unread): (13) goes red.
 
+// Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
+// front and XCTest reads words in its window, else the red is APPARATUS; then a red is PRODUCT
+// and quotes what the app showed. A SwiftUI Text's words are its accessibility value, not its
+// label: the read-by line, the keyring's effect sentences and a message's text are read there.
+
 import XCTest
 
 /// A red that is the product's, thrown where an assertion cannot be: what `vox` did, quoted.
@@ -146,18 +151,17 @@ final class FirstRunProof: XCTestCase {
         ui.launch()
         defer { ui.terminate() }
         let said = ui.descendants(matching: .any)["login-item-said"]
-        XCTAssertTrue(said.waitForExistence(timeout: 30),
-                      "PRODUCT: with Keep Running chosen and its daemon refusing for good, the app must say why the login item did not start")
-        let words = shown(said)
-        XCTAssertTrue(words.contains("STAGED-REASON is not a Vox data directory this version reads"),
-                      "PRODUCT: the app must quote the login item's own line; it said \"\(words)\"")
-        ui.buttons["login-item-off"].click()
-        XCTAssertTrue(said.waitForNonExistence(timeout: 30),
-                      "PRODUCT: Turn Keep Running Off must leave Keep Running off; the login item's line is still shown")
+        let quoted = words(ui, said, timeout: 30,
+                           "with Keep Running chosen and its daemon refusing for good, the app must quote the login item's own line",
+                           until: { $0.contains("STAGED-REASON is not a Vox data directory this version reads") }) ?? ""
+        tap(ui.buttons["login-item-off"], "Turn Keep Running Off")
+        if !said.waitForNonExistence(timeout: 30) {
+            XCTFail("PRODUCT: Turn Keep Running Off must leave Keep Running off; the login item's line is still shown: \(shown(said))")
+        }
         let answer = stager.run(["/bin/cat", config + "/app/login-item"], env: [:]).out
         XCTAssertEqual(answer.trimmingCharacters(in: .whitespacesAndNewlines), "no",
                        "PRODUCT: Turn Keep Running Off must keep the answer as Not Now; the answer file says \(answer.debugDescription)")
-        print("[proof] login item: quoted \"\(words)\"; after Turn Keep Running Off the answer is \(answer.debugDescription)")
+        print("[proof] login item: quoted \"\(quoted)\"; after Turn Keep Running Off the answer is \(answer.debugDescription)")
     }
 
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
@@ -191,46 +195,50 @@ final class FirstRunProof: XCTestCase {
         // (1) First run: the login item is asked about once, and declined here (approving it is
         // the manual check manual.login_item); then pick the node, and a wrong passphrase is the
         // daemon's sentence.
-        let why = ui.descendants(matching: .any)["login-item-why"]
-        XCTAssertTrue(why.waitForExistence(timeout: 30),
-                      "PRODUCT: the app never asked at first run whether to keep the daemon running")
-        let whyWords = why.label.isEmpty ? (why.value as? String ?? "") : why.label
-        XCTAssertTrue(whyWords.contains("keeps your rooms reachable while you are logged in, even with the app closed"),
-                      "PRODUCT: the login item question must say what it does; it said: \(whyWords)")
+        words(ui, ui.descendants(matching: .any)["login-item-why"], timeout: 30,
+              "at first run the app must ask whether to keep the daemon running, saying what that does",
+              until: { $0.contains("keeps your rooms reachable while you are logged in, even with the app closed") })
         // The menu bar extra, offered here and off until turned on (M-22): turned on, it is there.
-        XCTAssertTrue(ui.statusItems.count == 0,
-                      "PRODUCT: the menu bar extra must be off until the person turns it on")
+        // Premise: XCTest sees menu bar items on this Mac at all (Control Center's).
+        let controlCentre = XCUIApplication(bundleIdentifier: "com.apple.controlcenter")
+        let seesMenuBar = controlCentre.statusItems.count > 0
+        if !seesMenuBar {
+            XCTFail("APPARATUS: XCTest sees no menu bar items on this Mac (Control Center has none it can read), so Vox's cannot be looked for")
+        } else if ui.statusItems.count != 0 {
+            XCTFail("PRODUCT: the menu bar extra must be off until the person turns it on; Vox has \(ui.statusItems.count) menu bar item(s)")
+        }
         let offer = ui.checkBoxes["menu-bar-offer"]
-        offer.click()
-        XCTAssertEqual(offer.value as? Int, 1,
-                       "PRODUCT: \"Show Vox in the menu bar\", clicked, must show it is on; it says \(String(describing: offer.value))")
-        XCTAssertTrue(ui.statusItems.firstMatch.waitForExistence(timeout: 10),
-                      "PRODUCT: \"Show Vox in the menu bar\" was turned on and no menu bar item appeared")
-        ui.buttons["login-item-not-now"].click()
+        if present(ui, offer, timeout: 10, "the first run must offer \"Show Vox in the menu bar\"") {
+            tap(offer, "Show Vox in the menu bar")
+            switch offer.value as? Int {
+            case nil: XCTFail("APPARATUS: XCTest reads no value from the \"Show Vox in the menu bar\" checkbox")
+            case 1?: break
+            case let v?: XCTFail("PRODUCT: \"Show Vox in the menu bar\", clicked, must show it is on; its value is \(v)")
+            }
+            if seesMenuBar && !ui.statusItems.firstMatch.waitForExistence(timeout: 10) {
+                let theirs = controlCentre.statusItems.allElementsBoundByIndex.prefix(20).map(shown)
+                XCTFail("PRODUCT: \"Show Vox in the menu bar\" was turned on and Vox has no menu bar item; the menu bar items XCTest sees: \(theirs)")
+            }
+        }
+        tap(ui.buttons["login-item-not-now"], "Not Now")
         let pick = ui.buttons["node-alice"]
-        XCTAssertTrue(pick.waitForExistence(timeout: 30),
-                      "PRODUCT: the app never offered node alice at first run")
-        pick.click()
+        present(ui, pick, timeout: 30, "at first run the app must offer node alice")
+        tap(pick, "node alice")
         let field = ui.secureTextFields["passphrase"]
-        XCTAssertTrue(field.waitForExistence(timeout: 10),
-                      "PRODUCT: the app never asked for node alice's passphrase")
-        field.click()
+        present(ui, field, timeout: 10, "the app must ask for node alice's passphrase")
+        tap(field, "the passphrase field")
         field.typeText("not the passphrase")
-        ui.buttons["attach"].click()
-        let said = ui.descendants(matching: .any)["said"]
-        XCTAssertTrue(said.waitForExistence(timeout: 30),
-                      "PRODUCT: a wrong passphrase showed no sentence where it was typed")
-        let words = shown(said)
-        XCTAssertTrue(words.contains("that passphrase does not open node alice's identity"),
-                      "PRODUCT: a wrong passphrase must show the daemon's own sentence; it showed: \(words)")
+        tap(ui.buttons["attach"], "Attach")
+        words(ui, ui.descendants(matching: .any)["said"], timeout: 30,
+              "a wrong passphrase must show the daemon's own sentence where it was typed",
+              until: { $0.contains("that passphrase does not open node alice's identity") })
 
         // (2) The right one attaches it.
-        field.click()
+        tap(field, "the passphrase field")
         field.typeText("alice identity")
-        ui.buttons["attach"].click()
-        let attached = ui.descendants(matching: .any)["attached"]
-        XCTAssertTrue(attached.waitForExistence(timeout: 60),
-                      "PRODUCT: the right passphrase did not attach node alice")
+        tap(ui.buttons["attach"], "Attach")
+        present(ui, ui.descendants(matching: .any)["attached"], timeout: 60,
+                "the right passphrase must attach node alice")
         let listed = run(vox, ["node", "list"], env: voxEnv).out
         XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
                       "PRODUCT: `vox node list` must say alice is attached; it said: \(listed)")
@@ -251,13 +259,13 @@ final class FirstRunProof: XCTestCase {
         // The app makes the room (⌘N, M-31: create) and copies its link (⌘L).
         ui.typeKey("n", modifierFlags: .command)
         let roomName = ui.textFields["room-form-name"]
-        XCTAssertTrue(roomName.waitForExistence(timeout: 10), "PRODUCT: ⌘N opened no New Room form")
-        roomName.click()
+        present(ui, roomName, timeout: 10, "⌘N must open the New Room form")
+        tap(roomName, "the room's name field")
         roomName.typeText("mission")
         let roomSecret = ui.secureTextFields["room-form-passphrase"]
-        roomSecret.click()
+        tap(roomSecret, "the room's passphrase field")
         roomSecret.typeText("mission room")
-        ui.buttons["room-form-submit"].click()
+        tap(ui.buttons["room-form-submit"], "Create")
         var rooms = ""
         let madeUntil = Date().addingTimeInterval(60)
         while Date() < madeUntil && !rooms.contains(" mission") {
@@ -302,38 +310,30 @@ final class FirstRunProof: XCTestCase {
         }
         // The room has been on screen since ⌘N made it: bob, who joined meanwhile and whom alice
         // trusted meanwhile, is listed in its inspector without the room being opened again.
-        let joined = ui.descendants(matching: .any)["member-bob"]
-        let inKeyring = NSPredicate(format: "exists == true AND label BEGINSWITH %@", "bob, in keyring")
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: inKeyring, evaluatedWith: joined)],
-                                      timeout: 30), .completed,
-                       "PRODUCT: bob joined and was trusted while the room was on screen, and its inspector does not list him in alice's keyring; it said \"\(joined.exists ? shown(joined) : "no bob")\"")
+        words(ui, ui.descendants(matching: .any)["member-bob"], timeout: 30,
+              "bob joined and was trusted while the room was on screen: its inspector must list him in alice's keyring",
+              until: { $0.hasPrefix("bob, in keyring") })
         // Off the room, so a message to alice is unread: a room on screen is read.
-        ui.descendants(matching: .any)["keyring"].click()
+        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
                    env: bobSession)
-        let needsYou = ui.descendants(matching: .any)["group-needs you"]
-        let grouped = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
-        let met = XCTWaiter.wait(for: [expectation(for: grouped, evaluatedWith: needsYou)], timeout: 60)
+        words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 60,
+              "a message to alice must list the room under \"needs you (1)\"",
+              until: { $0 == "needs you (1)" })
         let row = ui.descendants(matching: .any)["room-mission"]
-        XCTAssertEqual(met, .completed,
-                       "PRODUCT: a message to alice must list the room under \"needs you (1)\"; the sidebar said \"\(needsYou.exists ? shown(needsYou) : "no needs-you group")\", the room's row \"\(row.exists ? shown(row) : "not listed")\"")
-        XCTAssertTrue(row.exists && shown(row).contains("needs you"),
-                      "PRODUCT: the room's row must say it needs you; it said \"\(row.exists ? shown(row) : "not listed")\"")
-        row.click()
+        words(ui, row, timeout: 10, "the room's row must say it needs you",
+              until: { $0.contains("needs you") })
+        tap(row, "mission in the sidebar")
         let bob = ui.descendants(matching: .any)["member-bob"]
-        XCTAssertTrue(bob.waitForExistence(timeout: 30),
-                      "PRODUCT: the inspector never listed bob")
-        XCTAssertTrue(shown(bob).hasPrefix("bob, in keyring"),
-                      "PRODUCT: the inspector must show bob in alice's keyring; it said \"\(shown(bob))\"")
-        let status = ui.descendants(matching: .any)["status"]
-        XCTAssertTrue(status.waitForExistence(timeout: 10), "PRODUCT: the window has no status bar")
-        let bar = shown(status)
-        XCTAssertTrue(bar.contains("node alice") && bar.contains("peer") && bar.contains("keyring"),
-                      "PRODUCT: the status bar must say the node, its peers and the keyring window; it said \"\(bar)\"")
-        let regrouped = shown(ui.descendants(matching: .any)["group-needs you"])
-        XCTAssertEqual(regrouped, "needs you (0)",
-                       "PRODUCT: the room shown is read, so nothing needs alice; the sidebar said \"\(regrouped)\"")
-        print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(shown(bob)); status: \(bar)")
+        let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
+                             until: { $0.hasPrefix("bob, in keyring") }) ?? ""
+        let bar = words(ui, ui.descendants(matching: .any)["status"], timeout: 10,
+                        "the status bar must say the node, its peers and the keyring window",
+                        until: { $0.contains("node alice") && $0.contains("peer") && $0.contains("keyring") }) ?? ""
+        let regrouped = words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 10,
+                              "the room shown is read, so nothing needs alice: \"needs you (0)\"",
+                              until: { $0 == "needs you (0)" }) ?? ""
+        print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bobWords); status: \(bar)")
 
         // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
         var readByAlice: [String] = []
@@ -387,8 +387,8 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: once alice's app is in front again, the message on screen must be read; bob's `vox room read --json` says read_by \(shownAgain)")
         // Alice posts; bob's agent reads it in a drain, as a harness does before every prompt.
         let compose = ui.textFields["compose"]
-        XCTAssertTrue(compose.waitForExistence(timeout: 10), "PRODUCT: the room has no field to post")
-        compose.click()
+        present(ui, compose, timeout: 10, "the room must have a field to post")
+        tap(compose, "the composer")
         compose.typeText("FROM-ALICE\r")
         var drained = ""
         let drainUntil = Date().addingTimeInterval(60)
@@ -401,40 +401,41 @@ final class FirstRunProof: XCTestCase {
         guard drained.contains("FROM-ALICE") else {
             throw Apparatus("bob's agent drain never read alice's FROM-ALICE in 60 s: \(drained)")
         }
+        // The read-by line is a Text: its words are its accessibility value.
         let readLine = ui.descendants(matching: .any)
             .matching(NSPredicate(format: "identifier BEGINSWITH 'read-by-'")).firstMatch
-        XCTAssertTrue(readLine.waitForExistence(timeout: 30) && shown(readLine) == "read by bob",
-                      "PRODUCT: alice's message read by bob must show \"read by bob\" under it; the timeline shows \(readLine.exists ? shown(readLine) : "no read-by line")")
-        print("[proof] bob's message read by \(readByAlice); alice's message: \(readLine.exists ? shown(readLine) : "none")")
+        let readWords = words(ui, readLine, timeout: 30,
+                              "alice's message read by bob must show \"read by bob\" under it",
+                              until: { $0 == "read by bob" }) ?? ""
+        print("[proof] bob's message read by \(readByAlice); alice's message: \(readWords)")
 
         // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
         try staged(vox, ["node", "create", "carol"],
                    env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
         let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
-        ui.descendants(matching: .any)["keyring"].click()
+        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
         let addFp = ui.textFields["keyring-add-fingerprint"]
-        XCTAssertTrue(addFp.waitForExistence(timeout: 10), "PRODUCT: the keyring view offers no add")
-        addFp.click()
+        present(ui, addFp, timeout: 10, "the keyring view must offer to add a node")
+        tap(addFp, "the fingerprint field")
         addFp.typeText(carolFp)
         let addAlias = ui.textFields["keyring-add-alias"]
-        addAlias.click()
+        tap(addAlias, "the alias field")
         addAlias.typeText("carol")
-        let addEffect = ui.descendants(matching: .any)["keyring-add-effect"]
-        XCTAssertTrue(addEffect.waitForExistence(timeout: 10)
-                          && shown(addEffect).contains("it may read what you write"),
-                      "PRODUCT: adding must say what trusting does before it is done; it said \(addEffect.exists ? shown(addEffect) : "nothing")")
-        ui.buttons["keyring-trust"].click()
+        // The effect sentences are Texts: their words are their accessibility value.
+        words(ui, ui.descendants(matching: .any)["keyring-add-effect"], timeout: 10,
+              "adding must say what trusting does before it is done",
+              until: { $0.contains("it may read what you write") })
+        tap(ui.buttons["keyring-trust"], "Trust")
         let carolRow = ui.descendants(matching: .any)["keyring-row-carol"]
-        XCTAssertTrue(carolRow.waitForExistence(timeout: 30), "PRODUCT: carol, once trusted, is not listed in the keyring view")
+        present(ui, carolRow, timeout: 30, "carol, once trusted, must be listed in the keyring view")
         let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(trustList.contains(carolFp),
                       "PRODUCT: `vox trust list` must list carol once the app trusted her; it said: \(trustList)")
-        ui.buttons["keyring-remove-carol"].click()
-        let removeEffect = ui.descendants(matching: .any)["keyring-remove-effect"]
-        XCTAssertTrue(removeEffect.waitForExistence(timeout: 10)
-                          && shown(removeEffect).contains("reads nothing you write from now on"),
-                      "PRODUCT: removing must say what untrusting does before it is done; it said \(removeEffect.exists ? shown(removeEffect) : "nothing")")
-        ui.buttons["keyring-untrust-confirm"].click()
+        tap(ui.buttons["keyring-remove-carol"], "Remove… on carol")
+        words(ui, ui.descendants(matching: .any)["keyring-remove-effect"], timeout: 10,
+              "removing must say what untrusting does before it is done",
+              until: { $0.contains("reads nothing you write from now on") })
+        tap(ui.buttons["keyring-untrust-confirm"], "Untrust")
         var after5 = ""
         let goneUntil = Date().addingTimeInterval(30)
         while Date() < goneUntil {
@@ -442,31 +443,39 @@ final class FirstRunProof: XCTestCase {
             if !after5.contains(carolFp) && !carolRow.exists { break }
             Thread.sleep(forTimeInterval: 0.5)
         }
-        XCTAssertFalse(after5.contains(carolFp) || carolRow.exists,
-                       "PRODUCT: once untrusted, carol must be gone from the keyring view and from `vox trust list`; it said: \(after5)")
+        if after5.contains(carolFp) {
+            XCTFail("PRODUCT: once untrusted, carol must be gone from `vox trust list`; it said: \(after5)")
+        }
+        // Gone from the view: shown with the window read, so a missing row is not a lost query.
+        if windowReadable(ui) && carolRow.exists {
+            XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(carolRow))\"")
+        }
         print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
 
         // (6) Attach a file to the room, To: bob, with a note.
-        ui.descendants(matching: .any)["room-mission"].click()
+        tap(ui.descendants(matching: .any)["room-mission"], "mission in the sidebar")
         let file = scratch.appendingPathComponent("for-bob.bin")
         let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
         try stager.write(bytes, to: file.path)
         let attachButton = ui.buttons["attach"]
-        XCTAssertTrue(attachButton.waitForExistence(timeout: 10), "PRODUCT: the room offers no Attach")
-        attachButton.click()
-        // The open panel: go to the file's path, then Attach.
+        present(ui, attachButton, timeout: 10, "the room must offer Attach")
+        tap(attachButton, "Attach (the paperclip)")
+        // The open panel, a window of the app: go to the file's path, then its Attach. Looked for
+        // among the windows only: an app-wide query also finds the Touch Bar's Attach.
         ui.typeKey("g", modifierFlags: [.command, .shift])
         ui.typeText(file.path + "\r")
         let choose = ui.windows.buttons["Attach"].firstMatch
-        XCTAssertTrue(choose.waitForExistence(timeout: 10), "APPARATUS: the open panel did not show")
-        choose.click()
+        if !choose.waitForExistence(timeout: 10) {
+            XCTFail("PRODUCT: Attach must open the file panel; no window has its Attach button; the window shows: \(onScreen(ui))")
+        }
+        tap(choose, "the file panel's Attach")
         let toBob = ui.descendants(matching: .any)["attach-to-bob"]
-        XCTAssertTrue(toBob.waitForExistence(timeout: 10), "PRODUCT: attaching a file asks no To:")
-        toBob.click()
+        present(ui, toBob, timeout: 10, "attaching a file must ask To:")
+        tap(toBob, "To: bob")
         let noteField = ui.textFields["attach-note"]
-        noteField.click()
+        tap(noteField, "the note field")
         noteField.typeText("FOR-BOB-NOTE")
-        ui.buttons["attach-send"].click()
+        tap(ui.buttons["attach-send"], "Send")
         let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(room)/for-bob.bin")
         var pulledBytes: Data?
         let pullUntil = Date().addingTimeInterval(120)
@@ -489,34 +498,37 @@ final class FirstRunProof: XCTestCase {
         let lanesToggle = ui.descendants(matching: .any)["lanes-toggle"]
         let bobLane = ui.descendants(matching: .any)["lane-state-bob"]
         if lanesToggle.exists {
-            lanesToggle.buttons["Lanes"].click()
-            XCTAssertFalse(bobLane.waitForExistence(timeout: 5) && shown(bobLane) == "bob: working",
-                           "PRODUCT: bob posted `working` holding no claim; his lane must not say working, and it said \(shown(bobLane))")
-            lanesToggle.buttons["Timeline"].click()
+            tap(lanesToggle.buttons["Lanes"], "Lanes")
+            if windowReadable(ui), bobLane.waitForExistence(timeout: 5), shown(bobLane) == "bob: working" {
+                XCTFail("PRODUCT: bob posted `working` holding no claim; his lane must not say working, and it says \"\(shown(bobLane))\"")
+            }
+            tap(lanesToggle.buttons["Timeline"], "Timeline")
         }
         try staged(vox, ["room", "claim", "--node", "bob", room, "ticket-1"], env: voxEnv)
         try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "ON-TICKET-1"],
                    env: voxEnv)
-        XCTAssertTrue(lanesToggle.waitForExistence(timeout: 30),
-                      "PRODUCT: a room whose member works on a claim must offer the lanes view")
-        lanesToggle.buttons["Lanes"].click()
-        let working = NSPredicate(format: "exists == true AND label == %@", "bob: working")
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: working, evaluatedWith: bobLane)], timeout: 30),
-                       .completed,
-                       "PRODUCT: bob, holding ticket-1 with a working post, must show working in his lane; it said \(bobLane.exists ? shown(bobLane) : "no lane")")
-        print("[proof] lanes: \(shown(bobLane))")
+        present(ui, lanesToggle, timeout: 30, "a room whose member works on a claim must offer the lanes view")
+        tap(lanesToggle.buttons["Lanes"], "Lanes")
+        let laneWords = words(ui, bobLane, timeout: 30,
+                              "bob, holding ticket-1 with a working post, must show working in his lane",
+                              until: { $0 == "bob: working" }) ?? ""
+        print("[proof] lanes: \(laneWords)")
         // ⌘O works with the lanes view shown, as with the timeline: the open panel shows.
-        ui.typeKey("o", modifierFlags: .command)
-        let panelAttach = ui.windows.buttons["Attach"].firstMatch
-        XCTAssertTrue(panelAttach.waitForExistence(timeout: 10),
-                      "PRODUCT: ⌘O in the lanes view must open the file panel to attach a file; nothing opened")
-        ui.typeKey(.escape, modifierFlags: [])
-        _ = panelAttach.waitForNonExistence(timeout: 10)
-        lanesToggle.buttons["Timeline"].click()
+        if windowReadable(ui) {
+            ui.typeKey("o", modifierFlags: .command)
+            let panelAttach = ui.windows.buttons["Attach"].firstMatch
+            if !panelAttach.waitForExistence(timeout: 10) {
+                XCTFail("PRODUCT: ⌘O in the lanes view must open the file panel to attach a file; no window has its Attach button; the window shows: \(onScreen(ui))")
+            }
+            ui.typeKey(.escape, modifierFlags: [])
+            _ = panelAttach.waitForNonExistence(timeout: 10)
+        }
+        tap(lanesToggle.buttons["Timeline"], "Timeline")
 
         // (8) Notifications: the room off screen, bob writes to alice.
-        ui.descendants(matching: .any)["keyring"].click()
-        let statusNow = shown(ui.descendants(matching: .any)["status"])
+        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
+        let statusNow = words(ui, ui.descendants(matching: .any)["status"], timeout: 10,
+                              "the window must have a status bar") ?? ""
         if statusNow.contains("notifications off") {
             throw Apparatus("Vox is not allowed to notify on this Mac: allow it in System Settings, Notifications, Vox, then run again; the app said \(statusNow)")
         }
@@ -526,13 +538,19 @@ final class FirstRunProof: XCTestCase {
         let banner = centre.descendants(matching: .any)
             .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "bob wrote to you",
                                   "bob wrote to you")).firstMatch
-        XCTAssertTrue(banner.waitForExistence(timeout: 30),
-                      "PRODUCT: bob's message to alice in a room off screen posted no notification saying \"bob wrote to you\" (with Vox allowed to notify and no Focus on)")
+        if !banner.waitForExistence(timeout: 30) {
+            let there = centre.descendants(matching: .any).allElementsBoundByIndex.prefix(30).map(shown)
+                .filter { !$0.isEmpty }
+            XCTFail("PRODUCT: bob's message to alice in a room off screen posted no notification saying \"bob wrote to you\" (Vox's status bar says it may notify: \(statusNow)); Notification Center shows: \(there)")
+        }
         let leaked = centre.descendants(matching: .any)
             .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
                                   "SECRET-TEXT-8", "SECRET-TEXT-8")).firstMatch
-        XCTAssertFalse(leaked.exists,
-                       "PRODUCT: a notification must not carry the message's text; one said \(shown(leaked))")
+        // Only where the banner itself was read: a query that reads nothing in Notification Center
+        // would pass this for nothing.
+        if banner.exists && leaked.exists {
+            XCTFail("PRODUCT: a notification must not carry the message's text; one said \(shown(leaked))")
+        }
         print("[proof] notification: \(shown(banner))")
 
         // (9) Keys. Two quiet rooms of alice's, made here; each takes a post of hers, so the app
@@ -549,34 +567,33 @@ final class FirstRunProof: XCTestCase {
             try staged(vox, ["room", "post", "--node", "alice", id, "HELLO-\(name)"], env: voxEnv)
         }
         let aaa = ui.descendants(matching: .any)["room-aaa"]
-        XCTAssertTrue(aaa.waitForExistence(timeout: 30), "PRODUCT: room aaa never showed in the sidebar")
-        XCTAssertTrue(ui.descendants(matching: .any)["room-bbb"].waitForExistence(timeout: 30),
-                      "PRODUCT: room bbb never showed in the sidebar")
-        aaa.click()
+        present(ui, aaa, timeout: 30, "room aaa must show in the sidebar")
+        present(ui, ui.descendants(matching: .any)["room-bbb"], timeout: 30,
+                "room bbb must show in the sidebar")
+        tap(aaa, "aaa in the sidebar")
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
                    env: bobSession)
-        let needs = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: needs, evaluatedWith:
-            ui.descendants(matching: .any)["group-needs you"])], timeout: 60), .completed,
-                       "PRODUCT: bob's message to alice must put mission under needs you")
+        words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 60,
+              "bob's message to alice must put mission under needs you",
+              until: { $0 == "needs you (1)" })
         ui.typeKey("j", modifierFlags: .command)
+        // A message's text is a Text: its words are its accessibility value.
         let landed = ui.descendants(matching: .any)
             .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "NEEDS-YOU-9",
                                   "NEEDS-YOU-9")).firstMatch
-        XCTAssertTrue(landed.waitForExistence(timeout: 15),
-                      "PRODUCT: ⌘J from room aaa must open mission, the room that needs alice; its message NEEDS-YOU-9 is not on screen")
+        present(ui, landed, timeout: 15,
+                "⌘J from room aaa must open mission, the room that needs alice, with its message NEEDS-YOU-9")
         // To: is the room's own: bob ticked in mission is not carried into aaa.
         let to = ui.menuButtons["compose-to"]
-        XCTAssertTrue(to.waitForExistence(timeout: 10), "PRODUCT: the composer offers no To:")
-        to.click()
-        ui.menuItems["bob"].click()
-        XCTAssertEqual(shown(to), "To: bob", "PRODUCT: ticking bob in To: must say so; it says \(shown(to))")
+        present(ui, to, timeout: 10, "the composer must offer To:")
+        tap(to, "To:")
+        tap(ui.menuItems["bob"], "bob in To:")
+        words(ui, to, timeout: 10, "ticking bob in To: must say so", until: { $0 == "To: bob" })
         // Seen in mission, then at once another room: the read record names mission, the room the
         // message is in.
-        aaa.click()
-        XCTAssertTrue(to.waitForExistence(timeout: 10), "PRODUCT: room aaa offers no To:")
-        XCTAssertEqual(shown(to), "To: the room",
-                       "PRODUCT: To: set in mission must not carry into aaa; aaa's composer says \(shown(to))")
+        tap(aaa, "aaa in the sidebar")
+        words(ui, to, timeout: 10, "To: set in mission must not carry into aaa",
+              until: { $0 == "To: the room" })
         var nine: [String] = []
         let nineUntil = Date().addingTimeInterval(30)
         while Date() < nineUntil && !nine.contains("alice") {
@@ -612,12 +629,11 @@ final class FirstRunProof: XCTestCase {
         guard !canonical.isEmpty else {
             throw Apparatus("alice's `vox service list --json` never listed bob's web share")
         }
-        aaa.click()
-        ui.descendants(matching: .any)["room-mission"].click()
+        tap(aaa, "aaa in the sidebar")
+        tap(ui.descendants(matching: .any)["room-mission"], "mission in the sidebar")
         let card = ui.descendants(matching: .any)["service-\(cliAddress)"]
-        XCTAssertTrue(card.waitForExistence(timeout: 30),
-                      "PRODUCT: the room shows no card for bob's service \(cliAddress)")
-        card.click()
+        present(ui, card, timeout: 30, "the room must show a card for bob's service \(cliAddress)")
+        tap(card, "the service card")
         NSPasteboard.general.clearContents()
         ui.typeKey("c", modifierFlags: [.command, .shift])
         Thread.sleep(forTimeInterval: 1)
@@ -639,10 +655,9 @@ final class FirstRunProof: XCTestCase {
         // run as a person pastes it, reaches bob's service.
         ui.typeKey("s", modifierFlags: [.command, .shift])
         let box = ui.descendants(matching: .any)["service-box-\(cliAddress)"]
-        XCTAssertTrue(box.waitForExistence(timeout: 30),
-                      "PRODUCT: the services view does not list bob's web share \(cliAddress)")
+        present(ui, box, timeout: 30, "the services view must list bob's web share \(cliAddress)")
         NSPasteboard.general.clearContents()
-        ui.buttons["copy-forward-\(cliAddress)"].click()
+        tap(ui.buttons["copy-forward-\(cliAddress)"], "Copy on the forward command")
         Thread.sleep(forTimeInterval: 1)
         let pasted = NSPasteboard.general.string(forType: .string) ?? ""
         XCTAssertEqual(pasted, "vox forward \(canonical) 127.0.0.1:0",
@@ -659,21 +674,20 @@ final class FirstRunProof: XCTestCase {
         // in mission with the name suggested, and bob reaches it by his own `vox service list`.
         let mine = try EchoServer(stager)
         let listedHere = ui.buttons["listening-\(mine.port)"]
-        XCTAssertTrue(listedHere.waitForExistence(timeout: 30),
-                      "PRODUCT: the services view does not list the service listening here on port \(mine.port)")
-        listedHere.click()
+        present(ui, listedHere, timeout: 30,
+                "the services view must list the service listening here on port \(mine.port)")
+        tap(listedHere, "the listening service")
         let shareRoom = ui.popUpButtons["share-room"]
-        XCTAssertTrue(shareRoom.waitForExistence(timeout: 10), "PRODUCT: picking a listening service offers no room to share it in")
-        shareRoom.click()
-        ui.menuItems["mission"].click()
-        let canReach = ui.descendants(matching: .any)["share-can"]
-        XCTAssertTrue(canReach.waitForExistence(timeout: 10) && shown(canReach).contains("bob"),
-                      "PRODUCT: before sharing, the view must say bob, whom alice trusts, can reach it; it said \"\(shown(canReach))\"")
-        ui.buttons["share-submit"].click()
+        present(ui, shareRoom, timeout: 10, "picking a listening service must offer a room to share it in")
+        tap(shareRoom, "the room picker")
+        tap(ui.menuItems["mission"], "mission in the room picker")
+        words(ui, ui.descendants(matching: .any)["share-can"], timeout: 10,
+              "before sharing, the view must say bob, whom alice trusts, can reach it",
+              until: { $0.contains("bob") })
+        tap(ui.buttons["share-submit"], "Share")
         let sharedName = ui.descendants(matching: .any)
             .matching(NSPredicate(format: "identifier BEGINSWITH %@", "service-mine-")).firstMatch
-        XCTAssertTrue(sharedName.waitForExistence(timeout: 30),
-                      "PRODUCT: the share made in one step is not under YOUR SHARES")
+        present(ui, sharedName, timeout: 30, "the share made in one step must be under YOUR SHARES")
         var bobSees = ""
         let bobUntil = Date().addingTimeInterval(60)
         while Date() < bobUntil && bobSees.isEmpty {
@@ -707,16 +721,13 @@ final class FirstRunProof: XCTestCase {
         guard refusedJoin.status != 0 else {
             throw Apparatus("carol's join with a wrong passphrase was not refused: \(refusedJoin.out)")
         }
-        ui.descendants(matching: .any)["decisions"].click()
-        let top = ui.descendants(matching: .any)["decision-0"]
-        let refusedFirst = NSPredicate(format: "exists == true AND label BEGINSWITH %@",
-                                       "refused: to join a room")
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: refusedFirst, evaluatedWith: top)],
-                                      timeout: 30), .completed,
-                       "PRODUCT: carol's refused join must be at the top of the decision record; the top says \(top.exists ? shown(top) : "nothing")")
-        XCTAssertTrue(ui.descendants(matching: .any)["decision-1"].exists,
-                      "PRODUCT: the decision record must keep the older decisions (the trust changes) below")
-        print("[proof] decision record top: \(shown(top))")
+        tap(ui.descendants(matching: .any)["decisions"], "Decision record in the sidebar")
+        let topWords = words(ui, ui.descendants(matching: .any)["decision-0"], timeout: 30,
+                             "carol's refused join must be at the top of the decision record",
+                             until: { $0.hasPrefix("refused: to join a room") }) ?? ""
+        present(ui, ui.descendants(matching: .any)["decision-1"], timeout: 5,
+                "the decision record must keep the older decisions (the trust changes) below")
+        print("[proof] decision record top: \(topWords)")
 
         // (11) Untrust cuts a live forward into alice's service.
         let aliceEcho = try EchoServer(stager)
@@ -740,12 +751,12 @@ final class FirstRunProof: XCTestCase {
         guard let live = Line(bobBound), live.roundTrip("BEFORE-UNTRUST\n") == "BEFORE-UNTRUST\n" else {
             throw Apparatus("bob's forward at \(bobBound) carried nothing before the untrust")
         }
-        ui.descendants(matching: .any)["keyring"].click()
-        ui.buttons["keyring-remove-bob"].click()
-        let untrustEffect = ui.descendants(matching: .any)["keyring-remove-effect"]
-        XCTAssertTrue(untrustEffect.waitForExistence(timeout: 10),
-                      "PRODUCT: removing bob must say what untrusting does first")
-        ui.buttons["keyring-untrust-confirm"].click()
+        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
+        tap(ui.buttons["keyring-remove-bob"], "Remove… on bob")
+        words(ui, ui.descendants(matching: .any)["keyring-remove-effect"], timeout: 10,
+              "removing bob must say what untrusting does first",
+              until: { $0.contains("reads nothing you write from now on") })
+        tap(ui.buttons["keyring-untrust-confirm"], "Untrust")
         XCTAssertTrue(live.cut(within: 30),
                       "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
         print("[proof] untrust cut bob's live forward into alice's notes service")
@@ -784,15 +795,106 @@ final class FirstRunProof: XCTestCase {
         }
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
         ui.launch()
-        let reopened = ui.descendants(matching: .any)["group-needs you"]
-        let counted = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: counted, evaluatedWith: reopened)],
-                                      timeout: 30), .completed,
-                       "PRODUCT: bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"; the sidebar says \(reopened.exists ? shown(reopened) : "no needs-you group")")
-        print("[proof] opened again: \(shown(reopened))")
+        let reopened = words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 30,
+                             "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
+                             until: { $0 == "needs you (1)" }) ?? ""
+        print("[proof] opened again: \(reopened)")
         ui.typeKey("q", modifierFlags: .command)
         _ = ui.wait(for: .notRunning, timeout: 30)
         _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
+    }
+
+    // ---- every check on the window proves its own query first --------------------------------
+    //
+    // A red must say whose it is (ADR-018): one that cannot tell a broken app from a broken proof
+    // is no proof. So before any check on what the window shows, the query is shown to work: Vox
+    // is in front and XCTest reads words in its window, else the red is APPARATUS. Then a red is
+    // PRODUCT and quotes what the app did show. A SwiftUI Text's words are its accessibility
+    // value, not its label (the read-by line, the keyring's effect sentences, a message's text):
+    // `shown` reads the label, else the value.
+
+    /// The premise: Vox in front, with words XCTest reads in its window. APPARATUS otherwise.
+    private func windowReadable(_ ui: XCUIApplication, file: StaticString = #filePath,
+                          line: UInt = #line) -> Bool {
+        if ui.state != .runningForeground {
+            ui.activate()
+            _ = ui.wait(for: .runningForeground, timeout: 5)
+        }
+        guard ui.state == .runningForeground else {
+            XCTFail("APPARATUS: Vox is not in front (state \(ui.state.rawValue)), so its window cannot be checked",
+                    file: file, line: line)
+            return false
+        }
+        guard ui.windows.firstMatch.waitForExistence(timeout: 5), !onScreen(ui).isEmpty else {
+            XCTFail("APPARATUS: XCTest reads no words in Vox's window, so nothing in it can be checked",
+                    file: file, line: line)
+            return false
+        }
+        return true
+    }
+
+    /// The words in Vox's frontmost window, each text's identifier with them: what a PRODUCT red
+    /// quotes.
+    private func onScreen(_ ui: XCUIApplication) -> String {
+        ui.windows.firstMatch.staticTexts.allElementsBoundByIndex.prefix(40).map { e -> String in
+            let words = shown(e)
+            return e.identifier.isEmpty || words.isEmpty ? words : "\(e.identifier): \(words)"
+        }
+        .filter { !$0.isEmpty }.joined(separator: " | ")
+    }
+
+    /// `element` on screen within `timeout`, the premise holding: PRODUCT, quoting the window,
+    /// when it never shows.
+    @discardableResult
+    private func present(_ ui: XCUIApplication, _ element: XCUIElement, timeout: TimeInterval,
+                         _ product: String, file: StaticString = #filePath, line: UInt = #line) -> Bool {
+        guard windowReadable(ui, file: file, line: line) else { return false }
+        if element.waitForExistence(timeout: timeout) { return true }
+        XCTFail("PRODUCT: \(product); the window shows: \(onScreen(ui))", file: file, line: line)
+        return false
+    }
+
+    /// `element`'s words once `holds` is true of them, within `timeout`, the premise holding:
+    /// PRODUCT quoting them (or the window, when it never shows) when it never is; APPARATUS when
+    /// it shows and XCTest reads neither its label nor its value.
+    @discardableResult
+    private func words(_ ui: XCUIApplication, _ element: XCUIElement, timeout: TimeInterval,
+                       _ product: String, until holds: (String) -> Bool = { _ in true },
+                       file: StaticString = #filePath, line: UInt = #line) -> String? {
+        guard windowReadable(ui, file: file, line: line) else { return nil }
+        let end = Date().addingTimeInterval(timeout)
+        var last = ""
+        repeat {
+            if element.exists {
+                last = shown(element)
+                if !last.isEmpty && holds(last) { return last }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < end
+        if !element.exists {
+            XCTFail("PRODUCT: \(product); it is not on screen; the window shows: \(onScreen(ui))",
+                    file: file, line: line)
+        } else if last.isEmpty {
+            XCTFail("APPARATUS: \(element.identifier) is on screen and XCTest reads neither its label nor its value",
+                    file: file, line: line)
+        } else {
+            XCTFail("PRODUCT: \(product); it shows \"\(last)\"", file: file, line: line)
+        }
+        return nil
+    }
+
+    /// Click `element`, shown to be there and hittable first: APPARATUS when XCTest cannot click
+    /// it, rather than an exception that names no side.
+    @discardableResult
+    private func tap(_ element: XCUIElement, _ what: String, file: StaticString = #filePath,
+                     line: UInt = #line) -> Bool {
+        guard element.waitForExistence(timeout: 10), element.isHittable else {
+            XCTFail("APPARATUS: XCTest cannot click \(what): \(element.exists ? "not hittable" : "not found")",
+                    file: file, line: line)
+            return false
+        }
+        element.click()
+        return true
     }
 
     /// A staging step: `vox` must succeed, else the staging was not achieved. Its output, trimmed.
