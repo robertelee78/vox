@@ -701,7 +701,9 @@ try:
     shared = until(offered, 60, 1)
     listed = run("alice", "service", "list", room).stdout.strip()
     can = (re.search(r"who can reach it: (.*?) who cannot", seen) or [None, ""])[1]
-    claim("serve", f":{sport}" in seen and "every interface" in seen and "alice" in can
+    # The warning itself, not the listing's "(every interface)" note beside the address.
+    warned = re.search(r"warning: `[^`]+` \([^)]*:" + str(sport) + r", tcp\) listens on every interface", seen)
+    claim("serve", f":{sport}" in seen and warned is not None and "alice" in can
           and tag is not None and shared,
           f"bob's preview: {seen!r}; alice's `vox service list`: {listed!r}")
     if tag:
