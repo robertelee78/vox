@@ -395,6 +395,23 @@ try:
                 return (rows[i + 1] if i + 1 < len(rows) else ""), "▶" in r, i
         return None, False, None
 
+    def members_box(t):
+        """The members pane on `t`'s screen: (its top border's row, its first and past-last
+        columns), found by its title as `pane` finds it (#511 sizes the panes to the window)."""
+        for y, row in enumerate(t.display()):
+            x = row.find("\u250cMembers")
+            if x >= 0:
+                end = row.find("\u2510", x)
+                return y, x, (len(row) if end < 0 else end + 1)
+        return None, 0, t.screen.columns
+    def at(t, who):
+        """The screen row of `who`'s name in the members pane, or None."""
+        i, (top, _, _) = label_of(who)[2], members_box(t)
+        return None if i is None or top is None else top + 1 + i
+    def in_box(t, y):
+        _, x0, x1 = members_box(t)
+        return cells_of(t, y)[1][x0:x1].strip()
+
     def trust_look(t, glyphs, primary, secondary, accent):
         """What the members pane of `t` shows of Alice (`glyphs[0]`, each trusts the other), Dave
         (`glyphs[1]`, only Bob trusts him) and Carol (`glyphs[2]`, not in Bob's keyring) by glyph,
@@ -404,10 +421,10 @@ try:
                 "carol": (glyphs[2], fp["carol"][:26], False)}
         ok, said = True, []
         for who, (glyph, name, strong) in want.items():
-            y = label_of(who)[2]
+            y = at(t, who)
             cells = None if y is None else span(t, y, glyph + name)
             if cells is None:
-                row = "" if y is None else cells_of(t, y)[1][112:].strip()
+                row = "" if y is None else in_box(t, y)
                 ok = False
                 said.append(f"{who}'s row {row!r} (want {glyph + name!r})")
                 continue
@@ -417,7 +434,8 @@ try:
             ok = ok and good
             said.append(f"{who} {glyph}name bold {name_cells[0].bold} fg {name_cells[0].fg!r} "
                         f"(want bold {strong}, {colour!r})")
-        off = stray(t, accent, cols=(112, 160))
+        # The sidebar beside the room shows its live "● online", which the accent marks (L-3).
+        off = stray(t, accent, live=("● online",), cols=members_box(t)[1:])
         said.append(f"accent cells off the focused border: {off[:6]!r}")
         return ok and not off, "; ".join(said)
 
@@ -438,7 +456,7 @@ try:
 
     stage("look")
     # Alice's key reaches Bob once her node has released it: wait for her ⇄ before judging.
-    tui.until(lambda: label_of("alice")[2] is not None and span(tui, label_of("alice")[2], "⇄ alice"), 60, 1)
+    tui.until(lambda: at(tui, "alice") is not None and span(tui, at(tui, "alice"), "⇄ alice"), 60, 1)
     ok, detail = trust_look(tui, ("⇄ ", "→ ", "· "), HEX["text.primary"], HEX["text.secondary"],
                             {HEX["accent"]})
     claim("look", ok, f"in truecolour: {detail}")
@@ -711,15 +729,14 @@ try:
         if colours is None:
             drawn = {c for y in range(tui.screen.lines) for c in
                      ((x.fg, x.bg) for x in cells_of(tui, y)[0])} - {("default", "default")}
-            ya, yd, yc = label_of("alice")[2], label_of("dave")[2], label_of("carol")[2]
+            ya, yd, yc = at(tui, "alice"), at(tui, "dave"), at(tui, "carol")
             a = span(tui, ya, glyphs[0] + "alice")
             dv = span(tui, yd, glyphs[1] + "dave")
             c = span(tui, yc, glyphs[2] + fp["carol"][:26])
             bold = a is not None and dv is not None and all(x.bold for x in a[3:] + dv[3:])
             ok = bold and c is not None and not drawn
-            detail = (f"alice {cells_of(tui, ya)[1][112:].strip()!r}, dave "
-                      f"{cells_of(tui, yd)[1][112:].strip()!r}, bold {bold}; carol "
-                      f"{cells_of(tui, yc)[1][112:].strip()!r}; colours drawn: {sorted(drawn)[:4]!r}")
+            detail = (f"alice {in_box(tui, ya)!r}, dave {in_box(tui, yd)!r}, bold {bold}; carol "
+                      f"{in_box(tui, yc)!r}; colours drawn: {sorted(drawn)[:4]!r}")
         elif colours == "16":
             sixteen = set(p256[:16]) | {"default", "black", "red", "green", "brown", "blue", "magenta",
                                         "cyan", "white"} | {f"bright{n}" for n in
