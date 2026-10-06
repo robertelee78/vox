@@ -1213,7 +1213,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " Enter send · :to <name> · :urgent · :lanes or Esc the room's timeline · : command"
         }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :lanes · :to <name> · :urgent · :link · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :lanes · :to <name> · :urgent · :attach <path> · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",

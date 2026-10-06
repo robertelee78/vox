@@ -2203,6 +2203,70 @@ impl CoreHandle for DaemonCore {
                 }
                 CommandStatus::Done
             }
+            Command::ShareFile {
+                channel_id,
+                path,
+                note,
+                to,
+                urgent,
+            } => {
+                let Ok(paths) = self.account.node_paths(&self.node) else {
+                    return CommandStatus::Failed(UiError::NotAttached);
+                };
+                let opts = crate::share_cli::ShareOpts {
+                    to: to.iter().map(vox_core::node::link::b32_encode).collect(),
+                    urgent,
+                    note: (!note.is_empty()).then_some(note),
+                    ..crate::share_cli::ShareOpts::default()
+                };
+                let room = vox_core::node::link::b32_encode(&channel_id);
+                let offered = until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    crate::share_cli::offer(
+                        &paths,
+                        &room,
+                        std::path::Path::new(path.trim()),
+                        &opts,
+                        |_, _, _| {},
+                    ),
+                );
+                if let Some(t) = self
+                    .timeline
+                    .as_mut()
+                    .filter(|t| t.channel_id == channel_id)
+                {
+                    t.stale = true;
+                }
+                match offered {
+                    Some(Ok(o)) => {
+                        let mut said = vec![if o.row.files > 0 {
+                            format!(
+                                "sharing {}/ ({} files, {} bytes) as {}",
+                                o.row.name, o.row.files, o.row.size, o.row.tag
+                            )
+                        } else {
+                            format!(
+                                "sharing {} ({} bytes) as {}",
+                                o.row.name, o.row.size, o.row.tag
+                            )
+                        }];
+                        if !o.to.is_empty() {
+                            let names: Vec<String> = o
+                                .to
+                                .iter()
+                                .filter_map(|fp| crate::ident::recipient(fp))
+                                .map(|fp| crate::ident::member_name(&self.snapshot.trusted, &fp))
+                                .collect();
+                            said.push(format!("for {}", names.join(", ")));
+                        }
+                        said.extend(o.notes);
+                        CommandStatus::Said(said.join(" · "))
+                    }
+                    Some(Err(e)) => CommandStatus::Said(e.to_string()),
+                    None => CommandStatus::NotConnected,
+                }
+            }
             Command::LanesSeen { channel_id, seen } => {
                 self.note_lanes_seen(channel_id, &seen);
                 CommandStatus::Done

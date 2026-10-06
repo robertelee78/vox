@@ -656,6 +656,20 @@ pub enum Command {
     OfferService,
     /// Drop the share flow's preview.
     CancelServe,
+    /// Share a file or folder in a room from the composer (ADR-028 F-1): its note the composer's
+    /// words, addressed and urgent as the composer is, as `vox share` does.
+    ShareFile {
+        /// The room.
+        channel_id: Digest32,
+        /// The file or folder, as the person typed it.
+        path: String,
+        /// The note: the composer's words, if any.
+        note: String,
+        /// The members it is for.
+        to: Vec<Digest32>,
+        /// Whether it may interrupt their agents.
+        urgent: bool,
+    },
     /// What the person has seen of each member's lane in a room, as they leave the lanes (W-3):
     /// `(member, the newest post of its seen)`. Kept with this node, across restarts.
     LanesSeen {

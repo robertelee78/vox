@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks thirty-five claims, each
+//! 160x50. It checks thirty-six claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -89,6 +89,9 @@
 //!   `urgent` (W-4, #513);
 //! - `seen`: Bob leaves his lanes and Alice posts again: looking again, only her new post is
 //!   marked new, her earlier ask not (W-3, #513);
+//! - `attach`: with `:to alice`, a note typed in the composer and `:attach <file>`, Alice reads
+//!   one message, a `file` announcement carrying the note and `to` naming her, and no second
+//!   message for the note (ADR-028 F-1, #493);
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
@@ -127,12 +130,12 @@
 //! trusted member that has not granted the newcomer (`newcomer`), a retention change with no line in
 //! the timeline or a focused pane titled twice (`retention`), the share flow's every-interface
 //! warning left out (`serve`), coordination posts shown in a lane, the
-//! composer's To: and urgent left off what it sends, every post marked new, a quote of the thread's root rather than `re`, Enter on a reply not
+//! composer's To: and urgent left off what it sends, every post marked new, an attach's note posted as a message of its own, a quote of the thread's root rather than `re`, Enter on a reply not
 //! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
 //! a pasted fingerprint that is not the node's let through to the keyring (`trust`), or an image
 //! drawn before this node's copy is verified (`inline`). It passes only on the script's PASS with
-//! all 35 claims ok.
+//! all 36 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -228,7 +231,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (35 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (36 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -242,8 +245,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (35, 35),
-                "APPARATUS: the driver said PASS without all 35 claims ok: {said}"
+                (36, 36),
+                "APPARATUS: the driver said PASS without all 36 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

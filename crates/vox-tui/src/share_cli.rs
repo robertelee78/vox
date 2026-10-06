@@ -81,17 +81,28 @@ fn shares_of(frame: Result<Frame, vox_core::error::Error>) -> Result<Vec<ShareRo
     }
 }
 
-/// `vox share <room> <file|dir>`.
+/// What a share offered: what the daemon serves, whom its announcement is to, and anything the
+/// sharer is to be told besides (an addressee that cannot be interrupted).
+pub(crate) struct Offered {
+    pub(crate) row: ShareRow,
+    pub(crate) to: Vec<String>,
+    pub(crate) notes: Vec<String>,
+}
+
+/// **The one way a file or folder is shared** (ADR-028 F-1): `vox share`, and the TUI's attach.
+/// The path is made absolute, the addressees checked, the hop rule applied, and one announcement
+/// carrying the note, the addressees and urgent is posted by the daemon, which serves it.
+/// `before` is told what is to be shared, in which room, and who is to fetch it, before it is.
 ///
 /// # Errors
-/// If the node cannot be reached, the room is unknown, an addressee is no member, or the daemon
-/// cannot read, serve or announce the file.
-pub async fn share(
+/// As `vox share` refuses.
+pub(crate) async fn offer(
     paths: &Paths,
     room: &str,
     path: &Path,
     opts: &ShareOpts,
-) -> Result<(), AppError> {
+    before: impl FnOnce(&str, &str, &[String]),
+) -> Result<Offered, AppError> {
     // The daemon reads the path, from wherever it was started: it is made absolute here.
     let path = std::fs::canonicalize(path)
         .map_err(|e| AppError::Usage(format!("{}: {e}", path.display())))?;
@@ -111,11 +122,7 @@ pub async fn share(
     } else {
         base
     };
-    println!("vox: about to share {what} in {which}");
-    println!(
-        "     the members of it in your keyring are to fetch it: {}",
-        crate::room_cli::listed(&reach, "none yet")
-    );
+    before(&what, &which, &reach);
     let note = opts.note.as_deref().map(str::trim).unwrap_or_default();
     let session = crate::coord::session_if_named();
     let me = client
@@ -163,20 +170,55 @@ pub async fn share(
             })
             .await,
     )?;
-    let Some(s) = shared.first() else {
+    let Some(row) = shared.into_iter().next() else {
         return Err(AppError::Usage(
             "the daemon did not say what it shares".into(),
         ));
     };
+    let mut notes = Vec::new();
     if opts.urgent {
         let me = client
             .me()
             .map(|d| vox_core::node::link::b32_encode(&d))
             .unwrap_or_default();
         if let Some(line) = crate::wake::uninterruptible(paths, &me, &env.to) {
-            eprintln!("vox: {line}");
+            notes.push(line);
         }
     }
+    Ok(Offered {
+        row,
+        to: env.to,
+        notes,
+    })
+}
+
+/// `vox share <room> <file|dir>`.
+///
+/// # Errors
+/// If the node cannot be reached, the room is unknown, an addressee is no member, or the daemon
+/// cannot read, serve or announce the file.
+pub async fn share(
+    paths: &Paths,
+    room: &str,
+    path: &Path,
+    opts: &ShareOpts,
+) -> Result<(), AppError> {
+    let Offered { row, to, notes } = offer(paths, room, path, opts, |what, which, reach| {
+        println!("vox: about to share {what} in {which}");
+        println!(
+            "     the members of it in your keyring are to fetch it: {}",
+            crate::room_cli::listed(reach, "none yet")
+        );
+    })
+    .await?;
+    for line in &notes {
+        eprintln!("vox: {line}");
+    }
+    let s = &row;
+    let env = Envelope {
+        to,
+        ..Envelope::new(FILE, "")
+    };
     if s.files > 0 {
         println!(
             "vox: sharing {}/ ({} files, {} bytes) as {}",
