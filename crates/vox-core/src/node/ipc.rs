@@ -322,6 +322,9 @@ const T_COUNT: u64 = 1200;
 const T_LANES_REQ: u64 = 512;
 /// [`Frame::Lanes`] (#512).
 const T_LANES: u64 = 1512;
+// What this node's person has not read in a room, for a client starting (ADR-028 R-8): answered
+// with [`Frame::Rows`]. Numbered by the unread levels' item (#484), far from the others.
+const T_UNREAD_REQ: u64 = 2484;
 // The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
 // `remove` reached the daemon (V030-06) while `list` still opened the profile, which the daemon
 // holds, so a service just added could not be listed. Not a protocol bump: additive, and a node
@@ -653,6 +656,13 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
+    /// What this node's person has not read in a room, oldest first, as [`Frame::Rows`]: the rows
+    /// after the newest one this node recorded as read, by someone else (ADR-028 R-8). A client
+    /// counts its unread from these when it starts, then from the node's events.
+    Unread {
+        /// The room.
+        channel_id: Digest32,
+    },
     /// The rows of a room with these entry hashes, those it holds, as [`Frame::Rows`] (V210-120).
     Find {
         /// The room.
@@ -715,6 +725,9 @@ impl Request {
             }
             Request::Lanes { channel_id } => {
                 e.array(2).uint(T_LANES_REQ).bytes(channel_id);
+            }
+            Request::Unread { channel_id } => {
+                e.array(2).uint(T_UNREAD_REQ).bytes(channel_id);
             }
             Request::Find {
                 channel_id,
@@ -1104,6 +1117,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Lanes { channel_id })
+            }
+            (T_UNREAD_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Unread { channel_id })
             }
             (T_AGREE, 4) => {
                 let channel_id = digest(&mut d)?;
@@ -3853,6 +3872,32 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         // Searched from the newest row back: what a client looks up (a reply's parent) is
         // usually recent.
+        // The rows the view says are unread here, as the timeline holds them (ADR-028 R-8).
+        Request::Unread { channel_id } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            let mut want: std::collections::BTreeSet<Digest32> =
+                detail.unread.iter().copied().collect();
+            let mut rows: Vec<MessageRow> = Vec::new();
+            for r in detail.timeline.iter().rev() {
+                if want.is_empty() {
+                    break;
+                }
+                if want.remove(&r.entry_hash) {
+                    rows.push(r.clone());
+                }
+            }
+            rows.reverse();
+            Frame::Rows { rows }
+        }
         Request::Find {
             channel_id,
             entries,

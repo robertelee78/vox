@@ -500,6 +500,9 @@ pub struct ChannelDetail {
     /// other members' nodes said they hold it)`, oldest first, for the same messages as
     /// [`Self::read_by`] looks at.
     pub held: Vec<(Digest32, u64)>,
+    /// What this node's person has not read here, oldest first
+    /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
+    pub unread: Vec<Digest32>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
