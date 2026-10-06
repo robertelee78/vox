@@ -3153,6 +3153,7 @@ dependencies = [
 name = "vox-ffi"
 version = "0.3.1"
 dependencies = [
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "uniffi",

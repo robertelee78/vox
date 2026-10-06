@@ -20,6 +20,12 @@
 //   (waits for a line on stdin: the bound address, once the proof has been through the forward)
 //   STOPPED                 `stopForward` stopped it
 //   STATUS <json>           `status`: the node's report, on one line
+//   (waits for a line on stdin: the path of a file to share to the peer)
+//   SHARED_FILE <name> <sha256>
+//                           `share` to the peer, with a note, answered once the daemon serves it
+//   LISTED_FILES <n> <name> `shares`: this node's shares in the room
+//   (waits for a line on stdin: the peer has shared a file to this node)
+//   PULLED <path>           `pulled`: the file this node pulled by itself (up to 90 s)
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -98,6 +104,24 @@ do {
     say("STOPPED")
     let report = try await client.status()
     say("STATUS \(report.replacingOccurrences(of: "\n", with: " "))")
+
+    let file = readLine() ?? ""
+    let fileShare = try await client.share(
+        room: room, path: file, to: [peer], note: "from swift", re: "", urgent: false, count: 0,
+        forSecs: 0)
+    say("SHARED_FILE \(fileShare.name) \(fileShare.sha256)")
+    let mineListed = try await client.shares(room: room)
+    say("LISTED_FILES \(mineListed.count) \(mineListed.first?.name ?? "")")
+
+    _ = readLine()
+    var pulled: [PulledFile] = []
+    // Within the proof's own wait for this line (120 s), so an empty answer is its to judge.
+    let pullUntil = Date().addingTimeInterval(90)
+    while pulled.isEmpty && Date() < pullUntil {
+        pulled = try await client.pulled(room: room)
+        if pulled.isEmpty { try await Task.sleep(nanoseconds: 250_000_000) }
+    }
+    say("PULLED \(pulled.first?.path ?? "")")
     _ = readLine()
     await client.close()
     say("CLOSED")

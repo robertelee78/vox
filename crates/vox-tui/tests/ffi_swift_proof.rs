@@ -19,7 +19,11 @@
 //!    app's own `vox service list` prints; `forward` to that address carries bytes to the peer's
 //!    service and back; `stopForward` ends it; `status` is the report `vox status --json` gives
 //!    for the same node (ADR-014 #436).
-//! 4. When the client closes, the daemon detaches the node it attached (`vox node list` says
+//! 4. A file the app shares to the peer (`share`, with a note) is served: the peer's node pulls
+//!    it by itself into its files directory, byte for byte, and `shares` lists it as the app's own
+//!    `vox share list` does. A file the peer shares to the app (`vox share --to`) is pulled by the
+//!    app's node by itself, and `pulled` gives where, byte for byte (ADR-028 F-1–F-4, #436).
+//! 5. When the client closes, the daemon detaches the node it attached (`vox node list` says
 //!    `detached`): the app's hold ends with it (M-6).
 //!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
@@ -551,7 +555,47 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     let cli_status: serde_json::Value =
         serde_json::from_str(&mine.run(&["status", "--json"], "")).unwrap_or_default();
 
-    // (4) The app closes; the daemon lets the node go.
+    // (4) Files both ways.
+    let to_peer = tmp.path().join("from-swift.bin");
+    let to_peer_bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    std::fs::write(&to_peer, &to_peer_bytes).unwrap();
+    writeln!(to_app, "{}", to_peer.display()).unwrap();
+    let shared_file = expect(&from_app, &seen, "SHARED_FILE ");
+    let listed_files = expect(&from_app, &seen, "LISTED_FILES ");
+    let cli_shares = mine.run(&["share", "list", &joined[7..]], "");
+    let room_dir = |d: &Daemon| -> Option<PathBuf> {
+        let nodes = std::fs::read_dir(d.data.join("nodes")).ok()?;
+        nodes
+            .filter_map(Result::ok)
+            .map(|n| n.path().join("files").join(&joined[7..]))
+            .find(|p| p.exists())
+    };
+    let until = Instant::now() + TIMEOUT;
+    let mut at_peer: Option<Vec<u8>> = None;
+    while Instant::now() < until && at_peer.is_none() {
+        at_peer = room_dir(&peer).and_then(|d| std::fs::read(d.join("from-swift.bin")).ok());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let from_peer = tmp.path().join("from-peer.bin");
+    let from_peer_bytes: Vec<u8> = (0..150_000u32).map(|i| (i * 13 % 241) as u8).collect();
+    std::fs::write(&from_peer, &from_peer_bytes).unwrap();
+    peer.run(
+        &[
+            "share",
+            &room,
+            from_peer.to_str().unwrap(),
+            "--to",
+            &app_fp,
+            "-m",
+            "from the peer",
+        ],
+        "",
+    );
+    writeln!(to_app).unwrap();
+    let pulled = expect(&from_app, &seen, "PULLED ")[7..].to_owned();
+    let at_app = std::fs::read(&pulled).ok();
+
+    // (5) The app closes; the daemon lets the node go.
     writeln!(to_app).unwrap();
     expect(&from_app, &seen, "CLOSED");
     let until = Instant::now() + TIMEOUT;
@@ -571,10 +615,13 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "{joined}\nwhile attached, `vox node list` said: {listed}{posted}\npeer's read shows the \
          app's post: {}\n{got}\n{shared}\n`vox service list` said: {cli_list}BOUND {bound}, \
          echoed {through:?}, refused once stopped: {refused_after}\nstatus identity {} (vox \
-         status: {})\nafter close, `vox node list` said: {after}all the Swift program said: {:?}",
+         status: {})\n{shared_file}; {listed_files}; the peer has it: {}; PULLED {pulled}, matches: {}\nafter \
+         close, `vox node list` said: {after}all the Swift program said: {:?}",
         read.contains("hello from swift"),
         status["identity"],
         cli_status["identity"],
+        at_peer.as_deref() == Some(&to_peer_bytes[..]),
+        at_app.as_deref() == Some(&from_peer_bytes[..]),
         seen.lock().unwrap()
     );
     assert!(
@@ -592,6 +639,24 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "PRODUCT: the peer must read the app's post: {read}"
     );
     assert_eq!(got, "GOT hello from the peer");
+    assert!(
+        at_peer.as_deref() == Some(&to_peer_bytes[..]),
+        "PRODUCT: a file the app shares to the peer must reach the peer's files directory byte \
+         for byte; {shared_file}; the peer has {:?} bytes",
+        at_peer.as_ref().map(Vec::len)
+    );
+    assert!(
+        listed_files.starts_with("LISTED_FILES 1 from-swift.bin")
+            && cli_shares.contains("from-swift.bin"),
+        "PRODUCT: `shares` must list the app's share as `vox share list` does: {listed_files} \
+         against {cli_shares}"
+    );
+    assert!(
+        at_app.as_deref() == Some(&from_peer_bytes[..]),
+        "PRODUCT: a file the peer shares to the app must be pulled by the app's node, and `pulled` \
+         must say where, byte for byte: it said {pulled:?}, holding {:?} bytes",
+        at_app.as_ref().map(Vec::len)
+    );
     assert_eq!(
         through, "through vox\n",
         "PRODUCT: a forward to {address} must carry bytes to the peer's service and back"

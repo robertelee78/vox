@@ -29,6 +29,8 @@ bindgen = ["uniffi/cli"]
 vox-core = { path = "../vox-core" }
 # The envelope a post with addressees, a reply or urgency is written as (ADR-020 4.5, 4.6).
 vox-agentcomms = { path = "../vox-agentcomms" }
+# A share's note, in its announcement's data (ADR-028 F-1).
+serde_json.workspace = true
 zeroize.workspace = true
 uniffi.workspace = true
 tokio.workspace = true
