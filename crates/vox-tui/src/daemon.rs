@@ -33,6 +33,10 @@ use crate::host::{Defaults, Router};
 /// How long an auto-started daemon lingers with no node and no client before it exits (L-8).
 const IDLE_LINGER: Duration = Duration::from_secs(1);
 
+/// How long an auto-started daemon serves before an idle exit may end it (L-8): the client that
+/// started it, slow to connect on a loaded machine, still finds it there.
+const START_GRACE: Duration = Duration::from_secs(10);
+
 /// Run this profile's node **without a terminal**, so agent sessions can attach
 /// (ADR-020 §12).
 ///
@@ -222,6 +226,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             if !args.as_detached {
                 return std::future::pending::<()>().await;
             }
+            let served = Instant::now();
             let mut since: Option<Instant> = None;
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -231,7 +236,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 }
                 if router.idle() {
                     let t = *since.get_or_insert_with(Instant::now);
-                    if t.elapsed() >= IDLE_LINGER {
+                    if t.elapsed() >= IDLE_LINGER && served.elapsed() >= START_GRACE {
                         return;
                     }
                 } else {

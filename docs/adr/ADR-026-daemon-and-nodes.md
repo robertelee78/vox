@@ -123,7 +123,9 @@ network presence from the start: there is no interim design with one socket per 
   stops or dies, the client MUST notice the connection close and exit non-zero, saying so; it MUST
   NOT keep running on a dead listener.
 - **L-8. An auto-started daemon** (S-2) MUST exit once it has no attached node and no client
-  connection, after a 1 s linger. A daemon started by hand MUST run until stopped.
+  connection, after a 1 s linger. It MUST NOT take that exit within 10 s of serving, so the client
+  that started it, slow to connect on a loaded machine, finds it there. A daemon started by hand
+  MUST run until stopped.
 
 ### 4. Control plane
 

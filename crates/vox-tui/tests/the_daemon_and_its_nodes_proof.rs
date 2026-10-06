@@ -13,7 +13,9 @@
 //! 3. **Keep (proof 7, L-4).** `vox daemon --keep` records its node; after the daemon stops, a
 //!    daemon started in the background attaches it again with its room open.
 //! 4. **Two clients, one daemon (proof 8, D-1, S-2).** Two `vox daemon --detach` at once end with
-//!    one daemon: one process holds `.daemon/lock`, and it exits on its own once idle.
+//!    one daemon: one process holds `.daemon/lock`. With no client, it is still there 3 s after it
+//!    serves (the 10 s start grace, L-8) and answers `vox node list`, and it exits on its own once
+//!    idle after the grace. Mutation: no grace turns it red at the 3 s check.
 //!
 //! 5. **Root is told at once (C-1).** The daemon admits no uid 0, so a person running vox as root
 //!    (a container's default user) must be told that, at once, with what to do — not left to
@@ -463,6 +465,8 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
         });
         (one.join().unwrap(), two.join().unwrap())
     });
+    // Both clients have returned, so the winner serves from about now.
+    let served = Instant::now();
     assert!(
         one.0 && two.0,
         "PRODUCT: two clients started a daemon together and one start lost the lock; that client \
@@ -484,9 +488,35 @@ fn two_clients_with_no_daemon_end_with_one_and_it_exits_when_idle() {
         "PRODUCT: two clients with no daemon ended with more than one: {seen:?}\nlog:\n{}",
         a.log()
     );
+    // **The start grace** (L-8): the daemon takes no idle exit within 10 s of serving, so a client
+    // slow to connect on a loaded machine still finds the daemon it started. At 3 s, past the 1 s
+    // linger and inside the grace, with no client ever connected, it is still there and answers.
+    let at = Duration::from_secs(3);
     assert!(
-        wait_until(Duration::from_secs(10), || !alive(pid)),
-        "PRODUCT: the auto-started daemon with no node and no client did not exit\nlog:\n{}",
+        served.elapsed() < at,
+        "APPARATUS: the staging took {:?}, past the 3 s mark it measures at",
+        served.elapsed()
+    );
+    std::thread::sleep(at - served.elapsed());
+    assert!(
+        alive(pid),
+        "PRODUCT: the auto-started daemon exited idle within 3 s of serving, inside its 10 s start \
+         grace (ADR-026 L-8), so a client slow to connect would not find it\nlog:\n{}",
+        a.log()
+    );
+    let (ok, out, err) = a.run(&["node", "list"], "");
+    assert!(
+        ok && a.lock_pid() == Some(pid),
+        "PRODUCT: `vox node list` 3 s after the start was not answered by the daemon the clients \
+         started ({pid}; the lock now names {:?}): {out}{err}\nlog:\n{}",
+        a.lock_pid(),
+        a.log()
+    );
+    // Once the grace has passed with no node and no client, it exits as before.
+    assert!(
+        wait_until(Duration::from_secs(20).saturating_sub(served.elapsed()), || !alive(pid)),
+        "PRODUCT: the auto-started daemon with no node and no client did not exit within 20 s of \
+         serving\nlog:\n{}",
         a.log()
     );
 }
