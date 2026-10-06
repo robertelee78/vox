@@ -89,7 +89,7 @@
 //!   `urgent` (W-4, #513);
 //! - `seen`: Bob leaves his lanes and Alice posts again: looking again, only her new post is
 //!   marked new, her earlier ask not (W-3, #513);
-//! - `attach`: with `:to alice`, a note typed in the composer and `:attach <file>`, Alice reads
+//! - `attach`: with `:to alice`, a note typed in the composer and `:share <file>`, Alice reads
 //!   one message, a `file` announcement carrying the note and `to` naming her, and no second
 //!   message for the note (ADR-028 F-1, #493);
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";

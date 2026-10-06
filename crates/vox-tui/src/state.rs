@@ -1392,8 +1392,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     match verb {
         "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
         "lanes" => return Some(Parsed::Lanes),
-        // Share a file or folder here, from the composer (F-1): its words the note.
-        "attach" if !rest.is_empty() => return Some(Parsed::Attach(channel, rest.to_owned())),
+        // Share a file or folder here, from the composer (F-1): its words the note. `share`, as
+        // `vox share` is; `:attach` is the node's.
+        "share" if !rest.is_empty() => return Some(Parsed::Attach(channel, rest.to_owned())),
         "to" => return Some(Parsed::To(rest.to_owned())),
         "urgent" => return Some(Parsed::Urgent),
         _ => {}

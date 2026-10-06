@@ -97,7 +97,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
   seen      Bob leaves his lanes and Alice posts again: looking again, only her new post is marked
             new in her lane, her earlier ask not (W-3, #513);
-  attach    with `:to alice`, the note typed in the composer and `:attach <file>`, Alice reads one
+  attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
             message: a `file` announcement carrying the note in it and `to` naming her, no second
             message for the note (ADR-028 F-1, #493);
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
@@ -1118,8 +1118,8 @@ try:
     tui.key(":to alice\r", 1)
     focus("Composer")
     tui.key("ATTACH-NOTE for alice", 1)
-    tui.key("\t", 1)  # composer -> members: what was typed stays, and `:` is a command again
-    tui.key(f":attach {attached}\r", 4)
+    focus("Timeline")  # away from the composer: what was typed stays, and `:` is a command again
+    tui.key(f":share {attached}\r", 4)
     said_share = " ".join(r.strip() for r in tui.display()[-4:])
     def announced():
         rows = [json.loads(l) for l in run("alice", "room", "read", room, "--json").stdout.splitlines() if l.strip()]
