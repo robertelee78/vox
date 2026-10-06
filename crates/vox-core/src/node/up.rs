@@ -578,7 +578,13 @@ where
                     // operator (PRD-001 R23), rather than dialled and dropped (V030-25).
                     let stated_udp = crate::tunnel::udp::is_udp(&room.service);
                     let why = match room.share {
-                        crate::node::resolver::ShareState::Absent => Some("shares no service"),
+                        // A share fingerprint the log here lacks is the sharer's to resolve
+                        // (ADR-028 S-1): it is asked, as `udp/<fingerprint>`.
+                        crate::node::resolver::ShareState::Absent
+                            if !room.by_unknown_fingerprint() =>
+                        {
+                            Some("shares no service")
+                        }
                         crate::node::resolver::ShareState::Stated if !stated_udp => {
                             Some("shares it over TCP, not UDP")
                         }

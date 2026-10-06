@@ -120,6 +120,10 @@ pub struct ChannelServices {
     /// trust, and only then send its request — and be authorized against a set captured
     /// before the withdrawal. No timing skill required; just patience.
     pub reachers: Reachers,
+    /// This node's own fingerprint: a dialer may name a service by its share fingerprint,
+    /// `SHA-256(room ‖ this node ‖ name)` (ADR-028 S-1), which only the sharer can always
+    /// turn back into the name, whatever the dialer's copy of the room's log holds.
+    pub me: Digest32,
 }
 
 impl std::fmt::Debug for ChannelServices {
@@ -147,6 +151,40 @@ pub async fn serve(
     snapshot: HostSnapshot,
 ) -> Result<()> {
     serve_reporting(client, send, recv, snapshot, None, None, None).await
+}
+
+/// The service a dialer's `label` names in `channel`, as `(the tag it is offered under, where it
+/// listens)`: by its tag, or by its share fingerprint (ADR-028 S-1, the `<service>` of a
+/// canonical address), as `<fingerprint>` for a TCP share or `udp/<fingerprint>` for a UDP one.
+/// The transport must match: a fingerprint names the share's name, which a TCP and a UDP share
+/// would have in common, and a request carried over one transport is never served by the other.
+/// The host resolves the fingerprint itself because it alone always holds its own shares: a
+/// member whose copy of the room's log lacks the share (it slept while it was made) still reaches
+/// it by the canonical address.
+fn offered_as(
+    channel: &ChannelServices,
+    channel_id: &Digest32,
+    label: &str,
+) -> Option<(String, std::net::SocketAddr)> {
+    let offered = channel.offered.borrow();
+    if let Some(at) = offered.get(label) {
+        return Some((label.to_owned(), *at));
+    }
+    let udp = label.starts_with("udp/");
+    let fp =
+        crate::node::link::b32_decode(label.strip_prefix("udp/").unwrap_or(label), "vox service")
+            .ok()?;
+    offered
+        .iter()
+        .find(|(tag, _)| {
+            crate::tunnel::udp::is_udp(tag) == udp
+                && crate::governance::share::service_fingerprint(
+                    channel_id,
+                    &channel.me,
+                    crate::node::channel::service_name(tag),
+                ) == fp
+        })
+        .map(|(tag, at)| (tag.clone(), *at))
 }
 
 /// [`serve`], emitting [`NodeEvent::TunnelServed`] for each authorized request.
@@ -187,8 +225,9 @@ pub async fn serve_reporting(
             let channel = snapshot.get(channel_id)?;
             // Read from the live offer, not a copy: a service removed while this stream sat
             // unread is refused like one that was never offered.
-            let endpoint = *channel.offered.borrow().get(tag)?;
+            let (tag, endpoint) = offered_as(channel, channel_id, tag)?;
             Some(HostService {
+                tag,
                 endpoint,
                 reachers: Arc::clone(&channel.reachers),
                 offered: Arc::clone(&channel.offered),

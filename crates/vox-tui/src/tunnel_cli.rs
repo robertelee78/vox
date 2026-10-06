@@ -377,6 +377,11 @@ pub fn print_services(
 /// The refusal for an address whose share the room's log does not carry, or `None` when it does
 /// (V030-25, PRD-001 R23: said at once, on this side).
 fn share_refusal(name: &str, room: &ServiceRoom) -> Option<AppError> {
+    // A canonical address names its share by fingerprint, which the sharer resolves itself: this
+    // node's copy of the log may simply be behind (ADR-028 S-1), so the host is asked.
+    if room.by_unknown_fingerprint() {
+        return None;
+    }
     match room.share {
         ShareState::Stated => None,
         ShareState::Absent => Some(AppError::Usage(format!(
@@ -1720,10 +1725,14 @@ pub async fn forward_named(
     // share is asked for as `udp/<name>` (ADR-022 decision 6) — and whether there is one at all.
     // A room this node joined and has not yet synced may not hold the statement yet; it arrives
     // with the first sync, so only that case waits. A synced room whose log carries no such
-    // share is refused at once, with the reason (PRD-001 R23).
+    // share is refused at once, with the reason (PRD-001 R23). A canonical address's share
+    // fingerprint does not wait: the host resolves it whatever this node's copy holds.
     let share_deadline = Instant::now() + share_patience();
+    let waits = |room: &ServiceRoom| {
+        room.share == ShareState::NotYetKnown && !room.by_unknown_fingerprint()
+    };
     // **A wait is said** (V210-100): up to SHARE_PATIENCE with nothing on the screen looked hung.
-    if room.share == ShareState::NotYetKnown {
+    if waits(&room) {
         waiting.on("the room's first sync, for what is shared there");
         eprintln!(
             "vox: {name}: waiting for this room's first sync with a member, to know what is shared \
@@ -1731,7 +1740,7 @@ pub async fn forward_named(
             share_patience().as_secs()
         );
     }
-    while room.share == ShareState::NotYetKnown && Instant::now() < share_deadline {
+    while waits(&room) && Instant::now() < share_deadline {
         tokio::time::sleep(Duration::from_millis(100)).await;
         room = resolve().await?;
     }
@@ -1782,11 +1791,36 @@ pub async fn forward_named(
         short(&host),
         first_attempt.elapsed().as_millis()
     );
+    // **A name, never a raw fingerprint** (ADR-028 S-1a): a canonical address names its service
+    // by fingerprint, and the host resolved it, but the person reads the share's name. It is on
+    // the room's log, which a node that was behind reads within moments of reaching the host:
+    // the forward is said at once, and the name when it arrives.
+    let unnamed = vox_core::node::link::b32_decode(&service, "vox service").is_ok();
+    let shown = if unnamed {
+        "the service that address names (its name is not on this node's copy of the room yet)"
+    } else {
+        service.as_str()
+    };
     println!(
-        "vox: forwarding {bound} to {service} on {name} ({})",
+        "vox: forwarding {bound} to {shown} on {name} ({})",
         short(&host)
     );
     println!("Ctrl-C to stop");
+    if unnamed {
+        let (at, name) = (held.at.clone(), name.to_owned());
+        tokio::spawn(async move {
+            let named_by = Instant::now() + SHARE_PATIENCE;
+            while Instant::now() < named_by {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if let Ok(r) = vox_core::node::nameipc::resolve(&at, &name).await {
+                    if r.share == ShareState::Stated {
+                        println!("vox: {bound} forwards to {}", r.service);
+                        return;
+                    }
+                }
+            }
+        });
+    }
     waiting.on("the vox daemon to stop");
     // Keep reading events while forwarding, so a connection the host refused or cut says why here
     // (PRD-001 R23); the application only ever sees its socket reset.
