@@ -730,6 +730,11 @@ pub struct ChannelState {
     /// yet, oldest first (ADR-023 decision 4). Installing one needs this identity's prekey
     /// ring, which the actor holds, so the actor drains them ([`Self::take_inbound_packages`]).
     inbound_packages: Vec<crate::node::keypackage::KeyPackage>,
+    /// Key-packages opened here from a member this node's owner has not trusted: not installed
+    /// (V210-118), and kept so the key is taken the moment the owner trusts its author, as a key
+    /// on the pairwise path is when its author offers it again. In memory only: a reopened room
+    /// collects every key-package for this identity from its log again.
+    held_packages: Vec<crate::node::keypackage::KeyPackage>,
     /// Accepted governance entries (consent grants and the rest) in acceptance
     /// order — the evaluator's input, rebuilt from the log on open (M14.5).
     gov_entries: Vec<GovEntry>,
@@ -1554,6 +1559,7 @@ impl ChannelState {
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
             inbound_packages: Vec::new(),
+            held_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -2003,6 +2009,7 @@ impl ChannelState {
             timeline_generation,
             log_ids,
             inbound_packages,
+            held_packages: Vec::new(),
             gov_entries,
             receivers,
             anchors,
@@ -2240,6 +2247,7 @@ impl ChannelState {
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
             inbound_packages: Vec::new(),
+            held_packages: Vec::new(),
             gov_entries: Vec::new(),
             receivers: BTreeMap::new(),
             anchors: BootstrapSet::new(),
@@ -2693,6 +2701,21 @@ impl ChannelState {
             }
         }
         true
+    }
+
+    /// Hold a key-package from a member this node's owner has not trusted (V210-118): its key is
+    /// not taken until [`Self::release_held_packages`].
+    pub fn hold_package(&mut self, package: crate::node::keypackage::KeyPackage) {
+        if !self.held_packages.contains(&package) {
+            self.held_packages.push(package);
+        }
+    }
+
+    /// Offer the held key-packages again, with the next ones the log delivers: the owner has
+    /// trusted someone, perhaps one of their authors.
+    pub fn release_held_packages(&mut self) {
+        let held = std::mem::take(&mut self.held_packages);
+        self.inbound_packages.extend(held);
     }
 
     /// Take the key-packages addressed to this identity that the log delivered since the last
