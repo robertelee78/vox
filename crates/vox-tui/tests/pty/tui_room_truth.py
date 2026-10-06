@@ -248,7 +248,9 @@ def tui_env(**extra):
 def unlock(t):
     """Open bob's room in `t` as a person would: each passphrase is typed only when a prompt asks
     for it. Typed with no prompt up, its letters were commands: `d` opened the decisions."""
-    asks = lambda: "passphrase" in t.text().lower()
+    # A prompt, as the TUI draws one ("identity passphrase (1/1):"): not the word anywhere, since
+    # the status bar says "keyring asks for the passphrase" once its window has closed.
+    asks = lambda: re.search(r"passphrase \(\d+/\d+\):", t.text()) is not None
     t.until(lambda: asks() or "attached: default" in t.text(), 20, 0.5)
     if asks():
         t.key("id pass\r", 4)
