@@ -655,6 +655,34 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         "PRODUCT: `vox share stop` must say what it is to end, naming the room, then that it \
          stopped: {out:?}"
     );
+    // A folder is shared as its files (#499), and said so: never "as one archive".
+    let folder = tmp.path().join("docs");
+    std::fs::create_dir_all(&folder).expect("APPARATUS: cannot make the shared folder");
+    std::fs::write(folder.join("a.txt"), "a\n").expect("APPARATUS: cannot write a.txt");
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "share",
+            &room_prefix,
+            folder.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT: vox share of a folder failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to share docs/ (a folder)",
+            &["\"team\""],
+            "vox: sharing docs/ (1 files",
+            ""
+        ) && !out.contains("archive"),
+        "PRODUCT: `vox share` of a folder must say it is to share the folder, not an archive, \
+         naming the room, then that it shares it: {out:?}"
+    );
+    let (ok, _, err) = vox(&data, &cfg, &["share", "stop", &room_prefix, "docs"], None);
+    assert!(ok, "PRODUCT: vox share stop of the folder failed: {err}");
     // A node this one shares no room with: a fingerprint nobody holds.
     let stranger = "a".repeat(52);
     let (ok, out, err) = vox(

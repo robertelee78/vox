@@ -106,7 +106,8 @@ pub async fn share(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let what = if path.is_dir() {
-        format!("{base} (a folder, as one archive)")
+        // A folder is shared as its files, each pulled and checked on its own (#499).
+        format!("{base}/ (a folder)")
     } else {
         base
     };
