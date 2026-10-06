@@ -899,9 +899,12 @@ final class FirstRunProof: XCTestCase {
         // ... and used: `vox forward` to what was copied carries bytes to bob's service and back.
         let forward = try start(vox, ["forward", "--node", "alice", copied, "127.0.0.1:0"],
                                 env: voxEnv, until: "vox: forwarding ", product: true)
-        defer { forward.terminate(); forward.waitUntilExit() }
         let bound = startedLine.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
         let through = Line(bound)?.roundTrip("THROUGH-THE-COPY\n") ?? ""
+        // Stopped now: a forward holds alice attached while it runs (step 12 checks the quit
+        // detaches her).
+        forward.terminate()
+        forward.waitUntilExit()
         XCTAssertEqual(through, "THROUGH-THE-COPY\n",
                        "PRODUCT: a forward to the copied address \(copied), bound at \(bound), must carry bytes to bob's service and back")
         print("[proof] ⌘J opened mission; ⌘⇧C copied \(copied)")
@@ -923,9 +926,11 @@ final class FirstRunProof: XCTestCase {
         let pastedForward = try start(vox, Array(pastedArgs.prefix(1)) + ["--node", "alice"]
                                       + Array(pastedArgs.dropFirst()),
                                       env: voxEnv, until: "vox: forwarding ", product: true)
-        defer { pastedForward.terminate(); pastedForward.waitUntilExit() }
         let pastedAt = startedLine.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
-        XCTAssertEqual(Line(pastedAt)?.roundTrip("PASTED-COMMAND\n") ?? "", "PASTED-COMMAND\n",
+        let pastedThrough = Line(pastedAt)?.roundTrip("PASTED-COMMAND\n") ?? ""
+        pastedForward.terminate()
+        pastedForward.waitUntilExit()
+        XCTAssertEqual(pastedThrough, "PASTED-COMMAND\n",
                        "PRODUCT: the forward command copied from the services view, run, must carry bytes to bob's service and back")
         // One-step sharing (S-4): a service listening on this Mac, picked from the list, is shared
         // in mission with the name suggested, and bob reaches it by his own `vox service list`.
