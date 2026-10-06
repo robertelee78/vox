@@ -32,6 +32,14 @@ pub use layout::{
 
 pub const VOX: &str = env!("CARGO_BIN_EXE_vox");
 pub const IDENTITY: &str = "identity passphrase";
+
+/// Where every `vox` this harness starts puts a daemon's `.vox` proxy: a free port of loopback,
+/// never 127.0.0.1:1080 (ADR-028 S-5). In one World the host's daemon took 1080 and the guest's
+/// `vox up` then could not, every time. The run's own `VOX_PROXY` when it set one; a proof that
+/// passes its own on a child (the proxy-port proofs) overrides this.
+pub fn proxy() -> String {
+    std::env::var("VOX_PROXY").unwrap_or_else(|_| "127.0.0.1:0".to_owned())
+}
 /// Generous: production Argon2id derivations and a real PoW happen inside it.
 pub const LINE_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -93,6 +101,7 @@ impl VoxProc {
     ) -> Self {
         let mut child = Command::new(exe)
             .args(args)
+            .env("VOX_PROXY", proxy())
             .envs(env.iter().copied())
             .env("VOX_DATA_DIR", data)
             .env("VOX_CONFIG_DIR", data.join("cfg"))
@@ -389,6 +398,7 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
 pub fn vox_once_plain(data: &Path, args: &[String]) -> (bool, String, String) {
     let out = Command::new(VOX)
         .args(args)
+        .env("VOX_PROXY", proxy())
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", data.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
