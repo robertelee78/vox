@@ -64,6 +64,11 @@ terminal and taken from nothing else: `--identity-passphrase`, `--identity-passp
 `VOX_IDENTITY_PASSPHRASE` are not read for it. Without a terminal the change is refused, with the
 command to run in one.
 
+To see where you are in that window, run `vox status`. Its second line is `keyring open 30m`, with
+the minutes left, while a keyring change goes through without the passphrase. It reads `keyring
+asks for the passphrase` once the window has closed. The TUI's status bar shows the same words
+while a node is attached.
+
 ## Rename a node in your keyring
 
 ```sh
@@ -110,5 +115,6 @@ For passphrases and paths, see [Commands and local state](reference.md). For a o
 conversation, see [the trust troubleshooting entry](troubleshooting.md#we-joined-but-cannot-read-each-other).
 
 Source: [trust and node commands](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
-[the 30-minute keyring window](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-core/src/node/actor.rs)
+[the 30-minute keyring window](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-core/src/node/actor.rs),
+[how the window is shown](https://github.com/robertelee78/vox/blob/0e27808d2769e34fa678870ecb17ed141caff269/crates/vox-tui/src/ui.rs)
 and [TUI state wording](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/ui.rs).

@@ -32,7 +32,9 @@ vox serve ssh=22
 
 `serve` creates a room, shares `127.0.0.1:22` in it as `ssh`, and keeps running. It prints the
 room ID, the room link, a generated room passphrase (`^ send this another way than the address (in
-person, a call, a different app)`) and the address the service answers on, with fingerprints in the node and room places.
+person, a call, a different app)`) and the address the service answers on, with fingerprints in the
+node and room places, followed by the [kind](#what-kind-of-service-it-is) Vox detected:
+`sharing 127.0.0.1:22 as ssh.FINGERPRINT.ROOM_ID.vox (ssh)`.
 Send the link and the passphrase separately. Protect this output: it includes the room passphrase.
 Several shares can be named at once, such as `vox serve ssh=22 dns=53/udp`; `--at` names a local
 endpoint other than `127.0.0.1:PORT`, and `--name` sets the new room's name, which every member sees (default
@@ -72,12 +74,33 @@ vox service list ROOM_ID
 ```
 
 Vox replies `offering "ssh" at 127.0.0.1:22 … it is dark until you vox trust add someone — and they
-join this room`. On the host, `service list` prints the address under `shared in` and the endpoint
-under `services offered`; on a guest it prints the address and who shares it, for example
-`ssh.robertgpt.family.vox  by robertgpt`. This offers an existing endpoint; it does not start
+join this room`. On the host, `service list` prints the address, `by you` and the kind under
+`shared in`, and the endpoint under `services offered`. On a guest it prints the address, who
+shares it and the kind, for example `ssh.robertgpt.family.vox  by robertgpt  ssh`. This offers
+an existing endpoint; it does not start
 `sshd`. The host's trust keyring controls reach, not the service name. Bind your underlying
 service appropriately: a service already listening on every LAN interface is still exposed there
 independently of Vox.
+
+## What kind of service it is
+
+When a service is shared, Vox finds out what it is and records that with the share. Every member's
+`vox service list` shows it, and the sharer's `vox serve` prints it in brackets. The kinds are:
+
+| Kind | How Vox recognizes it |
+|---|---|
+| `ssh` | the service greets a new connection with an SSH banner |
+| `https` | it answers a TLS handshake |
+| `http` | it answers an HTTP request |
+| `dns/udp` | a UDP service that answers a DNS query |
+| `tcp`, `udp` | anything else |
+
+To find out, Vox **connects to the service**: up to three short connections to a TCP service (one
+each for the banner, the handshake and the request), or one query to a UDP service. Your
+service's log may show them. For a service on this machine that none of these identifies, Vox
+also looks up the name of the program listening on the port (`lsof` on macOS, `ss` on Linux),
+so a local `sshd` is still `ssh` if it said nothing in time. The kind never comes from the port
+number or the name you gave the service: a plain echo shared as `ssh=7000` is `tcp`.
 
 ## Reach it through the local proxy
 
@@ -185,5 +208,6 @@ or [join troubleshooting](troubleshooting.md#i-cannot-join-a-room).
 
 Source: [service, proxy and forward arguments](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
 [tunnel behavior and diagnostics](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/tunnel_cli.rs),
+[how a service's kind is detected](https://github.com/robertelee78/vox/blob/0e27808d2769e34fa678870ecb17ed141caff269/crates/vox-core/src/node/probe.rs),
 [service addresses](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-017-room-bound-services.md)
 and [network changes and port mappings](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/docs/adr/ADR-012-nat-traversal-and-reachability.md).
