@@ -518,7 +518,16 @@ pub async fn post_cmd(
         return Err(AppError::Usage("refusing to post an empty message".into()));
     }
 
-    let session = coord::require_session(opts.coord.session.as_deref())?;
+    // **A person addresses a message with no session**: a `say` — with `--to`, `--urgent`
+    // or `--re` — is posted as the node, its `from` empty, when nothing names a session. Only
+    // work coordination is owned per session: another type, a work item or an attempt needs one.
+    let coordinates =
+        kind != vox_agentcomms::envelope::SAY || work.is_some() || opts.attempt.is_some();
+    let session = if coordinates {
+        coord::require_session(opts.coord.session.as_deref())?
+    } else {
+        coord::session(opts.coord.session.as_deref()).unwrap_or_default()
+    };
     let op = match &opts.coord.op {
         Some(op) if vox_agentcomms::ops::is_valid_op(op) => op.clone(),
         Some(op) => {
@@ -568,7 +577,7 @@ pub async fn post_cmd(
         &mut client,
         cid,
         paths,
-        Some(&session),
+        (!session.is_empty()).then_some(session.as_str()),
         &snap.me,
         opts.re.as_deref(),
         opts.urgent,
@@ -666,7 +675,7 @@ pub async fn post_cmd(
             "entry_hash": claim::b32(&posting.entry_hash),
             "op": posting.op,
             "status": posting.status,
-            "session": session,
+            "session": (!session.is_empty()).then_some(&session),
         });
         if !reach.is_empty() {
             out["reach"] = reach.iter().map(Reach::json).collect();
