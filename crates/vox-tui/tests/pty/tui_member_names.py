@@ -4,7 +4,15 @@
 Alice creates a room; Bob and Carol join it, all through real daemons. Bob trusts Alice as
 "alice" and does not trust Carol. Bob's daemon is stopped and his real `vox tui` is opened in a
 pty (pyte at 160x50). His members pane must name Alice "alice" (not her fingerprint), and Carol by
-26 characters of her fingerprint followed by "(not in keyring)", whole. Exit 0 = pass, 1 = red
+26 characters of her fingerprint followed by "(not in keyring)", whole.
+
+ADR-028 K-1, L-9, W-1 (#472): with Alice selected in the members pane, her card is drawn under her:
+her whole fingerprint in groups of four beside five rows of fingerprint art. `k` on the room list
+opens the keyring view, which shows each node Bob trusts, Alice and Erin (a node never in the
+room), by name with its grouped fingerprint and its art; Alice's art there is her card's, and
+Erin's is another. Mutation: the art drawn from the alias instead of the fingerprint turns it red.
+
+Exit 0 = pass, 1 = red
 (the product's), 2 = apparatus (CANNOT MEASURE). A `vox` step on the way that fails (an identity,
 a daemon, create, invite, join, trust, the roster) is the product's red: it prints `PRODUCT:` with
 what `vox` said and exits 1. Every process is recorded and killed by PID.
@@ -35,7 +43,7 @@ JOIN_SECS = 540
 SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix="vox-tui-names-")
 S = f"{SP}/tuin-{TAG}"
 subprocess.run(["rm", "-rf", S])
-for w in ("anchor", "alice", "bob", "carol"):
+for w in ("anchor", "alice", "bob", "carol", "erin"):
     for d in ("data", "cfg"):
         os.makedirs(f"{S}/{w}/{d}")
 open(f"{S}/idpass", "w").write("id pass")
@@ -97,7 +105,7 @@ try:
         product("the anchor `vox node` printed no spec within 30 s: " + open(f"{S}/anchor.err").read())
     stage("identities and daemons")
     fp = {}
-    for w in ("alice", "bob", "carol"):
+    for w in ("alice", "bob", "carol", "erin"):
         r = run(w, "id", "--identity-passphrase-file", f"{S}/idpass")
         if r.returncode != 0: product(f"{w}'s `vox id` failed: {r.stderr}")
         m = re.search(r"[a-z2-7]{52}", r.stdout)
@@ -120,8 +128,9 @@ try:
     for w in ("bob", "carol"):
         j = run(w, "room", "join", "--passphrase-file", "-", link, "--name", "m", stdin="room pass")
         if j.returncode != 0: product(f"{w}'s `vox room join` failed: {j.stderr.strip()}")
-    t = run("bob", "trust", "add", fp["alice"], "--name", "alice", "--identity-passphrase-file", f"{S}/idpass")
-    if t.returncode != 0: product(f"bob's `vox trust add` failed: {t.stderr.strip()}")
+    for (who, name) in (("alice", "alice"), ("erin", "erin")):
+        t = run("bob", "trust", "add", fp[who], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
+        if t.returncode != 0: product(f"bob's `vox trust add` of {name} failed: {t.stderr.strip()}")
     stage("bob's roster")
     # Bob's node must know both members before its TUI is opened.
     def roster():
@@ -162,7 +171,47 @@ try:
     carol_ok = carol_row is not None and "(not in keyring)" in carol_row
     print(f"{TAG} alice named 'alice': {alice_ok}; alice's fingerprint shown: {alice_fp_shown}; "
           f"carol by 26 chars + marker: {carol_ok}")
-    code = 0 if (alice_ok and not alice_fp_shown and carol_ok) else 1
+
+    stage("alice's card")
+    # The art's rows: ten facet characters, two per cell; the grouped fingerprint is beside them.
+    art = lambda rows: [m.group(0) for m in (re.search(r"[◢◣◤◥]{10}", r) for r in rows) if m]
+    grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
+    for _ in range(4):
+        if any("▶ alice" in r for r in members()):
+            break
+        tui.key("\x1b[B", 1)  # Down: the next member
+    rows = [r.rstrip() for r in members()]
+    at = next((i for i, r in enumerate(rows) if "▶ alice" in r), None)
+    under = rows[at + 1:at + 8] if at is not None else []
+    card_art = art(under)
+    first_groups = grouped(fp["alice"])[:24]
+    card_ok = len(card_art) == 5 and any(first_groups in r for r in under)
+    print(f"{TAG} alice selected: {at is not None}; her card: art {card_art!r}, "
+          f"'{first_groups}' beside it: {any(first_groups in r for r in under)}")
+
+    stage("the keyring view")
+    tui.key("\x1b", 2)  # Esc: back to the room list
+    tui.key("k", 2)
+    tui.until(lambda: any("Keyring" in r for r in tui.display()), 10, 0.5)
+    screen = [r.rstrip() for r in tui.display()]
+    def entry(name):
+        """The art and grouped text under `name`'s row in the keyring view."""
+        i = next((i for i, r in enumerate(screen) if re.search(rf"│\s+{name}\s*│?$", r)), None)
+        return ([], []) if i is None else (art(screen[i + 1:i + 6]), screen[i + 1:i + 6])
+    (alice_art, alice_rows), (erin_art, erin_rows) = entry("alice"), entry("erin")
+    print(f"{TAG} keyring view:")
+    for r in screen:
+        if r.strip():
+            print(f"  |{r}")
+    keyring_ok = (len(alice_art) == 5 and len(erin_art) == 5
+                  and any(first_groups in r for r in alice_rows)
+                  and any(grouped(fp["erin"])[:24] in r for r in erin_rows))
+    same_as_card = alice_art == card_art
+    differs = alice_art != erin_art
+    print(f"{TAG} the keyring shows alice and erin with their grouped fingerprints and art: "
+          f"{keyring_ok}; alice's art is her card's: {same_as_card}; erin's is another: {differs}")
+    code = 0 if (alice_ok and not alice_fp_shown and carol_ok and card_ok and keyring_ok
+                 and same_as_card and differs) else 1
     print(f"{TAG} {'PASS' if code == 0 else 'RED'}")
 except Hung as h:
     # A verb past the product's bound for it is the RED below, raised before this; so here every

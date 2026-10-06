@@ -992,6 +992,7 @@ impl DaemonCore {
             has_identity: self.has_identity,
             tunnels: snap.tunnels,
             closed_tunnels: snap.closed_tunnels,
+            keyring: snap.trusted.clone(),
         }
     }
 

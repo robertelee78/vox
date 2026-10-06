@@ -174,6 +174,8 @@ pub struct ViewModel {
     pub tunnels: Vec<vox_core::transport::quic::LiveTunnel>,
     /// The tunnels that ended for a reason a person should see, with that reason (V030-11).
     pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
+    /// The trust keyring, `(fingerprint, alias)`, for the keyring view (ADR-028 W-1, K-1).
+    pub keyring: Vec<(vox_core::hash::Digest32, String)>,
 }
 
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline

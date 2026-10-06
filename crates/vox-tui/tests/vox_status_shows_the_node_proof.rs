@@ -22,6 +22,13 @@
 //! second forward holds, the UDP flow with its counts, and — once the guest stops — the trusted
 //! member it can no longer reach, flagged `UNHEALTHY`.
 //!
+//! **#472 (ADR-028 K-1, L-9): the node's fingerprint, whole and grouped, with its art beside it.**
+//! The host's `vox status` shows its fingerprint in groups of four, which read back as the
+//! fingerprint `vox id` printed, beside a 5×5 mosaic of split triangles; the mosaic is the same
+//! on a later `vox status`, and the guest's — another node, with the same local name `default` —
+//! is a different one. Mutation: the art drawn from the node's name instead of its fingerprint —
+//! red, PRODUCT (the two nodes draw the same art).
+//!
 //! **Every red names its side**: `PRODUCT`, `PRODUCT (staging)`, `APPARATUS` or `CANNOT MEASURE`.
 //!
 //! **Mutations that must turn it red, as PRODUCT:** the status report built with no UDP flows
@@ -73,6 +80,27 @@ fn status_text(dir: &std::path::Path, who: &str) -> String {
         "PRODUCT: {who}'s `vox status` did not answer.\nstdout:\n{out}\nstderr:\n{err}"
     );
     out
+}
+
+/// The node card `vox status` prints under its first line: the art's rows (the leading run of
+/// facet characters on each line), and the grouped fingerprint beside them, joined by spaces.
+fn card(text: &str) -> (Vec<String>, String) {
+    let facet = |c: char| matches!(c, '◢' | '◣' | '◤' | '◥');
+    let mut art = Vec::new();
+    let mut grouped = Vec::new();
+    for line in text.lines().skip(1).take(5) {
+        let line = line.trim();
+        let row: String = line.chars().take_while(|c| facet(*c)).collect();
+        if row.is_empty() {
+            break;
+        }
+        let rest = line[row.len()..].trim();
+        if !rest.is_empty() {
+            grouped.push(rest.to_owned());
+        }
+        art.push(row);
+    }
+    (art, grouped.join(" "))
 }
 
 /// The UDP flow with `peer` for the service on `port`, in a status report: (to, from, dropped).
@@ -298,6 +326,32 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
     // ---- #84: the person's `vox status`, first with the UDP flow live ----
     let text = status_text(&host, "the host");
     eprintln!("[proof] the host's `vox status` with the UDP flow live:\n{text}");
+    let (host_art, host_grouped) = card(&text);
+    let guest_text = status_text(&guest, "the guest");
+    let (guest_art, _) = card(&guest_text);
+    let groups: Vec<String> = w
+        .host_fp
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(4)
+        .map(|g| g.iter().collect())
+        .collect();
+    eprintln!(
+        "[proof] the host's card: {host_art:?} {host_grouped:?}; the guest's art: {guest_art:?}"
+    );
+    assert!(
+        host_grouped == groups.join(" ")
+            && host_art.len() == 5
+            && host_art.iter().all(|r| r.chars().count() == 10),
+        "PRODUCT: the host's `vox status` must show its fingerprint {} in groups of four beside \
+         a 5×5 mosaic; it showed {host_grouped:?} beside {host_art:?}:\n{text}",
+        w.host_fp
+    );
+    assert!(
+        guest_art.len() == 5 && guest_art != host_art,
+        "PRODUCT: the guest is another node, so its `vox status` must draw other art than the \
+         host's {host_art:?}; it drew {guest_art:?}:\n{guest_text}"
+    );
     let g = &w.guest_fp[..12];
     let anchor_short = w
         .host_anchor
@@ -355,6 +409,12 @@ fn vox_status_shows_rooms_peers_tunnels_udp_flows_and_what_is_unhealthy() {
         .unwrap_or_else(|e| panic!("PRODUCT (staging): no echo through the TCP forward: {e}"));
     let text = status_text(&host, "the host");
     eprintln!("[proof] the host's `vox status` with a TCP tunnel live:\n{text}");
+    let (again, _) = card(&text);
+    assert!(
+        again == host_art,
+        "PRODUCT: the same node must draw the same art every time: first {host_art:?}, now \
+         {again:?}"
+    );
     assert!(
         text.lines()
             .any(|l| l.starts_with("tunnel ") && l.contains(&format!("from {g}"))),

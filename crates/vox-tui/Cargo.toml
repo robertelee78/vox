@@ -50,6 +50,7 @@ vox-core = { path = "../vox-core" }
 # vocabulary and claim resolver made reachable from the product; without this
 # dependency the model exists and nothing can use it.
 vox-agentcomms = { path = "../vox-agentcomms" }
+vox-text = { path = "../vox-text" }
 ratatui.workspace = true
 crossterm.workspace = true
 clap.workspace = true

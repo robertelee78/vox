@@ -58,6 +58,10 @@ fn render(v: &Value) -> String {
             "NOT on the network"
         }
     );
+    // The node's fingerprint whole, grouped, with its art beside it (ADR-028 K-1, L-9).
+    for line in vox_text::fingerprint::card(s(v, "identity")) {
+        let _ = writeln!(o, "  {line}");
+    }
     let empty = Vec::new();
     let arr = |k: &str| v.get(k).and_then(Value::as_array).unwrap_or(&empty);
     // Stored entries a room set aside when it opened (V210-74): said first, whatever else there is.

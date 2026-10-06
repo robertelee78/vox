@@ -148,6 +148,9 @@ pub enum Screen {
     Channel,
     /// The live tunnels, to see and close (V030-11): `t` on the channel list, or `:tunnels`.
     Tunnels,
+    /// The trust keyring, each node with its fingerprint grouped and its art (ADR-028 W-1, K-1):
+    /// `k` on the channel list, or `:keyring`.
+    Keyring,
 }
 
 /// Which pane has focus within the channel screen (cycled by `Tab`).
@@ -335,6 +338,10 @@ impl UiState {
                 self.settle(vm);
                 Action::Redraw
             }
+            KeyCode::Char('k') if self.screen == Screen::ChannelList => {
+                self.screen = Screen::Keyring;
+                Action::Redraw
+            }
             KeyCode::Char('x') | KeyCode::Delete if self.screen == Screen::Tunnels => {
                 self.close_selected_tunnel(vm)
             }
@@ -347,7 +354,7 @@ impl UiState {
                     self.screen = Screen::ChannelList;
                     return Action::Dispatch(Command::SelectChannel { channel_id: None });
                 }
-                if self.screen == Screen::Tunnels {
+                if matches!(self.screen, Screen::Tunnels | Screen::Keyring) {
                     self.screen = Screen::ChannelList;
                 }
                 Action::Redraw
@@ -549,6 +556,7 @@ impl UiState {
                     self.selected_channel = step(self.selected_channel, len);
                 }
             }
+            Screen::Keyring => {}
             Screen::Tunnels => {
                 if vm.tunnels.is_empty() {
                     return;
@@ -659,6 +667,7 @@ impl UiState {
                 self.screen = Screen::Tunnels;
                 self.settle(vm);
             }
+            Nav::Keyring => self.screen = Screen::Keyring,
         }
         Action::Redraw
     }
@@ -686,6 +695,8 @@ pub enum Nav {
     Down,
     /// Show the live tunnels (V030-11).
     Tunnels,
+    /// Show the trust keyring (ADR-028 W-1).
+    Keyring,
 }
 
 /// The result of parsing a `:`-command line.
@@ -755,6 +766,7 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         "up" => return Some(Parsed::Nav(Nav::Up)),
         "down" => return Some(Parsed::Nav(Nav::Down)),
         "tunnels" => return Some(Parsed::Nav(Nav::Tunnels)),
+        "keyring" => return Some(Parsed::Nav(Nav::Keyring)),
         // On the tunnel list, `close` closes the selected tunnel, not a channel.
         "close" if ui.screen == Screen::Tunnels => return Some(Parsed::CloseTunnel),
         _ => {}
