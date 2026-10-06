@@ -60,7 +60,7 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   lanes     Alice's node claims work and posts `working`, `status` and an `ask` as an agent, and
             Carol's claims work too: in Bob's lanes (`:lanes`), Alice's lane is headed "alice ·
             working" and shows her ask, with her coordination folded into one counted line and
-            none of it shown; Carol's, whom Bob cannot read, "carol · away" (ADR-028 W-3, #513);
+            none of it shown; Carol's lane carries one of the five state chips (ADR-028 W-3, #513);
   to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
   unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
@@ -689,7 +689,8 @@ try:
 
     stage("lanes")
     # The room's lanes (ADR-028 W-3, #513): Alice's node acts as an agent here, claiming work and
-    # saying so; Carol's does too, but Bob cannot read Carol, so all he can say of her is away.
+    # saying so; Carol's claims work too. What Bob's lanes are judged by is Alice's; Carol's lane
+    # must carry one of the five chips, whatever Bob's node can read of her.
     def as_agent(w, session, *args):
         e = env(w)
         e["VOX_SESSION"] = session
@@ -720,15 +721,20 @@ try:
                     return title, [bare(x) for x in pane(rows, g + name)]
         return None, []
     tui.until(lambda: (lane("alice")[0] or "").endswith("working") and "LANE-ASK" in " ".join(lane("alice")[1]), 60, 1)
-    (a_title, arows), (c_title, _) = lane("alice"), lane(fp["carol"][:8])
+    (a_title, arows), (c_title, crows) = lane("alice"), lane(fp["carol"][:6])
+    carol_read = [l for l in run("bob", "room", "read", room, "--json").stdout.splitlines()
+                  if fp["carol"] in l]
     atext = " ".join(arows)
     # A lane is narrow, so its rows wrap: read it as one text, without the spaces a wrap took.
     joined = "".join(arows).replace(" ", "")
-    claim("lanes", (a_title or "").endswith("· working") and (c_title or "").endswith("· away")
+    CHIPS = ("needs you", "working", "ready", "done", "away")
+    claim("lanes", (a_title or "").endswith("· working")
+          and any((c_title or "").endswith("· " + c) for c in CHIPS)
           and "LANE-ASKwhichcodecstays?" in joined
           and re.search(r"(\d+)coordinationposts?", joined) is not None
           and "LANE-WORKING" not in joined and "LANE-STATUS" not in joined,
-          f"alice's lane {a_title!r}: {arows!r}; carol's lane {c_title!r}")
+          f"alice's lane {a_title!r}: {arows!r}; carol's lane {c_title!r}: {crows!r}; carol's rows "
+          f"in bob's `vox room read --json`: {carol_read!r}")
 
     stage("to")
     # To: and urgent in the composer (ADR-028 W-4): the message carries them, as `vox room post

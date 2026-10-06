@@ -58,8 +58,8 @@
 //!   not the node's stayed where it was);
 //! - `lanes`: Alice's node claims work and posts `working`, `status` and an `ask` as an agent, and
 //!   Carol's claims work: in Bob's `:lanes`, Alice's lane is headed "alice · working" and shows her
-//!   ask, her coordination folded into one counted line and none of it shown; Carol's, whom Bob
-//!   cannot read, "carol · away" (ADR-028 W-3, #513);
+//!   ask, her coordination folded into one counted line and none of it shown; Carol's lane carries
+//!   one of the five state chips (ADR-028 W-3, #513);
 //! - `to`: `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the message
 //!   Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
 //! - `where`: with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI
