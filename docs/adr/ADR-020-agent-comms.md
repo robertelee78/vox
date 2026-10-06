@@ -393,6 +393,8 @@ they are not a defence against one that lies.
   dots and characters a filesystem treats specially removed). It MUST NOT overwrite anything: a
   taken name gets ` (1)`, ` (2)` …, and an existing `--out` is refused. Bytes go to a hidden `.part`
   file and are linked into place only after the hash and size match.
+  *Superseded in part by ADR-028 F-4: without `--out` or `--dir`, a pulled file lands in the
+  node's `files/<room>/`; the `downloads` setting and `~/Downloads` are gone.*
 - **11.6** `vox share <room> <file|dir> [--count N] [--for D]` MUST serve the file over HTTP on a
   room-bound service whose port and tag derive from the content hash, announcing `http: true`. A
   folder MUST be served as one deterministic tar (sorted, zero timestamps). The share ends after
