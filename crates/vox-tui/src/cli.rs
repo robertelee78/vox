@@ -101,7 +101,7 @@ fn label_of(spec: &str) -> String {
     vox_core::tunnel::udp::service_label(spec).unwrap_or_else(|| spec.to_owned())
 }
 
-/// Run a verb that attaches to the node already holding the profile.
+/// Run a verb that attaches to the node through the daemon already holding it.
 fn run_attached<Fut>(body: Fut) -> ExitCode
 where
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
@@ -152,7 +152,7 @@ fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
     }
 }
 
-/// Run a trust verb against the node that is already holding this profile.
+/// Run a trust verb against the daemon already holding this node.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
     let name = match &sub {
         TrustCmd::Add(a) => match trust_name(a) {
@@ -1160,7 +1160,8 @@ pub struct ServiceListArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// Print the listing as one JSON object; every address in it is canonical (ADR-028 S-3).
+    /// Print the listing as one JSON object; every address in it is canonical, the same on every
+    /// member's machine.
     #[arg(long)]
     pub json: bool,
     /// **Refused**, as for every verb: a command line is readable by every process on the
@@ -1193,7 +1194,7 @@ pub struct ServiceRemoveArgs {
     pub tag: String,
 }
 
-/// A profile plus the identity passphrase, for the verbs that unlock an identity but open
+/// A node plus the identity passphrase, for the verbs that unlock an identity but open
 /// no room: `vox id`, `vox trust list`.
 #[derive(Args, Debug, Clone)]
 pub struct IdentityArgs {
@@ -1417,7 +1418,7 @@ impl AnchorArgs {
         }
     }
 
-    /// For `--serve trusted`, the creators whose rooms this anchor serves: the profile's
+    /// For `--serve trusted`, the creators whose rooms this anchor serves: the node's
     /// `vox trust` list, read once with the identity passphrase. `None` for `anyone`.
     fn serve_only(
         &self,

@@ -690,7 +690,7 @@ pub fn run_node(
                         // **Elsewhere is another machine** (V210-170, #395): the anchors file above
                         // keeps loopback for clients on this one, but a loopback spec printed for
                         // copying to another machine is one that cannot reach this anchor.
-                        // A loopback spec is still printed, apart and said for what it is: a profile on
+                        // A loopback spec is still printed, apart and said for what it is: a node on
                         // this machine that reads another anchors file uses it.
                         let elsewhere = off_machine(&listening);
                         let here: Vec<&String> =
@@ -708,7 +708,7 @@ pub fn run_node(
                         }
                         if !here.is_empty() {
                             println!(
-                                "vox node: on this machine only, for a profile that reads another \
+                                "vox node: on this machine only, for a node that reads another \
                                  anchors file:"
                             );
                             for addr in here {
