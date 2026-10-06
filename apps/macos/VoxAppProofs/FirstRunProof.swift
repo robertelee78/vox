@@ -1105,7 +1105,7 @@ final class FirstRunProof: XCTestCase {
     /// The words in everything the app shows, each text's identifier with them: what a PRODUCT
     /// red quotes.
     private func onScreen(_ ui: XCUIApplication) -> String {
-        containers(ui).flatMap { $0.staticTexts.allElementsBoundByIndex.prefix(40) }.map { e -> String in
+        containers(ui).flatMap { $0.staticTexts.allElementsBoundByIndex.prefix(120) }.map { e -> String in
             let words = shown(e)
             return e.identifier.isEmpty || words.isEmpty ? words : "\(e.identifier): \(words)"
         }

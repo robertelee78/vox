@@ -191,12 +191,17 @@ private struct ShareForm: View {
                     Text("Cannot reach it (not in your keyring): \(reach.cannot.joined(separator: ", ")).")
                         .secondaryText()
                 }
-                if let failed { StateMark(kind: .danger, words: failed).textSelection(.enabled) }
                 Button("Share \(picked.program ?? "it") in \(roomName)") {
                     Task { await share(preview) }
                 }
                 .disabled(name.isEmpty || room.isEmpty)
                 .accessibilityIdentifier("share-submit")
+            }
+            // Said whether or not a preview came: a failed preview left nothing on screen, so a
+            // click on a listening service seemed to do nothing.
+            if let failed {
+                StateMark(kind: .danger, words: failed).textSelection(.enabled)
+                    .accessibilityIdentifier("share-said")
             }
         }
     }
