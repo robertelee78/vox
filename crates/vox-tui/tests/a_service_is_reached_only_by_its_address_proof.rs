@@ -773,7 +773,8 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     // (12) The canonical address pasted before the share has reached this machine: dave joins
     // with `vox connect`, which lets his node go; alice then shares nas-web and copies its
     // canonical address from her `vox service list`; and every member that could sync the room
-    // with dave is stopped. His forward must wait for the room's first sync, then reach nas-web.
+    // with dave is stopped. Pasted into his `.vox` proxy and into `vox forward`, it must wait for
+    // the room's first sync, then reach nas-web through both.
     let (dave_dir, dave_fp) = profile(tmp.path(), "dave");
     trust(&alice_dir, "alice", &dave_fp, "dave");
     trust(&dave_dir, "dave", &alice_fp, "nas");
@@ -823,18 +824,16 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          {alice_list}"
     );
     let others = [alice_pid, others[0], others[1]];
+    let dave_started = Instant::now();
+    let (dave_up, dave_proxy) = up("dave up", &dave_dir);
+    let by_proxy = std::thread::spawn({
+        let canonical = web_canonical.clone();
+        move || who_answers(dave_proxy, &canonical)
+    });
     let mut early = VoxProc::spawn(
         "dave forward",
         &dave_dir,
-        &args(&[
-            "forward",
-            &web_canonical,
-            "127.0.0.1:0",
-            "--anchor",
-            &spec,
-            "--listen",
-            "127.0.0.1:0",
-        ]),
+        &args(&["forward", &web_canonical, "127.0.0.1:0"]),
     );
     let waited = early.line_within(Duration::from_secs(20), |l| {
         l.contains("waiting for this room's first sync")
@@ -863,7 +862,21 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).ok()?;
         Some(line)
     });
-    eprintln!("dave's early paste: {waited:?} then {early_line:?} answered {early_answer:?}");
+    let proxied = by_proxy
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: the proxy client thread panicked"));
+    eprintln!(
+        "dave's early paste: {waited:?} then {early_line:?} answered {early_answer:?}; through his \
+         proxy: {proxied:?}"
+    );
+    assert_eq!(
+        proxied.as_deref(),
+        Ok("web"),
+        "PRODUCT: the canonical address {web_canonical}, pasted into dave's .vox proxy before the \
+         share reached his machine, must reach alice's nas-web once the room syncs; his vox up \
+         said:\n{}",
+        dave_up.said_since(dave_started).join("\n")
+    );
     assert!(
         early_answer
             .as_deref()
@@ -872,7 +885,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          reached it, must reach alice's nas-web once the room syncs; dave's forward said:\n{}",
         early.transcript()
     );
-    drop(early);
+    drop((early, dave_up));
 
     // (13) A readable part that names two things is refused, saying which: bob now calls carol
     // `Nas Box`, which as a label is `nas-box`, his name for alice too.
