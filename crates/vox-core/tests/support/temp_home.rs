@@ -43,6 +43,10 @@ static REAL_XDG_DATA_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// The operator's XDG_CONFIG_HOME, before it was replaced: where gh keeps its login.
 static REAL_XDG_CONFIG_HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Which of [`UNSET`] this process was started with, and their values: kept in memory only, so
+/// [`check`] can tell an inherited value that survived from one a proof set on purpose.
+static INHERITED: OnceLock<Vec<(&'static str, std::ffi::OsString)>> = OnceLock::new();
+
 /// The temporary HOME every child of this process inherits.
 static TEMP_HOME: OnceLock<PathBuf> = OnceLock::new();
 
@@ -124,6 +128,12 @@ extern "C" fn init() {
     for (var, sub) in XDG {
         std::env::set_var(var, home.join(sub));
     }
+    let _ = INHERITED.set(
+        UNSET
+            .iter()
+            .filter_map(|v| std::env::var_os(v).map(|val| (*v, val)))
+            .collect(),
+    );
     for var in UNSET {
         std::env::remove_var(var);
     }
@@ -228,21 +238,26 @@ pub fn check() {
         .args([
             "-c",
             "printf '%s\\n%s\\n' \"$HOME\" \"$XDG_CONFIG_HOME\"; \
-             printf '%s' \"$1\" > \"$HOME/.vox-proof-sentinel\"; shift; \
-             for v in \"$@\"; do \
-             if eval \"[ -n \\\"\\${$v+x}\\\" ]\"; then printf '%s\\n' \"$v\"; fi; done",
+             printf '%s' \"$1\" > \"$HOME/.vox-proof-sentinel\"",
             "sh",
             &nonce,
         ])
-        .args(UNSET)
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot start a child to report its HOME: {e}"));
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut lines = said.lines();
     let (home, cfg) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
-    // The names of any of them a child still has; never their values.
-    let kept: Vec<&str> = lines.collect();
+    // **What a child would inherit is this process's environment**: any of [`UNSET`] still holding
+    // the value this process was started with is the operator's, and a child would carry it. One
+    // a proof set itself (an empty CODEX_HOME of its own) is not. Names only; never a value.
+    let kept: Vec<&str> = INHERITED
+        .get()
+        .into_iter()
+        .flatten()
+        .filter(|(name, val)| std::env::var_os(name).as_ref() == Some(val))
+        .map(|(name, _)| *name)
+        .collect();
     let in_real = real_home()
         .map(|r| r.join(SENTINEL))
         .filter(|p| std::fs::read_to_string(p).is_ok_and(|t| t == nonce));
@@ -268,7 +283,8 @@ pub fn check() {
     );
     assert!(
         kept.is_empty(),
-        "APPARATUS: a proof's child still has {kept:?}, which name an agent's config or the \
+        "APPARATUS: a proof's children would still inherit {kept:?}, which name an agent's \
+         config or the \
          session running the proof"
     );
     let landed = std::fs::read_to_string(temp.join(SENTINEL)).unwrap_or_default();
