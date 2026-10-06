@@ -174,7 +174,11 @@ def one_daemon(app):
         if daemons(data) != [daemon]:
             fail("PRODUCT", f"`vox node attach` must use daemon {daemon}; now {daemons(data)}")
         first.send_signal(signal.SIGTERM)
-        first.wait(timeout=30)
+        try:
+            first.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            fail("PRODUCT", "Vox.app did not quit within 30 s of SIGTERM (a stop signal is a quit, "
+                            "ADR-026 S-4)")
         second = launch(app, env, out)
         started.append(second)
         most, pids = watch(data, 10)

@@ -44,8 +44,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             signal(sig, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
             // Out of the queue's callout: terminating runs a nested event loop until the node is
-            // let go of, and that work is on the main queue, which a callout would hold.
-            source.setEventHandler { RunLoop.main.perform { NSApp.terminate(nil) } }
+            // let go of, and that work is on the main queue, which a callout would hold. A run-loop
+            // timer, not RunLoop.perform: that queues the block without waking the loop, and an
+            // idle app then never quit.
+            source.setEventHandler {
+                NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
+            }
             source.resume()
             stops.append(source)
         }
