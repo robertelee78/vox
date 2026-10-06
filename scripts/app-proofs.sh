@@ -83,12 +83,33 @@ else
     codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
 fi
 
+# **No other Vox.app is registered** (APPARATUS before anything runs): LaunchServices opens a
+# registered us.vox.app for a notification click, Spotlight, Launchpad or a login item's lookup,
+# with none of this run's scratch directories, so on the person's real profile. Only this run's
+# own build may be registered, and it is unregistered when the run ends.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+vox_registrations() {
+    "$LSREGISTER" -dump 2>/dev/null \
+        | awk '/^path:/{p=$0} /identifier: +us\.vox\.app$/{print p}' \
+        | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u
+}
+STRAY="$(vox_registrations | grep -vxF "$APP" || true)"
+if [ -n "$STRAY" ]; then
+    echo "app-proofs: APPARATUS (precondition unmet): other Vox.app builds are registered with" \
+        "LaunchServices, and any of them can be opened on the real profile; unregister them" \
+        "(lsregister -u <path>, registration only) before a run:" >&2
+    echo "$STRAY" >&2
+    exit 2
+fi
+trap_unregister() { "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true; }
+
 # The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
 # when asked for by name.
 launch_status=0
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
+        trap_unregister
         check_real || exit 2
         exit "$launch_status"
     fi
@@ -104,7 +125,7 @@ fi
 TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 python3 scripts/app-proof-stager.py "$SCRATCH/stager.port" "$TOKEN" &
 STAGER=$!
-trap 'kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+trap 'kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null; trap_unregister; rm -rf "$SCRATCH"' EXIT
 for _ in $(seq 1 100); do [ -s "$SCRATCH/stager.port" ] && break; sleep 0.1; done
 [ -s "$SCRATCH/stager.port" ] || {
     echo "app-proofs: APPARATUS: the stager did not start" >&2
