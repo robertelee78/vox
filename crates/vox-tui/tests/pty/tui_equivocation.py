@@ -12,11 +12,11 @@ opened the room is `RED: PRODUCT (staging)`), 2 = apparatus (pyte missing). Ever
 Bounded throughout (`vox_pty.py`, V210-54): past its budget the driver says `HUNG at <stage>` with
 its stack, stops everything and exits red.
 """
-import os, sys
+import os, re, sys
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pane as pane_of, pyte, stage  # noqa: E402
 
 VOX, TAG, DATA, CFG, ROOM = sys.argv[1:6]
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "180"))
@@ -41,16 +41,23 @@ try:
     tui.key(f"{ROOM_PASS}\r", 4)
     tui.key("\r", 2)
 
-    # The timeline is the left-hand 70% of the screen; its notices are the rows that start "! ".
+    # The timeline pane, found by its title; its notices are the rows that start "! ".
     def timeline():
-        return [row[:112] for row in tui.display()]
+        return pane_of(tui.display(), "Timeline")
     def said(name):
-        return any(f"! {name} signed two different messages at the same place" in r for r in timeline())
+        """The notice begins a row of its own, and reads whole across the rows it wraps onto."""
+        rows = timeline()
+        for i, r in enumerate(rows):
+            if r.lstrip().startswith(f"! {name} "):
+                joined = re.sub(r"\s+", " ", "".join(rows[i:i + 4]))
+                if f"! {name} signed two different messages at the same place" in joined:
+                    return True
+        return False
     stage("the timeline pane")
     tui.until(lambda: all(said(n) for n in NAMES), 30, 1)
     pane = [r.rstrip() for r in timeline() if r.strip()]
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
-    print(f"{TAG} timeline pane (cols 0-111):")
+    print(f"{TAG} timeline pane:")
     for r in pane:
         print(f"  |{r}")
     if not any(ROOM in r for r in tui.display()) and not any("Timeline" in r for r in pane):

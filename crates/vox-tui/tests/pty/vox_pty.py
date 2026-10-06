@@ -46,6 +46,25 @@ def is_attached(text):
     return re.search(r"node [a-z0-9._-]+\s+·\s+attached: ", text) is not None
 
 
+def pane(rows, title):
+    """The rows inside the bordered pane whose top border begins with `title` (`Timeline`,
+    `Members`, `Rooms`), without its borders; [] when no such pane is drawn. Panes are found by
+    their titles, not by fixed columns, so a layout's widths can change under a driver."""
+    for y, row in enumerate(rows):
+        x = row.find("\u250c" + title)
+        if x < 0:
+            continue
+        end = row.find("\u2510", x)
+        end = len(row) if end < 0 else end
+        out = []
+        for r in rows[y + 1:]:
+            if r[x:x + 1] == "\u2514":
+                break
+            out.append(r[x + 1:end])
+        return out
+    return []
+
+
 class Hung(Exception):
     """The driver ran past its budget, or was told to stop."""
 

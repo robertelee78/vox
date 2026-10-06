@@ -46,6 +46,7 @@ use crate::viewmodel::{
     ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, Reachability,
     SyncStatus, Trust, UiError, ViewModel,
 };
+use vox_agentcomms::attention::{group, RoomGroup};
 
 /// How often the snapshot is asked again when no event has said anything changed: connections,
 /// tunnels and their last moved byte change without a room event.
@@ -98,6 +99,8 @@ pub struct DaemonCore {
     anchors: Vec<String>,
     /// The nodes attached to the daemon now, by name (the header's list).
     attached: Vec<String>,
+    /// Every node on this machine's disk, by name, read with each snapshot (ADR-028 W-1, #511).
+    on_disk: Vec<String>,
     tx: mpsc::Sender<Ev>,
     rx: mpsc::Receiver<Ev>,
     /// The daemon's event task.
@@ -310,6 +313,7 @@ impl DaemonCore {
             node,
             conn: None,
             attached,
+            on_disk: Vec::new(),
             tx,
             rx,
             daemon_events,
@@ -751,6 +755,12 @@ impl DaemonCore {
             return;
         }
         self.asked = Some(Instant::now());
+        self.on_disk = self
+            .account
+            .nodes_on_disk()
+            .iter()
+            .map(|n| n.as_str().to_owned())
+            .collect();
         let body = vox_core::node::snapshot::request_body();
         let Some(conn) = self.conn.as_mut() else {
             return;
@@ -1028,7 +1038,7 @@ impl DaemonCore {
                 Reachability::Offline
             }
         };
-        let channels = snap
+        let mut channels: Vec<ChannelSummary> = snap
             .rooms
             .iter()
             .map(|c| ChannelSummary {
@@ -1041,9 +1051,23 @@ impl DaemonCore {
                 to_you: self.unread.get(&c.channel_id).map_or(0, |u| u.to_you),
                 unread: self.unread.get(&c.channel_id).map_or(0, |u| u.new),
                 coordination: self.unread.get(&c.channel_id).map_or(0, |u| u.coordination),
+                group: self
+                    .unread
+                    .get(&c.channel_id)
+                    .map_or(RoomGroup::Quiet, |u| group(u.to_you, u.new, u.coordination)),
                 reachability: reachability(&c.channel_id),
             })
             .collect();
+        // Grouped as the sidebar lists them (ADR-028 W-2, #511): what needs the person first.
+        channels.sort_by_key(|c| c.group);
+        let mut machine_nodes: Vec<(String, bool)> = self
+            .on_disk
+            .iter()
+            .chain(&self.attached)
+            .map(|n| (n.clone(), self.attached.contains(n)))
+            .collect();
+        machine_nodes.sort();
+        machine_nodes.dedup();
         let timeline = self.active.and_then(|cid| {
             let room = snap.open.iter().find(|d| d.channel_id == cid)?;
             let own = Own {
@@ -1146,6 +1170,7 @@ impl DaemonCore {
             attached: self.conn.is_some(),
             node: self.node.as_str().to_owned(),
             nodes: self.attached.clone(),
+            machine_nodes,
             mlock_active: snap.mlock_active,
             keyring_open_secs: snap.keyring_open_secs,
             has_identity: self.has_identity,

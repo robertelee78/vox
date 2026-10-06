@@ -46,6 +46,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             `notify-command`, as `VOX_NOTIFY_COMMAND` sets it): titled with the room, naming Alice,
             and holding none of their text (ADR-028 R-10, #486); none more follows for the same
             room while it stays off screen;
+  regions   the sidebar names bob's node attached; once Alice writes to him there, the room is
+            listed under "needs you (1)" reading "to you 1"; and the nodes on this machine are
+            listed, his attached and a second one detached (ADR-028 W-1, W-2, #511);
   unreach   once Alice's and Carol's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's and Carol's daemons stopped, under a message Bob then posts his TUI says
@@ -67,7 +70,7 @@ import os, re, subprocess, sys, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
 # Sized for the debug build, whose joins grind their proof of work for minutes: two joins at
@@ -219,6 +222,10 @@ try:
         product("bob's node never read m-%03d and listed alice and carol within 120 s: read %r; roster %r"
                 % (POSTS, run("bob", "room", "read", room, "--limit", "500").stdout[-300:], last.stdout + last.stderr))
     stop(daemons["bob"])
+    # A second node on bob's machine, never attached: the sidebar lists it detached (#511). Made
+    # once his daemon has gone, so the TUI is told which node it acts as (`--node default`).
+    r = run("bob", "node", "create", "spare", "--passphrase-file", f"{S}/idpass")
+    if r.returncode != 0: product(f"bob's `vox node create spare` failed: {r.stderr.strip()}")
 
     stage("bob's tui: unlock and open the room")
     # Bob's notifications go to a script that writes each one to a file, so what is judged is the
@@ -226,7 +233,7 @@ try:
     NOTES = f"{S}/bob-notes"
     open(f"{S}/note.sh", "w").write(f"#!/bin/sh\nprintf '%s | %s\\n' \"$1\" \"$2\" >> {NOTES}\n")
     os.chmod(f"{S}/note.sh", 0o755)
-    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec],
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec, "--node", "default"],
               {**env("bob"), "VOX_NOTIFY_COMMAND": f"{S}/note.sh"})
     tui.pump(4)
     tui.key("id pass\r", 4)
@@ -234,8 +241,8 @@ try:
     tui.key("room pass\r", 4)
     tui.key("\r", 2)
     screen = lambda: "\n".join(tui.display())
-    # The timeline is the left-hand column (cols 0-111), the members pane the right (112+).
-    timeline = lambda: "\n".join(row[:112] for row in tui.display())
+    # The timeline and the members pane, each found by its title (the sidebar is to their left).
+    timeline = lambda: "\n".join(pane(tui.display(), "Timeline"))
     def has(text, s):
         return re.search(rf"(^|[^0-9]){re.escape(s)}([^0-9]|$)", text, re.M) is not None
     if not tui.until(lambda: "m-0" in timeline(), 30, 1): product("bob's `vox tui` never drew a message in the room's timeline within 30 s of unlocking")
@@ -249,9 +256,9 @@ try:
     stage("hidden")
     def row_of(key):
         """The timeline row holding `key`, without trailing blanks."""
-        for r in tui.display():
-            if key in r[:112]:
-                return r[:112].rstrip()
+        for r in pane(tui.display(), "Timeline"):
+            if key in r:
+                return r.rstrip()
         return None
     tui.until(lambda: row_of("h-5") is not None, 20, 1)
     rows = {k: row_of(k) for k in HIDDEN}
@@ -321,10 +328,10 @@ try:
 
     tui.key("\t", 1)   # timeline -> composer
     tui.key("\t", 1)   # composer -> members
-    pane = lambda: [row[112:].rstrip() for row in tui.display()]
+    members_pane = lambda: [row.rstrip() for row in pane(tui.display(), "Members")]
     def label_of(who):
         """The state line under `who`'s name in the members pane, and whether the marker is on it."""
-        rows = pane()
+        rows = members_pane()
         key = "alice" if who == "alice" else fp[who][:26]
         for i, r in enumerate(rows):
             if key in r:
@@ -338,7 +345,7 @@ try:
     # The pane's border is part of the row: the label is what sits between its edges.
     bare = lambda row: (row or "").strip().strip("│").strip()
     alice_ok = tui.until(lambda: bare(label_of("alice")[0]) == ALICE, 60, 1)
-    if label_of("carol")[0] is None: product("bob's node listed carol, and his `vox tui` members pane does not show her:\n" + "\n".join(pane()))
+    if label_of("carol")[0] is None: product("bob's node listed carol, and his `vox tui` members pane does not show her:\n" + "\n".join(members_pane()))
     if not alice_ok:
         product(f"bob trusts alice, and his `vox tui` members pane never showed her {ALICE!r} "
                 "within 60 s: " + repr(label_of("alice")[0]))
@@ -353,7 +360,7 @@ try:
         product("bob's `vox tui` never showed his own post r-001 within 30 s")
     def under(key):
         """The timeline row under the one holding `key`, bare of the pane's border."""
-        rows = [r[:112] for r in tui.display()]
+        rows = pane(tui.display(), "Timeline")
         for i, r in enumerate(rows):
             if key in r:
                 return bare(rows[i + 1]) if i + 1 < len(rows) else ""
@@ -399,7 +406,7 @@ try:
     for keys, secs in (("", 4), ("id pass\r", 4), ("\r", 2), ("room pass\r", 4), ("\r", 2)):
         if keys: os.write(atui.fd, keys.encode())
         both_until(lambda: False, secs)
-    if not both_until(lambda: "m-0" in "\n".join(r[:112] for r in atui.display()), 30):
+    if not both_until(lambda: "m-0" in "\n".join(pane(atui.display(), "Timeline")), 30):
         product("alice's `vox tui` never drew a message in the room's timeline within 30 s of unlocking")
     def held(w):
         r = run(w, "status", "--json")
@@ -409,7 +416,7 @@ try:
             product(f"{w}'s `vox status --json` says no entries held for the room: {r.stdout[:300]!r}")
         return rooms[0]["entries"]
     def under_in(t, key):
-        rows = [r[:112] for r in t.display()]
+        rows = pane(t.display(), "Timeline")
         for i, r in enumerate(rows):
             if key in r:
                 return bare(rows[i + 1]) if i + 1 < len(rows) else ""
@@ -528,6 +535,23 @@ try:
     claim("notify", len(raised) == 1 and raised[0].startswith("Vox: m |") and "alice" in raised[0]
           and "secret" not in raised[0] and "do not show" not in raised[0],
           f"notifications for three messages in a room off screen: {raised!r}")
+
+    stage("regions")
+    # After `notify`: its post to bob would otherwise be the room's one notification.
+    # Alice writes to bob in the room he just left: the sidebar lists it under "needs you" with
+    # its count; and it lists the nodes on this machine, attached or detached (#511).
+    p = run("alice", "room", "post", room, "--session", "alice-s", "--to", fp["bob"], "TO-BOB-511")
+    if p.returncode != 0: product(f"alice's `vox room post --to bob` failed: {p.stderr.strip()}")
+    side = lambda: [r.strip().strip("│").strip() for r in pane(tui.display(), "Rooms")]
+    def regions():
+        s = side()
+        heads = [i for i, r in enumerate(s) if r == "needs you (1)"]
+        under = s[heads[0] + 1] if heads and heads[0] + 1 < len(s) else ""
+        return (bool(heads) and under.lstrip("▶ ").startswith("m ") and "to you 1" in under
+                and "spare  detached" in s and "default  attached" in s
+                and bool(s) and s[0] == "node default · attached")
+    tui.until(regions, 30, 1)
+    claim("regions", regions(), f"sidebar: {side()!r}")
 
     stage("unreach")
     for w in ("alice", "carol"):

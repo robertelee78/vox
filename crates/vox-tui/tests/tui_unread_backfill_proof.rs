@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
 const ROWS: u16 = 30;
-const COLS: u16 = 120;
+const COLS: u16 = 160;
 
 /// One `vox` command, run to completion against a profile.
 /// A verb as a person runs it since ADR-026 L-2: one that needs its node attached, run while no

@@ -32,7 +32,7 @@ import errno, os, sys
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import STAGE, Hung, Tui, arm, disarm, pyte, stage, is_attached  # noqa: E402
+from vox_pty import STAGE, Hung, Tui, arm, disarm, pane, pyte, stage, is_attached  # noqa: E402
 
 VOX, DATA, CFG, IDPASS, ROOMPASS, TAG = sys.argv[1:7]
 # Optional: a member, by the first characters of its fingerprint, to select in this room and type
@@ -120,7 +120,7 @@ try:
         stage(":consent grant")
         key("\t", 0.5)  # timeline -> composer
         key("\t", 0.5)  # composer -> members
-        members = lambda: [r[100:] if len(r) > 100 else "" for r in tui.display()]
+        members = lambda: pane(tui.display(), "Members")
         def label_of(prefix):
             rows = members()
             for i, r in enumerate(rows):
