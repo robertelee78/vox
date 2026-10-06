@@ -481,12 +481,15 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     // not carol, who gave up on hers, nor mallory, who could not open it. Read on alice's own
     // `vox room read`, the line under the share's row.
     let (_, alice_reads) = alice.run(&["room", "read", &room]);
+    // The row's own lines: the row, then its indented continuations (who it is to, who pulled it).
     let pulled_line = alice_reads
         .lines()
         .skip_while(|l| !l.contains("file offered: report.bin"))
-        .nth(1)
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .map(str::trim)
+        .find(|l| l.starts_with("pulled by"))
         .unwrap_or_default()
-        .trim()
         .to_owned();
     eprintln!("[proof] carol's cut-short curl exited {carol_cut:?}; alice reads under report.bin: {pulled_line:?}");
 
