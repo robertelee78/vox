@@ -53,8 +53,8 @@
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
-//! - `where`: with Alice's and Carol's daemons stopped, under a message Bob then posts his TUI
-//!   says "only on this machine"; once Alice's daemon is back and has synced, "on 1 of 2 members'
+//! - `where`: with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI
+//!   says "only on this machine"; once Alice's daemon is back and has synced, "on 1 of 3 members'
 //!   nodes" (ADR-028 R-6, #482);
 //! - `accent`: there, the accent marks only the focused list's border and the live "● online";
 //! - `idle`: once the anchor is stopped too, it says "idle", with no count;

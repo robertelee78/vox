@@ -54,11 +54,11 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   regions   the sidebar names bob's node attached; once Alice writes to him there, the room is
             listed under "needs you (1)" reading "to you 1"; and the nodes on this machine are
             listed, his attached and a second one detached (ADR-028 W-1, W-2, #511);
-  unreach   once Alice's and Carol's daemons are stopped, it reads "○ offline";
+  unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
-  where     with Alice's and Carol's daemons stopped, under a message Bob then posts his TUI says
+  where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
             "only on this machine"; once Alice's daemon is started again and has synced, "on 1 of
-            2 members' nodes" (ADR-028 R-6, #482); Alice's daemon is then stopped again;
+            3 members' nodes" (ADR-028 R-6, #482); Alice's daemon is then stopped again;
   accent    there, the accent marks only the focused list's border and the live "● online";
   idle      once the anchor is stopped too, it says "idle", with no count;
   depths    Bob's TUI opened again three ways (L-5): under NO_COLOR with an ASCII locale (LC_ALL=C)
@@ -670,7 +670,7 @@ try:
     if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
         product("alice's daemon, started again, never answered `vox room list` within 60 s: "
                 + open(f"{S}/alice-again.err").read())
-    WHERE = "on 1 of 2 members' nodes"
+    WHERE = "on 1 of 3 members' nodes"  # alice of alice, carol and dave
     tui.until(lambda: under("d-001") == WHERE, 90, 1)
     synced = under("d-001")
     claim("where", alone == "only on this machine" and synced == WHERE,
