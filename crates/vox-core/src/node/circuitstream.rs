@@ -105,6 +105,10 @@ const OP_INCOMING: u64 = 1;
 const OP_OPENED: u64 = 2;
 const OP_REFUSED: u64 = 3;
 
+/// Why this node, as a relay, refused a circuit it had no room for: kept apart so the node's
+/// decision record (ADR-028 D-1) can tell it from a target that was not there.
+pub const AT_CAPACITY: &str = "circuit: relay at capacity";
+
 /// Why a relay or a target would not take part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CircuitRefusal {
@@ -462,7 +466,7 @@ where
             }
             let Some(slot) = ledger.take(peer) else {
                 refuse(&mut send, CircuitRefusal::Capacity).await;
-                return Err(Error::Unreachable("circuit: relay at capacity"));
+                return Err(Error::Unreachable(AT_CAPACITY));
             };
             let Some(target_conn) = connected(&target) else {
                 refuse(&mut send, CircuitRefusal::NotConnected).await;

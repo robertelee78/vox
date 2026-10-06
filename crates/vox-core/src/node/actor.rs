@@ -4034,6 +4034,8 @@ pub struct Node {
     /// yet named by a read record of its own, and when it last posted one (ms): ADR-028 RR-2's
     /// "at most one per room per 5 seconds" ([`READ_RECORD_EVERY_MS`]).
     reads_pending: BTreeMap<Digest32, (BTreeSet<Digest32>, u64)>,
+    /// What this node decided, kept on its disk for 14 days (ADR-028 §7).
+    decisions: crate::node::decisions::DecisionLog,
     /// Rooms this node holds ended, passing the end on before it deletes them (V030-08).
     winding: BTreeMap<Digest32, Winding>,
     /// Rooms this node took off boards (V030-14) — left, or ended — with the signed withdraw, put
@@ -4400,8 +4402,10 @@ impl Node {
         // later (ADR-020 §7); the actor keeps its own clone to emit with.
         let handle_event_tx = event_tx.clone();
         let (net_tx, net_rx) = mpsc::channel(NET_QUEUE);
+        let decisions = crate::node::decisions::DecisionLog::new(&paths.profile_dir);
         let node = Self {
             paths,
+            decisions,
             profile,
             millis_clock,
             checkpoint_idle_secs,
@@ -4976,14 +4980,23 @@ impl Node {
                 fingerprint,
                 petname,
             } => {
-                self.trust_identity(fingerprint, &petname, crate::node::trust::HistoryGrant::Now)
-                    .await
+                let was = self.trust.is_trusted(&fingerprint);
+                let out = self
+                    .trust_identity(fingerprint, &petname, crate::node::trust::HistoryGrant::Now)
+                    .await;
+                self.decided_trust(was, fingerprint, &out);
+                out
             }
             NodeCommand::TrustWith {
                 fingerprint,
                 petname,
                 history,
-            } => self.trust_identity(fingerprint, &petname, history).await,
+            } => {
+                let was = self.trust.is_trusted(&fingerprint);
+                let out = self.trust_identity(fingerprint, &petname, history).await;
+                self.decided_trust(was, fingerprint, &out);
+                out
+            }
             NodeCommand::Rename {
                 fingerprint,
                 petname,
@@ -4995,7 +5008,25 @@ impl Node {
                     Outcome::Failed(Fault::NotConsented)
                 }
             }
-            NodeCommand::Untrust { fingerprint } => self.untrust_identity(&fingerprint).await,
+            NodeCommand::Untrust { fingerprint } => {
+                let alias = self.trust.petname(&fingerprint).map(str::to_owned);
+                let out = self.untrust_identity(&fingerprint).await;
+                if matches!(out, Outcome::Done) && alias.is_some() {
+                    self.decisions.record(
+                        (self.millis_clock)(),
+                        &crate::node::decisions::Decision {
+                            asked: "to stop trusting a member",
+                            by: fingerprint,
+                            alias,
+                            decided: crate::node::decisions::Decided::Untrusted,
+                            why: "this node's person removed them from the keyring: they read \
+                                  nothing new from it and reach none of its services"
+                                .to_owned(),
+                        },
+                    );
+                }
+                out
+            }
             // Answered through `begin_create_channel`, which the run loop calls instead of this.
             NodeCommand::Serve { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::Up { channel_id, bind } => self.bring_up(&channel_id, bind).await,
@@ -5012,7 +5043,24 @@ impl Node {
             NodeCommand::RemoveService {
                 channel_id,
                 service_tag,
-            } => self.remove_service(&channel_id, &service_tag).await,
+            } => {
+                let out = self.remove_service(&channel_id, &service_tag).await;
+                if let (Outcome::Done, Some(me)) =
+                    (&out, self.profile.as_ref().map(Profile::fingerprint))
+                {
+                    self.decided(
+                        "to stop sharing a service",
+                        me,
+                        crate::node::decisions::Decided::Stopped,
+                        format!(
+                            "this node's person stopped sharing {service_tag} in room {}: nobody \
+                             reaches it from now on",
+                            crate::node::network::short_id(channel_id)
+                        ),
+                    );
+                }
+                out
+            }
             // Answered by `begin_forward` and `NetEvent::ForwardDialed`: the command loop takes it
             // before it gets here.
             NodeCommand::Forward { .. } => {
@@ -5192,6 +5240,7 @@ impl Node {
             (true, Some(creators)) => crate::nat::service::AnchorRooms::CreatedBy(creators.clone()),
         });
         net.count_ladders_in(Arc::clone(&self.sync_book));
+        net.record_decisions_in(self.decisions.clone());
         net.manager().report_to(self.event_tx.clone());
         // **A record landing on this node's board is an event, not something to notice later.**
         // A newcomer becomes findable to everyone away from the room only because a member that
@@ -7569,6 +7618,9 @@ impl Node {
                         // The host is told who reached what, because the carried
                         // service only ever sees loopback (ADR-017 decision 6).
                         let events = self.event_tx.clone();
+                        let decisions = self.decisions.clone();
+                        let alias = self.trust.petname(&peer).map(str::to_owned);
+                        let clock = Arc::clone(&self.millis_clock);
                         // **The tunnel holds its connection for as long as it runs.** That
                         // is what tells `retire_expired` the path is still carrying, so a
                         // better path appearing does not close it under a live session.
@@ -7593,16 +7645,46 @@ impl Node {
                             // The result used to be dropped here, so a host refusing a member —
                             // untrusted, no such service, its own service down — said nothing
                             // anywhere (PRD-001 R36).
+                            // What this node decided about it, for its own record (ADR-028 D-1).
+                            let decided = |d: crate::node::decisions::Decided, why: &str| {
+                                decisions.record(
+                                    clock(),
+                                    &crate::node::decisions::Decision {
+                                        asked: "a tunnel to a service",
+                                        by: peer,
+                                        alias: alias.clone(),
+                                        decided: d,
+                                        why: why.to_owned(),
+                                    },
+                                );
+                            };
                             match served {
                                 // Refusals only: a session that ends in an error after it was
                                 // accepted is a disconnect, not a no.
-                                Err(e @ crate::error::Error::TunnelDenied(_)) => {
+                                Err(crate::error::Error::TunnelDenied(why)) => {
+                                    decided(crate::node::decisions::Decided::Refused, why);
+                                    let e = crate::error::Error::TunnelDenied(why);
                                     let _ = events.send(NodeEvent::ProxyRefused {
                                         reason: format!("refused {who} a tunnel: {e}"),
                                     });
                                 }
+                                // Cut by a decision about reach: trust withdrawn, or the service
+                                // no longer offered (M17.11, R22).
+                                Err(crate::error::Error::TunnelRevoked(why)) => {
+                                    decided(crate::node::decisions::Decided::Cut, why);
+                                }
+                                // Past the member's tunnel cap (#272): refused, by this node.
+                                Err(crate::error::Error::TunnelLimit(why)) => {
+                                    decided(crate::node::decisions::Decided::Refused, &why);
+                                }
                                 // Closed on purpose (V030-11): the host is told too, as a close.
-                                Err(e @ crate::error::Error::TunnelClosed(_)) => {
+                                Err(crate::error::Error::TunnelClosed(why)) => {
+                                    // Cut here — by this node's person, or as stuck on this side —
+                                    // is this node's decision; closed at the other end is not.
+                                    if !why.contains(crate::tunnel::session::AT_THE_OTHER_END) {
+                                        decided(crate::node::decisions::Decided::Cut, &why);
+                                    }
+                                    let e = crate::error::Error::TunnelClosed(why);
                                     let _ = events.send(NodeEvent::TunnelClosed {
                                         reason: format!("a session from {who}: {e}"),
                                     });
@@ -7763,6 +7845,12 @@ impl Node {
                     crate::node::network::short_id(peer)
                 ),
             });
+            self.decided(
+                "to join a room",
+                peer,
+                crate::node::decisions::Decided::Refused,
+                format!("this node was already answering {JOINS_IN_FLIGHT} joins"),
+            );
             // Told why (V210-92): a bare refusal reads to the joiner as a wrong passphrase.
             tokio::spawn(crate::node::joinstream::refuse_join_as(
                 send,
@@ -7786,6 +7874,15 @@ impl Node {
                     ended.weight.3,
                 ),
             });
+            self.decided(
+                "to join a room",
+                ended.peer,
+                crate::node::decisions::Decided::Cut,
+                format!(
+                    "all {JOINS_IN_FLIGHT} join slots were held, and its join gave way to {}'s",
+                    crate::node::network::short_id(peer)
+                ),
+            );
         }
         // Including the slot just taken, so the first joiner sees a load of 1. This is what
         // `Difficulty::adapted_for_load` is for, and it was passed a literal `0` until now — so the
@@ -7912,6 +8009,14 @@ impl Node {
         let outcome = match outcome {
             Ok(o) => o,
             Err(reason) => {
+                // The exchange's reason is this node's own words: the joiner and the step that
+                // failed, never what it offered.
+                self.decided(
+                    "to join a room",
+                    peer,
+                    crate::node::decisions::Decided::Refused,
+                    reason.clone(),
+                );
                 let _ = self.event_tx.send(NodeEvent::JoinFailed { reason });
                 return;
             }
@@ -14637,6 +14742,9 @@ impl Node {
         }
         let (relayed_peers, relaying) = self.path_view();
         let connected_peers = self.connected_peers();
+        let trusted = self.trust_rows();
+        // What the decision record names members as where the keyring is not at hand.
+        self.decisions.set_aliases(&trusted);
         let view = NodeView {
             identity,
             locked,
@@ -14656,7 +14764,7 @@ impl Node {
                     local: f.local,
                 })
                 .collect(),
-            trusted: self.trust_rows(),
+            trusted,
             relayed_peers,
             relaying,
             connected: connected_peers.len(),
@@ -14734,6 +14842,38 @@ impl Node {
             .collect();
         relayed.sort_unstable();
         (relayed, net.relaying())
+    }
+
+    /// Record a decision about `by` (ADR-028 D-1), naming them as this node's keyring does.
+    fn decided(
+        &self,
+        asked: &'static str,
+        by: Digest32,
+        decided: crate::node::decisions::Decided,
+        why: String,
+    ) {
+        self.decisions.record(
+            (self.millis_clock)(),
+            &crate::node::decisions::Decision {
+                asked,
+                by,
+                alias: self.trust.petname(&by).map(str::to_owned),
+                decided,
+                why,
+            },
+        );
+    }
+
+    /// A trust just asked for: recorded when it added someone who was not trusted before.
+    fn decided_trust(&self, was: bool, fingerprint: Digest32, out: &Outcome) {
+        if !was && matches!(out, Outcome::Done) {
+            self.decided(
+                "to trust a member",
+                fingerprint,
+                crate::node::decisions::Decided::Trusted,
+                "this node's person added them to the keyring".to_owned(),
+            );
+        }
     }
 
     /// The keyring as the view carries it — empty while locked, because the
