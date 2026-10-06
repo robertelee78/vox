@@ -1626,15 +1626,7 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
     let (ok, _, err) = hook(
         &bob.data,
         &bob.cfg,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            &link,
-            "--name",
-            "agents",
-        ],
+        &["room", "join", "--passphrase-file", "-", &link],
         "channel passphrase",
     );
     assert!(

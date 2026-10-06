@@ -4,16 +4,16 @@
 //! add`, `vox service list/add` and `vox up`, every one a `vox` verb.
 //!
 //! The scene: alice shares `nas-ssh` and `nas-nfs` in one room with `vox serve nas-ssh=… nas-nfs=…`
-//! — two echo services that answer `ssh:` and `nfs:`. bob joins it and calls the room `fam` and
-//! alice `nas-box`; carol joins it and calls them `house` and `ally`. alice trusts both: reach is
-//! the host's decision (ADR-017 decision 3).
+//! — two echo services that answer `ssh:` and `nfs:` — and names the room `family`, the one name
+//! every member sees (ADR-028 R-1). bob joins it and calls alice `nas-box`; carol joins it and
+//! calls her `ally`. alice trusts both: reach is the host's decision (ADR-017 decision 3).
 //!
 //! What must hold:
 //!
-//! 1. bob reaches each service as `<service>.nas-box.fam.vox`, and as `vox serve` printed it (the
+//! 1. bob reaches each service as `<service>.nas-box.family.vox`, and as `vox serve` printed it (the
 //!    fingerprints in the node and room places).
-//! 2. carol reaches the same services through her own aliases, `<service>.ally.house.vox`.
-//! 3. `fam.vox` (a room), `nas-box.fam.vox` (a node) and `<room-id>.vox` (the form R44 removed
+//! 2. carol reaches the same services through her own aliases, `<service>.ally.family.vox`.
+//! 3. `family.vox` (a room), `nas-box.family.vox` (a node) and `<room-id>.vox` (the form R44 removed
 //!    with the genesis grant behind it) resolve to nothing: no connection, and what `vox up` says
 //!    about them names no service.
 //! 4. `vox service list` lists both services for each member, each with its address in that
@@ -21,11 +21,11 @@
 //! 5. a second share under a taken name is refused, naming it; the first still answers.
 //! 6. `vox serve` with a bare port is refused, saying how to name the share.
 //! 7. `vox forward` takes the address and nothing else (decider, 2026-10-03: "address only"):
-//!    `vox forward nas-ssh.nas-box.fam.vox` carries bob to alice's ssh service, and the form that
+//!    `vox forward nas-ssh.nas-box.family.vox` carries bob to alice's ssh service, and the form that
 //!    names a room, a member and a service is refused.
 //! 8. An address naming no share in a room bob has synced is refused at once, saying so: within
 //!    [`IMMEDIATE`], PRD-001 R23's bound (#69), with no wait for a share that is not coming.
-//! 9. The same for UDP: alice also shares `nas-dns` over UDP. `vox forward nas-dns.nas-box.fam.vox`
+//! 9. The same for UDP: alice also shares `nas-dns` over UDP. `vox forward nas-dns.nas-box.family.vox`
 //!    carries bob's datagrams to it and back, and an address naming no UDP share (`dns.…`) is
 //!    refused at once, saying so, rather than bound and its datagrams dropped.
 //! 10. The canonical address travels (ADR-028 S-1, #487): `vox serve` prints nas-ssh's as
@@ -396,6 +396,8 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
             &format!("nas-ssh={}", ssh_at.port()),
             &format!("nas-nfs={}", nfs_at.port()),
             &format!("nas-dns={}/udp", dns_at.port()),
+            "--name",
+            "family",
             "--anchor",
             &spec,
             "--listen",
@@ -431,10 +433,10 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         .unwrap_or_default()
         .to_owned();
 
-    // bob and carol join, each under their own name for the room.
+    // bob and carol join; the room keeps the name alice gave it.
     let mut bob_daemon = daemon("bob", &bob_dir, &spec);
     let mut carol_daemon = daemon("carol", &carol_dir, &spec);
-    for (who, dir, local) in [("bob", &bob_dir, "fam"), ("carol", &carol_dir, "house")] {
+    for (who, dir) in [("bob", &bob_dir), ("carol", &carol_dir)] {
         let (ok, out, err) = vox(
             dir,
             &["room", "join", "--passphrase-file", "-", &address],
@@ -442,20 +444,19 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         );
         assert!(
             ok,
-            "PRODUCT (staging): {who} joins alice's room as {local}: {out}{err}\nalice's vox serve \
-             said:\n{}",
+            "PRODUCT (staging): {who} joins alice's room: {out}{err}\nalice's vox serve said:\n{}",
             serve.transcript()
         );
     }
 
     // (4) Each lists both services, in its own words, with who shared them.
     let bob_wants = [
-        "nas-ssh.nas-box.fam.vox  by nas-box".to_owned(),
-        "nas-nfs.nas-box.fam.vox  by nas-box".to_owned(),
+        "nas-ssh.nas-box.family.vox  by nas-box".to_owned(),
+        "nas-nfs.nas-box.family.vox  by nas-box".to_owned(),
     ];
     let carol_wants = [
-        "nas-ssh.ally.house.vox  by ally".to_owned(),
-        "nas-nfs.ally.house.vox  by ally".to_owned(),
+        "nas-ssh.ally.family.vox  by ally".to_owned(),
+        "nas-nfs.ally.family.vox  by ally".to_owned(),
     ];
     let bob_list = listed(&bob_dir, &room, &bob_wants);
     let carol_list = listed(&carol_dir, &room, &carol_wants);
@@ -463,7 +464,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     let bob_canonical = bob_list
         .1
         .lines()
-        .skip_while(|l| !l.contains("nas-ssh.nas-box.fam.vox  by nas-box"))
+        .skip_while(|l| !l.contains("nas-ssh.nas-box.family.vox  by nas-box"))
         .nth(1)
         .unwrap_or_default()
         .trim()
@@ -474,12 +475,12 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
 
     // (1), (2): every address in each member's words, and the printed one.
     let reached: Vec<(String, Result<String, u8>)> = [
-        (bob_proxy, "nas-ssh.nas-box.fam.vox".to_owned()),
-        (bob_proxy, "nas-nfs.nas-box.fam.vox".to_owned()),
+        (bob_proxy, "nas-ssh.nas-box.family.vox".to_owned()),
+        (bob_proxy, "nas-nfs.nas-box.family.vox".to_owned()),
         (bob_proxy, printed_ssh.clone()),
         (bob_proxy, format!("nas-nfs.{alice_fp}.{room}.vox")),
-        (carol_proxy, "nas-ssh.ally.house.vox".to_owned()),
-        (carol_proxy, "nas-nfs.ally.house.vox".to_owned()),
+        (carol_proxy, "nas-ssh.ally.family.vox".to_owned()),
+        (carol_proxy, "nas-nfs.ally.family.vox".to_owned()),
         // (10) bob's copy, pasted on carol's machine, where every alias differs.
         (carol_proxy, bob_canonical.clone()),
     ]
@@ -493,8 +494,8 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     // (3) Nothing shorter is an address.
     let before_nothing = Instant::now();
     let nothing: Vec<(String, Result<String, u8>)> = [
-        "fam.vox".to_owned(),
-        "nas-box.fam.vox".to_owned(),
+        "family.vox".to_owned(),
+        "nas-box.family.vox".to_owned(),
         format!("{room}.vox"),
         format!("{alice_fp}.{room}.vox"),
     ]
@@ -513,7 +514,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         &["service", "add", &room, "nas-ssh", &nfs_at.to_string()],
         None,
     );
-    let after_dup = who_answers(bob_proxy, "nas-ssh.nas-box.fam.vox");
+    let after_dup = who_answers(bob_proxy, "nas-ssh.nas-box.family.vox");
 
     eprintln!(
         "bare serve: ok={bare_ok} {bare_out}{bare_err}\nprinted: {printed_line}\nbob's list: \
@@ -602,7 +603,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     let mut fwd = VoxProc::spawn(
         "bob forward",
         &bob_dir,
-        &args(&["forward", "nas-ssh.nas-box.fam.vox", "127.0.0.1:0"]),
+        &args(&["forward", "nas-ssh.nas-box.family.vox", "127.0.0.1:0"]),
     );
     let bound_line = fwd.expect_line("PRODUCT: `vox forward <address>` binds", |l| {
         l.starts_with("vox: forwarding ")
@@ -655,7 +656,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     );
     assert!(
         forwarded.starts_with("ssh:"),
-        "PRODUCT: `vox forward nas-ssh.nas-box.fam.vox` did not carry bob to alice's ssh service: \
+        "PRODUCT: `vox forward nas-ssh.nas-box.family.vox` did not carry bob to alice's ssh service: \
          {forwarded:?}"
     );
     assert!(
@@ -669,7 +670,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     let mut dns_fwd = VoxProc::spawn(
         "bob forward nas-dns",
         &bob_dir,
-        &args(&["forward", "nas-dns.nas-box.fam.vox", "127.0.0.1:0"]),
+        &args(&["forward", "nas-dns.nas-box.family.vox", "127.0.0.1:0"]),
     );
     let dns_line = dns_fwd.expect_line("PRODUCT: `vox forward` of a UDP share binds", |l| {
         l.starts_with("vox: forwarding ")
@@ -697,14 +698,14 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     };
     drop(dns_fwd);
     let (dns_refused, dns_took, dns_said) =
-        forward_refused(&bob_dir, "bob forward dns", "dns.nas-box.fam.vox");
+        forward_refused(&bob_dir, "bob forward dns", "dns.nas-box.family.vox");
     eprintln!(
         "forward nas-dns: {dns_line:?} answered {dns_answer:?}\nforward dns (no such share): \
          refused={dns_refused} after {dns_took:?}: {dns_said}"
     );
     assert!(
         dns_line.contains("udp/nas-dns") && dns_answer.as_deref() == Some("dns:query"),
-        "PRODUCT: `vox forward nas-dns.nas-box.fam.vox` must carry datagrams to alice's UDP share \
+        "PRODUCT: `vox forward nas-dns.nas-box.family.vox` must carry datagrams to alice's UDP share \
          and back: {dns_line:?} answered {dns_answer:?}"
     );
     assert!(
@@ -722,7 +723,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     let mut absent = VoxProc::spawn(
         "bob forward nas-ftp",
         &bob_dir,
-        &args(&["forward", "nas-ftp.nas-box.fam.vox", "127.0.0.1:0"]),
+        &args(&["forward", "nas-ftp.nas-box.family.vox", "127.0.0.1:0"]),
     );
     let absent_status = loop {
         match absent.child.try_wait() {
@@ -869,10 +870,13 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     // (13) A readable part that names two things is refused, saying which: bob now calls carol
     // `Nas Box`, which as a label is `nas-box`, his name for alice too.
     trust(&bob_dir, "bob", &carol_fp, "Nas Box");
-    let (amb_refused, _, amb_said) =
-        forward_refused(&bob_dir, "bob forward ambiguous", "nas-ssh.nas-box.fam.vox");
+    let (amb_refused, _, amb_said) = forward_refused(
+        &bob_dir,
+        "bob forward ambiguous",
+        "nas-ssh.nas-box.family.vox",
+    );
     assert!(
-        amb_refused && amb_said.contains("`nas-box` names 2 nodes you trust in `fam`"),
+        amb_refused && amb_said.contains("`nas-box` names 2 nodes you trust in `family`"),
         "PRODUCT: an address whose node part names two trusted nodes must be refused, saying so: \
          {amb_said}"
     );

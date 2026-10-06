@@ -470,15 +470,7 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
     assert!(ok, "PRODUCT (staging): chatty's link: {err}");
     let (ok, _, err) = vox(
         &bob_dir,
-        &[
-            "room",
-            "join",
-            "--passphrase-file",
-            "-",
-            chatty_link.trim(),
-            "--name",
-            "chatty",
-        ],
+        &["room", "join", "--passphrase-file", "-", chatty_link.trim()],
         Some("chatty passphrase\n"),
     );
     assert!(ok, "PRODUCT (staging): bob joins chatty: {err}");
