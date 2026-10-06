@@ -694,7 +694,11 @@ try:
         e = env(w)
         e["VOX_SESSION"] = session
         r = subprocess.run([VOX, *args], env=e, capture_output=True, text=True, timeout=120)
-        if r.returncode != 0: product(f"{w}'s `vox {' '.join(args[:2])}` as an agent failed: {r.stderr.strip()}")
+        # A claim some member cannot agree to (Carol and Dave, whom not everyone trusts) is posted
+        # all the same, and says so: what Bob's lanes are about is what it posted.
+        posted = args[1] == "claim" and "Your claim is posted" in r.stderr
+        if r.returncode != 0 and not posted:
+            product(f"{w}'s `vox {' '.join(args[:2])}` as an agent failed: {r.stderr.strip()}")
         return r
     as_agent("alice", "alice-agent", "room", "claim", room, "codec-port")
     as_agent("alice", "alice-agent", "room", "post", room, "--type", "working", "LANE-WORKING porting")
@@ -704,22 +708,27 @@ try:
     tui.key("\r", 2)  # into the room, selected in the sidebar
     tui.key(":lanes\r", 2)
     def lane(name):
-        """(the lane's title row, its rows) for the member `name`, by its title on Bob's screen."""
-        for r in tui.display():
+        """(the lane's title, its rows) for the member Bob calls `name` (his name for it, or the
+        start of its fingerprint), found by its title on Bob's screen."""
+        rows = tui.display()
+        for r in rows:
             for g in ("⇄ ", "→ ", "· ", ""):
-                at = r.find("┌" + g + name + " · ")
-                if at >= 0:
-                    title = r[at + 1:r.find("┐", at)].strip("─")
-                    return title, [bare(x) for x in pane(tui.display(), g + name + " · ")]
+                start = r.find("┌" + g + name)
+                if start >= 0:
+                    end = r.find("┐", start)
+                    title = r[start + 1:end if end > 0 else len(r)].strip("─")
+                    return title, [bare(x) for x in pane(rows, g + name)]
         return None, []
     tui.until(lambda: (lane("alice")[0] or "").endswith("working") and "LANE-ASK" in " ".join(lane("alice")[1]), 60, 1)
-    (at, arows), (ct, _) = lane("alice"), lane("carol")
+    (a_title, arows), (c_title, _) = lane("alice"), lane(fp["carol"][:8])
     atext = " ".join(arows)
-    folded = re.search(r"\b(\d+) coordination posts?\b", atext)
-    claim("lanes", (at or "").endswith("· working") and (ct or "").endswith("· away")
-          and "LANE-ASK which codec stays?" in atext and folded is not None
-          and "LANE-WORKING" not in atext and "LANE-STATUS" not in atext,
-          f"alice's lane {at!r}: {arows!r}; carol's lane {ct!r}")
+    # A lane is narrow, so its rows wrap: read it as one text, without the spaces a wrap took.
+    joined = "".join(arows).replace(" ", "")
+    claim("lanes", (a_title or "").endswith("· working") and (c_title or "").endswith("· away")
+          and "LANE-ASKwhichcodecstays?" in joined
+          and re.search(r"(\d+)coordinationposts?", joined) is not None
+          and "LANE-WORKING" not in joined and "LANE-STATUS" not in joined,
+          f"alice's lane {a_title!r}: {arows!r}; carol's lane {c_title!r}")
 
     stage("to")
     # To: and urgent in the composer (ADR-028 W-4): the message carries them, as `vox room post

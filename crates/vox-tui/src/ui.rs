@@ -677,6 +677,16 @@ fn render_lanes(
         }
         let from = rows.len().saturating_sub(height);
         shown.extend(owners[from..].iter().flatten().copied());
+        // The chip is always on the border: a name too long for the lane (a fingerprint, for a
+        // member this node has no name for) is cut, never the state.
+        let room = usize::from(col.width.saturating_sub(2))
+            .saturating_sub(glyph.chars().count() + state.chars().count() + 4)
+            .max(4);
+        let name = if name.chars().count() > room {
+            format!("{}…", name.chars().take(room - 1).collect::<String>())
+        } else {
+            name
+        };
         let title = format!("{glyph}{name} · {state}");
         let p = Paragraph::new(rows[from..].to_vec()).block(pane_block(&title, false));
         frame.render_widget(p, *col);
