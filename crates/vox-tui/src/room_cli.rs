@@ -3610,6 +3610,9 @@ pub async fn join(
             };
             println!("vox: joined {}", joined.as_deref().unwrap_or("the room"));
             println!("     you read a member once you trust it and it trusts you: `vox trust add`");
+            if let Ok(parsed) = vox_core::node::link::InviteLink::parse(link) {
+                who_reads_whom(&mut client, parsed.channel_id).await;
+            }
             Ok(())
         }
         // The daemon sends the outcome's name; turn it into the same guidance `vox connect`
@@ -3626,6 +3629,61 @@ pub async fn join(
         )),
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// How long a join waits for the trust of members this node trusts to reach it before saying who
+/// reads whom ([`who_reads_whom`]); what has not reached it by then is said to be on its way.
+const CONSENT_SETTLES: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// **Who reads whom, member by member, right after a join** (ADR-028 R-5, #481): each other
+/// member, by this node's name for it, trusted both ways, waiting for the other side, or not in
+/// keyring, with what is still to do ([`crate::ident::Reading`]). Best effort: a node that does not
+/// say leaves the join's own lines standing.
+async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
+    let Ok(Frame::Members { members }) = client.request(&Request::Roster { channel_id }).await
+    else {
+        return;
+    };
+    let keyring = match client.trusted("").await {
+        Ok(Frame::Trusted { entries }) => entries,
+        _ => Vec::new(),
+    };
+    let me = client.me();
+    // A member that trusts this node consents to it on the room's log, which reaches this node
+    // just after the join returns (measured: about 0.2 s). Read again for a moment while one this
+    // node trusts has not; after that, what is missing is said as not having reached this node.
+    let deadline = std::time::Instant::now() + CONSENT_SETTLES;
+    let inbound = loop {
+        let Ok(Frame::Consents { inbound, .. }) =
+            client.request(&Request::Consents { channel_id }).await
+        else {
+            return;
+        };
+        let waiting = members.iter().any(|m| {
+            Some(*m) != me && keyring.iter().any(|(fp, _)| fp == m) && !inbound.contains(m)
+        });
+        if !waiting || std::time::Instant::now() >= deadline {
+            break inbound;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let me_fp = me.map(|m| b32_encode(&m)).unwrap_or_default();
+    let others: Vec<Digest32> = members.into_iter().filter(|m| Some(*m) != me).collect();
+    if others.is_empty() {
+        println!("     no other member yet");
+        return;
+    }
+    println!("     who reads whom:");
+    for m in others {
+        let reading =
+            crate::ident::Reading::of(keyring.iter().any(|(fp, _)| *fp == m), inbound.contains(&m));
+        let name = crate::ident::name_in(&keyring, &m);
+        println!(
+            "     {} {name} — {}",
+            reading.glyph(),
+            reading.say(&name, &b32_encode(&m), &me_fp)
+        );
     }
 }
 

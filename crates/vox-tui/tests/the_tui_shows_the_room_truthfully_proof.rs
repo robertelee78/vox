@@ -37,8 +37,9 @@
 //!   Ctrl-R and sends q-answer. His post's `re` names q-mid, and the TUI shows it under "┆ alice:
 //!   q-mid…", one level, never q-root, while q-mid itself is off screen (ADR-028 R-9, #485);
 //! - `jump`: Bob selects q-answer and presses Enter, and q-mid is scrolled to and selected;
-//! - `consent`: Carol, whom Bob never trusted, reads "not in keyring · you don't read each
-//!   other", and Alice "in keyring · reads you" (the pane said "consented" for
+//! - `consent`: who reads whom, in words (ADR-028 R-5, #481): Carol, whom Bob never trusted, reads
+//!   "not in keyring: trust to read each other", Dave, whom he trusts and who trusts nobody,
+//!   "waiting for the other side", and Alice "trusted both ways" (the pane said "consented" for
 //!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
 //!   refuses her key; V210-155);
 //! - `look`: in truecolour, Alice's row reads "⇄ alice" (each trusts the other) and Dave's

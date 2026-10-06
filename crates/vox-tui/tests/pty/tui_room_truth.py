@@ -30,8 +30,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             q-mid, and the TUI shows it under "┆ alice: q-mid…", one level, not q-root, with q-mid
             itself off screen (ADR-028 R-9, #485);
   jump      Bob selects q-answer and presses Enter: the view moves to q-mid, selected;
-  consent   Carol, whom Bob never trusted, reads "not in keyring · you don't read each other";
-            Alice, whom he did, "in keyring · reads you" (V210-155: once
+  consent   Carol, whom Bob never trusted, reads "not in keyring: trust to read each other";
+            Dave, whom he trusts and who trusts nobody, "waiting for the other side"; Alice,
+            whom he did and who trusts him, "trusted both ways" (ADR-028 R-5, #481;
+            V210-155: once
             "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
   look      in truecolour, Alice's row is "⇄ alice" (each trusts the other) and Dave's "→ dave" (only
             Bob trusts him), both in text.primary bold, and Carol's "· <her fingerprint>" in
@@ -540,7 +542,9 @@ try:
     stage("consent")
     # Bob's node releases its key to Alice on its own (he trusts her): wait for that before
     # judging Carol.
-    ALICE, CAROL = "in keyring · reads you", "not in keyring · you don't read each other"
+    # Who reads whom, and what is still to do (ADR-028 R-5, #481).
+    ALICE, CAROL = "trusted both ways", "not in keyring: trust to read each other"
+    DAVE = "waiting for the other side"  # bob trusts dave, who trusts nobody
     # The pane's border is part of the row: the label is what sits between its edges.
     bare = lambda row: (row or "").strip().strip("│").strip()
     alice_ok = tui.until(lambda: bare(label_of("alice")[0]) == ALICE, 60, 1)
@@ -548,9 +552,10 @@ try:
     if not alice_ok:
         product(f"bob trusts alice, and his `vox tui` members pane never showed her {ALICE!r} "
                 "within 60 s: " + repr(label_of("alice")[0]))
-    carol_label = label_of("carol")[0]
-    claim("consent", bare(carol_label) == CAROL,
-          f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
+    carol_label, dave_label = label_of("carol")[0], label_of("dave")[0]
+    claim("consent", bare(carol_label) == CAROL and bare(dave_label) == DAVE,
+          f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}; "
+          f"dave: {(dave_label or '').strip()!r}")
 
     stage("look")
     # Alice's key reaches Bob once her node has released it: wait for her ⇄ before judging.
