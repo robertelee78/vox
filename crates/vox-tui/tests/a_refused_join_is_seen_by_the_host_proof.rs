@@ -25,13 +25,17 @@
 //!   one event naming bob, why, and the room by its ID (never its name), in `nodes/default/decisions/<today>.jsonl` (0600, its directory
 //!   0700); neither the passphrase bob offered nor a message alice posted is in it; and of two
 //!   earlier days planted before her daemon starts, the one 14 days old is removed and the one 13
-//!   days old kept.
+//!   days old kept. `vox status` names that refusal under "recent refusals", and first in
+//!   `--json`'s `refusals`; alice's TUI, on `d`, shows both refusals of bob's join (the
+//!   foreground arm's and the TUI arm's), newest first (D-3, #507).
 //!
 //! **Mutations that must turn it red:** the daemon's per-node reporter no longer saying a
 //! `JoinFailed` (`tunnel_cli::say_if_it_explains_a_failure`) — the foreground and auto-started arms
 //! red; the TUI ignoring `JoinFailed` (`DaemonCore::on_node_event`) — the TUI arm red; a node
 //! that records a message's text in its decision record when it posts one — the record arm red;
-//! a join refusal recorded with no room — the record arm red.
+//! a join refusal recorded with no room — the record arm red; a status report with no refusals in
+//! it — the `vox status` claims red; the TUI's decision record read oldest first — the TUI's
+//! decision claim red.
 
 #![cfg(unix)]
 
@@ -222,6 +226,21 @@ fn wrong_join(bob: &Person, link: &str) {
     );
 }
 
+/// How long ago a row of the TUI's decision record says it was decided, in seconds:
+/// `<n><unit> ago …`, its first word.
+fn age_secs(row: &str) -> Option<u64> {
+    let word = row.split_whitespace().next()?;
+    let (n, unit) = word.split_at(word.find(|c: char| !c.is_ascii_digit())?);
+    let n: u64 = n.parse().ok()?;
+    Some(match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3_600,
+        "d" => n * 86_400,
+        _ => return None,
+    })
+}
+
 /// Wait up to [`SAYS_WITHIN`] for `log` to say the join was refused; what it holds then.
 fn says(log: impl Fn() -> String) -> String {
     let t0 = Instant::now();
@@ -346,6 +365,37 @@ fn a_refused_join_is_seen_by_the_host() {
             ));
         }
     }
+    // `vox status` names the refusal (ADR-028 D-3, #507): as a person reads it, and in --json.
+    let short: String = bob.fp.chars().take(12).collect();
+    let (ok, status) = run(&alice.dir, &["status"]);
+    let line = status
+        .lines()
+        .skip_while(|l| l.trim() != "recent refusals")
+        .nth(1)
+        .unwrap_or("")
+        .to_owned();
+    println!("[proof] alice's `vox status`, its newest refusal: {line:?}");
+    let named = line.contains(&format!("refused {short} to join a room:"));
+    if !ok || !named || !line.contains("answering") {
+        red.push(format!(
+            "PRODUCT: alice's `vox status` must name her refusal of bob's join under \
+             \"recent refusals\"; it said: {status}"
+        ));
+    }
+    let (ok, json) = run(&alice.dir, &["status", "--json"]);
+    let newest = serde_json::from_str::<serde_json::Value>(json.trim())
+        .ok()
+        .map(|v| v["refusals"][0].clone());
+    if !ok
+        || newest.as_ref().is_none_or(|e| {
+            e["by"] != bob.fp.as_str() || e["asked"] != "to join a room" || !e["why"].is_string()
+        })
+    {
+        red.push(format!(
+            "PRODUCT: alice's `vox status --json` must name her refusal of bob's join first in \
+             `refusals`; it said: {json}"
+        ));
+    }
     let mode = |p: &Path| {
         std::os::unix::fs::PermissionsExt::mode(
             &std::fs::metadata(p)
@@ -397,7 +447,29 @@ fn a_refused_join_is_seen_by_the_host() {
         .lines()
         .find_map(|l| l.strip_prefix("alice SAID: "))
     {
-        Some(screen) => judge(&mut red, "alice's TUI's notice line", screen, &bob),
+        Some(screen) => {
+            judge(&mut red, "alice's TUI's notice line", screen, &bob);
+            // Her TUI's decision record, newest first (ADR-028 D-3, #507): the join it just
+            // refused, then the one her foreground daemon refused before it.
+            let rows: Vec<&str> = out
+                .stdout
+                .lines()
+                .filter_map(|l| l.strip_prefix("alice DECISION: "))
+                .collect();
+            println!("[proof] alice's TUI's decision record: {rows:?}");
+            let short: String = bob.fp.chars().take(12).collect();
+            let joins: Vec<u64> = rows
+                .iter()
+                .filter(|r| r.contains(&format!("refused {short}: to join a room")))
+                .filter_map(|r| age_secs(r))
+                .collect();
+            if joins.len() != 2 || joins[0] > joins[1] {
+                red.push(format!(
+                    "PRODUCT: alice's TUI must show her two refusals of bob's join, newest first; \
+                     its decision record shows: {rows:#?}"
+                ));
+            }
+        }
         None => red.push(format!(
             "{}: alice's TUI driver did not read its screen (exit {:?}): {}",
             if out.has_verdict("alice") && !out.stdout.contains("alice APPARATUS") {

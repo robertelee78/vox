@@ -226,6 +226,8 @@ pub struct ViewModel {
     pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
     /// The trust keyring, `(fingerprint, alias)`, for the keyring view (ADR-028 W-1, K-1).
     pub keyring: Vec<(vox_core::hash::Digest32, String)>,
+    /// What this node decided, newest first, from its decision record (ADR-028 D-3).
+    pub decisions: Vec<vox_core::node::decisions::Event>,
 }
 
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline

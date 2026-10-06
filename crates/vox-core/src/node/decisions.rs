@@ -24,6 +24,9 @@ pub const KEEP_DAYS: i64 = 14;
 /// ([`DecisionLog::record_folded`]): an hour.
 pub const FOLD_MS: u64 = 3_600_000;
 
+/// How many of its most recent refusals `vox status` names (D-3).
+pub const REFUSALS_SHOWN: usize = 5;
+
 /// What was decided (D-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decided {
@@ -70,6 +73,37 @@ pub struct Decision {
     /// decision is about one: a join, a share stopped. `None` for one about no room (a trust, a
     /// stream or relay circuit asked of the connection).
     pub room: Option<Digest32>,
+}
+
+/// One event of the record as read back: what [`DecisionLog::record`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    /// When, ms since the Unix epoch.
+    pub at_ms: u64,
+    /// What was asked.
+    pub asked: String,
+    /// Who asked, or whom it was about, as `vox` prints a fingerprint.
+    pub by: String,
+    /// This node's name for them, when it had one.
+    pub alias: Option<String>,
+    /// What was decided ([`Decided::as_str`]).
+    pub decided: String,
+    /// Why.
+    pub why: String,
+}
+
+impl Event {
+    fn of(line: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        Some(Self {
+            at_ms: v["at_ms"].as_u64()?,
+            asked: v["asked"].as_str()?.to_owned(),
+            by: v["by"].as_str()?.to_owned(),
+            alias: v["alias"].as_str().map(str::to_owned),
+            decided: v["decided"].as_str()?.to_owned(),
+            why: v["why"].as_str()?.to_owned(),
+        })
+    }
 }
 
 /// A node's decision record: where it is, and which day it was last pruned on. Cheap to clone;
@@ -235,6 +269,45 @@ impl DecisionLog {
         }
         let mut f = open.open(self.dir.join(format!("{}.jsonl", date_of(day))))?;
         f.write_all(format!("{line}\n").as_bytes())
+    }
+
+    /// The newest `limit` events of the record, newest first, those `decided` when it is given
+    /// (D-3). A line that does not read as an event is passed over.
+    #[must_use]
+    pub fn recent(&self, limit: usize, decided: Option<Decided>) -> Vec<Event> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut days: Vec<(i64, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let day = e
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_suffix(".jsonl"))
+                    .and_then(day_of)?;
+                Some((day, e.path()))
+            })
+            .collect();
+        days.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        let mut out = Vec::new();
+        for (_, path) in days {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let mut day: Vec<Event> = text
+                .lines()
+                .filter_map(Event::of)
+                .filter(|e| decided.is_none_or(|d| e.decided == d.as_str()))
+                .collect();
+            day.sort_by(|a, b| b.at_ms.cmp(&a.at_ms));
+            out.extend(day);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out.truncate(limit);
+        out
     }
 
     /// Remove every day's file older than [`KEEP_DAYS`] before `today`. A file whose name is not a

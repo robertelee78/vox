@@ -6,7 +6,8 @@ it shows its node attached this driver writes `ready` in <cue_dir>; then it read
 rows until they contain <want>, for at most 90 s, as a person would read them.
 
 Prints `<tag> SAID: <text>` with the bottom rows joined, and `<tag> SCREEN:` with the whole
-screen. Exit 0 = the TUI attached and the screen was read (the caller judges the words); 1 = the
+screen. Then it presses `d` for the node's decision record (ADR-028 D-3) and prints each of its
+rows as `<tag> DECISION: <row>`, top first. Exit 0 = the TUI attached and the screen was read (the caller judges the words); 1 = the
 TUI failed (`<tag> RED: PRODUCT: <what>`: never showed its node attached) or the driver hung
 (`HUNG at <stage>`: `vox_pty.py`, V210-54); 2 = apparatus (pyte missing). The TUI is killed by its
 PID, with bounded waits.
@@ -49,6 +50,16 @@ try:
     tui.until(lambda: WANT in bottom(), 90, 0.2)
     print(f"{TAG} SAID: {bottom()}")
     print(f"{TAG} SCREEN:\n{tui.text()}")
+    stage("the decision record")
+    # `d` on the channel list: what the node decided, newest first (ADR-028 D-3).
+    tui.key("d", 1)
+    tui.until(lambda: "Decisions (newest first" in tui.text(), 10, 0.2)
+    tui.pump(2)
+    rows = [" ".join(r.strip().strip("│").split()) for r in tui.display()]
+    print(f"{TAG} DECISIONS:")
+    for r in rows:
+        if " ago " in r:
+            print(f"{TAG} DECISION: {r}")
     code = 0
     tui.key("q", 1)
 except Hung as h:

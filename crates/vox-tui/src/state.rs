@@ -175,6 +175,9 @@ pub enum Screen {
     /// The trust keyring, each node with its fingerprint grouped and its art (ADR-028 W-1, K-1):
     /// `k` on the channel list, or `:keyring`.
     Keyring,
+    /// What this node decided, newest first (ADR-028 D-3): `d` on the channel list, or
+    /// `:decisions`.
+    Decisions,
 }
 
 /// Which pane has focus within the channel screen (cycled by `Tab`).
@@ -448,6 +451,10 @@ impl UiState {
                 self.screen = Screen::Keyring;
                 Action::Redraw
             }
+            KeyCode::Char('d') if self.screen == Screen::ChannelList => {
+                self.screen = Screen::Decisions;
+                Action::Redraw
+            }
             KeyCode::Char('x') | KeyCode::Delete if self.screen == Screen::Tunnels => {
                 self.close_selected_tunnel(vm)
             }
@@ -485,7 +492,10 @@ impl UiState {
                     self.replying = None;
                     return Action::Dispatch(Command::SelectChannel { channel_id: None });
                 }
-                if matches!(self.screen, Screen::Tunnels | Screen::Keyring) {
+                if matches!(
+                    self.screen,
+                    Screen::Tunnels | Screen::Keyring | Screen::Decisions
+                ) {
                     self.screen = Screen::ChannelList;
                 }
                 Action::Redraw
@@ -757,6 +767,8 @@ impl UiState {
                     .unwrap_or(0);
                 self.selected_tunnel = Some(vm.tunnels[step(cur, vm.tunnels.len())].id);
             }
+            // The record is read newest first, and nothing in it is acted on.
+            Screen::Decisions => {}
             Screen::Channel if self.focus == Focus::Timeline => {
                 // Up selects an older message, Down a newer one; past the newest follows again.
                 let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
@@ -880,6 +892,7 @@ impl UiState {
                 self.settle(vm);
             }
             Nav::Keyring => self.screen = Screen::Keyring,
+            Nav::Decisions => self.screen = Screen::Decisions,
         }
         Action::Redraw
     }
@@ -909,6 +922,8 @@ pub enum Nav {
     Tunnels,
     /// Show the trust keyring (ADR-028 W-1).
     Keyring,
+    /// Show what this node decided (ADR-028 D-3).
+    Decisions,
 }
 
 /// The result of parsing a `:`-command line.
@@ -981,6 +996,7 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         "down" => return Some(Parsed::Nav(Nav::Down)),
         "tunnels" => return Some(Parsed::Nav(Nav::Tunnels)),
         "keyring" => return Some(Parsed::Nav(Nav::Keyring)),
+        "decisions" => return Some(Parsed::Nav(Nav::Decisions)),
         // On the tunnel list, `close` closes the selected tunnel, not a channel.
         "close" if ui.screen == Screen::Tunnels => return Some(Parsed::CloseTunnel),
         _ => {}

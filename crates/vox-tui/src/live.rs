@@ -142,6 +142,8 @@ pub struct DaemonCore {
     /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
     /// ever, for a room that is over.
     mark_refused: Option<MarkRefused>,
+    /// This node's decision record as last read, and when (ADR-028 D-3).
+    decisions: (Option<Instant>, Vec<vox_core::node::decisions::Event>),
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -184,6 +186,9 @@ struct Timeline {
     /// The projection, and what it was projected with.
     projected: Option<Projected>,
 }
+
+/// How many of the node's decisions, newest first, the TUI's decision screen holds.
+const DECISIONS_SHOWN: usize = 500;
 
 /// The least time between two asks to record what a room showed, after the node did not take one.
 const MARK_RETRY: Duration = Duration::from_secs(3);
@@ -343,6 +348,7 @@ impl DaemonCore {
             timeline: None,
             marked: std::collections::BTreeSet::new(),
             mark_refused: None,
+            decisions: (None, Vec::new()),
             ended: None,
             stop,
         };
@@ -1379,7 +1385,24 @@ impl DaemonCore {
             tunnels: snap.tunnels,
             closed_tunnels: snap.closed_tunnels,
             keyring: snap.trusted.clone(),
+            decisions: self.decisions(),
         }
+    }
+
+    /// This node's decision record, newest first: read from its files at most once a
+    /// [`SNAPSHOT_EVERY`], like the snapshot, since a frame is drawn far more often than a node
+    /// decides (ADR-028 D-3).
+    fn decisions(&mut self) -> Vec<vox_core::node::decisions::Event> {
+        if self
+            .decisions
+            .0
+            .is_none_or(|at| at.elapsed() >= SNAPSHOT_EVERY)
+        {
+            let log =
+                vox_core::node::decisions::DecisionLog::new(&self.account.node_dir(&self.node));
+            self.decisions = (Some(Instant::now()), log.recent(DECISIONS_SHOWN, None));
+        }
+        self.decisions.1.clone()
     }
 
     /// Act as `name` from now on: let go of the node acted as (which detaches it if this TUI was
