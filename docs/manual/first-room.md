@@ -158,10 +158,20 @@ nodes.
 
 On the room list: `:new` creates a room and `:join` takes a room link, both through a masked
 passphrase prompt; Enter or `:open` opens the selected room; `t` or `:tunnels` lists live
-tunnels. In a room: `:link` prints its link, `:close` closes it on this node, `:leave` leaves
-it, `:end` ends it for everyone (creator or admin only), and `:back` or Esc returns to the list.
-`:quit` exits. The members pane states trust by glyph and in words, such as `⇄ alice` and `in keyring · reads you`. Use the
-same fingerprints and room IDs whichever client you choose.
+tunnels; `k` or `:keyring` shows your keyring; Ctrl-N opens the next room with a message to you.
+In a room, Tab moves between the timeline, the composer and the members pane:
+
+- In the composer, Enter sends. `@alice` in the text addresses alice: the message carries her
+  whole fingerprint, as `vox room post --to` does.
+- In the timeline, Up and Down select a message, Ctrl-R replies to it, quoting it, and Enter on a
+  reply's quote jumps to the message it answers.
+- `:link` prints the room link, `:rename NAME` renames the room for every member (creator or
+  admin only), `:close` closes it on this node, `:leave` leaves it and `:end` ends it for everyone
+  (creator or admin only); each of the last two asks you to type its word first. `:back` or Esc
+  returns to the list.
+
+`:quit` exits. The members pane states trust by glyph and in words, such as `⇄ alice` and `in
+keyring · reads you`. Use the same fingerprints and room IDs whichever client you choose.
 
 Next: [Rooms and messages](rooms.md), or [Identity and keyring](keyring.md).
 
