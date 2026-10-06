@@ -490,7 +490,13 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(inspector_cols(area.width)),
+            // The lanes are the members (ADR-028 W-3): they take the inspector's width too, so each
+            // lane's name and state fit on its border.
+            Constraint::Length(if ui.lanes {
+                0
+            } else {
+                inspector_cols(area.width)
+            }),
         ])
         .split(area);
 
@@ -564,6 +570,9 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         &about.join(" · "),
         focused(ui, Focus::Composer),
     );
+    if ui.lanes {
+        return;
+    }
     // Members above, and under them what is shared in the room (V030-25), when anything is.
     let shared_focus = focused(ui, Focus::Shared);
     // The pane's inner width: the command under the selected service is printed in full there,
