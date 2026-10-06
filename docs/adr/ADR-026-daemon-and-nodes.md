@@ -115,8 +115,9 @@ network presence from the start: there is no interim design with one socket per 
   (which MUST NOT trigger an implicit re-attach), stop its tasks, close its connections (D-5),
   unregister its signer from the identity exchange (ADR-011) before its keys are wiped, wipe its keys,
   close its store and release its directory lock.
-- **L-4. Keep.** `--keep` MUST record the node in `.daemon/attach` with its passphrase source: none,
-  or a file path. On daemon start each kept node MUST re-attach, and its rooms and services MUST come
+- **L-4. Keep.** `--keep` MUST record the node in `.daemon/attach` with its passphrase source: none
+  (an anchor's headless key, N-1), or a file path. A file source serves attach only, never a keyring
+  change (ADR-028 K-13; the decider, 2026-10-06). On daemon start each kept node MUST re-attach, and its rooms and services MUST come
   back. *Deferred (additive):* an environment-variable passphrase source in the attach file.
 - **L-5. Silent harness death.** *Deferred (additive):* a sweep that unregisters the sessions of a
   harness that died without ending them. Until it exists, such a session MUST keep holding its node.

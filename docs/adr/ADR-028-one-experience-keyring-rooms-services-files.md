@@ -87,7 +87,8 @@ by any of them (ADR-001: there is no typed agent or human).
 - **K-11. Every node has a passphrase.** Creating a node (`vox node create`, the TUI's or the app's
   onboarding, an agent skill pack's setup) MUST require a non-empty identity passphrase. The
   passphrase MUST be asked for in exactly two cases: attaching the node, and changing its keyring
-  (trust add, remove, rename, a capability change).
+  (trust add, remove, rename, a capability change). A retention change MUST NOT ask for it
+  (ADR-010 AR-28 as amended).
 - **K-12. Attaching does not open the keyring window.** A passphrase given to attach a node MUST
   NOT open the keyring window (ADR-026 N-2). Only a passphrase entered for a keyring change MUST
   open it, for 30 minutes. K-9 shows the window.
@@ -445,6 +446,8 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-026 N-6 | Agent node created "with no passphrase or one from an environment variable" | With a passphrase the operator types (K-11); a hook never supplies one (K-13) |
 | ADR-026 L-2 | A hook may attach a node implicitly | A hook never attaches; it shows the attach command (K-13) |
 | ADR-026 C-6 | Passphrases may come from an environment variable resolved in the client | Never for a keyring change (K-13) |
+| ADR-010 AR-28 | A retention request over the socket is gated on the identity passphrase | Not gated: retention is not one of the passphrase's two cases (K-11) |
+| ADR-026 L-4 | Passphrase source: none, or a file path | None only for an anchor's headless key; a file serves attach only (K-13) |
 | ADR-026 S-2, Context | A hook may attach; a session brings its node in | A hook may start the daemon but never attaches (K-13) |
 | ADR-015 16.2 | Passphrase from a file, `VOX_IDENTITY_PASSPHRASE`, then a prompt | File and variable for attach only; a keyring change is prompted (K-13) |
 | ADR-016 NR-13 note | "after the keyring window only keyring changes ask again" | The window opens only for a keyring change (K-12) |

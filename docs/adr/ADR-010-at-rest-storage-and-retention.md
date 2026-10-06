@@ -91,7 +91,7 @@ R-numbers are PRD-001's.
 - **AR-28 (R7).** A room's retention MUST be its ADR-007 policy-update `ttl`, set with `vox room retention <room> 1h|1w|1m|<secs>|forever`.
   - Only the room's creator, or an admin the creator delegated with `vox room admin`, MAY set it (ADR-007). *Built:* the check is the `policy` capability, which the creator holds and a delegated admin's certificate carries (ADR-007 G-5).
   - A member MAY set a lower retention for its own node only (AR-29); it MUST NOT raise a room's retention for its node.
-  - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history. Under ADR-026 that is the passphrase of the node the request resolves to.
+  - Over the control socket the request MUST be gated on the identity passphrase, because shortening it deletes history. Under ADR-026 that is the passphrase of the node the request resolves to. *Amended by ADR-028 K-11 (the decider, 2026-10-06):* a retention change MUST NOT ask for the passphrase; it is not one of the passphrase's two cases. Only the creator or a delegated admin may set it, as above.
   - **Planned:** a genesis carries `ttl` 0 (forever) at creation; a room's retention is set only after it is created.
 - **AR-29 (R8).** A node MUST also honour its own retention: the `retention` file in its config directory, with `default <dur>` and `<room-prefix> <dur>` lines. It MUST re-read the file every `RETENTION_REREAD_SECS`. If the file is unreadable, it MUST keep the last policy it read.
 - **AR-30 (R9).** The effective retention of a room on a node MUST be the shorter of the room's and the node's, where `0` means forever.
