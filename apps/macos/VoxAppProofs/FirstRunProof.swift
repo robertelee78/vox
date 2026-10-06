@@ -192,8 +192,8 @@ final class FirstRunProof: XCTestCase {
         }
         XCTAssertTrue(link.hasPrefix("vox://"),
                       "PRODUCT: ⌘L in the room must copy its vox:// link; the pasteboard has \(link.debugDescription)")
-        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", roomPass, link,
-                         "--name", "mission"], env: voxEnv)
+        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", roomPass, link],
+                   env: voxEnv)
         try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
                          "--identity-passphrase-file", alicePass], env: voxEnv)
         try staged(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
@@ -508,7 +508,7 @@ final class FirstRunProof: XCTestCase {
             $0.hasPrefix("vox://")
         }
         let refusedJoin = run(vox, ["room", "join", "--node", "carol", "--passphrase-file", wrongPass,
-                                    missionLink, "--name", "mission"], env: voxEnv)
+                                    missionLink], env: voxEnv)
         guard refusedJoin.status != 0 else {
             throw Apparatus("carol's join with a wrong passphrase was not refused: \(refusedJoin.out)")
         }
