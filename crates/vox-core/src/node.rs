@@ -67,6 +67,7 @@ pub mod pulls;
 pub mod resolver;
 pub mod retention;
 pub mod seatstream;
+pub mod service_reach;
 pub mod shares;
 pub mod snapshot;
 pub mod status;

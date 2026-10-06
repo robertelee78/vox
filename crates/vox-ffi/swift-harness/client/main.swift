@@ -13,6 +13,8 @@
 //   GOT <text>              a message arrived through the event listener
 //   (waits for a line on stdin: the peer now shares a service in the room)
 //   SHARED <address> <by> <kind>
+//   COMMANDS <what>=<command> | …   the share's ready-to-copy commands (ADR-028 S-3)
+//   NEEDS <need>=<yes|no> | …        what reaching it needs, and whether each holds
 //                           one per service the peer shares, as `services` lists it, once the
 //                           room's log has brought the peer's share (up to 120 s)
 //   (waits for a line on stdin: the proof has compared the list with `vox service list`)
@@ -103,6 +105,8 @@ do {
     }
     for s in shared {
         say("SHARED \(s.address) \(s.by) \(s.kind)")
+        say("COMMANDS " + s.commands.map { "\($0.what)=\($0.command)" }.joined(separator: " | "))
+        say("NEEDS " + s.needs.map { "\($0.need)=\($0.holds ? "yes" : "no")" }.joined(separator: " | "))
     }
     guard let first = shared.first else {
         say("ERROR the peer's share was never listed")

@@ -16,7 +16,9 @@
 //!    answered once the node has it.
 //! 2. A message the peer posts reaches the Swift program **through its listener**.
 //! 3. A service the peer shares (`vox service add`) is listed by `services` at the address the
-//!    app's own `vox service list` prints; `forward` to that address carries bytes to the peer's
+//!    app's own `vox service list` prints, with the commands (each with the canonical address)
+//!    and needs `vox service list --json` gives (ADR-028 S-3, #444); `forward` to that address
+//!    carries bytes to the peer's
 //!    service and back; `stopForward` ends it; `status` is the report `vox status --json` gives
 //!    for the same node (ADR-014 #436).
 //! 4. A file the app shares to the peer (`share`, with a note) is served: the peer's node pulls
@@ -38,6 +40,7 @@
 //!    the peer reaches it by its own `vox service list` and `vox forward`.
 //!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
+//! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
@@ -525,6 +528,8 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     peer.run(&["service", "add", &room, "echo", &echo_at], "");
     writeln!(to_app).unwrap();
     let shared = expect(&from_app, &seen, "SHARED ");
+    let commands = expect(&from_app, &seen, "COMMANDS ")[9..].to_owned();
+    let needs = expect(&from_app, &seen, "NEEDS ")[6..].to_owned();
     let address = shared
         .split_whitespace()
         .nth(1)
@@ -547,6 +552,53 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         address, cli_address,
         "PRODUCT: `services` must list the peer's share at the address `vox service list` \
          prints; it said {shared:?}"
+    );
+    // Its commands and needs, word for word as `vox service list --json` gives them (ADR-028
+    // S-3): every command carrying the canonical address.
+    let cli_json: serde_json::Value =
+        serde_json::from_str(&mine.run(&["service", "list", "--json", &joined[7..]], ""))
+            .unwrap_or_default();
+    let cli_share = cli_json["shared"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["by"] != "you"))
+        .cloned()
+        .unwrap_or_default();
+    let cli_commands = cli_share["commands"]
+        .as_array()
+        .map(|cs| {
+            cs.iter()
+                .map(|c| format!("{}={}", c["what"].as_str().unwrap_or(""), c["command"].as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+    let cli_needs = cli_share["needs"]
+        .as_array()
+        .map(|ns| {
+            ns.iter()
+                .map(|n| {
+                    let holds = if n["holds"].as_bool() == Some(true) { "yes" } else { "no" };
+                    format!("{}={holds}", n["need"].as_str().unwrap_or(""))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+    let canonical = cli_share["address"].as_str().unwrap_or_default().to_owned();
+    eprintln!("the app's commands: {commands}\nits needs: {needs}");
+    assert!(
+        !cli_commands.is_empty() && !canonical.is_empty(),
+        "APPARATUS: `vox service list --json` gave no share of the peer's to compare with: \
+         {cli_json}"
+    );
+    assert!(
+        commands == cli_commands && commands.contains(&canonical),
+        "PRODUCT: the app's commands for the share must be `vox service list --json`'s, each with \
+         the canonical address {canonical}: the app said {commands:?}, the CLI {cli_commands:?}"
+    );
+    assert_eq!(
+        needs, cli_needs,
+        "PRODUCT: the app's needs for the share must be `vox service list --json`'s"
     );
     writeln!(to_app).unwrap();
     let bound = expect(&from_app, &seen, "BOUND ")[6..].to_owned();

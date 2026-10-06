@@ -309,6 +309,30 @@ pub struct SharedService {
     pub udp: bool,
     /// What its sharer's node detected it to be (ADR-028 S-2).
     pub kind: String,
+    /// The ready-to-copy commands for its kind, each with the canonical address (ADR-028 S-3).
+    pub commands: Vec<ServiceCommand>,
+    /// What reaching it from here needs, and whether each holds (S-3).
+    pub needs: Vec<ServiceNeed>,
+}
+
+/// One ready-to-copy command for a shared service (ADR-028 S-3), as `vox service list` gives it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServiceCommand {
+    /// What it is: `ssh`, `forward`, `then` (what to run after the forward), `open`.
+    pub what: String,
+    /// The command, carrying the canonical address: it works pasted on any member's machine.
+    pub command: String,
+}
+
+/// One thing reaching a shared service needs (ADR-028 S-3), as `vox service list` says it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServiceNeed {
+    /// The condition, in words.
+    pub need: String,
+    /// Whether it holds now.
+    pub holds: bool,
+    /// What to do when it does not; empty when it holds.
+    pub otherwise: String,
 }
 
 /// A service this node offers in a room.
@@ -1383,6 +1407,25 @@ impl VoxClient {
     /// A malformed id, or the node's refusal.
     pub async fn services(&self, room: String) -> Result<RoomServices, VoxError> {
         let channel_id = digest(&room, "room id")?;
+        // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL, asked as
+        // `vox service list` asks it.
+        let held = Arc::clone(&self.held);
+        let proxy = self
+            .on_rt(async move {
+                let at = held
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|h| h.at.clone())
+                    .ok_or_else(not_attached)?;
+                Ok(vox_core::node::nameipc::proxy(&at)
+                    .await
+                    .map_err(|e| match e {
+                        Error::AppRefused(reason) => reason,
+                        other => other.to_string(),
+                    }))
+            })
+            .await?;
         on_held!(
             self,
             |c| match ask(c, &Request::Services { channel_id }).await? {
@@ -1394,12 +1437,30 @@ impl VoxClient {
                     room: shown_name(&room),
                     shared: shared
                         .into_iter()
-                        .map(|s| SharedService {
-                            address: shown_name(&s.address),
-                            canonical: s.canonical,
-                            by: shown_name(&s.by),
-                            udp: s.udp,
-                            kind: shown_name(&s.kind),
+                        .map(|s| {
+                            use vox_core::node::service_reach::{commands, needs};
+                            SharedService {
+                                commands: commands(&s)
+                                    .into_iter()
+                                    .map(|(what, command)| ServiceCommand {
+                                        what: what.to_owned(),
+                                        command,
+                                    })
+                                    .collect(),
+                                needs: needs(&s, Some(&proxy))
+                                    .into_iter()
+                                    .map(|(need, holds, otherwise)| ServiceNeed {
+                                        need: shown_name(&need),
+                                        holds,
+                                        otherwise: shown_name(&otherwise),
+                                    })
+                                    .collect(),
+                                address: shown_name(&s.address),
+                                canonical: s.canonical,
+                                by: shown_name(&s.by),
+                                udp: s.udp,
+                                kind: shown_name(&s.kind),
+                            }
                         })
                         .collect(),
                     offered: services
