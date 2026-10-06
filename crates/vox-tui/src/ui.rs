@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
+use vox_core::hash::Digest32;
 
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
 use crate::theme;
@@ -28,6 +29,8 @@ pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 /// who was offline, or a sync that caught up (ADR-023 decision 1). It sits in its true place in
 /// history; without the marker it would go unseen above what the reader already read.
 pub const LATE_MARKER: &str = "[late] ";
+/// What begins the line under a message this node sent that names who has read it (ADR-028 R-6).
+pub const READ_BY: &str = "read by ";
 
 /// Where a member stands with you, in words: whether you trust it, and whether it reads you here.
 /// Nothing for yourself.
@@ -62,6 +65,8 @@ fn sync_label(s: SyncStatus) -> String {
 /// Render the whole UI for the current state. The timeline's scroll is clamped to what it drew,
 /// so scrolling up past the oldest line leaves nothing to scroll back through.
 pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
+    // Only a room drawn in this frame has messages on screen.
+    ui.on_screen.clear();
     let area = frame.area();
     // The whole screen is drawn on the theme's base, not the terminal's own background (ADR-028
     // L-2); with no colour (NO_COLOR, a dumb terminal) this draws nothing.
@@ -233,7 +238,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(cols[0]);
 
-    ui.timeline_scroll = render_timeline(
+    (ui.timeline_scroll, ui.on_screen) = render_timeline(
         frame,
         body[0],
         &channel.held_back,
@@ -285,7 +290,7 @@ fn render_timeline(
     timeline: &[MessageView],
     scroll: usize,
     focus: bool,
-) -> usize {
+) -> (usize, Vec<Digest32>) {
     // Who this room holds back for equivocating comes first, one line each (V210-66).
     let notices = held_back.iter().map(|n| {
         Line::from(Span::styled(
@@ -298,7 +303,7 @@ fn render_timeline(
     let lines = timeline
         .iter()
         .rev()
-        .map(|m| {
+        .flat_map(|m| {
             // Characters a reader cannot see are shown as escapes (#331).
             let body = m.body.as_deref().map_or_else(
                 || UNDECRYPTABLE_MARKER.to_owned(),
@@ -321,9 +326,25 @@ fn render_timeline(
                 Style::default().add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(body));
-            Line::from(spans)
+            // Under a message it sent, who has read it, or where it is while nobody is known to
+            // have (ADR-028 R-6). Lines run newest first here, so it goes before the message's own.
+            let under = if m.read_by.is_empty() {
+                m.whereabouts.clone()
+            } else {
+                format!("{READ_BY}{}", m.read_by)
+            };
+            let read_by = (!under.is_empty()).then(|| {
+                Line::from(Span::styled(
+                    format!("  {under}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ))
+            });
+            read_by
+                .into_iter()
+                .chain(std::iter::once(Line::from(spans)))
+                .map(move |l| (Some(m.entry_hash), l))
         })
-        .chain(notices.rev());
+        .chain(notices.rev().map(|l| (None, l)));
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
     // are wrapped here, not by the widget, so the count the window is taken from is the count
@@ -332,18 +353,27 @@ fn render_timeline(
     let height = usize::from(area.height.saturating_sub(2));
     let want = height.saturating_add(scroll);
     let mut rows: Vec<Line> = Vec::new();
-    for l in lines {
-        rows.extend(wrap(l, width).into_iter().rev());
+    // Which message each row belongs to, so the frame can say which messages it showed.
+    let mut owners: Vec<Option<Digest32>> = Vec::new();
+    for (owner, l) in lines {
+        for row in wrap(l, width).into_iter().rev() {
+            rows.push(row);
+            owners.push(owner);
+        }
         if rows.len() >= want {
             break;
         }
     }
     rows.reverse();
+    owners.reverse();
     // Only a window that reached the oldest line can be short of `want`, so this is the most
     // there is to scroll; the scroll drawn is returned, and PageDown moves from it at once.
     let scroll = scroll.min(rows.len().saturating_sub(height));
     let bottom = rows.len() - scroll;
-    let shown: Vec<Line> = rows[bottom.saturating_sub(height)..bottom].to_vec();
+    let window = bottom.saturating_sub(height)..bottom;
+    let shown: Vec<Line> = rows[window.clone()].to_vec();
+    let mut on_screen: Vec<Digest32> = owners[window].iter().flatten().copied().collect();
+    on_screen.dedup();
     let title = if scroll > 0 {
         "Timeline (scrolled — End: newest)"
     } else {
@@ -351,7 +381,7 @@ fn render_timeline(
     };
     let p = Paragraph::new(shown).block(pane_block(title, focus));
     frame.render_widget(p, area);
-    scroll
+    (scroll, on_screen)
 }
 
 /// `line` broken into rows of at most `width` display columns, its styles kept.

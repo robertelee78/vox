@@ -45,6 +45,12 @@ pub struct OpenRoomSnap {
     pub shares: Vec<crate::node::channel::Share>,
     /// The members held back for equivocating: `(author, seq)`.
     pub equivocations: Vec<(Digest32, u64)>,
+    /// Who has read this node's own recent messages here: `(entry, readers)`, oldest first
+    /// (ADR-028 R-6; [`crate::node::api::ChannelDetail::read_by`]).
+    pub read_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// Where this node's own recent messages are: `(entry, how many of the other members' nodes
+    /// hold it)` ([`crate::node::api::ChannelDetail::held`]).
+    pub held: Vec<(Digest32, u64)>,
 }
 
 /// One node as a client draws it.
@@ -100,6 +106,8 @@ impl NodeSnapshot {
                     consented: d.consented.clone(),
                     shares: d.shares.clone(),
                     equivocations: d.equivocations.clone(),
+                    read_by: d.read_by.clone(),
+                    held: d.held.clone(),
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
@@ -131,7 +139,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(6).bytes(&o.channel_id).text(&o.local_name);
+            e.array(8).bytes(&o.channel_id).text(&o.local_name);
             digests(&mut e, &o.members);
             digests(&mut e, &o.consented);
             e.array(o.shares.len());
@@ -145,6 +153,15 @@ impl NodeSnapshot {
             e.array(o.equivocations.len());
             for (author, seq) in &o.equivocations {
                 e.array(2).bytes(author).uint(*seq);
+            }
+            e.array(o.read_by.len());
+            for (entry, readers) in &o.read_by {
+                e.array(2).bytes(entry);
+                digests(&mut e, readers);
+            }
+            e.array(o.held.len());
+            for (entry, n) in &o.held {
+                e.array(2).bytes(entry).uint(*n);
             }
         }
         e.array(self.trusted.len());
@@ -216,7 +233,7 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 6, "ipc snapshot open room")?;
+            want(&mut d, 8, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
             let local_name = d.text().map_err(bad("ipc snapshot open name"))?.to_owned();
             let members = read_digests(&mut d)?;
@@ -245,6 +262,18 @@ impl NodeSnapshot {
                 let seq = d.uint().map_err(bad("ipc snapshot equivocation seq"))?;
                 equivocations.push((author, seq));
             }
+            let mut read_by = Vec::new();
+            for _ in 0..d.array().map_err(bad("ipc snapshot read by"))? {
+                want(&mut d, 2, "ipc snapshot read by entry")?;
+                let entry = digest(&mut d)?;
+                read_by.push((entry, read_digests(&mut d)?));
+            }
+            let mut held = Vec::new();
+            for _ in 0..d.array().map_err(bad("ipc snapshot held"))? {
+                want(&mut d, 2, "ipc snapshot held entry")?;
+                let entry = digest(&mut d)?;
+                held.push((entry, d.uint().map_err(bad("ipc snapshot held count"))?));
+            }
             open.push(OpenRoomSnap {
                 channel_id,
                 local_name,
@@ -252,6 +281,8 @@ impl NodeSnapshot {
                 consented,
                 shares,
                 equivocations,
+                read_by,
+                held,
             });
         }
         let mut trusted = Vec::new();
@@ -414,6 +445,8 @@ mod tests {
                     kind: crate::governance::share::ServiceKind::Dns,
                 }],
                 equivocations: vec![([4; 32], 7)],
+                read_by: vec![([5; 32], vec![[4; 32]])],
+                held: vec![([5; 32], 1)],
             }],
             trusted: vec![([4; 32], "bob".into())],
             connected_peers: vec![[4; 32]],

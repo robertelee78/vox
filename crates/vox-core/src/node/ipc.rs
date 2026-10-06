@@ -308,6 +308,8 @@ const T_PING: u64 = 17;
 const T_STRUCTURED: u64 = 120;
 const T_FIND: u64 = 121;
 const T_COUNT_REQ: u64 = 122;
+// ADR-028 RR-1: entries shown or drained, for a read record. Numbered by its story (#503).
+const T_MARK_READ: u64 = 503;
 // V210-164: leaving a room over the socket, as joining and creating one are. Numbered by its item,
 // far from the others, like V210-120's.
 const T_LEAVE: u64 = 164;
@@ -355,6 +357,15 @@ pub enum Request {
     /// client; nothing before it does. **Terminal** — the connection becomes a
     /// stream and serves no further requests.
     Subscribe,
+    /// Entries of a room shown to this node's person or drained into its agent's turn (ADR-028
+    /// RR-1): the node posts a read record for them, batched (RR-2). At most
+    /// [`crate::node::content::MAX_READ_HASHES`]; a client with more sends more requests.
+    MarkRead {
+        /// The room.
+        channel_id: Digest32,
+        /// The entries shown.
+        entries: Vec<Digest32>,
+    },
     /// Append a message to a room.
     Post {
         /// The room.
@@ -697,6 +708,18 @@ impl Request {
             }
             Request::Post { channel_id, text } => {
                 e.array(3).uint(T_POST).bytes(channel_id).text(text);
+            }
+            Request::MarkRead {
+                channel_id,
+                entries,
+            } => {
+                e.array(3)
+                    .uint(T_MARK_READ)
+                    .bytes(channel_id)
+                    .array(entries.len());
+                for h in entries {
+                    e.bytes(h);
+                }
             }
             Request::Agree {
                 channel_id,
@@ -1071,6 +1094,23 @@ impl Request {
                     channel_id,
                     entry,
                     types,
+                })
+            }
+            (T_MARK_READ, 3) => {
+                let channel_id = digest(&mut d)?;
+                let n = d.array().map_err(|_| Error::MalformedIpc("ipc entries"))?;
+                if n > crate::node::content::MAX_READ_HASHES {
+                    return Err(Error::MalformedIpc("ipc too many entries"));
+                }
+                let mut entries = Vec::with_capacity(n);
+                for _ in 0..n {
+                    entries.push(digest(&mut d)?);
+                }
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::MarkRead {
+                    channel_id,
+                    entries,
                 })
             }
             (T_FIND, 3) => {
@@ -3467,6 +3507,21 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             entries: page(handle.view().trusted, after, |(id, petname)| {
                 (*id, petname.len())
             }),
+        },
+        Request::MarkRead {
+            channel_id,
+            entries,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::MarkRead {
+                channel_id,
+                entries,
+            })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
         },
         Request::Post { channel_id, text } => {
             // A room just joined is written to once its first sync with another member has ended

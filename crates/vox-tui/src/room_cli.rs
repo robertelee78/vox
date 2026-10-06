@@ -855,6 +855,16 @@ fn row_json(
     ops: &vox_agentcomms::ops::OpIndex,
     status_override: Option<&str>,
 ) -> String {
+    row_value(room_key, r, ops, status_override).to_string()
+}
+
+/// [`row_json`]'s object.
+fn row_value(
+    room_key: &str,
+    r: &vox_core::node::api::MessageRow,
+    ops: &vox_agentcomms::ops::OpIndex,
+    status_override: Option<&str>,
+) -> serde_json::Value {
     let parsed = Envelope::parse(&r.text);
     let (envelope, parse_error) = match &parsed {
         Ok(e) => (
@@ -897,7 +907,27 @@ fn row_json(
         "parse_error": parse_error,
         "op": op,
     })
-    .to_string()
+}
+
+/// Who has read this node's own recent messages in `room`, by entry, as the node's snapshot says
+/// (ADR-028 R-6): from the read records it can open, so a member whose records it cannot open is
+/// in none. Empty when the node does not say.
+async fn read_by_in(
+    client: &mut IpcClient,
+    room: &Digest32,
+) -> std::collections::BTreeMap<Digest32, Vec<Digest32>> {
+    let body = vox_core::node::snapshot::request_body();
+    let Ok(reply) = client.exchange(&body).await else {
+        return std::collections::BTreeMap::new();
+    };
+    let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
+        return std::collections::BTreeMap::new();
+    };
+    snap.open
+        .into_iter()
+        .find(|o| o.channel_id == *room)
+        .map(|o| o.read_by.into_iter().collect())
+        .unwrap_or_default()
 }
 
 /// Where in the timeline `cursor` sits, or a refusal: an unknown cursor is never
@@ -1127,9 +1157,17 @@ pub async fn read(
     ids.dedup();
     let group = coord::structured(&mut client, channel_id, &[], &ids).await?;
     let ops = coord::index_of(&coord::posted_of(&group));
+    let read_by = read_by_in(&mut client, &channel_id).await;
     let mut out = std::io::stdout().lock();
     for r in &shown {
-        let _ = writeln!(out, "{}", row_json(&room_key, r, &ops, None));
+        let mut row = row_value(&room_key, r, &ops, None);
+        // Under a message this node sent, who has read it, by this node's names (ADR-028 R-6).
+        if let Some(who) = read_by.get(&r.entry_hash) {
+            let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
+            names.sort();
+            row["read_by"] = names.into();
+        }
+        let _ = writeln!(out, "{row}");
     }
     Ok(())
 }

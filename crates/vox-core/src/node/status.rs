@@ -130,6 +130,10 @@ pub struct RoomStatus {
     /// Entries this node refused here as at or below their author's checkpoint since it opened
     /// the room (ADR-023 decision 3).
     pub refused_below_checkpoint: u64,
+    /// Every entry this node holds here, as the room was last published: messages, and what no
+    /// person is shown, such as read records (ADR-028 §6). What the room costs this node in
+    /// storage and every sync in traffic, which a count of messages does not say.
+    pub entries: u64,
     /// Its members.
     pub members: Vec<MemberStatus>,
 }
@@ -428,7 +432,7 @@ impl StatusReport {
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
@@ -438,6 +442,7 @@ impl StatusReport {
                 r.received_key_generations,
                 frozen,
                 r.refused_below_checkpoint,
+                r.entries,
                 list(members)
             )
         });

@@ -209,7 +209,11 @@ keep code in sync through GitHub.
 - **RR-2.** A read record MUST be a content entry in the reader's own feed, sealed under the
   reader's sender key like any message, listing the entry hashes read since its last record.
   Records MUST be batched (at most one per room per 5 seconds). They expire with the room's
-  retention.
+  retention. A read record counts as room activity for the idle end (ADR-023 RL-8.2), as any
+  entry does: it is sealed, so a member that cannot open it cannot tell it from a message, and
+  every member's node MUST reckon the end from the same entries or they would disagree on whether
+  the room is over. A record MUST NOT name a read record, or two nodes would answer each other's
+  records for as long as both are open.
 - **RR-3.** A client MUST compute `read by …` (R-6) from the read records it can open. A member
   whose read records this node cannot open (it does not trust this node) MUST NOT be shown as
   having read or not read.

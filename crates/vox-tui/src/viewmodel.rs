@@ -51,6 +51,8 @@ pub struct MemberView {
 /// the entry is render-gated *to you*; otherwise an honest non-leaking marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageView {
+    /// The message's entry hash.
+    pub entry_hash: Digest32,
     /// The author's composite-identity fingerprint (public).
     pub author: Digest32,
     /// The author's local nickname.
@@ -65,6 +67,14 @@ pub struct MessageView {
     /// It arrived after rows below it had already been shown: a member who was offline,
     /// or a sync that caught up (ADR-023 decision 1). Shown in its true place, marked.
     pub late: bool,
+    /// Under a message this node sent, who has read it, by this node's names for them, as the
+    /// read records it can open say (ADR-028 R-6, RR-3): `ann, bea`; empty when it knows of no
+    /// reader. A member that does not trust this node is never here, read or not.
+    pub read_by: String,
+    /// Under a message this node sent that no member is known to have read, where it is (ADR-028
+    /// R-6): "only on this machine", or "on N of M members' nodes" from what their nodes said they
+    /// hold. Empty when the node does not say.
+    pub whereabouts: String,
 }
 
 impl MessageView {

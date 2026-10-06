@@ -484,6 +484,15 @@ pub struct ChannelDetail {
     /// Entries this node refused here as at or below their author's checkpoint since it opened
     /// the room (ADR-023 decision 3).
     pub refused_below_checkpoint: u64,
+    /// Who has read this node's own recent messages, as the read records it can open say
+    /// (ADR-028 RR-3, R-6): `(entry, readers)` for each of its newest
+    /// [`crate::node::channel::READ_BY_SHOWN`] messages that any member is known to have read,
+    /// oldest first. A member whose records this node cannot open is in none of them.
+    pub read_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// Where this node's own recent messages are (ADR-028 R-6): `(entry, how many of the room's
+    /// other members' nodes said they hold it)`, oldest first, for the same messages as
+    /// [`Self::read_by`] looks at.
+    pub held: Vec<(Digest32, u64)>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -673,6 +682,15 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The text.
         text: String,
+    },
+    /// Note that these entries of an open channel were shown to this node's person, or drained
+    /// into its agent's turn (ADR-028 RR-1). The node posts a read record naming them, at most
+    /// one per room per 5 seconds (RR-2).
+    MarkRead {
+        /// The channelID.
+        channel_id: Digest32,
+        /// The entries shown.
+        entries: Vec<Digest32>,
     },
     /// Produce a `vox://` invite link for a channel this node holds open, naming this
     /// node, and any anchors the room uses, as where to reach the room, with this node as
@@ -1014,6 +1032,9 @@ pub enum Fault {
     /// The room is over: its creator ended it, or its idle end ran out (V030-08). It takes no
     /// new message.
     RoomEnded,
+    /// This identity has left the room (V210-164): nothing more of its is written there, not even
+    /// a read record, which would undo the leave.
+    RoomLeft,
     /// Only the room's creator may do that — end the room (or an admin it delegated), or choose
     /// its idle end (V030-08).
     NotCreator,
@@ -1183,6 +1204,9 @@ impl Fault {
             Fault::RoomEnded => {
                 "this room has ended — its creator or an admin ended it, or nothing was said in it for the idle end its creator chose — so it takes no new message\n       this node deletes it once it has passed the end on"
             }
+            Fault::RoomLeft => {
+                "you left this room, so nothing more of yours is written to it"
+            }
             Fault::NotCreator => {
                 "only the room's creator, or an admin it delegated, may do that — and this identity is neither"
             }
@@ -1323,6 +1347,7 @@ fault_names!(
     NotAdmin,
     AboveRoomRetention,
     RoomEnded,
+    RoomLeft,
     NotCreator,
     NotAnAdmin,
     NotRoomCreator,

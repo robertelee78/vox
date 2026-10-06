@@ -15,12 +15,25 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             three people are read from the bytes the TUI wrote, not from pyte's cells, and how a
             real terminal draws the glyph is not seen here;
   follows   a message Alice posts while it is open (m-071) is shown when it arrives;
+  shown     what Bob's TUI has drawn is read, and only that (ADR-028 RR-1, #504): Alice's
+            `vox room read --json` says m-071, on Bob's screen, is "read by" bob, and m-001, which
+            his TUI has not drawn yet, is read by nobody;
   scrolls   PageUp brings m-001 into view, and End returns to m-071;
   clamp     PageUp well past the oldest line, then one PageDown, moves the view one page (10
             lines): m-011 is the first line shown, not m-001 still;
   consent   Carol, whom Bob never trusted, reads "not trusted · you don't read each other"; Alice,
             whom he did, "trusted · reads you" (V210-155: once "? unverified" on every row and
             "← in-only" for Carol, though nothing comes in from her);
+  readby    under a message Bob posts, his TUI says nothing of readers until Alice's agent drains it
+            into its turn, and then says exactly "read by alice": from the read record Alice's node
+            posted, which Bob can open because she trusts him. Carol, who cannot read Bob, is
+            named neither as having read it nor as not (ADR-028 R-6, RR-3, #505);
+  nostorm   read records never answer read records (the decider; ADR-028 RR-2): Alice's daemon is
+            stopped and her real `vox tui` opened on the room beside Bob's; each posts, and once
+            each TUI says the other has read its post, with both TUIs on the room and both agents
+            draining, the entries `vox status --json` says each node holds stay the same for 15 s;
+            Alice's TUI and the daemon it started are then stopped and her `vox daemon` started
+            again;
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
@@ -35,6 +48,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             room while it stays off screen;
   unreach   once Alice's and Carol's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
+  where     with Alice's and Carol's daemons stopped, under a message Bob then posts his TUI says
+            "only on this machine"; once Alice's daemon is started again and has synced, "on 1 of
+            2 members' nodes" (ADR-028 R-6, #482); Alice's daemon is then stopped again;
   idle      once the anchor is stopped too, it says "idle", with no count.
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
@@ -117,6 +133,7 @@ class Product(Exception):
     pass
 
 tui = None
+TUIS = []  # every other `vox tui`, stopped at the end like the first
 code = 2
 results = {}
 def claim(name, ok, detail):
@@ -262,6 +279,19 @@ try:
     follows = tui.until(lambda: has(timeline(), f"m-{POSTS + 1:03d}"), 60, 1)
     claim("follows", follows, f"m-{POSTS + 1:03d} shown within 60 s: {follows}")
 
+    stage("shown")
+    import json
+    def alice_read_by():
+        r = run("alice", "room", "read", room, "--json")
+        if r.returncode != 0: product(f"alice's `vox room read --json` failed: {r.stderr.strip()}")
+        rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
+        return {row["text"]: row.get("read_by", []) for row in rows}
+    newest_read = until(lambda: alice_read_by().get(f"m-{POSTS + 1:03d}") == ["bob"], 30, 1)
+    seen = alice_read_by()
+    claim("shown", newest_read and seen.get("m-001") == [],
+          f"read by, on alice's node: m-{POSTS + 1:03d} {seen.get(f'm-{POSTS + 1:03d}')!r}; "
+          f"m-001 {seen.get('m-001')!r}")
+
     stage("scrolls")
     for _ in range((POSTS + 10) // 10):
         tui.key("\x1b[5~", 0.3)  # PageUp
@@ -315,6 +345,121 @@ try:
     carol_label = label_of("carol")[0]
     claim("consent", bare(carol_label) == CAROL,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}")
+
+    stage("readby")
+    p = run("bob", "room", "post", room, "r-001 read me")
+    if p.returncode != 0: product(f"bob's `vox room post` while his TUI is open failed: {p.stderr.strip()}")
+    if not tui.until(lambda: has(timeline(), "r-001"), 30, 1):
+        product("bob's `vox tui` never showed his own post r-001 within 30 s")
+    def under(key):
+        """The timeline row under the one holding `key`, bare of the pane's border."""
+        rows = [r[:112] for r in tui.display()]
+        for i, r in enumerate(rows):
+            if key in r:
+                return bare(rows[i + 1]) if i + 1 < len(rows) else ""
+        return None
+    # Nobody has read it yet: nothing is said of readers.
+    tui.pump(3)
+    before = under("r-001")
+    # Alice's agent drains it into its turn; the drain is bounded per turn, so turns are taken
+    # until r-001 is in one. Carol's agent drains too, though Bob's posts are not hers to read.
+    told = False
+    for _ in range(20):
+        h = run("alice", "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+                "--session", "alice-reader")
+        if "r-001" in h.stdout:
+            told = True
+            break
+        if not h.stdout.strip():
+            break
+    if not told: product(f"alice's agent was never told bob's r-001 by `vox agent hook`: {h.stdout[-300:]!r} {h.stderr.strip()!r}")
+    run("carol", "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+        "--session", "carol-reader")
+    tui.until(lambda: (under("r-001") or "").startswith("read by"), 30, 1)
+    tui.pump(3)
+    after = under("r-001")
+    claim("readby", not (before or "").startswith("read by") and after == "read by alice",
+          f"under r-001 before alice's drain: {before!r}; after it: {after!r}")
+
+    stage("nostorm")
+    # Read records never answer read records (the decider; ADR-028 RR-2): with both people's TUIs
+    # on the room and both agents draining, what each node holds stays flat once the first
+    # records are out. Counted as a person can: `vox status --json`'s entries held in the room.
+    stop(daemons["alice"])
+    atui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env("alice"))
+    TUIS.append(atui)
+    def both_until(pred, secs):
+        """`pred` within `secs`, both TUIs drawn meanwhile: one not read stalls on its pty."""
+        end = time.time() + secs
+        while time.time() < end:
+            tui.pump(0.5); atui.pump(0.5)
+            if pred():
+                return True
+        return False
+    for keys, secs in (("", 4), ("id pass\r", 4), ("\r", 2), ("room pass\r", 4), ("\r", 2)):
+        if keys: os.write(atui.fd, keys.encode())
+        both_until(lambda: False, secs)
+    if not both_until(lambda: "m-0" in "\n".join(r[:112] for r in atui.display()), 30):
+        product("alice's `vox tui` never drew a message in the room's timeline within 30 s of unlocking")
+    def held(w):
+        r = run(w, "status", "--json")
+        if r.returncode != 0: product(f"{w}'s `vox status --json` failed: {r.stderr.strip()}")
+        rooms = [x for x in json.loads(r.stdout)["rooms"] if x["id"].startswith(room)]
+        if not rooms or "entries" not in rooms[0]:
+            product(f"{w}'s `vox status --json` says no entries held for the room: {r.stdout[:300]!r}")
+        return rooms[0]["entries"]
+    def under_in(t, key):
+        rows = [r[:112] for r in t.display()]
+        for i, r in enumerate(rows):
+            if key in r:
+                return bare(rows[i + 1]) if i + 1 < len(rows) else ""
+        return None
+    for w, text in (("alice", "s-001 from alice"), ("bob", "s-002 from bob")):
+        p = run(w, "room", "post", room, text)
+        if p.returncode != 0: product(f"{w}'s `vox room post` of {text!r} with both TUIs open failed: {p.stderr.strip()}")
+    # The first records: each TUI says its post was read by the other, whose TUI drew it.
+    first = both_until(lambda: under("s-002") == "read by alice"
+                       and under_in(atui, "s-001") == "read by bob", 60)
+    if not first:
+        product(f"the first read records never showed: under bob's s-002 {under('s-002')!r}, "
+                f"under alice's s-001 {under_in(atui, 's-001')!r}")
+    drains = lambda: [run(w, "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+                          "--session", f"{w}-storm") for w in ("alice", "bob")]
+    drains()
+    both_until(lambda: False, 6)  # a record held back by the 5-second batch goes out
+    counts = [(held("alice"), held("bob"))]
+    t0 = time.time()
+    while time.time() - t0 < 15:
+        drains()
+        both_until(lambda: False, 1)  # both TUIs keep drawing the room
+        counts.append((held("alice"), held("bob")))
+    claim("nostorm", len(set(counts)) == 1,
+          f"entries held (alice, bob) over 15 s, both TUIs on the room and both agents draining: "
+          f"{counts[0]} to {counts[-1]} ({len(counts)} samples, {len(set(counts))} distinct)")
+    if not atui.stop():
+        product(f"alice's vox tui (pid {atui.pid}) outlived SIGKILL and could not be reaped")
+    TUIS.remove(atui)
+    # Her TUI started a daemon of its own, detached, that outlives it: stopped by its PID (its
+    # argv names her data directory), so her `vox daemon` below is the one later stages stop.
+    pids = [int(x) for x in subprocess.run(["pgrep", "-f", f"daemon .*--data-dir {S}/alice/"],
+                                           capture_output=True, text=True).stdout.split()]
+    if len(pids) != 1:
+        apparatus(f"expected the one daemon alice's TUI started, found PIDs {pids}")
+    os.kill(pids[0], __import__("signal").SIGTERM)
+    def gone():
+        try:
+            os.kill(pids[0], 0)
+            return False
+        except ProcessLookupError:
+            return True
+    if not until(gone, 30):
+        os.kill(pids[0], __import__("signal").SIGKILL)
+        if not until(gone, 10): apparatus(f"the daemon alice's TUI started (pid {pids[0]}) outlived SIGKILL")
+    daemons["alice"] = spawn("alice", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                             "--passphrase-file", f"{S}/idpass", out="alice-after-tui")
+    if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
+        product("alice's daemon, started again after her TUI, never answered `vox room list` within 60 s: "
+                + open(f"{S}/alice-after-tui.err").read())
 
     stage("words")
     # Before `unknown`, whose short answers leave the line under the status bar one row again.
@@ -395,6 +540,27 @@ try:
     tui.until(lambda: peers() == 1, 30, 1)
     claim("fewer", peers() == 1, f"with only the anchor left, status bar: {tui.display()[-2].strip()!r}")
 
+    stage("where")
+    tui.key("\r", 2)  # back into the room
+    p = run("bob", "room", "post", room, "d-001 where am i")
+    if p.returncode != 0: product(f"bob's `vox room post` with every other member offline failed: {p.stderr.strip()}")
+    if not tui.until(lambda: has(timeline(), "d-001"), 30, 1):
+        product("bob's `vox tui` never showed his own post d-001 within 30 s")
+    tui.until(lambda: under("d-001") == "only on this machine", 10, 0.5)
+    alone = under("d-001")
+    daemons["alice"] = spawn("alice", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                             "--passphrase-file", f"{S}/idpass", out="alice-again")
+    if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
+        product("alice's daemon, started again, never answered `vox room list` within 60 s: "
+                + open(f"{S}/alice-again.err").read())
+    WHERE = "on 1 of 2 members' nodes"
+    tui.until(lambda: under("d-001") == WHERE, 90, 1)
+    synced = under("d-001")
+    claim("where", alone == "only on this machine" and synced == WHERE,
+          f"under d-001 with every other member offline: {alone!r}; once alice's daemon is back: {synced!r}")
+    stop(daemons["alice"])
+    tui.key("\x1b", 2)  # Esc back to the channel list
+
     stage("idle")
     # Ctrl-C, how a person stops `vox node` (it takes no SIGTERM of its own).
     anchor.send_signal(__import__("signal").SIGINT)
@@ -430,9 +596,10 @@ except Exception:
 finally:
     disarm()
     stage("stopping every process")
-    if tui is not None and not tui.stop():
-        print(f"{TAG} RED: vox tui (pid {tui.pid}) outlived SIGKILL and could not be reaped")
-        code = 1
+    for t in [tui, *TUIS]:
+        if t is not None and not t.stop():
+            print(f"{TAG} RED: vox tui (pid {t.pid}) outlived SIGKILL and could not be reaped")
+            code = 1
     for p in PROCS:
         if p.poll() is None:
             stop(p)

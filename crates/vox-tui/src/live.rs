@@ -38,7 +38,7 @@ use vox_core::node::daemonipc::{
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
 use vox_core::node::paths::{Account, NodeName};
-use vox_core::node::snapshot::NodeSnapshot;
+use vox_core::node::snapshot::{NodeSnapshot, OpenRoomSnap};
 use zeroize::Zeroizing;
 
 use crate::app::CoreHandle;
@@ -123,6 +123,12 @@ pub struct DaemonCore {
     notice: Option<String>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
+    /// The messages already told to the node as shown (ADR-028 RR-1).
+    marked: std::collections::BTreeSet<Digest32>,
+    /// The last time the node did not take what the room on screen showed, and what the room was
+    /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
+    /// ever, for a room that is over.
+    mark_refused: Option<MarkRefused>,
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -149,9 +155,34 @@ struct Timeline {
     projected: Option<Projected>,
 }
 
+/// The least time between two asks to record what a room showed, after the node did not take one.
+const MARK_RETRY: Duration = Duration::from_secs(3);
+
+/// A [`DaemonCore::shown`] the node did not take.
+struct MarkRefused {
+    channel_id: Digest32,
+    at: Instant,
+    /// The room as it was then: its rows and the node's detail of it.
+    room: (usize, Option<OpenRoomSnap>),
+    /// The room is over (ended, or left): nothing it shows is recorded again.
+    over: bool,
+}
+
+/// What the node says of this node's own recent messages in the room on screen (ADR-028 R-6).
+#[derive(Clone, Default, PartialEq, Eq)]
+struct Own {
+    /// `(entry, readers)`, from the read records the node can open.
+    read_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// `(entry, how many other members' nodes hold it)`.
+    held: Vec<(Digest32, u64)>,
+    /// How many other members the room has.
+    others: u64,
+}
+
 struct Projected {
     me: Option<Digest32>,
     trusted: Vec<(Digest32, String)>,
+    own: Own,
     len: usize,
     rows: std::sync::Arc<Vec<MessageView>>,
 }
@@ -164,6 +195,9 @@ impl std::fmt::Debug for DaemonCore {
             .finish_non_exhaustive()
     }
 }
+
+/// Said under a message this node sent that no other member's node is known to hold (ADR-028 R-6).
+pub const ONLY_HERE: &str = "only on this machine";
 
 /// Short display form of a fingerprint (first 8 hex chars).
 #[must_use]
@@ -272,6 +306,8 @@ impl DaemonCore {
             notify_off,
             notice: None,
             timeline: None,
+            marked: std::collections::BTreeSet::new(),
+            mark_refused: None,
             ended: None,
             stop,
         };
@@ -809,11 +845,39 @@ impl DaemonCore {
         &mut self,
         me: Option<Digest32>,
         trusted: &[(Digest32, String)],
+        own: &Own,
     ) -> std::sync::Arc<Vec<MessageView>> {
         let Some(t) = self.timeline.as_mut() else {
             return std::sync::Arc::default();
         };
+        let readers = |r: &MessageRow| -> String {
+            if me != Some(r.author) {
+                return String::new();
+            }
+            let Some((_, who)) = own.read_by.iter().find(|(e, _)| *e == r.entry_hash) else {
+                return String::new();
+            };
+            let mut names: Vec<String> = who
+                .iter()
+                .map(|fp| crate::ident::member_name(trusted, fp))
+                .collect();
+            names.sort();
+            names.join(", ")
+        };
+        // Where a message it sent is, while no member is known to have read it (ADR-028 R-6):
+        // from what other members' nodes said they hold, never from what was sent them.
+        let whereabouts = |r: &MessageRow| -> String {
+            if me != Some(r.author) {
+                return String::new();
+            }
+            match own.held.iter().find(|(e, _)| *e == r.entry_hash) {
+                None => String::new(),
+                Some((_, 0)) => ONLY_HERE.to_owned(),
+                Some((_, n)) => format!("on {n} of {} members' nodes", own.others),
+            }
+        };
         let view_of = |r: &MessageRow| MessageView {
+            entry_hash: r.entry_hash,
             author: r.author,
             author_nick: if me == Some(r.author) {
                 "you".to_owned()
@@ -835,9 +899,16 @@ impl DaemonCore {
                 crate::agent_hook::words(&r.text)
             }),
             late: r.late,
+            read_by: readers(r),
+            whereabouts: whereabouts(r),
         };
         match t.projected.as_mut() {
-            Some(p) if p.me == me && p.trusted.as_slice() == trusted && p.len <= t.rows.len() => {
+            Some(p)
+                if p.me == me
+                    && p.trusted.as_slice() == trusted
+                    && p.own == *own
+                    && p.len <= t.rows.len() =>
+            {
                 if p.len < t.rows.len() {
                     std::sync::Arc::make_mut(&mut p.rows)
                         .extend(t.rows[p.len..].iter().map(view_of));
@@ -850,6 +921,7 @@ impl DaemonCore {
                 t.projected = Some(Projected {
                     me,
                     trusted: trusted.to_vec(),
+                    own: own.clone(),
                     len: t.rows.len(),
                     rows: std::sync::Arc::clone(&rows),
                 });
@@ -890,10 +962,15 @@ impl DaemonCore {
                 reachability: reachability(&c.channel_id),
             })
             .collect();
-        let timeline = self
-            .active
-            .filter(|cid| snap.open.iter().any(|d| d.channel_id == *cid))
-            .map(|_| self.project_timeline(me, &snap.trusted));
+        let timeline = self.active.and_then(|cid| {
+            let room = snap.open.iter().find(|d| d.channel_id == cid)?;
+            let own = Own {
+                read_by: room.read_by.clone(),
+                held: room.held.clone(),
+                others: room.members.iter().filter(|m| me != Some(**m)).count() as u64,
+            };
+            Some(self.project_timeline(me, &snap.trusted, &own))
+        });
         let active = self.active.and_then(|cid| {
             snap.open
                 .iter()
@@ -1170,6 +1247,67 @@ impl CoreHandle for DaemonCore {
 
     fn apply(&mut self, command: Command) -> CommandStatus {
         self.apply_noting(command, &mut || {})
+    }
+
+    fn shown(&mut self, entries: &[Digest32]) {
+        let Some(cid) = self.active else {
+            return;
+        };
+        // Each message is told to the node once; the node keeps what it has recorded.
+        let new: Vec<Digest32> = entries
+            .iter()
+            .filter(|h| !self.marked.contains(*h))
+            .copied()
+            .collect();
+        if new.is_empty() {
+            return;
+        }
+        // A refusal is not asked again every frame: only once the room has changed, and
+        // `MARK_RETRY` has passed, and never for a room that is over.
+        let room = (
+            self.timeline.as_ref().map_or(0, |t| t.rows.len()),
+            self.snapshot
+                .open
+                .iter()
+                .find(|o| o.channel_id == cid)
+                .cloned(),
+        );
+        if let Some(r) = self.mark_refused.as_ref().filter(|r| r.channel_id == cid) {
+            if r.over || r.room == room || r.at.elapsed() < MARK_RETRY {
+                return;
+            }
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return;
+        };
+        let request = Request::MarkRead {
+            channel_id: cid,
+            entries: new.clone(),
+        };
+        match until_stopped(&self.rt, &self.stop, conn.client.request(&request)) {
+            Some(Ok(Frame::Ok)) => {
+                self.marked.extend(new);
+                self.mark_refused = None;
+            }
+            Some(Ok(Frame::NodeDetached { .. })) => self.detached(),
+            Some(Ok(Frame::Error { reason })) => {
+                let over = matches!(
+                    Fault::from_explanation(&reason),
+                    Some(Fault::RoomEnded | Fault::RoomLeft)
+                );
+                self.mark_refused = Some(MarkRefused {
+                    channel_id: cid,
+                    at: Instant::now(),
+                    room,
+                    over,
+                });
+            }
+            Some(Ok(_)) | None => {}
+            Some(Err(e)) => {
+                self.ended
+                    .get_or_insert(format!("the vox daemon stopped answering: {e}"));
+            }
+        }
     }
 
     fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
