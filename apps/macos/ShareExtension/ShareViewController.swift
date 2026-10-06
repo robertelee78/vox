@@ -63,8 +63,22 @@ final class ShareModel: ObservableObject {
         return NSHomeDirectory()
     }
 
-    /// The account's data root, and its config directory beside it (vox's macOS defaults).
-    private static var dataRoot: String { home + "/Library/Application Support/vox" }
+    /// vox's macOS default for both the data root and the config directory
+    /// (`vox_core::node::paths::roots`): one directory, which the entitlement covers.
+    private static var defaultRoot: String { home + "/Library/Application Support/vox" }
+
+    /// The account's data root: `VOX_DATA_DIR` when set, as for every vox client.
+    private static var dataRoot: String {
+        ProcessInfo.processInfo.environment["VOX_DATA_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? defaultRoot
+    }
+
+    /// The account's config directory, where the app keeps its first-run choice of node:
+    /// `VOX_CONFIG_DIR` when set.
+    private static var configDir: String {
+        ProcessInfo.processInfo.environment["VOX_CONFIG_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? defaultRoot
+    }
 
     func load() async {
         file = await sharedFile()
@@ -80,7 +94,7 @@ final class ShareModel: ObservableObject {
             return
         }
         self.client = client
-        let choice = URL(fileURLWithPath: Self.dataRoot).appendingPathComponent("app/node")
+        let choice = URL(fileURLWithPath: Self.configDir).appendingPathComponent("app/node")
         guard
             let node = (try? String(contentsOf: choice, encoding: .utf8))?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
