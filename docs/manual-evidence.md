@@ -49,6 +49,36 @@ later parser or implementation may invalidate both an example and its troublesho
 | install: containers, root refusal, receive buffer (v0.3.1) | `crates/vox-core/src/error.rs` (`Root`); `crates/vox-core/src/transport/quic.rs` (`UDP_SOCKET_BUFFER`, `mtu_ceiling_for`, the buffer line) |
 | reference: paths, data root layout, passphrase input, daemon passphrase-file lines | `crates/vox-core/src/node/paths.rs`; ADR-026 F-1; `crates/vox-tui/src/app.rs:870-1020` |
 
+## v0.4.0 command check (integrate, in progress)
+
+For #516 the chapters are being written as v0.4.0 stories merge. This first part was checked on
+2026-10-05 against `integrate/v0.4.0` at `0e27808d2769e34fa678870ecb17ed141caff269`. The vox
+binary was `cargo build --release --bin vox` with no features, and it still says `vox 0.3.1`.
+Lines that need a test-only knob (a room cap lowered to 3, a member that never answers) come from
+the merged proofs. Those were run at the same commit, in release with `--features test-knobs`.
+Every process had scratch `VOX_DATA_DIR` and `VOX_CONFIG_DIR`, and every process was stopped by its
+recorded PID or `vox node detach`. No `sudo` was used. All of it is to be checked again against
+the v0.4.0 candidate, which is to replace this commit in the Baselines table.
+
+| Manual claim | Where and how | Observed |
+|---|---|---|
+| `vox status` shows the keyring window (#478) | macOS, a node attached with an empty passphrase file, then `vox status` | second line `keyring open 30m` |
+| The window, closed | `a_keyring_change_needs_a_recent_passphrase_proof` (test-knobs: a 1-minute window) | `vox status, open: Some("keyring open 1m"); past the window: Some("keyring asks for the passphrase")` |
+| The TUI status bar shows it | `the_tui_says_what_attaching_its_node_said_proof` (pty, pyte) | the status bar: `sync: idle — no peer connected · node default · attached: default · keyring open 30m` |
+| `vox serve` prints each share's kind (#489) | `vox serve ssh=P1 web=P2 plain=P3 --name svc` (an SSH-banner stand-in, an HTTP stand-in, a TCP echo) | `sharing 127.0.0.1:P1 as ssh.FINGERPRINT.ROOM_ID.vox (ssh)`, `… web… (http)`, `… plain… (tcp)` |
+| `https` and `dns/udp` | `vox serve site=P4 names=P5/udp` (a TLS server with a throwaway self-signed certificate; a UDP responder answering any query with its id and the QR bit) | `… site… (https)`, `… names… (dns/udp)`; `service list`: `names.FINGERPRINT.svc.vox  by you  dns/udp`, `site.FINGERPRINT.svc.vox  by you  https` |
+| The kind never comes from the name | `vox serve ssh=P6` (a TCP echo) | `… ssh.FINGERPRINT.ROOM_ID.vox (tcp)` |
+| `service list` shows the kind, on host and guest | A: `vox service list ROOM_ID`; B after `vox connect` and trust both ways | A: `ssh.FINGERPRINT.svc.vox  by you  ssh` with `services offered` `ssh  →  127.0.0.1:P1`; B: `ssh.robertgpt.svc.vox  by robertgpt  ssh`, `web.robertgpt.svc.vox  by robertgpt  http`, `plain.robertgpt.svc.vox  by robertgpt  tcp` |
+| `service add` is detected too | `vox service add ROOM_ID pages 127.0.0.1:P2` | `vox: offering "pages" at 127.0.0.1:P2 in room ROOM_ID` / `it is dark until you vox trust add someone — and they join this room`; then `pages.FINGERPRINT.svc.vox  by you  http` in `service list` |
+| Refusals at the cap (#366) | `a_join_to_a_full_room_is_refused_proof`, cap 3 | `vox: cannot join: the room is full, so you were not admitted` / `your passphrase was accepted; the room takes no more members`; `vox: cannot join: another newcomer took the room's last place at the same moment, so you were not admitted` / `your passphrase was accepted; try again`; `vox: cannot join: a member of the room did not agree to take you in, so you were not admitted` with `said: …: exchange: member bob did not answer within 5s, and every member online must agree before the room takes a newcomer` |
+| A split room passes its cap and says so | the same proof's split case, cap 3 | `the split healed: both list all 4, one past the cap of 3, and it is said`. A daemon's log carried `past its cap of 3, now 4 members: another member admitted it`; the manual gives the 1,024 cap's numbers (`MAX_AUTHORS` in `crates/vox-core/src/node/channel.rs`) |
+
+From source, not run: the cap of 1,024 (`MAX_AUTHORS`); the program-name fallback (`lsof` on
+macOS, `ss` on Linux, `kind_of_command` in `crates/vox-core/src/node/probe.rs`); up to three probe
+connections to a TCP service (`probe_tcp`). The split case was red once in this check: bob refused
+y as full because x, whose daemon was still running, had reached bob directly. That run's red was
+reported to the lead as staging rather than product, and a second run was green.
+
 ## v0.3.1 command check
 
 Run on 2026-10-05 for #425 with `vox 0.3.1` built at `bf6dfcdb` (`cargo build --release --bin

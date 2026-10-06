@@ -29,7 +29,7 @@ is not an alias for your parser.
 | Run an anchor | `vox node` with no subcommand | A headless node; reachable infrastructure |
 | Ask a node about rooms | `vox room list`, `read`, `roster` | The node attached |
 | Inspect runtime | `vox status`, `vox status --json` | The node attached |
-| Change peer trust | `vox trust add`, `rename`, `remove` | Compared fingerprint; passphrase after 30 minutes |
+| Change peer trust | `vox trust add`, `rename`, `remove` | Compared fingerprint; passphrase after 30 minutes (`vox status` shows the minutes left) |
 | List peer trust | `vox trust list` | The node attached |
 | Room lifecycle | `vox room retention`, `admin`, `leave`, `end` | Creator or admin for the room-wide ones |
 | Share a port in a new room | `vox serve NAME=PORT` | Existing local service |
