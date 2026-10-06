@@ -124,6 +124,10 @@ pub struct DaemonCore {
     notify_off: bool,
     /// The most recent public notice: a room link, a join, a trust grant, a detach.
     notice: Option<String>,
+    /// The newest join seen in a room this node holds open (ADR-028 K-7): the room, the newcomer,
+    /// and the line it put in [`Self::notice`]. Said again as the room's consent grants say more
+    /// members trust it, while nothing has replaced that line.
+    joined: Option<(Digest32, Digest32, String)>,
     /// The room on screen's rows, as read.
     timeline: Option<Timeline>,
     /// The messages already told to the node as shown (ADR-028 RR-1).
@@ -326,6 +330,7 @@ impl DaemonCore {
             notify_to,
             notify_off,
             notice: None,
+            joined: None,
             timeline: None,
             marked: std::collections::BTreeSet::new(),
             mark_refused: None,
@@ -702,12 +707,7 @@ impl DaemonCore {
             NodeEvent::Joined { responder, .. } => {
                 self.notice = Some(format!("joined via {}", self.member_name(&responder)));
             }
-            NodeEvent::PeerJoined { peer, .. } => {
-                self.notice = Some(format!(
-                    "{} joined — they read nothing until you trust them",
-                    self.member_name(&peer)
-                ));
-            }
+            NodeEvent::PeerJoined { channel_id, peer } => self.say_joined(channel_id, peer),
             NodeEvent::Consented { target, .. } => {
                 self.notice = Some(format!("you now trust {}", self.member_name(&target)));
             }
@@ -740,6 +740,64 @@ impl DaemonCore {
         }
     }
 
+    /// **A newcomer, and who trusts it** (ADR-028 K-7): a member in a room this node holds open
+    /// that the snapshot before did not list is said as joined. Every member's TUI says it, not
+    /// only the one that answered the join. And while that line stands, it is said again as the
+    /// room's consent grants name more members trusting the newcomer.
+    fn note_joins(&mut self, before: &NodeSnapshot) {
+        let me = self.snapshot.me;
+        let mut newcomer = None;
+        for room in &self.snapshot.open {
+            // A room just opened lists everyone already in it: none of them just joined.
+            let Some(was) = before.open.iter().find(|o| o.channel_id == room.channel_id) else {
+                continue;
+            };
+            if let Some(m) = room
+                .members
+                .iter()
+                .rev()
+                .find(|m| Some(**m) != me && !was.members.contains(m))
+            {
+                newcomer = Some((room.channel_id, *m));
+            }
+        }
+        if let Some((room, peer)) = newcomer {
+            self.say_joined(room, peer);
+        } else if let Some((room, peer, said)) = self.joined.clone() {
+            if self.notice.as_deref() == Some(said.as_str()) {
+                self.say_joined(room, peer);
+            }
+        }
+    }
+
+    /// Say that `peer` joined `room`, and which members this node trusts trust it (K-7): from the
+    /// consent grants on the room's log, never adding it to any keyring.
+    fn say_joined(&mut self, room: Digest32, peer: Digest32) {
+        let trusters: Vec<String> = self
+            .snapshot
+            .open
+            .iter()
+            .find(|o| o.channel_id == room)
+            .and_then(|o| o.trusted_by.iter().find(|(m, _)| *m == peer))
+            .map(|(_, by)| {
+                self.snapshot
+                    .trusted
+                    .iter()
+                    .filter(|(fp, _)| by.contains(fp))
+                    .map(|(fp, _)| self.member_name(fp))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let who = match trusters.as_slice() {
+            [] => "No one you trust trusts it yet.".to_owned(),
+            [one] => format!("{one} trusts it."),
+            [rest @ .., last] => format!("{} and {last} trust it.", rest.join(", ")),
+        };
+        let line = format!("{} joined. {who}", self.member_name(&peer));
+        self.notice = Some(line.clone());
+        self.joined = Some((room, peer, line));
+    }
+
     /// A member as the TUI names it: its keyring petname, else its fingerprint marked as not in
     /// the keyring (`crate::ident`, #198).
     fn member_name(&self, fp: &Digest32) -> String {
@@ -770,7 +828,10 @@ impl DaemonCore {
         };
         match answer {
             Ok(reply) => match NodeSnapshot::from_bytes(&reply) {
-                Ok(Some(s)) => self.snapshot = s,
+                Ok(Some(s)) => {
+                    let before = std::mem::replace(&mut self.snapshot, s);
+                    self.note_joins(&before);
+                }
                 Ok(None) => match Frame::from_bytes(&reply) {
                     Ok(Frame::NodeDetached { .. }) => self.detached(),
                     Ok(Frame::Error { reason }) => self.notice = Some(reason),

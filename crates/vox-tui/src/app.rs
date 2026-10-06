@@ -24,7 +24,7 @@
 //! nothing to its node.
 
 use std::io::{self, Stdout, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use crossterm::execute;
@@ -1407,6 +1407,10 @@ pub fn run_live(
     result
 }
 
+/// How long a command's answer stands under the status bar before a notice the node says later
+/// replaces it (ADR-028 K-7).
+const ANSWER_HOLD: Duration = Duration::from_secs(10);
+
 /// The loop over an abstract terminal (the testable core of [`run_tui`]).
 pub fn run_loop(mut io: impl TerminalIo, mut core: impl CoreHandle) -> Result<(), AppError> {
     io.enter()?;
@@ -1420,11 +1424,28 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
     // Surface any startup notice (e.g. the offline-shell banner) until the user acts.
     ui.status_message = core.startup_notice();
     let mut was_attached: Option<bool> = None;
+    let mut last_notice: Option<String> = None;
+    let mut answered_at = Instant::now();
     loop {
         if io.stop_requested() {
             return Ok(());
         }
         let vm = core.view();
+        // **What the node says last is shown** (ADR-028 K-7): a notice that arrives after the
+        // person's last command replaces that command's answer, which otherwise stood over it until
+        // the next command, so a join said minutes after a `done` was never seen. The answer is
+        // given [`ANSWER_HOLD`] to be read first: a room link the person asked for is not taken
+        // away by the next note the node makes.
+        if vm.notice != last_notice
+            && (vm.notice.is_none()
+                || ui.status_message.is_none()
+                || answered_at.elapsed() >= ANSWER_HOLD)
+        {
+            if vm.notice.is_some() {
+                ui.status_message = None;
+            }
+            last_notice.clone_from(&vm.notice);
+        }
         // The daemon it is a client of stopped: nothing here can go on (ADR-026 L-7).
         if let Some(why) = core.ended() {
             return Err(AppError::Usage(why));
@@ -1474,6 +1495,7 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
                 } else {
                     Some(status.message())
                 };
+                answered_at = Instant::now();
             }
         }
     }

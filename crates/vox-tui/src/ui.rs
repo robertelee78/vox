@@ -718,7 +718,8 @@ fn hint_rows(hint: &str, width: u16) -> u16 {
 
 /// What the line under the status bar says. A transient status/alert takes precedence over the
 /// static keybind hint, and a core notice (an invite link, a join, a consent) over the hint but
-/// not over a status the user's own last command produced.
+/// not over a status the user's own last command produced after it (a notice that arrives later
+/// clears that status: `event_loop`).
 fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
     if let Some(msg) = ui.status_message.as_ref() {
         return format!(" {msg}");
