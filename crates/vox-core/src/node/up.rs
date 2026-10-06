@@ -98,6 +98,27 @@ impl Names for VoxResolver {
     }
 }
 
+/// [`Names::lookup`], waiting while the name's `<service>` is a share fingerprint this node's copy
+/// of the room does not hold yet (ADR-028 S-1). A canonical address copied from another member
+/// names the share by fingerprint, which only the room's log turns into the name the host is asked
+/// for, and a room just opened may not have read its log yet. A name goes to the host as it is, so
+/// only a fingerprint waits: at most [`HOST_PATIENCE`], and not at all in a room that has synced.
+async fn lookup_known<N: Names>(
+    resolver: &N,
+    name: &str,
+) -> std::result::Result<ServiceRoom, String> {
+    let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
+    loop {
+        let room = resolver.lookup(name).await?;
+        let unknown_fingerprint = room.share == crate::node::resolver::ShareState::NotYetKnown
+            && crate::node::link::b32_decode(&room.service, "vox service").is_ok();
+        if !unknown_fingerprint || tokio::time::Instant::now() >= deadline {
+            return Ok(room);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Serve SOCKS5 on `bind` until the task is dropped.
 ///
 /// Loopback only, and enforced: this proxy carries traffic into rooms this machine is a
@@ -401,7 +422,7 @@ where
             ));
         }
     };
-    let room = match resolver.lookup(&name).await {
+    let room = match lookup_known(resolver, &name).await {
         Ok(room) => room,
         Err(why) => {
             // Said to this machine's operator only, and only about this machine's own
@@ -573,6 +594,14 @@ where
                     // **A datagram has no refusal to carry**, so one to a name the room's log
                     // shows is no UDP share is refused here, at once, and said to this node's
                     // operator (PRD-001 R23), rather than dialled and dropped (V030-25).
+                    // A canonical address whose share this node's copy of the room does not hold
+                    // yet (ADR-028 S-1) has no name to ask the host for: the datagram is dropped,
+                    // as one sent before a route exists is, and the next is looked up afresh.
+                    if room.share == crate::node::resolver::ShareState::NotYetKnown
+                        && crate::node::link::b32_decode(&room.service, "vox service").is_ok()
+                    {
+                        continue;
+                    }
                     let stated_udp = crate::tunnel::udp::is_udp(&room.service);
                     let why = match room.share {
                         crate::node::resolver::ShareState::Absent => Some("shares no service"),
