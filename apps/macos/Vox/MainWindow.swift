@@ -139,15 +139,19 @@ private struct RoomView: View {
                         HStack(spacing: 8) {
                             ForEach(model.roomServices, id: \.address) { service in
                                 let selected = model.selectedService?.address == service.address
-                                ServiceCard(service: service)
-                                    .background(selected
-                                                ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
-                                    // The whole card takes the click: without a shape only its
-                                    // drawn text and icon did, and a click between them (as at
-                                    // its centre) selected nothing.
-                                    .contentShape(Rectangle())
-                                    .onTapGesture { model.selectedService = service }
-                                    .accessibilityAddTraits(selected ? .isSelected : [])
+                                // A button, so a click anywhere on the card selects it, as AppKit
+                                // takes clicks, and VoiceOver can press it; a tap gesture on it
+                                // (with or without a shape) let clicks through unanswered.
+                                Button { model.selectedService = service } label: {
+                                    ServiceCard(service: service)
+                                        .background(selected
+                                                    ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("service-\(service.address)")
+                                .accessibilityLabel("service \(service.address), shared by \(service.by), \(service.kind)")
+                                .accessibilityAddTraits(selected ? .isSelected : [])
                             }
                         }
                         .padding(8)
@@ -414,9 +418,6 @@ private struct ServiceCard: View {
         }
         .padding(8)
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
-        .accessibilityElement(children: .ignore)
-        .accessibilityIdentifier("service-\(service.address)")
-        .accessibilityLabel("service \(service.address), shared by \(service.by), \(service.kind)")
     }
 }
 
