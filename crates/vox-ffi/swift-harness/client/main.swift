@@ -33,6 +33,13 @@
 //   PREVIEW <tag> <ip:port> <warning | warning …>
 //                           `servicePreview`: what sharing it would do, said before it is
 //   OFFERED <tag>           `serviceAdd` with the preview's tag and endpoint: shared in the room
+//   (waits for a line on stdin: the peer has posted a link)
+//   CARD <title> | <description> | <n>
+//                           the link card the peer's node fetched, as `read` gives it (up to 90 s);
+//                           n is its image's size in bytes
+//   IMAGE <w>x<h> JPEG <true|false> BLURHASH <hash>
+//                           the image the peer's file share announced: dimensions, whether the
+//                           thumbnail is a JPEG, its BlurHash
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -141,6 +148,20 @@ do {
     say("PREVIEW \(preview.tag) \(preview.local) \(preview.warnings.joined(separator: " | "))")
     try await client.serviceAdd(room: room, tag: preview.tag, local: preview.local)
     say("OFFERED \(preview.tag)")
+
+    // What a message carries for showing (ADR-028 F-9, F-10).
+    _ = readLine()
+    var card: LinkCard? = nil
+    let cardUntil = Date().addingTimeInterval(90)
+    while card == nil && Date() < cardUntil {
+        card = try await client.read(room: room, after: "", limit: 0).compactMap { $0.card }.first
+        if card == nil { try await Task.sleep(nanoseconds: 250_000_000) }
+    }
+    say("CARD \(card?.title ?? "") | \(card?.description ?? "") | \(card?.image?.count ?? 0)")
+    let image = try await client.read(room: room, after: "", limit: 0)
+        .compactMap { $0.image }.first
+    let jpeg = image.map { $0.thumb.starts(with: [0xFF, 0xD8]) } ?? false
+    say("IMAGE \(image?.width ?? 0)x\(image?.height ?? 0) JPEG \(jpeg) BLURHASH \(image?.blurhash ?? "")")
     _ = readLine()
     await client.close()
     say("CLOSED")
