@@ -1239,9 +1239,13 @@ final class FirstRunProof: XCTestCase {
                      file: StaticString = #filePath, line: UInt = #line) -> Bool {
         let end = Date().addingTimeInterval(10)
         repeat {
-            if let e = locate(ui, key), e.isHittable {
-                e.click()
-                return true
+            if let e = locate(ui, key) {
+                // Shown but off screen in a scroll view: scrolled to, as a person does.
+                if !e.isHittable { scrollTo(ui, e) }
+                if e.isHittable {
+                    e.click()
+                    return true
+                }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
@@ -1249,6 +1253,22 @@ final class FirstRunProof: XCTestCase {
         XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): \(locateEverywhere(ui, key) == nil ? "not shown" : "not hittable")",
                 file: file, line: line)
         return false
+    }
+
+    /// Scroll the window's scroll view that holds `e` until `e` is on screen (or it moves no more).
+    private func scrollTo(_ ui: XCUIApplication, _ e: XCUIElement) {
+        let target = e.frame
+        guard let view = ui.windows.firstMatch.scrollViews.allElementsBoundByIndex.first(where: {
+            $0.frame.minX <= target.midX && target.midX <= $0.frame.maxX
+        }) else { return }
+        for _ in 0..<20 where !e.isHittable {
+            let now = e.frame
+            let down = now.midY > view.frame.maxY
+            let up = now.midY < view.frame.minY
+            guard down || up else { return }
+            view.scroll(byDeltaX: 0, deltaY: down ? -200 : 200)
+            if e.frame == now { return }
+        }
     }
 
     /// Type `text` into `key`, only once it was clicked.
