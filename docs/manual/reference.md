@@ -34,9 +34,9 @@ is not an alias for your parser.
 | Room lifecycle | `vox room retention`, `admin`, `leave`, `end` | Creator or admin for the room-wide ones |
 | Share a port in a new room | `vox serve NAME=PORT` | Existing local service |
 | Join a service room | `vox connect ROOM_LINK` | Room link and passphrase |
-| Reach services | `vox up`, `vox forward SERVICE.NODE.ROOM.vox` | Host's trust; proxy or forward running |
+| Reach services | the daemon's proxy (`vox up` says where), `vox forward SERVICE.NODE.ROOM.vox` | Host's trust; a node attached, or the forward running |
 | Close live tunnels | `vox tunnel close` | `vox status` lists them |
-| Exchange file bytes | `vox room send`, `vox share`, `vox room get` | Attached node and a live offer |
+| Share and pull files | `vox share`, `vox share list`, `vox share stop`, `vox room get` | Attached node; the sharer's daemon serving it |
 | A room's family LAN | `vox lan up` | `sudo vox lan helper` running |
 | Wire a harness | `vox agent plugin`, `skill`, `trust`, `doctor` | `--node` for plugin and hook |
 
