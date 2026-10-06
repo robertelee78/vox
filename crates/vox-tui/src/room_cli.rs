@@ -957,25 +957,39 @@ fn row_value(
     })
 }
 
-/// Who has read this node's own recent messages in `room`, by entry, as the node's snapshot says
-/// (ADR-028 R-6): from the read records it can open, so a member whose records it cannot open is
-/// in none. Empty when the node does not say.
-async fn read_by_in(
+/// Who has read this node's own recent messages in `room`, and who has pulled its shares there
+/// whole (ADR-028 R-6, F-7), by entry, from one snapshot of the node. Empty when it does not say.
+async fn own_in(
     client: &mut IpcClient,
     room: &Digest32,
-) -> std::collections::BTreeMap<Digest32, Vec<Digest32>> {
+) -> (
+    std::collections::BTreeMap<Digest32, Vec<Digest32>>,
+    std::collections::BTreeMap<Digest32, Vec<Digest32>>,
+) {
     let body = vox_core::node::snapshot::request_body();
     let Ok(reply) = client.exchange(&body).await else {
-        return std::collections::BTreeMap::new();
+        return Default::default();
     };
     let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
-        return std::collections::BTreeMap::new();
+        return Default::default();
     };
     snap.open
         .into_iter()
         .find(|o| o.channel_id == *room)
-        .map(|o| o.read_by.into_iter().collect())
+        .map(|o| {
+            (
+                o.read_by.into_iter().collect(),
+                o.pulled_by.into_iter().collect(),
+            )
+        })
         .unwrap_or_default()
+}
+
+/// `pulled by <names>`, by this node's names, sorted.
+fn pulled_by_line(who: &[Digest32]) -> Option<String> {
+    let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
+    names.sort();
+    (!names.is_empty()).then(|| format!("{}{}", crate::ui::PULLED_BY, names.join(", ")))
 }
 
 /// Where in the timeline `cursor` sits, or a refusal: an unknown cursor is never
@@ -1161,6 +1175,7 @@ pub async fn read(
             )));
         };
         let held_back = equivocations_in(paths, &channel_id).await;
+        let (_, pulled_by) = own_in(&mut client, &channel_id).await;
         let mut out = std::io::stdout().lock();
         // **A member held back for equivocating is said first** (V210-63), named as the rows
         // below name it. `vox status --json` carries the same, in full, for agents.
@@ -1174,6 +1189,10 @@ pub async fn read(
         let take = if take == 0 { usize::MAX } else { take };
         for r in rows.iter().filter(|r| r.late || !only_late).take(take) {
             let _ = writeln!(out, "{}", plain_row(r));
+            // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
+            if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
+                let _ = writeln!(out, "  {line}");
+            }
         }
         return Ok(());
     }
@@ -1205,10 +1224,16 @@ pub async fn read(
     ids.dedup();
     let group = coord::structured(&mut client, channel_id, &[], &ids).await?;
     let ops = coord::index_of(&coord::posted_of(&group));
-    let read_by = read_by_in(&mut client, &channel_id).await;
+    let (read_by, pulled_by) = own_in(&mut client, &channel_id).await;
     let mut out = std::io::stdout().lock();
     for r in &shown {
         let mut row = row_value(&room_key, r, &ops, None);
+        // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
+        if let Some(who) = pulled_by.get(&r.entry_hash) {
+            let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
+            names.sort();
+            row["pulled_by"] = names.into();
+        }
         // Under a message this node sent, who has read it, by this node's names (ADR-028 R-6).
         if let Some(who) = read_by.get(&r.entry_hash) {
             let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();

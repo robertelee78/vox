@@ -175,6 +175,104 @@ enum Verdict {
     Stop(String),
 }
 
+/// Who has pulled one share whole (ADR-028 F-7): the members whose fetch of it completed, by the
+/// tunnel each came through, never by what a client says.
+#[derive(Debug, Clone, Default)]
+struct PulledBy {
+    room: Digest32,
+    /// The announcement's entry, base32; empty until it is known.
+    entry: String,
+    who: Vec<Digest32>,
+}
+
+/// Every share's [`PulledBy`], by tag: kept past the share's end, so its card still says who
+/// pulled it, and on disk, so a restart does too.
+#[derive(Debug, Default)]
+struct PulledBook {
+    file: PathBuf,
+    by_tag: BTreeMap<String, PulledBy>,
+}
+
+impl PulledBook {
+    fn load(file: PathBuf) -> Self {
+        let by_tag = std::fs::read(&file)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.as_object().cloned())
+            .map(|o| {
+                o.into_iter()
+                    .filter_map(|(tag, v)| {
+                        let room = b32_decode(v.get("room")?.as_str()?, "pulled-by room").ok()?;
+                        let entry = v.get("entry")?.as_str()?.to_owned();
+                        let who = v
+                            .get("who")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(|w| b32_decode(w.as_str()?, "pulled-by member").ok())
+                            .collect();
+                        Some((tag, PulledBy { room, entry, who }))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { file, by_tag }
+    }
+
+    fn save(&self) {
+        let v: serde_json::Map<String, serde_json::Value> = self
+            .by_tag
+            .iter()
+            .map(|(tag, p)| {
+                (
+                    tag.clone(),
+                    serde_json::json!({
+                        "room": b32_encode(&p.room),
+                        "entry": p.entry,
+                        "who": p.who.iter().map(b32_encode).collect::<Vec<_>>(),
+                    }),
+                )
+            })
+            .collect();
+        if let Some(dir) = self.file.parent() {
+            let _ = crate::node::paths::create_private_dir(dir);
+        }
+        let _ = crate::node::paths::write_private_file(
+            &self.file,
+            serde_json::Value::Object(v).to_string().as_bytes(),
+        );
+    }
+
+    /// `member` pulled the share `tag` in `room` whole.
+    fn pulled(&mut self, tag: &str, room: Digest32, member: Digest32) {
+        let p = self
+            .by_tag
+            .entry(tag.to_owned())
+            .or_insert_with(|| PulledBy {
+                room,
+                ..PulledBy::default()
+            });
+        if !p.who.contains(&member) {
+            p.who.push(member);
+            self.save();
+        }
+    }
+
+    /// The share `tag`'s announcement is `entry`.
+    fn announced(&mut self, tag: &str, room: Digest32, entry: &str) {
+        let p = self
+            .by_tag
+            .entry(tag.to_owned())
+            .or_insert_with(|| PulledBy {
+                room,
+                ..PulledBy::default()
+            });
+        if p.entry != entry {
+            entry.clone_into(&mut p.entry);
+            self.save();
+        }
+    }
+}
+
 /// The shares one node serves.
 pub struct Shares {
     paths: Paths,
@@ -184,6 +282,8 @@ pub struct Shares {
     events: broadcast::Sender<NodeEvent>,
     /// Held across each change, so a stop and the tending of the same share never interleave.
     active: Mutex<BTreeMap<String, Active>>,
+    /// Who pulled each share whole (F-7).
+    pulled: Arc<std::sync::Mutex<PulledBook>>,
 }
 
 impl std::fmt::Debug for Shares {
@@ -218,6 +318,9 @@ impl Shares {
         events: broadcast::Sender<NodeEvent>,
     ) -> Arc<Self> {
         let shares = Arc::new(Self {
+            pulled: Arc::new(std::sync::Mutex::new(PulledBook::load(
+                paths.shares_dir().join("pulled-by.json"),
+            ))),
             paths,
             cmd,
             view,
@@ -250,6 +353,31 @@ impl Shares {
             return Outcome::Failed(Fault::ShuttingDown);
         }
         rx.await.unwrap_or(Outcome::Failed(Fault::ShuttingDown))
+    }
+
+    /// Who has pulled each of this node's shares in `room` whole, by announcement (ADR-028 F-7):
+    /// `(entry, members)`, from this daemon's own record of completed fetches.
+    #[must_use]
+    pub fn pulled_by(&self, room: &Digest32) -> Vec<(Digest32, Vec<Digest32>)> {
+        let book = self
+            .pulled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        book.by_tag
+            .values()
+            .filter(|p| p.room == *room && !p.who.is_empty())
+            .filter_map(|p| Some((b32_decode(&p.entry, "pulled-by entry").ok()?, p.who.clone())))
+            .collect()
+    }
+
+    /// What `serve` needs to record who pulled the share `tag` in `room`.
+    fn witness(&self, tag: &str, room: Digest32) -> Witness {
+        Witness {
+            book: Arc::clone(&self.pulled),
+            tag: tag.to_owned(),
+            room,
+            owner: self.view.borrow().identity.as_ref().map(|i| i.fingerprint),
+        }
     }
 
     fn say(&self, note: String) {
@@ -357,6 +485,7 @@ impl Shares {
             name.clone(),
             size,
             Arc::clone(&fetched),
+            self.witness(&tag, req.channel_id),
             stopping,
         )
         .await
@@ -419,6 +548,12 @@ impl Shares {
                     break;
                 }
             }
+        }
+        if !entry.is_empty() {
+            self.pulled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .announced(&tag, req.channel_id, &entry);
         }
         let record = Record {
             tag: tag.clone(),
@@ -561,6 +696,7 @@ impl Shares {
                 record.name.clone(),
                 record.size,
                 Arc::clone(&fetched),
+                self.witness(&record.tag, record.room),
                 stopping,
             )
             .await
@@ -656,11 +792,36 @@ impl Shares {
 }
 
 /// Listen locally and hand the file to whoever connects, until `stopping`.
+/// Who a share's completed fetches are recorded against, and how its server tells them apart.
+#[derive(Clone)]
+struct Witness {
+    book: Arc<std::sync::Mutex<PulledBook>>,
+    tag: String,
+    room: Digest32,
+    /// This node, whose served tunnels say which member a connection is.
+    owner: Option<Digest32>,
+}
+
+impl Witness {
+    /// The member a connection from `from` came through a tunnel for.
+    fn member(&self, from: Option<SocketAddr>) -> Option<Digest32> {
+        crate::transport::quic::tunnel_peer_at(&self.owner?, from?)
+    }
+
+    fn pulled(&self, member: Digest32) {
+        self.book
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pulled(&self.tag, self.room, member);
+    }
+}
+
 async fn serve(
     file: PathBuf,
     name: String,
     size: u64,
     fetched: Arc<AtomicU64>,
+    witness: Witness,
     stopping: watch::Receiver<bool>,
 ) -> Result<(tokio::task::JoinHandle<()>, SocketAddr), String> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -670,16 +831,27 @@ async fn serve(
         .local_addr()
         .map_err(|e| format!("cannot read the local address: {e}"))?;
     let server = tokio::spawn(async move {
-        while let Ok((sock, _)) = listener.accept().await {
-            let (file, name, fetched, stopping) = (
+        while let Ok((sock, from)) = listener.accept().await {
+            let (file, name, fetched, witness, stopping) = (
                 file.clone(),
                 name.clone(),
                 Arc::clone(&fetched),
+                witness.clone(),
                 stopping.clone(),
             );
             tokio::spawn(async move {
-                if serve_one(sock, &file, &name, size, stopping).await {
+                // Which member this is, asked of the tunnel it came through once it has sent its
+                // request: by then the tunnel has said where its connection comes from.
+                let (whole, member) = serve_one(sock, &file, &name, size, stopping, || {
+                    witness.member(Some(from))
+                })
+                .await;
+                if whole {
                     fetched.fetch_add(1, Ordering::SeqCst);
+                    // **Pulled means the whole file reached it** (F-7): a fetch cut short is not.
+                    if let Some(m) = member {
+                        witness.pulled(m);
+                    }
                 }
             });
         }
@@ -688,14 +860,17 @@ async fn serve(
 }
 
 /// Answer one HTTP request with the file. Whatever the path, the answer is the share: there is
-/// one thing here. Returns whether the receiver took every byte.
+/// one thing here. Returns whether the receiver took every byte, and who it is, as `identify` says
+/// once its request has arrived.
 async fn serve_one(
     mut sock: tokio::net::TcpStream,
     file: &Path,
     name: &str,
     size: u64,
     mut stopping: watch::Receiver<bool>,
-) -> bool {
+    identify: impl FnOnce() -> Option<Digest32>,
+) -> (bool, Option<Digest32>) {
+    let mut member = None;
     let whole = async {
         // Read the request head (bounded) so a client that sends one gets a well-formed
         // exchange; the path is not interpreted.
@@ -707,6 +882,7 @@ async fn serve_one(
                 _ => return Some(false),
             }
         }
+        member = identify();
         let is_head = head.starts_with(b"HEAD ");
         let reply = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: \
@@ -761,11 +937,11 @@ async fn serve_one(
         _ = stopping.wait_for(|stop| *stop) => None,
     };
     match ended {
-        Some(done) => done,
+        Some(done) => (done, member),
         // Any other ending is a reset: a clean close would say "that was all of it".
         None => {
             crate::tunnel::session::abort_after_drain(sock).await;
-            false
+            (false, member)
         }
     }
 }

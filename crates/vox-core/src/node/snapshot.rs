@@ -60,6 +60,9 @@ pub struct OpenRoomSnap {
     /// Who trusts each member (ADR-028 K-7): `(member, the members that consent to it reading
     /// them)`.
     pub trusted_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// Who has pulled each of this node's shares here whole: `(entry, members)` (ADR-028 F-7;
+    /// [`crate::node::shares::Shares::pulled_by`]).
+    pub pulled_by: Vec<(Digest32, Vec<Digest32>)>,
 }
 
 /// One node as a client draws it.
@@ -120,6 +123,7 @@ impl NodeSnapshot {
                     held: d.held.clone(),
                     notices: d.notices.clone(),
                     trusted_by: d.trusted_by.clone(),
+                    pulled_by: handle.shares().pulled_by(&d.channel_id),
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
@@ -151,7 +155,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(11)
+            e.array(12)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -190,6 +194,11 @@ impl NodeSnapshot {
             for (member, by) in &o.trusted_by {
                 e.array(2).bytes(member);
                 digests(&mut e, by);
+            }
+            e.array(o.pulled_by.len());
+            for (entry, who) in &o.pulled_by {
+                e.array(2).bytes(entry);
+                digests(&mut e, who);
             }
         }
         e.array(self.trusted.len());
@@ -261,7 +270,7 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 11, "ipc snapshot open room")?;
+            want(&mut d, 12, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
             let name = Some(d.text().map_err(bad("ipc snapshot open name"))?.to_owned())
                 .filter(|n| !n.is_empty());
@@ -320,6 +329,12 @@ impl NodeSnapshot {
                 let member = digest(&mut d)?;
                 trusted_by.push((member, read_digests(&mut d)?));
             }
+            let mut pulled_by = Vec::new();
+            for _ in 0..d.array().map_err(bad("ipc snapshot pulled by"))? {
+                want(&mut d, 2, "ipc snapshot pulled by entry")?;
+                let entry = digest(&mut d)?;
+                pulled_by.push((entry, read_digests(&mut d)?));
+            }
             open.push(OpenRoomSnap {
                 channel_id,
                 name,
@@ -332,6 +347,7 @@ impl NodeSnapshot {
                 held,
                 notices,
                 trusted_by,
+                pulled_by,
             });
         }
         let mut trusted = Vec::new();
@@ -499,6 +515,7 @@ mod tests {
                 held: vec![([5; 32], 1)],
                 notices: Vec::new(),
                 trusted_by: vec![([4; 32], vec![[1; 32]])],
+                pulled_by: vec![([6; 32], vec![[4; 32]])],
             }],
             trusted: vec![([4; 32], "bob".into())],
             connected_peers: vec![[4; 32]],

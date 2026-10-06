@@ -431,6 +431,11 @@ where
             ));
         }
     };
+    // Which member this connection is, for the service to ask (ADR-028 F-7): set before the
+    // dialler hears it was accepted, so before it sends a byte.
+    if let Some(w) = &watch {
+        w.set_local(tcp.local_addr().ok());
+    }
     write_frame(&mut send, &[TunnelStatus::Accepted.as_byte()]).await?;
     let cut = withdrawn(reachers, offered, *client_id, req.service_tag);
     splice_until(send, recv, tcp, cut, watch).await

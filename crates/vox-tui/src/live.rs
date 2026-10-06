@@ -205,6 +205,8 @@ struct Own {
     read_by: Vec<(Digest32, Vec<Digest32>)>,
     /// `(entry, how many other members' nodes hold it)`.
     held: Vec<(Digest32, u64)>,
+    /// `(entry, members)` who pulled this node's share whole (ADR-028 F-7).
+    pulled_by: Vec<(Digest32, Vec<Digest32>)>,
     /// How many other members the room has.
     others: u64,
 }
@@ -1056,6 +1058,21 @@ impl DaemonCore {
             names.sort();
             names.join(", ")
         };
+        // Who pulled a share it sent, whole, from its daemon's own record (ADR-028 F-7).
+        let pullers = |r: &MessageRow| -> String {
+            if me != Some(r.author) {
+                return String::new();
+            }
+            let Some((_, who)) = own.pulled_by.iter().find(|(e, _)| *e == r.entry_hash) else {
+                return String::new();
+            };
+            let mut names: Vec<String> = who
+                .iter()
+                .map(|fp| crate::ident::member_name(trusted, fp))
+                .collect();
+            names.sort();
+            names.join(", ")
+        };
         // Where a message it sent is, while no member is known to have read it (ADR-028 R-6):
         // from what other members' nodes said they hold, never from what was sent them.
         let whereabouts = |r: &MessageRow| -> String {
@@ -1088,6 +1105,7 @@ impl DaemonCore {
             }),
             late: r.late,
             read_by: readers(r),
+            pulled_by: pullers(r),
             whereabouts: whereabouts(r),
             quote: if r.owed { None } else { quote_of(r) },
         };
@@ -1228,6 +1246,7 @@ impl DaemonCore {
             let own = Own {
                 read_by: room.read_by.clone(),
                 held: room.held.clone(),
+                pulled_by: room.pulled_by.clone(),
                 others: room.members.iter().filter(|m| me != Some(**m)).count() as u64,
             };
             Some(self.project_timeline(me, &snap.trusted, &own))
