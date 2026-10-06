@@ -205,6 +205,7 @@ fn card_of(env: &vox_agentcomms::envelope::Envelope) -> Option<LinkCard> {
             .and_then(|v| v.as_str())
             .and_then(unbase64),
     })
+}
 
 /// What a share's announcement offers, as its signed envelope states it.
 #[derive(Debug, Clone, uniffi::Record)]
