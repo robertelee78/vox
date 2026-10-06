@@ -374,14 +374,15 @@ impl Reading {
                  reached this node yet. Until it does neither reads the other; if they have not \
                  trusted you, they run `vox trust add {me}`"
             ),
-            Reading::NotInKeyring { trusts_you } => format!(
-                "not in keyring{}: to read each other, `vox trust add {fp} --name NAME`{}",
-                if trusts_you { ", trusts you" } else { "" },
-                if trusts_you {
-                    ""
-                } else {
-                    ", and they trust you"
-                }
+            // Their trust in this node, when it has reached it, is said; when it has not, only what
+            // each still runs, never that they have or have not given it.
+            Reading::NotInKeyring { trusts_you: true } => format!(
+                "not in keyring, trusts you: to read each other, you run `vox trust add {fp} \
+                 --name NAME`"
+            ),
+            Reading::NotInKeyring { trusts_you: false } => format!(
+                "not in keyring: to read each other, you run `vox trust add {fp} --name NAME`; \
+                 if they have not trusted you, they run `vox trust add {me}`"
             ),
         }
     }

@@ -33,10 +33,13 @@
 //! Journey 2 with a third person, carol, who joins `first` before bob and whom bob never trusts,
 //! and with bob trusting alice **before** he joins `first`, alice trusting him only after. Bob's
 //! `vox room join` of `first` must list alice as `→ alice — waiting for the other side` with the
-//! `vox trust add` alice runs (bob's fingerprint), and carol as `· … — not in keyring` with the
-//! `vox trust add` bob runs (carol's fingerprint); his join of `second`, alice's trust in him
-//! settled, lists alice as `⇄ alice — trusted both ways`. Mutation: the waiting state omitted
-//! (a member bob trusts that has not trusted him read as trusted both ways): `PRODUCT`.
+//! `vox trust add` alice runs (bob's fingerprint), and carol, who never trusted bob, by the whole
+//! line `· … — not in keyring: to read each other, you run `vox trust add <carol> --name NAME`; if
+//! they have not trusted you, they run `vox trust add <bob>``: it never says carol trusts him. His
+//! join of `second`, alice's trust in him settled, lists alice as `⇄ alice — trusted both ways`.
+//! Mutations: the waiting state omitted (a member bob trusts that has not trusted him read as
+//! trusted both ways), or a member's trust in bob said when it has not reached him (the
+//! not-in-keyring line's two cases swapped): `PRODUCT`.
 //!
 //! **The mutation that must turn (2) red:** a key released only into the rooms that were open when
 //! trust was decided (`release_key_to` refusing any other room). The first room still works; the
@@ -464,11 +467,18 @@ fn two_people_who_share_a_room_read_each_other_in_a_second_one_with_no_new_trust
     assert!(
         to_alice.starts_with("→ alice — waiting for the other side")
             && to_alice.contains(&format!("vox trust add {}", fps[1]))
-            && to_carol.starts_with(&format!("· {} — not in keyring", &fps[2][..26]))
-            && to_carol.contains(&format!("vox trust add {} --name", fps[2])),
+            && to_carol
+                == format!(
+                    "· {} — not in keyring: to read each other, you run `vox trust add {} --name \
+                     NAME`; if they have not trusted you, they run `vox trust add {}`",
+                    &fps[2][..26],
+                    fps[2],
+                    fps[1]
+                ),
         "PRODUCT: bob's `vox room join` of first must list alice, whom he trusts and who has not \
          trusted him, as waiting for the other side, with the `vox trust add` she runs, and carol, \
-         not in his keyring, with the one he runs; it printed:\n{said}"
+         not in his keyring and not trusting him, with what each runs and no word of her trusting \
+         him; it printed:\n{said}"
     );
     // 6. Each trusts the other (bob already has).
     alice.trust(bob, &fps[1]);
