@@ -369,27 +369,34 @@ pub fn service_commands(s: &vox_core::node::ipc::SharedService) -> Vec<(&'static
 }
 
 /// What one shared service needs to be reached from here, and whether each holds (ADR-028 S-3):
-/// `(the condition, holds, what to do when it does not)`.
+/// `(the condition, holds, what to do when it does not)`. `proxy` is whether the `.vox` proxy
+/// runs, or `None` where that is not known here (its need is then not said).
 #[must_use]
 pub fn service_needs(
     s: &vox_core::node::ipc::SharedService,
-    proxy: &Result<SocketAddr, String>,
+    proxy: Option<&Result<SocketAddr, String>>,
 ) -> Vec<(String, bool, String)> {
-    let who = if s.by == "you" { "you" } else { s.by.as_str() };
-    let mut needs = vec![
-        (
+    // This node's own share needs neither its own trust nor itself online.
+    let theirs = s.by != "you";
+    let who = s.by.as_str();
+    let mut needs = Vec::new();
+    if theirs {
+        needs.push((
             format!("{who} trusts this node"),
             s.trusts_you,
-            format!("{who} must trust this node: `vox trust add <this node's fingerprint>` there"),
-        ),
-        (
-            "this node is attached".to_owned(),
-            true,
-            "`vox node attach`".to_owned(),
-        ),
-    ];
+            format!(
+                "{who} must trust this node: there, `vox trust add` the fingerprint `vox id` \
+                 prints here"
+            ),
+        ));
+    }
+    needs.push((
+        "this node is attached".to_owned(),
+        true,
+        "`vox node attach`".to_owned(),
+    ));
     // A forward carries without the proxy; ssh by address and a URL go through it.
-    if matches!(s.kind.as_str(), "ssh" | "http" | "https") {
+    if let Some(proxy) = proxy.filter(|_| matches!(s.kind.as_str(), "ssh" | "http" | "https")) {
         needs.push(match proxy {
             Ok(at) => (
                 format!("the .vox proxy is running on {at}"),
@@ -403,11 +410,13 @@ pub fn service_needs(
             ),
         });
     }
-    needs.push((
-        format!("{who} is online"),
-        s.online,
-        format!("{who} is not reachable now; it is reached when it comes back"),
-    ));
+    if theirs {
+        needs.push((
+            format!("{who} is online"),
+            s.online,
+            format!("{who} is not reachable now; it is reached when it comes back"),
+        ));
+    }
     needs
 }
 
@@ -438,7 +447,7 @@ pub fn print_services(
                         .into_iter()
                         .map(|(what, command)| serde_json::json!({"what": what, "command": command}))
                         .collect::<Vec<_>>(),
-                    "needs": service_needs(s, proxy)
+                    "needs": service_needs(s, Some(proxy))
                         .into_iter()
                         .map(|(need, holds, otherwise)| {
                             serde_json::json!({"need": need, "holds": holds, "otherwise": otherwise})
@@ -475,7 +484,7 @@ pub fn print_services(
             for (what, command) in service_commands(s) {
                 println!("      {what:<8}{command}");
             }
-            for (need, holds, otherwise) in service_needs(s, proxy) {
+            for (need, holds, otherwise) in service_needs(s, Some(proxy)) {
                 if holds {
                     println!("      needs   {need}: yes");
                 } else {

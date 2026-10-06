@@ -167,6 +167,8 @@ pub enum Focus {
     Composer,
     /// The member pane.
     Members,
+    /// What is shared in the room (ADR-028 S-3): Up/Down select, `y` copies its command.
+    Shared,
 }
 
 impl Focus {
@@ -176,7 +178,8 @@ impl Focus {
         match self {
             Focus::Timeline => Focus::Composer,
             Focus::Composer => Focus::Members,
-            Focus::Members => Focus::Timeline,
+            Focus::Members => Focus::Shared,
+            Focus::Shared => Focus::Timeline,
         }
     }
 }
@@ -212,6 +215,9 @@ pub enum Action {
     Dispatch(Command),
     /// Quit the application.
     Quit,
+    /// Put this text on the system clipboard (OSC 52) and say it on the status line
+    /// (ADR-028 S-3): a shared service's command.
+    Copy(String),
 }
 
 /// The UI navigation state.
@@ -229,6 +235,8 @@ pub struct UiState {
     /// an unread re-sorts it, and a position would then name another room. Each frame finds its
     /// index again ([`UiState::settle`]).
     pub selected_room: Option<Digest32>,
+    /// The shared service selected in the room's Shared pane, by position (ADR-028 S-3).
+    pub selected_share: usize,
     /// The member selected in the member pane, **by identity** (V210-82): the pane is in
     /// fingerprint order, so a join re-sorts it, and a position would then name someone else.
     /// `None` until the pane first has a member (see [`UiState::settle`]).
@@ -257,6 +265,7 @@ impl Default for UiState {
             mode: Mode::Normal,
             selected_channel: 0,
             selected_room: None,
+            selected_share: 0,
             selected_member: None,
             timeline_scroll: 0,
             status_message: None,
@@ -391,7 +400,23 @@ impl UiState {
             }
             KeyCode::Tab if self.screen == Screen::Channel => {
                 self.focus = self.focus.next();
+                // The Shared pane is there only when something is shared.
+                if self.focus == Focus::Shared
+                    && vm.active.as_ref().is_none_or(|c| c.shared.is_empty())
+                {
+                    self.focus = self.focus.next();
+                }
                 Action::Redraw
+            }
+            KeyCode::Char('y') if self.screen == Screen::Channel && self.focus == Focus::Shared => {
+                match vm
+                    .active
+                    .as_ref()
+                    .and_then(|c| c.shared.get(self.selected_share))
+                {
+                    Some(s) if !s.copy.is_empty() => Action::Copy(s.copy.clone()),
+                    _ => Action::Redraw,
+                }
             }
             KeyCode::Esc => {
                 if self.screen == Screen::Channel {
@@ -439,6 +464,7 @@ impl UiState {
             self.screen = Screen::Channel;
             self.focus = Focus::Timeline;
             self.selected_member = None;
+            self.selected_share = 0;
             self.timeline_scroll = 0;
             Action::Dispatch(Command::SelectChannel {
                 channel_id: Some(summary.channel_id),
@@ -629,6 +655,12 @@ impl UiState {
                     .and_then(|id| vm.tunnels.iter().position(|t| t.id == id))
                     .unwrap_or(0);
                 self.selected_tunnel = Some(vm.tunnels[step(cur, vm.tunnels.len())].id);
+            }
+            Screen::Channel if self.focus == Focus::Shared => {
+                let len = vm.active.as_ref().map_or(0, |c| c.shared.len());
+                if len > 0 {
+                    self.selected_share = step(self.selected_share.min(len - 1), len);
+                }
             }
             Screen::Channel if self.focus == Focus::Timeline => {
                 // Up scrolls toward older messages.

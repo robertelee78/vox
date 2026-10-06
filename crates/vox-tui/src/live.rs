@@ -1251,10 +1251,38 @@ impl DaemonCore {
                                 } else {
                                     ""
                                 };
-                                format!(
-                                    "{} by {who}  {kind}{udp}",
-                                    names.address_of(&d.channel_id, &s.host, &s.name)
-                                )
+                                let address = names.address_of(&d.channel_id, &s.host, &s.name);
+                                let line = format!("{address} by {who}  {kind}{udp}");
+                                let svc = vox_core::node::ipc::SharedService {
+                                    address,
+                                    canonical: vox_core::node::resolver::canonical_address(
+                                        &d.channel_id,
+                                        &s.host,
+                                        &s.name,
+                                    ),
+                                    by: who,
+                                    udp: s.udp,
+                                    kind: kind.as_str().to_owned(),
+                                    trusts_you: me == Some(s.host)
+                                        || d.consenting.binary_search(&s.host).is_ok(),
+                                    online: me == Some(s.host)
+                                        || snap.connected_peers.binary_search(&s.host).is_ok(),
+                                };
+                                crate::viewmodel::SharedView {
+                                    line,
+                                    copy: crate::tunnel_cli::service_commands(&svc)
+                                        .into_iter()
+                                        .next()
+                                        .map(|(_, c)| c)
+                                        .unwrap_or_default(),
+                                    missing: crate::tunnel_cli::service_needs(&svc, None)
+                                        .into_iter()
+                                        .filter(|(_, holds, _)| !holds)
+                                        .map(|(need, _, otherwise)| {
+                                            format!("{need}: no — {otherwise}")
+                                        })
+                                        .collect(),
+                                }
                             })
                             .collect()
                     },

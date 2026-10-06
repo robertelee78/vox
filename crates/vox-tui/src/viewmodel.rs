@@ -153,11 +153,23 @@ pub struct ChannelView {
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
-    /// The services shared in the room (V030-25), each as `<address> by <who>`: its address in
-    /// this operator's own aliases (fingerprints where it has none), and who shared it.
-    pub shared: Vec<String>,
+    /// The services shared in the room (V030-25, ADR-028 S-3).
+    pub shared: Vec<SharedView>,
     /// This channel's reachability.
     pub reachability: Reachability,
+}
+
+/// One service shared in a room, as the TUI shows it (ADR-028 S-3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SharedView {
+    /// `<address> by <who>  <kind>`: its readable address in this operator's own aliases
+    /// (fingerprints where it has none), who shared it, and what it is.
+    pub line: String,
+    /// The command a copy gives, carrying the canonical address (S-1) so it works pasted on any
+    /// member's machine: the first of its kind's commands.
+    pub copy: String,
+    /// What it needs that does not hold, each in words; empty when nothing is missing.
+    pub missing: Vec<String>,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many
