@@ -56,7 +56,16 @@ final class NodeModel: ObservableObject {
 
     @Published private(set) var rooms: [Room] = []
     @Published var selection: Selection?
-    @Published private(set) var messages: [RoomMessage] = []
+    @Published private(set) var messages: [RoomMessage] = [] {
+        didSet {
+            byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
+            helloSeen = messages.contains { $0.kind == "hello" && $0.author != me }
+        }
+    }
+    /// The room on screen's messages by id, for what is in view.
+    private(set) var byID: [String: RoomMessage] = [:]
+    /// Whether another member of the room on screen announced an agent session.
+    private(set) var helloSeen = false
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
@@ -99,8 +108,16 @@ final class NodeModel: ObservableObject {
 
     /// Follows who has read what while a room is on screen.
     private var watching: Task<Void, Never>?
+    /// Follows the node's facts (keyring, nodes, peers) while the model lives.
+    private var following: Task<Void, Never>?
     @Published private(set) var members: [MemberRow] = []
     @Published private(set) var trusted: [TrustedNode] = []
+    /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
+    @Published private(set) var trustsBack: Set<String> = []
+    /// The keyring row selected, by fingerprint: what Keyring > Compare, Rename and Remove act on.
+    @Published var keyringSelected: String?
+    /// What a Keyring menu action asks the keyring view to open; each ask counts one up.
+    @Published var keyringAsk: KeyringAsk?
     @Published private(set) var nodes: [NodeSummary] = []
     @Published private(set) var peers = 0
     /// The keyring window, as the TUI's status bar says it (K-9).
@@ -156,6 +173,49 @@ final class NodeModel: ObservableObject {
         } catch {
             said = sentence(error)
         }
+        follow()
+    }
+
+    /// Read the node's facts again every few seconds, each published only when it changed: the
+    /// keyring and its window, the nodes on this Mac, the peers. A change made elsewhere (the
+    /// CLI, another client) shows without a notice.
+    private func follow() {
+        following?.cancel()
+        following = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self else { return }
+                await self.readFacts()
+            }
+        }
+    }
+
+    /// The keyring, the nodes on this Mac, the peers and the keyring window, assigned only when
+    /// they changed; and who trusts back, while the keyring is on screen.
+    private func readFacts() async {
+        if let keyring = try? await client.trustList(), keyring != trusted { trusted = keyring }
+        if let fresh = try? await client.nodes(), fresh != nodes { nodes = fresh }
+        if let view = try? await client.view() {
+            if Int(view.peers) != peers { peers = Int(view.peers) }
+            if view.keyring != keyring { keyring = view.keyring }
+        }
+        let ready = lanHelper.status == .enabled
+        if ready != lanHelperReady { lanHelperReady = ready }
+        if selection == .keyring {
+            let back = await readTrustsBack()
+            if back != trustsBack { trustsBack = back }
+        }
+    }
+
+    /// The nodes that trust this one back, from each open room's consents.
+    private func readTrustsBack() async -> Set<String> {
+        var back: Set<String> = []
+        for room in rooms where room.open {
+            if let consents = try? await client.consents(room: room.id) {
+                back.formUnion(consents.inbound)
+            }
+        }
+        return back
     }
 
     /// Rooms whose unread was counted from what the node recorded as read.
@@ -185,7 +245,7 @@ final class NodeModel: ObservableObject {
     func refresh() async {
         do {
             let fresh = try await client.rooms()
-            rooms = fresh.map { r in
+            let now = fresh.map { r in
                 var room = Room(id: r.id, name: name(of: r), open: r.open)
                 if let held = rooms.first(where: { $0.id == r.id }) {
                     room.addressed = held.addressed
@@ -195,20 +255,35 @@ final class NodeModel: ObservableObject {
                 }
                 return room
             }
-            trusted = try await client.trustList()
-            nodes = try await client.nodes()
-            lanHelperReady = lanHelper.status == .enabled
-            let view = try await client.view()
-            peers = Int(view.peers)
-            keyring = view.keyring
+            if now != rooms { rooms = now }
+            await readFacts()
+            let back = await readTrustsBack()
+            if back != trustsBack { trustsBack = back }
         } catch {
             said = sentence(error)
         }
     }
 
+    /// Put `selection` on screen at once: a room switched to shows nothing of the last one while
+    /// its own is read (show reads it).
+    func select(_ selection: Selection?) {
+        guard selection != self.selection else { return }
+        self.selection = selection
+        guard case .room = selection else { return }
+        messages = []
+        readBy = [:]
+        pulled = [:]
+        members = []
+        lanes = []
+        roomServices = []
+        selectedMessage = nil
+        selectedService = nil
+        replyTo = nil
+    }
+
     /// Show `selection`; a room shown is read, so its unread counts end.
     func show(_ selection: Selection?) async {
-        self.selection = selection
+        select(selection)
         if case .decisions = selection {
             decisionEvents = await decisions()
         }
@@ -220,11 +295,19 @@ final class NodeModel: ObservableObject {
             rooms[i].coordination = 0
         }
         do {
-            messages = try await client.read(room: id, after: "", limit: 0)
-            roomServices = (try? await client.services(room: id).shared) ?? []
-            lanes = (try? await client.lanes(room: id)) ?? []
+            // Each read lands only if the room is still the one on screen: a quick switch must not
+            // draw one room's messages under another.
+            let read = try await client.read(room: id, after: "", limit: 0)
+            guard case .room(id) = self.selection else { return }
+            messages = read
+            let services = (try? await client.services(room: id).shared) ?? []
+            let laneRows = (try? await client.lanes(room: id)) ?? []
+            let rows = try await memberRows(id)
+            guard case .room(id) = self.selection else { return }
+            roomServices = services
+            lanes = laneRows
+            members = rows
             watchReads(id)
-            members = try await memberRows(id)
         } catch {
             said = sentence(error)
         }
@@ -260,12 +343,11 @@ final class NodeModel: ObservableObject {
     }
 
     /// The change waiting for the passphrase, made with it; its bytes are wiped at once.
-    func retryKeyring(with typed: Data) async {
-        var bytes = typed
-        defer { bytes.resetBytes(in: 0..<bytes.count) }
+    func retryKeyring(with secret: Secret) async {
+        defer { secret.wipe() }
         guard let waiting = keyringWaiting else { return }
         do {
-            let passphrase = try Passphrase(bytes: bytes)
+            let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
             keyringDid = try await waiting(passphrase)
             keyringFailed = nil
@@ -338,6 +420,18 @@ final class NodeModel: ObservableObject {
         await show(.room(ordered[n - 1].id))
     }
 
+    /// Open the keyring view and ask it for `kind`: the add form, or the selected row's compare,
+    /// rename or remove (M-21).
+    func askKeyring(_ kind: KeyringAsk.Kind) {
+        let row = kind == .add ? nil : keyringSelected
+        guard kind == .add || row != nil else { return }
+        select(.keyring)
+        Task {
+            await show(.keyring)
+            keyringAsk = KeyringAsk(kind: kind, fingerprint: row)
+        }
+    }
+
     /// The room on screen's id, if a room is on screen.
     var roomOnScreen: String? {
         if case let .room(id) = selection { return id }
@@ -345,23 +439,21 @@ final class NodeModel: ObservableObject {
     }
 
     /// Create a room named `name` under `passphrase`, and show it.
-    func createRoom(_ name: String, passphrase typed: Data) async -> Bool {
-        await withPassphrase(typed) { [client] p in try await client.createRoom(name: name, passphrase: p) }
+    func createRoom(_ name: String, passphrase secret: Secret) async -> Bool {
+        await withPassphrase(secret) { [client] p in try await client.createRoom(name: name, passphrase: p) }
     }
 
     /// Join a room by its link and passphrase, and show it. It keeps the name its members gave it.
-    func joinRoom(_ link: String, passphrase typed: Data) async -> Bool {
-        await withPassphrase(typed) { [client] p in
+    func joinRoom(_ link: String, passphrase secret: Secret) async -> Bool {
+        await withPassphrase(secret) { [client] p in
             try await client.joinRoom(link: link, passphrase: p)
         }
     }
 
-    private func withPassphrase(_ typed: Data,
+    private func withPassphrase(_ secret: Secret,
                                 _ act: (Passphrase) async throws -> String) async -> Bool {
-        var bytes = typed
-        defer { bytes.resetBytes(in: 0..<bytes.count) }
         do {
-            let passphrase = try Passphrase(bytes: bytes)
+            let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
             let room = try await act(passphrase)
             await refresh()
@@ -400,12 +492,11 @@ final class NodeModel: ObservableObject {
     }
 
     /// Set the room on screen's retention.
-    func setRetention(_ seconds: UInt64, passphrase typed: Data) async -> Bool {
+    func setRetention(_ seconds: UInt64, passphrase secret: Secret) async -> Bool {
+        defer { secret.wipe() }
         guard let id = roomOnScreen else { return false }
-        var bytes = typed
-        defer { bytes.resetBytes(in: 0..<bytes.count) }
         do {
-            let passphrase = try Passphrase(bytes: bytes)
+            let passphrase = try secret.passphrase()
             defer { passphrase.wipe() }
             try await client.setRetention(room: id, ttlSecs: seconds, identityPassphrase: passphrase)
             did = seconds == 0 ? "Messages here are kept for good."
@@ -489,34 +580,35 @@ final class NodeModel: ObservableObject {
 
     /// The messages drawn on screen are read (R-6): the node is told, as the TUI tells it what it
     /// draws, once each, in batches. This node's own, and those not received yet, are not.
-    func drawn(_ message: RoomMessage) {
-        guard case let .room(room) = selection, message.author != me, !message.owed,
-              !marked.contains(message.id) else { return }
+    func drawn(_ message: RoomMessage, in room: String) {
+        guard case .room(room) = selection, byID[message.id] != nil, message.author != me,
+              !message.owed, !marked.contains(message.id) else { return }
         marked.insert(message.id)
-        unmarked.append(message.id)
+        unmarked[room, default: []].append(message.id)
         guard flushing == nil else { return }
         flushing = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard let self else { return }
-            let ids = self.unmarked
-            self.unmarked = []
+            // Batched by room: a switch inside the batch tells each room only its own.
+            let batches = self.unmarked
+            self.unmarked = [:]
             self.flushing = nil
-            do {
-                try await self.client.markRead(room: room, ids: ids)
-            } catch {
-                // Not recorded: drawn again, it is told again.
-                ids.forEach { self.marked.remove($0) }
-                self.said = sentence(error)
+            for (room, ids) in batches {
+                do {
+                    try await self.client.markRead(room: room, ids: ids)
+                } catch {
+                    // Not recorded: drawn again, it is told again.
+                    ids.forEach { self.marked.remove($0) }
+                    self.said = sentence(error)
+                }
             }
         }
     }
 
     private var marked: Set<String> = []
-    private var unmarked: [String] = []
+    private var unmarked: [String: [String]] = [:]
     private var flushing: Task<Void, Never>?
 
-    /// Who has read this node's messages in `room`, read again every few seconds while it is on
-    /// screen: read records arrive with the room's syncs and draw nothing of their own.
     /// The members of `room` other than this node, with the trust each has here.
     private func memberRows(_ room: String) async throws -> [MemberRow] {
         let roster = try await client.roster(room: room)
@@ -532,29 +624,33 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// The room on screen, read again every few seconds while it is there, each part published
+    /// only when it changed: who has read this node's messages (read records arrive with the
+    /// room's syncs and draw nothing of their own), the lanes, the pulled copies, the services
+    /// shared, and the members with their trust (one who joins while the room is on screen).
     private func watchReads(_ room: String) {
         watching?.cancel()
         watching = Task { [weak self] in
             while !Task.isCancelled {
-                guard let self, case .room(room) = self.selection else { return }
-                if let reads = try? await self.client.readBy(room: room) {
-                    self.readBy = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
-                }
-                if let lanes = try? await self.client.lanes(room: room) {
-                    self.lanes = lanes
-                }
-                if let copies = try? await self.client.pulled(room: room) {
-                    self.pulled = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
-                }
-                // A member who joins, or whose trust changes, while the room is on screen.
-                if let keyring = try? await self.client.trustList(), keyring != self.trusted {
-                    self.trusted = keyring
-                }
-                if let rows = try? await self.memberRows(room), rows != self.members,
-                   case .room(room) = self.selection {
-                    self.members = rows
-                }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, case .room(room) = self.selection else { return }
+                let reads = try? await self.client.readBy(room: room)
+                let laneRows = try? await self.client.lanes(room: room)
+                let copies = try? await self.client.pulled(room: room)
+                let services = try? await self.client.services(room: room).shared
+                let rows = try? await self.memberRows(room)
+                guard case .room(room) = self.selection else { return }
+                if let reads {
+                    let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
+                    if now != self.readBy { self.readBy = now }
+                }
+                if let laneRows, laneRows != self.lanes { self.lanes = laneRows }
+                if let copies {
+                    let now = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
+                    if now != self.pulled { self.pulled = now }
+                }
+                if let services, services != self.roomServices { self.roomServices = services }
+                if let rows, rows != self.members { self.members = rows }
             }
         }
     }

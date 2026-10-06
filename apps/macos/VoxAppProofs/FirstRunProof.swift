@@ -8,7 +8,8 @@
 //
 // What must hold, as a person sees it:
 // 1. At first run the app asks once whether to keep the daemon running while logged in, saying
-//    what that does (ADR-014 M-8); the person says Not Now. Then it lists the Mac's nodes; the person picks one and types its passphrase.
+//    what that does (ADR-014 M-8), and offers the menu bar extra, off until turned on; turned
+//    on, it appears (M-22). The person says Not Now. Then it lists the Mac's nodes; the person picks one and types its passphrase.
 //    A wrong passphrase shows the daemon's own sentence where it was typed.
 // 2. The right one attaches the node: the app says so, and `vox node list` says `attached`.
 // 3. The main window (ADR-028 W-1, W-2; ADR-014 M-13): ⌘N makes the room and shows it; bob joins
@@ -47,8 +48,9 @@
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
-// addressed to this node grouped as quiet (`attention::group`), or an inspector that lists the
-// members only when the room is opened: (3) goes red. The timeline drops
+// addressed to this node grouped as quiet (`attention::group`): (3) goes red. An app that never
+// reads the menu bar choice again (its delegate not observed): (1) goes red. An inspector
+// that lists the members only when the room is opened: (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
@@ -128,6 +130,12 @@ final class FirstRunProof: XCTestCase {
         let whyWords = why.label.isEmpty ? (why.value as? String ?? "") : why.label
         XCTAssertTrue(whyWords.contains("keeps your rooms reachable while you are logged in, even with the app closed"),
                       "PRODUCT: the login item question must say what it does; it said: \(whyWords)")
+        // The menu bar extra, offered here and off until turned on (M-22): turned on, it is there.
+        XCTAssertTrue(ui.statusItems.count == 0,
+                      "PRODUCT: the menu bar extra must be off until the person turns it on")
+        ui.checkBoxes["menu-bar-offer"].click()
+        XCTAssertTrue(ui.statusItems.firstMatch.waitForExistence(timeout: 10),
+                      "PRODUCT: \"Show Vox in the menu bar\" was turned on and no menu bar item appeared")
         ui.buttons["login-item-not-now"].click()
         let pick = ui.buttons["node-alice"]
         XCTAssertTrue(pick.waitForExistence(timeout: 30),

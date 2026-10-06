@@ -170,10 +170,29 @@ private struct PassphraseForm: View {
     }
 
     private func submit() {
-        let bytes = field.take()
+        // Return and the Attach button may both ask: the second finds the field empty.
+        guard let secret = field.take() else { return }
         let keep = keepInKeychain
-        Task { await model.attach(node, passphrase: bytes, keepInKeychain: keep) }
+        Task { await model.attach(node, passphrase: secret, keepInKeychain: keep) }
     }
+}
+
+/// Typed passphrase bytes with one owner, so wiping them wipes the only copy the app made (M-5).
+/// They are wiped as soon as they become a `Passphrase`, and when dropped.
+final class Secret: @unchecked Sendable {
+    private var bytes: Data
+
+    init(_ bytes: Data) { self.bytes = bytes }
+
+    /// A `Passphrase` of the bytes, which are wiped at once, whether or not it could be made.
+    func passphrase() throws -> Passphrase {
+        defer { wipe() }
+        return try Passphrase(bytes: bytes)
+    }
+
+    func wipe() { bytes.resetBytes(in: 0..<bytes.count) }
+
+    deinit { wipe() }
 }
 
 /// Holds the secure field, so its bytes are taken and the field cleared at once.
@@ -181,16 +200,19 @@ private struct PassphraseForm: View {
 final class SecureFieldHolder {
     let field = NSSecureTextField()
 
-    /// The typed bytes; the field is emptied.
-    func take() -> Data {
-        let bytes = Data(field.stringValue.utf8)
+    /// The typed bytes, the field emptied; nil when nothing was typed (or it was already taken).
+    func take() -> Secret? {
+        let text = field.stringValue
         field.stringValue = ""
-        return bytes
+        guard !text.isEmpty else { return nil }
+        return Secret(Data(text.utf8))
     }
 }
 
-/// An `NSSecureTextField`: its text is read only by `SecureFieldHolder.take`, never bound to a
-/// Swift `String` that outlives the keystroke.
+/// An `NSSecureTextField`, read only by `SecureFieldHolder.take`. What M-5 leaves: AppKit holds
+/// the typed text in the field until it is emptied, and `take` reads it once as a Swift `String`,
+/// which cannot be wiped and is freed, not cleared. The bytes the app hands on are a `Secret`,
+/// wiped in place once used.
 struct SecureInput: NSViewRepresentable {
     let holder: SecureFieldHolder
     let onSubmit: () -> Void

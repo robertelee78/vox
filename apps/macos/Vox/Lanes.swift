@@ -10,8 +10,7 @@ extension NodeModel {
     /// Whether the room on screen has agents' nodes as members, so the lanes view is offered: a
     /// member whose lane is working, ready or done, or that announced a session.
     var roomHasAgents: Bool {
-        lanes.contains { ["working", "ready", "done"].contains($0.state) }
-            || messages.contains { $0.kind == "hello" && $0.author != me }
+        helloSeen || lanes.contains { ["working", "ready", "done"].contains($0.state) }
     }
 }
 
@@ -81,7 +80,10 @@ private struct LaneColumn: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("lane-\(name)")
         .onDisappear {
-            if let last = posts.last { model.laneLooked[lane.fingerprint] = last.id }
+            // After the update that removes the column, not inside it.
+            guard let last = posts.last else { return }
+            let (model, member) = (model, lane.fingerprint)
+            DispatchQueue.main.async { model.laneLooked[member] = last.id }
         }
     }
 
@@ -110,10 +112,10 @@ struct ComposerAddress: View {
                         set: { on in if on { to.insert(member.id) } else { to.remove(member.id) } }))
                 }
             } label: {
-                Text(to.isEmpty ? "To: the room" : "To: " + model.members
-                    .filter { to.contains($0.id) }.map(\.name).joined(separator: ", "))
+                Text(addressed).lineLimit(1).truncationMode(.tail)
             }
-            .fixedSize()
+            .frame(maxWidth: 160)
+            .accessibilityLabel(addressedInFull)
             .accessibilityIdentifier("compose-to")
             Toggle("Urgent", isOn: $urgent)
                 .fixedSize()
@@ -121,5 +123,21 @@ struct ComposerAddress: View {
                 .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
         }
         .font(Theme.eyebrow)
+    }
+
+    private var names: [String] { model.members.filter { to.contains($0.id) }.map(\.name) }
+
+    /// Short enough for the composer's row at the window's narrowest: one name, or how many.
+    private var addressed: String {
+        switch names.count {
+        case 0: return "To: the room"
+        case 1: return "To: \(names[0])"
+        default: return "To: \(names.count) members"
+        }
+    }
+
+    /// Every name, for VoiceOver and the proofs.
+    private var addressedInFull: String {
+        names.isEmpty ? "To: the room" : "To: " + names.joined(separator: ", ")
     }
 }

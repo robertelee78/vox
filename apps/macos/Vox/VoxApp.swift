@@ -5,6 +5,7 @@
 // client holds it.
 
 import AppKit
+import Combine
 import SwiftUI
 
 @main
@@ -32,10 +33,18 @@ struct VoxApp: App {
     }
 }
 
-/// The app's lifecycle: start on launch, let go of the node on quit.
+/// The app's lifecycle: start on launch, let go of the node on quit. Observed by the app, which
+/// reads the menu bar choice from it: a change of that choice is passed on, and nothing else.
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     let model = AppModel()
+    private var menuBarChanges: AnyCancellable?
+
+    override init() {
+        super.init()
+        menuBarChanges = model.$menuBar.removeDuplicates().dropFirst()
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+    }
     /// SIGTERM, SIGHUP and SIGINT, each a clean quit (ADR-026 S-4).
     private var stops: [DispatchSourceSignal] = []
 

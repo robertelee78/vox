@@ -58,12 +58,19 @@ struct MenuBarFacts {
 struct MenuBarContent: View {
     @ObservedObject var app: AppModel
     @State private var facts = MenuBarFacts()
+    /// Whether the extra's window is open: a window-style extra keeps its content between opens,
+    /// so its facts are read again each time it opens.
+    @StateObject private var window = WindowSeen()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let model = app.node {
                 NodeFacts(model: model, facts: facts)
                     .task { facts = await model.menuBarFacts() }
+                    .onChange(of: window.seen) { open in
+                        guard open else { return }
+                        Task { facts = await model.menuBarFacts() }
+                    }
             } else {
                 Text("Vox is not acting as a node yet.").secondaryText()
             }
@@ -77,6 +84,7 @@ struct MenuBarContent: View {
         }
         .padding(12)
         .frame(width: 320)
+        .background(WindowReader(seen: window))
         .font(Theme.text)
     }
 }

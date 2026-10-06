@@ -31,20 +31,20 @@ struct DecisionsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Text("Decision record").font(Theme.heading)
+            // Two filters that share the room's width: they fit the window's narrowest.
             HStack {
-                Text("Decision record").font(Theme.heading)
-                Spacer()
                 Picker("About", selection: $about) {
                     Text("every node").tag(String?.none)
                     ForEach(nodes, id: \.0) { Text($0.1).tag(String?.some($0.0)) }
                 }
-                .frame(width: 220)
+                .frame(minWidth: 140, maxWidth: 220)
                 .accessibilityIdentifier("decisions-about")
                 Picker("Room", selection: $inRoom) {
                     Text("every room").tag(String?.none)
                     ForEach(roomsNamed, id: \.0) { Text($0.1).tag(String?.some($0.0)) }
                 }
-                .frame(width: 220)
+                .frame(minWidth: 140, maxWidth: 220)
                 .accessibilityIdentifier("decisions-room")
             }
             Text("What this node refused, and every change of who reaches it, kept 14 days and "
@@ -66,7 +66,8 @@ struct DecisionsView: View {
         .task {
             // Read again every few seconds while on screen: the node appends as it decides.
             while !Task.isCancelled {
-                model.decisionEvents = await model.decisions()
+                let now = await model.decisions()
+                if now != model.decisionEvents { model.decisionEvents = now }
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }

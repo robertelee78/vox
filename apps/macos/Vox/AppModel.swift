@@ -43,7 +43,9 @@ final class AppModel: ObservableObject {
 
     /// Whether the person chose Keep Running at first run: then a node is kept attached when the
     /// app quits, once its passphrase is in the Keychain or it needs none (ADR-014 M-6, M-8).
-    var keepRunning: Bool { Daemon.kept() == true }
+    /// Read once, then kept as the person answers: views read it as they draw, and the answer is
+    /// a file.
+    private(set) var keepRunning = Daemon.kept() == true
 
     /// Whether the app holds a node the daemon is to let go of when it quits.
     var holdsNode: Bool {
@@ -64,6 +66,7 @@ final class AppModel: ObservableObject {
     /// The person's answer at first run: keep the daemon running while logged in, or not now.
     func answerLoginItem(keep: Bool) async {
         Daemon.remember(kept: keep)
+        keepRunning = keep
         guard keep else {
             await reach()
             return
@@ -116,19 +119,16 @@ final class AppModel: ObservableObject {
 
     /// Attach `node` with the passphrase typed for it; the bytes go into a `Passphrase` at once
     /// and are not kept here (M-5).
-    func attach(_ node: String, passphrase typed: Data, keepInKeychain: Bool = false) async {
-        var bytes = typed
+    func attach(_ node: String, passphrase secret: Secret, keepInKeychain: Bool = false) async {
         guard let client else { return }
         phase = .attaching(node: node)
         let passphrase: Passphrase
         do {
-            passphrase = try Passphrase(bytes: bytes)
+            passphrase = try secret.passphrase()
         } catch {
-            bytes.resetBytes(in: 0..<bytes.count)
             phase = .passphrase(node: node, said: sentence(error))
             return
         }
-        bytes.resetBytes(in: 0..<bytes.count)
         defer { passphrase.wipe() }
         do {
             // Kept (K-10, opt-in): the daemon attaches it with the passphrase, stores that in the

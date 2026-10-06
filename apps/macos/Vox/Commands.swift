@@ -42,6 +42,8 @@ extension VoxAction {
     @MainActor static func all(_ node: NodeModel?) -> [VoxAction] {
         let live = node != nil
         let inRoom = node?.roomOnScreen != nil
+        // A keyring row selected, in the keyring view: what Compare, Rename and Remove act on.
+        let picked = node?.selection == .keyring && node?.keyringSelected != nil
         let digits: [VoxAction] = (1...9).map { n in
             VoxAction("View", "Room \(n)", KeyEquivalent(Character("\(n)")), enabled: live) {
                 Task { await node?.showRoom(at: n) }
@@ -71,10 +73,10 @@ extension VoxAction {
             VoxAction("Room", "Leave…", enabled: inRoom) { node?.sheet = .leave },
             VoxAction("Room", "End for Everyone…", enabled: inRoom) { node?.sheet = .end },
             VoxAction("Node", "Show Fingerprint", "i", enabled: live) { node?.sheet = .fingerprint },
-            VoxAction("Keyring", "Add…", enabled: live) { Task { await node?.show(.keyring) } },
-            VoxAction("Keyring", "Compare…", enabled: live) { Task { await node?.show(.keyring) } },
-            VoxAction("Keyring", "Rename…", enabled: live) { Task { await node?.show(.keyring) } },
-            VoxAction("Keyring", "Remove…", enabled: live) { Task { await node?.show(.keyring) } },
+            VoxAction("Keyring", "Add…", enabled: live) { node?.askKeyring(.add) },
+            VoxAction("Keyring", "Compare…", enabled: picked) { node?.askKeyring(.compare) },
+            VoxAction("Keyring", "Rename…", enabled: picked) { node?.askKeyring(.rename) },
+            VoxAction("Keyring", "Remove…", enabled: picked) { node?.askKeyring(.remove) },
             VoxAction("View", "Command Palette", "k", enabled: live) { node?.sheet = .palette },
             VoxAction("View", "Room", enabled: inRoom) { node?.showLanes = false },
             VoxAction("View", "Lanes", "l", [.command, .shift],
@@ -241,11 +243,12 @@ private struct RoomForm: View {
     }
 
     private func submit() {
-        let bytes = field.take()
+        // Return and the button may both ask: the second finds the field empty.
+        guard let secret = field.take() else { return }
         let (l, n) = (link, name)
         Task {
-            let ok = joining ? await model.joinRoom(l, passphrase: bytes)
-                : await model.createRoom(n, passphrase: bytes)
+            let ok = joining ? await model.joinRoom(l, passphrase: secret)
+                : await model.createRoom(n, passphrase: secret)
             if ok { model.sheet = nil }
         }
     }
@@ -319,9 +322,9 @@ private struct RetentionSheet: View {
     }
 
     private func submit() {
-        let bytes = field.take()
+        guard let secret = field.take() else { return }
         let s = seconds
-        Task { if await model.setRetention(s, passphrase: bytes) { model.sheet = nil } }
+        Task { if await model.setRetention(s, passphrase: secret) { model.sheet = nil } }
     }
 }
 

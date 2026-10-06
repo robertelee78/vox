@@ -4,11 +4,23 @@
 
 import SwiftUI
 
+/// What a Keyring menu action asks the keyring view to open (M-21): the add form, or the
+/// selected row's compare, rename or remove.
+struct KeyringAsk: Equatable {
+    enum Kind { case add, compare, rename, remove }
+    let kind: Kind
+    /// The row it is for; nil for add.
+    let fingerprint: String?
+    /// Each ask is new, so asking the same twice opens it twice.
+    let id = UUID()
+}
+
 struct KeyringView: View {
     @ObservedObject var model: NodeModel
     @State private var fingerprint = ""
     @State private var alias = ""
     @State private var removing: TrustedNode?
+    @FocusState private var adding: Bool
 
     var body: some View {
         ScrollView {
@@ -36,6 +48,10 @@ struct KeyringView: View {
                 }
                 ForEach(model.trusted, id: \.fingerprint) { node in
                     KeyringRow(model: model, node: node) { removing = node }
+                        .background(model.keyringSelected == node.fingerprint
+                                    ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
+                        .contentShape(Rectangle())
+                        .onTapGesture { model.keyringSelected = node.fingerprint }
                 }
             }
             .padding(24)
@@ -43,6 +59,15 @@ struct KeyringView: View {
         }
         .sheet(item: Binding(get: { removing.map(Removal.init) }, set: { removing = $0?.node })) {
             RemoveSheet(model: model, node: $0.node) { removing = nil }
+        }
+        .onChange(of: model.keyringAsk) { ask in
+            guard let ask else { return }
+            switch ask.kind {
+            case .add: adding = true
+            case .remove:
+                removing = model.trusted.first { $0.fingerprint == ask.fingerprint }
+            case .compare, .rename: break // the row opens its own
+            }
         }
     }
 
@@ -53,6 +78,7 @@ struct KeyringView: View {
             Text("ADD A NODE").font(Theme.eyebrow).secondaryText()
             TextField("Fingerprint (paste or type)", text: $fingerprint)
                 .font(Theme.mono)
+                .focused($adding)
                 .accessibilityIdentifier("keyring-add-fingerprint")
             TextField("Alias", text: $alias)
                 .accessibilityIdentifier("keyring-add-alias")
@@ -116,7 +142,9 @@ private struct KeyringRow: View {
                 .font(Theme.mono)
                 .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    TrustMark(name: node.name, trust: .oneWay)
+                    // ⇄ once it trusts this node back, → until then (L-4).
+                    TrustMark(name: node.name,
+                              trust: model.trustsBack.contains(node.fingerprint) ? .mutual : .oneWay)
                     Text(card.grouped).font(Theme.mono).textSelection(.enabled)
                         .accessibilityIdentifier("keyring-fingerprint-\(node.name)")
                 }
@@ -159,6 +187,14 @@ private struct KeyringRow: View {
         .padding(.vertical, 8)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("keyring-row-\(node.name)")
+        .onChange(of: model.keyringAsk) { ask in
+            guard let ask, ask.fingerprint == node.fingerprint else { return }
+            switch ask.kind {
+            case .compare: comparing = true; other = ""
+            case .rename: renaming = true; newAlias = node.name
+            case .add, .remove: break
+            }
+        }
     }
 }
 
@@ -223,7 +259,7 @@ private struct KeyringPassphrase: View {
     }
 
     private func submit() {
-        let bytes = field.take()
-        Task { await model.retryKeyring(with: bytes) }
+        guard let secret = field.take() else { return }
+        Task { await model.retryKeyring(with: secret) }
     }
 }

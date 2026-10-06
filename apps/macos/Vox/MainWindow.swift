@@ -16,7 +16,8 @@ struct MainWindow: View {
             } detail: {
                 switch model.selection {
                 case let .room(id):
-                    RoomView(model: model, room: id)
+                    // One view per room: its draft, To:, urgent and attachment do not carry over.
+                    RoomView(model: model, room: id).id(id)
                 case .keyring:
                     KeyringView(model: model)
                 case .decisions:
@@ -46,8 +47,12 @@ private struct Sidebar: View {
     @ObservedObject var model: NodeModel
 
     var body: some View {
+        // Selected at once, then read: the list never sees the old selection come back.
         List(selection: Binding(get: { model.selection },
-                                set: { s in Task { await model.show(s) } })) {
+                                set: { s in
+                                    model.select(s)
+                                    Task { await model.show(s) }
+                                })) {
             Section {
                 StateMark(kind: .live, words: "node \(model.node), attached")
                     .accessibilityIdentifier("attached")
@@ -118,6 +123,9 @@ private struct RoomView: View {
     @State private var urgent = false
     /// The rows inside the visible part of the timeline, as last measured.
     @State private var inView: Set<String> = []
+    /// The newest message when the messages last changed: if it was in view, the timeline follows
+    /// the next one; scrolled up to read, it stays (as the TUI does, V210-82).
+    @State private var newest: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -184,9 +192,11 @@ private struct RoomView: View {
                                 markSeen()
                             }
                             .onChange(of: model.messages.count) { _ in
-                                if let last = model.messages.last {
+                                let following = newest == nil || inView.contains(newest ?? "")
+                                if following, let last = model.messages.last {
                                     scroller.scrollTo(last.id, anchor: .bottom)
                                 }
+                                newest = model.messages.last?.id
                             }
                         }
                     }
@@ -200,26 +210,7 @@ private struct RoomView: View {
                         _ = firstFile(in: providers) { attaching = Attaching(url: $0) }
                     }
                     .accessibilityIdentifier("timeline")
-                    .sheet(item: $attaching) { file in
-                        AttachSheet(model: model, file: file) { attaching = nil }
-                    }
                     .quickLookPreview($looking)
-                    .onChange(of: model.attachAsked) { _ in
-                        if let url = chooseFile() { attaching = Attaching(url: url) }
-                    }
-                    .onChange(of: model.urgentAsked) { _ in send(urgent: true) }
-                    .onChange(of: model.incoming) { url in
-                        if let url {
-                            attaching = Attaching(url: url)
-                            model.incoming = nil
-                        }
-                    }
-                    .onAppear {
-                        if let url = model.incoming {
-                            attaching = Attaching(url: url)
-                            model.incoming = nil
-                        }
-                    }
                 }
                 Divider()
                 if let reply = model.replyTo {
@@ -256,6 +247,27 @@ private struct RoomView: View {
             Inspector(model: model, room: room)
                 .frame(width: 240)
         }
+        // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
+        // with the lanes view shown too.
+        .sheet(item: $attaching) { file in
+            AttachSheet(model: model, file: file) { attaching = nil }
+        }
+        .onChange(of: model.attachAsked) { _ in
+            if let url = chooseFile() { attaching = Attaching(url: url) }
+        }
+        .onChange(of: model.urgentAsked) { _ in send(urgent: true) }
+        .onChange(of: model.incoming) { url in
+            if let url {
+                attaching = Attaching(url: url)
+                model.incoming = nil
+            }
+        }
+        .onAppear {
+            if let url = model.incoming {
+                attaching = Attaching(url: url)
+                model.incoming = nil
+            }
+        }
     }
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
@@ -271,8 +283,8 @@ private struct RoomView: View {
     /// The rows in view are read, only while the window is in front of the person (R-6).
     private func markSeen() {
         guard window.seen else { return }
-        for message in model.messages where inView.contains(message.id) {
-            model.drawn(message)
+        for id in inView {
+            if let message = model.byID[id] { model.drawn(message, in: room) }
         }
     }
 }
@@ -453,7 +465,7 @@ private struct StatusBar: View {
             if let did = model.did {
                 Text(did)
             }
-if model.notifying == false {
+            if model.notifying == false {
                 // M-23: said where the person works, so a missing notification is explained.
                 Text("notifications off (System Settings, Notifications, Vox)")
                     .accessibilityIdentifier("notifications-off")
@@ -468,8 +480,24 @@ if model.notifying == false {
         .font(Theme.mono)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .accessibilityElement(children: .combine)
+        // A container, so "notifications-off" keeps its identifier; its label says the whole bar.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("status")
+        .accessibilityLabel(words)
+    }
+
+    /// The bar, in words.
+    private var words: String {
+        var parts = ["node \(model.node)", model.peers == 1 ? "1 peer" : "\(model.peers) peers",
+                     model.keyring]
+        if let did = model.did { parts.append(did) }
+        if model.notifying == false {
+            parts.append("notifications off (System Settings, Notifications, Vox)")
+        }
+        if let ended = model.ended { parts.append(ended) } else if let said = model.said {
+            parts.append(said)
+        }
+        return parts.filter { !$0.isEmpty }.joined(separator: ", ")
     }
 }
 
