@@ -85,10 +85,13 @@ struct Product: Error, CustomStringConvertible {
     var description: String { "PRODUCT: \(why)" }
 }
 
-/// What an element says to VoiceOver: its label, or, for text, its value (a status bar of combined
-/// text reads as its value).
+/// What an element says to VoiceOver: its label, else its value (a Text's words), else its title
+/// (a menu button's).
 func shown(_ element: XCUIElement) -> String {
-    element.label.isEmpty ? (element.value as? String ?? "") : element.label
+    if !element.label.isEmpty { return element.label }
+    if let value = element.value as? String, !value.isEmpty { return value }
+    // A menu button's words are its title.
+    return element.title
 }
 
 /// Refuse (APPARATUS) to launch the app with a data root or config directory outside this run's
