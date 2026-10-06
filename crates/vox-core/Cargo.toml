@@ -41,6 +41,10 @@ region.workspace = true
 curve25519-dalek.workspace = true
 subtle.workspace = true
 equihash.workspace = true
+# An image share's preview (ADR-028 F-9, `node::preview`).
+image.workspace = true
+blurhash.workspace = true
+base64.workspace = true
 blake2b_simd.workspace = true
 # Transport substrate (ADR-011, M9).
 quinn.workspace = true
