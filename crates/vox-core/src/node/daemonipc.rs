@@ -153,6 +153,10 @@ pub enum KeepSource {
     None,
     /// The first line of this file; the rest open rooms, as a piped `vox daemon`'s do.
     File(std::path::PathBuf),
+    /// Stored by the daemon in the macOS login keychain under this account (ADR-028 K-10), when
+    /// Vox.app asks it to keep the node it attaches with that passphrase (ADR-014 M-6). A client
+    /// asks with any account; the daemon stores it under the node's own directory.
+    Keychain(String),
 }
 
 /// A request to the daemon itself, with no `Use` (ADR-026 C-2).
@@ -670,6 +674,9 @@ impl Opening {
                         Some(KeepSource::File(p)) => {
                             e.array(1).text(&p.to_string_lossy());
                         }
+                        Some(KeepSource::Keychain(account)) => {
+                            e.array(2).text("keychain").text(account);
+                        }
                     }
                     e.array(rooms.len());
                     for r in rooms {
@@ -756,6 +763,12 @@ impl Opening {
                         } else {
                             KeepSource::File(p.into())
                         })
+                    }
+                    2 => {
+                        if text(&mut d, "ipc attach keep")? != "keychain" {
+                            return Err(Error::MalformedIpc("ipc attach keep"));
+                        }
+                        Some(KeepSource::Keychain(text(&mut d, "ipc attach keep")?))
                     }
                     _ => return Err(Error::MalformedIpc("ipc attach keep")),
                 };

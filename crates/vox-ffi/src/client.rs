@@ -22,7 +22,7 @@ use vox_core::error::{Error, IpcHandshake};
 use vox_core::hash::Digest32;
 use vox_core::node::api::{MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
-    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, NodeName, NodeState, UseNode,
+    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
 use vox_core::node::link::b32_encode;
@@ -706,6 +706,42 @@ impl VoxClient {
             Ok(me)
         })
         .await
+    }
+
+    /// Attach `node` so that it stays attached when the app quits, and again whenever the daemon
+    /// starts (ADR-014 M-6, ADR-028 K-10): with `passphrase`, the daemon stores it in the login
+    /// keychain and reads it from there at its next start; with none, for a node that needs none,
+    /// nothing is stored. The node must not be attached already, so a passphrase is stored only
+    /// once it has attached the node. Then [`VoxClient::attach`] acts as it.
+    ///
+    /// # Errors
+    /// The daemon's refusal (a wrong passphrase, the node already attached), or the node attached
+    /// but not kept, with why.
+    pub async fn keep(
+        &self,
+        node: String,
+        passphrase: Option<Arc<Passphrase>>,
+    ) -> Result<(), VoxError> {
+        let name = NodeName::parse(&node).map_err(|e| failed(e.to_string()))?;
+        let keep = if passphrase.is_some() {
+            KeepSource::Keychain(String::new())
+        } else {
+            KeepSource::None
+        };
+        let req = DaemonRequest::Attach {
+            node: name,
+            passphrase: passphrase.as_ref().map(|p| p.copy()),
+            keep: Some(keep),
+            rooms: Vec::new(),
+            anchors: Vec::new(),
+        };
+        match self.daemon(req).await? {
+            DaemonFrame::Attached(info, _) if info.keep => Ok(()),
+            DaemonFrame::Attached(_, notes) => Err(failed(notes.join("; "))),
+            _ => Err(failed(format!(
+                "the vox daemon did not say node {node} is kept"
+            ))),
+        }
     }
 
     /// Stop holding the node: the daemon detaches it unless it is kept or held by another client.

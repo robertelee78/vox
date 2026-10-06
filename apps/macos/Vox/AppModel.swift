@@ -30,6 +30,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var node: NodeModel?
     private var client: VoxClient?
 
+    /// Whether the person chose Keep Running at first run: then a node is kept attached when the
+    /// app quits, once its passphrase is in the Keychain or it needs none (ADR-014 M-6, M-8).
+    var keepRunning: Bool { Daemon.kept() == true }
+
     /// Whether the app holds a node the daemon is to let go of when it quits.
     var holdsNode: Bool {
         if case .attached = phase { return true }
@@ -101,7 +105,7 @@ final class AppModel: ObservableObject {
 
     /// Attach `node` with the passphrase typed for it; the bytes go into a `Passphrase` at once
     /// and are not kept here (M-5).
-    func attach(_ node: String, passphrase typed: Data) async {
+    func attach(_ node: String, passphrase typed: Data, keepInKeychain: Bool = false) async {
         var bytes = typed
         guard let client else { return }
         phase = .attaching(node: node)
@@ -116,6 +120,11 @@ final class AppModel: ObservableObject {
         bytes.resetBytes(in: 0..<bytes.count)
         defer { passphrase.wipe() }
         do {
+            // Kept (K-10, opt-in): the daemon attaches it with the passphrase, stores that in the
+            // login keychain, and keeps it attached past this app's quit.
+            if keepRunning && keepInKeychain {
+                try await client.keep(node: node, passphrase: passphrase)
+            }
             let fingerprint = try await client.attach(node: node, passphrase: passphrase)
             remember(node, client)
             enter(node, fingerprint, client)
@@ -130,12 +139,17 @@ final class AppModel: ObservableObject {
         client = nil
     }
 
-    /// Attach a node already attached (no passphrase needed), else ask for its passphrase.
+    /// Attach the node: one already attached, or one that needs no passphrase, at once; else ask
+    /// for its passphrase. With Keep Running chosen, a node that needs no passphrase is kept as it
+    /// attaches (M-6).
     private func use(_ node: NodeSummary) async {
         guard let client else { return }
-        guard node.state == "attached" else {
-            phase = .passphrase(node: node.name, said: nil)
-            return
+        if node.state != "attached" && keepRunning {
+            // Refused for a node that has a passphrase, which is then asked for.
+            if (try? await client.keep(node: node.name, passphrase: nil)) == nil {
+                phase = .passphrase(node: node.name, said: nil)
+                return
+            }
         }
         phase = .attaching(node: node.name)
         do {
@@ -143,7 +157,9 @@ final class AppModel: ObservableObject {
             remember(node.name, client)
             enter(node.name, fingerprint, client)
         } catch {
-            phase = .passphrase(node: node.name, said: sentence(error))
+            // A node not attached that wants its passphrase: asked for, with nothing said yet.
+            phase = .passphrase(node: node.name,
+                                said: node.state == "attached" ? sentence(error) : nil)
         }
     }
 
