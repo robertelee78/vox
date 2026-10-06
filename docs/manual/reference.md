@@ -76,6 +76,17 @@ Inside the data root:
 
 ### The decision record
 
+`vox status` lists the most recent refusals near its top, newest first:
+
+```text
+recent refusals
+  4s ago  refused 34rtzgeq333h to join a room: answering 34rtzgeq333h: join proof-of-possession failed
+```
+
+In the TUI, `d` on the room list, or `:decisions`, shows the whole record, newest first, titled
+`Decisions (newest first · kept 14 days · Esc: back)`. (`vox status` also begins with this node's
+own fingerprint, in groups beside its art.)
+
 Each node writes down every refusal and every change of access it decides: a join or a tunnel it
 refused, a session it cut, a node added to or removed from its keyring, a share it stopped. One
 JSON line per decision goes to `nodes/NAME/decisions/YYYY-MM-DD.jsonl`, one file per UTC day,

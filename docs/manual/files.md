@@ -34,8 +34,17 @@ attached, until the first of these:
 - you leave the room, or it ends;
 - `--count N` fetches have completed, or `--for` has passed (`90s`, `10m`, `2h`), if you gave either.
 
-A folder is shared as one tar file named after it: `vox share ROOM_ID ./photos` shares
-`photos.tar`.
+A folder is shared as its files: `vox share ROOM_ID ./docs` says `sharing docs/ (5 files, 3500
+bytes)`, and its message lists every file with its size and SHA-256. A member pulls the folder as
+a folder, `docs/`, checking each file on its own. When you share the folder again after changing
+it, a member's node fetches only the files that are new or changed, and a pull that was cut off
+goes on from the files it already has.
+
+An image share also carries, inside the encrypted message, a small preview (at most 16 KB), a
+BlurHash and the image's size, so a member sees what it is before pulling it, even while you are
+offline. The TUI draws an image inline, in a terminal that can (kitty, iTerm2, sixel, or with
+half-block characters otherwise), and only once your node has pulled it and its SHA-256 matches;
+one that is not pulled or does not match is named, never drawn.
 
 The share is a message. `-m` adds a note, which members read with the file's name and size.
 `--to` addresses it like a message: `--to carol` for one member, repeated for several. Give your
@@ -77,7 +86,7 @@ To pull a share your node did not pull, such as one addressed to someone else:
 vox room get ROOM_ID notes.txt
 ```
 
-The selector is the announced name (`photos.tar` for a shared folder), a SHA-256 prefix or the
+The selector is the announced name (`docs` for a shared folder), a SHA-256 prefix or the
 share's tag. If names collide, use the more specific identifier. Without `--dir` or `--out`, the
 file goes into the same files directory, and Vox prints its full path:
 
@@ -85,7 +94,8 @@ file goes into the same files directory, and Vox prints its full path:
 vox: DATA_ROOT/nodes/ann/files/ROOM_ID/notes.txt (15 bytes) matches its announced SHA-256
 ```
 
-`--dir ./incoming` puts it in another directory, under the sender's name made safe for local use.
+A folder pulled by hand says how much it fetched: `DATA_ROOT/…/docs/ (5 files: 5 fetched, 0
+already here) matches its announced SHA-256s`. `--dir ./incoming` puts it in another directory, under the sender's name made safe for local use.
 `--out ./incoming/final.txt` names an exact path, which must not already exist: Vox refuses with
 `already exists; vox room get never overwrites a file`. A copy you put elsewhere with `--dir` or
 `--out` is yours, and Vox never removes it.
