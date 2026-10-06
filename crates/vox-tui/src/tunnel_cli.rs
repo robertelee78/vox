@@ -382,7 +382,7 @@ pub fn service_needs(
     let mut needs = Vec::new();
     if theirs {
         needs.push((
-            format!("{who} trusts this node"),
+            format!("{who} trusts this node (as the room's log says)"),
             s.trusts_you,
             format!(
                 "{who} must trust this node: there, `vox trust add` the fingerprint `vox id` \

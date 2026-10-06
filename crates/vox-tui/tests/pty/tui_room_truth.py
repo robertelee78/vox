@@ -76,8 +76,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             weights and words are as in truecolour; in 256 colours (TERM=xterm-256color) Alice's
             name is index 255 and Carol's 247. In each the accent is on the focused border alone.
   copies    Alice shares an ssh stand-in; in Bob's TUI the room's Shared pane lists it, and `y` on it
-            puts `ssh $USER@<its canonical address>` on the clipboard by OSC 52 and says "copied:"
-            on the status line, the address the one Alice's `vox service list --json` gives
+            puts `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full
+            under the service and says "copied" on the status line, the address the one Alice's
+            `vox service list --json` gives
             (ADR-028 S-3, #490).
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
@@ -524,8 +525,11 @@ try:
     m = re.search(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(\x07|\x1b\\)", sent)
     copied = base64.b64decode(m.group(1)).decode() if m else None
     bar = tui.display()[-1] + tui.display()[-2]
-    claim("copies", copied == SSH_COPY and "copied: ssh $USER@" in bar,
-          f"OSC 52 carried {copied!r}, want {SSH_COPY!r}; status line: {bar.strip()!r}")
+    # The command, printed in full and wrapped under the selected service: the pane's rows, joined.
+    printed = "".join(r.strip().strip("│").strip() for r in shared_pane())
+    claim("copies", copied == SSH_COPY and "copied to the clipboard" in bar and SSH_COPY in printed,
+          f"OSC 52 carried {copied!r}, want {SSH_COPY!r}; printed in the Shared pane: "
+          f"{SSH_COPY in printed}; status line: {bar.strip()!r}")
     # Back round to the members pane, where the stages after this one expect focus.
     for _ in range(3):
         tui.key("\t", 0.5)

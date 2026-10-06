@@ -1516,9 +1516,15 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
             // **Copied, and said** (ADR-028 S-3): the command is on the status line too, for a
             // terminal that does not take OSC 52.
             Action::Copy(text) => {
+                // The command itself is printed in full in the Shared pane, wrapped; a status
+                // line is one row, which it does not fit.
                 ui.status_message = Some(match io.copy(&text) {
-                    Ok(()) => format!("copied: {text}"),
-                    Err(e) => format!("could not copy ({e}); the command: {text}"),
+                    Ok(()) => {
+                        "copied to the clipboard: the command shown in the Shared pane".into()
+                    }
+                    Err(e) => {
+                        format!("could not copy ({e}); the command is shown in the Shared pane")
+                    }
                 });
             }
             Action::Dispatch(cmd) => {

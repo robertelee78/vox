@@ -674,6 +674,22 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
          {}",
         String::from_utf8_lossy(&ssh_out.stderr)
     );
+    // The copy must carry the canonical address because the readable one differs between the two
+    // machines: each names the room, and the host, in its own words (ADR-028 S-1a).
+    let readable = |list: &str| {
+        list.lines()
+            .find(|l| l.trim_start().starts_with("nas-ssh.") && l.contains("  by "))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (host_readable, guest_readable) = (readable(&host_list), readable(&guest_list));
+    assert!(
+        !host_readable.is_empty() && !guest_readable.is_empty() && host_readable != guest_readable,
+        "APPARATUS: the host and the guest must name nas-ssh differently, or a copy of the readable \
+         address would work too and this would not show the canonical one is what travels: host \
+         {host_readable:?}, guest {guest_readable:?}"
+    );
     // What it needs, and that it holds: the host trusts the guest, and is online.
     let trust_line = guest_list
         .lines()
