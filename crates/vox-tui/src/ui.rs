@@ -894,7 +894,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
     }
     match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :attach · Ctrl-C quit"
         }
         Screen::Channel => {
             " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :link · : command · Esc back"

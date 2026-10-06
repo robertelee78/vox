@@ -839,6 +839,10 @@ impl UiState {
                         self.mode = Mode::Prompt(Prompt::new(kind, Some(channel_id)));
                         Action::Redraw
                     }
+                    Some(Parsed::Refused(why)) => {
+                        self.status_message = Some(why);
+                        Action::Redraw
+                    }
                     Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
                     Some(Parsed::Prompt(kind, name)) => {
                         // A rename is of the room on screen.
@@ -941,6 +945,8 @@ pub enum Parsed {
     CloseTunnel,
     /// Ask the person to confirm a change of access to a room, saying what it does (ADR-028 E-5).
     Confirm(PromptKind, Digest32),
+    /// Refused, saying why in the status line.
+    Refused(String),
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -949,7 +955,6 @@ pub enum Parsed {
 /// Per ADR-015 every action MUST be reachable by a typed command. Channel-
 /// independent verbs work anywhere (incl. the channel list):
 /// - `quit` / `q` — exit
-/// - `node <name>` — act as another node of this account
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
@@ -973,10 +978,16 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     match verb {
         "quit" | "q" => return Some(Parsed::Quit),
         "attach" => return Some(Parsed::Prompt(PromptKind::Attach, None)),
-        "node" if !rest.is_empty() => {
-            return Some(Parsed::Core(Command::UseNode {
-                name: rest.to_owned(),
-            }))
+        // **One node per client** (ADR-028 E-4, #470): this TUI acts only as the node it was
+        // opened with. Another node is a member of the rooms it shares with this one, never a
+        // node to act as.
+        "node" => {
+            return Some(Parsed::Refused(format!(
+                "this window acts only as node {}; to act as {}, open `vox tui --node {}`",
+                vm.node,
+                if rest.is_empty() { "another" } else { rest },
+                if rest.is_empty() { "NAME" } else { rest },
+            )))
         }
         "init" => return Some(Parsed::Prompt(PromptKind::CreateIdentity, None)),
         "new" if !rest.is_empty() => {

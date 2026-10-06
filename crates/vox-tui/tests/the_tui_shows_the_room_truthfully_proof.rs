@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks twenty-six claims, each
+//! 160x50. It checks twenty-seven claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -64,6 +64,8 @@
 //!   trusts it yet.", then, once Alice (whom Bob trusts) trusts Frank, "<frank> joined. alice trusts
 //!   it.", naming neither Erin (in Bob's keyring, never in the room, never granting Frank) nor
 //!   anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is added to no keyring of Bob's;
+//! - `onenode`: `:node spare` is refused, naming the one node the window acts as, and the window
+//!   still acts as default, by its status bar and sidebar (ADR-028 E-4, #470);
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
@@ -91,9 +93,9 @@
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`), a join line naming a
 //! trusted member that has not granted the newcomer (`newcomer`), a quote of the thread's root
-//! rather than `re`, Enter on a reply not moving the selection, or a trusted member shown as
-//! "verified" (`consent`). It passes only on the script's
-//! PASS with all 26 claims ok.
+//! rather than `re`, Enter on a reply not moving the selection, a trusted member shown as
+//! "verified" (`consent`), or `:node <name>` acting as another node again. It passes only on the
+//! script's PASS with all 27 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -183,7 +185,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (26 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (27 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -197,8 +199,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (26, 26),
-                "APPARATUS: the driver said PASS without all 26 claims ok: {said}"
+                (27, 27),
+                "APPARATUS: the driver said PASS without all 27 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

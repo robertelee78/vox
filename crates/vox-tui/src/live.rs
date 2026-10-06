@@ -1404,36 +1404,6 @@ impl DaemonCore {
         }
         self.decisions.1.clone()
     }
-
-    /// Act as `name` from now on: let go of the node acted as (which detaches it if this TUI was
-    /// its last holder, L-3) and take `name`, attached already or waiting for its passphrase.
-    fn use_node(&mut self, name: &str) -> CommandStatus {
-        let node = match NodeName::parse(name) {
-            Ok(n) => n,
-            Err(e) => return CommandStatus::Said(format!("{name:?} is not a node's name: {e}")),
-        };
-        if node == self.node && self.conn.is_some() {
-            return CommandStatus::Done;
-        }
-        if !self.account.nodes_on_disk().contains(&node) {
-            return CommandStatus::Said(format!(
-                "there is no node {node}; make one with `vox node create {node}`"
-            ));
-        }
-        self.conn = None;
-        self.node = node;
-        self.has_identity = true;
-        self.active = None;
-        self.timeline = None;
-        self.unread.clear();
-        self.snapshot = NodeSnapshot::default();
-        self.notice = None;
-        if self.attached.iter().any(|n| n == self.node.as_str()) {
-            self.attach(None)
-        } else {
-            CommandStatus::Done
-        }
-    }
 }
 
 impl Drop for DaemonCore {
@@ -1654,7 +1624,6 @@ impl CoreHandle for DaemonCore {
                 }
                 self.attach(Some(Zeroizing::new(passphrase.expose_secret().to_owned())))
             }
-            Command::UseNode { name } => self.use_node(&name),
             Command::CreateChannel { name, passphrase } => self.send(Request::Create {
                 name,
                 passphrase: Zeroizing::new(secret(&passphrase)),

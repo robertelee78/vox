@@ -463,11 +463,6 @@ pub enum Command {
         /// The identity passphrase (redacted/zeroized).
         passphrase: SecretString,
     },
-    /// Act as another node of this account from now on (ADR-015 9.1, `:node <name>`).
-    UseNode {
-        /// Its name.
-        name: String,
-    },
     /// Open a closed channel: its passphrase is the second lock factor.
     OpenChannel {
         /// The channelID.

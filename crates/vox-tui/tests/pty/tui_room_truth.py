@@ -72,6 +72,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             joined. alice trusts it.", naming neither Erin, whom Bob trusts and who never granted
             Frank, nor anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is in no keyring of
             Bob's after;
+  onenode   `:node spare` is refused, naming the one node this window acts as, and the window
+            still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -218,6 +220,18 @@ def tui_env(**extra):
     e.update(extra)
     return e
 
+def unlock(t):
+    """Open bob's room in `t` as a person would: each passphrase is typed only when a prompt asks
+    for it. Typed with no prompt up, its letters were commands: `d` opened the decisions."""
+    asks = lambda: "passphrase" in t.text().lower()
+    t.until(lambda: asks() or "attached: default" in t.text(), 20, 0.5)
+    if asks():
+        t.key("id pass\r", 4)
+    t.key("\r", 2)
+    if asks():
+        t.key("room pass\r", 4)
+    t.key("\r", 2)
+
 try:
     stage("anchor")
     anchor = spawn("anchor", "node", "--listen", "127.0.0.1:0", out="anchor")
@@ -313,10 +327,7 @@ try:
     tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec, "--node", "default"],
               tui_env(COLORTERM="truecolor", VOX_NOTIFY_COMMAND=f"{S}/note.sh"))
     tui.pump(4)
-    tui.key("id pass\r", 4)
-    tui.key("\r", 2)
-    tui.key("room pass\r", 4)
-    tui.key("\r", 2)
+    unlock(tui)
     screen = lambda: "\n".join(tui.display())
     # The timeline and the members pane, each found by its title (the sidebar is to their left).
     timeline = lambda: "\n".join(pane(tui.display(), "Timeline"))
@@ -797,6 +808,16 @@ try:
           f"before alice trusted frank, bob's TUI said {before_grant!r} (wanted {alone!r}); after, "
           f"{after_grant!r} (wanted {trusted!r}); frank absent from bob's keyring: {unadded}")
 
+    stage("onenode")
+    # One node per window (ADR-028 E-4, #470): `:node` acts as no other node.
+    tui.key(":node spare\r", 0)
+    said = tui.until(lambda: "acts only as node default" in tui.display()[-1], 10, 0.5)
+    tui.pump(3)  # time for the window to have taken spare, were it going to
+    bar, top = tui.display()[-2], (side() or [""])[0]
+    claim("onenode", said and "node default" in bar and "node spare" not in bar
+          and top == "node default · attached",
+          f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
+
     stage("unreach")
     for w in ("alice", "carol", "dave", "frank"):
         daemons[w].terminate()
@@ -850,10 +871,7 @@ try:
     ):
         tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], tui_env(**extra))
         tui.pump(4)
-        tui.key("id pass\r", 4)
-        tui.key("\r", 2)
-        tui.key("room pass\r", 4)
-        tui.key("\r", 2)
+        unlock(tui)
         tui.key("\t", 1)   # timeline -> composer
         tui.key("\t", 1)   # composer -> members
         if not tui.until(lambda: all(label_of(w)[0] is not None for w in ("alice", "carol", "dave")), 30, 1):
