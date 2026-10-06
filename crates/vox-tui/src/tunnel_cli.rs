@@ -8,7 +8,6 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use vox_core::governance::share::ServiceKind;
 use vox_core::hash::Digest32;
 use vox_core::node::actor::NodeHandle;
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome};
@@ -1430,11 +1429,11 @@ async fn ask(question: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Usage("no answer: nothing shared".into()))
 }
 
-/// Said under a list of what listens on this machine: unprivileged, `lsof` sees only this user's
-/// sockets and `ss` hides another user's program.
-pub(crate) const MAY_BE_MISSING: &str =
-    "another user's services, root's among them, may be missing here or listed without their \
-     program";
+// One wording for what listens here and what sharing it says, shared with the TUI and the app
+// (ADR-028 S-4): `vox_core::node::probe`.
+pub(crate) use vox_core::node::probe::{
+    exposure_warnings, listing_line, suggested_name, tag_of, MAY_BE_MISSING,
+};
 
 /// `vox serve` with no service named (ADR-028 S-4): list what listens on this machine, with
 /// its program's name, have the person pick one, suggest a name for it, and return
@@ -1486,99 +1485,6 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
         )));
     }
     Ok((chosen.port, tag_of(name, chosen.udp), endpoint))
-}
-
-/// The name a listening service is offered under, unless the person gives another (ADR-028 S-4):
-/// its detected kind, which is the best name; else its program's (S-2: the kind itself is never
-/// taken from either). Shared by `vox serve` and the TUI's share flow.
-pub(crate) async fn suggested_name(chosen: &vox_core::node::probe::Listening) -> String {
-    let kind = vox_core::node::probe::detect(chosen.endpoint(), chosen.udp).await;
-    match kind {
-        ServiceKind::Tcp | ServiceKind::Udp => chosen
-            .command
-            .as_deref()
-            .map(vox_core::node::resolver::label_of)
-            .filter(|n| !n.is_empty() && n.len() <= vox_core::governance::share::MAX_SERVICE_NAME)
-            .unwrap_or_else(|| "service".to_owned()),
-        other => other.as_str().to_owned(),
-    }
-}
-
-/// A service's tag from its name: `udp/<name>` for one that takes datagrams.
-pub(crate) fn tag_of(name: String, udp: bool) -> String {
-    if udp {
-        format!("udp/{name}")
-    } else {
-        name
-    }
-}
-
-/// One listening service as the list shows it: its program, where it listens, and over what.
-pub(crate) fn listing_line(l: &vox_core::node::probe::Listening) -> String {
-    let program = l.command.as_deref().unwrap_or("(not visible to you)");
-    let addrs: Vec<String> = l
-        .addrs
-        .iter()
-        .map(|a| SocketAddr::new(*a, l.port).to_string())
-        .collect();
-    let proto = if l.udp { "udp" } else { "tcp" };
-    let every = if l.on_every_interface() {
-        "  (every interface)"
-    } else {
-        ""
-    };
-    format!("{program:<20} {}  {proto}{every}", addrs.join(", "))
-}
-
-/// One listening service as a sentence says it, with none of the list's column padding:
-/// "python3.13 on 0.0.0.0:8080, tcp".
-fn said_in_a_sentence(l: &vox_core::node::probe::Listening) -> String {
-    let program = l
-        .command
-        .as_deref()
-        .unwrap_or("a program not visible to you");
-    let addrs: Vec<String> = l
-        .addrs
-        .iter()
-        .map(|a| SocketAddr::new(*a, l.port).to_string())
-        .collect();
-    let proto = if l.udp { "udp" } else { "tcp" };
-    format!("{program} on {}, {proto}", addrs.join(", "))
-}
-
-/// What a person must hear before `services` are shared (ADR-028 S-4): each one this machine
-/// listens for on every interface, which its networks reach with no Vox at all, and each on a
-/// well-known sensitive port.
-pub(crate) async fn exposure_warnings(
-    services: &[(u16, String)],
-    at: Option<SocketAddr>,
-) -> Vec<String> {
-    let found = tokio::task::spawn_blocking(vox_core::node::probe::listening)
-        .await
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    for (port, label) in services {
-        let name = vox_core::node::channel::service_name(label);
-        let udp = vox_core::tunnel::udp::is_udp(label);
-        let port = at.map_or(*port, |a| a.port());
-        if let Some(l) = found
-            .iter()
-            .find(|l| l.port == port && l.udp == udp && l.on_every_interface())
-        {
-            out.push(format!(
-                "`{name}` ({}) listens on every interface of this machine, so its networks \
-                 reach it without Vox; sharing it does not change that",
-                said_in_a_sentence(l)
-            ));
-        }
-        if let Some(what) = vox_core::node::probe::sensitive_port(port) {
-            out.push(format!(
-                "`{name}` is on port {port}, {what}: every node you trust in the room can \
-                 reach it"
-            ));
-        }
-    }
-    out
 }
 
 /// Who in `channel_id` can reach this node's services and who cannot (ADR-017 4.2), by name:
