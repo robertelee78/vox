@@ -454,7 +454,10 @@ try:
     def header(t):
         return next((bare(r) for r in t.display() if "Timeline ·" in r), "")
     def says(t, want):
-        return any(want in bare(r) for r in pane(t.display(), "Timeline"))
+        # The line wraps across rows of the narrow timeline: read the pane as one text, without
+        # the spaces a wrap may have taken from either side of a break.
+        text = "".join(bare(r) for r in pane(t.display(), "Timeline")).replace(" ", "")
+        return want.replace(" ", "") in text
     before = (header(atui), header(tui))
     r = run("alice", "room", "retention", room, "1w", "--identity-passphrase-file", f"{S}/idpass")
     if r.returncode != 0: product(f"alice's `vox room retention {room} 1w` failed: {r.stderr.strip()}")
