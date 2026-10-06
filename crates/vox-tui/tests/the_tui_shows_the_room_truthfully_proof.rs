@@ -71,14 +71,14 @@
 //!   trusts it yet.", then, once Alice (whom Bob trusts) trusts Frank, "<frank> joined. alice trusts
 //!   it.", naming neither Erin (in Bob's keyring, never in the room, never granting Frank) nor
 //!   anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is added to no keyring of Bob's;
-//! - `onenode`: `:node spare` is refused, naming the one node the window acts as, and the window
-//!   still acts as default, by its status bar and sidebar (ADR-028 E-4, #470);
 //! - `trust`: the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
 //!   in the members pane opens the trust prompt showing his fingerprint; Dave's fingerprint pasted
 //!   there adds nothing, says not to trust him and shows both; Frank's own, pasted through the
 //!   `:trust` the hint offers, in groups and upper case, adds him and says so once the identity
 //!   passphrase is typed into the prompt (`VOX_TEST_KEYRING_WINDOW_SECS` makes Bob's window a
 //!   minute, so it has closed): a wrong passphrase adds nothing and is never shown;
+//! - `onenode`: `:node spare` is refused, naming the one node the window acts as, and the window
+//!   still acts as default, by its status bar and sidebar (ADR-028 E-4, #470);
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);

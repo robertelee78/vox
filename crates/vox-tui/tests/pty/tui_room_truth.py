@@ -81,14 +81,14 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             joined. alice trusts it.", naming neither Erin, whom Bob trusts and who never granted
             Frank, nor anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is in no keyring of
             Bob's after;
-  onenode   `:node spare` is refused, naming the one node this window acts as, and the window
-            still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   trust     the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
             in Bob's members pane opens the trust prompt, showing his fingerprint; Dave's pasted
             there adds nothing and shows both fingerprints; Frank's own, pasted through the hint's
             `:trust`, in groups and upper case, adds him once the identity passphrase is typed
             into the prompt (Bob's keyring window is a minute, and has closed): a wrong one adds
             nothing and is never shown;
+  onenode   `:node spare` is refused, naming the one node this window acts as, and the window
+            still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -938,15 +938,6 @@ try:
           f"before alice trusted frank, bob's TUI said {before_grant!r} (wanted {alone!r}); after, "
           f"{after_grant!r} (wanted {trusted!r}); frank absent from bob's keyring: {unadded}")
 
-    stage("onenode")
-    # One node per window (ADR-028 E-4, #470): `:node` acts as no other node.
-    tui.key(":node spare\r", 0)
-    said = tui.until(lambda: "acts only as node default" in tui.display()[-1], 10, 0.5)
-    tui.pump(3)  # time for the window to have taken spare, were it going to
-    bar, top = tui.display()[-2], (side() or [""])[0]
-    claim("onenode", said and "node default" in bar and "node spare" not in bar
-          and top == "node default · attached",
-          f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
     stage("trust")
     # ADR-028 K-5 (#475): the join's line offers the one trust action, ":trust <frank's first 8>";
     # `t` on Frank in the members pane opens the same prompt. A fingerprint pasted that is not
@@ -997,6 +988,16 @@ try:
           f"the TUI said {wrong_pass_said!r}; frank's own pasted through {hint!r} with the "
           f"passphrase: added {matched}, said so {match_said}")
 
+    stage("onenode")
+    # After `trust`: its refusal takes the status line, where the join's offer to trust is read.
+    # One node per window (ADR-028 E-4, #470): `:node` acts as no other node.
+    tui.key(":node spare\r", 0)
+    said = tui.until(lambda: "acts only as node default" in tui.display()[-1], 10, 0.5)
+    tui.pump(3)  # time for the window to have taken spare, were it going to
+    bar, top = tui.display()[-2], (side() or [""])[0]
+    claim("onenode", said and "node default" in bar and "node spare" not in bar
+          and top == "node default · attached",
+          f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
     stage("unreach")
     for w in ("alice", "carol", "dave", "frank"):
         daemons[w].terminate()
