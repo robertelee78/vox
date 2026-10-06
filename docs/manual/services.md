@@ -53,6 +53,41 @@ who can reach it: a member of this room you have trusted (`vox trust add`)
 
 After a trusted member joins, it prints `can reach it now: ann`.
 
+Before it creates the room, `serve` warns about a service that is already exposed or sensitive:
+
+```text
+vox: warning: `web` (nginx                0.0.0.0:8080  tcp  (every interface)) listens on every interface of this machine, so its networks reach it without Vox; sharing it does not change that
+vox: warning: `db` is on port 5432, PostgreSQL's: every node you trust in the room can reach it
+```
+
+### Pick the service from a list
+
+`vox serve` with no service named lists what is listening on this machine, with each program's
+name, and asks which to share:
+
+```text
+vox: services listening on this machine
+   3  sshd                 127.0.0.1:22  tcp
+  another user's services, root's among them, may be missing here or listed without their program; name one with vox serve <name>=<port>
+share which? (its number, or its port)
+```
+
+Answer with the number or the port. It then suggests a name, the service's
+[kind](#what-kind-of-service-it-is) where Vox recognizes one (`name it [ssh]`); press Enter to
+take it or type another. Before anything is created it shows the address members will use and
+who can reach it, with any warning, and asks `share it? [y/N]`:
+
+```text
+members will reach it as ssh.FINGERPRINT.<the new room>.vox
+who can reach it: each node you trust, once it joins the room: carol, ann
+who cannot: anyone else who joins with the room link and passphrase
+share it? [y/N]
+```
+
+Anything but `y` stops with `not shared`, and nothing is created. On `y` it goes on as
+`vox serve ssh=22` does. Run as yourself, the list may miss another user's services, root's
+among them; name such a service as `NAME=PORT`.
+
 On the guest:
 
 ```sh
@@ -104,15 +139,16 @@ number or the name you gave the service: a plain echo shared as `ssh=7000` is `t
 
 ## Reach it through the local proxy
 
-On the guest:
+While a node is attached, the daemon runs a SOCKS5 proxy on `127.0.0.1:1080` that resolves
+`.vox` addresses and carries every room its attached nodes hold. Nothing else has to be started.
+On the guest, ask where it is:
 
 ```sh
 vox up
 ```
 
-With no room named, `vox up` carries every room the node holds. It prints `vox up on
-127.0.0.1:1080 — carrying every room this node holds`, a block to add to `~/.ssh/config` once,
-and a line for other tools:
+It prints `vox up on 127.0.0.1:1080 — the vox daemon's proxy, carrying every room its attached
+nodes hold`, a block to add to `~/.ssh/config` once, and a line for other tools, then exits:
 
 ```text
 Host *.vox
@@ -122,9 +158,13 @@ Host *.vox
 ```
 
 Vox prints this block rather than editing your SSH configuration. Copy the one your `vox up`
-printed: it names the port it really bound (`--bind` chooses another loopback port above 1024).
-Keep `vox up` running, then in another terminal use the **real SSH account on the host** and your
-service address:
+printed: it names the port the proxy really listens on. To use another loopback port, start the
+daemon with `vox daemon --proxy 127.0.0.1:PORT`, or set `VOX_PROXY`; the proxy listens on loopback
+only. If the port is taken, `vox up` says `the .vox proxy could not listen on 127.0.0.1:1080:
+Address already in use` and names both settings. `vox up --watch` stays in the foreground and
+prints what the proxy refuses or cuts, until stopped; the proxy runs on without it.
+
+Use the **real SSH account on the host** and your service address:
 
 ```sh
 ssh SSH_USER@ssh.robertgpt.family.vox

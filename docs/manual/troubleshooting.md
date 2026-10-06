@@ -225,7 +225,8 @@ service being reachable are separate facts.
 - the host trusts the guest fingerprint;
 - both use the intended room;
 - `vox service list ROOM_ID` names the intended offer and shows **your** address for it;
-- the guest's `vox up` or `vox forward` is still running;
+- the guest has a node attached, so its daemon's proxy runs (`vox up` says where, or why it
+  is not running), or its `vox forward` is still running;
 - the ordinary client uses that loopback proxy or forward.
 
 Copy the address your own `service list` prints, not one from someone else's screen: the node
@@ -279,17 +280,20 @@ sides an anchor they can reach. Do not delete the node or change trust to cure a
 
 ## The file is unavailable or fails verification
 
-**Meaning:** the room can retain an announcement after its live offer stops. An unreachable
-offer can also mean missing trust; a hash failure means the received bytes do not match the
-signed announcement, not that the check should be disabled.
+**Meaning:** a share's message can stay in the room after its sharer stops serving it. An
+unreachable share can also mean missing trust; a hash failure means the received bytes do not
+match the signed announcement, not that the check should be disabled.
 
-**Check:** identify the sender and exact offer; ask whether `room send` or `share` is still
-running (a `share` with `--count` or `--for` stops by itself). A fetch from an offer that has
-stopped says `the offer of FILE is gone: NAME no longer serves it`; one whose sender cannot be
-reached says `the offer of FILE cannot be collected now` and gives the reason. Inspect any reported size/hash or stall reason. If `--out` already exists, that
-is local destination protection, not a transfer failure.
+**Check:** identify the sharer and the exact share. Ask whether it is still shared: the sharer's
+`vox share list ROOM_ID` lists it, and a share given `--count` or `--for` stops by itself. A pull
+from a share that has stopped says `the offer of FILE is gone: NAME no longer serves it`; one
+whose sharer cannot be reached says `the offer of FILE cannot be collected now` and gives the
+reason. Inspect any reported size/hash or stall reason. If `--out` already exists, that is local
+destination protection, not a transfer failure. A share your node did not pull by itself is
+either addressed to someone else or from a node not in your keyring (see
+[where a shared file lands](files.md#where-a-shared-file-lands)).
 
-**Fix:** have the sender re-offer the intended unchanged file if needed, then fetch again.
+**Fix:** have the sharer share the intended unchanged file again if needed, then pull again.
 Use another output path for a collision. Do not salvage or open a failed `.part` as though
 verified; this workflow rejects incomplete/mismatched transfers and removes its partial file.
 

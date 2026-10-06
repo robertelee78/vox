@@ -103,10 +103,42 @@ is told what its node can see about each addressed member, for example `vox: to 
 sessions has announced itself in this room; you trust it; it trusts you`.
 
 An addressed post, a reply, a file offer and a ping are printed by their words, as any message
-is: the reply reads `yes, it arrived`, a file offer `file offered: report.pdf (18 bytes)`, a ping
+is: the reply reads `yes, it arrived`, a share `file offered: report.txt (22 bytes): the report`, a ping
 `ping: which agent sessions does this node hold, and can each be reached?`. An addressed post
 adds a line naming its recipients as you name them, such as `(to you)`. `--json` keeps the whole
 envelope, with the words in its `body` field, for programs.
+
+### Who has read it, and where it is
+
+The TUI says, under each of your own messages, what your node can see about it:
+
+- `only on this machine`, while no other member's node has said it holds the message, for example
+  because every other member is offline;
+- `on 1 of 2 members' nodes`, once that many other members' nodes have said they hold it;
+- `read by alice`, once a member has read it.
+
+A member's node says it has read a message when its TUI draws the message on screen in the room
+you are looking at, or when an agent working as that node takes the message into its turn. It
+says so in a read record, which is posted to the room like a message, sealed so only nodes that
+member trusts can open it. A node posts at most one read record per room every 5 seconds, and
+read records are never shown as messages, counted as unread or given to an agent.
+
+So `read by` names only members whose read records your node can open: members that trust you.
+A member that does not trust you is named neither as having read a message nor as not having
+read it. `vox room read --json` carries the same names in each row's `read_by` field.
+
+### Notifications
+
+While the TUI runs, a message arriving in a room you are not looking at raises one notification
+for that room, titled with the room's name and naming who wrote, for example `Vox: family` /
+`new messages from alice`. It never holds the messages' text. More messages in the same room raise
+no further notification while the room stays off screen.
+
+The notification goes to your terminal as a desktop notification (OSC 9), or as a bell when the
+TUI runs over SSH, where a terminal's notification reaches no desktop. To send it somewhere else,
+set `notify-command = PROGRAM` in the node's own `config/config` file, else in your account's
+`config` (see [Commands and local state](reference.md)), or set `VOX_NOTIFY_COMMAND`. Vox runs it
+as `PROGRAM TITLE BODY`.
 
 ### Characters you cannot see
 
