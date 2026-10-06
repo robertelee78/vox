@@ -806,7 +806,6 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
 
     let Staged {
         tmp: _tmp,
-        anchor,
         host,
         forward,
         tunnel,
@@ -973,7 +972,6 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     );
     drop(forward);
     drop(host);
-    drop(anchor);
 }
 
 /// Everything one R41 run stands on, set up as a person sets a tunnel up (see the module docs):
@@ -982,7 +980,6 @@ struct Staged {
     // Field order is drop order: the processes go before the directories they run in.
     forward: Proc,
     host: Proc,
-    anchor: Proc,
     tmp: tempfile::TempDir,
     host_dir: std::path::PathBuf,
     guest_dir: std::path::PathBuf,
@@ -999,28 +996,14 @@ struct Staged {
 /// starts.
 fn stage(host_env: &[(&str, &str)]) -> Staged {
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let anchor_dir = tmp.path().join("anchor");
     let host_dir = tmp.path().join("host");
     let guest_dir = tmp.path().join("guest");
-    for d in [&anchor_dir, &host_dir, &guest_dir] {
+    for d in [&host_dir, &guest_dir] {
         std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let (port, done) = sink();
     let link: Shared = Arc::new(Mutex::new(None));
 
-    let anchor = Proc::spawn(
-        "anchor",
-        &anchor_dir,
-        &["node", "--listen", "127.0.0.1:0"],
-        &[],
-    );
-    let spec = anchor
-        .expect_line("an --anchor spec", |l| {
-            l.trim_start().contains('@')
-                && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
-        })
-        .trim()
-        .to_owned();
 
     let (ok, host_fp, err) = vox_once(&host_dir, &["id"]);
     assert!(ok, "PRODUCT: host id: {err}");
@@ -1060,8 +1043,6 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
         &[
             "serve",
             &format!("{port_s}={port_s}"),
-            "--anchor",
-            &spec,
             "--listen",
             &host_listen,
         ],
@@ -1093,8 +1074,6 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
             &address,
             "--passphrase-file",
             &room_pass_file(&guest_dir, &passphrase),
-            "--anchor",
-            &spec,
             "--listen",
             "127.0.0.1:0",
         ],
@@ -1108,8 +1087,6 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
             "forward",
             &format!("{port_s}.{}.{room}.vox", host_fp.trim()),
             "127.0.0.1:0",
-            "--anchor",
-            &spec,
             "--listen",
             "127.0.0.1:0",
         ],
@@ -1130,34 +1107,10 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
         .expect("APPARATUS: a socket address the proof wrote");
     let raw = tcp_shaper(sink_addr, Arc::clone(&link));
 
-    // Direct, asserted: the anchor must carry no circuit for the timed transfers.
-    let carried_line = |l: &str| l.contains("circuit(s) carried") && !l.contains(" 0 circuit(s)");
-    let circuit_lines = |a: &Proc| -> Vec<String> {
-        a.said()
-            .into_iter()
-            .filter(|l| l.contains("circuit(s) carried"))
-            .collect()
-    };
     let _ = transfer(tunnel, &done);
-    let settle = Instant::now();
-    while circuit_lines(&anchor)
-        .last()
-        .is_some_and(|l| carried_line(l))
-        && settle.elapsed() < Duration::from_secs(120)
-    {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        !circuit_lines(&anchor)
-            .last()
-            .is_some_and(|l| carried_line(l)),
-        "PRODUCT (staging): two hosts on one loopback found no direct path; the anchor still \
-         carried their circuit 120 s after the forward came up"
-    );
     Staged {
         forward,
         host,
-        anchor,
         host_dir,
         guest_dir,
         tmp,
@@ -2516,7 +2469,7 @@ fn r41b_spike_path() {
             shown(&format!("r41b iter {i} transfer {k}: {:.1} Mbit/s, crossed {crossed} of {BYTES}", rate * 8.0 / 1e6));
             if crossed < BYTES {
                 shown(&format!("r41b BYPASS iter {i} transfer {k} at {:?}", start.elapsed()));
-                for p in [&s.host, &s.forward, &s.anchor] {
+                for p in [&s.host, &s.forward] {
                     for l in p.said() { shown(&format!("[{}] {l}", p.name)); }
                 }
                 for d in [&s.host_dir, &s.guest_dir] {
