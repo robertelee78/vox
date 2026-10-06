@@ -43,6 +43,11 @@ impl Root {
     fn vox(&self, args: &[&str], stdin: &str) -> (bool, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_vox"))
             .args(args)
+            // A daemon this starts never takes port 1080 (the same rule as `world::proxy`).
+            .env(
+                "VOX_PROXY",
+                std::env::var("VOX_PROXY").unwrap_or_else(|_| "127.0.0.1:0".to_owned()),
+            )
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
             .env_remove("VOX_NODE")
