@@ -436,6 +436,10 @@ where
     splice_until(send, recv, tcp, cut, watch).await
 }
 
+/// What a close's reason says when the tunnel was closed at the other end, not here: the host's
+/// decision record (ADR-028 D-1) keeps only the closes this node decided.
+pub const AT_THE_OTHER_END: &str = "at the other end";
+
 /// The QUIC application error code a host resets a tunnel stream with when it withdraws
 /// the dialer's reach mid-session (ADR-017 M17.11) — by untrusting the dialer, or by no
 /// longer offering the service (PRD-001 R22).
@@ -778,11 +782,11 @@ async fn splice_until(
             stuck_code,
         )),
         Some(Ok(Leg::ClosedThere)) => Some((
-            close("closed by a person at the other end".to_owned()),
+            close(format!("closed by a person {AT_THE_OTHER_END}")),
             closed_code,
         )),
         Some(Ok(Leg::StuckClosedThere)) => Some((
-            close("closed as stuck at the other end".to_owned()),
+            close(format!("closed as stuck {AT_THE_OTHER_END}")),
             stuck_code,
         )),
         _ => None,

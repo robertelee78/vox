@@ -21,12 +21,21 @@
 //! Every red names its side: `PRODUCT:` what the host said or did not; `PRODUCT (staging):` a `vox`
 //! step of the staging (a join that was not refused); `APPARATUS:` the driver's own machinery.
 //!
+//! - **decision record** (ADR-028 §7, #506): alice's node records the foreground arm's refusal as
+//!   one event naming bob and why, in `nodes/default/decisions/<today>.jsonl` (0600, its directory
+//!   0700); neither the passphrase bob offered nor a message alice posted is in it; and of two
+//!   earlier days planted before her daemon starts, the one 14 days old is removed and the one 13
+//!   days old kept.
+//!
 //! **Mutations that must turn it red:** the daemon's per-node reporter no longer saying a
 //! `JoinFailed` (`tunnel_cli::say_if_it_explains_a_failure`) — the foreground and auto-started arms
-//! red; the TUI ignoring `JoinFailed` (`DaemonCore::on_node_event`) — the TUI arm red.
+//! red; the TUI ignoring `JoinFailed` (`DaemonCore::on_node_event`) — the TUI arm red; a node
+//! that records a message's text in its decision record when it posts one — the record arm red.
 
 #![cfg(unix)]
 
+#[path = "support/decision_record.rs"]
+mod decision_record;
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -44,6 +53,8 @@ const WRONG: &str = "QXJZ-a-wrong-room-passphrase-KVWY";
 /// How long the host has to say it, once bob has been told no.
 const SAYS_WITHIN: Duration = Duration::from_secs(10);
 const SAID: &str = "a join did not complete — answering ";
+/// A message alice posts in her room: found in her decision record, it is the leak (ADR-028 D-2).
+const MESSAGE: &str = "QXJZ-a-message-nobody-records-KVWY";
 
 /// A child process, stopped by its own PID when dropped.
 struct Proc(Child);
@@ -262,12 +273,92 @@ fn a_refused_join_is_seen_by_the_host() {
 
     // ---- foreground: alice's `vox daemon`, run by hand ----------------------------------------
     let alice = Person::new(tmp.path(), "alice");
+    // Two days of an earlier record: one 14 days old, past what is kept, and one 13 days old.
+    let record = decision_record::dir(&alice.dir, "default");
+    std::fs::create_dir_all(&record).expect("APPARATUS: could not make the record's directory");
+    std::fs::set_permissions(&record, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("APPARATUS: could not set the record directory's mode");
+    let today = decision_record::today();
+    let (old, kept) = (
+        format!("{}.jsonl", decision_record::date_of(today - 14)),
+        format!("{}.jsonl", decision_record::date_of(today - 13)),
+    );
+    for name in [&old, &kept] {
+        std::fs::write(record.join(name), "{\"planted\":true}\n")
+            .expect("APPARATUS: could not plant an earlier day's record");
+    }
     let err = tmp.path().join("alice.daemon.err");
     let _alice_daemon = foreground_daemon(&alice, &err);
     let link = alice.room();
+    let (_, list) = run(&alice.dir, &["room", "list"]);
+    let room_id = list
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let (ok, said) = run(&alice.dir, &["room", "post", &room_id, MESSAGE]);
+    assert!(ok, "PRODUCT (staging): alice's `vox room post`: {said}");
     wrong_join(&bob, &link);
     let said = says(|| std::fs::read_to_string(&err).unwrap_or_default());
     judge(&mut red, "alice's foreground daemon's stderr", &said, &bob);
+
+    // ---- the decision record (ADR-028 §7, #506): alice's node keeps what it refused --------
+    let (events, _) = decision_record::until(&alice.dir, "default", SAYS_WITHIN, |e| {
+        decision_record::is(e, "to join a room", "refused", &bob.fp)
+    });
+    let refusals = events
+        .iter()
+        .filter(|e| decision_record::is(e, "to join a room", "refused", &bob.fp))
+        .count();
+    println!("[proof] alice's decision record: {events:?}");
+    if refusals != 1 {
+        red.push(format!(
+            "PRODUCT: alice's decision record must hold one refused join naming bob ({}) and why; \
+             it holds {refusals}: {events:?}",
+            bob.fp
+        ));
+    }
+    let files = decision_record::files(&alice.dir, "default");
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    let today_file = format!("{}.jsonl", decision_record::date_of(today));
+    if names.contains(&old.as_str())
+        || !names.contains(&kept.as_str())
+        || !names.contains(&today_file.as_str())
+    {
+        red.push(format!(
+            "PRODUCT: alice's decision record must keep 14 days: {kept} and {today_file} kept, \
+             {old} removed; it holds {names:?}"
+        ));
+    }
+    for (text, what) in [
+        (WRONG, "the passphrase bob offered"),
+        (MESSAGE, "the text of a message"),
+    ] {
+        if files.iter().any(|(_, t)| t.contains(text)) {
+            red.push(format!(
+                "PRODUCT: alice's decision record holds {what}: {files:?}"
+            ));
+        }
+    }
+    let mode = |p: &Path| {
+        std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(p)
+                .map(|m| m.permissions())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "PRODUCT: alice's decision record has no {}: {e}",
+                        p.display()
+                    )
+                }),
+        ) & 0o777
+    };
+    let (dir_mode, file_mode) = (mode(&record), mode(&record.join(&today_file)));
+    if (dir_mode, file_mode) != (0o700, 0o600) {
+        red.push(format!(
+            "PRODUCT: alice's decision record must be hers alone: the directory {dir_mode:o} \
+             (0700), today's file {file_mode:o} (0600)"
+        ));
+    }
 
     // ---- TUI: alice's `vox tui`, on the node that daemon holds --------------------------------
     let cues = tmp.path().join("cues");

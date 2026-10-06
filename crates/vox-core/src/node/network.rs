@@ -403,6 +403,9 @@ pub struct NodeNet {
     reaching: Mutex<HashMap<Digest32, Arc<tokio::sync::Notify>>>,
     /// Where each ladder run is counted for `vox status --json`, once the node has one.
     status: Mutex<Option<crate::node::status::SharedSyncBook>>,
+    /// Where this node records what it decided (ADR-028 D-1), once the node has one: a relay
+    /// circuit refused is decided here, off the actor.
+    decisions: Mutex<Option<crate::node::decisions::DecisionLog>>,
     service: RendezvousService,
     membership: SharedMembership,
     policy: SharedPolicy,
@@ -462,6 +465,11 @@ impl NodeNet {
         *lock(&self.status) = Some(book);
     }
 
+    /// Record this node's decisions taken here in `log` (ADR-028 D-1).
+    pub fn record_decisions_in(&self, log: crate::node::decisions::DecisionLog) {
+        *lock(&self.decisions) = Some(log);
+    }
+
     /// Build the surface over a bound endpoint. The board it serves is fresh
     /// in-memory state (an anchor that persists a board is M15).
     #[must_use]
@@ -481,6 +489,7 @@ impl NodeNet {
             presence,
             reaching: Mutex::new(HashMap::new()),
             status: Mutex::new(None),
+            decisions: Mutex::new(None),
             service,
             membership,
             policy: SharedPolicy::new(),
@@ -659,6 +668,22 @@ impl NodeNet {
         let class = self.classify(&peer);
         if !PeerPolicy::allows(class, kind) {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
+            // A refused stream is a refused dial (ADR-028 D-1). A joiner not yet a member here
+            // is refused every few seconds until it is, so repeats are folded, once an hour.
+            if let Some(log) = lock(&self.decisions).as_ref() {
+                let why = format!("it may not open a {kind:?} stream here, as {class:?}");
+                log.record_folded(
+                    (self.clock)().saturating_mul(1_000),
+                    &format!("stream {} {why}", crate::node::link::b32_encode(&peer)),
+                    &crate::node::decisions::Decision {
+                        asked: "to open a stream",
+                        by: peer,
+                        alias: None,
+                        decided: crate::node::decisions::Decided::Refused,
+                        why,
+                    },
+                );
+            }
             return Err(crate::error::Error::StreamRefused(
                 "peer may not open this stream kind",
             ));
@@ -893,7 +918,7 @@ impl NodeNet {
             }
             StreamKind::Circuit => {
                 let manager = Arc::clone(&self.manager);
-                circuitstream::serve_circuit(
+                let served = circuitstream::serve_circuit(
                     conn,
                     &|p| self.classify(p),
                     &|a, b| self.relays_between(a, b),
@@ -903,7 +928,29 @@ impl NodeNet {
                     self.presence.ledger(),
                     self.manager.endpoint(),
                 )
-                .await?;
+                .await;
+                // A circuit this node would not carry, for whom and why (ADR-028 D-1). A target
+                // that is not connected here, or that refused, is not this node's decision.
+                let refused = match &served {
+                    Err(Error::StreamRefused(why)) => Some(*why),
+                    Err(Error::Unreachable(why)) if *why == circuitstream::AT_CAPACITY => {
+                        Some(*why)
+                    }
+                    _ => None,
+                };
+                if let (Some(why), Some(log)) = (refused, lock(&self.decisions).as_ref()) {
+                    log.record(
+                        (self.clock)().saturating_mul(1_000),
+                        &crate::node::decisions::Decision {
+                            asked: "a relay circuit",
+                            by: peer,
+                            alias: None,
+                            decided: crate::node::decisions::Decided::Refused,
+                            why: why.to_owned(),
+                        },
+                    );
+                }
+                served?;
                 Ok(Inbound::ServedCircuit { peer })
             }
             StreamKind::Tunnel => Ok(Inbound::Tunnel { peer, send, recv }),

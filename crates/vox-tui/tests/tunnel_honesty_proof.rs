@@ -87,7 +87,9 @@
 //!   RP-10). An `ssh` session opened while the guest was trusted is reset the moment the host's
 //!   operator runs `vox trust remove`, and `vox up` says the host withdrew access. A new CONNECT
 //!   through the **same** proxy — whose connection to the host was made while trusted — is
-//!   refused in the SOCKS reply, and the service behind it never accepts a connection.
+//!   refused in the SOCKS reply, and the service behind it never accepts a connection. The
+//!   host's decision record (ADR-028 §7) then holds each of the three decisions once, naming the
+//!   guest and why: the untrust, the session cut, the CONNECT refused.
 //!
 //!   *A stream parked open across the withdrawal* (opened while trusted, its request sent only
 //!   after) cannot be produced by the shipped binary: no honest `vox` delays its request. It is
@@ -127,6 +129,9 @@ mod watchdog;
 
 #[path = "support/world.rs"]
 mod world;
+
+#[path = "support/decision_record.rs"]
+mod decision_record;
 
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
@@ -1862,6 +1867,35 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
          counted {dialled} connections, one more than the session before the withdrawal"
     );
     eprintln!("[test] step 4: refused, said why, and the service still counted 1");
+
+    // Step 5: the host's decision record (ADR-028 §7, #506) holds each decision once, naming the
+    // guest and why: the untrust, the session it cut, and the CONNECT refused after it.
+    let want = [
+        ("to stop trusting a member", "untrusted"),
+        ("a tunnel to a service", "cut"),
+        ("a tunnel to a service", "refused"),
+    ];
+    let (events, _) =
+        decision_record::until(&w.host_dir, "default", Duration::from_secs(10), |_| {
+            let all = decision_record::events(&w.host_dir, "default");
+            want.iter().all(|(asked, decided)| {
+                all.iter()
+                    .any(|e| decision_record::is(e, asked, decided, &w.guest_fp))
+            })
+        });
+    eprintln!("[test] step 5: the host's decision record: {events:?}");
+    for (asked, decided) in want {
+        let n = events
+            .iter()
+            .filter(|e| decision_record::is(e, asked, decided, &w.guest_fp))
+            .count();
+        assert_eq!(
+            n, 1,
+            "PRODUCT: the host's decision record must hold one {decided:?} event for {asked:?} \
+             naming the guest ({}) and why; it holds {n}: {events:?}",
+            w.guest_fp
+        );
+    }
 }
 
 #[test]
