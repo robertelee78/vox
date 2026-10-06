@@ -28,6 +28,7 @@ pub mod agreestream;
 pub mod api;
 pub mod app;
 pub mod appipc;
+pub mod card;
 pub mod channel;
 pub mod circuitstream;
 pub mod consent_order;

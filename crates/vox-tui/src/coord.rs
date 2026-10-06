@@ -596,6 +596,8 @@ pub struct Draft {
     pub body: String,
     /// Payload, without `op` or `vox`.
     pub data: serde_json::Map<String, serde_json::Value>,
+    /// Whether the node fetches a link card for the body's first URL (ADR-028 F-10).
+    pub card: bool,
 }
 
 /// How long a post waits to see its own entry in the node's view. The view skips a room while a
@@ -704,6 +706,7 @@ pub async fn post_once(
         &Request::Post {
             channel_id,
             text: env.to_text(),
+            card: draft.card,
         },
     )
     .await?

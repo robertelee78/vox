@@ -1762,7 +1762,12 @@ impl CoreHandle for DaemonCore {
                 self.apply(Command::SendText { channel_id, text })
             }
             Command::SendText { channel_id, text } => {
-                let status = self.send(Request::Post { channel_id, text });
+                // A link card, fetched by this node (ADR-028 F-10).
+                let status = self.send(Request::Post {
+                    channel_id,
+                    text,
+                    card: true,
+                });
                 if let Some(t) = self
                     .timeline
                     .as_mut()

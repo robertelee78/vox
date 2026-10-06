@@ -24,6 +24,8 @@ sha2.workspace = true
 # A shared folder's file list (ADR-028 F-8).
 percent-encoding.workspace = true
 unicode-normalization.workspace = true
+# A link card, fetched once by the sender's node (ADR-028 F-10).
+reqwest.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 ed25519-dalek.workspace = true

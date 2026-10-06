@@ -344,6 +344,12 @@ enum RoomCmd {
     /// With no text, or `-`, the message is read from stdin — which is the form to
     /// use for an agent-comms envelope, because JSON on a command line is where
     /// quoting goes wrong.
+    ///
+    /// A message carrying a link gets a link card: this node fetches the page of its first
+    /// http(s) link once, and its title, description and an image of at most 16 KB travel in the
+    /// message, so no reader's node contacts the site. That fetch tells the linked site this
+    /// machine's IP address. Only public addresses are fetched: a link to this machine or a
+    /// private network goes without a card. `--no-card` posts without one.
     Post(RoomPostArgs),
     /// Print a room's messages. The first column is the entry hash, which is the
     /// cursor: pass the last one back as `--since` to read only what is new.
@@ -1072,6 +1078,9 @@ pub struct RoomPostArgs {
     /// Extra payload, as a JSON object. May not set `vox` or `op`.
     #[arg(long)]
     pub data: Option<String>,
+    /// Post without a link card: this node fetches nothing, and the linked site learns nothing.
+    #[arg(long)]
+    pub no_card: bool,
     #[command(flatten)]
     pub coord: CoordArgs,
 }
@@ -2060,6 +2069,7 @@ pub fn run() -> ExitCode {
                                 thread: a.thread.clone(),
                                 data: a.data.clone(),
                                 coord: a.coord.opts(),
+                                no_card: a.no_card,
                             };
                             crate::room_cli::post_cmd(&paths, &a.room, a.text.as_deref(), &opts)
                                 .await

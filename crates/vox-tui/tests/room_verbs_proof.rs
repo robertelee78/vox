@@ -42,6 +42,17 @@
 //! `claim`: it is posted. Require a session for every structured post again, and it goes red on
 //! the person's addressed message.
 //!
+//! **A link card is fetched by the sender's node alone** (ADR-028 F-10,
+//! [`a_link_card_is_fetched_by_the_senders_node_alone`]): alice posts a message carrying a link
+//! to a local page, served by the proof and counting every request. When her `vox room post`
+//! returns, the page and its image have each been fetched once. bob's `vox room read`, plain and
+//! `--json`, and an agent's turn on his node show the card (title, description, and the image's
+//! exact bytes), and the server sees no request more. A link to a second local server is posted
+//! without a card and that server is never contacted: the shipped rule fetches public addresses
+//! only, and the proof's own server is allowed only by a knob compiled into proof builds
+//! (`test-knobs`). `--no-card` posts the link and fetches nothing. Mutant: fetch the card on the
+//! reader (red: the server counts bob's requests).
+//!
 //! Production Argon2id once at setup; `#[ignore]`d in the debug suite.
 //!
 //! **A room is made and posted to in a debug build too**
@@ -58,6 +69,12 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/room.rs"]
+mod support;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::Write;
 use std::path::Path;
@@ -815,5 +832,213 @@ fn a_debug_daemon_makes_a_room_takes_a_post_and_keeps_running() {
         said(&format!(
             "PRODUCT: vox daemon exited ({exited:?}) after making a room and a post"
         ))
+    );
+}
+
+/// A local web server that answers `/page` with a page naming its title, description and image,
+/// and `/img.png` with [`CARD_IMAGE`]; and records every request's path.
+fn card_server() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::io::Read as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("APPARATUS: bind the link card's local server");
+    let at = listener
+        .local_addr()
+        .expect("APPARATUS: the server's address");
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let path = String::from_utf8_lossy(&head)
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            log.lock().unwrap().push(path.clone());
+            let (ty, body): (&str, Vec<u8>) = if path == "/img.png" {
+                ("image/png", CARD_IMAGE.to_vec())
+            } else {
+                (
+                    "text/html; charset=utf-8",
+                    b"<html><head><title>Fallback</title>\
+                      <meta property=\"og:title\" content=\"The quarterly report\">\
+                      <meta property=\"og:description\" content=\"Numbers &amp; notes for Q3\">\
+                      <meta property=\"og:image\" content=\"/img.png\"></head></html>"
+                        .to_vec(),
+                )
+            };
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: \
+                     close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = s.write_all(&body);
+        }
+    });
+    (at, seen)
+}
+
+/// The image the proof's page names: 1 KB, well under the card's 16 KB.
+const CARD_IMAGE: &[u8; 1024] = &[0x5a; 1024];
+
+/// Standard base64, as the card carries its image.
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
+fn a_link_card_is_fetched_by_the_senders_node_alone() {
+    test_knobs::require(&["VOX_TEST_CARD_ALLOW"]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
+    // Server A is the one the proof's build may fetch from; server B is as local, and never.
+    let (allowed, seen) = card_server();
+    let (refused, refused_seen) = card_server();
+    // Before any daemon starts, and before any other thread of this test: every daemon inherits
+    // it, bob's too, so a reader that fetched would be counted.
+    std::env::set_var("VOX_TEST_CARD_ALLOW", allowed.to_string());
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a tokio runtime");
+    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&r.workers[0], &r.workers[1]);
+    let room = r.id.clone();
+    let count = |s: &std::sync::Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().clone();
+
+    let post = |text: &str, extra: &[&str]| {
+        let mut argv = vec!["room", "post", room.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push(text);
+        let o = alice.vox_in(None, &argv, None);
+        assert!(o.ok, "PRODUCT (staging): alice's `vox room post`: {o:?}");
+    };
+    post(
+        &format!("CARD-1 see http://{allowed}/page for the numbers."),
+        &[],
+    );
+    let after_post = count(&seen);
+    post(&format!("CARD-2 not this one: http://{refused}/page"), &[]);
+    post(
+        &format!("CARD-3 nor this: http://{allowed}/page"),
+        &["--no-card"],
+    );
+    support::until(
+        bob,
+        None,
+        "alice's three posts to reach bob",
+        &["room", "read", &room],
+        |o| o.stdout.contains("CARD-3"),
+    );
+    let read_json = bob.vox_in(None, &["room", "read", &room, "--json"], None);
+    let read_plain = bob.vox_in(None, &["room", "read", &room], None);
+    let turn = bob.vox_env(
+        None,
+        &[("VOX_HARNESS", "codex")],
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "default",
+            "--room",
+            &room,
+            "--session",
+            "reader-1",
+            "--format",
+            "codex",
+        ],
+        None,
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let after_reads = count(&seen);
+    let rows: Vec<serde_json::Value> = read_json
+        .stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let card_of = |marker: &str| {
+        rows.iter()
+            .find(|r| r["text"].as_str().is_some_and(|t| t.contains(marker)))
+            .map(|r| r["envelope"]["data"]["card"].clone())
+            .unwrap_or_default()
+    };
+    let (card1, card2, card3) = (card_of("CARD-1"), card_of("CARD-2"), card_of("CARD-3"));
+    eprintln!(
+        "[proof] server A after alice's post: {after_post:?}; after bob read it: {after_reads:?}; \
+         server B: {:?}\ncard 1: {card1}\ncard 2: {card2}\ncard 3: {card3}\nbob's read:\n{}\nan \
+         agent's turn on bob's node:\n{}",
+        count(&refused_seen),
+        read_plain.stdout,
+        turn.stdout
+    );
+    assert_eq!(
+        after_post,
+        vec!["/page".to_owned(), "/img.png".to_owned()],
+        "PRODUCT: by the time alice's post returned, her node must have fetched the page and its \
+         image once each"
+    );
+    assert!(
+        card1["title"] == "The quarterly report"
+            && card1["description"] == "Numbers & notes for Q3"
+            && card1["image"] == base64(CARD_IMAGE).as_str(),
+        "PRODUCT: bob must read the card alice's node fetched: title, description and the image's \
+         exact bytes; he read {card1}"
+    );
+    assert!(
+        read_plain
+            .stdout
+            .contains("link: The quarterly report \u{2014} Numbers & notes for Q3")
+            && turn
+                .stdout
+                .contains("link: The quarterly report \u{2014} Numbers & notes for Q3"),
+        "PRODUCT: bob's `vox room read` and an agent's turn on his node must show the card; they \
+         showed:\n{}\n{}",
+        read_plain.stdout,
+        turn.stdout
+    );
+    assert_eq!(
+        after_reads, after_post,
+        "PRODUCT: no reader's node may contact the linked site: the server counted more after bob \
+         read the card"
+    );
+    assert!(
+        card2.is_null() && count(&refused_seen).is_empty(),
+        "PRODUCT: a link to a local address must go without a card, and nothing there may be \
+         fetched; the card read {card2}, the server saw {:?}",
+        count(&refused_seen)
+    );
+    assert!(
+        card3.is_null(),
+        "PRODUCT: `--no-card` must post the link with no card, fetching nothing; the card read \
+         {card3}"
     );
 }
