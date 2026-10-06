@@ -172,9 +172,12 @@ pub struct RoomServices {
 /// A service a member shares in a room.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct SharedService {
-    /// Its address, `<service>.<node>.<room>.vox`, in this node's own aliases: what a forward
-    /// takes.
+    /// Its readable address, `<service>.<node>.<room>.vox` in this node's own aliases: for
+    /// showing only (ADR-028 S-1a).
     pub address: String,
+    /// Its canonical address, every part an identifier (ADR-028 S-1): what a copy or a message
+    /// carries, so it reaches the same service on any member's machine.
+    pub canonical: String,
     /// Who shares it: this node's name for them, or `you`.
     pub by: String,
     /// Whether it carries datagrams.
@@ -920,11 +923,12 @@ impl VoxClient {
                     room: shown_name(&room),
                     shared: shared
                         .into_iter()
-                        .map(|(address, by, udp, kind)| SharedService {
-                            address: shown_name(&address),
-                            by: shown_name(&by),
-                            udp,
-                            kind: shown_name(&kind),
+                        .map(|s| SharedService {
+                            address: shown_name(&s.address),
+                            canonical: s.canonical,
+                            by: shown_name(&s.by),
+                            udp: s.udp,
+                            kind: shown_name(&s.kind),
                         })
                         .collect(),
                     offered: services

@@ -10,6 +10,11 @@
 //!   node's trust keyring — or its fingerprint.
 //! - **`<room>`** is **this machine's** alias for the room — its local name — or its id.
 //!
+//! **The canonical form travels** (ADR-028 S-1): `<service fingerprint>.<node fingerprint>.<room
+//! id>.vox` ([`canonical_address`]) is what is copied, posted, handed to an agent or carried in a
+//! frame, because it resolves the same on every member's machine. The readable form, in this
+//! machine's own aliases, is for showing.
+//!
 //! The aliases are local pointers to a fingerprint, like a CNAME, meaningful only here: two
 //! machines may call the same node different things and both reach the same service. Nothing is
 //! published, registered or global.
@@ -108,6 +113,20 @@ pub fn label_of(name: &str) -> String {
         }
     }
     out.trim_matches('-').to_owned()
+}
+
+/// The **canonical** address of `name` shared by `host` in `channel_id` (ADR-028 S-1): every part
+/// an identifier, `<service fingerprint>.<node fingerprint>.<room id>.vox`, so it means the same on
+/// every member's machine. It is what a copy, a message, a hook or a frame carries; the readable
+/// form ([`VoxResolver::address_of`]) is for showing only. [`VoxResolver::lookup`] takes it.
+#[must_use]
+pub fn canonical_address(channel_id: &Digest32, host: &Digest32, name: &str) -> String {
+    format!(
+        "{}.{}.{}.vox",
+        b32_encode(&service_fingerprint(channel_id, host, name)),
+        b32_encode(host),
+        b32_encode(channel_id)
+    )
 }
 
 /// What a name that is not `<service>.<node>.<room>.vox` resolves to: nothing. The sentence is

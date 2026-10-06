@@ -349,17 +349,19 @@ pub fn print_services(
     room: &str,
     channel_id: &Digest32,
     services: &[(String, String)],
-    shared: &[(String, String, bool, String)],
+    shared: &[vox_core::node::ipc::SharedService],
 ) {
     if shared.is_empty() {
         println!("vox: nothing is shared in {room} ({})", short(channel_id));
     } else {
         println!("vox: shared in {room} ({})", short(channel_id));
         // Its kind, as its sharer's node detected it (ADR-028 S-2); a datagram service that
-        // is not plain `udp` says so too.
-        for (address, who, udp, kind) in shared {
-            let udp = if *udp && kind != "udp" { "/udp" } else { "" };
-            println!("  {address}  by {who}  {kind}{udp}");
+        // is not plain `udp` says so too. The readable address is for reading; the canonical
+        // one beneath it is what to copy, and works on any member's machine (ADR-028 S-1, S-3).
+        for s in shared {
+            let udp = if s.udp && s.kind != "udp" { "/udp" } else { "" };
+            println!("  {}  by {}  {}{udp}", s.address, s.by, s.kind);
+            println!("    {}", s.canonical);
         }
     }
     if services.is_empty() {
@@ -1178,9 +1180,8 @@ pub async fn serve(
         "           ^ send this another way than the address (in person, a call, a different app)"
     );
     println!();
-    // The address with the fingerprints in the node and room places: what any member can use
-    // as printed, or with its own aliases for this node and this room (V030-25).
-    let me = held.me.as_ref().map(b32_encode).unwrap_or_default();
+    // The canonical address (ADR-028 S-1): what any member can use as printed, on any machine.
+    let me = held.me.unwrap_or_default();
     // What each was detected to be (ADR-028 S-2), as the room's log says it.
     let shared = match held.client.request(&Request::Services { channel_id }).await {
         Ok(Frame::Services { shared, .. }) => shared,
@@ -1190,18 +1191,16 @@ pub async fn serve(
         let endpoint = at.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], *port)));
         let name = vox_core::node::channel::service_name(label);
         let udp = vox_core::tunnel::udp::is_udp(label);
+        let address = vox_core::node::resolver::canonical_address(&channel_id, &me, name);
         let said = shared
             .iter()
-            .find(|(address, who, ..)| who == "you" && address.starts_with(&format!("{name}.")))
-            .map(|(.., kind)| {
-                let proto = if udp && kind != "udp" { "/udp" } else { "" };
-                format!(" ({kind}{proto})")
+            .find(|s| s.by == "you" && s.canonical == address)
+            .map(|s| {
+                let proto = if udp && s.kind != "udp" { "/udp" } else { "" };
+                format!(" ({}{proto})", s.kind)
             })
             .unwrap_or_default();
-        println!(
-            "sharing {endpoint} as {name}.{me}.{}.vox{said}",
-            b32_encode(&channel_id)
-        );
+        println!("sharing {endpoint} as {address}{said}");
     }
     // **Who can reach it, by name, and who in the room cannot** (ADR-017 4.2): the reach rule is
     // the host's keyring — a member reaches the service once this node trusts it — so each list

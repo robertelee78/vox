@@ -1384,6 +1384,22 @@ impl Request {
     }
 }
 
+/// A service a member shares in a room, as [`Frame::Services`] carries it (V030-25).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedService {
+    /// Its readable address, in this node's own aliases for the node and the room where it has
+    /// them (ADR-028 S-1a): for showing only.
+    pub address: String,
+    /// Its canonical address, every part an identifier (ADR-028 S-1): what is copied or sent.
+    pub canonical: String,
+    /// Who shares it: this node's name for them, or `you`.
+    pub by: String,
+    /// Whether it carries datagrams.
+    pub udp: bool,
+    /// What its sharer's node detected it to be (ADR-028 S-2).
+    pub kind: String,
+}
+
 /// What the node sends.
 ///
 /// Not `#[non_exhaustive]`, for the same reason as
@@ -1513,9 +1529,8 @@ pub enum Frame {
         room: String,
         /// `(service tag, local address)`, in the node's order.
         services: Vec<(String, String)>,
-        /// What every member shares in the room (V030-25): `(address, sharer, udp, kind)`, each
-        /// as this node writes it, the kind as its sharer's node detected it (ADR-028 S-2).
-        shared: Vec<(String, String, bool, String)>,
+        /// What every member shares in the room (V030-25), with both forms of each address.
+        shared: Vec<SharedService>,
     },
     /// File shares, as a [`Request::Share`], [`Request::ShareStop`] or [`Request::ShareList`]
     /// asked for.
@@ -1648,12 +1663,13 @@ impl Frame {
                     e.array(2).text(tag).text(local);
                 }
                 e.array(shared.len());
-                for (address, who, udp, kind) in shared {
-                    e.array(4)
-                        .text(address)
-                        .text(who)
-                        .uint(u64::from(*udp))
-                        .text(kind);
+                for s in shared {
+                    e.array(5)
+                        .text(&s.address)
+                        .text(&s.canonical)
+                        .text(&s.by)
+                        .uint(u64::from(s.udp))
+                        .text(&s.kind);
                 }
             }
             Frame::Shares { shares } => {
@@ -2185,18 +2201,25 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             for _ in 0..count {
                 if d.array()
                     .map_err(|_| Error::MalformedIpc("ipc shared row"))?
-                    != 4
+                    != 5
                 {
                     return Err(Error::MalformedIpc("ipc shared row arity"));
                 }
                 let address = text(d, "ipc shared address")?;
-                let who = text(d, "ipc shared sharer")?;
+                let canonical = text(d, "ipc shared canonical address")?;
+                let by = text(d, "ipc shared sharer")?;
                 let udp = d
                     .uint()
                     .map_err(|_| Error::MalformedIpc("ipc shared udp"))?
                     != 0;
                 let kind = text(d, "ipc shared kind")?;
-                shared.push((address, who, udp, kind));
+                shared.push(SharedService {
+                    address,
+                    canonical,
+                    by,
+                    udp,
+                    kind,
+                });
             }
             return Ok(Frame::Services {
                 room,
