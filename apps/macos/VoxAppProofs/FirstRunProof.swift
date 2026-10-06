@@ -8,8 +8,9 @@
 //
 // What must hold, as a person sees it:
 // 1. At first run the app asks once whether to keep the daemon running while logged in, saying
-//    what that does (ADR-014 M-8), and offers the menu bar extra, off until turned on; turned
-//    on, it appears (M-22). The person says Not Now. Then it lists the Mac's nodes; the person picks one and types its passphrase.
+//    what that does (ADR-014 M-8), and offers the menu bar extra, off until turned on; clicked,
+//    the toggle shows it on (M-22; the item itself is looked at by a person in the notification
+//    case: XCTest reads no menu bar items here). The person says Not Now. Then it lists the Mac's nodes; the person picks one and types its passphrase.
 //    A wrong passphrase shows the daemon's own sentence where it was typed.
 // 2. The right one attaches the node: the app says so, and `vox node list` says `attached`.
 // 3. The main window (ADR-028 W-1, W-2; ADR-014 M-13): ⌘N makes the room and shows it; bob joins
@@ -69,8 +70,10 @@
 // nothing from before it opened (no seeding from VoxClient.unread): (13) goes red.
 
 // Every check on the window proves its own query first (ADR-018: a red names its side): Vox is in
-// front and XCTest reads words in its window, else the red is APPARATUS; then a red is PRODUCT
-// and quotes what the app showed. A SwiftUI Text's words are its accessibility value, not its
+// front and XCTest reads words in what it shows, else the red is APPARATUS; then a red is PRODUCT
+// and quotes what the app showed. "Missing" is PRODUCT only once every container the app can show
+// (windows with their sheets and popovers, dialogs such as the file panel, menus) was searched;
+// found only outside them (the Touch Bar), it is APPARATUS. A case stops at its first red. A SwiftUI Text's words are its accessibility value, not its
 // label: the read-by line, the keyring's effect sentences and a message's text are read there.
 
 import XCTest
@@ -100,6 +103,53 @@ func scratchOnly(_ env: [String: String], under scratch: String) throws {
     }
 }
 
+/// What a check looks for in what the app shows: an element by its identifier, by the start of
+/// its identifier, by the words it shows, a menu item by its title, or a button inside a control.
+enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
+    case id(String)
+    case idPrefix(String)
+    case showing(String)
+    case menuItem(String)
+    case child(of: String, button: String)
+
+    init(stringLiteral value: String) { self = .id(value) }
+
+    var description: String {
+        switch self {
+        case let .id(i): return "\"\(i)\""
+        case let .idPrefix(p): return "an element whose identifier starts \"\(p)\""
+        case let .showing(w): return "an element showing \"\(w)\""
+        case let .menuItem(t): return "the menu item \"\(t)\""
+        case let .child(of, button): return "\"\(button)\" in \"\(of)\""
+        }
+    }
+
+    /// The containers to search: a menu item only in menus, all else everywhere.
+    func containers(_ ui: XCUIApplication, all: [XCUIElementQuery]) -> [XCUIElementQuery] {
+        if case .menuItem = self { return [ui.menus] }
+        return all
+    }
+
+    func query(in container: XCUIElementQuery) -> XCUIElementQuery {
+        switch self {
+        case let .id(i):
+            return container.descendants(matching: .any).matching(identifier: i)
+        case let .idPrefix(p):
+            return container.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier BEGINSWITH %@", p))
+        case let .showing(w):
+            return container.descendants(matching: .any)
+                .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", w, w))
+        case let .menuItem(t):
+            return container.descendants(matching: .menuItem)
+                .matching(NSPredicate(format: "title == %@ OR label == %@", t, t))
+        case let .child(of, button):
+            return container.descendants(matching: .any).matching(identifier: of)
+                .descendants(matching: .button).matching(NSPredicate(format: "title == %@ OR label == %@", button, button))
+        }
+    }
+}
+
 /// A red that is the apparatus's, not the product's: staging was not achieved.
 struct Apparatus: Error, CustomStringConvertible {
     let why: String
@@ -113,6 +163,8 @@ final class FirstRunProof: XCTestCase {
     private var stager: Stager!
 
     override func setUpWithError() throws {
+        // A case stops at its first red: one red, with its side, and no cascade behind it.
+        continueAfterFailure = false
         stager = try Stager.fromEnvironment()
     }
 
@@ -151,13 +203,13 @@ final class FirstRunProof: XCTestCase {
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
         ui.launch()
         defer { ui.terminate() }
-        let said = ui.descendants(matching: .any)["login-item-said"]
+        let said = Key.id("login-item-said")
         let quoted = words(ui, said, timeout: 30,
                            "with Keep Running chosen and its daemon refusing for good, the app must quote the login item's own line",
                            until: { $0.contains("STAGED-REASON is not a Vox data directory this version reads") }) ?? ""
-        tap(ui.buttons["login-item-off"], "Turn Keep Running Off")
-        if !said.waitForNonExistence(timeout: 30) {
-            XCTFail("PRODUCT: Turn Keep Running Off must leave Keep Running off; the login item's line is still shown: \(shown(said))")
+        tap(ui, Key.id("login-item-off"), "Turn Keep Running Off")
+        if !el(ui, said).waitForNonExistence(timeout: 30) {
+            XCTFail("PRODUCT: Turn Keep Running Off must leave Keep Running off; the login item's line is still shown: \(shown(el(ui, said)))")
         }
         let answer = stager.run(["/bin/cat", config + "/app/login-item"], env: [:]).out
         XCTAssertEqual(answer.trimmingCharacters(in: .whitespacesAndNewlines), "no",
@@ -171,7 +223,8 @@ final class FirstRunProof: XCTestCase {
     /// trusting the other, alice attached; the app opens as alice, chosen before (first run
     /// done). With the keyring on screen, bob's message to alice posts one local notification
     /// saying who wrote to her, and never the message's text. Vox not allowed to notify is said
-    /// first, by the app's own status bar: APPARATUS, at once.
+    /// first, by the app's own status bar: APPARATUS, at once. The menu bar item, turned on at the
+    /// first-run question, is looked at by the person (a pause of 20 s, said in the log).
     func testNotificationSaysWhoWroteNeverWhat() throws {
         let env = ProcessInfo.processInfo.environment
         guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
@@ -188,7 +241,8 @@ final class FirstRunProof: XCTestCase {
         try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
         try stager.write(Data("bob identity\n".utf8), to: pass("bob"))
         try stager.write(Data("notify room\n".utf8), to: pass("room"))
-        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        // The first-run question is left unanswered, so the menu bar toggle is clicked as a
+        // person does (the path that once did nothing); the node is chosen before.
         try stager.write(Data("alice\n".utf8), to: config + "/app/node")
         daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
                            until: "vox daemon: control socket")
@@ -233,11 +287,20 @@ final class FirstRunProof: XCTestCase {
             ui.terminate()
             _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
         }
-        present(ui, ui.descendants(matching: .any)["attached"], timeout: 60,
+        // The menu bar item: turned on here, then looked at by the person at the Mac (XCTest reads
+        // no menu bar items on this Mac).
+        let offer = Key.id("menu-bar-offer")
+        if present(ui, offer, timeout: 30, "the first run must offer \"Show Vox in the menu bar\"") {
+            tap(ui, offer, "Show Vox in the menu bar")
+            print("[proof] LOOK NOW at the menu bar: Vox's speech-bubble item must be there, just turned on (waiting 20 s)")
+            Thread.sleep(forTimeInterval: 20)
+        }
+        tap(ui, Key.id("login-item-not-now"), "Not Now")
+        present(ui, Key.id("attached"), timeout: 60,
                 "the app, its node chosen before, must open attached as alice")
-        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         // Asked first: whether the app may notify, in its own status bar.
-        let statusNow = words(ui, ui.descendants(matching: .any)["status"], timeout: 10,
+        let statusNow = words(ui, Key.id("status"), timeout: 10,
                               "the window must have a status bar") ?? ""
         if statusNow.contains("notifications off") {
             throw Apparatus("Vox is not allowed to notify on this Mac: allow it in System Settings, Notifications, Vox, then run again; the app said \(statusNow)")
@@ -251,7 +314,11 @@ final class FirstRunProof: XCTestCase {
         if !banner.waitForExistence(timeout: 30) {
             let there = centre.descendants(matching: .any).allElementsBoundByIndex.prefix(30).map(shown)
                 .filter { !$0.isEmpty }
-            XCTFail("PRODUCT: bob's message to alice in a room off screen posted no notification saying \"bob wrote to you\" (Vox's status bar says it may notify: \(statusNow)); Notification Center shows: \(there)")
+            if there.isEmpty {
+                XCTFail("APPARATUS: XCTest reads nothing in Notification Center, so whether a banner showed cannot be told")
+            } else {
+                XCTFail("PRODUCT: bob's message to alice in a room off screen posted no notification saying \"bob wrote to you\" (Vox's status bar says it may notify: \(statusNow)); Notification Center shows: \(there)")
+            }
         }
         let leaked = centre.descendants(matching: .any)
             .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
@@ -295,47 +362,37 @@ final class FirstRunProof: XCTestCase {
         // (1) First run: the login item is asked about once, and declined here (approving it is
         // the manual check manual.login_item); then pick the node, and a wrong passphrase is the
         // daemon's sentence.
-        words(ui, ui.descendants(matching: .any)["login-item-why"], timeout: 30,
+        words(ui, Key.id("login-item-why"), timeout: 30,
               "at first run the app must ask whether to keep the daemon running, saying what that does",
               until: { $0.contains("keeps your rooms reachable while you are logged in, even with the app closed") })
-        // The menu bar extra, offered here and off until turned on (M-22): turned on, it is there.
-        // Premise: XCTest sees menu bar items on this Mac at all (Control Center's).
-        let controlCentre = XCUIApplication(bundleIdentifier: "com.apple.controlcenter")
-        let seesMenuBar = controlCentre.statusItems.count > 0
-        if !seesMenuBar {
-            XCTFail("APPARATUS: XCTest sees no menu bar items on this Mac (Control Center has none it can read), so Vox's cannot be looked for")
-        } else if ui.statusItems.count != 0 {
-            XCTFail("PRODUCT: the menu bar extra must be off until the person turns it on; Vox has \(ui.statusItems.count) menu bar item(s)")
-        }
-        let offer = ui.checkBoxes["menu-bar-offer"]
+        // The menu bar extra, offered here, off until turned on (M-22): the toggle shows it is on
+        // once clicked. Whether the item then shows in the menu bar XCTest cannot see on this
+        // Mac (it reads no menu bar items); a person looks, in testNotificationSaysWhoWroteNeverWhat.
+        let offer = Key.id("menu-bar-offer")
         if present(ui, offer, timeout: 10, "the first run must offer \"Show Vox in the menu bar\"") {
-            tap(offer, "Show Vox in the menu bar")
-            switch offer.value as? Int {
+            tap(ui, offer, "Show Vox in the menu bar")
+            switch el(ui, offer).value as? Int {
             case nil: XCTFail("APPARATUS: XCTest reads no value from the \"Show Vox in the menu bar\" checkbox")
             case 1?: break
             case let v?: XCTFail("PRODUCT: \"Show Vox in the menu bar\", clicked, must show it is on; its value is \(v)")
             }
-            if seesMenuBar && !ui.statusItems.firstMatch.waitForExistence(timeout: 10) {
-                let theirs = controlCentre.statusItems.allElementsBoundByIndex.prefix(20).map(shown)
-                XCTFail("PRODUCT: \"Show Vox in the menu bar\" was turned on and Vox has no menu bar item; the menu bar items XCTest sees: \(theirs)")
-            }
         }
-        tap(ui.buttons["login-item-not-now"], "Not Now")
-        let pick = ui.buttons["node-alice"]
+        tap(ui, Key.id("login-item-not-now"), "Not Now")
+        let pick = Key.id("node-alice")
         present(ui, pick, timeout: 30, "at first run the app must offer node alice")
-        tap(pick, "node alice")
-        let field = ui.secureTextFields["passphrase"]
+        tap(ui, pick, "node alice")
+        let field = Key.id("passphrase")
         present(ui, field, timeout: 10, "the app must ask for node alice's passphrase")
-        type(field, "not the passphrase", "the passphrase field")
-        tap(ui.buttons["attach"], "Attach")
-        words(ui, ui.descendants(matching: .any)["said"], timeout: 30,
+        type(ui, field, "not the passphrase", "the passphrase field")
+        tap(ui, Key.id("attach"), "Attach")
+        words(ui, Key.id("said"), timeout: 30,
               "a wrong passphrase must show the daemon's own sentence where it was typed",
               until: { $0.contains("that passphrase does not open node alice's identity") })
 
         // (2) The right one attaches it.
-        type(field, "alice identity", "the passphrase field")
-        tap(ui.buttons["attach"], "Attach")
-        present(ui, ui.descendants(matching: .any)["attached"], timeout: 60,
+        type(ui, field, "alice identity", "the passphrase field")
+        tap(ui, Key.id("attach"), "Attach")
+        present(ui, Key.id("attached"), timeout: 60,
                 "the right passphrase must attach node alice")
         let listed = run(vox, ["node", "list"], env: voxEnv).out
         XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
@@ -356,12 +413,12 @@ final class FirstRunProof: XCTestCase {
         let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
         // The app makes the room (⌘N, M-31: create) and copies its link (⌘L).
         ui.typeKey("n", modifierFlags: .command)
-        let roomName = ui.textFields["room-form-name"]
+        let roomName = Key.id("room-form-name")
         present(ui, roomName, timeout: 10, "⌘N must open the New Room form")
-        type(roomName, "mission", "the room's name field")
-        let roomSecret = ui.secureTextFields["room-form-passphrase"]
-        type(roomSecret, "mission room", "the room's passphrase field")
-        tap(ui.buttons["room-form-submit"], "Create")
+        type(ui, roomName, "mission", "the room's name field")
+        let roomSecret = Key.id("room-form-passphrase")
+        type(ui, roomSecret, "mission room", "the room's passphrase field")
+        tap(ui, Key.id("room-form-submit"), "Create")
         var rooms = ""
         let madeUntil = Date().addingTimeInterval(60)
         while Date() < madeUntil && !rooms.contains(" mission") {
@@ -406,27 +463,27 @@ final class FirstRunProof: XCTestCase {
         }
         // The room has been on screen since ⌘N made it: bob, who joined meanwhile and whom alice
         // trusted meanwhile, is listed in its inspector without the room being opened again.
-        words(ui, ui.descendants(matching: .any)["member-bob"], timeout: 30,
+        words(ui, Key.id("member-bob"), timeout: 30,
               "bob joined and was trusted while the room was on screen: its inspector must list him in alice's keyring",
               until: { $0.hasPrefix("bob, in keyring") })
         // Off the room, so a message to alice is unread: a room on screen is read.
-        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
                    env: bobSession)
-        words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 60,
+        words(ui, Key.id("group-needs you"), timeout: 60,
               "a message to alice must list the room under \"needs you (1)\"",
               until: { $0 == "needs you (1)" })
-        let row = ui.descendants(matching: .any)["room-mission"]
+        let row = Key.id("room-mission")
         words(ui, row, timeout: 10, "the room's row must say it needs you",
               until: { $0.contains("needs you") })
-        tap(row, "mission in the sidebar")
-        let bob = ui.descendants(matching: .any)["member-bob"]
+        tap(ui, row, "mission in the sidebar")
+        let bob = Key.id("member-bob")
         let bobWords = words(ui, bob, timeout: 30, "the inspector must list bob in alice's keyring",
                              until: { $0.hasPrefix("bob, in keyring") }) ?? ""
-        let bar = words(ui, ui.descendants(matching: .any)["status"], timeout: 10,
+        let bar = words(ui, Key.id("status"), timeout: 10,
                         "the status bar must say the node, its peers and the keyring window",
                         until: { $0.contains("node alice") && $0.contains("peer") && $0.contains("keyring") }) ?? ""
-        let regrouped = words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 10,
+        let regrouped = words(ui, Key.id("group-needs you"), timeout: 10,
                               "the room shown is read, so nothing needs alice: \"needs you (0)\"",
                               until: { $0 == "needs you (0)" }) ?? ""
         print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bobWords); status: \(bar)")
@@ -482,9 +539,9 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(shownAgain.contains("alice"),
                       "PRODUCT: once alice's app is in front again, the message on screen must be read; bob's `vox room read --json` says read_by \(shownAgain)")
         // Alice posts; bob's agent reads it in a drain, as a harness does before every prompt.
-        let compose = ui.textFields["compose"]
+        let compose = Key.id("compose")
         present(ui, compose, timeout: 10, "the room must have a field to post")
-        type(compose, "FROM-ALICE\r", "the composer")
+        type(ui, compose, "FROM-ALICE\r", "the composer")
         var drained = ""
         let drainUntil = Date().addingTimeInterval(60)
         while Date() < drainUntil && !drained.contains("FROM-ALICE") {
@@ -497,8 +554,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("bob's agent drain never read alice's FROM-ALICE in 60 s: \(drained)")
         }
         // The read-by line is a Text: its words are its accessibility value.
-        let readLine = ui.descendants(matching: .any)
-            .matching(NSPredicate(format: "identifier BEGINSWITH 'read-by-'")).firstMatch
+        let readLine = Key.idPrefix("read-by-")
         let readWords = words(ui, readLine, timeout: 30,
                               "alice's message read by bob must show \"read by bob\" under it",
                               until: { $0 == "read by bob" }) ?? ""
@@ -508,72 +564,71 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["node", "create", "carol"],
                    env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
         let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
-        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
-        let addFp = ui.textFields["keyring-add-fingerprint"]
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        let addFp = Key.id("keyring-add-fingerprint")
         present(ui, addFp, timeout: 10, "the keyring view must offer to add a node")
-        type(addFp, carolFp, "the fingerprint field")
-        let addAlias = ui.textFields["keyring-add-alias"]
-        type(addAlias, "carol", "the alias field")
+        type(ui, addFp, carolFp, "the fingerprint field")
+        let addAlias = Key.id("keyring-add-alias")
+        type(ui, addAlias, "carol", "the alias field")
         // The effect sentences are Texts: their words are their accessibility value.
-        words(ui, ui.descendants(matching: .any)["keyring-add-effect"], timeout: 10,
+        words(ui, Key.id("keyring-add-effect"), timeout: 10,
               "adding must say what trusting does before it is done",
               until: { $0.contains("it may read what you write") })
-        tap(ui.buttons["keyring-trust"], "Trust")
-        let carolRow = ui.descendants(matching: .any)["keyring-row-carol"]
+        tap(ui, Key.id("keyring-trust"), "Trust")
+        let carolRow = Key.id("keyring-row-carol")
         present(ui, carolRow, timeout: 30, "carol, once trusted, must be listed in the keyring view")
         let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
         XCTAssertTrue(trustList.contains(carolFp),
                       "PRODUCT: `vox trust list` must list carol once the app trusted her; it said: \(trustList)")
-        tap(ui.buttons["keyring-remove-carol"], "Remove… on carol")
-        words(ui, ui.descendants(matching: .any)["keyring-remove-effect"], timeout: 10,
+        tap(ui, Key.id("keyring-remove-carol"), "Remove… on carol")
+        words(ui, Key.id("keyring-remove-effect"), timeout: 10,
               "removing must say what untrusting does before it is done",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui.buttons["keyring-untrust-confirm"], "Untrust")
+        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
         var after5 = ""
         let goneUntil = Date().addingTimeInterval(30)
         while Date() < goneUntil {
             after5 = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
-            if !after5.contains(carolFp) && !carolRow.exists { break }
+            if !after5.contains(carolFp) && locate(ui, carolRow) == nil { break }
             Thread.sleep(forTimeInterval: 0.5)
         }
         if after5.contains(carolFp) {
             XCTFail("PRODUCT: once untrusted, carol must be gone from `vox trust list`; it said: \(after5)")
         }
         // Gone from the view: shown with the window read, so a missing row is not a lost query.
-        if windowReadable(ui) && carolRow.exists {
-            XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(carolRow))\"")
+        if windowReadable(ui), let row = locate(ui, carolRow) {
+            XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
         print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
 
         // (6) Attach a file to the room, To: bob, with a note.
-        tap(ui.descendants(matching: .any)["room-mission"], "mission in the sidebar")
+        tap(ui, Key.id("room-mission"), "mission in the sidebar")
         let file = scratch.appendingPathComponent("for-bob.bin")
         let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
         try stager.write(bytes, to: file.path)
-        let attachButton = ui.buttons["attach"]
+        let attachButton = Key.id("attach")
         present(ui, attachButton, timeout: 10, "the room must offer Attach")
-        tap(attachButton, "Attach (the paperclip)")
-        // The file panel, a dialog of the app (open-panel): go to the file's path, then the
-        // panel's own Attach (OKButton), once the Go To sheet has closed and it is enabled. Never
-        // an app-wide query: that also finds the Touch Bar's Attach.
-        if let panel = openPanel(ui, timeout: 10) {
+        tap(ui, attachButton, "Attach (the paperclip)")
+        // The file panel (open-panel, a dialog of the app, found wherever it shows): go to the
+        // file's path, then the panel's own Attach (OKButton), once the Go To sheet has closed and
+        // it is enabled.
+        if present(ui, Key.id("open-panel"), timeout: 10, "Attach must open the file panel") {
             ui.typeKey("g", modifierFlags: [.command, .shift])
             ui.typeText(file.path + "\r")
-            let choose = panel.buttons["OKButton"]
-            let enabled = NSPredicate(format: "exists == true AND isEnabled == true")
-            if XCTWaiter.wait(for: [expectation(for: enabled, evaluatedWith: choose)], timeout: 10) != .completed {
-                XCTFail("APPARATUS: the file panel's Attach never became enabled after going to \(file.path): the Go To sheet did not take the path")
+            let choose = el(ui, Key.id("open-panel")).buttons["OKButton"]
+            let enabled = NSPredicate(format: "exists == true AND isEnabled == true AND isHittable == true")
+            if XCTWaiter.wait(for: [expectation(for: enabled, evaluatedWith: choose)], timeout: 10) == .completed {
+                choose.click()
+            } else {
+                XCTFail("APPARATUS: the file panel's Attach never became clickable after going to \(file.path): the Go To sheet did not take the path")
             }
-            tap(choose, "the file panel's Attach")
-        } else {
-            XCTFail("PRODUCT: Attach must open the file panel; no file panel showed; the window shows: \(onScreen(ui))")
         }
-        let toBob = ui.descendants(matching: .any)["attach-to-bob"]
+        let toBob = Key.id("attach-to-bob")
         present(ui, toBob, timeout: 10, "attaching a file must ask To:")
-        tap(toBob, "To: bob")
-        let noteField = ui.textFields["attach-note"]
-        type(noteField, "FOR-BOB-NOTE", "the note field")
-        tap(ui.buttons["attach-send"], "Send")
+        tap(ui, toBob, "To: bob")
+        let noteField = Key.id("attach-note")
+        type(ui, noteField, "FOR-BOB-NOTE", "the note field")
+        tap(ui, Key.id("attach-send"), "Send")
         let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(room)/for-bob.bin")
         var pulledBytes: Data?
         let pullUntil = Date().addingTimeInterval(120)
@@ -593,20 +648,21 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "NO-CLAIM"],
                    env: voxEnv)
         Thread.sleep(forTimeInterval: 10)
-        let lanesToggle = ui.descendants(matching: .any)["lanes-toggle"]
-        let bobLane = ui.descendants(matching: .any)["lane-state-bob"]
-        if lanesToggle.exists {
-            tap(lanesToggle.buttons["Lanes"], "Lanes")
-            if windowReadable(ui), bobLane.waitForExistence(timeout: 5), shown(bobLane) == "bob: working" {
-                XCTFail("PRODUCT: bob posted `working` holding no claim; his lane must not say working, and it says \"\(shown(bobLane))\"")
+        let lanesToggle = Key.id("lanes-toggle")
+        let bobLane = Key.id("lane-state-bob")
+        if locate(ui, lanesToggle) != nil {
+            tap(ui, Key.child(of: "lanes-toggle", button: "Lanes"), "Lanes")
+            if windowReadable(ui), el(ui, bobLane).waitForExistence(timeout: 5),
+               shown(el(ui, bobLane)) == "bob: working" {
+                XCTFail("PRODUCT: bob posted `working` holding no claim; his lane must not say working, and it says \"\(shown(el(ui, bobLane)))\"")
             }
-            tap(lanesToggle.buttons["Timeline"], "Timeline")
+            tap(ui, Key.child(of: "lanes-toggle", button: "Timeline"), "Timeline")
         }
         try staged(vox, ["room", "claim", "--node", "bob", room, "ticket-1"], env: voxEnv)
         try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "ON-TICKET-1"],
                    env: voxEnv)
         present(ui, lanesToggle, timeout: 30, "a room whose member works on a claim must offer the lanes view")
-        tap(lanesToggle.buttons["Lanes"], "Lanes")
+        tap(ui, Key.child(of: "lanes-toggle", button: "Lanes"), "Lanes")
         let laneWords = words(ui, bobLane, timeout: 30,
                               "bob, holding ticket-1 with a working post, must show working in his lane",
                               until: { $0 == "bob: working" }) ?? ""
@@ -614,14 +670,13 @@ final class FirstRunProof: XCTestCase {
         // ⌘O works with the lanes view shown, as with the timeline: the open panel shows.
         if windowReadable(ui) {
             ui.typeKey("o", modifierFlags: .command)
-            if let panel = openPanel(ui, timeout: 10) {
-                tap(panel.buttons["CancelButton"], "the file panel's Cancel")
-                _ = panel.waitForNonExistence(timeout: 10)
-            } else {
-                XCTFail("PRODUCT: ⌘O in the lanes view must open the file panel to attach a file; no file panel showed; the window shows: \(onScreen(ui))")
+            if present(ui, Key.id("open-panel"), timeout: 10,
+                       "⌘O in the lanes view must open the file panel to attach a file") {
+                tap(ui, Key.id("CancelButton"), "the file panel's Cancel")
+                _ = el(ui, Key.id("open-panel")).waitForNonExistence(timeout: 10)
             }
         }
-        tap(lanesToggle.buttons["Timeline"], "Timeline")
+        tap(ui, Key.child(of: "lanes-toggle", button: "Timeline"), "Timeline")
 
         // (8) Notifications are their own case, testNotificationSaysWhoWroteNeverWhat: the one
         // step that needs a person at the Mac (Vox allowed to notify, no Focus on), run alone.
@@ -639,32 +694,30 @@ final class FirstRunProof: XCTestCase {
             }
             try staged(vox, ["room", "post", "--node", "alice", id, "HELLO-\(name)"], env: voxEnv)
         }
-        let aaa = ui.descendants(matching: .any)["room-aaa"]
+        let aaa = Key.id("room-aaa")
         present(ui, aaa, timeout: 30, "room aaa must show in the sidebar")
-        present(ui, ui.descendants(matching: .any)["room-bbb"], timeout: 30,
+        present(ui, Key.id("room-bbb"), timeout: 30,
                 "room bbb must show in the sidebar")
-        tap(aaa, "aaa in the sidebar")
+        tap(ui, aaa, "aaa in the sidebar")
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
                    env: bobSession)
-        words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 60,
+        words(ui, Key.id("group-needs you"), timeout: 60,
               "bob's message to alice must put mission under needs you",
               until: { $0 == "needs you (1)" })
         ui.typeKey("j", modifierFlags: .command)
         // A message's text is a Text: its words are its accessibility value.
-        let landed = ui.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "NEEDS-YOU-9",
-                                  "NEEDS-YOU-9")).firstMatch
+        let landed = Key.showing("NEEDS-YOU-9")
         present(ui, landed, timeout: 15,
                 "⌘J from room aaa must open mission, the room that needs alice, with its message NEEDS-YOU-9")
         // To: is the room's own: bob ticked in mission is not carried into aaa.
-        let to = ui.menuButtons["compose-to"]
+        let to = Key.id("compose-to")
         present(ui, to, timeout: 10, "the composer must offer To:")
-        tap(to, "To:")
-        tap(ui.menuItems["bob"], "bob in To:")
+        tap(ui, to, "To:")
+        tap(ui, Key.menuItem("bob"), "bob in To:")
         words(ui, to, timeout: 10, "ticking bob in To: must say so", until: { $0 == "To: bob" })
         // Seen in mission, then at once another room: the read record names mission, the room the
         // message is in.
-        tap(aaa, "aaa in the sidebar")
+        tap(ui, aaa, "aaa in the sidebar")
         words(ui, to, timeout: 10, "To: set in mission must not carry into aaa",
               until: { $0 == "To: the room" })
         var nine: [String] = []
@@ -702,11 +755,11 @@ final class FirstRunProof: XCTestCase {
         guard !canonical.isEmpty else {
             throw Apparatus("alice's `vox service list --json` never listed bob's web share")
         }
-        tap(aaa, "aaa in the sidebar")
-        tap(ui.descendants(matching: .any)["room-mission"], "mission in the sidebar")
-        let card = ui.descendants(matching: .any)["service-\(cliAddress)"]
+        tap(ui, aaa, "aaa in the sidebar")
+        tap(ui, Key.id("room-mission"), "mission in the sidebar")
+        let card = Key.id("service-\(cliAddress)")
         present(ui, card, timeout: 30, "the room must show a card for bob's service \(cliAddress)")
-        tap(card, "the service card")
+        tap(ui, card, "the service card")
         NSPasteboard.general.clearContents()
         ui.typeKey("c", modifierFlags: [.command, .shift])
         Thread.sleep(forTimeInterval: 1)
@@ -727,10 +780,10 @@ final class FirstRunProof: XCTestCase {
         // readable address shown and the canonical one copied; the forward command, copied and
         // run as a person pastes it, reaches bob's service.
         ui.typeKey("s", modifierFlags: [.command, .shift])
-        let box = ui.descendants(matching: .any)["service-box-\(cliAddress)"]
+        let box = Key.id("service-box-\(cliAddress)")
         present(ui, box, timeout: 30, "the services view must list bob's web share \(cliAddress)")
         NSPasteboard.general.clearContents()
-        tap(ui.buttons["copy-forward-\(cliAddress)"], "Copy on the forward command")
+        tap(ui, Key.id("copy-forward-\(cliAddress)"), "Copy on the forward command")
         Thread.sleep(forTimeInterval: 1)
         let pasted = NSPasteboard.general.string(forType: .string) ?? ""
         XCTAssertEqual(pasted, "vox forward \(canonical) 127.0.0.1:0",
@@ -746,20 +799,19 @@ final class FirstRunProof: XCTestCase {
         // One-step sharing (S-4): a service listening on this Mac, picked from the list, is shared
         // in mission with the name suggested, and bob reaches it by his own `vox service list`.
         let mine = try EchoServer(stager)
-        let listedHere = ui.buttons["listening-\(mine.port)"]
+        let listedHere = Key.id("listening-\(mine.port)")
         present(ui, listedHere, timeout: 30,
                 "the services view must list the service listening here on port \(mine.port)")
-        tap(listedHere, "the listening service")
-        let shareRoom = ui.popUpButtons["share-room"]
+        tap(ui, listedHere, "the listening service")
+        let shareRoom = Key.id("share-room")
         present(ui, shareRoom, timeout: 10, "picking a listening service must offer a room to share it in")
-        tap(shareRoom, "the room picker")
-        tap(ui.menuItems["mission"], "mission in the room picker")
-        words(ui, ui.descendants(matching: .any)["share-can"], timeout: 10,
+        tap(ui, shareRoom, "the room picker")
+        tap(ui, Key.menuItem("mission"), "mission in the room picker")
+        words(ui, Key.id("share-can"), timeout: 10,
               "before sharing, the view must say bob, whom alice trusts, can reach it",
               until: { $0.contains("bob") })
-        tap(ui.buttons["share-submit"], "Share")
-        let sharedName = ui.descendants(matching: .any)
-            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "service-mine-")).firstMatch
+        tap(ui, Key.id("share-submit"), "Share")
+        let sharedName = Key.idPrefix("service-mine-")
         present(ui, sharedName, timeout: 30, "the share made in one step must be under YOUR SHARES")
         var bobSees = ""
         let bobUntil = Date().addingTimeInterval(60)
@@ -794,11 +846,11 @@ final class FirstRunProof: XCTestCase {
         guard refusedJoin.status != 0 else {
             throw Apparatus("carol's join with a wrong passphrase was not refused: \(refusedJoin.out)")
         }
-        tap(ui.descendants(matching: .any)["decisions"], "Decision record in the sidebar")
-        let topWords = words(ui, ui.descendants(matching: .any)["decision-0"], timeout: 30,
+        tap(ui, Key.id("decisions"), "Decision record in the sidebar")
+        let topWords = words(ui, Key.id("decision-0"), timeout: 30,
                              "carol's refused join must be at the top of the decision record",
                              until: { $0.hasPrefix("refused: to join a room") }) ?? ""
-        present(ui, ui.descendants(matching: .any)["decision-1"], timeout: 5,
+        present(ui, Key.id("decision-1"), timeout: 5,
                 "the decision record must keep the older decisions (the trust changes) below")
         print("[proof] decision record top: \(topWords)")
 
@@ -824,12 +876,12 @@ final class FirstRunProof: XCTestCase {
         guard let live = Line(bobBound), live.roundTrip("BEFORE-UNTRUST\n") == "BEFORE-UNTRUST\n" else {
             throw Apparatus("bob's forward at \(bobBound) carried nothing before the untrust")
         }
-        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
-        tap(ui.buttons["keyring-remove-bob"], "Remove… on bob")
-        words(ui, ui.descendants(matching: .any)["keyring-remove-effect"], timeout: 10,
+        tap(ui, Key.id("keyring"), "Keyring in the sidebar")
+        tap(ui, Key.id("keyring-remove-bob"), "Remove… on bob")
+        words(ui, Key.id("keyring-remove-effect"), timeout: 10,
               "removing bob must say what untrusting does first",
               until: { $0.contains("reads nothing you write from now on") })
-        tap(ui.buttons["keyring-untrust-confirm"], "Untrust")
+        tap(ui, Key.id("keyring-untrust-confirm"), "Untrust")
         XCTAssertTrue(live.cut(within: 30),
                       "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
         print("[proof] untrust cut bob's live forward into alice's notes service")
@@ -868,7 +920,7 @@ final class FirstRunProof: XCTestCase {
         }
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
         ui.launch()
-        let reopened = words(ui, ui.descendants(matching: .any)["group-needs you"], timeout: 30,
+        let reopened = words(ui, Key.id("group-needs you"), timeout: 30,
                              "bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"",
                              until: { $0 == "needs you (1)" }) ?? ""
         print("[proof] opened again: \(reopened)")
@@ -886,69 +938,110 @@ final class FirstRunProof: XCTestCase {
     // value, not its label (the read-by line, the keyring's effect sentences, a message's text):
     // `shown` reads the label, else the value.
 
-    /// The premise: Vox in front, with words XCTest reads in its window. APPARATUS otherwise.
+    /// The premise: Vox in front, with words XCTest reads in what it shows. APPARATUS otherwise.
     private func windowReadable(_ ui: XCUIApplication, file: StaticString = #filePath,
-                          line: UInt = #line) -> Bool {
+                                line: UInt = #line) -> Bool {
         if ui.state != .runningForeground {
             ui.activate()
             _ = ui.wait(for: .runningForeground, timeout: 5)
         }
         guard ui.state == .runningForeground else {
-            XCTFail("APPARATUS: Vox is not in front (state \(ui.state.rawValue)), so its window cannot be checked",
+            XCTFail("APPARATUS: Vox is not in front (state \(ui.state.rawValue)), so what it shows cannot be checked",
                     file: file, line: line)
             return false
         }
         guard ui.windows.firstMatch.waitForExistence(timeout: 5), !onScreen(ui).isEmpty else {
-            XCTFail("APPARATUS: XCTest reads no words in Vox's window, so nothing in it can be checked",
+            XCTFail("APPARATUS: XCTest reads no words in what Vox shows, so nothing in it can be checked",
                     file: file, line: line)
             return false
         }
         return true
     }
 
-    /// The words in Vox's frontmost window, each text's identifier with them: what a PRODUCT red
-    /// quotes.
+    /// Everything the app can show a person: its windows (with their sheets and popovers), its
+    /// dialogs (the file panel), and its open menus. Never the Touch Bar, which mirrors controls.
+    private func containers(_ ui: XCUIApplication) -> [XCUIElementQuery] {
+        [ui.windows, ui.dialogs, ui.sheets, ui.popovers, ui.menus]
+    }
+
+    /// The words in everything the app shows, each text's identifier with them: what a PRODUCT
+    /// red quotes.
     private func onScreen(_ ui: XCUIApplication) -> String {
-        ui.windows.firstMatch.staticTexts.allElementsBoundByIndex.prefix(40).map { e -> String in
+        containers(ui).flatMap { $0.staticTexts.allElementsBoundByIndex.prefix(40) }.map { e -> String in
             let words = shown(e)
             return e.identifier.isEmpty || words.isEmpty ? words : "\(e.identifier): \(words)"
         }
         .filter { !$0.isEmpty }.joined(separator: " | ")
     }
 
-    /// `element` on screen within `timeout`, the premise holding: PRODUCT, quoting the window,
-    /// when it never shows.
+    /// Where `key` is in what the app shows now, searched in every container; nil when nowhere.
+    private func locate(_ ui: XCUIApplication, _ key: Key) -> XCUIElement? {
+        for container in key.containers(ui, all: containers(ui)) {
+            let found = key.query(in: container).firstMatch
+            if found.exists { return found }
+        }
+        return nil
+    }
+
+    /// The element `key` names, where it is now (else a query that finds nothing): for reading
+    /// its value or whether it is there.
+    private func el(_ ui: XCUIApplication, _ key: Key) -> XCUIElement {
+        locate(ui, key) ?? key.query(in: ui.windows).firstMatch
+    }
+
+    /// `key` shown within `timeout`, the premise holding. Not shown: PRODUCT only once every
+    /// container the app can show was searched, quoting what they show; found only outside them
+    /// (the Touch Bar), APPARATUS.
     @discardableResult
-    private func present(_ ui: XCUIApplication, _ element: XCUIElement, timeout: TimeInterval,
-                         _ product: String, file: StaticString = #filePath, line: UInt = #line) -> Bool {
+    private func present(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
+                         file: StaticString = #filePath, line: UInt = #line) -> Bool {
         guard windowReadable(ui, file: file, line: line) else { return false }
-        if element.waitForExistence(timeout: timeout) { return true }
-        XCTFail("PRODUCT: \(product); the window shows: \(onScreen(ui))", file: file, line: line)
+        let end = Date().addingTimeInterval(timeout)
+        repeat {
+            if locate(ui, key) != nil { return true }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < end
+        missing(ui, key, product, file: file, line: line)
         return false
     }
 
-    /// `element`'s words once `holds` is true of them, within `timeout`, the premise holding:
-    /// PRODUCT quoting them (or the window, when it never shows) when it never is; APPARATUS when
-    /// it shows and XCTest reads neither its label nor its value.
+    /// The red for `key` not shown: APPARATUS when the app has it only outside what it shows a
+    /// person, PRODUCT otherwise, quoting everything shown.
+    private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, file: StaticString,
+                         line: UInt) {
+        let anywhere = key.query(in: ui.descendants(matching: .any)).firstMatch
+        if anywhere.exists {
+            XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
+                    file: file, line: line)
+        } else {
+            XCTFail("PRODUCT: \(product); \(key) is in none of the app's windows, dialogs, sheets, popovers or menus, which show: \(onScreen(ui))",
+                    file: file, line: line)
+        }
+    }
+
+    /// `key`'s words once `holds` is true of them, within `timeout`, the premise holding: PRODUCT
+    /// quoting them when it never is; `missing` when it never shows; APPARATUS when it shows and
+    /// XCTest reads neither its label nor its value.
     @discardableResult
-    private func words(_ ui: XCUIApplication, _ element: XCUIElement, timeout: TimeInterval,
-                       _ product: String, until holds: (String) -> Bool = { _ in true },
+    private func words(_ ui: XCUIApplication, _ key: Key, timeout: TimeInterval, _ product: String,
+                       until holds: (String) -> Bool = { _ in true },
                        file: StaticString = #filePath, line: UInt = #line) -> String? {
         guard windowReadable(ui, file: file, line: line) else { return nil }
         let end = Date().addingTimeInterval(timeout)
         var last = ""
+        var seen = false
         repeat {
-            if element.exists {
-                last = shown(element)
+            if let e = locate(ui, key) {
+                seen = true
+                last = shown(e)
                 if !last.isEmpty && holds(last) { return last }
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
-        if !element.exists {
-            XCTFail("PRODUCT: \(product); it is not on screen; the window shows: \(onScreen(ui))",
-                    file: file, line: line)
+        if !seen {
+            missing(ui, key, product, file: file, line: line)
         } else if last.isEmpty {
-            XCTFail("APPARATUS: \(element.identifier) is on screen and XCTest reads neither its label nor its value",
+            XCTFail("APPARATUS: \(key) is shown and XCTest reads neither its label nor its value",
                     file: file, line: line)
         } else {
             XCTFail("PRODUCT: \(product); it shows \"\(last)\"", file: file, line: line)
@@ -956,32 +1049,28 @@ final class FirstRunProof: XCTestCase {
         return nil
     }
 
-    /// Click `element`, shown to be there and hittable first: APPARATUS when XCTest cannot click
-    /// it, rather than an exception that names no side.
+    /// Click `key`, once it is shown and hittable: APPARATUS when XCTest cannot click it, never an
+    /// exception that names no side.
     @discardableResult
-    private func tap(_ element: XCUIElement, _ what: String, file: StaticString = #filePath,
-                     line: UInt = #line) -> Bool {
-        guard element.waitForExistence(timeout: 10), element.isHittable else {
-            XCTFail("APPARATUS: XCTest cannot click \(what): \(element.exists ? "not hittable" : "not found")",
-                    file: file, line: line)
-            return false
-        }
-        element.click()
-        return true
+    private func tap(_ ui: XCUIApplication, _ key: Key, _ what: String,
+                     file: StaticString = #filePath, line: UInt = #line) -> Bool {
+        let end = Date().addingTimeInterval(10)
+        repeat {
+            if let e = locate(ui, key), e.isHittable {
+                e.click()
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < end
+        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): \(locate(ui, key) == nil ? "not shown" : "not hittable")",
+                file: file, line: line)
+        return false
     }
 
-    /// Type `text` into `element`, only once it was clicked: typing into one that is not there is
-    /// an XCTest exception that names no side.
-    private func type(_ element: XCUIElement, _ text: String, _ what: String,
+    /// Type `text` into `key`, only once it was clicked.
+    private func type(_ ui: XCUIApplication, _ key: Key, _ text: String, _ what: String,
                       file: StaticString = #filePath, line: UInt = #line) {
-        if tap(element, what, file: file, line: line) { element.typeText(text) }
-    }
-
-    /// The file panel (an NSOpenPanel: a dialog of the app, `open-panel`, not one of its
-    /// windows), once it shows.
-    private func openPanel(_ ui: XCUIApplication, timeout: TimeInterval) -> XCUIElement? {
-        let panel = ui.dialogs["open-panel"]
-        return panel.waitForExistence(timeout: timeout) ? panel : nil
+        if tap(ui, key, what, file: file, line: line) { el(ui, key).typeText(text) }
     }
 
     /// A staging step: `vox` must succeed, else the staging was not achieved. Its output, trimmed.
