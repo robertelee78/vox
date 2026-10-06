@@ -1557,7 +1557,7 @@ pub struct ServeArgs {
     /// `<name>=<port>/udp`. A member reaches each as `<name>.<node>.<room>.vox`, and only that
     /// way; a bare port is refused. The first creates the room; `vox serve ssh=22 dns=53/udp`
     /// shares both. None: the services listening on this machine are listed to pick one from,
-    /// with a name suggested and a preview before it is shared (ADR-028 S-4).
+    /// with a name suggested and a preview of who can reach it before it is shared.
     #[arg(num_args = 0..)]
     pub ports: Vec<String>,
     /// The local endpoint to carry connections to, when it is not `127.0.0.1:<port>`.
