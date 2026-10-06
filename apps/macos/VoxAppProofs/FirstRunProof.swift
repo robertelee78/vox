@@ -117,6 +117,17 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
 
     init(stringLiteral value: String) { self = .id(value) }
 
+    /// Something of the same kind that is always shown while the main window is (the status
+    /// bar by identifier and by its words; Quit Vox among the menus): what the same search must
+    /// find before anything it does not find is called missing.
+    var sibling: Key {
+        switch self {
+        case .id, .idPrefix, .child: return .id("status")
+        case .showing: return .showing("node ")
+        case .menuItem: return .menuItem("Quit Vox")
+        }
+    }
+
     var description: String {
         switch self {
         case let .id(i): return "\"\(i)\""
@@ -715,6 +726,11 @@ final class FirstRunProof: XCTestCase {
             if bobRows.isEmpty { Thread.sleep(forTimeInterval: 0.5) }
         }
         if bobRows.isEmpty {
+            // Premise: bob's room read shows the room at all (a message staged before).
+            let bobs = run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out
+            guard bobs.contains("STAGE-") else {
+                throw Apparatus("bob's `vox room read` shows none of the room's earlier messages either, so the share's absence says nothing: \(bobs.suffix(600))")
+            }
             let alices = run(vox, ["room", "read", "--node", "alice", "--json", room], env: voxEnv).out
             XCTFail("PRODUCT: the file attached in the app, with its note FOR-BOB-NOTE, never reached the room as bob's node reads it in 60 s; alice's node reads: \(alices.suffix(1500))")
         }
@@ -743,6 +759,11 @@ final class FirstRunProof: XCTestCase {
             if got != want { Thread.sleep(forTimeInterval: 0.5) }
         }
         if got != want {
+            // Premise: bob's node directory, under which pulls land, is where the proof looks.
+            let nodeDir = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob").path
+            guard stager.run(["/bin/test", "-d", nodeDir], env: [:]).status == 0 else {
+                throw Apparatus("bob's node directory \(nodeDir) does not exist, so the proof is looking in the wrong data root")
+            }
             let there = stager.run(["/bin/ls", "-lR", URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files").path], env: [:]).out
             let pulls = run(vox, ["room", "read", "--node", "bob", room], env: voxEnv).out
             XCTFail("PRODUCT: the file attached To: bob must be pulled by bob's node, byte for byte, into \(bobCopy.path) within 120 s; it holds \(got.isEmpty ? "nothing" : "sha256 \(got)"); bob's files: \(there.isEmpty ? "none" : there.replacingOccurrences(of: "\n", with: " ⏎ ")); bob's room read: \(pulls.suffix(1200))")
@@ -877,19 +898,23 @@ final class FirstRunProof: XCTestCase {
         tap(ui, card, "the service card")
         // Clicked, the card is selected (it says so to VoiceOver), and enables Room > Copy
         // Selected Service's Address (⌘⇧C).
-        let selectedUntil = Date().addingTimeInterval(5)
-        while Date() < selectedUntil && !el(ui, card).isSelected { Thread.sleep(forTimeInterval: 0.2) }
-        if !el(ui, card).isSelected {
-            keepTree(ui, "the service card was not selected")
-            XCTFail("PRODUCT: clicking bob's service card must select it; it does not say it is selected")
-        }
+        // Two signals of one selection, read together: neither found is the proof's; the trait
+        // unread while the menu item is enabled is the proof's too (the selection took).
         let copyItem = el(ui, Key.menuItem("Copy Selected Service's Address"))
+        let selectedUntil = Date().addingTimeInterval(5)
+        while Date() < selectedUntil && !(el(ui, card).isSelected && copyItem.isEnabled) {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        let selected = el(ui, card).isSelected
         if !copyItem.exists {
             keepTree(ui, "the copy menu item was not found")
             XCTFail("APPARATUS: XCTest finds no menu item \"Copy Selected Service's Address\" in the app's menus")
-        } else if !copyItem.isEnabled {
-            keepTree(ui, "the copy menu item was disabled")
-            XCTFail("PRODUCT: clicking bob's service card must select it, enabling Room > Copy Selected Service's Address; it is disabled")
+        } else if !selected && copyItem.isEnabled {
+            keepTree(ui, "the card's Selected trait was unread")
+            XCTFail("APPARATUS: the copy menu item is enabled (the card is selected) but XCTest reads no Selected trait on the card")
+        } else if !selected || !copyItem.isEnabled {
+            keepTree(ui, "the service card was not selected")
+            XCTFail("PRODUCT: clicking bob's service card must select it (said to VoiceOver) and enable Room > Copy Selected Service's Address; selected \(selected), enabled \(copyItem.isEnabled)")
         }
         let copied = copiedBy(ui) { ui.typeKey("c", modifierFlags: [.command, .shift]) }
         if copied != canonical {
@@ -1176,6 +1201,13 @@ final class FirstRunProof: XCTestCase {
     private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, file: StaticString,
                          line: UInt) {
         keepTree(ui, "\(key) was not shown")
+        // Premise: the same search finds a known sibling of the same kind; if not, the search is
+        // what failed, not the app.
+        if locateEverywhere(ui, key.sibling) == nil {
+            XCTFail("APPARATUS: \(key) not found, and the same search finds not even \(key.sibling), which is always shown: the search, not the app, is at fault",
+                    file: file, line: line)
+            return
+        }
         let anywhere = key.query(in: ui.descendants(matching: .any)).firstMatch
         if anywhere.exists {
             XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
