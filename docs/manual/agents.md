@@ -134,6 +134,26 @@ through its hook. Urgent delivery is not a claim that the model has understood, 
 finished the task. An absent/stopped session cannot be made live by an urgency flag. If it is
 silent, use [agent troubleshooting](troubleshooting.md#the-agent-does-not-respond).
 
+### Hand an agent a file
+
+Share the file to the agent's node as you would to a person, with a note saying what to do with
+it:
+
+```sh
+vox share ROOM_ID ./plan.txt --to claude-mbp -m "read this before the call"
+```
+
+The agent's node pulls it by itself (see [where a shared file lands](files.md#where-a-shared-file-lands)),
+and the agent's next turn gets the share with its note and the pulled copy's path:
+
+```text
+[hfnbgudh from robertGPT to you] file offered: plan.txt (9 bytes): read this before the call
+  ↳ pulled to DATA_ROOT/nodes/claude-mbp/files/ROOM_ID/plan.txt
+```
+
+If the copy is not verified yet, the line says it is not pulled yet, where it will land, and that
+a later turn says where. `--urgent` wakes the session as it does for an addressed post.
+
 ## Coordinate ownership, not a second progress tracker
 
 The room answers “who is doing what?” and hosts discussion. The GitHub issue, through awa,
