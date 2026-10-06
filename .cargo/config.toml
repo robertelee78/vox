@@ -1,0 +1,8 @@
+# Environment for what cargo runs from this tree (`cargo test`, `cargo run`).
+[env]
+# The vox daemon runs the `.vox` proxy on 127.0.0.1:1080 while a node is attached (ADR-028 S-5).
+# Every proof starts daemons of its own, and a proof's daemon must never take port 1080 from the
+# decider's real daemon on the same machine, nor fight the proofs running beside it. So a daemon
+# started from a cargo-run test binary binds a free port, and says which in its log and in `vox up`.
+# Not forced: a run that sets VOX_PROXY itself keeps its own. A shipped binary never reads this file.
+VOX_PROXY = "127.0.0.1:0"

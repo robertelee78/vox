@@ -1349,6 +1349,8 @@ fn shell_setup_keeps_the_rc_files_symlink_and_mode() {
             .arg("shell-setup")
             .args(extra)
             .env_clear()
+            // A proof's daemon never takes port 1080 (.cargo/config.toml).
+            .env("VOX_PROXY", "127.0.0.1:0")
             .env("HOME", &home)
             .env("PATH", "/usr/bin:/bin")
             .env("SHELL", "/bin/zsh")

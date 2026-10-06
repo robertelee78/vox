@@ -283,6 +283,8 @@ fn a_live_models_post_is_dropped_only_from_its_own_sessions_drain() {
             Command::new(&shell)
                 .args(args)
                 .env_clear()
+                // A proof's daemon never takes port 1080 (.cargo/config.toml).
+                .env("VOX_PROXY", "127.0.0.1:0")
                 .env("PATH", path)
                 .env("HOME", std::env::var_os("HOME").unwrap_or_default())
                 .env("SHELL", &shell)

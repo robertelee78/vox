@@ -596,6 +596,9 @@ pub struct DaemonArgs {
     /// exit once nothing is attached and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
+    /// Where the `.vox` SOCKS5 proxy listens while a node is attached. Loopback only.
+    #[arg(long, env = "VOX_PROXY", default_value = crate::daemon_proxy::DEFAULT_PROXY)]
+    pub proxy: SocketAddr,
 }
 
 /// `vox tunnel …`.
@@ -1595,10 +1598,9 @@ pub struct ConnectArgs {
 pub struct UpArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
-    /// One room to open and carry, with its passphrase. Omitted, the proxy runs inside
-    /// the daemon, as this node (`vox daemon`), and carries every room it holds: `ssh
-    /// user@ssh.nas.family.vox` reaches service `ssh` on the node you call `nas` in room
-    /// `family`, for any node you trust, in any room.
+    /// One room to open, with its passphrase, if it is closed. The proxy carries every room
+    /// the daemon's attached nodes hold: `ssh user@ssh.nas.family.vox` reaches service `ssh`
+    /// on the node you call `nas` in room `family`, for any node you trust, in any room.
     pub room: Option<String>,
     /// **Refused**, as on every room verb: use `--passphrase-file`, or let it prompt
     /// when a room is named.
@@ -1613,10 +1615,10 @@ pub struct UpArgs {
     /// Read the identity passphrase from this file (first line).
     #[arg(long)]
     pub identity_passphrase_file: Option<std::path::PathBuf>,
-    /// Where the proxy listens. Loopback only, and a port above 1024 — nothing here needs
-    /// privilege.
-    #[arg(long, default_value = "127.0.0.1:1080")]
-    pub bind: SocketAddr,
+    /// Stay in the foreground and print what the proxy refuses or cuts, until stopped. The
+    /// proxy runs on without it.
+    #[arg(long)]
+    pub watch: bool,
 }
 
 use crate::client::DEFAULT_LISTEN;
@@ -1740,14 +1742,15 @@ enum Cmd {
     /// turn) and `vox agent skill <harness>` (the agent text, and where it goes).
     #[command(subcommand)]
     Agent(AgentCmd),
-    /// Bring up the local entry point for a room's services: a SOCKS5 proxy that resolves
-    /// the room's `.vox` name.
+    /// Say where the local entry point for rooms' services is: the vox daemon's SOCKS5 proxy,
+    /// which resolves `.vox` names and runs while any node is attached.
     ///
     /// This is how a tool reaches a room-bound service by name — the same shape a Tor user
     /// reaches a `.onion` through, and for the same reason: it needs no privilege of any
     /// kind. `ssh` is pointed at it with one `ProxyCommand` line, which `vox up` prints;
-    /// most other tools take `ALL_PROXY=socks5h://…`. Runs until stopped: SIGINT (Ctrl-C),
-    /// SIGTERM, SIGHUP or SIGQUIT each stops it cleanly.
+    /// most other tools take `ALL_PROXY=socks5h://…`. Attaches this node if it is not, prints
+    /// and exits; `--watch` stays and prints what the proxy refuses until stopped (SIGINT,
+    /// SIGTERM, SIGHUP or SIGQUIT).
     Up(UpArgs),
     /// Forward a local port to a shared service, named by its address
     /// `<service>.<node>.<room>.vox` — `ssh` over Vox. Runs until stopped: SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops it
@@ -2646,7 +2649,7 @@ pub fn run() -> ExitCode {
                     &args.profile,
                     pass(args.identity_passphrase, args.identity_passphrase_file),
                     room,
-                    args.bind,
+                    args.watch,
                     &steps,
                 )
                 .await

@@ -501,7 +501,9 @@ impl OcSandbox {
         cmd.arg("-f").arg(profile).arg(opencode_bin());
         // A cleared environment: an inherited one (cargo's) silently disables plugin hooks, and
         // the operator's PATH and USER name their home and other agents' scratch directories.
-        cmd.env_clear();
+        cmd.env_clear()
+            // A proof's daemon never takes port 1080 (.cargo/config.toml).
+            .env("VOX_PROXY", "127.0.0.1:0");
         let mut path: Vec<PathBuf> = path_first.iter().map(|p| p.to_path_buf()).collect();
         path.extend(std::env::split_paths(SANDBOX_PATH));
         cmd.env(

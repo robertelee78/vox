@@ -71,7 +71,9 @@ impl Account {
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(VOX);
-        c.env_clear();
+        c.env_clear()
+            // A proof's daemon never takes port 1080 (.cargo/config.toml).
+            .env("VOX_PROXY", "127.0.0.1:0");
         for key in ["PATH", "HOME", "TMPDIR"] {
             if let Some(v) = std::env::var_os(key) {
                 c.env(key, v);
@@ -760,7 +762,9 @@ fn hook_read_to_end(a: &Account, session: &str, within: Duration) -> (Option<Str
     let template = a.cmd(&[]);
     let mut sh = Command::new("/bin/sh");
     sh.args(["-c", r#"exec "$0" agent hook --node agent 3>&1 4>&2"#, VOX])
-        .env_clear();
+        .env_clear()
+        // A proof's daemon never takes port 1080 (.cargo/config.toml).
+        .env("VOX_PROXY", "127.0.0.1:0");
     for (k, v) in template.get_envs() {
         if let Some(v) = v {
             sh.env(k, v);
@@ -894,7 +898,9 @@ fn as_root(a: &Account, args: &[&str], within: Duration) -> Option<(Duration, St
     }
     let vox = a.cmd(args);
     let mut c = Command::new("unshare");
-    c.env_clear();
+    c.env_clear()
+        // A proof's daemon never takes port 1080 (.cargo/config.toml).
+        .env("VOX_PROXY", "127.0.0.1:0");
     for (k, v) in vox.get_envs() {
         if let Some(v) = v {
             c.env(k, v);

@@ -508,7 +508,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) => "resolving a .vox name",
-        NetEvent::UpAll { .. } => "bringing the proxy up for every room",
+        NetEvent::MemberDialer(_) => "lending the proxy its dialer",
     }
 }
 
@@ -870,14 +870,9 @@ enum NetEvent {
     /// A `.vox` name is being resolved (PRD-001 R20): answer with a snapshot of this
     /// node's rooms and keyring names.
     Names(oneshot::Sender<crate::node::resolver::VoxResolver>),
-    /// Bring the SOCKS proxy up across every room this node holds, for a `vox up` that
-    /// asked over the control socket; refusals and cut sessions go to `report`.
-    UpAll {
-        bind: std::net::SocketAddr,
-        report: mpsc::UnboundedSender<String>,
-        reply:
-            oneshot::Sender<crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)>>,
-    },
+    /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
+    /// name that resolved to one of this node's rooms.
+    MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
     /// A held room's address was given again and a member it names answered there (V210-167):
     /// keep what it names as the room's, dial its anchors, and answer the join.
     AddressReached {
@@ -3536,24 +3531,31 @@ impl NodeHandle {
         .await
     }
 
-    /// Bring the SOCKS proxy up across every room this node holds (`vox up` over the
-    /// control socket, PRD-001 R20). Refusals and cut sessions are sent to `report` as
-    /// sentences; the proxy runs until the returned handle is aborted.
+    /// Say a note of the daemon's proxy (ADR-028 S-5) as this node's event, as the node's own
+    /// proxy did: a refusal or a deliberate close, which the TUI, the app, `vox up --watch` and
+    /// the decision record take like any other event.
+    pub fn proxy_note(&self, note: crate::node::tunnel::TunnelNote) {
+        let _ = self.event_tx.send(note_event(note));
+    }
+
+    /// Say that a tunnel the daemon's proxy carried into `channel_id` was cut because the host
+    /// withdrew this node's reach to `port` (ADR-017 M17.11), as this node's event.
+    pub fn proxy_reach_withdrawn(&self, channel_id: Digest32, port: u16) {
+        let _ = self
+            .event_tx
+            .send(NodeEvent::ReachWithdrawn { channel_id, port });
+    }
+
+    /// This node's way of reaching a member of one of its rooms, for the daemon's proxy
+    /// (ADR-028 S-5), which carries every attached node's rooms on one port and dials through
+    /// the node that holds the room a name resolved to.
     ///
     /// # Errors
-    /// If the address is not loopback, cannot be bound, or the node is not networked.
-    pub async fn up_all(
-        &self,
-        bind: std::net::SocketAddr,
-        report: mpsc::UnboundedSender<String>,
-    ) -> crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)> {
+    /// If the node has stopped or is not networked.
+    pub async fn member_dialer(&self) -> crate::error::Result<MemberDialer> {
         let (reply, rx) = oneshot::channel();
         self.net_tx
-            .send(NetEvent::UpAll {
-                bind,
-                report,
-                reply,
-            })
+            .send(NetEvent::MemberDialer(reply))
             .await
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))?;
         rx.await
@@ -7429,12 +7431,20 @@ impl Node {
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
             }
-            NetEvent::UpAll {
-                bind,
-                report,
-                reply,
-            } => {
-                let _ = reply.send(self.bring_up_all(bind, report).await);
+            NetEvent::MemberDialer(reply) => {
+                let _ = reply.send(
+                    self.net
+                        .as_ref()
+                        .map(|net| {
+                            MemberDialer(NodeDialer {
+                                net: Arc::clone(net),
+                                channel_id: None,
+                            })
+                        })
+                        .ok_or(crate::error::Error::Unreachable(
+                            "the node is not networked",
+                        )),
+                );
             }
             NetEvent::AppDial(crate::node::app::AppDial {
                 channel_id,
@@ -13674,7 +13684,7 @@ impl Node {
                     });
                 }
             },
-            move |note: crate::node::tunnel::TunnelNote| {
+            move |_room: Option<Digest32>, note: crate::node::tunnel::TunnelNote| {
                 let _ = events.send(note_event(note));
             },
         ));
@@ -13703,67 +13713,6 @@ impl Node {
             names.name(*fp, petname);
         }
         names
-    }
-
-    /// Bring the SOCKS proxy up for every room at once (PRD-001 R20): names resolve
-    /// against the node's rooms and keyring as they are when each connection asks.
-    async fn bring_up_all(
-        &mut self,
-        bind: std::net::SocketAddr,
-        report: mpsc::UnboundedSender<String>,
-    ) -> crate::error::Result<(std::net::SocketAddr, tokio::task::AbortHandle)> {
-        if !bind.ip().is_loopback() {
-            return Err(crate::error::Error::MalformedTunnel(
-                "vox up binds loopback only",
-            ));
-        }
-        let net = self
-            .net
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or(crate::error::Error::Unreachable(
-                "the node is not networked",
-            ))?;
-        let listener =
-            tokio::net::TcpListener::bind(bind)
-                .await
-                .map_err(|e| crate::error::Error::Path {
-                    op: "bind the vox up proxy",
-                    detail: format!("{bind}: {e}"),
-                })?;
-        let bound = listener
-            .local_addr()
-            .map_err(|_| crate::error::Error::Unreachable("the proxy listener has no address"))?;
-        let names = Arc::new(NodeNames {
-            net_tx: self.net_tx.clone(),
-        });
-        let dialer = Arc::new(NodeDialer {
-            net,
-            channel_id: None,
-        });
-        let cut = report.clone();
-        let task = tokio::spawn(crate::node::up::serve_reporting(
-            listener,
-            names,
-            dialer,
-            Arc::clone(&self.udp_flows),
-            move |room: &Digest32, port: u16| {
-                let _ = cut.send(format!(
-                    "the host withdrew access to port {port} in room {} — that session was cut",
-                    crate::node::link::b32_encode(room)
-                ));
-            },
-            // A deliberate close is said as one, never as a refusal (V030-11).
-            move |note: crate::node::tunnel::TunnelNote| {
-                let _ = report.send(match note {
-                    crate::node::tunnel::TunnelNote::Refused(reason) => reason,
-                    crate::node::tunnel::TunnelNote::Closed(reason) => {
-                        format!("tunnel closed — {reason}")
-                    }
-                });
-            },
-        ));
-        Ok((bound, task.abort_handle()))
     }
 
     /// Start a forward: the checks that are this machine's business here, and the first dial —
@@ -14687,7 +14636,11 @@ struct NodeDialer {
 }
 
 impl crate::node::up::HostDialer for NodeDialer {
-    async fn connection(&self, host: &Digest32) -> crate::error::Result<Arc<VoxConnection>> {
+    async fn connection(
+        &self,
+        host: &Digest32,
+        _channel_id: &Digest32,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
         // `reach` returns a live connection when there is one and otherwise runs the whole
         // ADR-012 ladder, so this is both "give me the connection" and "make one". The
         // endpoint hints come from the board, which is also why this must happen per
@@ -14699,6 +14652,20 @@ impl crate::node::up::HostDialer for NodeDialer {
             None => self.net.board_endpoints_any(host),
         };
         self.net.reach(*host, &endpoints).await
+    }
+}
+
+/// A node's way of reaching a member, lent to the daemon's proxy ([`NodeHandle::member_dialer`]):
+/// the same ladder `vox forward` and the node's own proxy dial through.
+pub struct MemberDialer(NodeDialer);
+
+impl crate::node::up::HostDialer for MemberDialer {
+    async fn connection(
+        &self,
+        host: &Digest32,
+        channel_id: &Digest32,
+    ) -> crate::error::Result<Arc<VoxConnection>> {
+        self.0.connection(host, channel_id).await
     }
 }
 

@@ -474,7 +474,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         "PRODUCT: connect should say how to see what is shared in the room it joined.\n{out}"
     );
 
-    // 5. `vox up` — the guest's entry point. Parse where it bound.
+    // 5. `vox up --watch` — the guest's entry point, the daemon's proxy. Parse where it is.
     let mut up = VoxProc::spawn(
         "up",
         &guest_dir,
@@ -487,8 +487,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
             // to reach the service, not merely to join once.
             "--passphrase-file".into(),
             room_pass_file(&guest_dir, &passphrase),
-            "--bind".into(),
-            "127.0.0.1:0".into(),
+            "--watch".into(),
             "--anchor".into(),
             anchor_spec.clone(),
             "--listen".into(),
@@ -595,8 +594,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
             room.clone(),
             "--passphrase-file".into(),
             room_pass_file(&stranger_dir, &passphrase),
-            "--bind".into(),
-            "127.0.0.1:0".into(),
+            "--watch".into(),
             "--anchor".into(),
             anchor_spec.clone(),
             "--listen".into(),

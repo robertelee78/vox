@@ -334,8 +334,7 @@ fn stage_dial_back(w: &mut ForwardedWorld, n: usize) -> Staging {
             &w.room,
             "--passphrase-file",
             &room_pass_file(&carol, &w.passphrase),
-            "--bind",
-            "127.0.0.1:0",
+            "--watch",
             "--anchor",
             &w.anchor.v6_spec,
             "--listen",
@@ -909,6 +908,10 @@ fn a_first_direct_connection_completes_in_under_two_seconds() {
             eprintln!("[proof] sample {i}: `vox up` did not exit on Ctrl-C within 15 s; killed");
         }
         drop(up);
+        // Each sample is a first connection: the node `vox up` attached stays attached, and the
+        // proxy with it (ADR-028 S-5), so the guest's daemon is stopped before the next sample,
+        // as the punched and relayed proofs stop theirs.
+        world::reap_daemon(&w.guest_dir);
     }
 
     let never = direct.iter().filter(|d| **d > GIVE_UP).count();

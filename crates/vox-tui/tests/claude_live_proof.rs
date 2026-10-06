@@ -286,6 +286,8 @@ impl ClaudeHome {
     fn command(&self, program: &Path, path: &str, data: &Path, cfg: &Path) -> Command {
         let mut c = Command::new(program);
         c.env_clear()
+            // A proof's daemon never takes port 1080 (.cargo/config.toml).
+            .env("VOX_PROXY", "127.0.0.1:0")
             .env("PATH", path)
             .env("HOME", &self.home)
             .env("TMPDIR", &self.tmp)
