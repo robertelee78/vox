@@ -1084,7 +1084,9 @@ try:
     env_ = row.get("envelope") or {}
     claim("to", "To: alice · urgent" in composer and env_.get("to") == [fp["alice"]]
           and env_.get("urgent") is True
-          and "no member of this room is named zz-nobody" in refused and unset,
+          and "no member of this room is named zz-nobody" in refused and unset
+          # A person's message says nothing of where they ran vox: no `at` (ADR-020 4.9 is agents').
+          and "at" not in env_,
           f"bob's composer: {composer.strip()!r}; alice reads the message as {row!r}; `:to zz-nobody` "
           f"said {refused!r}, To: left unset: {unset}")
 
