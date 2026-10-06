@@ -317,11 +317,14 @@ private struct MessageRow: View {
                 }
             }
             if let file = message.file {
-                FileCard(file: file, pulled: pulled, look: look)
+                FileCard(file: file, image: message.image, pulled: pulled, look: look)
             }
             if message.file == nil || !(message.file?.note.isEmpty ?? true) {
                 Text(message.owed ? "not received yet" : shownText)
                     .textSelection(.enabled)
+            }
+            if let card = message.card {
+                LinkCardView(card: card)
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
@@ -345,15 +348,27 @@ private struct MessageRow: View {
 /// signed announcement states them.
 private struct FileCard: View {
     let file: FileOffer
+    /// The image's preview its share announced (ADR-028 F-9): shown while the sharer is offline.
+    let image: ImagePreview?
     /// This node's verified copy, once pulled (F-3, F-4).
     let pulled: String?
     let look: (URL) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: file.folder ? "folder" : "doc")
-                .font(.system(size: 22))
-                .accessibilityHidden(true)
+            if let image, let thumb = NSImage(data: image.thumb) {
+                Image(nsImage: thumb)
+                    .resizable()
+                    .aspectRatio(CGFloat(image.width) / CGFloat(max(image.height, 1)), contentMode: .fit)
+                    .frame(maxWidth: 160, maxHeight: 120)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .accessibilityLabel("image \(image.width) by \(image.height)")
+                    .accessibilityIdentifier("thumb-\(file.name)")
+            } else {
+                Image(systemName: file.folder ? "folder" : "doc")
+                    .font(.system(size: 22))
+                    .accessibilityHidden(true)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(file.name).fontWeight(.bold)
                 Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
@@ -377,6 +392,35 @@ private struct FileCard: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("file-\(file.name)")
         .accessibilityLabel("\(file.folder ? "folder" : "file") \(file.name), \(file.size) bytes")
+    }
+}
+
+/// A link's card (ADR-028 F-10): what the sender's node found at the message's first link, carried
+/// in the message, so drawing it fetches nothing. Opening the link is the person's own choice.
+private struct LinkCardView: View {
+    let card: LinkCard
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if let data = card.image, let picture = NSImage(data: data) {
+                Image(nsImage: picture).resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 72, maxHeight: 72)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .accessibilityHidden(true)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                if !card.title.isEmpty { Text(card.title).fontWeight(.bold) }
+                if !card.description.isEmpty { Text(card.description).secondaryText().lineLimit(3) }
+                if let url = URL(string: card.url) {
+                    Link(card.url, destination: url).font(Theme.eyebrow).lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+        .padding(8)
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("card-\(card.url)")
     }
 }
 

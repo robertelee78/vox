@@ -509,6 +509,24 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// Rename the room on screen: its one name, as every member sees it (ADR-028 R-1). Only its
+    /// creator or an admin may; the node's refusal is said as it comes.
+    func renameRoom(to name: String, passphrase secret: Secret) async -> Bool {
+        defer { secret.wipe() }
+        guard let id = roomOnScreen else { return false }
+        do {
+            let passphrase = try secret.passphrase()
+            defer { passphrase.wipe() }
+            try await client.renameRoom(room: id, name: name, identityPassphrase: passphrase)
+            did = "The room is now \(name) for every member."
+            await refresh()
+            return true
+        } catch {
+            said = sentence(error)
+            return false
+        }
+    }
+
     /// The decision record as last read, newest first (M-18).
     @Published var decisionEvents: [DecisionEvent] = []
 

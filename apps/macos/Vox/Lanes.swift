@@ -114,7 +114,9 @@ struct ComposerAddress: View {
             } label: {
                 Text(addressed).lineLimit(1).truncationMode(.tail)
             }
-            .frame(maxWidth: 160)
+            // At least wide enough for "To: the room": with no minimum the label collapsed and
+            // only the menu's chevron showed.
+            .frame(minWidth: 110, maxWidth: 160)
             .accessibilityLabel(addressedInFull)
             .accessibilityIdentifier("compose-to")
             Toggle("Urgent", isOn: $urgent)
