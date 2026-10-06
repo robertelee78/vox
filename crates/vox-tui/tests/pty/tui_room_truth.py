@@ -790,14 +790,14 @@ except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
 except Gone as g:
-    # Nothing in the driver stops the TUI before the end: a signal that ended it came from
-    # outside the product (APPARATUS); a TUI that exited on its own, a panic included, is the
-    # product's red, quoted.
+    # The driver stops a TUI only through `Tui.stop`, never while it still drives it: a signal
+    # that ended one came from outside the product (APPARATUS); a TUI that exited on its own, a
+    # panic included, is the product's red, quoted.
     if g.signal is not None and g.signal in (signal.SIGTERM, signal.SIGKILL, signal.SIGHUP, signal.SIGINT):
         print(f"{TAG} APPARATUS: the TUI was stopped from outside the driver: {g}")
         code = 2
     else:
-        print(f"{TAG} PRODUCT: bob's `vox tui` ended while in use: {g}")
+        print(f"{TAG} PRODUCT: a `vox tui` ended while in use: {g}")
         print(f"{TAG} RED")
         code = 1
 except subprocess.TimeoutExpired as t:
