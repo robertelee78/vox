@@ -19,10 +19,10 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use vox_core::hash::Digest32;
 
-use crate::state::{Focus, Mode, Prompt, Screen, UiState};
+use crate::state::{Focus, Mode, Prompt, PromptKind, Screen, UiState};
 use crate::theme;
 use crate::viewmodel::{
-    MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
+    ImageState, MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
 };
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
@@ -36,12 +36,20 @@ pub const LATE_MARKER: &str = "[late] ";
 pub const READ_BY: &str = "read by ";
 /// What leads the list of who pulled a share whole (ADR-028 F-7).
 pub const PULLED_BY: &str = "pulled by ";
+/// What marks a room's retention in its header (ADR-028 R-7).
+pub const RETENTION: &str = "⏱";
 
 /// The mark before the message selected in the timeline (ADR-028 R-9, #485).
 pub const SELECTED_MARKER: &str = "▶ ";
 
 /// The mark before a reply's quote of the message it answers, on the row above it.
 pub const QUOTE_MARKER: &str = "  ┆ ";
+
+/// The mark before an image a message shares, when it is named rather than drawn (ADR-028 F-11).
+pub const IMAGE_MARKER: &str = "\u{25a3} image ";
+
+/// What is said of an image a message shares until this node's copy is verified (ADR-028 F-11).
+pub const IMAGE_UNVERIFIED: &str = "drawn once it is pulled and verified";
 
 /// Where a member stands with you, in words: who reads whom, and what is still to do (ADR-028
 /// R-5, #481), the states `vox room join` names ([`crate::ident::Reading`]). Nothing for yourself.
@@ -147,6 +155,8 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
         render_keyring(frame, chunks[0], vm);
     } else if ui.screen == Screen::Decisions {
         render_decisions(frame, chunks[0], vm);
+    } else if ui.screen == Screen::Serve {
+        render_serve(frame, chunks[0], vm, ui);
     } else {
         let regions = Layout::default()
             .direction(Direction::Horizontal)
@@ -186,15 +196,32 @@ fn render_prompt(frame: &mut Frame, area: Rect, p: &Prompt) {
         )
         .unwrap_or(u16::MAX)
     });
-    let h = 5u16.saturating_add(note_rows).min(area.height);
+    // The trust prompt shows the node's fingerprint, grouped, beside its art (ADR-028 K-5), so
+    // the person compares it by eye as well as by what they paste.
+    let card: Vec<String> = match (p.kind, p.target) {
+        (PromptKind::Trust, Some(fp)) => {
+            let mut c = vec!["this node:".to_owned()];
+            c.extend(vox_text::fingerprint::card(
+                &vox_core::node::link::b32_encode(&fp),
+            ));
+            c
+        }
+        _ => Vec::new(),
+    };
+    let card_rows = u16::try_from(card.len()).unwrap_or(u16::MAX);
+    let h = 5u16
+        .saturating_add(note_rows)
+        .saturating_add(card_rows)
+        .min(area.height);
     let y = area.height.saturating_sub(h);
     let overlay = Rect::new(area.x, y, area.width, h);
     let step = format!("{}/{}", p.step + 1, p.kind.fields().len());
-    let mut body = vec![Line::from(format!(
+    let mut body: Vec<Line> = card.into_iter().map(Line::from).collect();
+    body.push(Line::from(format!(
         "{} ({step}): {}",
         p.label(),
         p.display()
-    ))];
+    )));
     if let Some(note) = p.kind.note() {
         body.push(Line::from(note));
     }
@@ -403,6 +430,54 @@ fn render_decisions(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     frame.render_widget(list, area);
 }
 
+/// Sharing a service listening on this machine into the room (ADR-028 S-4), as `vox serve` with
+/// no name does: what listens here, then, for the one picked, what is said before it is shared.
+fn render_serve(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
+    if let Some(p) = vm.serve_preview.as_ref() {
+        let lines: Vec<Line> = p
+            .lines
+            .iter()
+            .map(|l| Line::from(format!("  {l}")))
+            .chain(std::iter::once(Line::from("")))
+            .chain(std::iter::once(Line::from(
+                "  Enter: share it in this room · Esc: back to the list",
+            )))
+            .collect();
+        let w = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(pane_block("Share a service", true));
+        frame.render_widget(w, area);
+        return;
+    }
+    let mut items: Vec<ListItem> = vm
+        .listening
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let marker = if i == ui.selected_listening {
+                "▶ "
+            } else {
+                "  "
+            };
+            ListItem::new(format!("{marker}{}", l.line))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(
+            "  nothing listening on this machine can be seen from here",
+        ));
+    }
+    items.push(ListItem::new(format!(
+        "  {}",
+        crate::tunnel_cli::MAY_BE_MISSING
+    )));
+    let list = List::new(items).block(pane_block(
+        "Services listening on this machine (Enter: preview · Esc: back)",
+        true,
+    ));
+    frame.render_widget(list, area);
+}
+
 fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiState) {
     let Some(channel) = vm.active.as_ref() else {
         let p = Paragraph::new("No room open").block(Block::default().borders(Borders::ALL));
@@ -428,13 +503,14 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         body[0],
         &channel.held_back,
         channel.timeline.as_slice(),
-        &channel.notices,
+        (&channel.notices, &channel.retention),
         Selection {
             scroll: ui.timeline_scroll,
             selected: ui.selected_message,
             reveal: std::mem::take(&mut ui.reveal_selected),
+            focus: focused(ui, Focus::Timeline),
         },
-        focused(ui, Focus::Timeline),
+        &mut ui.images.borrow_mut(),
     );
     // What a reply answers, named in its composer's title until it is sent (ADR-028 R-9).
     let replying = ui.replying.map(|re| {
@@ -465,6 +541,11 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         focused(ui, Focus::Composer),
     );
     // Members above, and under them what is shared in the room (V030-25), when anything is.
+    let shared_focus = focused(ui, Focus::Shared);
+    // The pane's inner width: the command under the selected service is printed in full there,
+    // wrapped, since it is longer than a line (ADR-028 S-3).
+    let inner = usize::from(cols[1].width.saturating_sub(2)).max(20);
+    let shared_lines = shared_lines(&channel.shared, ui.selected_share, shared_focus, inner);
     let side = if channel.shared.is_empty() {
         vec![cols[1]]
     } else {
@@ -473,7 +554,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             .constraints([
                 Constraint::Min(3),
                 Constraint::Length(
-                    u16::try_from(channel.shared.len().saturating_add(2)).unwrap_or(u16::MAX),
+                    u16::try_from(shared_lines.len().saturating_add(2)).unwrap_or(u16::MAX),
                 ),
             ])
             .split(cols[1])
@@ -487,13 +568,45 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         focused(ui, Focus::Members),
     );
     if let Some(area) = side.get(1) {
-        let items: Vec<ListItem> = channel
-            .shared
-            .iter()
-            .map(|s| ListItem::new(Line::from(s.clone())))
-            .collect();
-        frame.render_widget(List::new(items).block(pane_block("Shared", false)), *area);
+        let items: Vec<ListItem> = shared_lines.into_iter().map(ListItem::new).collect();
+        frame.render_widget(
+            List::new(items).block(pane_block("Shared", shared_focus)),
+            *area,
+        );
     }
+}
+
+/// The Shared pane's lines (ADR-028 S-3): each service, and under the one selected while the pane
+/// has focus, what it needs that does not hold and, in full, the command `y` copies.
+fn shared_lines(
+    shared: &[crate::viewmodel::SharedView],
+    selected: usize,
+    focus: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (i, s) in shared.iter().enumerate() {
+        let here = focus && i == selected.min(shared.len().saturating_sub(1));
+        lines.push(Line::from(format!(
+            "{}{}",
+            if here { "▶ " } else { "  " },
+            s.line
+        )));
+        if here {
+            for m in &s.missing {
+                lines.push(Line::from(format!("    needs: {m}")));
+            }
+            lines.push(Line::from("    y copies:"));
+            let chars: Vec<char> = s.copy.chars().collect();
+            for chunk in chars.chunks(width.saturating_sub(6).max(10)) {
+                lines.push(Line::from(format!(
+                    "      {}",
+                    chunk.iter().collect::<String>()
+                )));
+            }
+        }
+    }
+    lines
 }
 
 fn focused(ui: &UiState, pane: Focus) -> bool {
@@ -501,11 +614,12 @@ fn focused(ui: &UiState, pane: Focus) -> bool {
 }
 
 /// Where the timeline is: scrolled `scroll` lines up from its newest, and the message selected,
-/// which `reveal` says to scroll into view on this draw.
+/// which `reveal` says to scroll into view on this draw; and whether it has the focus.
 struct Selection {
     scroll: usize,
     selected: Option<Digest32>,
     reveal: bool,
+    focus: bool,
 }
 
 fn render_timeline(
@@ -513,14 +627,16 @@ fn render_timeline(
     area: Rect,
     held_back: &[String],
     timeline: &[MessageView],
-    room_notices: &[NoticeView],
+    // What happened to the room, and its retention, for the header.
+    (room_notices, retention): (&[NoticeView], &str),
     at: Selection,
-    focus: bool,
+    images: &mut crate::images::Images,
 ) -> (usize, Vec<Digest32>) {
     let Selection {
         mut scroll,
         selected,
         reveal,
+        focus,
     } = at;
     // Who this room holds back for equivocating comes first, one line each (V210-66).
     let notices = held_back.iter().map(|n| {
@@ -550,10 +666,17 @@ fn render_timeline(
     let mut rows: Vec<Line> = Vec::new();
     // Which message each row belongs to, so the frame can say which messages it showed.
     let mut owners: Vec<Option<Digest32>> = Vec::new();
-    let mut push = |rows: &mut Vec<Line<'static>>, owner: Option<Digest32>, l: Line<'static>| {
+    // The rows kept for an image drawn over them, by which image (ADR-028 F-11).
+    let mut pics: Vec<Option<usize>> = Vec::new();
+    let mut drawn: Vec<(Digest32, std::sync::Arc<image::DynamicImage>)> = Vec::new();
+    let mut push = |rows: &mut Vec<Line<'static>>,
+                    owner: Option<Digest32>,
+                    pic: Option<usize>,
+                    l: Line<'static>| {
         for row in wrap(l, width).into_iter().rev() {
             rows.push(row);
             owners.push(owner);
+            pics.push(pic);
         }
     };
     let mut reached_oldest = true;
@@ -566,7 +689,7 @@ fn render_timeline(
             break;
         }
         while let Some(n) = said.next_if(|n| n.timestamp > m.timestamp) {
-            push(&mut rows, None, notice_line(n));
+            push(&mut rows, None, None, notice_line(n));
         }
         // Under a message it sent, who has read it, or where it is while nobody is known to
         // have (ADR-028 R-6). Rows run newest first here, so it goes before the message's own.
@@ -586,10 +709,40 @@ fn render_timeline(
                 format!("  {under}"),
                 Style::default().add_modifier(Modifier::DIM),
             ));
-            push(&mut rows, Some(m.entry_hash), l);
+            push(&mut rows, Some(m.entry_hash), None, l);
+        }
+        // **An image it shares, under it** (ADR-028 F-11): drawn once this node's copy is
+        // verified, on a terminal that draws images; otherwise said in words.
+        if let Some(img) = &m.image {
+            match &img.state {
+                ImageState::Ready(decoded) if images.draws() => {
+                    let at = drawn.len();
+                    drawn.push((m.entry_hash, std::sync::Arc::clone(decoded)));
+                    for _ in 0..crate::images::IMAGE_ROWS {
+                        push(&mut rows, Some(m.entry_hash), Some(at), Line::default());
+                    }
+                }
+                state => {
+                    let l = Line::from(Span::styled(
+                        format!(
+                            "  {IMAGE_MARKER}{} {}\u{d7}{} \u{2014} {}",
+                            vox_agentcomms::envelope::reveal_keeping(&img.name, |_| false),
+                            img.width,
+                            img.height,
+                            match state {
+                                ImageState::Unverified => IMAGE_UNVERIFIED,
+                                ImageState::Ready(_) => "verified; this terminal draws no images",
+                                ImageState::NotDrawn(why) => why,
+                            }
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                    push(&mut rows, Some(m.entry_hash), None, l);
+                }
+            }
         }
         let chosen = selected == Some(m.entry_hash);
-        push(&mut rows, Some(m.entry_hash), message_line(m, chosen));
+        push(&mut rows, Some(m.entry_hash), None, message_line(m, chosen));
         // **The one message this replies to, quoted above it** (ADR-028 R-9, #485).
         if let Some(q) = &m.quote {
             let l = Line::from(Span::styled(
@@ -602,17 +755,18 @@ fn render_timeline(
                 ),
                 Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
             ));
-            push(&mut rows, Some(m.entry_hash), l);
+            push(&mut rows, Some(m.entry_hash), None, l);
         }
         found |= chosen;
     }
     if reached_oldest {
         for l in said.map(notice_line).chain(notices.rev()) {
-            push(&mut rows, None, l);
+            push(&mut rows, None, None, l);
         }
     }
     rows.reverse();
     owners.reverse();
+    pics.reverse();
     if seek {
         // Into view: its top row no higher than the window's, its bottom no lower. Counted up
         // from the newest row, as `scroll` is.
@@ -636,15 +790,30 @@ fn render_timeline(
     let bottom = rows.len() - scroll;
     let window = bottom.saturating_sub(height)..bottom;
     let shown: Vec<Line> = rows[window.clone()].to_vec();
-    let mut on_screen: Vec<Digest32> = owners[window].iter().flatten().copied().collect();
+    let mut on_screen: Vec<Digest32> = owners[window.clone()].iter().flatten().copied().collect();
     on_screen.dedup();
+    // The room's header always says its retention (ADR-028 R-7).
     let title = if scroll > 0 {
-        "Timeline (scrolled — End: newest)"
+        format!("Timeline · {RETENTION} {retention} (scrolled — End: newest)")
     } else {
-        "Timeline"
+        format!("Timeline · {RETENTION} {retention}")
     };
-    let p = Paragraph::new(shown).block(pane_block(title, focus));
+    let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
+    // Each image whose rows are all in the window is drawn over them; one cut by its edge is not.
+    for (at, (entry, img)) in drawn.iter().enumerate() {
+        let mine: Vec<usize> = window.clone().filter(|i| pics[*i] == Some(at)).collect();
+        if mine.len() == usize::from(crate::images::IMAGE_ROWS) {
+            let y = u16::try_from(mine[0] - window.start).unwrap_or(u16::MAX);
+            let rect = Rect::new(
+                area.x + 1,
+                area.y.saturating_add(1).saturating_add(y),
+                area.width.saturating_sub(2),
+                crate::images::IMAGE_ROWS,
+            );
+            images.draw(frame, rect, *entry, img);
+        }
+    }
     (scroll, on_screen)
 }
 
@@ -894,12 +1063,14 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
     }
     match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :attach · Ctrl-C quit"
         }
         Screen::Channel => {
             " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
+        Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",
+        Screen::Serve => " ↑/↓ select · Enter preview · :serve <port> · Esc back to the room",
         Screen::Keyring => " : command · Esc back",
         Screen::Decisions => " what this node decided, newest first · : command · Esc back",
     }

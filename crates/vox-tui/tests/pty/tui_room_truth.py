@@ -51,6 +51,15 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             draining, the entries `vox status --json` says each node holds stay the same for 15 s;
             Alice's TUI and the daemon it started are then stopped and her `vox daemon` started
             again;
+  serve     Bob's `:serve <port>` for a service the driver listens on, on every interface, says
+            what sharing it does before it is shared: its address, that alice can reach it, and
+            the warning that it listens on every interface; Enter shares it, and Alice's `vox
+            service list` lists it (ADR-028 S-4, #491);
+  retention while both TUIs are open, Alice runs `vox room retention <room> 1w`: each header,
+            which said "⏱ forever", says "⏱ 1 week", and each timeline gains one line, "you set
+            the room's retention to 1 week: messages older than 1 week are removed from now on"
+            on Alice's and the same naming alice on Bob's (ADR-028 R-7, #483); and a focused
+            pane's border names it once ("Members [focus]", never "MembersMembers [focus]");
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant` and `:revoke`
@@ -72,6 +81,14 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             joined. alice trusts it.", naming neither Erin, whom Bob trusts and who never granted
             Frank, nor anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is in no keyring of
             Bob's after;
+  trust     the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
+            in Bob's members pane opens the trust prompt, showing his fingerprint; Dave's pasted
+            there adds nothing and shows both fingerprints; Frank's own, pasted through the hint's
+            `:trust`, in groups and upper case, adds him once the identity passphrase is typed
+            into the prompt (Bob's keyring window is a minute, and has closed): a wrong one adds
+            nothing and is never shown;
+  onenode   `:node spare` is refused, naming the one node this window acts as, and the window
+            still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -85,6 +102,16 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             in 16 colours (TERM=xterm) every colour drawn is one of the 16 and the trust glyphs,
             weights and words are as in truecolour; in 256 colours (TERM=xterm-256color) Alice's
             name is index 255 and Carol's 247. In each the accent is on the focused border alone.
+  copies    Alice shares an ssh stand-in; in Bob's TUI the room's Shared pane lists it, and `y` on it
+            puts `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full
+            under the service and says "copied" on the status line, the address the one Alice's
+            `vox service list --json` gives
+            (ADR-028 S-3, #490);
+  inline    in a TUI run as kitty: an image bob's node pulled and verified, whose copy this driver
+            then overwrites on bob's disk, and one alice shares to carol (not pulled by bob's node)
+            are each named "image <name> <w>×<h> — drawn once it is pulled and verified", and no
+            kitty graphics are written; one she shares to the room is drawn as kitty graphics once
+            bob's node has pulled and verified it (ADR-028 F-11, #502).
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
@@ -96,7 +123,7 @@ and exits 1. An exception in the driver itself prints `APPARATUS: driver crashed
 traceback and exits 2. Every process is recorded and killed by PID. Bounded throughout
 (`vox_pty.py`, V210-54).
 """
-import json, os, re, signal, subprocess, sys, time, traceback
+import base64, json, os, re, signal, socket, subprocess, sys, threading, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -218,6 +245,18 @@ def tui_env(**extra):
     e.update(extra)
     return e
 
+def unlock(t):
+    """Open bob's room in `t` as a person would: each passphrase is typed only when a prompt asks
+    for it. Typed with no prompt up, its letters were commands: `d` opened the decisions."""
+    asks = lambda: "passphrase" in t.text().lower()
+    t.until(lambda: asks() or "attached: default" in t.text(), 20, 0.5)
+    if asks():
+        t.key("id pass\r", 4)
+    t.key("\r", 2)
+    if asks():
+        t.key("room pass\r", 4)
+    t.key("\r", 2)
+
 try:
     stage("anchor")
     anchor = spawn("anchor", "node", "--listen", "127.0.0.1:0", out="anchor")
@@ -273,6 +312,29 @@ try:
                              ("bob", "dave", "dave"), ("bob", "erin", "erin")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
+    stage("alice shares an ssh stand-in")
+    # It greets as sshd does, so Alice's node detects it as ssh (ADR-028 S-2).
+    ssh_srv = socket.socket()
+    ssh_srv.bind(("127.0.0.1", 0)); ssh_srv.listen(8)
+    def ssh_greets():
+        while True:
+            try:
+                c, _ = ssh_srv.accept()
+                c.sendall(b"SSH-2.0-VoxProofStandIn\r\n"); c.close()
+            except OSError:
+                return
+    threading.Thread(target=ssh_greets, daemon=True).start()
+    a = run("alice", "service", "add", room, "nas-ssh", f"127.0.0.1:{ssh_srv.getsockname()[1]}")
+    if a.returncode != 0: product(f"alice's `vox service add` failed: {a.stderr.strip()}")
+    def ssh_canonical():
+        r = run("alice", "service", "list", room, "--json")
+        if r.returncode != 0: return None
+        return next((x["address"] for x in json.loads(r.stdout)["shared"]
+                     if x["readable"].startswith("nas-ssh.") and x["kind"] == "ssh"), None)
+    if not until(lambda: ssh_canonical() is not None, 60, 1):
+        product("alice's `vox service list --json` never listed nas-ssh as ssh within 60 s: "
+                + run("alice", "service", "list", room, "--json").stdout)
+    SSH_COPY = f"ssh $USER@{ssh_canonical()}"
     stage("alice posts")
     for i in range(1, POSTS + 1):
         p = run("alice", "room", "post", room, f"m-{i:03d}")
@@ -311,12 +373,10 @@ try:
     open(f"{S}/note.sh", "w").write(f"#!/bin/sh\nprintf '%s | %s\\n' \"$1\" \"$2\" >> {NOTES}\n")
     os.chmod(f"{S}/note.sh", 0o755)
     tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec, "--node", "default"],
-              tui_env(COLORTERM="truecolor", VOX_NOTIFY_COMMAND=f"{S}/note.sh"))
+              tui_env(COLORTERM="truecolor", VOX_NOTIFY_COMMAND=f"{S}/note.sh",
+                      VOX_TEST_KEYRING_WINDOW_SECS="60"))
     tui.pump(4)
-    tui.key("id pass\r", 4)
-    tui.key("\r", 2)
-    tui.key("room pass\r", 4)
-    tui.key("\r", 2)
+    unlock(tui)
     screen = lambda: "\n".join(tui.display())
     # The timeline and the members pane, each found by its title (the sidebar is to their left).
     timeline = lambda: "\n".join(pane(tui.display(), "Timeline"))
@@ -435,7 +495,8 @@ try:
     def focus(pane):
         """Tab until `pane`'s title says it has the focus."""
         for _ in range(4):
-            if any(f"{pane} [focus]" in r for r in tui.display()):
+            # The title may say more after the pane's name (the timeline's retention, #483).
+            if any(re.search(rf"\u250c{pane}[^\u2510]*\[focus\]", r) for r in tui.display()):
                 return
             tui.key("\t", 0.3)
         product(f"Tab never gave bob's {pane} the focus; screen:\n" + tui.text())
@@ -571,6 +632,30 @@ try:
                             {HEX["accent"]})
     claim("look", ok, f"in truecolour: {detail}")
 
+    stage("copies")
+    tui.key("\t", 1)   # members -> shared
+    shared_pane = lambda: [row.rstrip() for row in pane(tui.display(), "Shared")]
+    # Selected: its row is the one with "y copies:" under it (the marker can fall outside a
+    # narrow pane's cut).
+    if not tui.until(lambda: any("nas-ssh." in r for r in shared_pane())
+                     and any("y copies:" in r for r in shared_pane()), 30, 1):
+        product("bob's `vox tui` never showed alice's nas-ssh selected in the room's Shared pane: "
+                + repr(shared_pane()))
+    mark = len(tui.raw)
+    tui.key("y", 2)
+    sent = bytes(tui.raw[mark:])
+    m = re.search(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(\x07|\x1b\\)", sent)
+    copied = base64.b64decode(m.group(1)).decode() if m else None
+    bar = tui.display()[-1] + tui.display()[-2]
+    # The command, printed in full and wrapped under the selected service: the pane's rows, joined.
+    printed = "".join(r.strip().strip("│").strip() for r in shared_pane())
+    claim("copies", copied == SSH_COPY and "copied to the clipboard" in bar and SSH_COPY in printed,
+          f"OSC 52 carried {copied!r}, want {SSH_COPY!r}; printed in the Shared pane: "
+          f"{SSH_COPY in printed}; status line: {bar.strip()!r}")
+    # Back round to the members pane, where the stages after this one expect focus.
+    for _ in range(3):
+        tui.key("\t", 0.5)
+
     stage("readby")
     p = run("bob", "room", "post", room, "r-001 read me")
     if p.returncode != 0: product(f"bob's `vox room post` while his TUI is open failed: {p.stderr.strip()}")
@@ -621,8 +706,12 @@ try:
             if pred():
                 return True
         return False
-    for keys, secs in (("", 4), ("id pass\r", 4), ("\r", 2), ("room pass\r", 4), ("\r", 2)):
-        if keys: os.write(atui.fd, keys.encode())
+    # As unlock(), each passphrase typed only at its prompt, with both TUIs read meanwhile.
+    asks = lambda: "passphrase" in atui.text().lower()
+    for keys, secs, gated in (("", 4, False), ("id pass\r", 4, True), ("\r", 2, False),
+                              ("room pass\r", 4, True), ("\r", 2, False)):
+        if keys and (not gated or asks()):
+            os.write(atui.fd, keys.encode())
         both_until(lambda: False, secs)
     # The room's newest lines are the `quote` stage's f- lines by now, m- ones before it ran.
     if not both_until(lambda: re.search(r"[mf]-0", "\n".join(pane(atui.display(), "Timeline"))), 30):
@@ -662,6 +751,32 @@ try:
     claim("nostorm", len(set(counts)) == 1,
           f"entries held (alice, bob) over 15 s, both TUIs on the room and both agents draining: "
           f"{counts[0]} to {counts[-1]} ({len(counts)} samples, {len(set(counts))} distinct)")
+    stage("retention")
+    # A retention change is one line in each member's timeline, saying who set what and what it
+    # does from now on; the room's header always says the retention (ADR-028 R-7, #483).
+    def header(t):
+        return next((bare(r) for r in t.display() if "Timeline ·" in r), "")
+    def says(t, want):
+        # The line wraps across rows of the narrow timeline: read the pane as one text, without
+        # the spaces a wrap may have taken from either side of a break.
+        text = "".join(bare(r) for r in pane(t.display(), "Timeline")).replace(" ", "")
+        return want.replace(" ", "") in text
+    before = (header(atui), header(tui))
+    r = run("alice", "room", "retention", room, "1w", "--identity-passphrase-file", f"{S}/idpass")
+    if r.returncode != 0: product(f"alice's `vox room retention {room} 1w` failed: {r.stderr.strip()}")
+    LINE = "set the room's retention to 1 week: messages older than 1 week are removed from now on"
+    both_until(lambda: says(atui, f"you {LINE}") and says(tui, f"alice {LINE}")
+               and "⏱ 1 week" in header(atui) and "⏱ 1 week" in header(tui), 60)
+    after = (header(atui), header(tui))
+    # A focused pane names itself once on its border: "Members [focus]", never "MembersMembers".
+    once = all(h.count("Timeline") == 1 and h.count("Members") == 1 for h in after) \
+        and any("[focus]" in h for h in after)
+    claim("retention", all("⏱ forever" in h for h in before) and all("⏱ 1 week" in h for h in after)
+          and says(atui, f"you {LINE}") and says(tui, f"alice {LINE}") and once,
+          f"headers (alice, bob) before: {before!r}; after: {after!r}; alice's timeline says "
+          f"'you {LINE}': {says(atui, f'you {LINE}')}; bob's says 'alice {LINE}': "
+          f"{says(tui, f'alice {LINE}')}; each pane's title once on its border: {once}")
+
     if not atui.stop():
         product(f"alice's vox tui (pid {atui.pid}) outlived SIGKILL and could not be reaped")
     TUIS.remove(atui)
@@ -686,6 +801,37 @@ try:
     if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
         product("alice's daemon, started again after her TUI, never answered `vox room list` within 60 s: "
                 + open(f"{S}/alice-after-tui.err").read())
+
+    stage("serve")
+    # Sharing a service from the TUI is one step, as `vox serve` with no name is (ADR-028 S-4,
+    # #491): the driver listens on every interface on a free port, and Bob's `:serve <port>`
+    # says what sharing it does, warning that it listens on every interface, before it is shared.
+    import socket
+    svc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    svc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    svc.bind(("0.0.0.0", 0)); svc.listen(4)
+    sport = svc.getsockname()[1]
+    tui.key(f":serve {sport}\r", 3)
+    def preview():
+        return " ".join(" ".join(r.strip().strip("│").split()) for r in pane(tui.display(), "Share a service"))
+    tui.until(lambda: "Enter: share it" in preview(), 30, 1)
+    seen = preview()
+    tag = (re.search(r"\bas (\S+): members will reach it as", seen) or [None, None])[1]
+    tui.key("\r", 3)
+    def offered():
+        r = run("alice", "service", "list", room)
+        return r.returncode == 0 and tag is not None and tag in r.stdout and "bob" in r.stdout
+    shared = until(offered, 60, 1)
+    listed = run("alice", "service", "list", room).stdout.strip()
+    can = (re.search(r"who can reach it: (.*?) who cannot", seen) or [None, ""])[1]
+    # The warning itself, not the listing's "(every interface)" note beside the address.
+    warned = re.search(r"warning: `[^`]+` \([^)]*:" + str(sport) + r", tcp\) listens on every interface", seen)
+    claim("serve", f":{sport}" in seen and warned is not None and "alice" in can
+          and tag is not None and shared,
+          f"bob's preview: {seen!r}; alice's `vox service list`: {listed!r}")
+    if tag:
+        run("bob", "service", "remove", room, tag)
+    svc.close()
 
     stage("words")
     # Before `unknown`, whose short answers leave the line under the status bar one row again.
@@ -797,6 +943,66 @@ try:
           f"before alice trusted frank, bob's TUI said {before_grant!r} (wanted {alone!r}); after, "
           f"{after_grant!r} (wanted {trusted!r}); frank absent from bob's keyring: {unadded}")
 
+    stage("trust")
+    # ADR-028 K-5 (#475): the join's line offers the one trust action, ":trust <frank's first 8>";
+    # `t` on Frank in the members pane opens the same prompt. A fingerprint pasted that is not
+    # Frank's adds nothing and shows both; Frank's own, pasted in groups and upper case, adds him.
+    flat_ws = lambda: re.sub(r"\s+", " ", flat())
+    hint = f":trust {fp['frank'][:8]}"
+    hinted = hint in flat_ws()
+    grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
+    in_ring = lambda: fp["frank"] in run("bob", "trust", "list").stdout
+    tui.key("\r", 2)   # into the room
+    tui.key("\t", 1)   # timeline -> composer
+    tui.key("\t", 1)   # composer -> members
+    for _ in range(8):
+        if label_of("frank")[1]:
+            break
+        tui.key("\x1b[B", 1)  # Down: the next member
+    tui.key("t", 2)
+    prompt_seen = "Trust this node?" in flat() and grouped(fp["frank"])[:24] in flat_ws()
+    tui.key(grouped(fp["dave"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("\r", 3)
+    mismatch_said = (f"given: {grouped(fp['dave'])}" in flat_ws()
+                     and f"this node: {grouped(fp['frank'])}" in flat_ws()
+                     and "do not trust it" in flat_ws())
+    mismatch_added = in_ring()
+    # Bob's keyring window (a minute here) has closed: the prompt's passphrase field is typed into.
+    closed = tui.until(lambda: "keyring asks for the passphrase" in run("bob", "status").stdout, 90, 2)
+    tui.key(":" + hint[1:] + "\r", 2)
+    tui.key(grouped(fp["frank"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("not the pass\r", 3)
+    wrong_pass_added = in_ring()
+    wrong_pass_said = [l for l in tui.display()[-6:] if l.strip()]
+    shown_secret = "not the pass" in flat()
+    tui.key(":" + hint[1:] + "\r", 2)
+    tui.key(grouped(fp["frank"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("id pass\r", 3)
+    matched = tui.until(in_ring, 30, 1)
+    match_said = "you now trust frank" in flat_ws()
+    tui.key("\x1b", 2)  # back to the room list
+    claim("trust", hinted and prompt_seen and mismatch_said and not mismatch_added and closed
+          and not wrong_pass_added and not shown_secret and matched and match_said,
+          f"the join offered {hint!r}: {hinted}; `t` on frank opened the prompt with his "
+          f"fingerprint: {prompt_seen}; dave's pasted: both shown and told not to trust: "
+          f"{mismatch_said}, frank added anyway: {mismatch_added}; with the keyring closed "
+          f"({closed}), a wrong passphrase added him: {wrong_pass_added}, was shown: {shown_secret}, "
+          f"the TUI said {wrong_pass_said!r}; frank's own pasted through {hint!r} with the "
+          f"passphrase: added {matched}, said so {match_said}")
+
+    stage("onenode")
+    # After `trust`: its refusal takes the status line, where the join's offer to trust is read.
+    # One node per window (ADR-028 E-4, #470): `:node` acts as no other node.
+    tui.key(":node spare\r", 0)
+    said = tui.until(lambda: "acts only as node default" in tui.display()[-1], 10, 0.5)
+    tui.pump(3)  # time for the window to have taken spare, were it going to
+    bar, top = tui.display()[-2], (side() or [""])[0]
+    claim("onenode", said and "node default" in bar and "node spare" not in bar
+          and top == "node default · attached",
+          f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
     stage("unreach")
     for w in ("alice", "carol", "dave", "frank"):
         daemons[w].terminate()
@@ -850,10 +1056,7 @@ try:
     ):
         tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], tui_env(**extra))
         tui.pump(4)
-        tui.key("id pass\r", 4)
-        tui.key("\r", 2)
-        tui.key("room pass\r", 4)
-        tui.key("\r", 2)
+        unlock(tui)
         tui.key("\t", 1)   # timeline -> composer
         tui.key("\t", 1)   # composer -> members
         if not tui.until(lambda: all(label_of(w)[0] is not None for w in ("alice", "carol", "dave")), 30, 1):
@@ -886,6 +1089,77 @@ try:
         if not tui.stop():
             apparatus(f"`vox tui` ({name}, pid {tui.pid}) could not be stopped")
     claim("depths", all(depths.values()), f"{depths!r}")
+
+    stage("inline")
+    # Images drawn inline, only once verified (ADR-028 F-11, #502). The anchor comes back on its
+    # port, and alice's daemon with it; bob's TUI runs as kitty would, on the room list.
+    # - ours.png, to the room: bob's node pulls and verifies it while the room is off screen; then
+    #   this driver, as an attacker on bob's disk, overwrites the pulled copy. Opened, the room
+    #   must name it unverified and draw nothing: what is on disk is not what was announced.
+    # - carols.png, addressed to carol: bob's node does not pull it; named, never drawn.
+    # - theirs.png, to the room, shared with the room open: drawn once pulled and verified.
+    def png(path, w, h, salt=0):
+        import struct, zlib
+        raw = b"".join(b"\x00" + bytes(v for x in range(w) for v in (x * 255 // w, y * 255 // h, (x ^ y ^ salt) & 255))
+                       for y in range(h))
+        chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+        open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                               + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    port = spec.rsplit("/", 1)[1]
+    anchor = spawn("anchor", "node", "--listen", f"127.0.0.1:{port}", out="anchor-again")
+    daemons["alice"] = spawn("alice", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                             "--passphrase-file", f"{S}/idpass", out="alice-inline")
+    if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
+        product("alice's daemon, started for the images, never answered `vox room list` within 60 s: "
+                + open(f"{S}/alice-inline.err").read())
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec],
+              tui_env(TERM="xterm-kitty", COLORTERM="truecolor"))
+    tui.pump(4)
+    tui.key("id pass\r", 4)
+    tui.key("\r", 2)
+    tui.key("room pass\r", 4)
+    tui.key("\r", 2)
+    tui.key("\x1b", 2)  # Esc: the room list, the room off screen
+    KITTY = b"\x1b_G"
+    # The pane's rows run together, as the TUI wrapped one line over them.
+    flat = lambda: "".join(r.strip() for r in pane(tui.display(), "Timeline"))
+    for name, w, h, salt in (("ours", 120, 80, 0), ("carols", 96, 64, 1), ("theirs", 88, 56, 2), ("forged", 120, 80, 3)):
+        png(f"{S}/{name}.png", w, h, salt)
+    p = run("alice", "share", room, f"{S}/ours.png")
+    if p.returncode != 0: product(f"alice's `vox share` of ours.png failed: {p.stderr.strip()}")
+    pulls = f"{S}/bob/data/nodes/default/pulls"
+    def pulled(name):
+        import glob
+        for f in glob.glob(f"{pulls}/*.json"):
+            try:
+                path = json.load(open(f))["path"]
+            except (OSError, ValueError, KeyError):
+                continue
+            if path.endswith(name) and os.path.exists(path):
+                return path
+        return None
+    if not until(lambda: pulled("ours.png"), 90, 1):
+        product("bob's node never pulled ours.png within 90 s (no pull record names it): "
+                + repr(os.listdir(pulls) if os.path.isdir(pulls) else "no pulls directory"))
+    os.replace(f"{S}/forged.png", pulled("ours.png"))  # the attacker's bytes, in place
+    p = run("alice", "share", room, f"{S}/carols.png", "--to", fp["carol"])
+    if p.returncode != 0: product(f"alice's `vox share` of carols.png failed: {p.stderr.strip()}")
+    tui.key("\r", 2)  # into the room
+    said = {n: f"image {n} {wh} — drawn once it is pulled and verified"
+            for n, wh in (("ours.png", "120×80"), ("carols.png", "96×64"))}
+    named = tui.until(lambda: all(v in flat() for v in said.values()), 60, 1)
+    tui.pump(5)  # time for a drawing, were the TUI to draw what is not verified
+    before = KITTY in bytes(tui.raw)
+    p = run("alice", "share", room, f"{S}/theirs.png")
+    if p.returncode != 0: product(f"alice's `vox share` of theirs.png failed: {p.stderr.strip()}")
+    # Read from the bytes the TUI wrote from here on: pyte does not draw kitty graphics, and
+    # prints their payload over its screen.
+    drew = tui.until(lambda: KITTY in bytes(tui.raw), 90, 1)
+    claim("inline", named and not before and drew,
+          f"named unverified (ours.png overwritten on bob's disk, carols.png not pulled here): {named}; "
+          f"kitty graphics written before theirs.png was shared: {before}; after, once bob's node "
+          f"had pulled and verified it: {drew}")
+    stop(daemons["alice"])
 
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} screen at the end:")

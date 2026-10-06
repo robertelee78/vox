@@ -48,6 +48,23 @@ pub fn equivocation_notice(name: &str, seq: u64) -> String {
     )
 }
 
+/// The TUI's one trust action, as offered beside a node not in the keyring (ADR-028 K-5):
+/// `:trust` and the start of its fingerprint, enough to name it.
+#[must_use]
+pub fn trust_hint(fp: &Digest32) -> String {
+    format!(":trust {}", &author_id(fp)[..MIN_PREFIX])
+}
+
+/// A fingerprint as a person pasted or typed it, compared as the node writes it: spaces, dashes
+/// and case do not count, so `M4OL SURT …` in groups is `m4olsurt…`.
+#[must_use]
+pub fn typed_fingerprint(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// How many fingerprint characters follow an alias that another node's alias equals but for case.
 pub const CLASH_SUFFIX: usize = 6;
 
