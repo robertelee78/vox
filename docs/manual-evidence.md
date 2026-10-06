@@ -63,10 +63,12 @@ the v0.4.0 candidate, which is to replace this commit in the Baselines table.
 | Manual claim | Where and how | Observed |
 |---|---|---|
 | `vox status` shows the keyring window (#478) | macOS, a node attached with an empty passphrase file, then `vox status` | second line `keyring open 30m` |
-| The window, closed | `a_keyring_change_needs_a_recent_passphrase_proof` (test-knobs: a 1-minute window) | `vox status, open: Some("keyring open 1m"); past the window: Some("keyring asks for the passphrase")` |
+| The window, closing | the release binary: a node attached at 17:05:29, then `vox status` at 17:34:32 and 17:36:32 | `keyring open 1m`, then `keyring asks for the passphrase` |
+| The window, closed (knob) | `a_keyring_change_needs_a_recent_passphrase_proof` (test-knobs: a 1-minute window) | `vox status, open: Some("keyring open 1m"); past the window: Some("keyring asks for the passphrase")` |
 | The TUI status bar shows it | `the_tui_says_what_attaching_its_node_said_proof` (pty, pyte) | the status bar: `sync: idle — no peer connected · node default · attached: default · keyring open 30m` |
 | `vox serve` prints each share's kind (#489) | `vox serve ssh=P1 web=P2 plain=P3 --name svc` (an SSH-banner stand-in, an HTTP stand-in, a TCP echo) | `sharing 127.0.0.1:P1 as ssh.FINGERPRINT.ROOM_ID.vox (ssh)`, `… web… (http)`, `… plain… (tcp)` |
 | `https` and `dns/udp` | `vox serve site=P4 names=P5/udp` (a TLS server with a throwaway self-signed certificate; a UDP responder answering any query with its id and the QR bit) | `… site… (https)`, `… names… (dns/udp)`; `service list`: `names.FINGERPRINT.svc.vox  by you  dns/udp`, `site.FINGERPRINT.svc.vox  by you  https` |
+| A plain UDP service | `vox serve media=P7/udp` (a UDP echo) | `… media… (udp)`; `service list`: `media.FINGERPRINT.svc.vox  by you  udp` |
 | The kind never comes from the name | `vox serve ssh=P6` (a TCP echo) | `… ssh.FINGERPRINT.ROOM_ID.vox (tcp)` |
 | `service list` shows the kind, on host and guest | A: `vox service list ROOM_ID`; B after `vox connect` and trust both ways | A: `ssh.FINGERPRINT.svc.vox  by you  ssh` with `services offered` `ssh  →  127.0.0.1:P1`; B: `ssh.robertgpt.svc.vox  by robertgpt  ssh`, `web.robertgpt.svc.vox  by robertgpt  http`, `plain.robertgpt.svc.vox  by robertgpt  tcp` |
 | `service add` is detected too | `vox service add ROOM_ID pages 127.0.0.1:P2` | `vox: offering "pages" at 127.0.0.1:P2 in room ROOM_ID` / `it is dark until you vox trust add someone — and they join this room`; then `pages.FINGERPRINT.svc.vox  by you  http` in `service list` |
