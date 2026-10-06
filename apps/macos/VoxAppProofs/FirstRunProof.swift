@@ -740,8 +740,9 @@ final class FirstRunProof: XCTestCase {
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
 
         // (7) Lanes. Working without a claim is not working.
+        // Coordination is owned per session: bob's posts and claims here are his session's.
         try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "NO-CLAIM"],
-                   env: voxEnv)
+                   env: bobSession)
         Thread.sleep(forTimeInterval: 10)
         let lanesToggle = Key.id("lanes-toggle")
         let bobLane = Key.id("lane-state-bob")
@@ -753,9 +754,9 @@ final class FirstRunProof: XCTestCase {
             }
             tap(ui, Key.child(of: "lanes-toggle", button: "Timeline"), "Timeline")
         }
-        try staged(vox, ["room", "claim", "--node", "bob", room, "ticket-1"], env: voxEnv)
+        try staged(vox, ["room", "claim", "--node", "bob", room, "ticket-1"], env: bobSession)
         try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "ON-TICKET-1"],
-                   env: voxEnv)
+                   env: bobSession)
         present(ui, lanesToggle, timeout: 30, "a room whose member works on a claim must offer the lanes view")
         tap(ui, Key.child(of: "lanes-toggle", button: "Lanes"), "Lanes")
         let laneWords = words(ui, bobLane, timeout: 30,
