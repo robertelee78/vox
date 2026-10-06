@@ -320,6 +320,51 @@ pub struct OfferedService {
     pub local: String,
 }
 
+/// A service listening on this machine, as one-step sharing lists it (ADR-028 S-4): what `vox
+/// serve` with no name lists.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ListeningService {
+    /// Its port.
+    pub port: u16,
+    /// Whether it takes datagrams (UDP) rather than connections (TCP).
+    pub udp: bool,
+    /// The listening program's command name, where this user may read it; `None` for one this
+    /// user cannot see (usually another user's, root's among them).
+    pub program: Option<String>,
+    /// Every address it listens on, as `ip:port`; `0.0.0.0` or `[::]` for every interface.
+    pub addresses: Vec<String>,
+    /// Whether it listens on every interface, which this machine's networks reach without Vox.
+    pub every_interface: bool,
+    /// The line `vox serve` lists it as: program, addresses, protocol, `(every interface)`.
+    pub line: String,
+}
+
+/// What listens on this machine, and the sentence said under the list (ADR-028 S-4).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ListeningServices {
+    /// The services, as `vox serve` lists them.
+    pub services: Vec<ListeningService>,
+    /// Said under the list, always: another user's listeners may be missing from it or listed
+    /// without their program (#491).
+    pub may_be_missing: String,
+}
+
+/// What sharing one listening service would do, said before it is done (ADR-028 S-4), as `vox
+/// serve` with no name says it: the name and tag it is offered under, the endpoint members are
+/// carried to, and each warning.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServicePreview {
+    /// The suggested name: its detected kind (`ssh`, `http`, …), else its program's name, else
+    /// `service`. A person may give another; `service_add` takes any valid one.
+    pub name: String,
+    /// The tag it is offered under: the name, `udp/` before it for datagrams.
+    pub tag: String,
+    /// The endpoint members are carried to, as `ip:port`: what `service_add` takes.
+    pub local: String,
+    /// Each warning, one sentence: it listens on every interface, or sits on a sensitive port.
+    pub warnings: Vec<String>,
+}
+
 /// A file or folder this node shares, as `vox share list` shows it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FileShare {
@@ -1256,6 +1301,80 @@ impl VoxClient {
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
         };
         on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// What listens on this machine, for one-step sharing (ADR-028 S-4), as `vox serve` with no
+    /// name lists it, and the sentence said under the list.
+    ///
+    /// **Read here, in the app's process, not by the daemon**, as `vox serve` and the TUI read it:
+    /// unprivileged, `lsof` and `ss` see what the user running them may see, and the person
+    /// sharing is the app's user. It needs no node attached.
+    pub async fn listening(&self) -> ListeningServices {
+        let found = self
+            .rt
+            .spawn_blocking(vox_core::node::probe::listening)
+            .await
+            .unwrap_or_default();
+        ListeningServices {
+            services: found
+                .iter()
+                .map(|l| ListeningService {
+                    port: l.port,
+                    udp: l.udp,
+                    program: l.command.clone(),
+                    addresses: l
+                        .addrs
+                        .iter()
+                        .map(|a| std::net::SocketAddr::new(*a, l.port).to_string())
+                        .collect(),
+                    every_interface: l.on_every_interface(),
+                    line: vox_core::node::probe::listing_line(l).trim_end().to_owned(),
+                })
+                .collect(),
+            may_be_missing: vox_core::node::probe::MAY_BE_MISSING.to_owned(),
+        }
+    }
+
+    /// What sharing the service listening on `port` would do (ADR-028 S-4), said before it is
+    /// done, as `vox serve` with no name says it; `udp` picks one of two on the same port, `None`
+    /// the first. Share it with `service_add(room, tag, local)`.
+    ///
+    /// # Errors
+    /// Nothing this user can see listens on that port.
+    pub async fn service_preview(
+        &self,
+        port: u16,
+        udp: Option<bool>,
+    ) -> Result<ServicePreview, VoxError> {
+        self.on_rt(async move {
+            let found = tokio::task::spawn_blocking(vox_core::node::probe::listening)
+                .await
+                .unwrap_or_default();
+            let chosen = found
+                .into_iter()
+                .find(|l| l.port == port && udp.is_none_or(|u| l.udp == u))
+                .ok_or_else(|| {
+                    failed(format!(
+                        "nothing listening on port {port} can be seen from here; {}",
+                        vox_core::node::probe::MAY_BE_MISSING
+                    ))
+                })?;
+            let local = chosen.endpoint();
+            let name = vox_core::node::probe::suggested_name(&chosen).await;
+            let tag = vox_core::node::probe::tag_of(name.clone(), chosen.udp);
+            let warnings = vox_core::node::probe::exposure_warnings(
+                &[(chosen.port, tag.clone())],
+                Some(local),
+            )
+            .await;
+            Ok(ServicePreview {
+                name,
+                tag,
+                local: local.to_string(),
+                warnings,
+            })
+        })
+        .await
     }
 
     /// What is shared in `room` and what this node offers there (`vox service list`).

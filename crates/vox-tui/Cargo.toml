@@ -53,6 +53,9 @@ vox-agentcomms = { path = "../vox-agentcomms" }
 vox-text = { path = "../vox-text" }
 ratatui.workspace = true
 crossterm.workspace = true
+# Verified images drawn inline in the timeline (ADR-028 F-11).
+ratatui-image.workspace = true
+image.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true
@@ -95,9 +98,8 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]
-# The share proof makes a photo to share, and reads the thumbnail its announcement carries
-# (ADR-028 F-9).
-image.workspace = true
+# The share proof reads the thumbnail an announcement carries (ADR-028 F-9); `image`, a
+# dependency of the TUI, makes the photo it shares.
 base64.workspace = true
 # The at-rest floor proof re-derives the vault key the binary wrote, independently of
 # vox-core, with the ADR-010 floor parameters hard-coded in the test.

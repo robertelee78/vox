@@ -47,6 +47,12 @@
 //!     back, because alice's node resolves its own share fingerprint.
 //! 13. A readable part that names two things is refused, saying which: bob calls carol `Nas Box`,
 //!     whose label is his name for alice too.
+//! 14. A command copied from `vox service list` works on another member's machine (ADR-028 S-3,
+//!     #490): bob's listing gives `ssh $USER@<canonical>` for alice's ssh share; carol runs it in
+//!     a real `ssh` through her own proxy, and the share hears ssh's banner. bob's readable address
+//!     is refused on carol's machine (he names alice `nas-box`, she does not), which is checked
+//!     first, so a copy of the readable form could not pass. Mutation: the commands carry the
+//!     readable address.
 //!
 //! **Mutations that must turn it red** (#487): the room part resolved by this machine's own name
 //! only, the room id refused, and carol's paste of bob's canonical address fails at her proxy:
@@ -209,6 +215,37 @@ fn daemon_pid(dir: &Path) -> Option<u32> {
         .trim()
         .parse()
         .ok()
+}
+
+/// An `sshd` stand-in that greets with an SSH banner, so the sharer's node detects it as `ssh`
+/// (ADR-028 S-2), and reports the first line each client sends: a real `ssh` client that reached
+/// it sends its own `SSH-2.0-…` banner.
+fn ssh_banner_service() -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the ssh stand-in");
+    let at = listener
+        .local_addr()
+        .expect("APPARATUS: the ssh stand-in's address");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                if s.write_all(b"SSH-2.0-VoxProofStandIn\r\n").is_err() {
+                    return;
+                }
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut std::io::BufReader::new(&s), &mut line).is_ok()
+                    && !line.is_empty()
+                {
+                    let _ = tx.send(line.trim().to_owned());
+                }
+            });
+        }
+    });
+    (at, rx)
 }
 
 /// A TCP service that answers each line with `<owner>:<line>`.
@@ -768,6 +805,94 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         "PRODUCT: a forward to an address naming no share in a synced room took {absent_took:?} to \
          be refused; R23 bounds a refusal at {IMMEDIATE:?}"
     );
+    // (14) A command copied from `vox service list` works on another member's machine (ADR-028
+    // S-3, #490): alice shares an ssh stand-in; bob's listing gives `ssh $USER@<address>`; carol
+    // pastes it into a real `ssh`, pointed at her own `.vox` proxy by the block her own listing
+    // prints. bob's readable address names alice `nas-box`, which carol has no name for, so only
+    // the canonical address in the copy can reach it there; the stand-in must hear ssh's banner.
+    let (login_at, login_heard) = ssh_banner_service();
+    let (ok, out, err) = vox(
+        &alice_dir,
+        &["service", "add", &room, "nas-login", &login_at.to_string()],
+        None,
+    );
+    assert!(ok, "PRODUCT (staging): alice shares nas-login: {out}{err}");
+    let (_, bob_login) = listed(
+        &bob_dir,
+        &room,
+        &["ssh $USER@".to_owned(), "nas-login.".to_owned()],
+    );
+    let copied = bob_login
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("nas-login."))
+        .find_map(|l| l.trim_start().strip_prefix("ssh "))
+        .map(|c| c.trim().to_owned())
+        .unwrap_or_default();
+    let bob_readable = bob_login
+        .lines()
+        .find(|l| l.trim_start().starts_with("nas-login."))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    let (_, carol_login) = listed(
+        &carol_dir,
+        &room,
+        &["nas-login.".to_owned(), "ProxyCommand".to_owned()],
+    );
+    let block: String = carol_login
+        .lines()
+        .skip_while(|l| !l.contains("add this to ~/.ssh/config"))
+        .skip(1)
+        .take_while(|l| l.starts_with("    "))
+        .map(|l| format!("{}\n", l.trim_start()))
+        .collect();
+    // The staging's premise: bob's readable address leads nowhere on carol's machine, so a copy
+    // that carried it could not pass.
+    let (readable_refused, _, readable_said) =
+        forward_refused(&carol_dir, "carol forward bob's words", &bob_readable);
+    let ssh_dir = tempfile::tempdir().expect("APPARATUS: a directory for ssh's files");
+    let config = ssh_dir.path().join("config");
+    std::fs::write(&config, &block).expect("APPARATUS: write the ssh config");
+    // The pasted command, run by a shell as a person's would be; only where ssh keeps its own
+    // files, and that it never prompts, is the proof's.
+    let pasted = copied.replacen(
+        "ssh ",
+        &format!(
+            "ssh -F {} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+             -o ConnectTimeout=60 ",
+            config.display()
+        ),
+        1,
+    );
+    let ssh_out = Command::new("sh")
+        .args(["-c", &pasted])
+        .stdin(Stdio::null())
+        .output()
+        .expect("APPARATUS: run ssh");
+    let heard = login_heard.recv_timeout(Duration::from_secs(5)).ok();
+    eprintln!(
+        "S-3: bob's listing:\n{bob_login}\ncarol's ssh block:\n{block}\nbob's readable on carol's \
+         machine: refused={readable_refused}: {readable_said}\npasted: {pasted}\nssh said: {}\nthe \
+         ssh stand-in heard: {heard:?}",
+        String::from_utf8_lossy(&ssh_out.stderr)
+    );
+    assert!(
+        readable_refused && readable_said.contains("nas-box"),
+        "APPARATUS: bob's readable address {bob_readable:?} must lead nowhere on carol's machine, or \
+         a readable copy would pass too: {readable_said}"
+    );
+    assert!(
+        copied.starts_with("ssh $USER@") && block.contains("ProxyCommand"),
+        "PRODUCT: `vox service list` must give an ssh share's ssh command, and the ~/.ssh/config \
+         block for this machine's proxy; bob's said:\n{bob_login}\ncarol's said:\n{carol_login}"
+    );
+    assert!(
+        heard.as_deref().is_some_and(|h| h.starts_with("SSH-2.0-")),
+        "PRODUCT: the ssh command copied from bob's `vox service list` ({copied}), pasted on carol's \
+         machine, must reach alice's ssh service; it heard {heard:?}, and ssh said: {}",
+        String::from_utf8_lossy(&ssh_out.stderr)
+    );
+
     // (11) A readable address whose room part names nothing here is refused, saying which.
     let (unknown_refused, _, unknown_said) = forward_refused(
         &bob_dir,

@@ -623,7 +623,12 @@ pub struct Posting {
 fn envelope(draft: &Draft, session: &str, op: &str) -> Envelope {
     let mut env = Envelope::new(&draft.kind, &draft.body);
     env.from = session.to_owned();
-    env.at = context();
+    // **A person's message carries no working directory or branch**: `at` is where an agent's
+    // session works (ADR-020 4.9). A post with no session is a person's (the TUI's To: or
+    // urgent, `vox room post --to` with none named), and where they ran it is nobody's business.
+    if !session.is_empty() {
+        env.at = context();
+    }
     env.to.clone_from(&draft.to);
     env.urgent = draft.urgent;
     env.re.clone_from(&draft.re);

@@ -3598,8 +3598,9 @@ impl NodeHandle {
 
     /// The services shared in an open room (V030-25): each address readable, as **this** node
     /// writes it — its own aliases for the node and the room where it has them, the fingerprints
-    /// where it has not — and canonical (ADR-028 S-1), with its sharer as this node names them; or
-    /// `None` if the room is not open.
+    /// where it has not — and canonical (ADR-028 S-1), with its sharer as this node names them,
+    /// and whether the sharer trusts this node and is reachable now (ADR-028 S-3); or `None` if
+    /// the room is not open.
     pub async fn shared_in(
         &self,
         channel_id: Digest32,
@@ -3608,12 +3609,13 @@ impl NodeHandle {
         let (tx, rx) = oneshot::channel();
         self.net_tx.send(NetEvent::Names(tx)).await.ok()?;
         let names = rx.await.ok()?;
-        let me = self
-            .view_rx
-            .borrow()
-            .identity
-            .as_ref()
-            .map(|i| i.fingerprint);
+        let (me, connected) = {
+            let view = self.view_rx.borrow();
+            (
+                view.identity.as_ref().map(|i| i.fingerprint),
+                view.connected_peers.clone(),
+            )
+        };
         Some(
             detail
                 .shares
@@ -3634,6 +3636,10 @@ impl NodeHandle {
                         by: who,
                         udp: s.udp,
                         kind: s.kind.as_str().to_owned(),
+                        // Off the room's log: the sharer consents to this node reading it, which
+                        // its node does for a member it trusts (ADR-020 §3).
+                        trusts_you: Some(s.host) == me || detail.consenting.contains(&s.host),
+                        online: Some(s.host) == me || connected.contains(&s.host),
                     }
                 })
                 .collect(),

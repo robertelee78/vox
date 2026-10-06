@@ -8,7 +8,6 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use vox_core::governance::share::ServiceKind;
 use vox_core::hash::Digest32;
 use vox_core::node::actor::NodeHandle;
 use vox_core::node::api::{Fault, NodeCommand, NodeEvent, Outcome};
@@ -342,15 +341,134 @@ pub fn named_spec(spec: &str) -> Result<(u16, String), AppError> {
     Ok((port, tag))
 }
 
-/// What `vox service list` prints, from a node this verb opened or from the daemon: the services
-/// shared in the room by every member, each with its address as this node writes it and who
-/// shared it (V030-25), then what this node itself offers there and where.
+/// The ready-to-copy commands for one shared service, by its kind (ADR-028 S-3): each
+/// `(what it is, the command)`, every one carrying the **canonical** address (S-1) so it works
+/// pasted on any member's machine. `ssh` and a URL go through the `.vox` proxy; a forward does not.
+#[must_use]
+pub fn service_commands(s: &vox_core::node::ipc::SharedService) -> Vec<(&'static str, String)> {
+    let c = &s.canonical;
+    match s.kind.as_str() {
+        "ssh" => vec![
+            ("ssh", format!("ssh $USER@{c}")),
+            ("forward", format!("vox forward {c} 127.0.0.1:2222")),
+            ("then", "ssh -p 2222 $USER@127.0.0.1".to_owned()),
+        ],
+        scheme @ ("http" | "https") => {
+            let port = if scheme == "http" { 8080 } else { 8443 };
+            vec![
+                ("open", format!("{scheme}://{c}/")),
+                ("forward", format!("vox forward {c} 127.0.0.1:{port}")),
+                ("then", format!("{scheme}://127.0.0.1:{port}/")),
+            ]
+        }
+        "dns" => vec![("forward", format!("vox forward {c} 127.0.0.1:5353"))],
+        // A forward picks a free port and says which.
+        _ => vec![("forward", format!("vox forward {c} 127.0.0.1:0"))],
+    }
+}
+
+/// What one shared service needs to be reached from here, and whether each holds (ADR-028 S-3):
+/// `(the condition, holds, what to do when it does not)`. `proxy` is whether the `.vox` proxy
+/// runs, or `None` where that is not known here (its need is then not said).
+#[must_use]
+pub fn service_needs(
+    s: &vox_core::node::ipc::SharedService,
+    proxy: Option<&Result<SocketAddr, String>>,
+) -> Vec<(String, bool, String)> {
+    // This node's own share needs neither its own trust nor itself online.
+    let theirs = s.by != "you";
+    let who = s.by.as_str();
+    let mut needs = Vec::new();
+    if theirs {
+        needs.push((
+            format!("{who} trusts this node (as the room's log says)"),
+            s.trusts_you,
+            format!(
+                "{who} must trust this node: there, `vox trust add` the fingerprint `vox id` \
+                 prints here"
+            ),
+        ));
+    }
+    needs.push((
+        "this node is attached".to_owned(),
+        true,
+        "`vox node attach`".to_owned(),
+    ));
+    // A forward carries without the proxy; ssh by address and a URL go through it.
+    if let Some(proxy) = proxy.filter(|_| matches!(s.kind.as_str(), "ssh" | "http" | "https")) {
+        needs.push(match proxy {
+            Ok(at) => (
+                format!("the .vox proxy is running on {at}"),
+                true,
+                String::new(),
+            ),
+            Err(why) => (
+                "the .vox proxy is running".to_owned(),
+                false,
+                format!("not running: {why}"),
+            ),
+        });
+    }
+    if theirs {
+        needs.push((
+            format!("{who} is online"),
+            s.online,
+            format!("{who} is not reachable now; it is reached when it comes back"),
+        ));
+    }
+    needs
+}
+
+/// What `vox service list` prints, from the daemon: the services shared in the room by every
+/// member, each with its readable address and its canonical one beneath it (V030-25, ADR-028
+/// S-1, S-3), who shared it, the commands to reach it and what those need; then what this node
+/// itself offers there and where. With `json`, the same as one JSON object, every address in it
+/// canonical.
 pub fn print_services(
     room: &str,
     channel_id: &Digest32,
     services: &[(String, String)],
     shared: &[vox_core::node::ipc::SharedService],
+    proxy: &Result<SocketAddr, String>,
+    json: bool,
 ) {
+    if json {
+        let rows: Vec<serde_json::Value> = shared
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "address": s.canonical,
+                    "readable": s.address,
+                    "by": s.by,
+                    "kind": s.kind,
+                    "udp": s.udp,
+                    "commands": service_commands(s)
+                        .into_iter()
+                        .map(|(what, command)| serde_json::json!({"what": what, "command": command}))
+                        .collect::<Vec<_>>(),
+                    "needs": service_needs(s, Some(proxy))
+                        .into_iter()
+                        .map(|(need, holds, otherwise)| {
+                            serde_json::json!({"need": need, "holds": holds, "otherwise": otherwise})
+                        })
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let offered: Vec<serde_json::Value> = services
+            .iter()
+            .map(|(tag, local)| serde_json::json!({"tag": tag, "local": local}))
+            .collect();
+        let out = serde_json::json!({
+            "room": room,
+            "room_id": b32_encode(channel_id),
+            "shared": rows,
+            "offered": offered,
+            "ssh_config": proxy.as_ref().ok().map(|at| vox_core::node::up::ssh_config_hint(*at)),
+        });
+        println!("{out}");
+        return;
+    }
     if shared.is_empty() {
         println!("vox: nothing is shared in {room} ({})", short(channel_id));
     } else {
@@ -362,6 +480,30 @@ pub fn print_services(
             let udp = if s.udp && s.kind != "udp" { "/udp" } else { "" };
             println!("  {}  by {}  {}{udp}", s.address, s.by, s.kind);
             println!("    {}", s.canonical);
+            for (what, command) in service_commands(s) {
+                println!("      {what:<8}{command}");
+            }
+            for (need, holds, otherwise) in service_needs(s, Some(proxy)) {
+                if holds {
+                    println!("      needs   {need}: yes");
+                } else {
+                    println!("      needs   {need}: NO — {otherwise}");
+                }
+            }
+        }
+        // `ssh <address>` needs ssh pointed at the proxy, once (what `vox up` prints).
+        if shared.iter().any(|s| s.kind == "ssh") {
+            match proxy {
+                Ok(at) => {
+                    println!("  for ssh by address, add this to ~/.ssh/config once:");
+                    for line in vox_core::node::up::ssh_config_hint(*at).lines() {
+                        println!("    {line}");
+                    }
+                }
+                Err(why) => {
+                    println!("  ssh by address needs the .vox proxy, which is not running: {why}")
+                }
+            }
         }
     }
     if services.is_empty() {
@@ -1287,6 +1429,12 @@ async fn ask(question: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Usage("no answer: nothing shared".into()))
 }
 
+// One wording for what listens here and what sharing it says, shared with the TUI and the app
+// (ADR-028 S-4): `vox_core::node::probe`.
+pub(crate) use vox_core::node::probe::{
+    exposure_warnings, listing_line, suggested_name, tag_of, MAY_BE_MISSING,
+};
+
 /// `vox serve` with no service named (ADR-028 S-4): list what listens on this machine, with
 /// its program's name, have the person pick one, suggest a name for it, and return
 /// `(port, tag, endpoint)`.
@@ -1307,10 +1455,7 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
     }
     // Unprivileged, `lsof` sees only this user's sockets and `ss` hides another user's program:
     // a service missing here may still be listening.
-    println!(
-        "  another user's services, root's among them, may be missing here or listed without \
-         their program; name one with vox serve <name>=<port>"
-    );
+    println!("  {MAY_BE_MISSING}; name one with vox serve <name>=<port>");
     let answer = ask("share which? (its number, or its port)").await?;
     let chosen = answer
         .parse::<usize>()
@@ -1327,18 +1472,7 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
             ))
         })?;
     let endpoint = chosen.endpoint();
-    // Its detected kind is the best name; else its program's (S-2: the kind itself is never
-    // taken from either).
-    let kind = vox_core::node::probe::detect(endpoint, chosen.udp).await;
-    let suggested = match kind {
-        ServiceKind::Tcp | ServiceKind::Udp => chosen
-            .command
-            .as_deref()
-            .map(vox_core::node::resolver::label_of)
-            .filter(|n| !n.is_empty() && n.len() <= vox_core::governance::share::MAX_SERVICE_NAME)
-            .unwrap_or_else(|| "service".to_owned()),
-        other => other.as_str().to_owned(),
-    };
+    let suggested = suggested_name(chosen).await;
     let given = ask(&format!("name it [{suggested}]")).await?;
     let name = if given.is_empty() {
         suggested
@@ -1350,77 +1484,7 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
             "{given:?}: a service's name is letters, digits and `-`, at most 63 of them"
         )));
     }
-    let tag = if chosen.udp {
-        format!("udp/{name}")
-    } else {
-        name
-    };
-    Ok((chosen.port, tag, endpoint))
-}
-
-/// One listening service as the list shows it: its program, where it listens, and over what.
-fn listing_line(l: &vox_core::node::probe::Listening) -> String {
-    let program = l.command.as_deref().unwrap_or("(not visible to you)");
-    let addrs: Vec<String> = l
-        .addrs
-        .iter()
-        .map(|a| SocketAddr::new(*a, l.port).to_string())
-        .collect();
-    let proto = if l.udp { "udp" } else { "tcp" };
-    let every = if l.on_every_interface() {
-        "  (every interface)"
-    } else {
-        ""
-    };
-    format!("{program:<20} {}  {proto}{every}", addrs.join(", "))
-}
-
-/// One listening service as a sentence says it, with none of the list's column padding:
-/// "python3.13 on 0.0.0.0:8080, tcp".
-fn said_in_a_sentence(l: &vox_core::node::probe::Listening) -> String {
-    let program = l
-        .command
-        .as_deref()
-        .unwrap_or("a program not visible to you");
-    let addrs: Vec<String> = l
-        .addrs
-        .iter()
-        .map(|a| SocketAddr::new(*a, l.port).to_string())
-        .collect();
-    let proto = if l.udp { "udp" } else { "tcp" };
-    format!("{program} on {}, {proto}", addrs.join(", "))
-}
-
-/// What a person must hear before `services` are shared (ADR-028 S-4): each one this machine
-/// listens for on every interface, which its networks reach with no Vox at all, and each on a
-/// well-known sensitive port.
-async fn exposure_warnings(services: &[(u16, String)], at: Option<SocketAddr>) -> Vec<String> {
-    let found = tokio::task::spawn_blocking(vox_core::node::probe::listening)
-        .await
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    for (port, label) in services {
-        let name = vox_core::node::channel::service_name(label);
-        let udp = vox_core::tunnel::udp::is_udp(label);
-        let port = at.map_or(*port, |a| a.port());
-        if let Some(l) = found
-            .iter()
-            .find(|l| l.port == port && l.udp == udp && l.on_every_interface())
-        {
-            out.push(format!(
-                "`{name}` ({}) listens on every interface of this machine, so its networks \
-                 reach it without Vox; sharing it does not change that",
-                said_in_a_sentence(l)
-            ));
-        }
-        if let Some(what) = vox_core::node::probe::sensitive_port(port) {
-            out.push(format!(
-                "`{name}` is on port {port}, {what}: every node you trust in the room can \
-                 reach it"
-            ));
-        }
-    }
-    out
+    Ok((chosen.port, tag_of(name, chosen.udp), endpoint))
 }
 
 /// Who in `channel_id` can reach this node's services and who cannot (ADR-017 4.2), by name:

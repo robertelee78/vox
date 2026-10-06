@@ -101,7 +101,7 @@ fn label_of(spec: &str) -> String {
     vox_core::tunnel::udp::service_label(spec).unwrap_or_else(|| spec.to_owned())
 }
 
-/// Run a verb that attaches to the node already holding the profile.
+/// Run a verb that attaches to the node through the daemon already holding it.
 fn run_attached<Fut>(body: Fut) -> ExitCode
 where
     Fut: std::future::Future<Output = Result<(), crate::app::AppError>>,
@@ -152,7 +152,7 @@ fn trust_name(a: &TrustAddArgs) -> Result<String, crate::app::AppError> {
     }
 }
 
-/// Run a trust verb against the node that is already holding this profile.
+/// Run a trust verb against the daemon already holding this node.
 fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
     let name = match &sub {
         TrustCmd::Add(a) => match trust_name(a) {
@@ -1179,6 +1179,10 @@ pub struct ServiceListArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
+    /// Print the listing as one JSON object; every address in it is canonical, the same on every
+    /// member's machine.
+    #[arg(long)]
+    pub json: bool,
     /// **Refused**, as for every verb: a command line is readable by every process on the
     /// machine while it runs. Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`,
     /// or let it prompt.
@@ -1209,7 +1213,7 @@ pub struct ServiceRemoveArgs {
     pub tag: String,
 }
 
-/// A profile plus the identity passphrase, for the verbs that unlock an identity but open
+/// A node plus the identity passphrase, for the verbs that unlock an identity but open
 /// no room: `vox id`, `vox trust list`.
 #[derive(Args, Debug, Clone)]
 pub struct IdentityArgs {
@@ -1433,7 +1437,7 @@ impl AnchorArgs {
         }
     }
 
-    /// For `--serve trusted`, the creators whose rooms this anchor serves: the profile's
+    /// For `--serve trusted`, the creators whose rooms this anchor serves: the node's
     /// `vox trust` list, read once with the identity passphrase. `None` for `anyone`.
     fn serve_only(
         &self,
@@ -1768,7 +1772,8 @@ enum Cmd {
     Serve(ServeArgs),
     /// Join a room from the address you were given, and print the name its services
     /// answer on. One-shot: joining is durable, so there is nothing to keep
-    /// running — `vox up` is what makes the name resolve.
+    /// running: the daemon's proxy resolves the name while a node is attached (`vox up` says
+    /// where it listens).
     Connect(ConnectArgs),
     /// Offer a local TCP service to a room, or list what is offered.
     ///
@@ -2693,7 +2698,9 @@ pub fn run() -> ExitCode {
                         crate::room_cli::service_remove(&paths, &r.room.room, &label_of(&r.tag))
                             .await
                     }
-                    ServiceCmd::List(r) => crate::room_cli::service_list(&paths, &r.room).await,
+                    ServiceCmd::List(r) => {
+                        crate::room_cli::service_list(&paths, &r.room, r.json).await
+                    }
                 }
             })
         }

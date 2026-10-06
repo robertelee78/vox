@@ -177,11 +177,38 @@ pub trait TerminalIo {
     /// Leave the alternate screen (clearing it), purge scrollback, restore the
     /// terminal. Idempotent; also performed on drop by real backends.
     fn leave(&mut self) -> io::Result<()>;
+    /// Put `text` on the system clipboard (ADR-028 S-3): OSC 52, which the terminal (or tmux,
+    /// with `set-clipboard on`) hands to the clipboard, here and over ssh alike.
+    fn copy(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
     /// Whether the process was asked to stop (SIGTERM), so the loop ends as a quit does. The
     /// loop checks it at least every poll.
     fn stop_requested(&self) -> bool {
         false
     }
+}
+
+/// Standard base64 (RFC 4648, padded), as OSC 52 carries the clipboard's text.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// The real crossterm/ratatui backend with a RAII restore on every exit path.
@@ -267,6 +294,12 @@ impl TerminalIo for CrosstermIo {
 
     fn stop_requested(&self) -> bool {
         self.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn copy(&mut self, text: &str) -> io::Result<()> {
+        let mut out = io::stdout();
+        write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+        out.flush()
     }
 
     /// **A passphrase is read past crossterm** (V210-94). crossterm reads the terminal into a
@@ -657,7 +690,7 @@ pub fn run_node(
                         // **Elsewhere is another machine** (V210-170, #395): the anchors file above
                         // keeps loopback for clients on this one, but a loopback spec printed for
                         // copying to another machine is one that cannot reach this anchor.
-                        // A loopback spec is still printed, apart and said for what it is: a profile on
+                        // A loopback spec is still printed, apart and said for what it is: a node on
                         // this machine that reads another anchors file uses it.
                         let elsewhere = off_machine(&listening);
                         let here: Vec<&String> =
@@ -675,7 +708,7 @@ pub fn run_node(
                         }
                         if !here.is_empty() {
                             println!(
-                                "vox node: on this machine only, for a profile that reads another \
+                                "vox node: on this machine only, for a node that reads another \
                                  anchors file:"
                             );
                             for addr in here {
@@ -1480,6 +1513,20 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
         match ui.on_key(key, &vm) {
             Action::Quit => return Ok(()),
             Action::Redraw => {}
+            // **Copied, and said** (ADR-028 S-3): the command is on the status line too, for a
+            // terminal that does not take OSC 52.
+            Action::Copy(text) => {
+                // The command itself is printed in full in the Shared pane, wrapped; a status
+                // line is one row, which it does not fit.
+                ui.status_message = Some(match io.copy(&text) {
+                    Ok(()) => {
+                        "copied to the clipboard: the command shown in the Shared pane".into()
+                    }
+                    Err(e) => {
+                        format!("could not copy ({e}); the command is shown in the Shared pane")
+                    }
+                });
+            }
             Action::Dispatch(cmd) => {
                 // Moving between screens is no action to report: a "done" there took the place of
                 // the screen's own key hints.

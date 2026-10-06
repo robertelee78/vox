@@ -30,6 +30,13 @@
 //   LAN_UP <line>           `lanUp`, allowing port 5000, answered with the daemon's first line
 //   LAN_SAID <lines>        `lanSaid`: what the LAN has said, joined with " | "
 //   LAN_DOWN                `lanDown` took it down
+//   (waits for a line on stdin: the port a stand-in listens on, on every interface)
+//   LISTENING <line> EVERY <true|false>
+//                           `listening`: the stand-in, as one-step sharing lists it
+//   MISSING <sentence>      what is said under the list
+//   PREVIEW <tag> <ip:port> <warning | warning …>
+//                           `servicePreview`: what sharing it would do, said before it is
+//   OFFERED <tag>           `serviceAdd` with the preview's tag and endpoint: shared in the room
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -139,6 +146,18 @@ do {
     say("LAN_SAID \(lanLines.joined(separator: " | "))")
     try await client.lanDown(room: room)
     say("LAN_DOWN")
+
+    // One-step sharing (ADR-028 S-4, #444): what listens here, what sharing it says, then share.
+    let port = UInt16(readLine() ?? "") ?? 0
+    let here = await client.listening()
+    for s in here.services where s.port == port {
+        say("LISTENING \(s.line) EVERY \(s.everyInterface)")
+    }
+    say("MISSING \(here.mayBeMissing)")
+    let preview = try await client.servicePreview(port: port, udp: false)
+    say("PREVIEW \(preview.tag) \(preview.local) \(preview.warnings.joined(separator: " | "))")
+    try await client.serviceAdd(room: room, tag: preview.tag, local: preview.local)
+    say("OFFERED \(preview.tag)")
     _ = readLine()
     await client.close()
     say("CLOSED")

@@ -90,10 +90,55 @@ pub struct MessageView {
     /// R-6): "only on this machine", or "on N of M members' nodes" from what their nodes said they
     /// hold. Empty when the node does not say.
     pub whereabouts: String,
+    /// Agents coordinating rather than talking (presence, progress, the claim protocol;
+    /// `vox_agentcomms::attention::CHATTER`): a lane folds these into one counted line (ADR-028
+    /// W-3, ADR-020 6.6).
+    pub coordination: bool,
     /// The one message this replies to, quoted (ADR-028 R-9, #485): the entry its `re` names,
     /// never that one's own quote or the thread's root.
     pub quote: Option<QuoteView>,
+    /// An image this message shares (ADR-028 F-9, F-11): drawn inline once verified.
+    pub image: Option<ImageView>,
 }
+
+/// **An image a message shares** (ADR-028 F-11, #502): drawn only once this node's copy is verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageView {
+    /// Its file name, as announced.
+    pub name: String,
+    /// Its width and height in pixels, as announced.
+    pub width: u64,
+    /// Its height.
+    pub height: u64,
+    /// Where this node's copy stands: drawn only once it is verified and decoded.
+    pub state: ImageState,
+}
+
+/// **Where a shared image stands on this node** (ADR-028 F-11): its copy is hashed and decoded
+/// off the TUI's thread, and only an image that is both verified and decoded is drawn.
+#[derive(Clone, Debug)]
+pub enum ImageState {
+    /// Not pulled here, its copy not yet checked, or its bytes not what was announced.
+    Unverified,
+    /// Verified, and decoded within the limits the sharer's daemon decodes with (and scaled to
+    /// at most [`crate::images::DECODED_EDGE`] on its longest edge): ready to draw.
+    Ready(std::sync::Arc<image::DynamicImage>),
+    /// Verified, and not drawn here: why, in words.
+    NotDrawn(&'static str),
+}
+
+impl PartialEq for ImageState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unverified, Self::Unverified) => true,
+            (Self::Ready(a), Self::Ready(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::NotDrawn(a), Self::NotDrawn(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ImageState {}
 
 /// **A reply's quote: one level** (ADR-028 R-9, #485): the message its `re` names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,6 +204,9 @@ pub struct ChannelView {
     /// What a person is told happened to the room, in its order, each with who did it, by
     /// this node's name for them: `ann renamed the room to family` (ADR-028 E-5).
     pub notices: Vec<NoticeView>,
+    /// The retention this node applies here, as a person reads it ("1 week", "forever"): what the
+    /// room's header always shows (ADR-028 R-7).
+    pub retention: String,
     /// The members, in display order.
     pub members: Vec<MemberView>,
     /// The render-gated timeline, oldest-first. Shared with the core, which adds a new
@@ -168,11 +216,29 @@ pub struct ChannelView {
     /// One notice per member this node holds back for equivocating here (V210-63, V210-66), by
     /// the name this operator gave them; drawn above the timeline, **each on its own line**.
     pub held_back: Vec<String>,
-    /// The services shared in the room (V030-25), each as `<address> by <who>`: its address in
-    /// this operator's own aliases (fingerprints where it has none), and who shared it.
-    pub shared: Vec<String>,
+    /// The services shared in the room (V030-25, ADR-028 S-3).
+    pub shared: Vec<SharedView>,
     /// This channel's reachability.
     pub reachability: Reachability,
+    /// Each other member and its lane state's words, in the room's member order, as the node
+    /// derives them (ADR-028 W-3, #512): what heads each lane.
+    pub lanes: Vec<(Digest32, String)>,
+    /// For each member, the newest of its posts the person had seen when they last left the
+    /// lanes (W-3, "what changed since the person last looked"): what is after it is new.
+    pub lanes_seen: Vec<(Digest32, Digest32)>,
+}
+
+/// One service shared in a room, as the TUI shows it (ADR-028 S-3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SharedView {
+    /// `<address> by <who>  <kind>`: its readable address in this operator's own aliases
+    /// (fingerprints where it has none), who shared it, and what it is.
+    pub line: String,
+    /// The command a copy gives, carrying the canonical address (S-1) so it works pasted on any
+    /// member's machine: the first of its kind's commands.
+    pub copy: String,
+    /// What it needs that does not hold, each in words; empty when nothing is missing.
+    pub missing: Vec<String>,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many
@@ -228,6 +294,36 @@ pub struct ViewModel {
     pub keyring: Vec<(vox_core::hash::Digest32, String)>,
     /// What this node decided, newest first, from its decision record (ADR-028 D-3).
     pub decisions: Vec<vox_core::node::decisions::Event>,
+    /// What listens on this machine, for sharing one into a room (ADR-028 S-4), as `vox serve`
+    /// lists it; empty until the share flow asks.
+    pub listening: Vec<ListeningView>,
+    /// The service the share flow is about to offer, and what is said before it is (S-4).
+    pub serve_preview: Option<ServePreview>,
+}
+
+/// One service listening on this machine, as the share flow lists it (ADR-028 S-4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListeningView {
+    /// Its program, where it listens, and over what: `vox serve`'s line.
+    pub line: String,
+    /// Its port.
+    pub port: u16,
+    /// Whether it takes datagrams.
+    pub udp: bool,
+}
+
+/// A service about to be offered in a room, and what the person is told first (ADR-028 S-4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServePreview {
+    /// The room.
+    pub channel_id: Digest32,
+    /// The tag it is offered under: its suggested name, `udp/` before it for datagrams.
+    pub tag: String,
+    /// Where it listens, which the room's members are carried to.
+    pub local: std::net::SocketAddr,
+    /// What is said before it is offered: its address, who can reach it and who cannot, and
+    /// each warning.
+    pub lines: Vec<String>,
 }
 
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline
@@ -463,11 +559,6 @@ pub enum Command {
         /// The identity passphrase (redacted/zeroized).
         passphrase: SecretString,
     },
-    /// Act as another node of this account from now on (ADR-015 9.1, `:node <name>`).
-    UseNode {
-        /// Its name.
-        name: String,
-    },
     /// Open a closed channel: its passphrase is the second lock factor.
     OpenChannel {
         /// The channelID.
@@ -526,6 +617,16 @@ pub enum Command {
         /// The identity passphrase, as `vox room rename` asks for it (redacted/zeroized).
         identity_passphrase: SecretString,
     },
+    /// Add a node to the keyring under a name (ADR-028 K-3, K-5), as `vox trust add` does, once
+    /// the person has compared its fingerprint.
+    Trust {
+        /// The node.
+        target: Digest32,
+        /// The person's name for it.
+        petname: String,
+        /// The identity passphrase, empty while the keyring window is open (redacted/zeroized).
+        identity_passphrase: SecretString,
+    },
     /// Ask for a `vox://` invite link for a channel this node holds open. The link
     /// comes back as a notice; it carries no secret.
     Invite {
@@ -538,6 +639,58 @@ pub enum Command {
         channel_id: Digest32,
         /// The plaintext to send (becomes ciphertext in the core).
         text: String,
+    },
+    /// List what listens on this machine, for the share flow (ADR-028 S-4).
+    ProbeListening,
+    /// Say what offering the service listening on `port` in a room would do, before it is done
+    /// (S-4): `udp` picks one of two on the same port; `None` takes the first.
+    PreviewServe {
+        /// The room.
+        channel_id: Digest32,
+        /// The service's port.
+        port: u16,
+        /// Datagrams or connections, when the person picked one.
+        udp: Option<bool>,
+    },
+    /// Offer the previewed service in its room (S-4), as `vox service add` does.
+    OfferService,
+    /// Drop the share flow's preview.
+    CancelServe,
+    /// Share a file or folder in a room from the composer (ADR-028 F-1): its note the composer's
+    /// words, addressed and urgent as the composer is, as `vox share` does.
+    ShareFile {
+        /// The room.
+        channel_id: Digest32,
+        /// The file or folder, as the person typed it.
+        path: String,
+        /// The note: the composer's words, if any.
+        note: String,
+        /// The members it is for.
+        to: Vec<Digest32>,
+        /// Whether it may interrupt their agents.
+        urgent: bool,
+    },
+    /// What the person has seen of each member's lane in a room, as they leave the lanes (W-3):
+    /// `(member, the newest post of its seen)`. Kept with this node, across restarts.
+    LanesSeen {
+        /// The room.
+        channel_id: Digest32,
+        /// `(member, newest post seen)`.
+        seen: Vec<(Digest32, Digest32)>,
+    },
+    /// Post `text` to a channel addressed, urgent, or both (ADR-028 W-4): the one way a
+    /// structured message is posted, as `vox room post --to … --urgent` posts it.
+    PostAddressed {
+        /// The target channel.
+        channel_id: Digest32,
+        /// The message's words.
+        text: String,
+        /// The members it is to.
+        to: Vec<Digest32>,
+        /// Whether it may interrupt their agents.
+        urgent: bool,
+        /// The entry it replies to, if it is a reply.
+        re: Option<Digest32>,
     },
     /// Send `text` to a channel as a reply to its entry `re` (ADR-028 R-9, #485).
     Reply {

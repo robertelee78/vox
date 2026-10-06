@@ -373,92 +373,48 @@ pub(crate) async fn addressees(
     Ok(to)
 }
 
-/// `vox room post` — append a message.
-///
-/// With no structured flag, the text is posted exactly as given: prose is a `say`, and
-/// an agent may paste an envelope. **Except a claim-protocol operation**, which is
-/// refused: it would lack the session, the operation id and the version stamp that
-/// make it valid, and the dedicated verbs exist to set them.
-///
-/// With any structured flag, the CLI builds the envelope itself: it fills `from` and
-/// `at`, stamps the version, and posts under an operation id exactly once in effect.
-/// A post carrying `--work` takes part in work coordination, so it passes the version
-/// gate first (exit 3). A reused `--op` with different content is refused (exit 4).
+/// What a structured post did, for its caller to say (`vox room post`, the TUI's composer).
+pub(crate) struct PostReport {
+    room_key: String,
+    session: String,
+    posting: coord::Posting,
+    is_result: bool,
+    reach: Vec<Reach>,
+    unread: Vec<(String, String, String, String)>,
+    /// What the poster is told besides: an addressee that cannot be interrupted (V210-169).
+    pub(crate) notes: Vec<String>,
+}
+
+impl PostReport {
+    /// What the poster is told of each other node addressed (V030-17) and anything else, one
+    /// sentence each.
+    pub(crate) fn said(&self) -> Vec<String> {
+        self.notes
+            .iter()
+            .cloned()
+            .chain(
+                self.reach
+                    .iter()
+                    .map(|r| format!("to {}: {}", r.name, r.says)),
+            )
+            .collect()
+    }
+}
+
+/// **The one way a structured message is posted** (ADR-020 §9, ADR-028 W-4): `vox room post`
+/// with a structured flag, and the TUI's composer with To: or urgent set. It checks the type,
+/// the data and the addressees, applies the hop rule and the urgent limits (V210-121), and posts
+/// under an operation id exactly once in effect.
 ///
 /// # Errors
-/// As above, or if the node cannot be reached.
-pub async fn post_cmd(
+/// As `vox room post` refuses.
+pub(crate) async fn post_structured(
     paths: &Paths,
     room: &str,
-    text: Option<&str>,
+    body: &str,
     opts: &PostOpts,
-) -> Result<(), AppError> {
-    let body = body_of(text)?;
-    if !opts.is_structured() {
-        if body.trim().is_empty() {
-            return Err(AppError::Usage("refusing to post an empty message".into()));
-        }
-        // An envelope every reader would refuse is refused here, before it is posted
-        // (V210-123): a type or name not on one line would otherwise sit in the log unread.
-        if let Err(e @ vox_agentcomms::envelope::ParseError::Malformed(_)) = Envelope::parse(&body)
-        {
-            return Err(AppError::Usage(format!("refusing to post it: {e}")));
-        }
-        if let Ok(env) = Envelope::parse(&body) {
-            // **A raw envelope addresses members by fingerprint** (V210-161), as `--to` writes
-            // them: a name in `to` would read as addressed to nobody on every node.
-            if !env.to.is_empty() {
-                let (mut client, cid, _) = open_room(paths, room).await?;
-                let members = members_of(&mut client, cid).await?;
-                if let Some(bad) = env
-                    .to
-                    .iter()
-                    .find(|t| !crate::ident::recipient(t).is_some_and(|fp| members.contains(&fp)))
-                {
-                    return Err(AppError::Usage(format!(
-                        "refusing to post it: `to` names {:?}, which is not a member's whole \
-                         fingerprint as `vox room roster` prints it. Use --to, which takes your \
-                         name for a member or its fingerprint",
-                        vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
-                    )));
-                }
-            }
-            if claim::is_claim_protocol(&env) {
-                return Err(AppError::Usage(format!(
-                    "refusing a raw `{}`: claim-protocol operations need a session, an \
-                     operation id and a version stamp. Use `vox room {}`.",
-                    env.kind, env.kind
-                )));
-            }
-            // **A raw envelope cannot start an urgent chain of its own from a woken session**
-            // (V210-121): it is posted exactly as given, so it would not inherit the `re` a
-            // structured post takes, and two agents answering each other that way woke each
-            // other for ever.
-            if env.urgent && env.re.is_none() {
-                if let Some(session) = coord::session(opts.coord.session.as_deref()) {
-                    let (mut client, cid, room_key) = open_room(paths, room).await?;
-                    let me = client
-                        .me()
-                        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
-                    // The wakes and what followed the oldest of them (V210-120).
-                    let rows =
-                        coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
-                    let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &me);
-                    if !open.is_empty() {
-                        return Err(AppError::Usage(format!(
-                            "refusing a raw urgent message with no `re` from session {session}: \
-                             it was woken by {} and has not answered. Reply with `--re <entry>`, \
-                             or post with the structured flags (`--type`, `--to`, `--urgent`), \
-                             which answer the message that woke it when only one is open.",
-                            open.join(", ")
-                        )));
-                    }
-                }
-            }
-        }
-        return post(paths, room, Some(&body), !opts.no_card).await;
-    }
-
+) -> Result<PostReport, AppError> {
+    let body = body.to_owned();
     let kind = opts.kind.clone().unwrap_or_else(|| "say".into());
     if !vox_agentcomms::envelope::is_valid_name(&kind, vox_agentcomms::envelope::MAX_NAME) {
         return Err(AppError::Usage(format!(
@@ -611,9 +567,10 @@ pub async fn post_cmd(
     // message is posted, and waits in the room for that session's next turn. This node's
     // sessions only: another node decides for its own.
     let me = client.me().map(|m| b32_encode(&m)).unwrap_or_default();
+    let mut notes = Vec::new();
     if opts.urgent {
         if let Some(line) = crate::wake::uninterruptible(paths, &me, &draft.to) {
-            eprintln!("vox: {line}");
+            notes.push(line);
         }
     }
     // **What to expect of each other node addressed** (V030-17), from the room as it stands
@@ -678,6 +635,115 @@ pub async fn post_cmd(
     } else {
         Vec::new()
     };
+    Ok(PostReport {
+        room_key,
+        session,
+        posting,
+        is_result,
+        reach,
+        unread,
+        notes,
+    })
+}
+
+/// `vox room post` — append a message.
+///
+/// With no structured flag, the text is posted exactly as given: prose is a `say`, and
+/// an agent may paste an envelope. **Except a claim-protocol operation**, which is
+/// refused: it would lack the session, the operation id and the version stamp that
+/// make it valid, and the dedicated verbs exist to set them.
+///
+/// With any structured flag, the CLI builds the envelope itself: it fills `from` and
+/// `at`, stamps the version, and posts under an operation id exactly once in effect.
+/// A post carrying `--work` takes part in work coordination, so it passes the version
+/// gate first (exit 3). A reused `--op` with different content is refused (exit 4).
+///
+/// # Errors
+/// As above, or if the node cannot be reached.
+pub async fn post_cmd(
+    paths: &Paths,
+    room: &str,
+    text: Option<&str>,
+    opts: &PostOpts,
+) -> Result<(), AppError> {
+    let body = body_of(text)?;
+    if !opts.is_structured() {
+        if body.trim().is_empty() {
+            return Err(AppError::Usage("refusing to post an empty message".into()));
+        }
+        // An envelope every reader would refuse is refused here, before it is posted
+        // (V210-123): a type or name not on one line would otherwise sit in the log unread.
+        if let Err(e @ vox_agentcomms::envelope::ParseError::Malformed(_)) = Envelope::parse(&body)
+        {
+            return Err(AppError::Usage(format!("refusing to post it: {e}")));
+        }
+        if let Ok(env) = Envelope::parse(&body) {
+            // **A raw envelope addresses members by fingerprint** (V210-161), as `--to` writes
+            // them: a name in `to` would read as addressed to nobody on every node.
+            if !env.to.is_empty() {
+                let (mut client, cid, _) = open_room(paths, room).await?;
+                let members = members_of(&mut client, cid).await?;
+                if let Some(bad) = env
+                    .to
+                    .iter()
+                    .find(|t| !crate::ident::recipient(t).is_some_and(|fp| members.contains(&fp)))
+                {
+                    return Err(AppError::Usage(format!(
+                        "refusing to post it: `to` names {:?}, which is not a member's whole \
+                         fingerprint as `vox room roster` prints it. Use --to, which takes your \
+                         name for a member or its fingerprint",
+                        vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
+                    )));
+                }
+            }
+            if claim::is_claim_protocol(&env) {
+                return Err(AppError::Usage(format!(
+                    "refusing a raw `{}`: claim-protocol operations need a session, an \
+                     operation id and a version stamp. Use `vox room {}`.",
+                    env.kind, env.kind
+                )));
+            }
+            // **A raw envelope cannot start an urgent chain of its own from a woken session**
+            // (V210-121): it is posted exactly as given, so it would not inherit the `re` a
+            // structured post takes, and two agents answering each other that way woke each
+            // other for ever.
+            if env.urgent && env.re.is_none() {
+                if let Some(session) = coord::session(opts.coord.session.as_deref()) {
+                    let (mut client, cid, room_key) = open_room(paths, room).await?;
+                    let me = client
+                        .me()
+                        .ok_or_else(|| AppError::Usage("the node did not say who it is".into()))?;
+                    // The wakes and what followed the oldest of them (V210-120).
+                    let rows =
+                        coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
+                    let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &me);
+                    if !open.is_empty() {
+                        return Err(AppError::Usage(format!(
+                            "refusing a raw urgent message with no `re` from session {session}: \
+                             it was woken by {} and has not answered. Reply with `--re <entry>`, \
+                             or post with the structured flags (`--type`, `--to`, `--urgent`), \
+                             which answer the message that woke it when only one is open.",
+                            open.join(", ")
+                        )));
+                    }
+                }
+            }
+        }
+        return post(paths, room, Some(&body), !opts.no_card).await;
+    }
+
+    let PostReport {
+        room_key,
+        session,
+        posting,
+        is_result,
+        reach,
+        unread,
+        notes,
+    } = post_structured(paths, room, &body, opts).await?;
+    for line in &notes {
+        eprintln!("vox: {line}");
+    }
     if opts.coord.json {
         let mut out = serde_json::json!({
             "schema": "vox.room.post/1",
@@ -2426,7 +2492,7 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the node cannot say.
-pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
+pub async fn service_list(paths: &Paths, room: &str, json: bool) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Services { channel_id }).await {
@@ -2435,7 +2501,17 @@ pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
             services,
             shared,
         }) => {
-            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared);
+            // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL.
+            let proxy = match crate::client::one_shot(paths) {
+                Ok(at) => vox_core::node::nameipc::proxy(&at)
+                    .await
+                    .map_err(|e| match e {
+                        vox_core::error::Error::AppRefused(reason) => reason,
+                        other => other.to_string(),
+                    }),
+                Err(e) => Err(e.to_string()),
+            };
+            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared, &proxy, json);
             Ok(())
         }
         // The node's reason, as `vox service list` without a daemon gives it.

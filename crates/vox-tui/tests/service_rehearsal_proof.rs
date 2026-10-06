@@ -236,6 +236,35 @@ fn echo_service() -> u16 {
     port
 }
 
+/// An `sshd` stand-in that greets with an SSH banner, so the sharer's node detects it as `ssh`
+/// (ADR-028 S-2), and reports on the channel the first line each client sends: a real `ssh`
+/// client that reached it sends its own `SSH-2.0-…` banner.
+fn ssh_banner_service() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("APPARATUS: bind the ssh stand-in");
+    let port = listener
+        .local_addr()
+        .expect("APPARATUS: the ssh stand-in's address")
+        .port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                if s.write_all(b"SSH-2.0-VoxProofStandIn\r\n").is_err() {
+                    return;
+                }
+                let mut line = String::new();
+                if BufReader::new(&s).read_line(&mut line).is_ok() && !line.is_empty() {
+                    let _ = tx.send(line.trim().to_owned());
+                }
+            });
+        }
+    });
+    (port, rx)
+}
+
 /// Speak RFC 1928 to `proxy`, asking it to CONNECT to `host:port` **by name** — which is
 /// the `socks5h` behaviour `vox up` requires, and the reason a `.vox` name never reaches
 /// a resolver.
@@ -559,6 +588,48 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         "PRODUCT: the host should name the service that was reached: {reached}"
     );
 
+    // ---- ADR-028 S-3 (#490): what reaching a share needs, and whether it holds, as the guest's
+    // `vox service list` says it (a copied command reaching the service across members' own
+    // names is a_service_is_reached_only_by_its_address_proof's).
+    let (ssh_port, _ssh_heard) = ssh_banner_service();
+    let (ok, out, err) = vox_once(
+        &host_dir,
+        &[
+            "service".into(),
+            "add".into(),
+            room.clone(),
+            "nas-ssh".into(),
+            format!("127.0.0.1:{ssh_port}"),
+        ],
+    );
+    assert!(ok, "PRODUCT (staging): the host shares nas-ssh: {out}{err}");
+    let listing = |dir: &std::path::Path, want: &dyn Fn(&str) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let (ok, out, err) = vox_once(dir, &["service".into(), "list".into(), room.clone()]);
+            if ok && want(&out) {
+                return out;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: `vox service list` never showed what was expected: {out}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    };
+    let guest_list = listing(&guest_dir, &|o| o.contains("nas-ssh."));
+    // What it needs, and that it holds: the host trusts the guest, and is online.
+    let trust_line = guest_list
+        .lines()
+        .skip_while(|l| !l.contains("nas-ssh."))
+        .find(|l| l.contains("needs") && l.contains("trusts this node"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        trust_line.ends_with(": yes"),
+        "PRODUCT: the guest's listing must say the host trusts it: {trust_line:?}\n{guest_list}"
+    );
+
     drop(up);
 
     // ---- the control: an UNTRUSTED joiner reaches nothing (M17.7) ----
@@ -643,6 +714,23 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         l.starts_with("! ") && l.contains("the host refused")
     });
     eprintln!("[test] the stranger's vox up said: {why}");
+    // ADR-028 S-3: its listing names the condition that does not hold, before it tries.
+    let (_, stranger_list, _) = vox_once(
+        &stranger_dir,
+        &["service".into(), "list".into(), room.clone()],
+    );
+    let stranger_needs = stranger_list
+        .lines()
+        .skip_while(|l| !l.contains("nas-ssh."))
+        .find(|l| l.contains("needs") && l.contains("trusts this node"))
+        .unwrap_or_default()
+        .to_owned();
+    eprintln!("[test] S-3: the stranger's listing:\n{stranger_list}");
+    assert!(
+        stranger_needs.contains(": NO") && stranger_needs.contains("must trust this node"),
+        "PRODUCT: the untrusted joiner's `vox service list` must name what is missing, that the \
+         host does not trust it: {stranger_needs:?}\n{stranger_list}"
+    );
 
     drop(stranger_up);
     drop(host);

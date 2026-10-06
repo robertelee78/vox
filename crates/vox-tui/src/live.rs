@@ -44,14 +44,21 @@ use zeroize::Zeroizing;
 
 use crate::app::CoreHandle;
 use crate::viewmodel::{
-    ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, NoticeView,
-    QuoteView, Reachability, SyncStatus, Trust, UiError, ViewModel,
+    ChannelSummary, ChannelView, Command, CommandStatus, ImageView, MemberView, MessageView,
+    NoticeView, QuoteView, Reachability, SyncStatus, Trust, UiError, ViewModel,
 };
 use vox_agentcomms::attention::{group, RoomGroup};
 
 /// How often the snapshot is asked again when no event has said anything changed: connections,
 /// tunnels and their last moved byte change without a room event.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
+
+/// What one check of a pulled image found: its announcement, and where it stands.
+type ImageCheck = (Digest32, crate::viewmodel::ImageState);
+
+/// The largest image file the TUI hashes and draws (ADR-028 F-11): a bigger one is a file, not a
+/// picture to show inline.
+const MAX_DRAWN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How much of a quoted message a reply shows: its first line, to this many characters.
 const QUOTE_CHARS: usize = 80;
@@ -141,12 +148,29 @@ pub struct DaemonCore {
     timeline: Option<Timeline>,
     /// The messages already told to the node as shown (ADR-028 RR-1).
     marked: std::collections::BTreeSet<Digest32>,
+    /// Image shares whose pulled copy has been checked off this thread, and what it came to
+    /// (ADR-028 F-11): only a verified, decoded one is drawn.
+    images: BTreeMap<Digest32, crate::viewmodel::ImageState>,
+    /// Pull records already handed to a check: a copy is hashed once.
+    checked: std::collections::BTreeSet<Digest32>,
+    /// Where the checks say what they found.
+    image_checks: (mpsc::Sender<ImageCheck>, mpsc::Receiver<ImageCheck>),
     /// The last time the node did not take what the room on screen showed, and what the room was
     /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
     /// ever, for a room that is over.
     mark_refused: Option<MarkRefused>,
     /// This node's decision record as last read, and when (ADR-028 D-3).
     decisions: (Option<Instant>, Vec<vox_core::node::decisions::Event>),
+    /// What listens on this machine, as the share flow last listed it (ADR-028 S-4).
+    listening: Vec<vox_core::node::probe::Listening>,
+    /// The service the share flow is about to offer, with what was said of it.
+    serve_preview: Option<crate::viewmodel::ServePreview>,
+    /// The room on screen's lane states as the node last gave them, for which room, and when
+    /// (ADR-028 W-3).
+    lanes: (Option<Instant>, Option<Digest32>, Vec<(Digest32, String)>),
+    /// What the person last saw of each lane, by room and member (ADR-028 W-3), as kept in the
+    /// node's directory ([`LANES_SEEN_FILE`]); read once.
+    lanes_seen: Option<BTreeMap<String, BTreeMap<String, String>>>,
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -192,6 +216,13 @@ struct Timeline {
 
 /// How many of the node's decisions, newest first, the TUI's decision screen holds.
 const DECISIONS_SHOWN: usize = 500;
+/// Where the TUI keeps, in the node's directory, what the person last saw of each lane (ADR-028
+/// W-3): `{room: {member: newest post seen}}`, fingerprints and hashes as `vox` prints them.
+const LANES_SEEN_FILE: &str = "tui-lanes-seen.json";
+
+/// How often the room on screen's lane states are asked of the node (ADR-028 W-3): as often as the
+/// snapshot, since a state changes when the room does.
+const LANES_EVERY: Duration = SNAPSHOT_EVERY;
 
 /// The least time between two asks to record what a room showed, after the node did not take one.
 const MARK_RETRY: Duration = Duration::from_secs(3);
@@ -220,6 +251,8 @@ struct Own {
 }
 
 struct Projected {
+    /// How many images were verified when this was projected: one more projects again.
+    verified: usize,
     me: Option<Digest32>,
     trusted: Vec<(Digest32, String)>,
     own: Own,
@@ -351,8 +384,15 @@ impl DaemonCore {
             clashes_said: std::collections::BTreeSet::new(),
             timeline: None,
             marked: std::collections::BTreeSet::new(),
+            images: BTreeMap::new(),
+            checked: std::collections::BTreeSet::new(),
+            image_checks: mpsc::channel(),
             mark_refused: None,
             decisions: (None, Vec::new()),
+            listening: Vec::new(),
+            serve_preview: None,
+            lanes: (None, None, Vec::new()),
+            lanes_seen: None,
             ended: None,
             stop,
         };
@@ -556,8 +596,10 @@ impl DaemonCore {
             // command's own status puts over every notice, and `:link` showed a person nothing to
             // give anyone. A room link is no secret: the passphrase travels apart.
             Ok(Frame::Link { url, .. }) => {
-                self.notice = Some(format!("room link: {url}"));
-                CommandStatus::Said(format!("room link: {url}"))
+                // Add to room (ADR-028 W-5): the link, and that its passphrase goes another way.
+                let said = format!("room link: {url} — send its passphrase another way");
+                self.notice = Some(said.clone());
+                CommandStatus::Said(said)
             }
             Ok(Frame::Error { reason }) => failed(&reason),
             Ok(_) => CommandStatus::Failed(UiError::Internal),
@@ -706,7 +748,9 @@ impl DaemonCore {
             // and a count are all public facts; nothing here can carry plaintext or key material
             // (ADR-015).
             NodeEvent::InviteLink { url, .. } => {
-                self.notice = Some(format!("room link: {url}"));
+                self.notice = Some(format!(
+                    "room link: {url} — send its passphrase another way"
+                ));
             }
             NodeEvent::AddressNote { note, .. }
             | NodeEvent::NodeNote { note }
@@ -812,7 +856,13 @@ impl DaemonCore {
             [one] => format!("{one} trusts it."),
             [rest @ .., last] => format!("{} and {last} trust it.", rest.join(", ")),
         };
-        let line = format!("{} joined. {who}", self.member_name(&peer));
+        // Trust is offered where it matters (ADR-028 K-5), with the one action used everywhere.
+        let offer = if self.snapshot.trusted.iter().any(|(t, _)| *t == peer) {
+            String::new()
+        } else {
+            format!(" · {}", crate::ident::trust_hint(&peer))
+        };
+        let line = format!("{} joined. {who}{offer}", self.member_name(&peer));
         self.notice = Some(line.clone());
         self.joined = Some((room, peer, line));
     }
@@ -850,6 +900,7 @@ impl DaemonCore {
                 Ok(Some(s)) => {
                     let before = std::mem::replace(&mut self.snapshot, s);
                     self.note_joins(&before);
+                    self.check_pulls();
                 }
                 Ok(None) => match Frame::from_bytes(&reply) {
                     Ok(Frame::NodeDetached { .. }) => self.detached(),
@@ -963,6 +1014,126 @@ impl DaemonCore {
         }
     }
 
+    /// **Verify what this node pulled of the room on screen's image shares** (ADR-028 F-11): each
+    /// pull record new here is handed once to a thread of its own, which hashes and decodes the
+    /// copy ([`crate::images::verify_and_decode`]), so a large file never holds up a frame. The
+    /// daemon checked it as it pulled; this checks the file that is there now, which is what is
+    /// drawn. What the checks found is taken in here too.
+    fn check_pulls(&mut self) {
+        while let Ok((entry, state)) = self.image_checks.1.try_recv() {
+            self.images.insert(entry, state);
+        }
+        let Some(t) = self.timeline.as_ref() else {
+            return;
+        };
+        let Ok(paths) = self.account.node_paths(&self.node) else {
+            return;
+        };
+        for p in vox_core::node::pulls::recorded(&paths) {
+            if p.room != t.channel_id || self.checked.contains(&p.entry) {
+                continue;
+            }
+            let Some(row) = t.rows.iter().find(|r| r.entry_hash == p.entry) else {
+                continue;
+            };
+            self.checked.insert(p.entry);
+            let Ok(e) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
+                continue;
+            };
+            let (Some(sha), Some(size)) = (
+                e.data.get("sha256").and_then(serde_json::Value::as_str),
+                e.data.get("size").and_then(serde_json::Value::as_u64),
+            ) else {
+                continue;
+            };
+            if e.data.get("image").is_none() {
+                continue;
+            }
+            if size > MAX_DRAWN_BYTES {
+                self.images.insert(
+                    p.entry,
+                    crate::viewmodel::ImageState::NotDrawn(crate::images::PAST_LIMITS),
+                );
+                continue;
+            }
+            let (tx, sha, entry) = (self.image_checks.0.clone(), sha.to_owned(), p.entry);
+            let spawned = std::thread::Builder::new()
+                .name("vox-image-check".into())
+                .spawn(move || {
+                    let _ = tx.send((entry, crate::images::verify_and_decode(&p.path, size, &sha)));
+                });
+            if spawned.is_err() {
+                // Not checked now; looked at again with the next snapshot.
+                self.checked.remove(&entry);
+            }
+        }
+    }
+
+    /// What the person last saw of each lane, read from the node's directory the first time.
+    fn lanes_seen(&mut self) -> &mut BTreeMap<String, BTreeMap<String, String>> {
+        let path = self.account.node_dir(&self.node).join(LANES_SEEN_FILE);
+        self.lanes_seen.get_or_insert_with(|| {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Keep what the person has now seen of each lane in `channel_id` (W-3), in the node's
+    /// directory, so the next look marks only what is newer, across restarts.
+    fn note_lanes_seen(&mut self, channel_id: Digest32, seen: &[(Digest32, Digest32)]) {
+        let room = vox_core::node::link::b32_encode(&channel_id);
+        let entry = self.lanes_seen().entry(room).or_default();
+        for (member, post) in seen {
+            entry.insert(
+                vox_core::node::link::b32_encode(member),
+                vox_core::node::link::b32_encode(post),
+            );
+        }
+        let path = self.account.node_dir(&self.node).join(LANES_SEEN_FILE);
+        if let Ok(bytes) = serde_json::to_vec(self.lanes_seen()) {
+            let mut open = std::fs::OpenOptions::new();
+            open.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                open.mode(0o600);
+            }
+            if let Ok(mut f) = open.open(&path) {
+                let _ = std::io::Write::write_all(&mut f, &bytes);
+            }
+        }
+    }
+
+    /// The room on screen's lane states (ADR-028 W-3, #512), from the node: asked again at most
+    /// every [`LANES_EVERY`], and at once for a room that just came on screen. None without one.
+    fn lanes(&mut self) -> Vec<(Digest32, String)> {
+        let Some(cid) = self.active else {
+            return Vec::new();
+        };
+        let fresh =
+            self.lanes.1 == Some(cid) && self.lanes.0.is_some_and(|at| at.elapsed() < LANES_EVERY);
+        if !fresh {
+            if let Some(conn) = self.conn.as_mut() {
+                let asked = Request::Lanes { channel_id: cid };
+                match until_stopped(&self.rt, &self.stop, conn.client.request(&asked)) {
+                    Some(Ok(Frame::Lanes { lanes })) => {
+                        self.lanes = (Some(Instant::now()), Some(cid), lanes)
+                    }
+                    // Not answered this time (a room not open yet): asked again at the next.
+                    Some(Ok(_)) => self.lanes = (Some(Instant::now()), Some(cid), Vec::new()),
+                    None | Some(Err(_)) => {}
+                }
+            }
+        }
+        if self.lanes.1 == Some(cid) {
+            self.lanes.2.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Read the room on screen: whole when it first comes on screen, or when a late row or an
     /// unknown cursor says the order changed above what is shown; else only what arrived since.
     fn read_timeline(&mut self) {
@@ -1052,10 +1223,29 @@ impl DaemonCore {
         trusted: &[(Digest32, String)],
         own: &Own,
     ) -> std::sync::Arc<Vec<MessageView>> {
+        let images = &self.images;
         let Some(t) = self.timeline.as_mut() else {
             return std::sync::Arc::default();
         };
         let (held, projected) = (&t.rows, &mut t.projected);
+        // **An image a message shares** (ADR-028 F-9, F-11): as announced, with this node's copy
+        // once it is verified here.
+        let image_of = |r: &MessageRow| {
+            let e = vox_agentcomms::envelope::Envelope::parse(&r.text).ok()?;
+            if e.kind != crate::room_cli::FILE {
+                return None;
+            }
+            let image = e.data.get("image")?;
+            Some(ImageView {
+                name: e.data.get("name")?.as_str()?.to_owned(),
+                width: image.get("width")?.as_u64()?,
+                height: image.get("height")?.as_u64()?,
+                state: images
+                    .get(&r.entry_hash)
+                    .cloned()
+                    .unwrap_or(crate::viewmodel::ImageState::Unverified),
+            })
+        };
         let name_of = |author: &Digest32| {
             if me == Some(*author) {
                 "you".to_owned()
@@ -1133,7 +1323,16 @@ impl DaemonCore {
         let view_of = |r: &MessageRow| MessageView {
             entry_hash: r.entry_hash,
             author: r.author,
-            author_nick: name_of(&r.author),
+            author_nick: if me == Some(r.author) || trusted.iter().any(|(t, _)| *t == r.author) {
+                name_of(&r.author)
+            } else {
+                // A node not in the keyring is offered the one trust action (ADR-028 K-5).
+                format!(
+                    "{} (not in keyring · {})",
+                    crate::ident::author_id(&r.author),
+                    crate::ident::trust_hint(&r.author)
+                )
+            },
             // The wire names addressees by fingerprint; the timeline by this node's own names.
             addressed: if r.owed {
                 String::new()
@@ -1153,6 +1352,10 @@ impl DaemonCore {
             pulled_by: pullers(r),
             whereabouts: whereabouts(r),
             quote: if r.owed { None } else { quote_of(r) },
+            image: if r.owed { None } else { image_of(r) },
+            coordination: !r.owed
+                && vox_agentcomms::envelope::Envelope::parse(&r.text)
+                    .is_ok_and(|e| vox_agentcomms::attention::CHATTER.contains(&e.kind.as_str())),
         };
         // A quote whose message arrives after its reply is projected again with it.
         let quoted_late = |p: &Projected| {
@@ -1165,6 +1368,7 @@ impl DaemonCore {
         match projected.as_mut() {
             Some(p)
                 if p.me == me
+                    && p.verified == images.len()
                     && p.trusted.as_slice() == trusted
                     && p.own == *own
                     && p.len <= held.len()
@@ -1179,6 +1383,7 @@ impl DaemonCore {
             _ => {
                 let rows = std::sync::Arc::new(held.iter().map(view_of).collect::<Vec<_>>());
                 *projected = Some(Projected {
+                    verified: images.len(),
                     me,
                     trusted: trusted.to_vec(),
                     own: own.clone(),
@@ -1220,6 +1425,26 @@ impl DaemonCore {
     }
 
     fn project(&mut self) -> ViewModel {
+        let lanes = self.lanes();
+        let seen_here: Vec<(Digest32, Digest32)> = match self.active {
+            Some(cid) => {
+                let room = vox_core::node::link::b32_encode(&cid);
+                self.lanes_seen()
+                    .get(&room)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(member, post)| {
+                                Some((
+                                    vox_core::node::link::b32_decode(member, "member").ok()?,
+                                    vox_core::node::link::b32_decode(post, "post").ok()?,
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
         let snap = self.snapshot.clone();
         let me = snap.me;
         // A room is reachable when this node holds a connection to another of its members. A
@@ -1307,6 +1532,7 @@ impl DaemonCore {
                         &d.channel_id,
                         names_here(),
                     ),
+                    retention: vox_core::node::retention::describe(d.retention),
                     notices: d
                         .notices
                         .iter()
@@ -1385,10 +1611,50 @@ impl DaemonCore {
                                 } else {
                                     ""
                                 };
-                                format!(
-                                    "{} by {who}  {kind}{udp}",
-                                    names.address_of(&d.channel_id, &s.host, &s.name)
-                                )
+                                // A sharer not in the keyring cannot be reached until each
+                                // trusts the other: the one trust action is offered (K-5).
+                                let offer = if me != Some(s.host)
+                                    && !snap.trusted.iter().any(|(t, _)| *t == s.host)
+                                {
+                                    format!(
+                                        "  (not in keyring · {})",
+                                        crate::ident::trust_hint(&s.host)
+                                    )
+                                } else {
+                                    String::new()
+                                };
+                                let address = names.address_of(&d.channel_id, &s.host, &s.name);
+                                let line = format!("{address} by {who}  {kind}{udp}{offer}");
+                                let svc = vox_core::node::ipc::SharedService {
+                                    address,
+                                    canonical: vox_core::node::resolver::canonical_address(
+                                        &d.channel_id,
+                                        &s.host,
+                                        &s.name,
+                                    ),
+                                    by: who,
+                                    udp: s.udp,
+                                    kind: kind.as_str().to_owned(),
+                                    trusts_you: me == Some(s.host)
+                                        || d.consenting.binary_search(&s.host).is_ok(),
+                                    online: me == Some(s.host)
+                                        || snap.connected_peers.binary_search(&s.host).is_ok(),
+                                };
+                                crate::viewmodel::SharedView {
+                                    line,
+                                    copy: crate::tunnel_cli::service_commands(&svc)
+                                        .into_iter()
+                                        .next()
+                                        .map(|(_, c)| c)
+                                        .unwrap_or_default(),
+                                    missing: crate::tunnel_cli::service_needs(&svc, None)
+                                        .into_iter()
+                                        .filter(|(_, holds, _)| !holds)
+                                        .map(|(need, _, otherwise)| {
+                                            format!("{need}: no — {otherwise}")
+                                        })
+                                        .collect(),
+                                }
                             })
                             .collect()
                     },
@@ -1404,6 +1670,8 @@ impl DaemonCore {
                         })
                         .collect(),
                     reachability: reachability(&cid),
+                    lanes: lanes.clone(),
+                    lanes_seen: seen_here.clone(),
                 })
         });
         ViewModel {
@@ -1425,6 +1693,146 @@ impl DaemonCore {
             closed_tunnels: snap.closed_tunnels,
             keyring: snap.trusted.clone(),
             decisions: self.decisions(),
+            listening: self
+                .listening
+                .iter()
+                .map(|l| crate::viewmodel::ListeningView {
+                    line: crate::tunnel_cli::listing_line(l),
+                    port: l.port,
+                    udp: l.udp,
+                })
+                .collect(),
+            serve_preview: self.serve_preview.clone(),
+        }
+    }
+
+    /// List what listens on this machine (ADR-028 S-4), as `vox serve` does.
+    fn probe_listening(&mut self) {
+        // Spawned inside the runtime: `spawn_blocking` made outside it panics.
+        self.listening = self
+            .rt
+            .block_on(async { tokio::task::spawn_blocking(vox_core::node::probe::listening).await })
+            .unwrap_or_default();
+    }
+
+    /// What offering the service on `port` in `channel_id` would do, said before it is done
+    /// (ADR-028 S-4), as `vox serve` says it: the name it is offered under, the address members
+    /// reach it at, who can reach it and who cannot, and each warning.
+    fn preview_serve(
+        &mut self,
+        channel_id: Digest32,
+        port: u16,
+        udp: Option<bool>,
+    ) -> CommandStatus {
+        if self.listening.is_empty() {
+            self.probe_listening();
+        }
+        let Some(chosen) = self
+            .listening
+            .iter()
+            .find(|l| l.port == port && udp.is_none_or(|u| l.udp == u))
+            .cloned()
+        else {
+            return CommandStatus::Said(format!(
+                "nothing listening on port {port} can be seen from here; {}",
+                crate::tunnel_cli::MAY_BE_MISSING
+            ));
+        };
+        let local = chosen.endpoint();
+        let name = self.rt.block_on(crate::tunnel_cli::suggested_name(&chosen));
+        let tag = crate::tunnel_cli::tag_of(name.clone(), chosen.udp);
+        let warnings = self.rt.block_on(crate::tunnel_cli::exposure_warnings(
+            &[(chosen.port, tag.clone())],
+            Some(local),
+        ));
+        let snap = &self.snapshot;
+        let me = snap.me;
+        let mut names = vox_core::node::resolver::VoxResolver::new();
+        for o in &snap.open {
+            names.add_room(o.channel_id, o.name.as_deref(), &o.members);
+        }
+        for (fp, petname) in &snap.trusted {
+            names.name(*fp, petname);
+        }
+        let members: Vec<Digest32> = snap
+            .open
+            .iter()
+            .find(|o| o.channel_id == channel_id)
+            .map(|o| o.members.clone())
+            .unwrap_or_default();
+        let (mut can, mut cannot) = (Vec::new(), Vec::new());
+        for m in members.iter().filter(|m| Some(**m) != me) {
+            if snap.trusted.iter().any(|(t, _)| t == m) {
+                can.push(crate::ident::member_name(&snap.trusted, m));
+            } else {
+                cannot.push(crate::ident::member_name(&snap.trusted, m));
+            }
+        }
+        let address = me.map_or_else(
+            || format!("{name}.<you>.<the room>.vox"),
+            |me| names.address_of(&channel_id, &me, &name),
+        );
+        let mut lines = vec![
+            format!(
+                "share {}",
+                crate::tunnel_cli::listing_line(&chosen).trim_end()
+            ),
+            format!("as {tag}: members will reach it as {address}"),
+            format!(
+                "who can reach it: {}",
+                if can.is_empty() {
+                    "nobody yet: you trust no member of this room".to_owned()
+                } else {
+                    can.join(", ")
+                }
+            ),
+            format!(
+                "who cannot: {}",
+                if cannot.is_empty() {
+                    "nobody else is in the room".to_owned()
+                } else {
+                    // Each named as the keyring has it, which says it is not in it.
+                    cannot.join(", ")
+                }
+            ),
+        ];
+        lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
+        self.serve_preview = Some(crate::viewmodel::ServePreview {
+            channel_id,
+            tag,
+            local,
+            lines,
+        });
+        CommandStatus::Done
+    }
+
+    /// Offer the previewed service in its room (ADR-028 S-4), as `vox service add` does: offered
+    /// until removed, across the daemon's restarts.
+    fn offer_service(&mut self) -> CommandStatus {
+        let Some(p) = self.serve_preview.take() else {
+            return CommandStatus::Said("nothing to share: pick a service first".into());
+        };
+        match self.request(&Request::AddService {
+            channel_id: p.channel_id,
+            service_tag: p.tag.clone(),
+            local: p.local.to_string(),
+            persist: true,
+        }) {
+            Ok(Frame::Ok) => {
+                self.asked = None;
+                let said = format!("offering {} at {} in this room", p.tag, p.local);
+                self.notice = Some(said.clone());
+                CommandStatus::Said(said)
+            }
+            Ok(Frame::Error { reason }) => {
+                CommandStatus::Said(format!("cannot offer {}: {reason}", p.tag))
+            }
+            Ok(other) => CommandStatus::Said(format!(
+                "cannot offer {}: {}",
+                p.tag,
+                crate::client::unexpected(&other)
+            )),
+            Err(_) => CommandStatus::Failed(UiError::NotAttached),
         }
     }
 
@@ -1443,36 +1851,6 @@ impl DaemonCore {
         }
         self.decisions.1.clone()
     }
-
-    /// Act as `name` from now on: let go of the node acted as (which detaches it if this TUI was
-    /// its last holder, L-3) and take `name`, attached already or waiting for its passphrase.
-    fn use_node(&mut self, name: &str) -> CommandStatus {
-        let node = match NodeName::parse(name) {
-            Ok(n) => n,
-            Err(e) => return CommandStatus::Said(format!("{name:?} is not a node's name: {e}")),
-        };
-        if node == self.node && self.conn.is_some() {
-            return CommandStatus::Done;
-        }
-        if !self.account.nodes_on_disk().contains(&node) {
-            return CommandStatus::Said(format!(
-                "there is no node {node}; make one with `vox node create {node}`"
-            ));
-        }
-        self.conn = None;
-        self.node = node;
-        self.has_identity = true;
-        self.active = None;
-        self.timeline = None;
-        self.unread.clear();
-        self.snapshot = NodeSnapshot::default();
-        self.notice = None;
-        if self.attached.iter().any(|n| n == self.node.as_str()) {
-            self.attach(None)
-        } else {
-            CommandStatus::Done
-        }
-    }
 }
 
 impl Drop for DaemonCore {
@@ -1489,6 +1867,10 @@ fn wipe(request: &mut Request) {
         Request::Create { passphrase, .. }
         | Request::OpenRoom { passphrase, .. }
         | Request::Join { passphrase, .. } => passphrase.zeroize(),
+        Request::Trust {
+            identity_passphrase,
+            ..
+        } => identity_passphrase.zeroize(),
         _ => {}
     }
 }
@@ -1686,6 +2068,21 @@ impl CoreHandle for DaemonCore {
     fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
         let secret = |s: &SecretString| s.expose_secret().to_owned();
         match command {
+            Command::ProbeListening => {
+                self.serve_preview = None;
+                self.probe_listening();
+                CommandStatus::Done
+            }
+            Command::PreviewServe {
+                channel_id,
+                port,
+                udp,
+            } => self.preview_serve(channel_id, port, udp),
+            Command::OfferService => self.offer_service(),
+            Command::CancelServe => {
+                self.serve_preview = None;
+                CommandStatus::Done
+            }
             Command::CreateIdentity { passphrase } => self.create_identity(&passphrase, waiting),
             Command::Attach { passphrase } => {
                 if self.conn.is_some() {
@@ -1693,7 +2090,6 @@ impl CoreHandle for DaemonCore {
                 }
                 self.attach(Some(Zeroizing::new(passphrase.expose_secret().to_owned())))
             }
-            Command::UseNode { name } => self.use_node(&name),
             Command::CreateChannel { name, passphrase } => self.send(Request::Create {
                 name,
                 passphrase: Zeroizing::new(secret(&passphrase)),
@@ -1707,6 +2103,21 @@ impl CoreHandle for DaemonCore {
                 name,
                 identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
             }),
+            Command::Trust {
+                target,
+                petname,
+                identity_passphrase,
+            } => match self.send(Request::Trust {
+                target,
+                petname: petname.clone(),
+                identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
+                full_history: false,
+            }) {
+                CommandStatus::Done => CommandStatus::Said(format!(
+                    "you now trust {petname}: it may read what you write in every room you share"
+                )),
+                other => other,
+            },
             Command::OpenChannel {
                 channel_id,
                 passphrase,
@@ -1791,6 +2202,116 @@ impl CoreHandle for DaemonCore {
                     self.notified.remove(&cid);
                 }
                 CommandStatus::Done
+            }
+            Command::ShareFile {
+                channel_id,
+                path,
+                note,
+                to,
+                urgent,
+            } => {
+                let Ok(paths) = self.account.node_paths(&self.node) else {
+                    return CommandStatus::Failed(UiError::NotAttached);
+                };
+                let opts = crate::share_cli::ShareOpts {
+                    to: to.iter().map(vox_core::node::link::b32_encode).collect(),
+                    urgent,
+                    note: (!note.is_empty()).then_some(note),
+                    ..crate::share_cli::ShareOpts::default()
+                };
+                let room = vox_core::node::link::b32_encode(&channel_id);
+                let offered = until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    crate::share_cli::offer(
+                        &paths,
+                        &room,
+                        std::path::Path::new(path.trim()),
+                        &opts,
+                        |_, _, _| {},
+                    ),
+                );
+                if let Some(t) = self
+                    .timeline
+                    .as_mut()
+                    .filter(|t| t.channel_id == channel_id)
+                {
+                    t.stale = true;
+                }
+                match offered {
+                    Some(Ok(o)) => {
+                        let mut said = vec![if o.row.files > 0 {
+                            format!(
+                                "sharing {}/ ({} files, {} bytes) as {}",
+                                o.row.name, o.row.files, o.row.size, o.row.tag
+                            )
+                        } else {
+                            format!(
+                                "sharing {} ({} bytes) as {}",
+                                o.row.name, o.row.size, o.row.tag
+                            )
+                        }];
+                        if !o.to.is_empty() {
+                            let names: Vec<String> = o
+                                .to
+                                .iter()
+                                .filter_map(|fp| crate::ident::recipient(fp))
+                                .map(|fp| crate::ident::member_name(&self.snapshot.trusted, &fp))
+                                .collect();
+                            said.push(format!("for {}", names.join(", ")));
+                        }
+                        said.extend(o.notes);
+                        CommandStatus::Said(said.join(" · "))
+                    }
+                    Some(Err(e)) => CommandStatus::Said(e.to_string()),
+                    None => CommandStatus::NotConnected,
+                }
+            }
+            Command::LanesSeen { channel_id, seen } => {
+                self.note_lanes_seen(channel_id, &seen);
+                CommandStatus::Done
+            }
+            Command::PostAddressed {
+                channel_id,
+                text,
+                to,
+                urgent,
+                re,
+            } => {
+                let Ok(paths) = self.account.node_paths(&self.node) else {
+                    return CommandStatus::Failed(UiError::NotAttached);
+                };
+                let opts = crate::room_cli::PostOpts {
+                    to: to.iter().map(vox_core::node::link::b32_encode).collect(),
+                    urgent,
+                    re: re.as_ref().map(vox_core::node::link::b32_encode),
+                    ..crate::room_cli::PostOpts::default()
+                };
+                let room = vox_core::node::link::b32_encode(&channel_id);
+                let posted = until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    crate::room_cli::post_structured(&paths, &room, &text, &opts),
+                );
+                if let Some(t) = self
+                    .timeline
+                    .as_mut()
+                    .filter(|t| t.channel_id == channel_id)
+                {
+                    t.stale = true;
+                }
+                match posted {
+                    Some(Ok(report)) => {
+                        let said = report.said();
+                        if said.is_empty() {
+                            CommandStatus::Done
+                        } else {
+                            CommandStatus::Said(said.join(" · "))
+                        }
+                    }
+                    Some(Err(e)) => CommandStatus::Said(e.to_string()),
+                    None => CommandStatus::NotConnected,
+                }
             }
             Command::Reply {
                 channel_id,

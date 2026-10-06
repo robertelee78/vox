@@ -202,7 +202,7 @@ impl IdentityVault {
         let version = d.uint().map_err(Error::from)?;
         vault_aad(version)?;
         let profile_id = u8::try_from(d.uint().map_err(Error::from)?)
-            .map_err(|_| Error::MalformedAtRest("vault profile id range"))?;
+            .map_err(|_| Error::MalformedAtRest("vault parameter set out of range"))?;
         let salt: [u8; SALT_LEN] = d
             .bytes()
             .map_err(Error::from)?

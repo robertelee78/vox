@@ -43,6 +43,9 @@ pub enum PromptKind {
     /// End `Prompt::target` for everyone: `[the word "end"]`, typed to confirm what the title says
     /// it does (ADR-028 E-5).
     EndRoom,
+    /// Trust the node `Prompt::target` (ADR-028 K-5): `[its fingerprint as they gave it, a
+    /// name, identity passphrase]`. The fingerprint is compared before anything is added.
+    Trust,
 }
 
 impl PromptKind {
@@ -58,6 +61,11 @@ impl PromptKind {
             PromptKind::RenameRoom => &["new room name", "identity passphrase"],
             PromptKind::LeaveRoom => &["type leave to leave it"],
             PromptKind::EndRoom => &["type end to end it for everyone"],
+            PromptKind::Trust => &[
+                "their fingerprint, as they gave it to you (paste or type it)",
+                "your name for them",
+                "identity passphrase (Enter alone while the keyring is open)",
+            ],
         }
     }
 
@@ -71,6 +79,8 @@ impl PromptKind {
             PromptKind::JoinChannel => i == 1,
             // A confirming word is no secret.
             PromptKind::LeaveRoom | PromptKind::EndRoom => false,
+            // A fingerprint and a name are not; only the passphrase.
+            PromptKind::Trust => i == 2,
             _ => true,
         }
     }
@@ -103,6 +113,9 @@ impl PromptKind {
             PromptKind::EndRoom => {
                 "End this room for everyone? Every member's node is to take no new message in it \
                  and delete it"
+            }
+            PromptKind::Trust => {
+                "Trust this node? Compare its fingerprint with the one they gave you"
             }
         }
     }
@@ -178,6 +191,9 @@ pub enum Screen {
     /// What this node decided, newest first (ADR-028 D-3): `d` on the channel list, or
     /// `:decisions`.
     Decisions,
+    /// Sharing a service listening on this machine into the room on screen (ADR-028 S-4):
+    /// `:serve`, or `:serve <port>` for one directly.
+    Serve,
 }
 
 /// Which pane has focus within the channel screen (cycled by `Tab`).
@@ -189,6 +205,8 @@ pub enum Focus {
     Composer,
     /// The member pane.
     Members,
+    /// What is shared in the room (ADR-028 S-3): Up/Down select, `y` copies its command.
+    Shared,
 }
 
 impl Focus {
@@ -198,7 +216,8 @@ impl Focus {
         match self {
             Focus::Timeline => Focus::Composer,
             Focus::Composer => Focus::Members,
-            Focus::Members => Focus::Timeline,
+            Focus::Members => Focus::Shared,
+            Focus::Shared => Focus::Timeline,
         }
     }
 }
@@ -234,6 +253,9 @@ pub enum Action {
     Dispatch(Command),
     /// Quit the application.
     Quit,
+    /// Put this text on the system clipboard (OSC 52) and say it on the status line
+    /// (ADR-028 S-3): a shared service's command.
+    Copy(String),
 }
 
 /// The UI navigation state.
@@ -251,6 +273,8 @@ pub struct UiState {
     /// an unread re-sorts it, and a position would then name another room. Each frame finds its
     /// index again ([`UiState::settle`]).
     pub selected_room: Option<Digest32>,
+    /// The shared service selected in the room's Shared pane, by position (ADR-028 S-3).
+    pub selected_share: usize,
     /// The member selected in the member pane, **by identity** (V210-82): the pane is in
     /// fingerprint order, so a join re-sorts it, and a position would then name someone else.
     /// `None` until the pane first has a member (see [`UiState::settle`]).
@@ -264,6 +288,8 @@ pub struct UiState {
     pub reveal_selected: bool,
     /// The message the composer is replying to, when it is.
     pub replying: Option<Digest32>,
+    /// The images ready to draw inline, and how this terminal draws them (ADR-028 F-11).
+    pub images: std::rc::Rc<std::cell::RefCell<crate::images::Images>>,
     /// A transient status/alert line shown at the bottom (e.g. the result of the
     /// last command, an error, a recovery hint). `None` when clear.
     pub status_message: Option<String>,
@@ -276,6 +302,18 @@ pub struct UiState {
     /// person has been shown, for a read record (ADR-028 RR-1). Taken by the loop after each
     /// frame; empty when no room is on screen.
     pub on_screen: Vec<Digest32>,
+    /// The service selected in the share flow's list, by its place in it (ADR-028 S-4).
+    pub selected_listening: usize,
+    /// The room the share flow offers into.
+    pub serve_room: Option<Digest32>,
+    /// The room's lanes are on screen in place of its timeline (ADR-028 W-3): `:lanes`.
+    pub lanes: bool,
+    /// Whom the composer's next message is to (ADR-028 W-4, `to`): `:to <name>…`.
+    pub to: Vec<Digest32>,
+    /// The composer's next message is urgent (W-4, ADR-020 4.5): `:urgent`.
+    pub urgent: bool,
+    /// The room the lanes, To: and urgent belong to: another room starts without them.
+    pub compose_room: Option<Digest32>,
 }
 
 impl Default for UiState {
@@ -286,15 +324,23 @@ impl Default for UiState {
             mode: Mode::Normal,
             selected_channel: 0,
             selected_room: None,
+            selected_share: 0,
             selected_member: None,
             timeline_scroll: 0,
             selected_message: None,
             reveal_selected: false,
             replying: None,
+            images: std::rc::Rc::default(),
             status_message: None,
             composer: String::new(),
             selected_tunnel: None,
             on_screen: Vec::new(),
+            selected_listening: 0,
+            serve_room: None,
+            lanes: false,
+            to: Vec::new(),
+            urgent: false,
+            compose_room: None,
         }
     }
 }
@@ -310,6 +356,14 @@ impl UiState {
     /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
     /// draws and the member a command acts on are one member, held by identity from then on.
     pub fn settle(&mut self, vm: &ViewModel) {
+        // The lanes, To: and urgent are the room's: another room starts without them.
+        let room = vm.active.as_ref().map(|c| c.channel_id);
+        if room != self.compose_room {
+            self.compose_room = room;
+            self.lanes = false;
+            self.to.clear();
+            self.urgent = false;
+        }
         match self
             .selected_room
             .and_then(|id| vm.channels.iter().position(|c| c.channel_id == id))
@@ -412,15 +466,30 @@ impl UiState {
                             return Action::Redraw;
                         }
                     };
-                    let text = if to.is_empty() {
-                        text
-                    } else {
-                        let mut e = vox_agentcomms::envelope::Envelope::say(&text);
-                        e.to = to;
-                        e.to_text()
-                    };
+                    // Whom `@alias` names (K-4) join the To: (W-4): both are addressing.
+                    for fp in to {
+                        if let Ok(id) = vox_core::node::link::b32_decode(&fp, "member") {
+                            if !self.to.contains(&id) {
+                                self.to.push(id);
+                            }
+                        }
+                    }
                     self.composer.clear();
-                    return Action::Dispatch(match self.replying.take() {
+                    let re = self.replying.take();
+                    // Addressed or urgent, the message goes the one way a structured message is
+                    // posted, as `vox room post --to … --urgent` posts it (ADR-028 W-4).
+                    if !self.to.is_empty() || self.urgent {
+                        let to = std::mem::take(&mut self.to);
+                        let urgent = std::mem::replace(&mut self.urgent, false);
+                        return Action::Dispatch(Command::PostAddressed {
+                            channel_id,
+                            text,
+                            to,
+                            urgent,
+                            re,
+                        });
+                    }
+                    return Action::Dispatch(match re {
                         Some(re) => Command::Reply {
                             channel_id,
                             re,
@@ -447,6 +516,15 @@ impl UiState {
                 self.settle(vm);
                 Action::Redraw
             }
+            // `t` on a member is the same trust action as `:trust` (ADR-028 K-5).
+            KeyCode::Char('t')
+                if self.screen == Screen::Channel && self.focus == Focus::Members =>
+            {
+                match self.selected_member {
+                    Some(fp) => self.offer_trust(fp, vm),
+                    None => Action::Redraw,
+                }
+            }
             KeyCode::Char('k') if self.screen == Screen::ChannelList => {
                 self.screen = Screen::Keyring;
                 Action::Redraw
@@ -454,6 +532,23 @@ impl UiState {
             KeyCode::Char('d') if self.screen == Screen::ChannelList => {
                 self.screen = Screen::Decisions;
                 Action::Redraw
+            }
+            // The share flow (ADR-028 S-4): Enter previews the service selected, then offers it.
+            KeyCode::Enter if self.screen == Screen::Serve => {
+                if vm.serve_preview.is_some() {
+                    self.screen = Screen::Channel;
+                    return Action::Dispatch(Command::OfferService);
+                }
+                let (Some(channel_id), Some(l)) =
+                    (self.serve_room, vm.listening.get(self.selected_listening))
+                else {
+                    return Action::Redraw;
+                };
+                Action::Dispatch(Command::PreviewServe {
+                    channel_id,
+                    port: l.port,
+                    udp: Some(l.udp),
+                })
             }
             KeyCode::Char('x') | KeyCode::Delete if self.screen == Screen::Tunnels => {
                 self.close_selected_tunnel(vm)
@@ -483,9 +578,37 @@ impl UiState {
             }
             KeyCode::Tab if self.screen == Screen::Channel => {
                 self.focus = self.focus.next();
+                // The Shared pane is there only when something is shared.
+                if self.focus == Focus::Shared
+                    && vm.active.as_ref().is_none_or(|c| c.shared.is_empty())
+                {
+                    self.focus = self.focus.next();
+                }
                 Action::Redraw
             }
+            KeyCode::Char('y') if self.screen == Screen::Channel && self.focus == Focus::Shared => {
+                match vm
+                    .active
+                    .as_ref()
+                    .and_then(|c| c.shared.get(self.selected_share))
+                {
+                    Some(s) if !s.copy.is_empty() => Action::Copy(s.copy.clone()),
+                    _ => Action::Redraw,
+                }
+            }
             KeyCode::Esc => {
+                // Out of the share flow's preview, then out of the flow, back to the room.
+                if self.screen == Screen::Serve {
+                    if vm.serve_preview.is_some() {
+                        return Action::Dispatch(Command::CancelServe);
+                    }
+                    self.screen = Screen::Channel;
+                    return Action::Redraw;
+                }
+                // Out of the lanes, back to the room's timeline.
+                if self.screen == Screen::Channel && self.lanes {
+                    return self.leave_lanes(vm);
+                }
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
                     self.selected_message = None;
@@ -537,6 +660,7 @@ impl UiState {
             self.screen = Screen::Channel;
             self.focus = Focus::Timeline;
             self.selected_member = None;
+            self.selected_share = 0;
             self.timeline_scroll = 0;
             self.selected_message = None;
             self.replying = None;
@@ -611,6 +735,40 @@ impl UiState {
         };
         let secret = |s: &Zeroizing<String>| SecretString::from(s.as_str().to_owned());
         match p.kind {
+            PromptKind::Trust => {
+                let Some(target) = p.target else {
+                    return Action::Redraw;
+                };
+                let theirs = vox_core::node::link::b32_encode(&target);
+                let given = crate::ident::typed_fingerprint(&p.fields[0]);
+                // **A mismatch is its own outcome** (ADR-028 K-5): nothing is added, and both are
+                // shown, so the person sees that they differ.
+                if given != theirs {
+                    self.status_message = Some(format!(
+                        "not trusted: the fingerprint you were given is not this node's — do not \
+                         trust it; ask them for theirs again another way. given: {} · this node: \
+                         {}",
+                        vox_text::fingerprint::grouped(&given),
+                        vox_text::fingerprint::grouped(&theirs)
+                    ));
+                    return Action::Redraw;
+                }
+                let petname = p.fields[1].trim().to_owned();
+                if petname.is_empty() {
+                    // A node in the keyring always has a name (ADR-028 K-3).
+                    self.status_message = Some("a name is required: what do you call them?".into());
+                    let mut again = Prompt::new(PromptKind::Trust, Some(target));
+                    again.fields[0] = Zeroizing::new(p.fields[0].as_str().to_owned());
+                    again.step = 1;
+                    self.mode = Mode::Prompt(again);
+                    return Action::Redraw;
+                }
+                Action::Dispatch(Command::Trust {
+                    target,
+                    petname,
+                    identity_passphrase: secret(&p.fields[2]),
+                })
+            }
             PromptKind::Attach => Action::Dispatch(Command::Attach {
                 passphrase: secret(&p.fields[0]),
             }),
@@ -707,6 +865,28 @@ impl UiState {
         }
     }
 
+    /// Open the trust prompt on `fp`, unless it is this node or already in the keyring.
+    fn offer_trust(&mut self, fp: Digest32, vm: &ViewModel) -> Action {
+        let me = vm
+            .active
+            .as_ref()
+            .and_then(|c| c.members.iter().find(|m| m.id == fp))
+            .is_some_and(|m| m.trust == crate::viewmodel::Trust::You);
+        if me {
+            self.status_message = Some("that is this node".into());
+            return Action::Redraw;
+        }
+        if vm.keyring.iter().any(|(id, _)| *id == fp) {
+            self.status_message = Some(format!(
+                "{} is already in your keyring",
+                crate::ident::name_in(&vm.keyring, &fp)
+            ));
+            return Action::Redraw;
+        }
+        self.mode = Mode::Prompt(Prompt::new(PromptKind::Trust, Some(fp)));
+        Action::Redraw
+    }
+
     /// Close the tunnel selected in the tunnel list (V030-11).
     fn close_selected_tunnel(&mut self, vm: &ViewModel) -> Action {
         match self
@@ -757,6 +937,11 @@ impl UiState {
                 }
             }
             Screen::Keyring => {}
+            Screen::Serve => {
+                if !vm.listening.is_empty() && vm.serve_preview.is_none() {
+                    self.selected_listening = step(self.selected_listening, vm.listening.len());
+                }
+            }
             Screen::Tunnels => {
                 if vm.tunnels.is_empty() {
                     return;
@@ -769,6 +954,12 @@ impl UiState {
             }
             // The record is read newest first, and nothing in it is acted on.
             Screen::Decisions => {}
+            Screen::Channel if self.focus == Focus::Shared => {
+                let len = vm.active.as_ref().map_or(0, |c| c.shared.len());
+                if len > 0 {
+                    self.selected_share = step(self.selected_share.min(len - 1), len);
+                }
+            }
             Screen::Channel if self.focus == Focus::Timeline => {
                 // Up selects an older message, Down a newer one; past the newest follows again.
                 let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
@@ -835,8 +1026,84 @@ impl UiState {
                         Action::Redraw
                     }
                     Some(Parsed::CloseTunnel) => self.close_selected_tunnel(vm),
+                    Some(Parsed::Serve(channel_id, port)) => {
+                        self.screen = Screen::Serve;
+                        self.serve_room = Some(channel_id);
+                        self.selected_listening = 0;
+                        match port.map(|p| p.parse::<u16>()) {
+                            None => Action::Dispatch(Command::ProbeListening),
+                            Some(Ok(port)) => Action::Dispatch(Command::PreviewServe {
+                                channel_id,
+                                port,
+                                udp: None,
+                            }),
+                            Some(Err(_)) => {
+                                self.status_message =
+                                    Some("`:serve` takes a port, or nothing for the list".into());
+                                Action::Dispatch(Command::ProbeListening)
+                            }
+                        }
+                    }
                     Some(Parsed::Confirm(kind, channel_id)) => {
                         self.mode = Mode::Prompt(Prompt::new(kind, Some(channel_id)));
+                        Action::Redraw
+                    }
+                    Some(Parsed::Trust(fp)) => self.offer_trust(fp, vm),
+                    Some(Parsed::Refused(why)) => {
+                        self.status_message = Some(why);
+                        Action::Redraw
+                    }
+                    Some(Parsed::Send(channel_id, text)) => {
+                        if self.to.is_empty() && !self.urgent {
+                            Action::Dispatch(Command::SendText { channel_id, text })
+                        } else {
+                            let to = std::mem::take(&mut self.to);
+                            let urgent = std::mem::replace(&mut self.urgent, false);
+                            Action::Dispatch(Command::PostAddressed {
+                                channel_id,
+                                text,
+                                to,
+                                urgent,
+                                re: None,
+                            })
+                        }
+                    }
+                    Some(Parsed::Attach(channel_id, path)) => {
+                        // The composer's words are the note, its To: and urgent the share's: one
+                        // announcement carries all of them (F-1), and the composer is spent.
+                        let note = std::mem::take(&mut self.composer).trim().to_owned();
+                        let to = std::mem::take(&mut self.to);
+                        let urgent = std::mem::replace(&mut self.urgent, false);
+                        Action::Dispatch(Command::ShareFile {
+                            channel_id,
+                            path,
+                            note,
+                            to,
+                            urgent,
+                        })
+                    }
+                    Some(Parsed::Lanes) => {
+                        if self.lanes {
+                            self.leave_lanes(vm)
+                        } else {
+                            self.lanes = true;
+                            Action::Redraw
+                        }
+                    }
+                    Some(Parsed::To(names)) => {
+                        self.set_to(&names, vm);
+                        Action::Redraw
+                    }
+                    Some(Parsed::Urgent) => {
+                        self.urgent = !self.urgent;
+                        self.status_message = Some(
+                            if self.urgent {
+                                "the next message is urgent"
+                            } else {
+                                "the next message is not urgent"
+                            }
+                            .into(),
+                        );
                         Action::Redraw
                     }
                     Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
@@ -861,6 +1128,81 @@ impl UiState {
             }
             _ => Action::Redraw,
         }
+    }
+
+    /// Leave the lanes: what each lane showed is what the person has now seen (W-3), kept by
+    /// the node's TUI state so the next look marks only what is newer, across restarts.
+    fn leave_lanes(&mut self, vm: &ViewModel) -> Action {
+        self.lanes = false;
+        let Some(c) = vm.active.as_ref() else {
+            return Action::Redraw;
+        };
+        let seen: Vec<(Digest32, Digest32)> = c
+            .lanes
+            .iter()
+            .filter_map(|(member, _)| {
+                c.timeline
+                    .iter()
+                    .rev()
+                    .find(|m| m.author == *member && !m.coordination)
+                    .map(|m| (*member, m.entry_hash))
+            })
+            .collect();
+        Action::Dispatch(Command::LanesSeen {
+            channel_id: c.channel_id,
+            seen,
+        })
+    }
+
+    /// Set the composer's To: from `names`, this node's names for members of the room or the
+    /// start of their fingerprints (as `vox room post --to` takes them); none clears it. A name
+    /// that is no member, or that names more than one, is refused with a sentence, and changes
+    /// nothing: the next message goes nowhere it was not meant to.
+    fn set_to(&mut self, names: &str, vm: &ViewModel) {
+        let Some(c) = vm.active.as_ref() else {
+            return;
+        };
+        let mut to = Vec::new();
+        for name in names.split([',', ' ']).filter(|n| !n.is_empty()) {
+            let found: Vec<&crate::viewmodel::MemberView> = c
+                .members
+                .iter()
+                .filter(|m| {
+                    m.trust != crate::viewmodel::Trust::You
+                        && (m.nickname == name
+                            || (name.len() >= 8
+                                && vox_core::node::link::b32_encode(&m.id).starts_with(name)))
+                })
+                .collect();
+            match found[..] {
+                [m] => {
+                    if !to.contains(&m.id) {
+                        to.push(m.id);
+                    }
+                }
+                [] => {
+                    self.status_message = Some(format!(
+                        "no member of this room is named {name}: the next message's To: is \
+                         unchanged"
+                    ));
+                    return;
+                }
+                _ => {
+                    self.status_message = Some(format!(
+                        "{name} names {} members of this room; give more of a fingerprint: the \
+                         next message's To: is unchanged",
+                        found.len()
+                    ));
+                    return;
+                }
+            }
+        }
+        self.to = to;
+        self.status_message = Some(if self.to.is_empty() {
+            "the next message is to the room".into()
+        } else {
+            format!("the next message is to {}", names.trim())
+        });
     }
 
     /// Apply a navigation action (the typed-command equivalents of the chord
@@ -941,6 +1283,23 @@ pub enum Parsed {
     CloseTunnel,
     /// Ask the person to confirm a change of access to a room, saying what it does (ADR-028 E-5).
     Confirm(PromptKind, Digest32),
+    /// Refused, saying why in the status line.
+    Refused(String),
+    /// Share a service listening here into this room (ADR-028 S-4): the list, or the one on the
+    /// port given.
+    Serve(Digest32, Option<String>),
+    /// Open the trust prompt on this node (ADR-028 K-5).
+    Trust(Digest32),
+    /// Send a message to this room, with the composer's To: and urgent (ADR-028 W-4).
+    Send(Digest32, String),
+    /// Share the file or folder at this path in the room, from the composer (ADR-028 F-1).
+    Attach(Digest32, String),
+    /// Show or leave the room's lanes (ADR-028 W-3).
+    Lanes,
+    /// Set the composer's To: from these names (W-4); none clears it.
+    To(String),
+    /// Switch the composer's urgent on or off (W-4).
+    Urgent,
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -949,7 +1308,6 @@ pub enum Parsed {
 /// Per ADR-015 every action MUST be reachable by a typed command. Channel-
 /// independent verbs work anywhere (incl. the channel list):
 /// - `quit` / `q` — exit
-/// - `node <name>` — act as another node of this account
 /// - `open` / `back` / `focus` / `up` / `down` — navigation
 ///
 /// Channel-scoped verbs require an active channel:
@@ -973,10 +1331,38 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     match verb {
         "quit" | "q" => return Some(Parsed::Quit),
         "attach" => return Some(Parsed::Prompt(PromptKind::Attach, None)),
-        "node" if !rest.is_empty() => {
-            return Some(Parsed::Core(Command::UseNode {
-                name: rest.to_owned(),
-            }))
+        // **One node per client** (ADR-028 E-4, #470): this TUI acts only as the node it was
+        // opened with. Another node is a member of the rooms it shares with this one, never a
+        // node to act as.
+        "node" => {
+            return Some(Parsed::Refused(format!(
+                "this window acts only as node {}; to act as {}, open `vox tui --node {}`",
+                vm.node,
+                if rest.is_empty() { "another" } else { rest },
+                if rest.is_empty() { "NAME" } else { rest },
+            )))
+        }
+        // The one trust action (ADR-028 K-5): a member of the room on screen, by the start of its
+        // fingerprint as the screen offers it, or by name.
+        "trust" => {
+            let Some(room) = vm.active.as_ref() else {
+                return Some(Parsed::Refused(
+                    "open the room the node is in, then :trust it".into(),
+                ));
+            };
+            if rest.is_empty() {
+                return Some(Parsed::Refused(
+                    ":trust takes the start of the node's fingerprint, as the screen shows it"
+                        .into(),
+                ));
+            }
+            let members: Vec<Digest32> = room.members.iter().map(|m| m.id).collect();
+            return Some(
+                match crate::ident::resolve_member(rest, &members, &vm.keyring) {
+                    Ok(fp) => Parsed::Trust(fp),
+                    Err(why) => Parsed::Refused(why),
+                },
+            );
         }
         "init" => return Some(Parsed::Prompt(PromptKind::CreateIdentity, None)),
         "new" if !rest.is_empty() => {
@@ -1003,11 +1389,17 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     }
     // Channel-scoped verbs require an active channel.
     let channel = ui.active_channel_id(vm)?;
+    match verb {
+        "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
+        "lanes" => return Some(Parsed::Lanes),
+        // Share a file or folder here, from the composer (F-1): its words the note. `share`, as
+        // `vox share` is; `:attach` is the node's.
+        "share" if !rest.is_empty() => return Some(Parsed::Attach(channel, rest.to_owned())),
+        "to" => return Some(Parsed::To(rest.to_owned())),
+        "urgent" => return Some(Parsed::Urgent),
+        _ => {}
+    }
     let cmd = match verb {
-        "send" if !rest.is_empty() => Command::SendText {
-            channel_id: channel,
-            text: rest.to_owned(),
-        },
         "close" => Command::CloseChannel {
             channel_id: channel,
         },
@@ -1022,6 +1414,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
                 Some(rest.to_owned()).filter(|r| !r.is_empty()),
             ))
         }
+        // Share a service listening here into this room (ADR-028 S-4): the list, or one port.
+        "serve" if rest.is_empty() => return Some(Parsed::Serve(channel, None)),
+        "serve" => return Some(Parsed::Serve(channel, Some(rest.to_owned()))),
         // The link is public; it can be produced by a one-line command.
         "link" => Command::Invite {
             channel_id: channel,

@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks twenty-six claims, each
+//! 160x50. It checks thirty-six claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -21,6 +21,13 @@
 //! - `nostorm`: read records never answer read records (the decider; ADR-028 RR-2): with Alice's
 //!   real `vox tui` on the room beside Bob's and both agents draining, once each TUI says the other
 //!   has read its post, the entries `vox status --json` says each node holds stay the same for 15 s;
+//! - `serve`: Bob's `:serve <port>`, for a service the driver listens on on every interface, says
+//!   before sharing it its address, that alice can reach it and that it listens on every
+//!   interface; Enter shares it, and Alice's `vox service list` lists it (ADR-028 S-4, #491);
+//! - `retention`: with both TUIs open, Alice sets the room's retention to 1 week: each header, which
+//!   said "⏱ forever", says "⏱ 1 week", and each timeline shows one line saying who set it and
+//!   that messages older than that are removed from now on (ADR-028 R-7, #483); and a focused
+//!   pane's border names it once;
 //! - `words`: `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
 //!   never an "invite link" (the decider's words, #406);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
@@ -64,6 +71,27 @@
 //!   trusts it yet.", then, once Alice (whom Bob trusts) trusts Frank, "<frank> joined. alice trusts
 //!   it.", naming neither Erin (in Bob's keyring, never in the room, never granting Frank) nor
 //!   anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is added to no keyring of Bob's;
+//! - `trust`: the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
+//!   in the members pane opens the trust prompt showing his fingerprint; Dave's fingerprint pasted
+//!   there adds nothing, says not to trust him and shows both; Frank's own, pasted through the
+//!   `:trust` the hint offers, in groups and upper case, adds him and says so once the identity
+//!   passphrase is typed into the prompt (`VOX_TEST_KEYRING_WINDOW_SECS` makes Bob's window a
+//!   minute, so it has closed): a wrong passphrase adds nothing and is never shown;
+//! - `onenode`: `:node spare` is refused, naming the one node the window acts as, and the window
+//!   still acts as default, by its status bar and sidebar (ADR-028 E-4, #470);
+//! - `lanes`: Alice's node claims work and posts `working`, `status` and an `ask` as an agent, and
+//!   Carol's claims work: in Bob's `:lanes`, Alice's lane is headed "alice · working" and shows her
+//!   ask, her coordination folded into one counted line and none of it shown; Carol's lane carries
+//!   one of the five state chips (ADR-028 W-3, #513);
+//! - `to`: `:to zz-nobody` is refused with a sentence and sets nothing; `:to alice` and `:urgent`
+//!   show on the composer as "To: alice · urgent", and the message Bob then sends, through the
+//!   one path `vox room post --to … --urgent` takes, reaches Alice with `to` naming her and
+//!   `urgent` (W-4, #513);
+//! - `seen`: Bob leaves his lanes and Alice posts again: looking again, only her new post is
+//!   marked new, her earlier ask not (W-3, #513);
+//! - `attach`: with `:to alice`, a note typed in the composer and `:share <file>`, Alice reads
+//!   one message, a `file` announcement carrying the note and `to` naming her, and no second
+//!   message for the note (ADR-028 F-1, #493);
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
@@ -77,6 +105,15 @@
 //!   Carol ". <her fingerprint>", every state still read by glyph, weight and word; in 16 colours (`TERM=xterm`)
 //!   every colour drawn is one of the 16; in 256 colours Alice's name is index 255 and Carol's 247.
 //!   In each the words are as in truecolour and the accent is on the focused border alone.
+//! - `copies`: Alice shares an ssh stand-in; Bob's Shared pane lists it, and `y` on it puts
+//!   `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full under the
+//!   service and says "copied" on the status line, the address Alice's `vox service list --json`
+//!   gives (ADR-028 S-3, #490);
+//! - `inline`: in a TUI run as kitty, an image Bob's node pulled whose copy the driver then
+//!   overwrites on his disk (an attacker's bytes), and one Alice shares to Carol, which his node
+//!   does not pull, are each named ("image carols.png 96×64 — drawn once it is pulled and
+//!   verified") and no kitty graphics are written; one she shares to the room is drawn as kitty
+//!   graphics once Bob's node has pulled and verified it (ADR-028 F-11, #502).
 //!
 //! The `target`, `delivers` and `revoke` claims are gone with `:consent grant|revoke` (V210-148): a
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
@@ -90,10 +127,15 @@
 //! carries the message text or is raised per message, a room with a message to Bob grouped other
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`), a join line naming a
-//! trusted member that has not granted the newcomer (`newcomer`), a quote of the thread's root
-//! rather than `re`, Enter on a reply not moving the selection, or a trusted member shown as
-//! "verified" (`consent`). It passes only on the script's
-//! PASS with all 26 claims ok.
+//! trusted member that has not granted the newcomer (`newcomer`), a retention change with no line in
+//! the timeline or a focused pane titled twice (`retention`), the share flow's every-interface
+//! warning left out (`serve`), coordination posts shown in a lane, the
+//! composer's To: and urgent left off what it sends, every post marked new, an attach's note posted as a message of its own, a quote of the thread's root rather than `re`, Enter on a reply not
+//! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
+//! another node again, a copied command that is not the service's canonical address (`copies`), or
+//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), or an image
+//! drawn before this node's copy is verified (`inline`). It passes only on the script's PASS with
+//! all 36 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -110,6 +152,9 @@ mod watchdog;
 
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -171,6 +216,9 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // So the driver's budget is 1750 s, it is stopped from outside at 1780 s, and the watchdog is
     // past both. A release run takes about two minutes.
     watchdog::arm_for(Duration::from_secs(1880));
+    // Bob's keyring window is a minute, so the trust prompt's passphrase field is typed into
+    // (`trust`): the window is closed by then.
+    test_knobs::require(&["VOX_TEST_KEYRING_WINDOW_SECS"]);
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_truth.py");
     let clock = StallClock::start();
     let out = pty_driver::run_within(
@@ -183,7 +231,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (26 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (36 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -197,8 +245,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (26, 26),
-                "APPARATUS: the driver said PASS without all 26 claims ok: {said}"
+                (36, 36),
+                "APPARATUS: the driver said PASS without all 36 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
