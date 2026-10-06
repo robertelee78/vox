@@ -78,6 +78,12 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             Bob's after;
   onenode   `:node spare` is refused, naming the one node this window acts as, and the window
             still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
+  trust     the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
+            in Bob's members pane opens the trust prompt, showing his fingerprint; Dave's pasted
+            there adds nothing and shows both fingerprints; Frank's own, pasted through the hint's
+            `:trust`, in groups and upper case, adds him once the identity passphrase is typed
+            into the prompt (Bob's keyring window is a minute, and has closed): a wrong one adds
+            nothing and is never shown;
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -357,7 +363,8 @@ try:
     open(f"{S}/note.sh", "w").write(f"#!/bin/sh\nprintf '%s | %s\\n' \"$1\" \"$2\" >> {NOTES}\n")
     os.chmod(f"{S}/note.sh", 0o755)
     tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec, "--node", "default"],
-              tui_env(COLORTERM="truecolor", VOX_NOTIFY_COMMAND=f"{S}/note.sh"))
+              tui_env(COLORTERM="truecolor", VOX_NOTIFY_COMMAND=f"{S}/note.sh",
+                      VOX_TEST_KEYRING_WINDOW_SECS="60"))
     tui.pump(4)
     unlock(tui)
     screen = lambda: "\n".join(tui.display())
@@ -908,6 +915,55 @@ try:
     claim("onenode", said and "node default" in bar and "node spare" not in bar
           and top == "node default · attached",
           f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
+    stage("trust")
+    # ADR-028 K-5 (#475): the join's line offers the one trust action, ":trust <frank's first 8>";
+    # `t` on Frank in the members pane opens the same prompt. A fingerprint pasted that is not
+    # Frank's adds nothing and shows both; Frank's own, pasted in groups and upper case, adds him.
+    flat_ws = lambda: re.sub(r"\s+", " ", flat())
+    hint = f":trust {fp['frank'][:8]}"
+    hinted = hint in flat_ws()
+    grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
+    in_ring = lambda: fp["frank"] in run("bob", "trust", "list").stdout
+    tui.key("\r", 2)   # into the room
+    tui.key("\t", 1)   # timeline -> composer
+    tui.key("\t", 1)   # composer -> members
+    for _ in range(8):
+        if label_of("frank")[1]:
+            break
+        tui.key("\x1b[B", 1)  # Down: the next member
+    tui.key("t", 2)
+    prompt_seen = "Trust this node?" in flat() and grouped(fp["frank"])[:24] in flat_ws()
+    tui.key(grouped(fp["dave"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("\r", 3)
+    mismatch_said = (f"given: {grouped(fp['dave'])}" in flat_ws()
+                     and f"this node: {grouped(fp['frank'])}" in flat_ws()
+                     and "do not trust it" in flat_ws())
+    mismatch_added = in_ring()
+    # Bob's keyring window (a minute here) has closed: the prompt's passphrase field is typed into.
+    closed = tui.until(lambda: "keyring asks for the passphrase" in run("bob", "status").stdout, 90, 2)
+    tui.key(":" + hint[1:] + "\r", 2)
+    tui.key(grouped(fp["frank"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("not the pass\r", 3)
+    wrong_pass_added = in_ring()
+    wrong_pass_said = [l for l in tui.display()[-6:] if l.strip()]
+    shown_secret = "not the pass" in flat()
+    tui.key(":" + hint[1:] + "\r", 2)
+    tui.key(grouped(fp["frank"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("id pass\r", 3)
+    matched = tui.until(in_ring, 30, 1)
+    match_said = "you now trust frank" in flat_ws()
+    tui.key("\x1b", 2)  # back to the room list
+    claim("trust", hinted and prompt_seen and mismatch_said and not mismatch_added and closed
+          and not wrong_pass_added and not shown_secret and matched and match_said,
+          f"the join offered {hint!r}: {hinted}; `t` on frank opened the prompt with his "
+          f"fingerprint: {prompt_seen}; dave's pasted: both shown and told not to trust: "
+          f"{mismatch_said}, frank added anyway: {mismatch_added}; with the keyring closed "
+          f"({closed}), a wrong passphrase added him: {wrong_pass_added}, was shown: {shown_secret}, "
+          f"the TUI said {wrong_pass_said!r}; frank's own pasted through {hint!r} with the "
+          f"passphrase: added {matched}, said so {match_said}")
 
     stage("unreach")
     for w in ("alice", "carol", "dave", "frank"):

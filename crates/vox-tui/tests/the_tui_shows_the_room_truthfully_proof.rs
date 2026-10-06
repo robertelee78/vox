@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks twenty-nine claims, each
+//! 160x50. It checks thirty claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -69,6 +69,12 @@
 //!   anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is added to no keyring of Bob's;
 //! - `onenode`: `:node spare` is refused, naming the one node the window acts as, and the window
 //!   still acts as default, by its status bar and sidebar (ADR-028 E-4, #470);
+//! - `trust`: the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
+//!   in the members pane opens the trust prompt showing his fingerprint; Dave's fingerprint pasted
+//!   there adds nothing, says not to trust him and shows both; Frank's own, pasted through the
+//!   `:trust` the hint offers, in groups and upper case, adds him and says so once the identity
+//!   passphrase is typed into the prompt (`VOX_TEST_KEYRING_WINDOW_SECS` makes Bob's window a
+//!   minute, so it has closed): a wrong passphrase adds nothing and is never shown;
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
@@ -102,8 +108,9 @@
 //! trusted member that has not granted the newcomer (`newcomer`), the share flow's every-interface
 //! warning left out (`serve`), a quote of the thread's root rather than `re`, Enter on a reply not
 //! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
-//! another node again, or a copied command that is not the service's canonical address (`copies`).
-//! It passes only on the script's PASS with all 29 claims ok.
+//! another node again, a copied command that is not the service's canonical address (`copies`), or
+//! a pasted fingerprint that is not the node's let through to the keyring (`trust`). It passes only
+//! on the script's PASS with all 30 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -120,6 +127,9 @@ mod watchdog;
 
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -181,6 +191,9 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // So the driver's budget is 1750 s, it is stopped from outside at 1780 s, and the watchdog is
     // past both. A release run takes about two minutes.
     watchdog::arm_for(Duration::from_secs(1880));
+    // Bob's keyring window is a minute, so the trust prompt's passphrase field is typed into
+    // (`trust`): the window is closed by then.
+    test_knobs::require(&["VOX_TEST_KEYRING_WINDOW_SECS"]);
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_truth.py");
     let clock = StallClock::start();
     let out = pty_driver::run_within(
@@ -193,7 +206,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (29 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (30 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -207,8 +220,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (29, 29),
-                "APPARATUS: the driver said PASS without all 29 claims ok: {said}"
+                (30, 30),
+                "APPARATUS: the driver said PASS without all 30 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

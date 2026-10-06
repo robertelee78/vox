@@ -563,6 +563,16 @@ pub enum Command {
         /// The identity passphrase, as `vox room rename` asks for it (redacted/zeroized).
         identity_passphrase: SecretString,
     },
+    /// Add a node to the keyring under a name (ADR-028 K-3, K-5), as `vox trust add` does, once
+    /// the person has compared its fingerprint.
+    Trust {
+        /// The node.
+        target: Digest32,
+        /// The person's name for it.
+        petname: String,
+        /// The identity passphrase, empty while the keyring window is open (redacted/zeroized).
+        identity_passphrase: SecretString,
+    },
     /// Ask for a `vox://` invite link for a channel this node holds open. The link
     /// comes back as a notice; it carries no secret.
     Invite {

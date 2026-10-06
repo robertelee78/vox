@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use vox_core::hash::Digest32;
 
-use crate::state::{Focus, Mode, Prompt, Screen, UiState};
+use crate::state::{Focus, Mode, Prompt, PromptKind, Screen, UiState};
 use crate::theme;
 use crate::viewmodel::{
     MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
@@ -188,15 +188,32 @@ fn render_prompt(frame: &mut Frame, area: Rect, p: &Prompt) {
         )
         .unwrap_or(u16::MAX)
     });
-    let h = 5u16.saturating_add(note_rows).min(area.height);
+    // The trust prompt shows the node's fingerprint, grouped, beside its art (ADR-028 K-5), so
+    // the person compares it by eye as well as by what they paste.
+    let card: Vec<String> = match (p.kind, p.target) {
+        (PromptKind::Trust, Some(fp)) => {
+            let mut c = vec!["this node:".to_owned()];
+            c.extend(vox_text::fingerprint::card(
+                &vox_core::node::link::b32_encode(&fp),
+            ));
+            c
+        }
+        _ => Vec::new(),
+    };
+    let card_rows = u16::try_from(card.len()).unwrap_or(u16::MAX);
+    let h = 5u16
+        .saturating_add(note_rows)
+        .saturating_add(card_rows)
+        .min(area.height);
     let y = area.height.saturating_sub(h);
     let overlay = Rect::new(area.x, y, area.width, h);
     let step = format!("{}/{}", p.step + 1, p.kind.fields().len());
-    let mut body = vec![Line::from(format!(
+    let mut body: Vec<Line> = card.into_iter().map(Line::from).collect();
+    body.push(Line::from(format!(
         "{} ({step}): {}",
         p.label(),
         p.display()
-    ))];
+    )));
     if let Some(note) = p.kind.note() {
         body.push(Line::from(note));
     }
