@@ -35,9 +35,9 @@
 //! 11. A readable address whose room part names no room here is refused, saying so.
 //! 12. The canonical address pasted before the share has reached the machine: dave joins, alice
 //!     then shares `nas-web` and copies its canonical address, every
-//!     member that could sync with him is stopped (SIGSTOP), and his `vox forward` must say it is
-//!     waiting for the room's first sync, then reach nas-web once they resume. A
-//!     forward that never waited is CANNOT MEASURE (the staging did not happen), not a pass.
+//!     member that could sync with him is stopped (SIGSTOP), and with his node holding no such
+//!     share his proxy and his `vox forward` must reach nas-web once they resume. A node that
+//!     already held it is CANNOT MEASURE (the staging did not happen), not a pass.
 //!     And pasted on a member whose copy of the room is behind: carol, synced,
 //!     sleeps (SIGSTOP) while alice shares `nas-www`; with alice and bob stopped too she wakes
 //!     holding no such share, and her proxy and `vox forward` must still reach it once alice is
@@ -833,20 +833,21 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         &dave_dir,
         &args(&["forward", &web_canonical, "127.0.0.1:0"]),
     );
-    let waited = early.line_within(Duration::from_secs(20), |l| {
+    // The premise, from dave's own node while every member is still stopped: it holds no
+    // nas-web, so his paste names a share his copy of the room lacks. (Whether his room counts as
+    // synced yet varies with the join's timing, and no longer matters: alice resolves it.)
+    let (_, dave_saw, _) = vox(&dave_dir, &["service", "list", &room], None);
+    let waited = early.line_within(Duration::from_secs(3), |l| {
         l.contains("waiting for this room's first sync")
     });
     for pid in &others {
         let _ = signal("CONT", *pid);
     }
-    let Some(waited) = waited else {
-        panic!(
-            "CANNOT MEASURE (APPARATUS): dave's room had already synced, or his forward never \
-             asked, before the members were stopped, so the paste did not arrive before the share. \
-             dave's forward said:\n{}",
-            early.transcript()
-        );
-    };
+    assert!(
+        !dave_saw.contains("nas-web."),
+        "CANNOT MEASURE (APPARATUS): dave's node already held nas-web while every member was \
+         stopped, so his paste did not arrive before the share: {dave_saw}"
+    );
     let early_line = early.line_within(vox_core::node::up::HOST_PATIENCE, |l| {
         l.starts_with("vox: forwarding ")
     });
