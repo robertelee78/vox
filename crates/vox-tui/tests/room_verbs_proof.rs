@@ -20,6 +20,9 @@
 //! - `--limit` caps;
 //! - **posting from stdin works**, which is how an agent sends a JSON envelope
 //!   without fighting shell quoting;
+//! - **a person addresses a message with no session**: `room post --to <member> --urgent`, with
+//!   no session variable at all, is posted as the node and read back addressed and urgent (a
+//!   `say` is not work coordination; only that is owned per session);
 //! - `room roster` names the member;
 //! - **`room post` refuses every raw claim-protocol message** (`claim`, `release`, `handoff`,
 //!   `renew`, and a `decline` naming a resource), says which verb to use, and neither the room nor
@@ -30,7 +33,8 @@
 //!   running, an unknown room, a malformed cursor.
 //!
 //! **Mutation** (RP-01): drop the raw-claim refusal from `post_cmd` and it goes red on the raw
-//! `claim`: it is posted.
+//! `claim`: it is posted. Require a session for every structured post again, and it goes red on
+//! the person's addressed message.
 //!
 //! Production Argon2id once at setup; `#[ignore]`d in the debug suite.
 //!
@@ -285,6 +289,53 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let envelope = envelope.as_str();
     let (ok, _, err) = vox(&data, &cfg, &["room", "post", &room_prefix], Some(envelope));
     assert!(ok, "PRODUCT: room post from stdin failed: {err}");
+
+    // ---- a person addresses a message, with no agent session at all ----
+    // At a terminal nothing names a session; `--to` and `--urgent` on a plain `say` are a
+    // person's, and the node posts it as itself.
+    let mut person = Command::new(VOX);
+    person
+        .args([
+            "room",
+            "post",
+            &room_prefix,
+            "--to",
+            &me,
+            "--urgent",
+            "a person's addressed message",
+        ])
+        .env("VOX_DATA_DIR", &data)
+        .env("VOX_CONFIG_DIR", &cfg)
+        .stdin(Stdio::null());
+    for agent in ["VOX_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"] {
+        person.env_remove(agent);
+    }
+    let out = person
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox room post: {e}"));
+    assert!(
+        out.status.success(),
+        "PRODUCT: a person's `vox room post --to <member> --urgent`, with no session named, must \
+         be posted; it said: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_, rows, _) = vox(&data, &cfg, &["room", "read", "--json", &room_prefix], None);
+    let addressed = rows
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|r| {
+            r["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("a person's addressed message"))
+        });
+    assert!(
+        addressed.as_ref().is_some_and(
+            |r| r["envelope"]["to"][0] == me.as_str() && r["envelope"]["urgent"] == true
+        ),
+        "PRODUCT: the person's message must reach its addressee: `vox room read --json` must hold \
+         it addressed to {me} and urgent; it holds {addressed:?}"
+    );
 
     // ---- every raw claim-protocol operation is refused (RP-01): it would lack the session, op
     // id and version stamp that make it valid, and `vox room <kind>` sets them. All five kinds, a
