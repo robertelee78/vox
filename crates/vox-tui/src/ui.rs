@@ -35,6 +35,12 @@ pub const LATE_MARKER: &str = "[late] ";
 /// What begins the line under a message this node sent that names who has read it (ADR-028 R-6).
 pub const READ_BY: &str = "read by ";
 
+/// The mark before the message selected in the timeline (ADR-028 R-9, #485).
+pub const SELECTED_MARKER: &str = "▶ ";
+
+/// The mark before a reply's quote of the message it answers, on the row above it.
+pub const QUOTE_MARKER: &str = "  ┆ ";
+
 /// Where a member stands with you, in words: whether your keyring names it, and whether it reads
 /// you here. Nothing for yourself.
 #[must_use]
@@ -367,10 +373,41 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         &channel.held_back,
         channel.timeline.as_slice(),
         &channel.notices,
-        ui.timeline_scroll,
+        Selection {
+            scroll: ui.timeline_scroll,
+            selected: ui.selected_message,
+            reveal: std::mem::take(&mut ui.reveal_selected),
+        },
         focused(ui, Focus::Timeline),
     );
-    render_composer(frame, body[1], &ui.composer, focused(ui, Focus::Composer));
+    // What a reply answers, named in its composer's title until it is sent (ADR-028 R-9).
+    let replying = ui.replying.map(|re| {
+        channel
+            .timeline
+            .iter()
+            .find(|m| m.entry_hash == re)
+            .map_or_else(
+                || "a message".to_owned(),
+                |m| {
+                    let words = m.body.as_deref().unwrap_or(UNDECRYPTABLE_MARKER);
+                    let first: String = words
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(40)
+                        .collect();
+                    format!("{}: {first}", m.author_nick)
+                },
+            )
+    });
+    render_composer(
+        frame,
+        body[1],
+        &ui.composer,
+        replying.as_deref(),
+        focused(ui, Focus::Composer),
+    );
     // Members above, and under them what is shared in the room (V030-25), when anything is.
     let side = if channel.shared.is_empty() {
         vec![cols[1]]
@@ -407,15 +444,28 @@ fn focused(ui: &UiState, pane: Focus) -> bool {
     ui.screen == Screen::Channel && ui.focus == pane && matches!(ui.mode, Mode::Normal)
 }
 
+/// Where the timeline is: scrolled `scroll` lines up from its newest, and the message selected,
+/// which `reveal` says to scroll into view on this draw.
+struct Selection {
+    scroll: usize,
+    selected: Option<Digest32>,
+    reveal: bool,
+}
+
 fn render_timeline(
     frame: &mut Frame,
     area: Rect,
     held_back: &[String],
     timeline: &[MessageView],
     room_notices: &[NoticeView],
-    scroll: usize,
+    at: Selection,
     focus: bool,
 ) -> (usize, Vec<Digest32>) {
+    let Selection {
+        mut scroll,
+        selected,
+        reveal,
+    } = at;
     // Who this room holds back for equivocating comes first, one line each (V210-66).
     let notices = held_back.iter().map(|n| {
         Line::from(Span::styled(
@@ -451,8 +501,11 @@ fn render_timeline(
         }
     };
     let mut reached_oldest = true;
+    // While the selected message must be scrolled to, the rows go on until all of its are in.
+    let seek = reveal && selected.is_some();
+    let mut found = false;
     for m in timeline.iter().rev() {
-        if rows.len() >= want {
+        if rows.len() >= want && (!seek || found) {
             reached_oldest = false;
             break;
         }
@@ -473,7 +526,23 @@ fn render_timeline(
             ));
             push(&mut rows, Some(m.entry_hash), l);
         }
-        push(&mut rows, Some(m.entry_hash), message_line(m));
+        let chosen = selected == Some(m.entry_hash);
+        push(&mut rows, Some(m.entry_hash), message_line(m, chosen));
+        // **The one message this replies to, quoted above it** (ADR-028 R-9, #485).
+        if let Some(q) = &m.quote {
+            let l = Line::from(Span::styled(
+                format!(
+                    "{QUOTE_MARKER}{}",
+                    q.text.as_deref().map_or_else(
+                        || "(a message this room does not hold yet)".to_owned(),
+                        |t| vox_agentcomms::envelope::reveal_keeping(t, |_| false),
+                    )
+                ),
+                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ));
+            push(&mut rows, Some(m.entry_hash), l);
+        }
+        found |= chosen;
     }
     if reached_oldest {
         for l in said.map(notice_line).chain(notices.rev()) {
@@ -482,6 +551,23 @@ fn render_timeline(
     }
     rows.reverse();
     owners.reverse();
+    if seek {
+        // Into view: its top row no higher than the window's, its bottom no lower. Counted up
+        // from the newest row, as `scroll` is.
+        let up = |i: usize| rows.len() - 1 - i;
+        if let (Some(top), Some(low)) = (
+            owners.iter().position(|o| o.is_some() && *o == selected),
+            owners.iter().rposition(|o| o.is_some() && *o == selected),
+        ) {
+            let (from, to) = (up(low), up(top) + 1);
+            if to > scroll + height {
+                scroll = to.saturating_sub(height);
+            }
+            if from < scroll {
+                scroll = from;
+            }
+        }
+    }
     // Only a window that reached the oldest line can be short of `want`, so this is the most
     // there is to scroll; the scroll drawn is returned, and PageDown moves from it at once.
     let scroll = scroll.min(rows.len().saturating_sub(height));
@@ -500,8 +586,9 @@ fn render_timeline(
     (scroll, on_screen)
 }
 
-/// One message as the timeline draws it: who, to whom, and what it says.
-fn message_line(m: &MessageView) -> Line<'static> {
+/// One message as the timeline draws it: who, to whom, and what it says; `chosen` marks it
+/// selected.
+fn message_line(m: &MessageView, chosen: bool) -> Line<'static> {
     // Characters a reader cannot see are shown as escapes (#331).
     let body = m.body.as_deref().map_or_else(
         || UNDECRYPTABLE_MARKER.to_owned(),
@@ -524,6 +611,15 @@ fn message_line(m: &MessageView) -> Line<'static> {
         Style::default().add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::raw(body));
+    if chosen {
+        spans.insert(
+            0,
+            Span::styled(
+                SELECTED_MARKER,
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
     Line::from(spans)
 }
 
@@ -553,7 +649,7 @@ fn wrap(line: Line<'_>, width: usize) -> Vec<Line<'_>> {
     rows
 }
 
-fn render_composer(frame: &mut Frame, area: Rect, text: &str, focus: bool) {
+fn render_composer(frame: &mut Frame, area: Rect, text: &str, replying: Option<&str>, focus: bool) {
     let shown = if text.is_empty() && !focus {
         "type a message — Tab to focus the composer, : for commands".to_owned()
     } else if focus {
@@ -561,7 +657,11 @@ fn render_composer(frame: &mut Frame, area: Rect, text: &str, focus: bool) {
     } else {
         text.to_owned()
     };
-    let p = Paragraph::new(shown).block(pane_block("Composer", focus));
+    let title = replying.map_or_else(
+        || "Composer".to_owned(),
+        |r| format!("Composer — replying to {r} (Esc: not a reply)"),
+    );
+    let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
 }
 
@@ -731,7 +831,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " ↑/↓ select · Enter open · t tunnels · k keyring · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
         }
         Screen::Channel => {
-            " Tab switch pane · Enter send · PgUp/PgDn scroll · :link · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Keyring => " : command · Esc back",

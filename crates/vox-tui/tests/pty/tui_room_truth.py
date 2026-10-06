@@ -25,6 +25,11 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             message shown, not m-001 still;
   renamed   Alice renames the room while Bob's TUI is open, and his timeline says so in one
             line, by his name for her: "alice renamed the room to family" (ADR-028 R-1, E-5);
+  quote     Alice posts q-root, then q-mid replying to it (`--re`, in q-root's thread), then 50
+            lines. Bob selects q-mid (Up), presses Ctrl-R and sends q-answer: his post's `re` names
+            q-mid, and the TUI shows it under "┆ alice: q-mid…", one level, not q-root, with q-mid
+            itself off screen (ADR-028 R-9, #485);
+  jump      Bob selects q-answer and presses Enter: the view moves to q-mid, selected;
   consent   Carol, whom Bob never trusted, reads "not in keyring · you don't read each other";
             Alice, whom he did, "in keyring · reads you" (V210-155: once
             "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
@@ -400,6 +405,75 @@ try:
     claim("renamed", renamed, f"{said!r} in bob's timeline within 60 s: {renamed}; its last rows: "
           f"{[r.strip() for r in timeline().splitlines() if r.strip()][-3:]!r}")
 
+    stage("quote")
+    def alice_posts(*args):
+        p = run("alice", "room", "post", room, "--json", "--session", "quote-proof", *args)
+        if p.returncode != 0: product(f"alice's `vox room post {' '.join(args)}` failed: {p.stderr.strip()}")
+        return json.loads(p.stdout.strip().splitlines()[-1])["entry_hash"]
+    q_root = alice_posts("q-root what shall we build")
+    q_mid = alice_posts("--re", q_root, "--thread", q_root, "q-mid the lexer first")
+    FILL = 50  # more lines than the pane holds, so q-mid is off screen under the reply
+    for i in range(1, FILL + 1):
+        p = run("alice", "room", "post", room, f"f-{i:03d}")
+        if p.returncode != 0: product(f"alice's `vox room post` of f-{i:03d} failed: {p.stderr.strip()}")
+    if not tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 60, 1):
+        product(f"bob's `vox tui` never drew f-{FILL:03d} within 60 s")
+    rows = lambda: [r.rstrip() for r in pane(tui.display(), "Timeline")]
+    selected = lambda: next((r for r in rows() if "▶ " in r), "")
+    def focus(pane):
+        """Tab until `pane`'s title says it has the focus."""
+        for _ in range(4):
+            if any(f"{pane} [focus]" in r for r in tui.display()):
+                return
+            tui.key("\t", 0.3)
+        product(f"Tab never gave bob's {pane} the focus; screen:\n" + tui.text())
+    focus("Timeline")
+    for _ in range(FILL + 5):
+        tui.key("\x1b[A", 0.1)  # Up: an older message selected
+        if "q-mid" in selected():
+            break
+    if "q-mid" not in selected():
+        product(f"Up never selected q-mid in bob's timeline; selected row: {selected()!r}; screen:\n"
+                + tui.text())
+    tui.key("\x12", 0.3)  # Ctrl-R: reply to the message selected
+    tui.key("q-answer on it", 0.3)
+    tui.key("\r", 1)
+    tui.key("\x1b[F", 0.5)  # End: the newest, nothing selected
+    if not tui.until(lambda: any("you: q-answer" in r for r in rows()), 30, 0.5):
+        product("bob's reply q-answer never appeared in his timeline within 30 s")
+    shown = rows()
+    at = next(i for i, r in enumerate(shown) if "you: q-answer" in r)
+    above = shown[at - 1] if at else ""
+    def bob_reply_re():
+        r = run("bob", "room", "read", room, "--json", "--limit", "500")
+        for line in r.stdout.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            env = row.get("envelope") or {}
+            if env.get("body") == "q-answer on it":
+                return env.get("re")
+        return None
+    wrote = bob_reply_re()
+    mid_off = not any("alice: q-mid" in r and "┆" not in r for r in shown)
+    claim("quote", wrote == q_mid and "┆ alice: q-mid the lexer first" in above and "q-root" not in above
+          and mid_off,
+          f"bob's reply's re names q-mid: {wrote == q_mid} (re {wrote!r}); the row above it: "
+          f"{above.strip()!r}; q-mid itself off screen: {mid_off}")
+
+    stage("jump")
+    focus("Timeline")
+    tui.key("\x1b[A", 0.5)  # Up: the newest, q-answer, selected
+    sel_reply = selected()
+    tui.key("\r", 0)  # Enter: to the message it quotes
+    jumped = tui.until(lambda: "alice: q-mid" in selected() and "┆" not in selected(), 5, 0.2)
+    claim("jump", "q-answer" in sel_reply and jumped,
+          f"selected before Enter: {sel_reply.strip()!r}; after: {selected().strip()!r}")
+    tui.key("\x1b[F", 0)  # End
+    tui.until(lambda: has(timeline(), f"f-{FILL:03d}"), 5, 0.2)
+    focus("Timeline")  # where the stages below begin
+
     tui.key("\t", 1)   # timeline -> composer
     tui.key("\t", 1)   # composer -> members
     members_pane = lambda: [row.rstrip() for row in pane(tui.display(), "Members")]
@@ -531,7 +605,8 @@ try:
     for keys, secs in (("", 4), ("id pass\r", 4), ("\r", 2), ("room pass\r", 4), ("\r", 2)):
         if keys: os.write(atui.fd, keys.encode())
         both_until(lambda: False, secs)
-    if not both_until(lambda: "m-0" in "\n".join(pane(atui.display(), "Timeline")), 30):
+    # The room's newest lines are the `quote` stage's f- lines by now, m- ones before it ran.
+    if not both_until(lambda: re.search(r"[mf]-0", "\n".join(pane(atui.display(), "Timeline"))), 30):
         product("alice's `vox tui` never drew a message in the room's timeline within 30 s of unlocking")
     def held(w):
         r = run(w, "status", "--json")
