@@ -11,6 +11,10 @@
 //                           read back at once, are that post
 //   (waits for a line on stdin: the peer now trusts it and has posted)
 //   GOT <text>              a message arrived through the event listener
+//   (waits for a line on stdin: a stand-in LAN helper's socket)
+//   LAN_UP <line>           `lanUp`, allowing port 5000, answered with the daemon's first line
+//   LAN_SAID <lines>        `lanSaid`: what the LAN has said, joined with " | "
+//   LAN_DOWN                `lanDown` took it down
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -66,7 +70,19 @@ do {
 
     // The proof trusts this identity on the peer and posts there, then says go.
     _ = readLine()
-    // Hold on until the proof has its answer about the event stream.
+    // The family LAN, through the helper the proof stands in for.
+    let helper = readLine() ?? ""
+    say("LAN_UP \(try await client.lanUp(room: room, allow: [5000], helperSocket: helper))")
+    // The lines after the first arrive as the LAN says them: up to 10 s for the next two.
+    var lanLines = try await client.lanSaid(room: room)
+    let saidUntil = Date().addingTimeInterval(10)
+    while lanLines.count < 3 && Date() < saidUntil {
+        try await Task.sleep(nanoseconds: 100_000_000)
+        lanLines = try await client.lanSaid(room: room)
+    }
+    say("LAN_SAID \(lanLines.joined(separator: " | "))")
+    try await client.lanDown(room: room)
+    say("LAN_DOWN")
     _ = readLine()
     await client.close()
     say("CLOSED")
