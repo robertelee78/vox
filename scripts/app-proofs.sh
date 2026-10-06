@@ -43,6 +43,10 @@ if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     if [ "$*" = "LaunchProof" ]; then
         exit "$launch_status"
     fi
+else
+    # Loud when not run: an optional proof never reads as a pass.
+    echo "app-proofs: OPTIONAL PROOF NOT RUN: LaunchProof (scripts/app-launch-proof.py);" \
+        "run it with: scripts/app-proofs.sh LaunchProof" >&2
 fi
 
 only=()
