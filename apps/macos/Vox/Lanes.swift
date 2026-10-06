@@ -116,6 +116,7 @@ struct ComposerAddress: View {
             .fixedSize()
             .accessibilityIdentifier("compose-to")
             Toggle("Urgent", isOn: $urgent)
+                .fixedSize()
                 .accessibilityIdentifier("compose-urgent")
                 .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
         }

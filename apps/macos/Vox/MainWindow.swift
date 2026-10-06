@@ -244,6 +244,8 @@ private struct RoomView: View {
                     .accessibilityIdentifier("attach")
                     TextField("Say something to the room", text: $draft)
                         .textFieldStyle(.plain)
+                        .frame(minWidth: 160, maxWidth: .infinity)
+                        .layoutPriority(1)
                         .onSubmit { send(urgent: urgent) }
                         .accessibilityIdentifier("compose")
                     ComposerAddress(model: model, to: $to, urgent: $urgent)

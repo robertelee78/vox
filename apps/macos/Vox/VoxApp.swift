@@ -14,7 +14,9 @@ struct VoxApp: App {
     var body: some Scene {
         Window("Vox", id: "main") {
             RootView(model: delegate.model)
-                .frame(minWidth: 520, minHeight: 360)
+                // The sidebar (260) and the inspector (240) leave the room 400 or more: room
+                // for the composer's field beside its To: and Urgent controls.
+                .frame(minWidth: 900, minHeight: 360)
                 // Dark is the one theme (ADR-028 L-2).
                 .preferredColorScheme(.dark)
         }

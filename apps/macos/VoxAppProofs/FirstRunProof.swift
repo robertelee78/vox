@@ -65,6 +65,12 @@ struct Product: Error, CustomStringConvertible {
     var description: String { "PRODUCT: \(why)" }
 }
 
+/// What an element says to VoiceOver: its label, or, for text, its value (a status bar of combined
+/// text reads as its value).
+func shown(_ element: XCUIElement) -> String {
+    element.label.isEmpty ? (element.value as? String ?? "") : element.label
+}
+
 /// A red that is the apparatus's, not the product's: staging was not achieved.
 struct Apparatus: Error, CustomStringConvertible {
     let why: String
@@ -243,7 +249,7 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the inspector must show bob in alice's keyring; it said \"\(bob.label)\"")
         let status = ui.descendants(matching: .any)["status"]
         XCTAssertTrue(status.waitForExistence(timeout: 10), "PRODUCT: the window has no status bar")
-        let bar = status.label
+        let bar = shown(status)
         XCTAssertTrue(bar.contains("node alice") && bar.contains("peer") && bar.contains("keyring"),
                       "PRODUCT: the status bar must say the node, its peers and the keyring window; it said \"\(bar)\"")
         let regrouped = ui.descendants(matching: .any)["group-needs you"].label
@@ -425,7 +431,7 @@ final class FirstRunProof: XCTestCase {
 
         // (8) Notifications: the room off screen, bob writes to alice.
         ui.descendants(matching: .any)["keyring"].click()
-        let statusNow = ui.descendants(matching: .any)["status"].label
+        let statusNow = shown(ui.descendants(matching: .any)["status"])
         if statusNow.contains("notifications off") {
             throw Apparatus("Vox is not allowed to notify on this Mac: allow it in System Settings, Notifications, Vox, then run again; the app said \(statusNow)")
         }
