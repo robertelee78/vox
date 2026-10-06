@@ -7,7 +7,8 @@
 //   VOX_PROOF_SCRATCH  a scratch directory: the data root and config directory go there
 //
 // What must hold, as a person sees it:
-// 1. At first run the app lists the Mac's nodes; the person picks one and types its passphrase.
+// 1. At first run the app asks once whether to keep the daemon running while logged in, saying
+//    what that does (ADR-014 M-8); the person says Not Now. Then it lists the Mac's nodes; the person picks one and types its passphrase.
 //    A wrong passphrase shows the daemon's own sentence where it was typed.
 // 2. The right one attaches the node: the app says so, and `vox node list` says `attached`.
 // 3. The main window (ADR-028 W-1, W-2; ADR-014 M-13): once bob, a member alice trusts, posts to
@@ -62,7 +63,16 @@ final class FirstRunProof: XCTestCase {
         ui.launchEnvironment = voxEnv
         ui.launch()
 
-        // (1) First run: pick the node, and a wrong passphrase is the daemon's sentence.
+        // (1) First run: the login item is asked about once, and declined here (approving it is
+        // the manual check manual.login_item); then pick the node, and a wrong passphrase is the
+        // daemon's sentence.
+        let why = ui.descendants(matching: .any)["login-item-why"]
+        XCTAssertTrue(why.waitForExistence(timeout: 30),
+                      "PRODUCT: the app never asked at first run whether to keep the daemon running")
+        let whyWords = why.label.isEmpty ? (why.value as? String ?? "") : why.label
+        XCTAssertTrue(whyWords.contains("keeps your rooms reachable while you are logged in, even with the app closed"),
+                      "PRODUCT: the login item question must say what it does; it said: \(whyWords)")
+        ui.buttons["login-item-not-now"].click()
         let pick = ui.buttons["node-alice"]
         XCTAssertTrue(pick.waitForExistence(timeout: 30),
                       "PRODUCT: the app never offered node alice at first run")
