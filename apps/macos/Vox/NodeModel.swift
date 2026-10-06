@@ -3,6 +3,7 @@
 // (W-1).
 
 import Foundation
+import ServiceManagement
 
 @MainActor
 final class NodeModel: ObservableObject {
@@ -60,6 +61,15 @@ final class NodeModel: ObservableObject {
     @Published private(set) var peers = 0
     /// The keyring window, as the TUI's status bar says it (K-9).
     @Published private(set) var keyring = ""
+    /// Whether the LAN helper is approved, so the family LAN may be offered (ADR-014 M-12).
+    @Published private(set) var lanHelperReady = false
+    /// The rooms whose family LAN this app runs; each one's latest line, and why one failed.
+    @Published private(set) var lanOn: Set<String> = []
+    @Published private(set) var lanSaid: [String: String] = [:]
+    @Published private(set) var lanFailed: [String: String] = [:]
+
+    /// The family LAN's root helper: the bundle's launchd daemon (ADR-014 M-10).
+    private var lanHelper: SMAppService { .daemon(plistName: "us.vox.lanhelper.plist") }
     /// The last thing that failed, in the daemon's words (M-7), or the node's last notice.
     @Published private(set) var said: String?
     /// The node ended: detached, or the daemon stopped.
@@ -105,6 +115,7 @@ final class NodeModel: ObservableObject {
             }
             trusted = try await client.trustList()
             nodes = try await client.nodes()
+            lanHelperReady = lanHelper.status == .enabled
             let view = try await client.view()
             peers = Int(view.peers)
             keyring = view.keyring
@@ -138,6 +149,38 @@ final class NodeModel: ObservableObject {
             }
         } catch {
             said = sentence(error)
+        }
+    }
+
+    /// Register the LAN helper; macOS asks the person to approve it in System Settings, which
+    /// the app opens and never clicks through (M-10, M-33).
+    func allowLanHelper() async {
+        do {
+            try lanHelper.register()
+        } catch {
+            said = error.localizedDescription
+        }
+        if lanHelper.status == .requiresApproval {
+            SMAppService.openSystemSettingsLoginItems()
+        }
+        lanHelperReady = lanHelper.status == .enabled
+    }
+
+    /// Bring this Mac onto `room`'s family LAN, or take it down; a failure is the daemon's
+    /// sentence, shown where it was asked (M-7).
+    func setLan(_ room: String, on: Bool) async {
+        lanFailed[room] = nil
+        do {
+            if on {
+                lanSaid[room] = try await client.lanUp(room: room, allow: [])
+                lanOn.insert(room)
+            } else {
+                try await client.lanDown(room: room)
+                lanOn.remove(room)
+                lanSaid[room] = nil
+            }
+        } catch {
+            lanFailed[room] = sentence(error)
         }
     }
 
