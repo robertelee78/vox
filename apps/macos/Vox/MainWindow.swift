@@ -401,6 +401,8 @@ private struct Inspector: View {
         }
         .padding(12)
         .frame(maxHeight: .infinity, alignment: .topLeading)
+        // A container, so each row keeps its own identifier (member-<name>) under this one.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("inspector")
     }
 }
