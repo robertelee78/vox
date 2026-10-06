@@ -586,11 +586,13 @@ fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
 }
 
 fn pane_block(title: &str, focus: bool) -> Block<'_> {
-    let b = Block::default().borders(Borders::ALL).title(title);
+    // One title: `Block::title` adds a title beside any already set, so a focused pane titled
+    // first and then "[focus]" drew its name twice ("MembersMembers [focus]").
+    let b = Block::default().borders(Borders::ALL);
     if focus {
         focus_block(b.title(format!("{title} [focus]")))
     } else {
-        b.border_style(theme::fg(theme::LINE_HAIR))
+        b.title(title).border_style(theme::fg(theme::LINE_HAIR))
     }
 }
 

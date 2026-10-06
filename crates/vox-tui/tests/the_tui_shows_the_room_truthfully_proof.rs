@@ -22,7 +22,8 @@
 //!   has read its post, the entries `vox status --json` says each node holds stay the same for 15 s;
 //! - `retention`: with both TUIs open, Alice sets the room's retention to 1 week: each header, which
 //!   said "⏱ forever", says "⏱ 1 week", and each timeline shows one line saying who set it and
-//!   that messages older than that are removed from now on (ADR-028 R-7, #483);
+//!   that messages older than that are removed from now on (ADR-028 R-7, #483); and a focused
+//!   pane's border names it once;
 //! - `words`: `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
 //!   never an "invite link" (the decider's words, #406);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
@@ -62,7 +63,7 @@
 //! top, a scroll not clamped to the oldest line, every member shown `Trust::Trusted`, a stub command
 //! restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
 //! as not having read, every message marked read whether drawn or not, a message called held by a
-//! node that has not said it holds it, a read record named by a read record, a retention change with no line in the timeline, `SyncStatus`
+//! node that has not said it holds it, a read record named by a read record, a retention change with no line in the timeline, a focused pane titled twice, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
 //! carries the message text or is raised per message, or a room with a message to Bob grouped
 //! other than "needs you". It passes only on the script's PASS with all 20 claims ok.
