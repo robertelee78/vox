@@ -1555,7 +1555,10 @@ pub async fn connect(
         "joined. `vox service list {}` shows what is shared here",
         short(&channel_id)
     );
-    println!("        reach a service as <service>.<node>.<room>.vox, with `vox up` running");
+    println!(
+        "        reach a service as <service>.<node>.<room>.vox through the daemon's proxy, \
+         running while a node is attached (`vox up` says where)"
+    );
     Ok(())
 }
 

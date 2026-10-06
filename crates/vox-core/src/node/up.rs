@@ -393,11 +393,14 @@ where
             // arbitrary addresses would be an open relay for anything on this machine.
             refused(
                 None,
-                Refused("a CONNECT to a bare address: vox up carries .vox names only".to_owned()),
+                Refused(
+                    "a CONNECT to a bare address: the .vox proxy carries .vox names only"
+                        .to_owned(),
+                ),
             );
             socks::write_reply(&mut stream, Reply::AddressNotSupported, UNSPECIFIED).await?;
             return Err(Error::MalformedTunnel(
-                "vox up carries .vox names only; configure socks5h so the name reaches it",
+                "the .vox proxy carries .vox names only; configure socks5h so the name reaches it",
             ));
         }
     };
@@ -552,7 +555,7 @@ where
                 }
                 let Target::Domain(name, port) = datagram.target else {
                     refused(None, Refused(
-                        "a UDP datagram to a bare address: vox up carries .vox names only"
+                        "a UDP datagram to a bare address: the .vox proxy carries .vox names only"
                             .to_owned(),
                     ));
                     continue;
