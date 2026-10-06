@@ -134,7 +134,77 @@ pub struct RoomMessage {
     /// The file or folder it shares, when it is a share's announcement (ADR-028 F-1): the message
     /// is its card, its text the note.
     pub file: Option<FileOffer>,
+    /// The image a file share announces (ADR-028 F-9), or none: not a share, or not an image.
+    pub image: Option<ImagePreview>,
+    /// The link card its sender's node fetched for its first link (ADR-028 F-10), or none.
+    pub card: Option<LinkCard>,
 }
+
+/// What a file share's announcement carries of an image (ADR-028 F-9), so it can be shown while
+/// the sharer is offline.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ImagePreview {
+    /// The image's width, in pixels.
+    pub width: u32,
+    /// Its height, in pixels.
+    pub height: u32,
+    /// A JPEG thumbnail of at most 16 KB.
+    pub thumb: Vec<u8>,
+    /// Its BlurHash, for the moment before the thumbnail is drawn.
+    pub blurhash: String,
+}
+
+/// A link card (ADR-028 F-10): what the sender's node found at the message's first link, carried
+/// in the message, so no reader fetches anything.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LinkCard {
+    /// The link.
+    pub url: String,
+    /// The page's title, or empty.
+    pub title: String,
+    /// Its description, or empty.
+    pub description: String,
+    /// Its image's bytes, as the page served them, when it was small enough to travel.
+    pub image: Option<Vec<u8>>,
+}
+
+fn unbase64(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
+
+/// `data.image` of a file share, or `None` when any part is missing or malformed.
+fn image_of(env: &vox_agentcomms::envelope::Envelope) -> Option<ImagePreview> {
+    if env.kind != vox_core::node::shares::FILE {
+        return None;
+    }
+    let image = env.data.get("image")?;
+    Some(ImagePreview {
+        width: u32::try_from(image.get("width")?.as_u64()?).ok()?,
+        height: u32::try_from(image.get("height")?.as_u64()?).ok()?,
+        thumb: unbase64(image.get("thumb")?.as_str()?)?,
+        blurhash: image.get("blurhash")?.as_str()?.to_owned(),
+    })
+}
+
+/// `data.card`, or `None` when it has no link or says nothing. Its words are the page's, another
+/// party's choice: shown, never laid out.
+fn card_of(env: &vox_agentcomms::envelope::Envelope) -> Option<LinkCard> {
+    let card = env.data.get("card")?;
+    let text = |k: &str| card.get(k).and_then(|v| v.as_str()).map(shown_name);
+    let (title, description) = (text("title"), text("description"));
+    if title.is_none() && description.is_none() {
+        return None;
+    }
+    Some(LinkCard {
+        url: shown_name(card.get("url")?.as_str()?),
+        title: title.unwrap_or_default(),
+        description: description.unwrap_or_default(),
+        image: card
+            .get("image")
+            .and_then(|v| v.as_str())
+            .and_then(unbase64),
+    })
 
 /// What a share's announcement offers, as its signed envelope states it.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -553,7 +623,7 @@ fn shown_name(s: &str) -> String {
 fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str>) -> RoomMessage {
     use vox_agentcomms::attention::{unread_level, UnreadLevel as L};
     let reveal = |s: &str| vox_agentcomms::envelope::reveal_keeping(s, |c| c == '\n' || c == '\t');
-    let (kind, text, to, re, urgent, file) =
+    let (kind, text, to, re, urgent, file, image, card) =
         match vox_agentcomms::envelope::Envelope::parse(&row.text) {
             Ok(env) => (
                 shown_name(&env.kind),
@@ -562,6 +632,8 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 env.re.as_deref().map(shown_name).unwrap_or_default(),
                 env.urgent,
                 file_offer(&env),
+                image_of(&env),
+                card_of(&env),
             ),
             Err(_) => (
                 vox_agentcomms::envelope::SAY.to_owned(),
@@ -569,6 +641,8 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
                 Vec::new(),
                 String::new(),
                 false,
+                None,
+                None,
                 None,
             ),
         };
@@ -590,6 +664,8 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
             L::Coordination => UnreadLevel::Coordination,
         },
         file,
+        image,
+        card,
     }
 }
 
@@ -1167,6 +1243,26 @@ impl VoxClient {
         let req = Request::OpenRoom {
             channel_id: digest(&room, "room id")?,
             passphrase: passphrase.copy(),
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// Give a room a new name, for every member (ADR-028 R-1), as `vox room rename`: only its
+    /// creator or an admin may, and the identity passphrase is asked for that reason.
+    ///
+    /// # Errors
+    /// A malformed id, a wrong passphrase, or the node's refusal in its own words (this node may
+    /// not rename the room; the name is not one DNS label).
+    pub async fn rename_room(
+        &self,
+        room: String,
+        name: String,
+        identity_passphrase: Arc<Passphrase>,
+    ) -> Result<(), VoxError> {
+        let req = Request::RenameRoom {
+            channel_id: digest(&room, "room id")?,
+            name,
+            identity_passphrase: identity_passphrase.copy(),
         };
         on_held!(self, |c| done(c, &req).await)
     }

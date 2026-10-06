@@ -39,9 +39,20 @@
 //!    listens on every interface; `serviceAdd` with the preview's tag and endpoint shares it, and
 //!    the peer reaches it by its own `vox service list` and `vox forward`.
 //!
+//! 7. **What a message carries for showing, and a room's name**: a message the peer posts with
+//!    a link carries the card the peer's node fetched (ADR-028 F-10), and `read` gives its title,
+//!    description and image; the image the peer's file share announced (F-9) comes with its
+//!    dimensions, a JPEG thumbnail and a BlurHash. `renameRoom` on the peer's room is refused
+//!    with the node's own sentence; on a room the app created and the peer joined, it renames
+//!    the room for both, and the peer's own `vox room list` shows the new name (R-1). The card
+//!    is fetched from a local server, so this test needs `--features vox-tui/test-knobs`
+//!    (`VOX_TEST_CARD_ALLOW`) and refuses as CANNOT MEASURE without it.
+//!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
 //! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
+//! Mutants for (7), one per claim, each red PRODUCT: `RoomMessage.card` always nil;
+//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -56,6 +67,8 @@
 
 #![cfg(target_os = "macos")]
 
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -364,6 +377,59 @@ fn echo_listener(d: &Daemon, room: &str, label: &str, limit: Option<usize>) -> P
     Proc(child)
 }
 
+/// A local web server answering `/page` with a page naming a title, a description and an image,
+/// and `/img.png` with [`CARD_IMAGE`].
+fn card_server() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("APPARATUS: bind the link card's local server");
+    let at = listener
+        .local_addr()
+        .expect("APPARATUS: the server's address");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let path = String::from_utf8_lossy(&head)
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+            let (ty, body): (&str, Vec<u8>) = if path == "/img.png" {
+                ("image/png", CARD_IMAGE.to_vec())
+            } else {
+                (
+                    "text/html; charset=utf-8",
+                    b"<html><head><title>Fallback</title>\
+                      <meta property=\"og:title\" content=\"The quarterly report\">\
+                      <meta property=\"og:description\" content=\"Numbers &amp; notes for Q3\">\
+                      <meta property=\"og:image\" content=\"/img.png\"></head></html>"
+                        .to_vec(),
+                )
+            };
+            let _ = s.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: \
+                     close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = s.write_all(&body);
+        }
+    });
+    at
+}
+
+/// The image the card's page names: 1 KB, well under what a card carries.
+const CARD_IMAGE: &[u8; 1024] = &[0x5a; 1024];
+
 #[test]
 #[ignore = "builds the xcframework, compiles Swift, runs a real daemon; CI runs it in release on macOS"]
 fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
@@ -447,11 +513,15 @@ fn a_swift_app_embeds_the_node_and_talks_to_a_daemon() {
 }
 
 #[test]
-#[ignore = "builds the xcframework, compiles Swift, runs two real daemons; run on macOS by hand"]
+#[ignore = "builds the xcframework, compiles Swift, runs two real daemons; run on macOS by hand, with `--features vox-tui/test-knobs`"]
 fn a_swift_app_acts_as_a_node_through_the_daemon() {
     let tmp = tempfile::tempdir().unwrap();
     // Built before the watchdog is armed, as above.
     let harness = &harnesses().client;
+    test_knobs::require(&["VOX_TEST_CARD_ALLOW"]);
+    // Before any daemon starts: the peer's node fetches the card from this server alone.
+    let card_at = card_server();
+    std::env::set_var("VOX_TEST_CARD_ALLOW", card_at.to_string());
     watchdog::arm();
 
     // The peer: another data root, its own `vox daemon`, its node made by `vox id`.
@@ -643,9 +713,14 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         at_peer = room_dir(&peer).and_then(|d| std::fs::read(d.join("from-swift.bin")).ok());
         std::thread::sleep(Duration::from_millis(250));
     }
-    let from_peer = tmp.path().join("from-peer.bin");
-    let from_peer_bytes: Vec<u8> = (0..150_000u32).map(|i| (i * 13 % 241) as u8).collect();
-    std::fs::write(&from_peer, &from_peer_bytes).unwrap();
+    // An image, so its announcement carries a preview (7).
+    let from_peer = tmp.path().join("from-peer.png");
+    image::RgbImage::from_fn(48, 32, |x, y| {
+        image::Rgb([(x * 5) as u8, (y * 7) as u8, 90])
+    })
+    .save(&from_peer)
+    .expect("APPARATUS: write the peer's image");
+    let from_peer_bytes = std::fs::read(&from_peer).unwrap();
     peer.run(
         &[
             "share",
@@ -766,7 +841,75 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
          service list` and `vox forward`: it found {peer_address:?} in {peer_list}"
     );
 
-    // (7) The app closes; the daemon lets the node go.
+    // (7) A link card and an image preview, as `read` gives them; then a room's one name.
+    peer.run(
+        &[
+            "room",
+            "post",
+            &room,
+            &format!("the numbers: http://{card_at}/page"),
+        ],
+        "",
+    );
+    writeln!(to_app).unwrap();
+    let card = expect(&from_app, &seen, "CARD ");
+    let image = expect(&from_app, &seen, "IMAGE ");
+    let refused = expect(&from_app, &seen, "REFUSED ");
+    let created = expect(&from_app, &seen, "CREATED ");
+    let (made, made_link) = {
+        let mut w = created[8..].split_whitespace();
+        (
+            w.next().unwrap_or_default().to_owned(),
+            w.next().unwrap_or_default().to_owned(),
+        )
+    };
+    peer.run(
+        &["room", "join", &made_link, "--passphrase-file", "-"],
+        "mine passphrase\n",
+    );
+    writeln!(to_app).unwrap();
+    let renamed = expect(&from_app, &seen, "RENAMED");
+    // `vox room list` shows a room by its short id, then its name.
+    let shows_renamed = |l: &str, id: &str| {
+        let mut w = l.split_whitespace();
+        w.next().is_some_and(|s| id.starts_with(s)) && w.next() == Some("renamed")
+    };
+    let until = Instant::now() + TIMEOUT;
+    let mut peer_rooms = String::new();
+    while Instant::now() < until {
+        peer_rooms = peer.run(&["room", "list"], "");
+        if peer_rooms.lines().any(|l| shows_renamed(l, &made)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!("{card}\n{image}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room list`: {peer_rooms}");
+    assert_eq!(
+        card,
+        format!(
+            "CARD The quarterly report | Numbers & notes for Q3 | {}",
+            CARD_IMAGE.len()
+        ),
+        "PRODUCT: `read` must give the link card the peer's node fetched: its title, description \
+         and image"
+    );
+    assert!(
+        image.starts_with("IMAGE 48x32 JPEG true BLURHASH ") && image.len() > 31,
+        "PRODUCT: `read` must give the image the peer's share announced: 48x32, a JPEG thumbnail \
+         and a BlurHash: {image}"
+    );
+    assert!(
+        refused.contains("this identity is not its admin"),
+        "PRODUCT: `renameRoom` on a room this node may not rename must throw the node's refusal: \
+         {refused}"
+    );
+    assert!(
+        peer_rooms.lines().any(|l| shows_renamed(l, &made)),
+        "PRODUCT: a room the app renamed must show its new name in the peer's own `vox room \
+         list`: {peer_rooms}"
+    );
+
+    // (8) The app closes; the daemon lets the node go.
     writeln!(to_app).unwrap();
     expect(&from_app, &seen, "CLOSED");
     let until = Instant::now() + TIMEOUT;
