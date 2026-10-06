@@ -1168,16 +1168,18 @@ impl DaemonCore {
                             } else {
                                 crate::ident::member_name(&snap.trusted, who)
                             };
+                            // Only what is true whatever the change was: a lengthening, or a room
+                            // with nothing old enough, removed nothing.
                             let line = if *ttl == 0 {
                                 format!(
-                                    "{who} set the room's retention to forever: nothing is \
-                                     removed for its age"
+                                    "{who} set the room's retention to forever: from now on no \
+                                     message is removed for its age"
                                 )
                             } else {
+                                let d = vox_core::node::retention::describe(*ttl);
                                 format!(
-                                    "{who} set the room's retention to {}: older messages were \
-                                     removed",
-                                    vox_core::node::retention::describe(*ttl)
+                                    "{who} set the room's retention to {d}: messages older than \
+                                     {d} are removed from now on"
                                 )
                             };
                             (*at, line)

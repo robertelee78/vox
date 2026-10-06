@@ -36,8 +36,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             again;
   retention while both TUIs are open, Alice runs `vox room retention <room> 1w`: each header,
             which said "⏱ forever", says "⏱ 1 week", and each timeline gains one line, "you set
-            the room's retention to 1 week: older messages were removed" on Alice's and the same
-            naming alice on Bob's (ADR-028 R-7, #483);
+            the room's retention to 1 week: messages older than 1 week are removed from now on"
+            on Alice's and the same naming alice on Bob's (ADR-028 R-7, #483);
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
@@ -461,7 +461,7 @@ try:
     before = (header(atui), header(tui))
     r = run("alice", "room", "retention", room, "1w", "--identity-passphrase-file", f"{S}/idpass")
     if r.returncode != 0: product(f"alice's `vox room retention {room} 1w` failed: {r.stderr.strip()}")
-    LINE = "set the room's retention to 1 week: older messages were removed"
+    LINE = "set the room's retention to 1 week: messages older than 1 week are removed from now on"
     both_until(lambda: says(atui, f"you {LINE}") and says(tui, f"alice {LINE}")
                and "⏱ 1 week" in header(atui) and "⏱ 1 week" in header(tui), 60)
     after = (header(atui), header(tui))
@@ -469,7 +469,7 @@ try:
           and says(atui, f"you {LINE}") and says(tui, f"alice {LINE}"),
           f"headers (alice, bob) before: {before!r}; after: {after!r}; alice's timeline says "
           f"'you {LINE}': {says(atui, f'you {LINE}')}; bob's says 'alice {LINE}': "
-          f"{says(tui, f'alice {LINE}')}")
+          f"{says(tui, f'alice {LINE}')})
 
     if not atui.stop():
         product(f"alice's vox tui (pid {atui.pid}) outlived SIGKILL and could not be reaped")

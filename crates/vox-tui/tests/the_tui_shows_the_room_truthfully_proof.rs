@@ -21,8 +21,8 @@
 //!   real `vox tui` on the room beside Bob's and both agents draining, once each TUI says the other
 //!   has read its post, the entries `vox status --json` says each node holds stay the same for 15 s;
 //! - `retention`: with both TUIs open, Alice sets the room's retention to 1 week: each header, which
-//!   said "⏱ forever", says "⏱ 1 week", and each timeline shows one line saying who set it and that
-//!   older messages were removed (ADR-028 R-7, #483);
+//!   said "⏱ forever", says "⏱ 1 week", and each timeline shows one line saying who set it and
+//!   that messages older than that are removed from now on (ADR-028 R-7, #483);
 //! - `words`: `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
 //!   never an "invite link" (the decider's words, #406);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
