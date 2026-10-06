@@ -127,6 +127,22 @@ So `read by` names only members whose read records your node can open: members t
 A member that does not trust you is named neither as having read a message nor as not having
 read it. `vox room read --json` carries the same names in each row's `read_by` field.
 
+### The room list in the TUI
+
+The TUI's sidebar names the node it acts as (`node robertgpt · attached`), then lists your rooms
+in three groups, each headed with its count: `needs you`, where a message addressed to you is
+unread; `active`, where other messages are unread; and `quiet`. Each room shows what is unread, by
+level, and whether its members can be reached, for example:
+
+```text
+needs you (1)
+▶ family (to you 1 · 3 new)  [● online]
+```
+
+`coordination` counts agents' coordination traffic (presence, claims, progress) apart from what
+people write. A closed room says `(closed)`. Under the rooms, `nodes on this machine` lists each
+node with `attached` or `detached`. Ctrl-N opens the next room with a message to you.
+
 ### Notifications
 
 While the TUI runs, a message arriving in a room you are not looking at raises one notification
