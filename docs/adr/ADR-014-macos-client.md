@@ -76,7 +76,8 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   app MUST say plainly that the rooms are reachable only while Vox is open.
 - **M-9.** The app MUST start and reach that daemon; it MUST NOT start a second one for the same
   data root (ADR-026 D-1). With the login item declined, the app MUST start the daemon as `vox`
-  does (ADR-026 S-2).
+  does (ADR-026 S-2). The login item's daemon, finding another daemon serving the data root, MUST
+  wait and serve once that one stops: launchd restarts it only after a crash.
 - **M-10.** The family LAN's root part MUST be a privileged helper registered with
   `SMAppService.daemon(plistName:)` (`Contents/Library/LaunchDaemons/us.vox.lanhelper.plist`),
   approved once by the person in System Settings. It replaces `sudo vox lan helper` on macOS. It
