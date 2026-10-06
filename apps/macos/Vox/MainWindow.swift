@@ -107,6 +107,11 @@ private struct RoomView: View {
     @State private var attaching: Attaching?
     /// The pulled copy Quick Look shows.
     @State private var looking: URL?
+    /// The lanes view in place of the timeline (W-3).
+    @State private var showLanes = false
+    /// What the composer posts is addressed to, and whether it is urgent (M-15).
+    @State private var to: Set<String> = []
+    @State private var urgent = false
     /// The rows inside the visible part of the timeline, as last measured.
     @State private var inView: Set<String> = []
 
@@ -122,65 +127,80 @@ private struct RoomView: View {
                     }
                     Divider()
                 }
-                GeometryReader { viewport in
-                    ScrollViewReader { scroller in
-                        // A scroll view of its own, not a List: a List's rows are cells whose frames
-                        // do not measure in this coordinate space, so what is in view could not be
-                        // told.
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 10) {
-                                ForEach(model.messages, id: \.id) { message in
-                                    MessageRow(message: message, me: model.me,
-                                               readBy: model.readBy[message.id] ?? [],
-                                               pulled: model.pulled[message.id]) { looking = $0 }
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .reportsFrame(of: message.id)
-                                        .id(message.id)
+                if model.roomHasAgents {
+                    Picker("", selection: $showLanes) {
+                        Text("Timeline").tag(false)
+                        Text("Lanes").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 220)
+                    .padding(8)
+                    .accessibilityIdentifier("lanes-toggle")
+                }
+                if showLanes && model.roomHasAgents {
+                    LanesView(model: model)
+                } else {
+                    GeometryReader { viewport in
+                        ScrollViewReader { scroller in
+                            // A scroll view of its own, not a List: a List's rows are cells whose frames
+                            // do not measure in this coordinate space, so what is in view could not be
+                            // told.
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 10) {
+                                    ForEach(model.messages, id: \.id) { message in
+                                        MessageRow(message: message, me: model.me,
+                                                   readBy: model.readBy[message.id] ?? [],
+                                                   pulled: model.pulled[message.id]) { looking = $0 }
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .reportsFrame(of: message.id)
+                                            .id(message.id)
+                                    }
+                                }
+                                .padding(12)
+                            }
+                            .coordinateSpace(name: "timeline")
+                            .onPreferenceChange(RowFrames.self) { frames in
+                                // Seen: at least half of the row inside the timeline's bounds.
+                                let bounds = CGRect(origin: .zero, size: viewport.size)
+                                inView = Set(frames.compactMap { id, frame in
+                                    let shown = frame.intersection(bounds)
+                                    return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
+                                })
+                                markSeen()
+                            }
+                            .onChange(of: model.messages.count) { _ in
+                                if let last = model.messages.last {
+                                    scroller.scrollTo(last.id, anchor: .bottom)
                                 }
                             }
-                            .padding(12)
-                        }
-                        .coordinateSpace(name: "timeline")
-                        .onPreferenceChange(RowFrames.self) { frames in
-                            // Seen: at least half of the row inside the timeline's bounds.
-                            let bounds = CGRect(origin: .zero, size: viewport.size)
-                            inView = Set(frames.compactMap { id, frame in
-                                let shown = frame.intersection(bounds)
-                                return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
-                            })
-                            markSeen()
-                        }
-                        .onChange(of: model.messages.count) { _ in
-                            if let last = model.messages.last {
-                                scroller.scrollTo(last.id, anchor: .bottom)
-                            }
                         }
                     }
-                }
-                .background(WindowReader(seen: window))
-                .onChange(of: window.seen) { _ in markSeen() }
-                // A file dropped on the timeline, or pasted into it, is attached (M-24, F-1).
-                .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                    firstFile(in: providers) { attaching = Attaching(url: $0) }
-                }
-                .onPasteCommand(of: [.fileURL]) { providers in
-                    _ = firstFile(in: providers) { attaching = Attaching(url: $0) }
-                }
-                .accessibilityIdentifier("timeline")
-                .sheet(item: $attaching) { file in
-                    AttachSheet(model: model, file: file) { attaching = nil }
-                }
-                .quickLookPreview($looking)
-                .onChange(of: model.incoming) { url in
-                    if let url {
-                        attaching = Attaching(url: url)
-                        model.incoming = nil
+                    .background(WindowReader(seen: window))
+                    .onChange(of: window.seen) { _ in markSeen() }
+                    // A file dropped on the timeline, or pasted into it, is attached (M-24, F-1).
+                    .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+                        firstFile(in: providers) { attaching = Attaching(url: $0) }
                     }
-                }
-                .onAppear {
-                    if let url = model.incoming {
-                        attaching = Attaching(url: url)
-                        model.incoming = nil
+                    .onPasteCommand(of: [.fileURL]) { providers in
+                        _ = firstFile(in: providers) { attaching = Attaching(url: $0) }
+                    }
+                    .accessibilityIdentifier("timeline")
+                    .sheet(item: $attaching) { file in
+                        AttachSheet(model: model, file: file) { attaching = nil }
+                    }
+                    .quickLookPreview($looking)
+                    .onChange(of: model.incoming) { url in
+                        if let url {
+                            attaching = Attaching(url: url)
+                            model.incoming = nil
+                        }
+                    }
+                    .onAppear {
+                        if let url = model.incoming {
+                            attaching = Attaching(url: url)
+                            model.incoming = nil
+                        }
                     }
                 }
                 Divider()
@@ -197,11 +217,13 @@ private struct RoomView: View {
                     TextField("Say something to the room", text: $draft)
                         .textFieldStyle(.plain)
                         .onSubmit {
-                            let text = draft
+                            let (text, recipients, now) = (draft, Array(to), urgent)
                             draft = ""
-                            Task { await model.post(text) }
+                            urgent = false
+                            Task { await model.post(text, to: recipients, urgent: now) }
                         }
                         .accessibilityIdentifier("compose")
+                    ComposerAddress(model: model, to: $to, urgent: $urgent)
                 }
                 .padding(12)
             }

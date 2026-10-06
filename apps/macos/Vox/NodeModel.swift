@@ -63,6 +63,11 @@ final class NodeModel: ObservableObject {
     /// A file handed to Vox from elsewhere (the Finder Services item, M-24), waiting for the room
     /// on screen to take it: its To: and note are asked there.
     @Published var incoming: URL?
+    /// Each other member's lane in the room on screen (ADR-028 W-3), as the node derives it.
+    @Published private(set) var lanes: [Lane] = []
+    /// The newest message of each member's lane when the person last looked at the lanes, by
+    /// fingerprint: what changed since is what came after (W-3).
+    @Published var laneLooked: [String: String] = [:]
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
     /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
@@ -156,6 +161,7 @@ final class NodeModel: ObservableObject {
         do {
             messages = try await client.read(room: id, after: "", limit: 0)
             roomServices = (try? await client.services(room: id).shared) ?? []
+            lanes = (try? await client.lanes(room: id)) ?? []
             watchReads(id)
             let roster = try await client.roster(room: id)
             let consents = try await client.consents(room: id)
@@ -295,10 +301,10 @@ final class NodeModel: ObservableObject {
     }
 
     /// Post `text` to the room on screen.
-    func post(_ text: String) async {
+    func post(_ text: String, to: [String] = [], urgent: Bool = false) async {
         guard case let .room(id) = selection else { return }
         do {
-            try await client.post(room: id, text: text, to: [], re: "", urgent: false)
+            try await client.post(room: id, text: text, to: to, re: "", urgent: urgent)
         } catch {
             said = sentence(error)
         }
@@ -343,6 +349,9 @@ final class NodeModel: ObservableObject {
                 guard let self, case .room(room) = self.selection else { return }
                 if let reads = try? await self.client.readBy(room: room) {
                     self.readBy = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
+                }
+                if let lanes = try? await self.client.lanes(room: room) {
+                    self.lanes = lanes
                 }
                 if let copies = try? await self.client.pulled(room: room) {
                     self.pulled = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }

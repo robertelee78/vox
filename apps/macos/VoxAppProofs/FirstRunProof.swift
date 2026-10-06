@@ -25,13 +25,15 @@
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
-// 7. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 7. The lanes view (ADR-014 M-15, ADR-028 W-3, #442): bob posting `working` without a claim is
+//    not working; once he claims a resource and posts `working`, his lane's chip says working.
+// 8. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (7) goes red. A room with a message
+// place of the app's hold), and quitting leaves it attached: (8) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
-// of its own: (6) goes red.
+// of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 
 import XCTest
 
@@ -330,7 +332,32 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the note must travel in the share itself, as one message; bob's `vox room read --json` has \(bobRows.count) row(s) with it: \(bobRows)")
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
 
-        // (7) Quitting detaches it.
+        // (7) Lanes. Working without a claim is not working.
+        try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "NO-CLAIM"],
+                   env: voxEnv)
+        Thread.sleep(forTimeInterval: 10)
+        let lanesToggle = ui.descendants(matching: .any)["lanes-toggle"]
+        let bobLane = ui.descendants(matching: .any)["lane-state-bob"]
+        if lanesToggle.exists {
+            lanesToggle.buttons["Lanes"].click()
+            XCTAssertFalse(bobLane.waitForExistence(timeout: 5) && bobLane.label == "bob: working",
+                           "PRODUCT: bob posted `working` holding no claim; his lane must not say working, and it said \(bobLane.label)")
+            lanesToggle.buttons["Timeline"].click()
+        }
+        try staged(vox, ["room", "claim", "--node", "bob", room, "ticket-1"], env: voxEnv)
+        try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "ON-TICKET-1"],
+                   env: voxEnv)
+        XCTAssertTrue(lanesToggle.waitForExistence(timeout: 30),
+                      "PRODUCT: a room whose member works on a claim must offer the lanes view")
+        lanesToggle.buttons["Lanes"].click()
+        let working = NSPredicate(format: "exists == true AND label == %@", "bob: working")
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: working, evaluatedWith: bobLane)], timeout: 30),
+                       .completed,
+                       "PRODUCT: bob, holding ticket-1 with a working post, must show working in his lane; it said \(bobLane.exists ? bobLane.label : "no lane")")
+        print("[proof] lanes: \(bobLane.label)")
+        lanesToggle.buttons["Timeline"].click()
+
+        // (8) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
