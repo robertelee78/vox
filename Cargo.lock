@@ -3142,6 +3142,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "vox-agentcomms",
  "vox-sockdrops",
  "vox-text",
  "x25519-dalek",
