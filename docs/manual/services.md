@@ -112,7 +112,8 @@ vox service list ROOM_ID
 ```
 
 `connect` asks for the room passphrase, joins once and exits, printing the command to list what is
-shared. Both sides then exchange trust as in [Identity and keyring](keyring.md); the host must
+shared and that a service is reached through the daemon's proxy, running while a node is attached
+(`vox up` says where). Both sides then exchange trust as in [Identity and keyring](keyring.md); the host must
 trust the guest's fingerprint before the guest can reach its service.
 
 ## Offer a service in an existing room
@@ -124,8 +125,10 @@ vox service add ROOM_ID ssh 127.0.0.1:22
 vox service list ROOM_ID
 ```
 
-Vox replies `offering "ssh" at 127.0.0.1:22 … it is dark until you vox trust add someone — and they
-join this room`. On the host, `service list` prints the readable address, `by you` and the kind
+Vox first says who is to reach it (`vox: about to offer "ssh" at 127.0.0.1:22 in "family"` / `the
+members of it in your keyring are to reach it: ann`), then `offering "ssh" at 127.0.0.1:22 in room
+ROOM_ID` and who can reach it now; with nobody in your keyring in the room yet it says `it is dark
+until you vox trust add someone — and they join this room`. On the host, `service list` prints the readable address, `by you` and the kind
 under `shared in`, the canonical address under it, and the endpoint under `services offered`. On a
 guest it prints the readable address, who shares it and the kind, for example
 `ssh.robertgpt.family.vox  by robertgpt  ssh`, and the canonical address under it. This offers
@@ -220,7 +223,9 @@ vox service remove ROOM_ID ssh
 vox service list ROOM_ID
 ```
 
-Removal withdraws the offer and cuts its live sessions; warn affected users first. It does
+Removal withdraws the offer and cuts its live sessions; warn affected users first. Vox says
+which sessions it is to cut before it acts (`its live sessions are to be cut: none is open`) and
+which it cut after (`no longer offering "ssh"; live sessions cut: none was open`). It does
 not remove the guest from your keyring or stop the underlying local SSH/web server. Removing a
 node from your keyring also cuts its reach at once. For the foreground `serve` example, Ctrl-C
 stops that serving process and its live offer. Leaving or ending the room stops every service
