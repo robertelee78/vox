@@ -47,6 +47,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             draining, the entries `vox status --json` says each node holds stay the same for 15 s;
             Alice's TUI and the daemon it started are then stopped and her `vox daemon` started
             again;
+  serve     Bob's `:serve <port>` for a service the driver listens on, on every interface, says
+            what sharing it does before it is shared: its address, that alice can reach it, and
+            the warning that it listens on every interface; Enter shares it, and Alice's `vox
+            service list` lists it (ADR-028 S-4, #491);
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
@@ -674,6 +678,34 @@ try:
     if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
         product("alice's daemon, started again after her TUI, never answered `vox room list` within 60 s: "
                 + open(f"{S}/alice-after-tui.err").read())
+
+    stage("serve")
+    # Sharing a service from the TUI is one step, as `vox serve` with no name is (ADR-028 S-4,
+    # #491): the driver listens on every interface on a free port, and Bob's `:serve <port>`
+    # says what sharing it does, warning that it listens on every interface, before it is shared.
+    import socket
+    svc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    svc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    svc.bind(("0.0.0.0", 0)); svc.listen(4)
+    sport = svc.getsockname()[1]
+    tui.key(f":serve {sport}\r", 3)
+    def preview():
+        return " ".join(" ".join(r.strip().strip("│").split()) for r in pane(tui.display(), "Share a service"))
+    tui.until(lambda: "Enter: share it" in preview(), 30, 1)
+    seen = preview()
+    tag = (re.search(r"\bas (\S+): members will reach it as", seen) or [None, None])[1]
+    tui.key("\r", 3)
+    def offered():
+        r = run("alice", "service", "list", room)
+        return r.returncode == 0 and tag is not None and tag in r.stdout and "bob" in r.stdout
+    shared = until(offered, 60, 1)
+    listed = run("alice", "service", "list", room).stdout.strip()
+    claim("serve", f":{sport}" in seen and "every interface" in seen and "who can reach it: alice" in seen
+          and tag is not None and shared,
+          f"bob's preview: {seen!r}; alice's `vox service list`: {listed!r}")
+    if tag:
+        run("bob", "service", "remove", room, tag)
+    svc.close()
 
     stage("words")
     # Before `unknown`, whose short answers leave the line under the status bar one row again.

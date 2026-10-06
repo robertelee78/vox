@@ -175,6 +175,9 @@ pub enum Screen {
     /// The trust keyring, each node with its fingerprint grouped and its art (ADR-028 W-1, K-1):
     /// `k` on the channel list, or `:keyring`.
     Keyring,
+    /// Sharing a service listening on this machine into the room on screen (ADR-028 S-4):
+    /// `:serve`, or `:serve <port>` for one directly.
+    Serve,
 }
 
 /// Which pane has focus within the channel screen (cycled by `Tab`).
@@ -273,6 +276,10 @@ pub struct UiState {
     /// person has been shown, for a read record (ADR-028 RR-1). Taken by the loop after each
     /// frame; empty when no room is on screen.
     pub on_screen: Vec<Digest32>,
+    /// The service selected in the share flow's list, by its place in it (ADR-028 S-4).
+    pub selected_listening: usize,
+    /// The room the share flow offers into.
+    pub serve_room: Option<Digest32>,
 }
 
 impl Default for UiState {
@@ -292,6 +299,8 @@ impl Default for UiState {
             composer: String::new(),
             selected_tunnel: None,
             on_screen: Vec::new(),
+            selected_listening: 0,
+            serve_room: None,
         }
     }
 }
@@ -448,6 +457,23 @@ impl UiState {
                 self.screen = Screen::Keyring;
                 Action::Redraw
             }
+            // The share flow (ADR-028 S-4): Enter previews the service selected, then offers it.
+            KeyCode::Enter if self.screen == Screen::Serve => {
+                if vm.serve_preview.is_some() {
+                    self.screen = Screen::Channel;
+                    return Action::Dispatch(Command::OfferService);
+                }
+                let (Some(channel_id), Some(l)) =
+                    (self.serve_room, vm.listening.get(self.selected_listening))
+                else {
+                    return Action::Redraw;
+                };
+                Action::Dispatch(Command::PreviewServe {
+                    channel_id,
+                    port: l.port,
+                    udp: Some(l.udp),
+                })
+            }
             KeyCode::Char('x') | KeyCode::Delete if self.screen == Screen::Tunnels => {
                 self.close_selected_tunnel(vm)
             }
@@ -479,6 +505,14 @@ impl UiState {
                 Action::Redraw
             }
             KeyCode::Esc => {
+                // Out of the share flow's preview, then out of the flow, back to the room.
+                if self.screen == Screen::Serve {
+                    if vm.serve_preview.is_some() {
+                        return Action::Dispatch(Command::CancelServe);
+                    }
+                    self.screen = Screen::Channel;
+                    return Action::Redraw;
+                }
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
                     self.selected_message = None;
@@ -747,6 +781,11 @@ impl UiState {
                 }
             }
             Screen::Keyring => {}
+            Screen::Serve => {
+                if !vm.listening.is_empty() && vm.serve_preview.is_none() {
+                    self.selected_listening = step(self.selected_listening, vm.listening.len());
+                }
+            }
             Screen::Tunnels => {
                 if vm.tunnels.is_empty() {
                     return;
@@ -823,6 +862,24 @@ impl UiState {
                         Action::Redraw
                     }
                     Some(Parsed::CloseTunnel) => self.close_selected_tunnel(vm),
+                    Some(Parsed::Serve(channel_id, port)) => {
+                        self.screen = Screen::Serve;
+                        self.serve_room = Some(channel_id);
+                        self.selected_listening = 0;
+                        match port.map(|p| p.parse::<u16>()) {
+                            None => Action::Dispatch(Command::ProbeListening),
+                            Some(Ok(port)) => Action::Dispatch(Command::PreviewServe {
+                                channel_id,
+                                port,
+                                udp: None,
+                            }),
+                            Some(Err(_)) => {
+                                self.status_message =
+                                    Some("`:serve` takes a port, or nothing for the list".into());
+                                Action::Dispatch(Command::ProbeListening)
+                            }
+                        }
+                    }
                     Some(Parsed::Confirm(kind, channel_id)) => {
                         self.mode = Mode::Prompt(Prompt::new(kind, Some(channel_id)));
                         Action::Redraw
@@ -926,6 +983,9 @@ pub enum Parsed {
     CloseTunnel,
     /// Ask the person to confirm a change of access to a room, saying what it does (ADR-028 E-5).
     Confirm(PromptKind, Digest32),
+    /// Share a service listening here into this room (ADR-028 S-4): the list, or the one on the
+    /// port given.
+    Serve(Digest32, Option<String>),
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -1006,6 +1066,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
                 Some(rest.to_owned()).filter(|r| !r.is_empty()),
             ))
         }
+        // Share a service listening here into this room (ADR-028 S-4): the list, or one port.
+        "serve" if rest.is_empty() => return Some(Parsed::Serve(channel, None)),
+        "serve" => return Some(Parsed::Serve(channel, Some(rest.to_owned()))),
         // The link is public; it can be produced by a one-line command.
         "link" => Command::Invite {
             channel_id: channel,

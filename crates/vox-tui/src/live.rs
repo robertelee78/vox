@@ -142,6 +142,10 @@ pub struct DaemonCore {
     /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
     /// ever, for a room that is over.
     mark_refused: Option<MarkRefused>,
+    /// What listens on this machine, as the share flow last listed it (ADR-028 S-4).
+    listening: Vec<vox_core::node::probe::Listening>,
+    /// The service the share flow is about to offer, with what was said of it.
+    serve_preview: Option<crate::viewmodel::ServePreview>,
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -343,6 +347,8 @@ impl DaemonCore {
             timeline: None,
             marked: std::collections::BTreeSet::new(),
             mark_refused: None,
+            listening: Vec::new(),
+            serve_preview: None,
             ended: None,
             stop,
         };
@@ -1379,6 +1385,146 @@ impl DaemonCore {
             tunnels: snap.tunnels,
             closed_tunnels: snap.closed_tunnels,
             keyring: snap.trusted.clone(),
+            listening: self
+                .listening
+                .iter()
+                .map(|l| crate::viewmodel::ListeningView {
+                    line: crate::tunnel_cli::listing_line(l),
+                    port: l.port,
+                    udp: l.udp,
+                })
+                .collect(),
+            serve_preview: self.serve_preview.clone(),
+        }
+    }
+
+    /// List what listens on this machine (ADR-028 S-4), as `vox serve` does.
+    fn probe_listening(&mut self) {
+        self.listening = self
+            .rt
+            .block_on(tokio::task::spawn_blocking(
+                vox_core::node::probe::listening,
+            ))
+            .unwrap_or_default();
+    }
+
+    /// What offering the service on `port` in `channel_id` would do, said before it is done
+    /// (ADR-028 S-4), as `vox serve` says it: the name it is offered under, the address members
+    /// reach it at, who can reach it and who cannot, and each warning.
+    fn preview_serve(
+        &mut self,
+        channel_id: Digest32,
+        port: u16,
+        udp: Option<bool>,
+    ) -> CommandStatus {
+        if self.listening.is_empty() {
+            self.probe_listening();
+        }
+        let Some(chosen) = self
+            .listening
+            .iter()
+            .find(|l| l.port == port && udp.is_none_or(|u| l.udp == u))
+            .cloned()
+        else {
+            return CommandStatus::Said(format!(
+                "nothing listening on port {port} can be seen from here; {}",
+                crate::tunnel_cli::MAY_BE_MISSING
+            ));
+        };
+        let local = chosen.endpoint();
+        let name = self.rt.block_on(crate::tunnel_cli::suggested_name(&chosen));
+        let tag = crate::tunnel_cli::tag_of(name.clone(), chosen.udp);
+        let warnings = self.rt.block_on(crate::tunnel_cli::exposure_warnings(
+            &[(chosen.port, tag.clone())],
+            Some(local),
+        ));
+        let snap = &self.snapshot;
+        let me = snap.me;
+        let mut names = vox_core::node::resolver::VoxResolver::new();
+        for o in &snap.open {
+            names.add_room(o.channel_id, o.name.as_deref(), &o.members);
+        }
+        for (fp, petname) in &snap.trusted {
+            names.name(*fp, petname);
+        }
+        let members: Vec<Digest32> = snap
+            .open
+            .iter()
+            .find(|o| o.channel_id == channel_id)
+            .map(|o| o.members.clone())
+            .unwrap_or_default();
+        let (mut can, mut cannot) = (Vec::new(), Vec::new());
+        for m in members.iter().filter(|m| Some(**m) != me) {
+            if snap.trusted.iter().any(|(t, _)| t == m) {
+                can.push(crate::ident::member_name(&snap.trusted, m));
+            } else {
+                cannot.push(crate::ident::member_name(&snap.trusted, m));
+            }
+        }
+        let address = me.map_or_else(
+            || format!("{name}.<you>.<the room>.vox"),
+            |me| names.address_of(&channel_id, &me, &name),
+        );
+        let mut lines = vec![
+            format!(
+                "share {}",
+                crate::tunnel_cli::listing_line(&chosen).trim_end()
+            ),
+            format!("as {tag}: members will reach it as {address}"),
+            format!(
+                "who can reach it: {}",
+                if can.is_empty() {
+                    "nobody yet: you trust no member of this room".to_owned()
+                } else {
+                    can.join(", ")
+                }
+            ),
+            format!(
+                "who cannot: {}",
+                if cannot.is_empty() {
+                    "nobody else is in the room".to_owned()
+                } else {
+                    format!("{} (not trusted)", cannot.join(", "))
+                }
+            ),
+        ];
+        lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
+        self.serve_preview = Some(crate::viewmodel::ServePreview {
+            channel_id,
+            tag,
+            local,
+            lines,
+        });
+        CommandStatus::Done
+    }
+
+    /// Offer the previewed service in its room (ADR-028 S-4), as `vox service add` does: offered
+    /// until removed, across the daemon's restarts.
+    fn offer_service(&mut self) -> CommandStatus {
+        let Some(p) = self.serve_preview.take() else {
+            return CommandStatus::Said("nothing to share: pick a service first".into());
+        };
+        match self.request(&Request::AddService {
+            channel_id: p.channel_id,
+            service_tag: p.tag.clone(),
+            local: p.local.to_string(),
+            persist: true,
+        }) {
+            Ok(Frame::Ok) => {
+                self.asked = None;
+                let said = format!("offering {} at {} in this room", p.tag, p.local);
+                self.notice = Some(said.clone());
+                CommandStatus::Said(said)
+            }
+            Ok(Frame::Error { reason }) => {
+                CommandStatus::Said(format!("cannot offer {}: {reason}", p.tag))
+            }
+            Ok(other) => CommandStatus::Said(format!(
+                "cannot offer {}: {}",
+                p.tag,
+                crate::client::unexpected(&other)
+            )),
+            Err(_) => CommandStatus::Failed(UiError::NotAttached),
         }
     }
 
@@ -1624,6 +1770,21 @@ impl CoreHandle for DaemonCore {
     fn apply_noting(&mut self, command: Command, waiting: &mut dyn FnMut()) -> CommandStatus {
         let secret = |s: &SecretString| s.expose_secret().to_owned();
         match command {
+            Command::ProbeListening => {
+                self.serve_preview = None;
+                self.probe_listening();
+                CommandStatus::Done
+            }
+            Command::PreviewServe {
+                channel_id,
+                port,
+                udp,
+            } => self.preview_serve(channel_id, port, udp),
+            Command::OfferService => self.offer_service(),
+            Command::CancelServe => {
+                self.serve_preview = None;
+                CommandStatus::Done
+            }
             Command::CreateIdentity { passphrase } => self.create_identity(&passphrase, waiting),
             Command::Attach { passphrase } => {
                 if self.conn.is_some() {
