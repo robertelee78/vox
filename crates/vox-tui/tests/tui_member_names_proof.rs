@@ -1,6 +1,6 @@
-//! The TUI names a member by the name you gave it, or by 26 characters of its fingerprint marked
-//! "(not in keyring)" (#198, V210-24), through the shipped `vox tui` in a pty; and (ADR-028 K-1,
-//! L-9, W-1, #472) draws the selected member's card, its fingerprint grouped beside its art, and a
+//! The TUI names a member by the name you gave it, or by 26 characters of its fingerprint, whole,
+//! with "not in keyring" on its state line (#198, V210-24; ADR-028 L-4), through the shipped
+//! `vox tui` in a pty; and (ADR-028 K-1, L-9, W-1, #472) draws the selected member's card, its fingerprint grouped beside its art, and a
 //! keyring view (`k`) of every node you trust with the same card, each node's art its own.
 //! Mutation: the art drawn from the alias instead of the fingerprint turns it red (Alice's art and
 //! Erin's are then one).
@@ -68,8 +68,8 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
             panic!("PRODUCT: a `vox` step before the TUI's members pane failed: {said}")
         }
         Some(1) if said.contains("cargo RED") => panic!(
-            "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters + \"(not in \
-             keyring)\", and draw each node's own card in the members pane and the keyring view: \
+            "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters with \"not in \
+             keyring\" under them, and draw each node's own card in the members pane and the keyring view: \
              {said}"
         ),
         _ => panic!(

@@ -1,9 +1,10 @@
 //! The TUI shows a room as it is (V210-82, #273),
 //! through the shipped `vox tui` in a pty.
 //!
-//! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
-//! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks nineteen claims, each
+//! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
+//! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
+//! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
+//! 160x50. It checks twenty-two claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -29,9 +30,14 @@
 //! - `scrolls`: PageUp brings m-001 into view, and End returns to m-071;
 //! - `clamp`: PageUp well past the oldest line, then one PageDown, shows m-011 first (the scroll
 //!   ran on past the top, so PageDown needed as many presses again before the view moved);
-//! - `consent`: Carol, whom Bob never trusted, reads "not trusted · you don't read each other", and
-//!   Alice "trusted · reads you" (the pane said "consented" for everyone, then "? unverified" on
-//!   every row and "← in-only" for Carol, though Bob's node refuses her key; V210-155);
+//! - `consent`: Carol, whom Bob never trusted, reads "not in keyring · you don't read each
+//!   other", and Alice "in keyring · reads you" (the pane said "consented" for
+//!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
+//!   refuses her key; V210-155);
+//! - `look`: in truecolour, Alice's row reads "⇄ alice" (each trusts the other) and Dave's
+//!   "→ dave" (only Bob trusts him), both in text.primary bold, and Carol's "· <fingerprint>" in
+//!   text.secondary, not bold; the accent is on the focused members pane's border and nowhere
+//!   else (ADR-028 L-3, L-4; colours read from the token file);
 //! - `unknown`: `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command",
 //!   and the help line names none of them (they only said "not available yet"; V210-155);
 //! - `sync`: the status bar says how many peers the node is connected to, the anchor and at least
@@ -47,10 +53,16 @@
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
-//! - `where`: with Alice's and Carol's daemons stopped, under a message Bob then posts his TUI
-//!   says "only on this machine"; once Alice's daemon is back and has synced, "on 1 of 2 members'
+//! - `where`: with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI
+//!   says "only on this machine"; once Alice's daemon is back and has synced, "on 1 of 3 members'
 //!   nodes" (ADR-028 R-6, #482);
-//! - `idle`: once the anchor is stopped too, it says "idle", with no count.
+//! - `accent`: there, the accent marks only the focused list's border and the live "● online";
+//! - `idle`: once the anchor is stopped too, it says "idle", with no count;
+//! - `depths`: Bob's TUI opened again three ways (ADR-028 L-5, #509): under `NO_COLOR` with
+//!   `LC_ALL=C` it draws no colour at all, and Alice reads "<> alice" and Dave "-> dave", bold, and
+//!   Carol ". <her fingerprint>", every state still read by glyph, weight and word; in 16 colours (`TERM=xterm`)
+//!   every colour drawn is one of the 16; in 256 colours Alice's name is index 255 and Carol's 247.
+//!   In each the words are as in truecolour and the accent is on the focused border alone.
 //!
 //! The `target`, `delivers` and `revoke` claims are gone with `:consent grant|revoke` (V210-148): a
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
@@ -61,8 +73,10 @@
 //! as not having read, every message marked read whether drawn or not, a message called held by a
 //! node that has not said it holds it, a read record named by a read record, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
-//! carries the message text or is raised per message, or a room with a message to Bob grouped
-//! other than "needs you". It passes only on the script's PASS with all 19 claims ok.
+//! carries the message text or is raised per message, a room with a message to Bob grouped other
+//! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
+//! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`). It passes only on the
+//! script's PASS with all 22 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -135,23 +149,24 @@ const STALL_BUDGET: Duration = Duration::from_secs(30);
 fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (#240).
     // Its bounds are the product's: a member waits 480 s for a joiner's proof of work (V210-87),
-    // which a debug build can take minutes to grind, and the driver joins three members. So the
-    // driver's budget is 1170 s, it is stopped from outside at 1200 s, and the watchdog is past
-    // both. A release run takes about a minute.
-    watchdog::arm_for(Duration::from_secs(1300));
+    // which a debug build can take minutes to grind, and the driver joins three members at once, then
+    // opens the TUI three times more (`depths`, about 90 s). So
+    // the driver's budget is 1260 s, it is stopped from outside at 1290 s, and the watchdog is past
+    // both. A release run takes about two minutes.
+    watchdog::arm_for(Duration::from_secs(1390));
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_truth.py");
     let clock = StallClock::start();
     let out = pty_driver::run_within(
         script,
         &[env!("CARGO_BIN_EXE_vox"), "truth"],
-        Duration::from_secs(1200),
+        Duration::from_secs(1290),
     );
     let stall = clock.stop();
     let said = out.stdout.clone();
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (19 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (22 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -165,8 +180,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (19, 19),
-                "APPARATUS: the driver said PASS without all 19 claims ok: {said}"
+                (22, 22),
+                "APPARATUS: the driver said PASS without all 22 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

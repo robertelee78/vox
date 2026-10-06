@@ -41,6 +41,9 @@ pub struct OpenRoomSnap {
     pub members: Vec<Digest32>,
     /// Who this identity consents to reading it here, in fingerprint order.
     pub consented: Vec<Digest32>,
+    /// The other members that consent to this identity reading them here, in fingerprint order:
+    /// the inbound half of `consented`, so a client can show who trusts this node (ADR-028 L-4).
+    pub consenting: Vec<Digest32>,
     /// What every member shares here: `(sharer, name, udp, kind)`.
     pub shares: Vec<crate::node::channel::Share>,
     /// The members held back for equivocating: `(author, seq)`.
@@ -104,6 +107,7 @@ impl NodeSnapshot {
                     local_name: d.local_name.clone(),
                     members: d.members.clone(),
                     consented: d.consented.clone(),
+                    consenting: d.consenting.clone(),
                     shares: d.shares.clone(),
                     equivocations: d.equivocations.clone(),
                     read_by: d.read_by.clone(),
@@ -139,9 +143,10 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(8).bytes(&o.channel_id).text(&o.local_name);
+            e.array(9).bytes(&o.channel_id).text(&o.local_name);
             digests(&mut e, &o.members);
             digests(&mut e, &o.consented);
+            digests(&mut e, &o.consenting);
             e.array(o.shares.len());
             for s in &o.shares {
                 e.array(4)
@@ -233,11 +238,12 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 8, "ipc snapshot open room")?;
+            want(&mut d, 9, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
             let local_name = d.text().map_err(bad("ipc snapshot open name"))?.to_owned();
             let members = read_digests(&mut d)?;
             let consented = read_digests(&mut d)?;
+            let consenting = read_digests(&mut d)?;
             let mut shares = Vec::new();
             for _ in 0..d.array().map_err(bad("ipc snapshot shares"))? {
                 want(&mut d, 4, "ipc snapshot share")?;
@@ -279,6 +285,7 @@ impl NodeSnapshot {
                 local_name,
                 members,
                 consented,
+                consenting,
                 shares,
                 equivocations,
                 read_by,
@@ -438,6 +445,7 @@ mod tests {
                 local_name: "ops".into(),
                 members: vec![[1; 32], [4; 32]],
                 consented: vec![[4; 32]],
+                consenting: vec![[4; 32]],
                 shares: vec![crate::node::channel::Share {
                     host: [4; 32],
                     name: "web".into(),

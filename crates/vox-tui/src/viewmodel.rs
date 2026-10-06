@@ -27,6 +27,9 @@ pub enum Trust {
     Trusted {
         /// Whether it holds your key here, so it can read what you write.
         reads_you: bool,
+        /// Whether it released its key to you here, which a node does only for a member its
+        /// keyring trusts: so it trusts you too (ADR-028 L-4's `⇄`).
+        trusts_you: bool,
     },
     /// Your keyring does not name the member: your node refuses its key, so you cannot read it.
     NotTrusted {

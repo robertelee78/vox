@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 /// Where a token falls back to in a 16-colour terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +43,33 @@ pub struct Token {
 }
 
 include!(concat!(env!("OUT_DIR"), "/theme_tokens.rs"));
+
+/// Whether the trust glyphs are to be drawn in ASCII (ADR-028 L-4: `<>`, `->`, `.`): a locale
+/// that names a character set other than UTF-8 (`C`, `POSIX`, a Latin-1 one), or a `dumb`
+/// terminal. With no locale set, the terminal is taken at its word and gets the glyphs.
+#[must_use]
+pub fn ascii_from(locale: Option<&str>, term: Option<&str>) -> bool {
+    if term == Some("dumb") {
+        return true;
+    }
+    locale.is_some_and(|l| {
+        let l = l.to_ascii_lowercase();
+        !(l.contains("utf-8") || l.contains("utf8"))
+    })
+}
+
+/// This process's [`ascii_from`], read from its environment once: the first of `LC_ALL`,
+/// `LC_CTYPE` and `LANG` that is set, as the C library reads them.
+#[must_use]
+pub fn ascii() -> bool {
+    static ASCII: OnceLock<bool> = OnceLock::new();
+    *ASCII.get_or_init(|| {
+        let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()));
+        ascii_from(locale.as_deref(), std::env::var("TERM").ok().as_deref())
+    })
+}
 
 /// What the terminal can show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +149,12 @@ pub fn color(t: Token) -> Option<Color> {
 #[must_use]
 pub fn fg(t: Token) -> Style {
     color(t).map_or_else(Style::default, |c| Style::default().fg(c))
+}
+
+/// A style whose foreground is `t`, bold: weight carries what colour cannot (ADR-028 L-4).
+#[must_use]
+pub fn strong(t: Token) -> Style {
+    fg(t).add_modifier(Modifier::BOLD)
 }
 
 /// The style the whole screen is drawn on: `bg.base` behind `text.primary`.

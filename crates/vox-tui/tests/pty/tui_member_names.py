@@ -4,7 +4,8 @@
 Alice creates a room; Bob and Carol join it, all through real daemons. Bob trusts Alice as
 "alice" and does not trust Carol. Bob's daemon is stopped and his real `vox tui` is opened in a
 pty (pyte at 160x50). His members pane must name Alice "alice" (not her fingerprint), and Carol by
-26 characters of her fingerprint followed by "(not in keyring)", whole.
+26 characters of her fingerprint, whole, with "not in keyring" on the state line under it (ADR-028
+L-4: the pane is too narrow for both on one row beside her trust glyph).
 
 ADR-028 K-1, L-9, W-1 (#472): with Alice selected in the members pane, her card is drawn under her:
 her whole fingerprint in groups of four beside five rows of fingerprint art. `k` on the room list
@@ -167,21 +168,24 @@ try:
     txt = "\n".join(pane)
     alice_ok = re.search(r"(^|[^a-z2-7])alice([^a-z2-7]|$)", txt, re.M) is not None
     alice_fp_shown = fp["alice"][:8] in txt
-    carol_row = next((r for r in pane if want_carol in r), None)
-    carol_ok = carol_row is not None and "(not in keyring)" in carol_row
+    carol_at = next((i for i, r in enumerate(pane) if want_carol in r), None)
+    carol_ok = (carol_at is not None and carol_at + 1 < len(pane)
+                and pane[carol_at + 1].strip().strip("│").strip().startswith("not in keyring ·"))
     print(f"{TAG} alice named 'alice': {alice_ok}; alice's fingerprint shown: {alice_fp_shown}; "
-          f"carol by 26 chars + marker: {carol_ok}")
+          f"carol by 26 chars, 'not in keyring' under: {carol_ok}")
 
     stage("alice's card")
     # The art's rows: ten facet characters, two per cell; the grouped fingerprint is beside them.
     art = lambda rows: [m.group(0) for m in (re.search(r"[◢◣◤◥]{10}", r) for r in rows) if m]
     grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
+    # The selected row is the marker, Alice's trust glyph, then her name: "▶ ⇄ alice" (L-4).
+    picked = lambda r: re.search(r"▶ \S+ ?alice\b", r) is not None
     for _ in range(4):
-        if any("▶ alice" in r for r in members()):
+        if any(picked(r) for r in members()):
             break
         tui.key("\x1b[B", 1)  # Down: the next member
     rows = [r.rstrip() for r in members()]
-    at = next((i for i, r in enumerate(rows) if "▶ alice" in r), None)
+    at = next((i for i, r in enumerate(rows) if picked(r)), None)
     under = rows[at + 1:at + 8] if at is not None else []
     card_art = art(under)
     first_groups = grouped(fp["alice"])[:24]

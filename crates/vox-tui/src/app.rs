@@ -1460,13 +1460,20 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
             Action::Quit => return Ok(()),
             Action::Redraw => {}
             Action::Dispatch(cmd) => {
+                // Moving between screens is no action to report: a "done" there took the place of
+                // the screen's own key hints.
+                let moving = matches!(cmd, Command::SelectChannel { .. });
                 // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
                 // this terminal, and a line written there lands inside the screen.
                 let status = core.apply_noting(cmd, &mut || {
                     ui.status_message = Some(WAITING_FOR_PROFILE_TUI.into());
                     let _ = io.draw(&mut |f| render(f, &vm, &mut ui));
                 });
-                ui.status_message = Some(status.message());
+                ui.status_message = if moving && matches!(status, CommandStatus::Done) {
+                    None
+                } else {
+                    Some(status.message())
+                };
             }
         }
     }

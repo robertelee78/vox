@@ -140,7 +140,7 @@ try:
         # trusted (its key went out, so sessions are up), then 15 s more (V29-19 measured a first
         # grant failing for want of a session for up to 15 s after a room opened).
         rows_all = lambda: "\n".join(members())
-        if not tui.until(lambda: "trusted" in rows_all(), 60, 1):
+        if not tui.until(lambda: "in keyring ·" in rows_all(), 60, 1):
             give(1, f"RED: PRODUCT (staging): the TUI's node never showed a trusted member, so it never connected:\n{tui.text()}")
         tui.pump(15)
         gone_check()

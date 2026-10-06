@@ -6,10 +6,11 @@
 //! scrollback (ADR-015 at-rest screen claim). Because rendering is a pure function
 //! of state into a `Frame`, it is covered by `TestBackend` render-snapshot tests.
 //!
-//! ## Accessibility (ADR-015)
-//! State is **never** signalled by colour alone: trust and reachability each render
-//! as a text label (so they survive `NO_COLOR`, monochrome terminals, and screen
-//! readers).
+//! ## Accessibility (ADR-015, ADR-028 E-6, L-3, L-4, L-8)
+//! State is **never** signalled by colour alone: trust renders as a glyph, a weight and words,
+//! reachability as a glyph and a word, a warning as `▲` or `✕` and its words, so each survives
+//! `NO_COLOR`, monochrome terminals and screen readers. The accent marks only the focused pane and
+//! what is live; it never marks trust, a warning or decoration.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -32,25 +33,67 @@ pub const LATE_MARKER: &str = "[late] ";
 /// What begins the line under a message this node sent that names who has read it (ADR-028 R-6).
 pub const READ_BY: &str = "read by ";
 
-/// Where a member stands with you, in words: whether you trust it, and whether it reads you here.
-/// Nothing for yourself.
+/// Where a member stands with you, in words: whether your keyring names it, and whether it reads
+/// you here. Nothing for yourself.
 #[must_use]
 pub fn trust_label(t: Trust) -> Option<&'static str> {
     match t {
         Trust::You => None,
-        Trust::Trusted { reads_you: true } => Some("trusted · reads you"),
-        Trust::Trusted { reads_you: false } => Some("trusted · cannot read you yet"),
-        Trust::NotTrusted { reads_you: true } => Some("not trusted · still reads you"),
-        Trust::NotTrusted { reads_you: false } => Some("not trusted · you don't read each other"),
+        Trust::Trusted {
+            reads_you: true, ..
+        } => Some("in keyring · reads you"),
+        Trust::Trusted {
+            reads_you: false, ..
+        } => Some("in keyring · cannot read you yet"),
+        Trust::NotTrusted { reads_you: true } => Some("not in keyring · still reads you"),
+        Trust::NotTrusted { reads_you: false } => {
+            Some("not in keyring · you don't read each other")
+        }
     }
 }
 
-/// A reachability glyph + word.
-fn reachability_label(r: Reachability) -> &'static str {
+/// A member's trust glyph and the style of its name (ADR-028 L-4): in text.primary bold, `⇄` for a
+/// node in your keyring that trusts you too and `→` for one that does not (yet); `·` in
+/// text.secondary for one not in your keyring; nothing for yourself.
+fn trust_mark(t: Trust) -> (&'static str, Style) {
+    let ascii = theme::ascii();
+    match t {
+        Trust::You => ("", theme::fg(theme::TEXT_PRIMARY)),
+        Trust::Trusted { trusts_you, .. } => (
+            match (ascii, trusts_you) {
+                (true, true) => "<> ",
+                (true, false) => "-> ",
+                (false, true) => "⇄ ",
+                (false, false) => "→ ",
+            },
+            theme::strong(theme::TEXT_PRIMARY),
+        ),
+        Trust::NotTrusted { .. } => (
+            if ascii { ". " } else { "· " },
+            theme::fg(theme::TEXT_SECONDARY),
+        ),
+    }
+}
+
+/// A warning's glyph: `▲` for what needs attention, `✕` for danger (ADR-028 L-2), `!` where the
+/// terminal takes ASCII alone.
+fn warn_glyph(danger: bool) -> &'static str {
+    match (theme::ascii(), danger) {
+        (true, _) => "!",
+        (false, true) => "✕",
+        (false, false) => "▲",
+    }
+}
+
+/// A reachability glyph + word, and its style: a room whose members are connected is live, so it
+/// alone takes the accent (ADR-028 L-3).
+fn reachability_label(r: Reachability) -> (&'static str, Style) {
     match r {
-        Reachability::Online => "● online",
-        Reachability::NeedsPeerOrNode => "◐ needs peer/node online",
-        Reachability::Offline => "○ offline",
+        Reachability::Online => ("● online", theme::fg(theme::ACCENT)),
+        Reachability::NeedsPeerOrNode => {
+            ("◐ needs peer/node online", theme::fg(theme::TEXT_SECONDARY))
+        }
+        Reachability::Offline => ("○ offline", theme::fg(theme::TEXT_SECONDARY)),
     }
 }
 
@@ -152,8 +195,8 @@ fn sidebar_cols(width: u16) -> u16 {
     (width * 30 / 100).clamp(28, 48)
 }
 
-/// The inspector's width beside a room: 48 columns, where a member named by its 26-character
-/// fingerprint and "(not in keyring)", and the longest trust label under it, fit; half the room's
+/// The inspector's width beside a room: 48 columns, where a member named by its trust glyph and
+/// 26-character fingerprint, and the longest trust label under it, fit; half the room's
 /// area where that is less.
 fn inspector_cols(width: u16) -> u16 {
     48.min(width / 2)
@@ -202,12 +245,14 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         } else {
             format!(" ({})", levels.join(" · "))
         };
-        let lock = if c.open { "" } else { " 🔒" };
-        items.push(ListItem::new(format!(
-            "{marker}{}{lock}{unread}  [{}]",
-            c.local_name,
-            reachability_label(c.reachability)
-        )));
+        // In words, never a padlock (ADR-028 L-8).
+        let closed = if c.open { "" } else { " (closed)" };
+        let (reach, reach_style) = reachability_label(c.reachability);
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw(format!("{marker}{}{closed}{unread}  [", c.local_name)),
+            Span::styled(reach, reach_style),
+            Span::raw("]"),
+        ])));
     }
     if !vm.machine_nodes.is_empty() {
         items.push(
@@ -370,8 +415,8 @@ fn render_timeline(
     // Who this room holds back for equivocating comes first, one line each (V210-66).
     let notices = held_back.iter().map(|n| {
         Line::from(Span::styled(
-            format!("! {n}"),
-            Style::default().add_modifier(Modifier::BOLD),
+            format!("{} {n}", warn_glyph(true)),
+            theme::strong(theme::DANGER),
         ))
     });
     // Built newest first and only as far back as the window reaches (V210-120): every frame built
@@ -514,10 +559,17 @@ fn render_members(
             } else {
                 "  "
             };
-            // Always words, never colour alone (a11y).
-            let mut lines = vec![Line::from(format!("{marker}{}", m.nickname))];
+            // Glyph, weight and words, never colour alone (ADR-028 L-4, E-6).
+            let (glyph, style) = trust_mark(m.trust);
+            let mut lines = vec![Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{glyph}{}", m.nickname), style),
+            ])];
             if let Some(label) = trust_label(m.trust) {
-                lines.push(Line::from(format!("    {label}")));
+                lines.push(Line::from(Span::styled(
+                    format!("    {label}"),
+                    theme::fg(theme::TEXT_SECONDARY),
+                )));
             }
             // The selected member's card (ADR-028 K-1, L-9): its fingerprint whole and grouped,
             // with its art beside it, never the art alone.
@@ -561,12 +613,14 @@ fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     frame.render_widget(list, area);
 }
 
-fn pane_block(title: &str, focus: bool) -> Block<'_> {
-    let b = Block::default().borders(Borders::ALL).title(title);
+/// A pane's frame, its title said once: "Members", or "Members [focus]" while it holds the focus.
+fn pane_block(title: &str, focus: bool) -> Block<'static> {
+    let b = Block::default().borders(Borders::ALL);
     if focus {
         focus_block(b.title(format!("{title} [focus]")))
     } else {
-        b.border_style(theme::fg(theme::LINE_HAIR))
+        b.title(title.to_owned())
+            .border_style(theme::fg(theme::LINE_HAIR))
     }
 }
 
@@ -589,19 +643,23 @@ fn render_status_bar(frame: &mut Frame, area: Rect, vm: &ViewModel) {
     } else {
         format!("{node}  ·  attached: {}", vm.nodes.join(", "))
     };
-    let mlock = if vm.mlock_active {
-        String::new()
-    } else {
-        "  ⚠ mlock unavailable (zeroize-only)".to_owned()
-    };
     // The keyring window (ADR-028 K-9): whether a keyring change will ask for the passphrase.
     let keyring = if vm.attached {
         format!("  ·  {}", keyring_label(vm.keyring_open_secs))
     } else {
         String::new()
     };
-    let text = format!(" sync: {}  ·  {lock}{keyring}{mlock}", sync_label(vm.sync));
-    frame.render_widget(Paragraph::new(text), area);
+    let mut spans = vec![Span::raw(format!(
+        " sync: {}  ·  {lock}{keyring}",
+        sync_label(vm.sync)
+    ))];
+    if !vm.mlock_active {
+        spans.push(Span::styled(
+            format!("  {} mlock unavailable (zeroize-only)", warn_glyph(false)),
+            theme::fg(theme::ATTENTION),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// The keyring window as the status bar and `vox status` say it (ADR-028 K-9): `keyring open 23m`

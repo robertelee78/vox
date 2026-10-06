@@ -1091,20 +1091,30 @@ impl DaemonCore {
                             let is_me = me == Some(*m);
                             MemberView {
                                 id: *m,
+                                // The members pane says "not in keyring" on the member's state
+                                // line (ADR-028 L-4), so a member without a name is its
+                                // fingerprint alone, which fits beside its trust glyph.
                                 nickname: if is_me {
                                     "you".to_owned()
                                 } else {
-                                    crate::ident::member_name(&snap.trusted, m)
+                                    match snap.trusted.iter().find(|(t, _)| t == m) {
+                                        Some((_, name)) if !name.trim().is_empty() => name.clone(),
+                                        _ => crate::ident::author_id(m),
+                                    }
                                 },
                                 // Off the keyring and the room's log: this node releases its key
                                 // only to a member its keyring trusts (V210-148), and takes a
                                 // member's key only if it trusts it.
                                 trust: {
                                     let reads_you = d.consented.binary_search(m).is_ok();
+                                    let trusts_you = d.consenting.binary_search(m).is_ok();
                                     if is_me {
                                         Trust::You
                                     } else if snap.trusted.iter().any(|(t, _)| t == m) {
-                                        Trust::Trusted { reads_you }
+                                        Trust::Trusted {
+                                            reads_you,
+                                            trusts_you,
+                                        }
                                     } else {
                                         Trust::NotTrusted { reads_you }
                                     }

@@ -76,9 +76,13 @@ removal has real access and key-rotation consequences.
 
 ## Understand the member pane
 
-The TUI pairs state with words, including `trusted · reads you` and
-`trusted · cannot read you yet`. These describe local trust and whether the other member
-can read your messages in that room. They are not read receipts for an individual message.
+The TUI shows trust by glyph, weight and words. A node in your keyring is drawn bold with `→`,
+and its line says `in keyring · reads you` or `in keyring · cannot read you yet`. A node not in
+your keyring is drawn plain with `·` and named by its fingerprint. Its line says
+`not in keyring · still reads you` or `not in keyring · you don't read each other`. Where the
+terminal takes only ASCII, the glyphs are `->` and `.`. The words describe local trust and
+whether the other member can read your messages in that room. They are not read receipts for
+an individual message.
 
 If the state and your expectation differ, check each person's selected node and keyring,
 then connectivity. Do not add an unfamiliar fingerprint simply to silence a warning.
