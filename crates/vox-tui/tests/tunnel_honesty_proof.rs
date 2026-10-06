@@ -88,7 +88,8 @@
 //!   operator runs `vox trust remove`, and `vox up` says the host withdrew access. `vox trust
 //!   remove` names that session before it acts and says after that it cut it, and that the host's
 //!   own sessions into the guest's services are untouched, naming one the host holds into a
-//!   service the guest shares; that session still echoes after (ADR-028 E-5). A new CONNECT
+//!   service the guest shares; that session still echoes after. Before it acts it says the guest
+//!   is to reach none of the host's services, naming the one it offers as lost (ADR-028 E-5). A new CONNECT
 //!   through the **same** proxy — whose connection to the host was made while trusted — is
 //!   refused in the SOCKS reply, and the service behind it never accepts a connection. The
 //!   host's decision record (ADR-028 §7) then holds each of the three decisions once, naming the
@@ -1899,6 +1900,20 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
         l.starts_with("     your sessions into its services are untouched: tunnel ")
             && l.contains("you reaching the guest's notes")
     });
+    // And that the guest is to reach none of the host's services: the one it offers is named as
+    // lost, never as one the guest is to reach.
+    let acted = lines
+        .iter()
+        .position(|l| l.starts_with("vox: no longer trusting"));
+    let loses = lines.iter().position(|l| {
+        l.starts_with("     and to reach none of your services from now on: it loses ")
+            && l.contains(&format!("{port} in \"service\""))
+    });
+    assert!(
+        matches!((loses, acted), (Some(b), Some(a)) if b < a),
+        "PRODUCT: before it acts, `vox trust remove` must say the guest is to reach none of the \
+         host's services, naming the {port} it offers as lost:\n{out}"
+    );
     assert!(
         matches!((to_cut, was_cut), (Some(b), Some(a)) if b < a) && untouched,
         "PRODUCT: `vox trust remove` must name the live session it is to cut ({session:?}) before \

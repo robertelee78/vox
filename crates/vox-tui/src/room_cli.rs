@@ -4197,10 +4197,15 @@ pub async fn trust_remove(
         "     it is to read nothing you write from now on in {}; what it already read stays read",
         listed(&room_names, "any room")
     );
-    println!(
-        "     and to reach {}",
-        listed(&services, "none of your services")
-    );
+    // What it is to lose, never what it is to keep: once untrusted it reaches none of them.
+    if services.is_empty() {
+        println!("     and to reach none of your services (you offer none in a room you share)");
+    } else {
+        println!(
+            "     and to reach none of your services from now on: it loses {}",
+            listed(&services, "")
+        );
+    }
     let said: Vec<String> = sessions.iter().map(|(_, t)| t.clone()).collect();
     println!(
         "     its live sessions into your services are to be cut: {}",
