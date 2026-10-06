@@ -34,6 +34,8 @@ pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 pub const LATE_MARKER: &str = "[late] ";
 /// What begins the line under a message this node sent that names who has read it (ADR-028 R-6).
 pub const READ_BY: &str = "read by ";
+/// What marks a room's retention in its header (ADR-028 R-7).
+pub const RETENTION: &str = "⏱";
 
 /// The mark before the message selected in the timeline (ADR-028 R-9, #485).
 pub const SELECTED_MARKER: &str = "▶ ";
@@ -372,7 +374,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         body[0],
         &channel.held_back,
         channel.timeline.as_slice(),
-        &channel.notices,
+        (&channel.notices, &channel.retention),
         Selection {
             scroll: ui.timeline_scroll,
             selected: ui.selected_message,
@@ -457,7 +459,8 @@ fn render_timeline(
     area: Rect,
     held_back: &[String],
     timeline: &[MessageView],
-    room_notices: &[NoticeView],
+    // What happened to the room, and its retention, for the header.
+    (room_notices, retention): (&[NoticeView], &str),
     at: Selection,
     focus: bool,
 ) -> (usize, Vec<Digest32>) {
@@ -576,12 +579,13 @@ fn render_timeline(
     let shown: Vec<Line> = rows[window.clone()].to_vec();
     let mut on_screen: Vec<Digest32> = owners[window].iter().flatten().copied().collect();
     on_screen.dedup();
+    // The room's header always says its retention (ADR-028 R-7).
     let title = if scroll > 0 {
-        "Timeline (scrolled — End: newest)"
+        format!("Timeline · {RETENTION} {retention} (scrolled — End: newest)")
     } else {
-        "Timeline"
+        format!("Timeline · {RETENTION} {retention}")
     };
-    let p = Paragraph::new(shown).block(pane_block(title, focus));
+    let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
     (scroll, on_screen)
 }

@@ -60,6 +60,10 @@ pub struct OpenRoomSnap {
     /// Who trusts each member (ADR-028 K-7): `(member, the members that consent to it reading
     /// them)`.
     pub trusted_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// The retention this node applies here, seconds, `0` forever
+    /// ([`crate::node::api::ChannelDetail::retention`]): what the room's header always shows
+    /// (ADR-028 R-7).
+    pub retention: u64,
 }
 
 /// One node as a client draws it.
@@ -120,6 +124,7 @@ impl NodeSnapshot {
                     held: d.held.clone(),
                     notices: d.notices.clone(),
                     trusted_by: d.trusted_by.clone(),
+                    retention: d.retention,
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
@@ -151,7 +156,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(11)
+            e.array(12)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -191,6 +196,7 @@ impl NodeSnapshot {
                 e.array(2).bytes(member);
                 digests(&mut e, by);
             }
+            e.uint(o.retention);
         }
         e.array(self.trusted.len());
         for (fp, name) in &self.trusted {
@@ -261,7 +267,7 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 11, "ipc snapshot open room")?;
+            want(&mut d, 12, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
             let name = Some(d.text().map_err(bad("ipc snapshot open name"))?.to_owned())
                 .filter(|n| !n.is_empty());
@@ -320,6 +326,7 @@ impl NodeSnapshot {
                 let member = digest(&mut d)?;
                 trusted_by.push((member, read_digests(&mut d)?));
             }
+            let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
             open.push(OpenRoomSnap {
                 channel_id,
                 name,
@@ -332,6 +339,7 @@ impl NodeSnapshot {
                 held,
                 notices,
                 trusted_by,
+                retention,
             });
         }
         let mut trusted = Vec::new();
@@ -499,6 +507,7 @@ mod tests {
                 held: vec![([5; 32], 1)],
                 notices: Vec::new(),
                 trusted_by: vec![([4; 32], vec![[1; 32]])],
+                retention: 604_800,
             }],
             trusted: vec![([4; 32], "bob".into())],
             connected_peers: vec![[4; 32]],

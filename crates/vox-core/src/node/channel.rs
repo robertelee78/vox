@@ -6150,11 +6150,31 @@ impl ChannelState {
     }
 
     /// What a person is told happened to the room, in the room's order (ADR-028 E-5): each name
-    /// an admin gave it. One line each in the timeline, never a message: no reader, cursor or
-    /// agent counts them.
+    /// an admin gave it, and each change of its retention (R-7). One line each in the timeline,
+    /// never a message: no reader, cursor or agent counts them.
     #[must_use]
     pub fn notices(&self) -> Vec<RoomNotice> {
-        self.evaluator
+        let at = |h: &Digest32| self.dag.get_by_hash(h).map_or(0, |e| e.skeleton.claimed_ms);
+        // Who set what, and only what is true whatever the change was: a lengthening, or a room
+        // with nothing old enough, removed nothing.
+        let retention = self.evaluator.retention_changes().iter().map(|c| RoomNotice {
+            entry_hash: c.entry_hash,
+            author: c.author,
+            created_millis: at(&c.entry_hash),
+            what: if c.ttl == 0 {
+                "set the room's retention to forever: from now on no message is removed for its \
+                 age"
+                    .to_owned()
+            } else {
+                let d = crate::node::retention::describe(c.ttl);
+                format!(
+                    "set the room's retention to {d}: messages older than {d} are removed from \
+                     now on"
+                )
+            },
+        });
+        let mut all: Vec<RoomNotice> = self
+            .evaluator
             .name_statements()
             .iter()
             .enumerate()
@@ -6171,7 +6191,11 @@ impl ChannelState {
                     format!("renamed the room to {}", n.name)
                 },
             })
-            .collect()
+            .chain(retention)
+            .collect();
+        // In the room's order: by the time each says it was made.
+        all.sort_by_key(|n| (n.created_millis, n.entry_hash));
+        all
     }
 
     /// Whether `who` may name the room: its creator or an admin (ADR-028 R-1).
