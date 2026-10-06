@@ -42,7 +42,9 @@
 //! 7. **What a message carries for showing, and a room's name**: a message the peer posts with
 //!    a link carries the card the peer's node fetched (ADR-028 F-10), and `read` gives its title,
 //!    description and image; the image the peer's file share announced (F-9) comes with its
-//!    dimensions, a JPEG thumbnail and a BlurHash. `renameRoom` on the peer's room is refused
+//!    dimensions, a JPEG thumbnail and a BlurHash. Once the peer has pulled the app's file share
+//!    whole, `pulledBy` names it, by the app's name for it, against that share's announcement
+//!    (F-7). `renameRoom` on the peer's room is refused
 //!    with the node's own sentence; on a room the app created and the peer joined, it renames
 //!    the room for both, and the peer's own `vox room list` shows the new name (R-1). The card
 //!    is fetched from a local server, so this test needs `--features vox-tui/test-knobs`
@@ -52,7 +54,8 @@
 //! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
 //! Mutants for (7), one per claim, each red PRODUCT: `RoomMessage.card` always nil;
-//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node.
+//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
+//! always empty.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -637,7 +640,13 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         .as_array()
         .map(|cs| {
             cs.iter()
-                .map(|c| format!("{}={}", c["what"].as_str().unwrap_or(""), c["command"].as_str().unwrap_or("")))
+                .map(|c| {
+                    format!(
+                        "{}={}",
+                        c["what"].as_str().unwrap_or(""),
+                        c["command"].as_str().unwrap_or("")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" | ")
         })
@@ -647,7 +656,11 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         .map(|ns| {
             ns.iter()
                 .map(|n| {
-                    let holds = if n["holds"].as_bool() == Some(true) { "yes" } else { "no" };
+                    let holds = if n["holds"].as_bool() == Some(true) {
+                        "yes"
+                    } else {
+                        "no"
+                    };
                     format!("{}={holds}", n["need"].as_str().unwrap_or(""))
                 })
                 .collect::<Vec<_>>()
@@ -854,6 +867,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     writeln!(to_app).unwrap();
     let card = expect(&from_app, &seen, "CARD ");
     let image = expect(&from_app, &seen, "IMAGE ");
+    let pulled_by = expect(&from_app, &seen, "PULLED_BY ");
     let refused = expect(&from_app, &seen, "REFUSED ");
     let created = expect(&from_app, &seen, "CREATED ");
     let (made, made_link) = {
@@ -883,7 +897,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    eprintln!("{card}\n{image}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room list`: {peer_rooms}");
+    eprintln!("{card}\n{image}\n{pulled_by}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room list`: {peer_rooms}");
     assert_eq!(
         card,
         format!(
@@ -897,6 +911,11 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         image.starts_with("IMAGE 48x32 JPEG true BLURHASH ") && image.len() > 31,
         "PRODUCT: `read` must give the image the peer's share announced: 48x32, a JPEG thumbnail \
          and a BlurHash: {image}"
+    );
+    assert_eq!(
+        pulled_by, "PULLED_BY peer SAME true",
+        "PRODUCT: `pulledBy` must say the peer pulled the app's file share whole, by the name the \
+         app trusts it under, against the share's own announcement"
     );
     assert!(
         refused.contains("this identity is not its admin"),

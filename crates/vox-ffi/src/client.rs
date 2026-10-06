@@ -264,6 +264,16 @@ pub struct ReadBy {
     pub names: Vec<String>,
 }
 
+/// Who has pulled one of this node's own shares whole and verified it (ADR-028 F-7).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PulledBy {
+    /// The share's announcement: its message id.
+    pub id: String,
+    /// This node's names for the members who pulled it, sorted; a fingerprint's first 12
+    /// characters for one it has no name for.
+    pub names: Vec<String>,
+}
+
 /// **The three unread levels** (ADR-028 R-8): what one unread message is to this node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum UnreadLevel {
@@ -822,6 +832,50 @@ impl VoxClient {
         Ok(on_held!(self, |c| room_ids(c).await)?
             .into_iter()
             .map(|r| r.0)
+            .collect())
+    }
+
+    /// One of the node's marks on its own entries in `room`, from one snapshot: each entry's id
+    /// and the sorted names of the members `pick` lists for it, entries with none left out.
+    async fn own_marks(
+        &self,
+        room: String,
+        pick: fn(vox_core::node::snapshot::OpenRoomSnap) -> Vec<(Digest32, Vec<Digest32>)>,
+    ) -> Result<Vec<(String, Vec<String>)>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let body = vox_core::node::snapshot::request_body();
+        let (reply, names) = on_held!(self, |c| {
+            let names = names(c).await?;
+            let reply = c
+                .exchange(&body)
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            Ok((reply, names))
+        })?;
+        let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
+            return Err(failed(
+                "the vox daemon did not answer with the node's state",
+            ));
+        };
+        let name = |fp: &Digest32| {
+            names
+                .get(fp)
+                .cloned()
+                .unwrap_or_else(|| b32_encode(fp).chars().take(12).collect())
+        };
+        Ok(snap
+            .open
+            .into_iter()
+            .find(|o| o.channel_id == channel_id)
+            .map(pick)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, who)| !who.is_empty())
+            .map(|(entry, who)| {
+                let mut names: Vec<String> = who.iter().map(name).collect();
+                names.sort();
+                (b32_encode(&entry), names)
+            })
             .collect())
     }
 }
@@ -2121,43 +2175,26 @@ impl VoxClient {
     /// # Errors
     /// A malformed id, or the daemon's refusal.
     pub async fn read_by(&self, room: String) -> Result<Vec<ReadBy>, VoxError> {
-        let channel_id = digest(&room, "room id")?;
-        let body = vox_core::node::snapshot::request_body();
-        let (reply, names) = on_held!(self, |c| {
-            let names = names(c).await?;
-            let reply = c
-                .exchange(&body)
-                .await
-                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
-            Ok((reply, names))
-        })?;
-        let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
-            return Err(failed(
-                "the vox daemon did not answer with the node's state",
-            ));
-        };
-        let name = |fp: &Digest32| {
-            names
-                .get(fp)
-                .cloned()
-                .unwrap_or_else(|| b32_encode(fp).chars().take(12).collect())
-        };
-        Ok(snap
-            .open
+        Ok(self
+            .own_marks(room, |o| o.read_by)
+            .await?
             .into_iter()
-            .find(|o| o.channel_id == channel_id)
-            .map(|o| o.read_by)
-            .unwrap_or_default()
+            .map(|(id, names)| ReadBy { id, names })
+            .collect())
+    }
+
+    /// Who has pulled this node's own shares in `room` whole and verified them (ADR-028 F-7), from
+    /// the daemon's record of completed fetches, as `vox room read` says "pulled by": a fetch cut
+    /// short is in none.
+    ///
+    /// # Errors
+    /// A malformed id, or the daemon's refusal.
+    pub async fn pulled_by(&self, room: String) -> Result<Vec<PulledBy>, VoxError> {
+        Ok(self
+            .own_marks(room, |o| o.pulled_by)
+            .await?
             .into_iter()
-            .filter(|(_, who)| !who.is_empty())
-            .map(|(entry, who)| {
-                let mut names: Vec<String> = who.iter().map(name).collect();
-                names.sort();
-                ReadBy {
-                    id: b32_encode(&entry),
-                    names,
-                }
-            })
+            .map(|(id, names)| PulledBy { id, names })
             .collect())
     }
 
