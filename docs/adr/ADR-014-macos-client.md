@@ -59,9 +59,12 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   person chose Keep Running (M-8) and either stored the node's passphrase in the Keychain when
   attaching it (ADR-028 K-10) or the node needs none; then the daemon keeps it as `--keep` does,
   and attaches it again whenever it starts. The passphrase MUST be stored by the daemon, only
-  after it has attached the node with it, and read back by the daemon alone. In every other case
-  quitting MUST detach the node (ADR-028 A-4), unless another client holds it or it was kept by
-  hand.
+  once it is proved: by attaching the node with it, or, for a node attached already, by checking
+  it against the node's vault. It MUST be read back by the daemon alone, never on the daemon's
+  async workers, and MUST be in the Keychain only while the daemon's attach file keeps the node
+  with it. A store that fails MUST leave the node not kept and nothing stored, so the person can
+  simply ask again. In every other case quitting MUST detach the node (ADR-028 A-4), unless
+  another client holds it or it was kept by hand.
 - **M-7.** Every user-visible failure MUST be the daemon's sentence, shown where the action was
   taken, never a generic error.
 
@@ -76,7 +79,8 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   app MUST say plainly that the rooms are reachable only while Vox is open.
 - **M-9.** The app MUST start and reach that daemon; it MUST NOT start a second one for the same
   data root (ADR-026 D-1). With the login item declined, the app MUST start the daemon as `vox`
-  does (ADR-026 S-2).
+  does (ADR-026 S-2). The login item's daemon, finding another daemon serving the data root, MUST
+  wait and serve once that one stops: launchd restarts it only after a crash.
 - **M-10.** The family LAN's root part MUST be a privileged helper registered with
   `SMAppService.daemon(plistName:)` (`Contents/Library/LaunchDaemons/us.vox.lanhelper.plist`),
   approved once by the person in System Settings. It replaces `sudo vox lan helper` on macOS. It

@@ -608,8 +608,7 @@ pub struct DaemonArgs {
     pub keep: bool,
     /// For a service manager, such as the macOS login item: no foreground node and nothing
     /// asked for, running until stopped; kept nodes attach as always. With a daemon already
-    /// running for this data root it says so and exits 0, so the manager does not start it
-    /// again and again.
+    /// running for this data root it says so and waits, serving once that one stops.
     #[arg(long, conflicts_with_all = ["node", "keep", "passphrase_file", "detach"])]
     pub no_node: bool,
     /// How a client starts the daemon: its own session, no foreground node, and an

@@ -31,7 +31,11 @@ mod mac {
         );
         String::from_utf8(bytes.to_vec())
             .map(Zeroizing::new)
-            .map_err(|_| "what the Keychain holds for it is not text".to_owned())
+            .map_err(|e| {
+                // The refused copy is the passphrase's bytes too.
+                drop(Zeroizing::new(e.into_bytes()));
+                "what the Keychain holds for it is not text".to_owned()
+            })
     }
 
     /// Remove what is stored for `account`; nothing stored is not an error.
