@@ -628,11 +628,72 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
     }
 
+    // Bob holds no key of alice's: with her daemon stopped, so nothing can be delivered, bob
+    // trusts her, and still none of her posts opens. A key taken earlier and merely not shown
+    // would render the moment his ring names her.
+    let tmp_path = tmp.path().to_owned();
+    let mut alice = alice;
+    alice.daemon = None;
+    bob.trust(&alice);
+    std::thread::sleep(Duration::from_secs(10));
+    for (name, room, _) in &alice_posted {
+        let (ok, seen, e) = bob.vox(&["room", "read", room], None);
+        assert!(
+            ok && seen.contains(&format!("CAROL-TO-BOB-IN-{name}")),
+            "PRODUCT (staging): bob's read of room {name} after trusting alice did not succeed: {e}"
+        );
+        let n = count(&seen, "A118-");
+        assert_eq!(
+            n, 0,
+            "PRODUCT: bob renders {n} of alice's posts in room {name} with her offline, the moment he \
+             trusted her: his node held her key while it did not trust her"
+        );
+    }
+
+    // Alice comes back; her re-key round offers the key again, bob's node takes it now, and bob
+    // reads her posts, the earlier ones included: every one she made after trusting him.
+    start_daemon(&mut alice, &tmp_path, &spec, "daemon-again");
+    let back = Instant::now();
+    for (name, room, posted) in &alice_posted {
+        let mut want: Vec<String> = (1..=*posted)
+            .map(|k| format!("A118-IN-{name} {k}"))
+            .collect();
+        want.push(format!("A118-FINAL-IN-{name}"));
+        // Under the generation live when bob trusts her: the ones above are under a retired one.
+        want.push(format!("A118-WHILE-CAROL-REMOVED-IN-{name}"));
+        want.push(format!("A118-AFTER-ROTATION-IN-{name}"));
+        let all = until(
+            &format!("bob renders all of alice's posts in room {name}"),
+            Duration::from_secs(120).saturating_sub(back.elapsed()),
+            || {
+                let seen = bob.vox(&["room", "read", room], None).1;
+                want.iter()
+                    .all(|w| seen.lines().any(|l| l.ends_with(w.as_str())))
+            },
+        );
+        let seen = bob.vox(&["room", "read", room], None).1;
+        assert!(
+            all,
+            "PRODUCT: bob trusted alice, yet within 120 s of her return he renders {} of her {} posts in \
+             room {name} (missing: {:?}): a key refused while untrusted, or one retired since, was \
+             never taken once trusted",
+            count(&seen, "A118-"),
+            want.len(),
+            want.iter()
+                .filter(|w| !seen.lines().any(|l| l.ends_with(w.as_str())))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "[proof] room {name}: bob reads all {} of alice's posts {:?} after her return",
+            want.len(),
+            back.elapsed()
+        );
+    }
+
     // **Nor by the log** (V210-118): dave trusts bob while bob's daemon is stopped, so dave's dial
     // fails and his key goes to bob as a key-package in the room's log, which every member
     // carries. Bob never trusted dave: once he is back, none of dave's posts opens for him, read
     // or drained. Then bob trusts dave, and reads them: the key was held, not lost.
-    let tmp_path = tmp.path().to_owned();
     bob.daemon = None;
     dave.trust(&bob);
     let dave_log = tmp_path.join("dave.daemon.err");
@@ -708,67 +769,6 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
             ),
             "PRODUCT: bob trusted dave, yet within 120 s he never rendered dave's post in room \
              {name}: the key dave sent by the log was lost, not held"
-        );
-    }
-
-    // Bob holds no key of alice's: with her daemon stopped, so nothing can be delivered, bob
-    // trusts her, and still none of her posts opens. A key taken earlier and merely not shown
-    // would render the moment his ring names her.
-    let mut alice = alice;
-    alice.daemon = None;
-    bob.trust(&alice);
-    std::thread::sleep(Duration::from_secs(10));
-    for (name, room, _) in &alice_posted {
-        let (ok, seen, e) = bob.vox(&["room", "read", room], None);
-        assert!(
-            ok && seen.contains(&format!("CAROL-TO-BOB-IN-{name}")),
-            "PRODUCT (staging): bob's read of room {name} after trusting alice did not succeed: {e}"
-        );
-        let n = count(&seen, "A118-");
-        assert_eq!(
-            n, 0,
-            "PRODUCT: bob renders {n} of alice's posts in room {name} with her offline, the moment he \
-             trusted her: his node held her key while it did not trust her"
-        );
-    }
-
-    // Alice comes back; her re-key round offers the key again, bob's node takes it now, and bob
-    // reads her posts, the earlier ones included: every one she made after trusting him.
-    start_daemon(&mut alice, &tmp_path, &spec, "daemon-again");
-    let back = Instant::now();
-    for (name, room, posted) in &alice_posted {
-        let mut want: Vec<String> = (1..=*posted)
-            .map(|k| format!("A118-IN-{name} {k}"))
-            .collect();
-        want.push(format!("A118-FINAL-IN-{name}"));
-        // Under the generation live when bob trusts her: the ones above are under a retired one.
-        want.push(format!("A118-WHILE-CAROL-REMOVED-IN-{name}"));
-        want.push(format!("A118-AFTER-ROTATION-IN-{name}"));
-        let all = until(
-            &format!("bob renders all of alice's posts in room {name}"),
-            Duration::from_secs(120).saturating_sub(back.elapsed()),
-            || {
-                let seen = bob.vox(&["room", "read", room], None).1;
-                want.iter()
-                    .all(|w| seen.lines().any(|l| l.ends_with(w.as_str())))
-            },
-        );
-        let seen = bob.vox(&["room", "read", room], None).1;
-        assert!(
-            all,
-            "PRODUCT: bob trusted alice, yet within 120 s of her return he renders {} of her {} posts in \
-             room {name} (missing: {:?}): a key refused while untrusted, or one retired since, was \
-             never taken once trusted",
-            count(&seen, "A118-"),
-            want.len(),
-            want.iter()
-                .filter(|w| !seen.lines().any(|l| l.ends_with(w.as_str())))
-                .collect::<Vec<_>>()
-        );
-        eprintln!(
-            "[proof] room {name}: bob reads all {} of alice's posts {:?} after her return",
-            want.len(),
-            back.elapsed()
         );
     }
 }
