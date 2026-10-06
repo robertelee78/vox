@@ -35,6 +35,13 @@
 //! and passed over by the sync. Mutations, each red PRODUCT: the join no longer records R as a
 //! member (`note_member`); the link's member role ignored (A1 listed).
 //!
+//! **A guest never calls its host an anchor** (V030-51, AGENTS.md "Anchors"). On a direct path, the
+//! guest joins and forwards to the host's service; the host restarts. Nothing the guest's forward
+//! says, nor its `vox status`, may call the host an anchor — "connected to this anchor", "the
+//! connection to this anchor is gone" — and the forward carries a round trip again after the
+//! restart. Mutation: the host dialled as one of the room's anchors with the old word for its loss
+//! (as integrate before V030-51), red PRODUCT.
+//!
 //! **A red names its side.** The report's content is PRODUCT. A `vox` step that fails while the
 //! world is set is PRODUCT (staging), as the harness labels it; the test's own sockets and
 //! processes are APPARATUS.
@@ -392,5 +399,51 @@ fn unreachable_anchor_check(
         "PRODUCT: j's `vox status --json` lists members of the room among its anchors: {listed:?} \
          (r {r_short} let it in). Its anchors: {}",
         v["anchors"]
+    );
+}
+
+#[test]
+#[ignore = "real binaries, production Argon2id and a PoW; CI runs it in release"]
+fn a_guest_never_calls_its_host_an_anchor() {
+    watchdog::arm();
+    let port = echo_service();
+    let mut w = World::build(&Setup {
+        specs: vec![format!("{port}={port}")],
+        trusted: true,
+        path: PathKind::Direct,
+        guest_leg: None,
+    });
+    let guest = w.guest_dir.clone();
+    let (mut fwd, at) = w.forward_service("forward", &guest, &port.to_string());
+    let back = round_trip(at, b"before", Duration::from_secs(120))
+        .unwrap_or_else(|e| panic!("PRODUCT (staging): nothing crossed the forward: {e}"));
+    assert_eq!(back, b"before", "PRODUCT (staging): the forward must echo");
+    w.restart_host_as_daemon();
+    // The forward reaches the restarted host again: the guest has seen the host go and come back.
+    let back = round_trip(at, b"after", Duration::from_secs(120)).unwrap_or_else(|e| {
+        panic!("PRODUCT: nothing crossed the forward after the host restarted: {e}")
+    });
+    assert_eq!(
+        back, b"after",
+        "PRODUCT: the forward must echo after the restart"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let host_short: String = w.host_fp.chars().take(12).collect();
+    let said = fwd.transcript();
+    let (ok, status, err) = vox_once(&guest, &args(&["status"]));
+    assert!(
+        ok,
+        "PRODUCT: the guest's `vox status` failed: {status}{err}"
+    );
+    eprintln!("[test] the guest's forward said:\n{said}\nits `vox status`:\n{status}");
+    let called: Vec<&str> = said
+        .lines()
+        .chain(status.lines())
+        .filter(|l| l.contains(&host_short) && l.contains("anchor"))
+        .collect();
+    assert!(
+        called.is_empty(),
+        "PRODUCT: the guest called its host {host_short}, a member of the room, an anchor: \
+         {called:?}"
     );
 }

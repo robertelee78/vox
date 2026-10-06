@@ -6147,7 +6147,7 @@ impl Node {
         // A peer that said it was stopping stopped, however the connection then ended: by its
         // close, by this end's close on hearing it, or by a close that never arrived.
         let why = match (silent, conn.quinn().close_reason()) {
-            _ if conn.peer_stopped() => "the anchor stopped".to_owned(),
+            _ if conn.peer_stopped() => format!("the {} stopped", self.board_word(&id)),
             // Its peer is still running, but its only path ran through a relay that stopped: that
             // is the cause, not the probe's verdict on a path that no longer exists (V210-93).
             _ if conn.carrier_stopped().is_some() => format!(
@@ -6171,8 +6171,9 @@ impl Node {
             net.manager().note(
                 id,
                 format!(
-                    "the connection to this anchor is gone {}s after it was made ({why}); it is \
+                    "the connection to this {} is gone {}s after it was made ({why}); it is \
                      redialled in {wait}s",
+                    self.board_word(&id),
                     lasted.unwrap_or(0)
                 ),
             );
@@ -6180,7 +6181,10 @@ impl Node {
             self.anchor_backoff.remove(&id);
             net.manager().note(
                 id,
-                format!("the connection to this anchor is gone ({why}); it is redialled now"),
+                format!(
+                    "the connection to this {} is gone ({why}); it is redialled now",
+                    self.board_word(&id)
+                ),
             );
         }
     }
@@ -14945,15 +14949,25 @@ impl Node {
     /// (`--anchor`, the anchors file) or a room names that is not one of its members; any other
     /// board is a room host's own (V210-107).
     fn board_note(&self, peer: &Digest32) -> &'static str {
+        if self.board_word(peer) == "anchor" {
+            "connected to this anchor"
+        } else {
+            "connected to this room host's board"
+        }
+    }
+
+    /// What the board `peer` is called, by [`Self::board_note`]'s rule: `anchor`, or `room host's
+    /// board` (V030-51: a room host is never called an anchor, made or lost).
+    fn board_word(&self, peer: &Digest32) -> &'static str {
         let anchor = self.anchors.get(peer).is_some()
             || self
                 .room_anchors
                 .values()
                 .any(|set| set.get(peer).is_some());
         if anchor {
-            "connected to this anchor"
+            "anchor"
         } else {
-            "connected to this room host's board"
+            "room host's board"
         }
     }
 
