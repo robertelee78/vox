@@ -11,7 +11,10 @@
 		<string>vox</string>
 		<string>lan</string>
 		<string>helper</string>
+		<string>--serve-bundle-owner</string>
 	</array>
+	<key>RunAtLoad</key>
+	<true/>
 	<key>AssociatedBundleIdentifiers</key>
 	<string>us.vox.app</string>
 </dict>

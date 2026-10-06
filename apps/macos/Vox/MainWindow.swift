@@ -126,7 +126,7 @@ private struct RoomView: View {
                     .accessibilityIdentifier("compose")
             }
             Divider()
-            Inspector(members: model.members)
+            Inspector(model: model, room: room)
                 .frame(width: 240)
         }
     }
@@ -157,20 +157,54 @@ private struct MessageRow: View {
 
 /// The room's members and their trust (L-4).
 private struct Inspector: View {
-    let members: [NodeModel.MemberRow]
+    @ObservedObject var model: NodeModel
+    let room: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("MEMBERS").font(Theme.eyebrow).secondaryText()
-            ForEach(members) { member in
+            ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
                     .accessibilityIdentifier("member-\(member.name)")
             }
+            Divider().padding(.vertical, 8)
+            FamilyLan(model: model, room: room)
             Spacer()
         }
         .padding(12)
         .frame(maxHeight: .infinity, alignment: .topLeading)
         .accessibilityIdentifier("inspector")
+    }
+}
+
+/// The room's family LAN (ADR-013): offered only once the LAN helper is approved, and before
+/// that, what approving it grants (ADR-014 M-12).
+private struct FamilyLan: View {
+    @ObservedObject var model: NodeModel
+    let room: String
+
+    var body: some View {
+        Text("FAMILY LAN").font(Theme.eyebrow).secondaryText()
+        if model.lanHelperReady {
+            Toggle("On this room's LAN", isOn: Binding(
+                get: { model.lanOn.contains(room) },
+                set: { on in Task { await model.setLan(room, on: on) } }))
+                .accessibilityIdentifier("family-lan")
+            if let said = model.lanSaid[room] {
+                Text(said).font(Theme.mono).secondaryText().textSelection(.enabled)
+                    .accessibilityIdentifier("family-lan-said")
+            }
+        } else {
+            Text("The family LAN needs Vox's LAN helper: one root process that creates network "
+                + "interfaces for Vox and nothing else. Approve it once in System Settings.")
+                .secondaryText()
+                .accessibilityIdentifier("family-lan-why")
+            Button("Allow the LAN Helper") { Task { await model.allowLanHelper() } }
+                .accessibilityIdentifier("family-lan-allow")
+        }
+        if let failed = model.lanFailed[room] {
+            StateMark(kind: .danger, words: failed).textSelection(.enabled)
+        }
     }
 }
 

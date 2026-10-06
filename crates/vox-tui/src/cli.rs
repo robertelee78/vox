@@ -256,7 +256,8 @@ enum ServiceCmd {
 #[derive(Subcommand, Debug, Clone)]
 enum LanCmd {
     /// Create LAN interfaces for `vox lan up`, as root. Run it with `sudo`: it serves only
-    /// the person who ran `sudo`, accepts only LAN addresses (`100.64.0.0/10`,
+    /// the person who ran `sudo` (or, run by Vox.app's login-time helper, the person who owns
+    /// Vox.app), accepts only LAN addresses (`100.64.0.0/10`,
     /// `fd00::/8`), opens no node and touches no network. Runs until interrupted;
     /// interfaces it made live exactly as long as the `vox lan up` holding them.
     Helper(LanHelperArgs),
@@ -271,6 +272,12 @@ pub struct LanHelperArgs {
     /// Where to listen.
     #[arg(long, default_value = crate::lan_cli::DEFAULT_HELPER_SOCKET)]
     pub socket: PathBuf,
+    /// Serve the person who owns the Vox.app this `vox` is inside, as the app's login-time
+    /// helper does (ADR-014 M-10), instead of the person who ran `sudo`. Refused for a Vox.app
+    /// owned by root, one with a directory or file down to this `vox` that others may write,
+    /// or one not signed by the same Developer ID team as this `vox`.
+    #[arg(long)]
+    pub serve_bundle_owner: bool,
 }
 
 /// `vox lan up`
@@ -2785,13 +2792,15 @@ pub fn run() -> ExitCode {
                 .await
             })
         }
-        Cmd::Lan(LanCmd::Helper(a)) => match crate::lan_cli::run_helper(&a.socket) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("vox lan helper: {e}");
-                ExitCode::FAILURE
+        Cmd::Lan(LanCmd::Helper(a)) => {
+            match crate::lan_cli::run_helper(&a.socket, a.serve_bundle_owner) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox lan helper: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Cmd::Lan(LanCmd::Up(a)) => {
             if let Err(e) =
                 crate::tunnel_cli::refuse_disclosed_room_passphrase(a.room.passphrase.as_ref())

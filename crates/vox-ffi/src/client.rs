@@ -340,6 +340,16 @@ struct Held {
     /// The forwards this app made, by the address each is bound at: each on a connection of its
     /// own, which carries it until it is stopped or the node is let go of.
     forwards: HashMap<String, IpcClient>,
+    /// The family LANs this app runs, by room: each on a connection of its own, which runs it
+    /// until it is stopped or the node is let go of.
+    lans: HashMap<Digest32, Lan>,
+}
+
+/// A family LAN the app runs: dropping `stop` closes its connection, and the daemon takes the LAN
+/// down.
+struct Lan {
+    stop: tokio::sync::oneshot::Sender<()>,
+    said: Arc<Mutex<Vec<String>>>,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
@@ -702,6 +712,7 @@ impl VoxClient {
                 client,
                 at: at.attached_only(),
                 forwards: HashMap::new(),
+                lans: HashMap::new(),
             });
             Ok(me)
         })
@@ -1486,6 +1497,143 @@ impl VoxClient {
                 other => Err(unexpected(&other)),
             }
         )
+    }
+
+    /// Bring this Mac onto `room`'s family LAN (ADR-013), as `vox lan up` does: the daemon asks the
+    /// root helper for the interface and runs the LAN until [`Self::lan_down`] or the node is let
+    /// go of. `allow` are the local ports members may reach over it; none by default. Answers the
+    /// daemon's first line, once the LAN is up: the interface and this node's LAN addresses.
+    ///
+    /// # Errors
+    /// A malformed id, the room not open, the helper not running or refusing, or the LAN not
+    /// started, with why.
+    pub async fn lan_up(&self, room: String, allow: Vec<u16>) -> Result<String, VoxError> {
+        use vox_core::node::lan_request::{LanRequest, LanSaid, DEFAULT_HELPER_SOCKET};
+        let channel_id = digest(&room, "room id")?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let at = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.at.clone())
+                .ok_or_else(not_attached)?;
+            let (mut stream, _) = vox_core::node::ipc::open_as(&at)
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            let req = LanRequest {
+                channel_id,
+                helper: PathBuf::from(DEFAULT_HELPER_SOCKET),
+                stats_file: None,
+                allow: allow.into_iter().collect(),
+            };
+            vox_core::node::ipc::write_frame(&mut stream, &req.to_bytes())
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            let first = match vox_core::node::ipc::read_frame(&mut stream).await {
+                Ok(Some(body)) => match LanSaid::parse(&body) {
+                    Some(LanSaid::Said(line)) => line,
+                    Some(LanSaid::Failed(why)) => return Err(failed(why)),
+                    None => match Frame::from_bytes(&body) {
+                        Ok(Frame::Error { reason }) => return Err(failed(reason)),
+                        _ => {
+                            return Err(failed(
+                                "the vox daemon answered the LAN with something else",
+                            ))
+                        }
+                    },
+                },
+                _ => return Err(failed("the vox daemon closed the LAN before it was up")),
+            };
+            let said = Arc::new(Mutex::new(vec![first.clone()]));
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            // The LAN's lines, kept for `lan_said`, until it is stopped or the daemon ends it.
+            let lines = Arc::clone(&said);
+            tokio::spawn(async move {
+                tokio::pin!(stopped);
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        frame = vox_core::node::ipc::read_frame(&mut stream) => {
+                            let line = match frame {
+                                Ok(Some(body)) => match LanSaid::parse(&body) {
+                                    Some(LanSaid::Said(l)) => l,
+                                    Some(LanSaid::Failed(why)) => format!("the LAN stopped: {why}"),
+                                    None => continue,
+                                },
+                                _ => "the LAN stopped: the vox daemon closed it".to_owned(),
+                            };
+                            let end = line.starts_with("the LAN stopped");
+                            lines.lock().unwrap_or_else(PoisonError::into_inner).push(line);
+                            if end {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Closing the connection takes the LAN down.
+                drop(stream);
+            });
+            match held.lock().await.as_mut() {
+                Some(h) => {
+                    h.lans.insert(channel_id, Lan { stop, said });
+                    Ok(first)
+                }
+                None => Err(not_attached()),
+            }
+        })
+        .await
+    }
+
+    /// Take `room`'s family LAN down: its interface goes with it.
+    ///
+    /// # Errors
+    /// A malformed id, or no LAN of this app's runs for that room.
+    pub async fn lan_down(&self, room: String) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let lan = held
+                .lock()
+                .await
+                .as_mut()
+                .ok_or_else(not_attached)?
+                .lans
+                .remove(&channel_id);
+            match lan {
+                Some(lan) => {
+                    let _ = lan.stop.send(());
+                    Ok(())
+                }
+                None => Err(failed("this app runs no LAN for that room")),
+            }
+        })
+        .await
+    }
+
+    /// What `room`'s family LAN has said, oldest first, as `vox lan up` prints it; empty when
+    /// this app runs none there.
+    ///
+    /// # Errors
+    /// A malformed id.
+    pub async fn lan_said(&self, room: String) -> Result<Vec<String>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            Ok(held
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|h| h.lans.get(&channel_id))
+                .map(|l| {
+                    l.said
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone()
+                })
+                .unwrap_or_default())
+        })
+        .await
     }
 
     /// Deliver the held node's events to `listener` until it is detached or the daemon stops.
