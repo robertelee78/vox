@@ -12,6 +12,7 @@ final class NodeModel: ObservableObject {
     enum Selection: Hashable {
         case room(String)
         case keyring
+        case decisions
     }
 
     /// A room as the sidebar shows it.
@@ -390,6 +391,16 @@ final class NodeModel: ObservableObject {
         } catch {
             said = sentence(error)
             return false
+        }
+    }
+
+    /// This node's decision record, newest first (M-18).
+    func decisions() async -> [DecisionEvent] {
+        do {
+            return try await client.decisions()
+        } catch {
+            said = sentence(error)
+            return []
         }
     }
 

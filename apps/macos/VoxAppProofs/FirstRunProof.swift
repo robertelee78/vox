@@ -34,15 +34,17 @@
 // 9. Keys (ADR-014 M-20, #446): with quiet rooms aaa and bbb and mission needing alice, ⌘J from
 //    aaa goes to mission, not to bbb, the next room in the sidebar's order; ⌘⇧C on a selected
 //    service card copies the address `vox service list` gives.
-// 10. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 10. The decision record (ADR-014 M-18, ADR-028 §7, #445): carol's join with a wrong passphrase,
+//     refused by alice's node, is at the top of the view, above the trust changes of steps 3 and 5.
+// 11. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (10) goes red. A room with a message
+// place of the app's hold), and quitting leaves it attached: (11) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
-// the sidebar's order: (9) goes red.
+// the sidebar's order: (9) goes red. The decision record oldest first: (10) goes red.
 
 import XCTest
 
@@ -442,7 +444,32 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: ⌘⇧C on the selected service must copy its address as `vox service list` gives it")
         print("[proof] ⌘J opened mission; ⌘⇧C copied \(copied)")
 
-        // (10) Quitting detaches it.
+        // (10) A refused join, newest in the decision record.
+        let carolPass = scratch.appendingPathComponent("carol.pass").path
+        let wrongPass = scratch.appendingPathComponent("wrong.pass").path
+        try "carol identity\n".write(toFile: carolPass, atomically: true, encoding: .utf8)
+        try "not the room passphrase\n".write(toFile: wrongPass, atomically: true, encoding: .utf8)
+        try staged(vox, ["node", "attach", "carol", "--passphrase-file", carolPass], env: voxEnv)
+        let missionLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        let refusedJoin = run(vox, ["room", "join", "--node", "carol", "--passphrase-file", wrongPass,
+                                    missionLink, "--name", "mission"], env: voxEnv)
+        guard refusedJoin.status != 0 else {
+            throw Apparatus("carol's join with a wrong passphrase was not refused: \(refusedJoin.out)")
+        }
+        ui.descendants(matching: .any)["decisions"].click()
+        let top = ui.descendants(matching: .any)["decision-0"]
+        let refusedFirst = NSPredicate(format: "exists == true AND label BEGINSWITH %@",
+                                       "refused: to join a room")
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: refusedFirst, evaluatedWith: top)],
+                                      timeout: 30), .completed,
+                       "PRODUCT: carol's refused join must be at the top of the decision record; the top says \(top.exists ? top.label : "nothing")")
+        XCTAssertTrue(ui.descendants(matching: .any)["decision-1"].exists,
+                      "PRODUCT: the decision record must keep the older decisions (the trust changes) below")
+        print("[proof] decision record top: \(top.label)")
+
+        // (11) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""

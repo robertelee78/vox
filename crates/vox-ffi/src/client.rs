@@ -163,6 +163,24 @@ pub struct Lane {
     pub state: String,
 }
 
+/// One event of this node's decision record (ADR-028 §7): what it decided, about whom, and why,
+/// in its own words; never message text, a file name, a passphrase or a key.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DecisionEvent {
+    /// When, milliseconds since the Unix epoch.
+    pub at_millis: u64,
+    /// What was asked: "to join a room", "a tunnel to a service", …
+    pub asked: String,
+    /// Who asked, or whom it was about: a fingerprint, base32.
+    pub by: String,
+    /// This node's name for them when it was decided; empty when it had none.
+    pub alias: String,
+    /// `refused`, `trusted`, `untrusted`, `cut` or `stopped`.
+    pub decided: String,
+    /// Why, in this node's words.
+    pub why: String,
+}
+
 /// Who has read one of this node's own messages (ADR-028 R-6).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ReadBy {
@@ -1509,6 +1527,63 @@ impl VoxClient {
             Frame::Shares { shares } => Ok(shares.into_iter().map(file_share).collect()),
             other => Err(unexpected(&other)),
         })
+    }
+
+    /// This node's decision record, newest first (ADR-028 §7, D-1, D-2): every day's file it
+    /// keeps (14 days), read from `nodes/<node>/decisions/`, as the TUI's Decisions screen reads
+    /// it. A line that does not parse is left out.
+    ///
+    /// # Errors
+    /// No node attached, or the data root cannot be found.
+    pub async fn decisions(&self) -> Result<Vec<DecisionEvent>, VoxError> {
+        let held = Arc::clone(&self.held);
+        let (data_root, config_dir) = (self.data_root.clone(), self.config_dir.clone());
+        self.on_rt(async move {
+            let node = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.node.clone())
+                .ok_or_else(not_attached)?;
+            let account = Account::of(Some(&data_root), Some(&config_dir))
+                .map_err(|e| failed(format!("data root: {e}")))?;
+            let dir = account
+                .node_dir(&node)
+                .join(vox_core::node::decisions::DECISIONS_DIR);
+            let Ok(days) = std::fs::read_dir(&dir) else {
+                return Ok(Vec::new());
+            };
+            let text = |v: &serde_json::Value, k: &str| {
+                v.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .map(shown_name)
+                    .unwrap_or_default()
+            };
+            let mut events: Vec<DecisionEvent> = days
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+                .filter_map(|p| std::fs::read_to_string(p).ok())
+                .flat_map(|day| {
+                    day.lines()
+                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|v| {
+                    Some(DecisionEvent {
+                        at_millis: v.get("at_ms")?.as_u64()?,
+                        asked: text(&v, "asked"),
+                        by: text(&v, "by"),
+                        alias: text(&v, "alias"),
+                        decided: text(&v, "decided"),
+                        why: text(&v, "why"),
+                    })
+                })
+                .collect();
+            events.sort_by(|a, b| b.at_millis.cmp(&a.at_millis));
+            Ok(events)
+        })
+        .await
     }
 
     /// What this node pulled by itself in `room` and verified, oldest first, each where `vox room

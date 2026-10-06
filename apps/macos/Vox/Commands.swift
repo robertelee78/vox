@@ -72,6 +72,9 @@ extension NodeModel {
             VoxAction("View", "Keyring", "k", [.command, .shift]) {
                 Task { await self.show(.keyring) }
             },
+            VoxAction("View", "Decision Record", "d", [.command, .shift]) {
+                Task { await self.show(.decisions) }
+            },
         ] + digits
     }
 }

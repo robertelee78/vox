@@ -19,6 +19,8 @@ struct MainWindow: View {
                     RoomView(model: model, room: id)
                 case .keyring:
                     KeyringView(model: model)
+                case .decisions:
+                    DecisionsView(model: model)
                 case nil:
                     Text("Pick a room.")
                         .secondaryText()
@@ -66,6 +68,8 @@ private struct Sidebar: View {
             Section {
                 Text("Keyring").tag(NodeModel.Selection.keyring)
                     .accessibilityIdentifier("keyring")
+                Text("Decision record").tag(NodeModel.Selection.decisions)
+                    .accessibilityIdentifier("decisions")
             }
             Section {
                 ForEach(model.nodes, id: \.name) { node in
