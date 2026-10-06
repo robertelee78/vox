@@ -979,6 +979,26 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
+    /// Give a room a new name, for every member (ADR-028 R-1), as `vox room rename`: only its
+    /// creator or an admin may, and the identity passphrase is asked for that reason.
+    ///
+    /// # Errors
+    /// A malformed id, a wrong passphrase, or the node's refusal in its own words (this node may
+    /// not rename the room; the name is not one DNS label).
+    pub async fn rename_room(
+        &self,
+        room: String,
+        name: String,
+        identity_passphrase: Arc<Passphrase>,
+    ) -> Result<(), VoxError> {
+        let req = Request::RenameRoom {
+            channel_id: digest(&room, "room id")?,
+            name,
+            identity_passphrase: identity_passphrase.copy(),
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
     /// A room link, for someone else to join with.
     ///
     /// # Errors

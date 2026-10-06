@@ -40,6 +40,10 @@
 //   IMAGE <w>x<h> JPEG <true|false> BLURHASH <hash>
 //                           the image the peer's file share announced: dimensions, whether the
 //                           thumbnail is a JPEG, its BlurHash
+//   REFUSED <error>         `renameRoom` on the peer's room, which this node may not rename
+//   CREATED <room> <link>   `createRoom` named "mine", and its link
+//   (waits for a line on stdin: the peer has joined it)
+//   RENAMED                 `renameRoom` gave it the name "renamed"
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -149,7 +153,7 @@ do {
     try await client.serviceAdd(room: room, tag: preview.tag, local: preview.local)
     say("OFFERED \(preview.tag)")
 
-    // What a message carries for showing (ADR-028 F-9, F-10).
+    // What a message carries for showing (ADR-028 F-9, F-10), and a room's one name (R-1).
     _ = readLine()
     var card: LinkCard? = nil
     let cardUntil = Date().addingTimeInterval(90)
@@ -162,6 +166,20 @@ do {
         .compactMap { $0.image }.first
     let jpeg = image.map { $0.thumb.starts(with: [0xFF, 0xD8]) } ?? false
     say("IMAGE \(image?.width ?? 0)x\(image?.height ?? 0) JPEG \(jpeg) BLURHASH \(image?.blurhash ?? "")")
+    let operator_ = try Passphrase(bytes: Data(args[3].utf8))
+    do {
+        try await client.renameRoom(room: room, name: "taken", identityPassphrase: operator_)
+        say("REFUSED nothing: the rename was answered")
+    } catch {
+        say("REFUSED \(error)")
+    }
+    let made = try await client.createRoom(
+        name: "mine", passphrase: try Passphrase(bytes: Data("mine passphrase".utf8)))
+    say("CREATED \(made) \(try await client.link(room: made).url)")
+    _ = readLine()
+    try await client.renameRoom(room: made, name: "renamed", identityPassphrase: operator_)
+    operator_.wipe()
+    say("RENAMED")
     _ = readLine()
     await client.close()
     say("CLOSED")

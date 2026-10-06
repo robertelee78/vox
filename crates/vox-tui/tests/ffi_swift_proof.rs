@@ -32,17 +32,19 @@
 //!    listens on every interface; `serviceAdd` with the preview's tag and endpoint shares it, and
 //!    the peer reaches it by its own `vox service list` and `vox forward`.
 //!
-//! 7. **What a message carries for showing**: a message the peer posts with
+//! 7. **What a message carries for showing, and a room's name**: a message the peer posts with
 //!    a link carries the card the peer's node fetched (ADR-028 F-10), and `read` gives its title,
 //!    description and image; the image the peer's file share announced (F-9) comes with its
-//!    dimensions, a JPEG thumbnail and a BlurHash. The card
+//!    dimensions, a JPEG thumbnail and a BlurHash. `renameRoom` on the peer's room is refused
+//!    with the node's own sentence; on a room the app created and the peer joined, it renames
+//!    the room for both, and the peer's own `vox room list` shows the new name (R-1). The card
 //!    is fetched from a local server, so this test needs `--features vox-tui/test-knobs`
 //!    (`VOX_TEST_CARD_ALLOW`) and refuses as CANNOT MEASURE without it.
 //!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
 //! Mutants for (7), one per claim, each red PRODUCT: `RoomMessage.card` always nil;
-//! `RoomMessage.image` always nil.
+//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -769,7 +771,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
          service list` and `vox forward`: it found {peer_address:?} in {peer_list}"
     );
 
-    // (7) A link card and an image preview, as `read` gives them.
+    // (7) A link card and an image preview, as `read` gives them; then a room's one name.
     peer.run(
         &[
             "room",
@@ -782,7 +784,36 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     writeln!(to_app).unwrap();
     let card = expect(&from_app, &seen, "CARD ");
     let image = expect(&from_app, &seen, "IMAGE ");
-    eprintln!("{card}\n{image}");
+    let refused = expect(&from_app, &seen, "REFUSED ");
+    let created = expect(&from_app, &seen, "CREATED ");
+    let (made, made_link) = {
+        let mut w = created[8..].split_whitespace();
+        (
+            w.next().unwrap_or_default().to_owned(),
+            w.next().unwrap_or_default().to_owned(),
+        )
+    };
+    peer.run(
+        &["room", "join", &made_link, "--passphrase-file", "-"],
+        "mine passphrase\n",
+    );
+    writeln!(to_app).unwrap();
+    let renamed = expect(&from_app, &seen, "RENAMED");
+    // `vox room list` shows a room by its short id, then its name.
+    let shows_renamed = |l: &str, id: &str| {
+        let mut w = l.split_whitespace();
+        w.next().is_some_and(|s| id.starts_with(s)) && w.next() == Some("renamed")
+    };
+    let until = Instant::now() + TIMEOUT;
+    let mut peer_rooms = String::new();
+    while Instant::now() < until {
+        peer_rooms = peer.run(&["room", "list"], "");
+        if peer_rooms.lines().any(|l| shows_renamed(l, &made)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    eprintln!("{card}\n{image}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room list`: {peer_rooms}");
     assert_eq!(
         card,
         format!(
@@ -796,6 +827,16 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         image.starts_with("IMAGE 48x32 JPEG true BLURHASH ") && image.len() > 31,
         "PRODUCT: `read` must give the image the peer's share announced: 48x32, a JPEG thumbnail \
          and a BlurHash: {image}"
+    );
+    assert!(
+        refused.contains("this identity is not its admin"),
+        "PRODUCT: `renameRoom` on a room this node may not rename must throw the node's refusal: \
+         {refused}"
+    );
+    assert!(
+        peer_rooms.lines().any(|l| shows_renamed(l, &made)),
+        "PRODUCT: a room the app renamed must show its new name in the peer's own `vox room \
+         list`: {peer_rooms}"
     );
 
     // (5) The app closes; the daemon lets the node go.
