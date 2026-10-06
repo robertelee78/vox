@@ -48,8 +48,9 @@ local label. Use the selector your version's command help accepts.
 
 A node can share a named local service with a room. Reach depends on shared room membership
 and the host's trust decision. Each member reaches it as `service.node.room.vox`, where the node
-and room parts are that member's own names for them, so two members may see different
-addresses for the same service. It is not a public web link and does not install global DNS.
+and room parts are that member's own names for them, so two members may see different readable
+addresses for the same service. Its canonical address, made of fingerprints and IDs, is the same
+for everyone and is the one to copy and send. It is not a public web link and does not install global DNS.
 The daemon's local proxy (`vox up` says where it listens) or a forward (`vox forward`) bridges
 your ordinary tool into Vox.
 
