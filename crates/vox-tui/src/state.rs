@@ -254,6 +254,13 @@ pub struct UiState {
     pub selected_member: Option<Digest32>,
     /// How many lines the timeline is scrolled up from its newest; 0 follows new messages.
     pub timeline_scroll: usize,
+    /// The message selected in the timeline, **by entry** (ADR-028 R-9, #485): what `r` replies
+    /// to, and whose quote Enter jumps to. `None` follows the newest.
+    pub selected_message: Option<Digest32>,
+    /// The timeline must scroll to the selected message on its next draw: it was just selected.
+    pub reveal_selected: bool,
+    /// The message the composer is replying to, when it is.
+    pub replying: Option<Digest32>,
     /// A transient status/alert line shown at the bottom (e.g. the result of the
     /// last command, an error, a recovery hint). `None` when clear.
     pub status_message: Option<String>,
@@ -278,6 +285,9 @@ impl Default for UiState {
             selected_room: None,
             selected_member: None,
             timeline_scroll: 0,
+            selected_message: None,
+            reveal_selected: false,
+            replying: None,
             status_message: None,
             composer: String::new(),
             selected_tunnel: None,
@@ -386,7 +396,19 @@ impl UiState {
                         return Action::Redraw;
                     };
                     self.composer.clear();
-                    return Action::Dispatch(Command::SendText { channel_id, text });
+                    return Action::Dispatch(match self.replying.take() {
+                        Some(re) => Command::Reply {
+                            channel_id,
+                            re,
+                            text,
+                        },
+                        None => Command::SendText { channel_id, text },
+                    });
+                }
+                // Esc while replying drops the reply, not the room.
+                KeyCode::Esc if self.replying.is_some() => {
+                    self.replying = None;
+                    return Action::Redraw;
                 }
                 _ => {}
             }
@@ -408,6 +430,29 @@ impl UiState {
             KeyCode::Char('x') | KeyCode::Delete if self.screen == Screen::Tunnels => {
                 self.close_selected_tunnel(vm)
             }
+            // **A reply quotes one message** (ADR-028 R-9, #485): Ctrl-R replies to the message
+            // selected, or the newest; the composer says which until it is sent. A control key, so
+            // a message begun with the timeline focused is never turned into a reply by its first
+            // letter.
+            KeyCode::Char('r')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.screen == Screen::Channel =>
+            {
+                let newest = vm
+                    .active
+                    .as_ref()
+                    .and_then(|c| c.timeline.last().map(|m| m.entry_hash));
+                if let Some(re) = self.selected_message.or(newest) {
+                    self.replying = Some(re);
+                    self.focus = Focus::Composer;
+                }
+                Action::Redraw
+            }
+            // Enter on a reply jumps to the message it quotes.
+            KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Timeline => {
+                self.jump_to_quote(vm);
+                Action::Redraw
+            }
             KeyCode::Tab if self.screen == Screen::Channel => {
                 self.focus = self.focus.next();
                 Action::Redraw
@@ -415,6 +460,8 @@ impl UiState {
             KeyCode::Esc => {
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
+                    self.selected_message = None;
+                    self.replying = None;
                     return Action::Dispatch(Command::SelectChannel { channel_id: None });
                 }
                 if matches!(self.screen, Screen::Tunnels | Screen::Keyring) {
@@ -441,6 +488,7 @@ impl UiState {
             }
             KeyCode::End if self.screen == Screen::Channel => {
                 self.timeline_scroll = 0;
+                self.selected_message = None;
                 Action::Redraw
             }
             _ => Action::Redraw,
@@ -459,6 +507,8 @@ impl UiState {
             self.focus = Focus::Timeline;
             self.selected_member = None;
             self.timeline_scroll = 0;
+            self.selected_message = None;
+            self.replying = None;
             Action::Dispatch(Command::SelectChannel {
                 channel_id: Some(summary.channel_id),
             })
@@ -642,6 +692,27 @@ impl UiState {
 
     /// Up/Down: the channel list's selection, or on a channel screen, the timeline's scroll while
     /// it has focus and the member selection otherwise.
+    /// **Selecting a quote jumps to it** (ADR-028 R-9, #485): the message the selected reply
+    /// quotes is selected and scrolled to.
+    fn jump_to_quote(&mut self, vm: &ViewModel) {
+        let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
+            return;
+        };
+        let Some(quote) = self
+            .selected_message
+            .and_then(|h| timeline.iter().find(|m| m.entry_hash == h))
+            .and_then(|m| m.quote.as_ref())
+        else {
+            return;
+        };
+        if timeline.iter().any(|m| m.entry_hash == quote.entry_hash) {
+            self.selected_message = Some(quote.entry_hash);
+            self.reveal_selected = true;
+        } else {
+            self.status_message = Some("the quoted message is not in this room yet".into());
+        }
+    }
+
     fn move_selection(&mut self, vm: &ViewModel, delta: isize) {
         let step =
             |cur: usize, len: usize| (cur as isize + delta).rem_euclid(len as isize) as usize;
@@ -666,12 +737,24 @@ impl UiState {
                 self.selected_tunnel = Some(vm.tunnels[step(cur, vm.tunnels.len())].id);
             }
             Screen::Channel if self.focus == Focus::Timeline => {
-                // Up scrolls toward older messages.
-                self.timeline_scroll = if delta < 0 {
-                    self.timeline_scroll.saturating_add(1)
-                } else {
-                    self.timeline_scroll.saturating_sub(1)
+                // Up selects an older message, Down a newer one; past the newest follows again.
+                let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
+                    return;
                 };
+                let at = self
+                    .selected_message
+                    .and_then(|h| timeline.iter().position(|m| m.entry_hash == h));
+                let next = match (at, delta < 0) {
+                    (None, true) => timeline.len().checked_sub(1),
+                    (None, false) => None,
+                    (Some(i), true) => Some(i.saturating_sub(1)),
+                    (Some(i), false) => Some(i + 1).filter(|n| *n < timeline.len()),
+                };
+                self.selected_message = next.map(|i| timeline[i].entry_hash);
+                if self.selected_message.is_none() {
+                    self.timeline_scroll = 0;
+                }
+                self.reveal_selected = true;
             }
             Screen::Channel => {
                 let Some(members) = vm.active.as_ref().map(|c| &c.members) else {
@@ -759,6 +842,8 @@ impl UiState {
             Nav::Back => {
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
+                    self.selected_message = None;
+                    self.replying = None;
                     return Action::Dispatch(Command::SelectChannel { channel_id: None });
                 }
             }

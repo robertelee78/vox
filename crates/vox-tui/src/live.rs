@@ -37,6 +37,7 @@ use vox_core::node::daemonipc::{
     UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, Request};
+use vox_core::node::link::{b32_decode, b32_encode};
 use vox_core::node::paths::{Account, NodeName};
 use vox_core::node::snapshot::{NodeSnapshot, OpenRoomSnap};
 use zeroize::Zeroizing;
@@ -44,13 +45,16 @@ use zeroize::Zeroizing;
 use crate::app::CoreHandle;
 use crate::viewmodel::{
     ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, NoticeView,
-    Reachability, SyncStatus, Trust, UiError, ViewModel,
+    QuoteView, Reachability, SyncStatus, Trust, UiError, ViewModel,
 };
 use vox_agentcomms::attention::{group, RoomGroup};
 
 /// How often the snapshot is asked again when no event has said anything changed: connections,
 /// tunnels and their last moved byte change without a room event.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
+
+/// How much of a quoted message a reply shows: its first line, to this many characters.
+const QUOTE_CHARS: usize = 80;
 
 /// How the TUI takes its node (ADR-026 L-2, S-4; the decider's ruling of 2026-10-03): it holds it
 /// implicitly, so quitting or SIGHUP drops only its hold, and a node it was the last holder of
@@ -1004,6 +1008,40 @@ impl DaemonCore {
         let Some(t) = self.timeline.as_mut() else {
             return std::sync::Arc::default();
         };
+        let (held, projected) = (&t.rows, &mut t.projected);
+        let name_of = |author: &Digest32| {
+            if me == Some(*author) {
+                "you".to_owned()
+            } else {
+                crate::ident::member_name(trusted, author)
+            }
+        };
+        // **One level** (ADR-028 R-9, #485): the entry `re` names, as this room holds it.
+        let quote_of = |r: &MessageRow| {
+            let re = vox_agentcomms::envelope::Envelope::parse(&r.text)
+                .ok()?
+                .re
+                .and_then(|re| b32_decode(&re.trim().to_ascii_lowercase(), "re").ok())?;
+            let text = held
+                .iter()
+                .find(|p| p.entry_hash == re && !p.owed)
+                .map(|p| {
+                    let words = crate::agent_hook::words(&p.text);
+                    let first = words.lines().next().unwrap_or_default();
+                    let cut: String = first.chars().take(QUOTE_CHARS).collect();
+                    let more =
+                        if first.chars().count() > QUOTE_CHARS || words.lines().nth(1).is_some() {
+                            "…"
+                        } else {
+                            ""
+                        };
+                    format!("{}: {cut}{more}", name_of(&p.author))
+                });
+            Some(QuoteView {
+                entry_hash: re,
+                text,
+            })
+        };
         let readers = |r: &MessageRow| -> String {
             if me != Some(r.author) {
                 return String::new();
@@ -1033,11 +1071,7 @@ impl DaemonCore {
         let view_of = |r: &MessageRow| MessageView {
             entry_hash: r.entry_hash,
             author: r.author,
-            author_nick: if me == Some(r.author) {
-                "you".to_owned()
-            } else {
-                crate::ident::member_name(trusted, &r.author)
-            },
+            author_nick: name_of(&r.author),
             // The wire names addressees by fingerprint; the timeline by this node's own names.
             addressed: if r.owed {
                 String::new()
@@ -1055,33 +1089,71 @@ impl DaemonCore {
             late: r.late,
             read_by: readers(r),
             whereabouts: whereabouts(r),
+            quote: if r.owed { None } else { quote_of(r) },
         };
-        match t.projected.as_mut() {
+        // A quote whose message arrives after its reply is projected again with it.
+        let quoted_late = |p: &Projected| {
+            p.rows.iter().any(|v| {
+                v.quote.as_ref().is_some_and(|q| {
+                    q.text.is_none() && held[p.len..].iter().any(|r| r.entry_hash == q.entry_hash)
+                })
+            })
+        };
+        match projected.as_mut() {
             Some(p)
                 if p.me == me
                     && p.trusted.as_slice() == trusted
                     && p.own == *own
-                    && p.len <= t.rows.len() =>
+                    && p.len <= held.len()
+                    && !quoted_late(p) =>
             {
-                if p.len < t.rows.len() {
-                    std::sync::Arc::make_mut(&mut p.rows)
-                        .extend(t.rows[p.len..].iter().map(view_of));
-                    p.len = t.rows.len();
+                if p.len < held.len() {
+                    std::sync::Arc::make_mut(&mut p.rows).extend(held[p.len..].iter().map(view_of));
+                    p.len = held.len();
                 }
                 std::sync::Arc::clone(&p.rows)
             }
             _ => {
-                let rows = std::sync::Arc::new(t.rows.iter().map(view_of).collect::<Vec<_>>());
-                t.projected = Some(Projected {
+                let rows = std::sync::Arc::new(held.iter().map(view_of).collect::<Vec<_>>());
+                *projected = Some(Projected {
                     me,
                     trusted: trusted.to_vec(),
                     own: own.clone(),
-                    len: t.rows.len(),
+                    len: held.len(),
                     rows: std::sync::Arc::clone(&rows),
                 });
                 rows
             }
         }
+    }
+
+    /// **A reply, as the CLI's `--re` writes one** (ADR-028 R-9, #485): a `say` whose `re` names
+    /// the entry replied to, in the thread that entry is in (or begins), spending a hop of its
+    /// parent's budget (ADR-020 §9). Its parents are the room on screen's rows.
+    fn reply_text(&self, channel_id: Digest32, re: &Digest32, text: &str) -> String {
+        use vox_agentcomms::envelope::{reply_hops_by, Envelope};
+        let held: &[MessageRow] = self
+            .timeline
+            .as_ref()
+            .filter(|t| t.channel_id == channel_id)
+            .map_or(&[], |t| t.rows.as_slice());
+        let text_of = |h: &str| {
+            let h = b32_decode(&h.trim().to_ascii_lowercase(), "re").ok()?;
+            held.iter()
+                .find(|r| r.entry_hash == h)
+                .map(|r| r.text.clone())
+        };
+        let re_b32 = b32_encode(re);
+        let mut reply = Envelope::say(text);
+        reply.thread = Some(
+            text_of(&re_b32)
+                .and_then(|t| Envelope::parse(&t).ok())
+                .and_then(|p| p.thread)
+                .unwrap_or_else(|| re_b32.clone()),
+        );
+        reply.hops = reply_hops_by(&re_b32, text_of);
+        reply.re = Some(re_b32);
+        reply.to_text()
     }
 
     fn project(&mut self) -> ViewModel {
@@ -1640,6 +1712,14 @@ impl CoreHandle for DaemonCore {
                     self.notified.remove(&cid);
                 }
                 CommandStatus::Done
+            }
+            Command::Reply {
+                channel_id,
+                re,
+                text,
+            } => {
+                let text = self.reply_text(channel_id, &re, &text);
+                self.apply(Command::SendText { channel_id, text })
             }
             Command::SendText { channel_id, text } => {
                 let status = self.send(Request::Post { channel_id, text });

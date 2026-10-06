@@ -87,6 +87,18 @@ pub struct MessageView {
     /// R-6): "only on this machine", or "on N of M members' nodes" from what their nodes said they
     /// hold. Empty when the node does not say.
     pub whereabouts: String,
+    /// The one message this replies to, quoted (ADR-028 R-9, #485): the entry its `re` names,
+    /// never that one's own quote or the thread's root.
+    pub quote: Option<QuoteView>,
+}
+
+/// **A reply's quote: one level** (ADR-028 R-9, #485): the message its `re` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuoteView {
+    /// The quoted entry, which selecting the quote jumps to.
+    pub entry_hash: Digest32,
+    /// `alice: its first line`, or `None` while this room does not hold that entry.
+    pub text: Option<String>,
 }
 
 impl MessageView {
@@ -520,6 +532,15 @@ pub enum Command {
         /// The target channel.
         channel_id: Digest32,
         /// The plaintext to send (becomes ciphertext in the core).
+        text: String,
+    },
+    /// Send `text` to a channel as a reply to its entry `re` (ADR-028 R-9, #485).
+    Reply {
+        /// The target channel.
+        channel_id: Digest32,
+        /// The entry replied to.
+        re: Digest32,
+        /// The reply's words.
         text: String,
     },
 }

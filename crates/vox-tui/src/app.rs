@@ -148,7 +148,7 @@ impl CoreHandle for OfflineCore {
         // Offline: do not fabricate delivery. Report a bounded, honest status.
         match command {
             Command::CreateChannel { .. } | Command::Join { .. } => CommandStatus::NeedsNode,
-            Command::SendText { .. } => CommandStatus::NotConnected,
+            Command::SendText { .. } | Command::Reply { .. } => CommandStatus::NotConnected,
             _ => CommandStatus::Queued,
         }
     }
