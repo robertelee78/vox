@@ -8,9 +8,18 @@ struct DecisionsView: View {
     private var events: [DecisionEvent] { model.decisionEvents }
     /// The node the record is filtered to, by fingerprint; nil for every node.
     @State private var about: String?
+    /// The room it is filtered to, by ID; nil for every room and none.
+    @State private var inRoom: String?
 
     private var shown: [DecisionEvent] {
-        events.filter { about == nil || $0.by == about }
+        events.filter { (about == nil || $0.by == about) && (inRoom == nil || $0.room == inRoom) }
+    }
+
+    /// Each room the record names, once, by this node's name for it.
+    private var roomsNamed: [(String, String)] {
+        Set(events.map(\.room).filter { !$0.isEmpty }).map { id in
+            (id, model.rooms.first { $0.id == id }?.name ?? String(id.prefix(12)))
+        }.sorted { $0.1 < $1.1 }
     }
 
     /// Each node the record names, once, by this node's name for it.
@@ -31,6 +40,12 @@ struct DecisionsView: View {
                 }
                 .frame(width: 220)
                 .accessibilityIdentifier("decisions-about")
+                Picker("Room", selection: $inRoom) {
+                    Text("every room").tag(String?.none)
+                    ForEach(roomsNamed, id: \.0) { Text($0.1).tag(String?.some($0.0)) }
+                }
+                .frame(width: 220)
+                .accessibilityIdentifier("decisions-room")
             }
             Text("What this node refused, and every change of who reaches it, kept 14 days and "
                 + "never sent anywhere. Newest first.").secondaryText()

@@ -179,6 +179,8 @@ pub struct DecisionEvent {
     pub decided: String,
     /// Why, in this node's words.
     pub why: String,
+    /// The room it concerns, by its ID; empty for a decision about no room.
+    pub room: String,
 }
 
 /// Who has read one of this node's own messages (ADR-028 R-6).
@@ -1577,6 +1579,7 @@ impl VoxClient {
                         alias: text(&v, "alias"),
                         decided: text(&v, "decided"),
                         why: text(&v, "why"),
+                        room: text(&v, "room"),
                     })
                 })
                 .collect();
