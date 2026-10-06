@@ -58,6 +58,53 @@ check_real() {
     fi
 }
 
+# **Preflight: everything this run needs, checked in seconds, before any build.**
+# The app this run proves: the one given, or the one it builds here.
+if [ -n "${VOX_PROOF_APP:-}" ]; then
+    APP="$(cd "$VOX_PROOF_APP" && pwd)"
+else
+    APP="$DERIVED/Build/Products/Release/Vox.app"
+fi
+# **No other Vox.app is registered** (APPARATUS before anything runs): LaunchServices opens a
+# registered us.vox.app for a notification click, Spotlight, Launchpad or a login item's lookup,
+# with none of this run's scratch directories, so on the person's real profile. Only this run's
+# own build may be registered, and it is unregistered when the run ends.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+vox_registrations() {
+    "$LSREGISTER" -dump 2>/dev/null \
+        | awk '/^path:/{p=$0} /identifier: +us\.vox\.app$/{print p}' \
+        | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u
+}
+STRAY="$(vox_registrations | grep -vxF "$APP" || true)"
+if [ -n "$STRAY" ]; then
+    echo "app-proofs: APPARATUS (precondition unmet): other Vox.app builds are registered with" \
+        "LaunchServices, and any of them can be opened on the real profile; unregister them" \
+        "(lsregister -u <path>, registration only) before a run:" >&2
+    echo "$STRAY" >&2
+    exit 2
+fi
+# UI automation: developer mode on (the one-time approval macOS asks for is not readable here;
+# without it xcodebuild says so at once, below).
+if ! DevToolsSecurity -status 2>/dev/null | grep -q "enabled"; then
+    echo "app-proofs: APPARATUS (precondition unmet): developer mode is off, so UI automation cannot" \
+        "run; turn it on (DevToolsSecurity -enable, the person's own step), then run again" >&2
+    exit 2
+fi
+# The build: the commit it is made from, said first, and refused if it is not the one asked for.
+HEAD_SHA="$(git rev-parse --short=8 HEAD)"
+DIRTY="$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')"
+echo "app-proofs: preflight: building $HEAD_SHA ($DIRTY file(s) changed since it); no login item" \
+    "loaded; no other Vox.app registered; developer mode on"
+if [ -n "${VOX_PROOF_SHA:-}" ] && [ "${HEAD_SHA}" != "${VOX_PROOF_SHA:0:8}" -o "$DIRTY" != 0 ]; then
+    echo "app-proofs: APPARATUS (precondition unmet): asked to prove $VOX_PROOF_SHA, and the tree is" \
+        "$HEAD_SHA with $DIRTY file(s) changed" >&2
+    exit 2
+fi
+# Notifications: whether Vox may notify is not readable from a script on this macOS; the
+# notification case (FirstRunProof/testNotificationSaysWhoWroteNeverWhat) asks the app first
+# and stops at once, APPARATUS, if the app says notifications are off.
+echo "app-proofs: preflight: whether Vox may notify is checked first by the notification case"
+
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh
 cargo build --release --bin vox
 
@@ -83,24 +130,6 @@ else
     codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
 fi
 
-# **No other Vox.app is registered** (APPARATUS before anything runs): LaunchServices opens a
-# registered us.vox.app for a notification click, Spotlight, Launchpad or a login item's lookup,
-# with none of this run's scratch directories, so on the person's real profile. Only this run's
-# own build may be registered, and it is unregistered when the run ends.
-LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-vox_registrations() {
-    "$LSREGISTER" -dump 2>/dev/null \
-        | awk '/^path:/{p=$0} /identifier: +us\.vox\.app$/{print p}' \
-        | sed -E 's/^path: *//; s/ \(0x[0-9a-f]+\)$//' | sort -u
-}
-STRAY="$(vox_registrations | grep -vxF "$APP" || true)"
-if [ -n "$STRAY" ]; then
-    echo "app-proofs: APPARATUS (precondition unmet): other Vox.app builds are registered with" \
-        "LaunchServices, and any of them can be opened on the real profile; unregister them" \
-        "(lsregister -u <path>, registration only) before a run:" >&2
-    echo "$STRAY" >&2
-    exit 2
-fi
 trap_unregister() { "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true; }
 
 # The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
@@ -136,6 +165,14 @@ only=()
 for class in "$@"; do
     only+=("-only-testing:VoxAppProofs/$class")
 done
+# The notification case needs a person at the Mac (Vox allowed to notify, no Focus on): left out
+# of a run that names nothing, and said so; run alone, in about a minute, by naming it.
+NOTIFY=FirstRunProof/testNotificationSaysWhoWroteNeverWhat
+if [ "$#" -eq 0 ]; then
+    only+=("-skip-testing:VoxAppProofs/$NOTIFY")
+    echo "app-proofs: OPTIONAL PROOF NOT RUN: $NOTIFY (it needs a person at the Mac); run it" \
+        "alone with: scripts/app-proofs.sh $NOTIFY" >&2
+fi
 # Every red names its side: a red the suite reports is the product's or the proof's own, said in
 # its failure message (PRODUCT: or APPARATUS:); a runner that never started is the machine's.
 status=0

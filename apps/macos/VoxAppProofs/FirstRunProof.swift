@@ -30,7 +30,8 @@
 // 7. The lanes view (ADR-014 M-15, ADR-028 W-3, #442): bob posting `working` without a claim is
 //    not working; once he claims a resource and posts `working`, his lane's chip says working;
 //    ⌘O there opens the file panel, as on the timeline.
-// 8. Notifications (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
+// 8. Notifications, a case of its own (testNotificationSaysWhoWroteNeverWhat), the one step that
+//    needs a person at the Mac (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
 //    to alice posts one local notification, titled with the room, saying who wrote to her, and
 //    never the message's text. Preconditions, not the proof's to arrange: Vox allowed to notify
 //    (the app says "notifications off" otherwise, an APPARATUS red) and no Focus on.
@@ -162,6 +163,105 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(answer.trimmingCharacters(in: .whitespacesAndNewlines), "no",
                        "PRODUCT: Turn Keep Running Off must keep the answer as Not Now; the answer file says \(answer.debugDescription)")
         print("[proof] login item: quoted \"\(quoted)\"; after Turn Keep Running Off the answer is \(answer.debugDescription)")
+    }
+
+    /// (8) Notifications (ADR-014 M-23, ADR-028 R-10, #448), alone: the one step that needs a
+    /// person at the Mac, so it is run by itself, in about a minute, with no replay of the
+    /// journey. Staged by `vox` alone: alice and bob, a room of alice's that bob joined, each
+    /// trusting the other, alice attached; the app opens as alice, chosen before (first run
+    /// done). With the keyring on screen, bob's message to alice posts one local notification
+    /// saying who wrote to her, and never the message's text. Vox not allowed to notify is said
+    /// first, by the app's own status bar: APPARATUS, at once.
+    func testNotificationSaysWhoWroteNeverWhat() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let app = URL(fileURLWithPath: appPath)
+        let vox = app.appendingPathComponent("Contents/Helpers/vox").path
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("notify")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        let bobSession = voxEnv.merging(["VOX_SESSION": "bob-proof"]) { $1 }
+        let pass = { (name: String) in root.appendingPathComponent("\(name).pass").path }
+        try stager.write(Data("alice identity\n".utf8), to: pass("alice"))
+        try stager.write(Data("bob identity\n".utf8), to: pass("bob"))
+        try stager.write(Data("notify room\n".utf8), to: pass("room"))
+        try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+        try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+        daemon = try start(vox, ["daemon", "--listen", "127.0.0.1:0"], env: voxEnv,
+                           until: "vox daemon: control socket")
+        for (name, words) in [("alice", "alice identity"), ("bob", "bob identity")] {
+            try staged(vox, ["node", "create", name],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": words]) { $1 })
+            try staged(vox, ["node", "attach", name, "--passphrase-file", pass(name)], env: voxEnv)
+        }
+        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", pass("room"),
+                         "--name", "notify"], env: voxEnv)
+        let room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+            $0.contains(" notify")
+        }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+            $0.hasPrefix("vox://")
+        }
+        try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", pass("room"), link],
+                   env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
+                         "--identity-passphrase-file", pass("alice")], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
+                         "--identity-passphrase-file", pass("bob")], env: voxEnv)
+        // Forward-only keys: bob posts until one is readable to alice.
+        var readable = false
+        let staging = Date().addingTimeInterval(120)
+        var n = 0
+        while !readable && Date() < staging {
+            n += 1
+            try staged(vox, ["room", "post", "--node", "bob", room, "STAGE-\(n)"], env: voxEnv)
+            Thread.sleep(forTimeInterval: 1)
+            readable = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out.contains("STAGE-")
+        }
+        guard readable else { throw Apparatus("alice never read a post of bob's in 120 s") }
+
+        let ui = XCUIApplication(url: app)
+        ui.launchEnvironment = voxEnv
+        try scratchOnly(ui.launchEnvironment, under: scratchPath)
+        ui.launch()
+        defer {
+            ui.terminate()
+            _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
+        }
+        present(ui, ui.descendants(matching: .any)["attached"], timeout: 60,
+                "the app, its node chosen before, must open attached as alice")
+        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
+        // Asked first: whether the app may notify, in its own status bar.
+        let statusNow = words(ui, ui.descendants(matching: .any)["status"], timeout: 10,
+                              "the window must have a status bar") ?? ""
+        if statusNow.contains("notifications off") {
+            throw Apparatus("Vox is not allowed to notify on this Mac: allow it in System Settings, Notifications, Vox, then run again; the app said \(statusNow)")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "SECRET-TEXT-8"],
+                   env: bobSession)
+        let centre = XCUIApplication(bundleIdentifier: "com.apple.notificationcenterui")
+        let banner = centre.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "bob wrote to you",
+                                  "bob wrote to you")).firstMatch
+        if !banner.waitForExistence(timeout: 30) {
+            let there = centre.descendants(matching: .any).allElementsBoundByIndex.prefix(30).map(shown)
+                .filter { !$0.isEmpty }
+            XCTFail("PRODUCT: bob's message to alice in a room off screen posted no notification saying \"bob wrote to you\" (Vox's status bar says it may notify: \(statusNow)); Notification Center shows: \(there)")
+        }
+        let leaked = centre.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+                                  "SECRET-TEXT-8", "SECRET-TEXT-8")).firstMatch
+        // Only where the banner itself was read: a query that reads nothing in Notification Center
+        // would pass this for nothing.
+        if banner.exists && leaked.exists {
+            XCTFail("PRODUCT: a notification must not carry the message's text; one said \(shown(leaked))")
+        }
+        print("[proof] notification: \(shown(banner))")
     }
 
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
@@ -525,33 +625,8 @@ final class FirstRunProof: XCTestCase {
         }
         tap(lanesToggle.buttons["Timeline"], "Timeline")
 
-        // (8) Notifications: the room off screen, bob writes to alice.
-        tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
-        let statusNow = words(ui, ui.descendants(matching: .any)["status"], timeout: 10,
-                              "the window must have a status bar") ?? ""
-        if statusNow.contains("notifications off") {
-            throw Apparatus("Vox is not allowed to notify on this Mac: allow it in System Settings, Notifications, Vox, then run again; the app said \(statusNow)")
-        }
-        try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "SECRET-TEXT-8"],
-                   env: bobSession)
-        let centre = XCUIApplication(bundleIdentifier: "com.apple.notificationcenterui")
-        let banner = centre.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", "bob wrote to you",
-                                  "bob wrote to you")).firstMatch
-        if !banner.waitForExistence(timeout: 30) {
-            let there = centre.descendants(matching: .any).allElementsBoundByIndex.prefix(30).map(shown)
-                .filter { !$0.isEmpty }
-            XCTFail("PRODUCT: bob's message to alice in a room off screen posted no notification saying \"bob wrote to you\" (Vox's status bar says it may notify: \(statusNow)); Notification Center shows: \(there)")
-        }
-        let leaked = centre.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
-                                  "SECRET-TEXT-8", "SECRET-TEXT-8")).firstMatch
-        // Only where the banner itself was read: a query that reads nothing in Notification Center
-        // would pass this for nothing.
-        if banner.exists && leaked.exists {
-            XCTFail("PRODUCT: a notification must not carry the message's text; one said \(shown(leaked))")
-        }
-        print("[proof] notification: \(shown(banner))")
+        // (8) Notifications are their own case, testNotificationSaysWhoWroteNeverWhat: the one
+        // step that needs a person at the Mac (Vox allowed to notify, no Focus on), run alone.
 
         // (9) Keys. Two quiet rooms of alice's, made here; each takes a post of hers, so the app
         // learns of it, and her own posts are never unread.
