@@ -72,6 +72,16 @@ holds; that member then sees both rooms by their room IDs, in `vox room list`, `
 addresses, and is told why once, until one of them is renamed. A verb given that name is refused
 and names both IDs.
 
+`vox room join` ends by saying who reads whom, member by member, with the step each of you has
+left:
+
+```text
+vox: joined family
+     you read a member once you trust it and it trusts you: `vox trust add`
+     who reads whom:
+     · y2vem5l7ay2tsmkw7xcnkk3aw2 — not in keyring: to read each other, you run `vox trust add y2vem5l7ay2tsmkw7xcnkk3aw2asho4ewvalrixyyosuojndarca --name NAME`; if they have not trusted you, they run `vox trust add 74v3tydsnq4kk27yd2p46hft2hvj7b5jfydmks5s35gdzwelardq`
+```
+
 Joining a room your node already holds updates where it finds the room's members; it is not
 refused. Confirm with `room list` and `room roster`, then compare and exchange trust as needed.
 [Your first shared room](first-room.md) shows the complete sequence.
@@ -156,6 +166,14 @@ set `notify-command = PROGRAM` in the node's own `config/config` file, else in y
 `config` (see [Commands and local state](reference.md)), or set `VOX_NOTIFY_COMMAND`. Vox runs it
 as `PROGRAM TITLE BODY`.
 
+### Links
+
+A message with a link gets a link card: your node fetches the page once, when you post, and puts
+its title, description and a small image (at most 16 KB) into the encrypted message. Readers'
+nodes never contact the site. `vox room read` shows it under the message as `↳ link: Example
+Domain`. Your node fetches only from public addresses: a link to this machine, your local network
+or another private address goes without a card. `vox room post --no-card` posts without one.
+
 ### Replies
 
 A reply names the one message it answers (`--re` on the command line; Ctrl-R on a selected
@@ -167,7 +185,8 @@ far back it is. There are no threads to open: a reply quotes one message, and th
 
 When a node joins a room, each member's TUI says so and names which of the nodes in its keyring
 trust the newcomer, for example `FINGERPRINT (not in keyring) joined. alice trusts it.` or
-`FINGERPRINT (not in keyring) joined. No one you trust trusts it yet.` This adds nothing to your keyring: it tells you whom to ask before
+`FINGERPRINT (not in keyring) joined. No one you trust trusts it yet.`, followed by the one trust
+action, `· :trust` and the start of its fingerprint. This adds nothing to your keyring: it tells you whom to ask before
 you decide.
 
 ### Characters you cannot see
@@ -212,6 +231,10 @@ The duration is `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. I
 deletes older messages. It asks for no passphrase. Before it acts, Vox says what it is to do:
 `vox: about to set how long "family" keeps messages: 1 week`. It says plainly that a modified node
 can keep everything: retention is housekeeping, not a security property.
+
+In the TUI the room's header always shows its retention (`Timeline · ⏱ 1 week`), and a change
+appears in every member's timeline: `alice set the room's retention to 1 week: messages older than
+1 week are removed from now on`.
 
 A member who is not an admin can only keep less on its own node. The same command then reports
 `set your own retention for … this node keeps its messages for 1 hour` and that nothing changed

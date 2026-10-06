@@ -153,25 +153,29 @@ membership and connectivity using [Troubleshooting](troubleshooting.md#we-joined
 
 `vox` with no arguments, or `vox tui`, opens the interactive client. It is a client of the same
 daemon, so it runs beside the CLI and any agent sessions; you do not stop anything to use it.
-`:attach` attaches your node if it is not attached, and `:node NAME` acts as another of your
-nodes.
+`:attach` attaches your node if it is not attached. A TUI acts only as the node it was opened
+with; to act as another, open another: `vox tui --node spare`.
 
 On the room list: `:new` creates a room and `:join` takes a room link, both through a masked
 passphrase prompt; Enter or `:open` opens the selected room; `t` or `:tunnels` lists live
 tunnels; `k` or `:keyring` shows your keyring; Ctrl-N opens the next room with a message to you.
-In a room, Tab moves between the timeline, the composer and the members pane:
+In a room, Tab moves between the timeline, the composer, the members pane and the Shared pane:
 
 - In the composer, Enter sends. `@alice` in the text addresses alice: the message carries her
   whole fingerprint, as `vox room post --to` does.
 - In the timeline, Up and Down select a message, Ctrl-R replies to it, quoting it, and Enter on a
   reply's quote jumps to the message it answers.
+- In the Shared pane, each service shared in the room is listed with its commands; `y` copies the
+  selected one to your clipboard. `:serve` shares one of yours there, picked from what listens on
+  this machine.
 - `:link` prints the room link, `:rename NAME` renames the room for every member (creator or
   admin only), `:close` closes it on this node, `:leave` leaves it and `:end` ends it for everyone
   (creator or admin only); each of the last two asks you to type its word first. `:back` or Esc
   returns to the list.
 
-`:quit` exits. The members pane states trust by glyph and in words, such as `⇄ alice` and `in
-keyring · reads you`. Use the same fingerprints and room IDs whichever client you choose.
+`:quit` exits. The members pane states trust by glyph and in words, such as `⇄ alice` and `trusted
+both ways`; `t` on a member, or `:trust`, trusts it (see [Identity and keyring](keyring.md#trust-from-the-tui)).
+`d` or `:decisions` on the room list shows the [decision record](reference.md#the-decision-record). Use the same fingerprints and room IDs whichever client you choose.
 
 Next: [Rooms and messages](rooms.md), or [Identity and keyring](keyring.md).
 
