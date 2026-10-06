@@ -374,7 +374,7 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     //
     //    Since ADR-026 the host makes its node first (C-3: a verb acts as a node that
     //    exists), and the trust is made with that node attached (L-2).
-    let (ok, _, err) = vox_once(&host_dir, &["id".into()]);
+    let (ok, host_id, err) = vox_once(&host_dir, &["id".into()]);
     assert!(ok, "PRODUCT (staging): vox id (host): {err}");
     let (ok, guest_id, err) = vox_once(&guest_dir, &["id".into()]);
     assert!(
@@ -386,6 +386,22 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         guest_fp.len(),
         52,
         "PRODUCT: a fingerprint is 52 base32 characters, alone on the line: {guest_fp:?}"
+    );
+    // The guest names the host in its own words, so the readable addresses on the two machines
+    // differ (ADR-028 S-1a): a copied command works there only if it carries the canonical one.
+    let (ok, out, err) = vox_once(
+        &guest_dir,
+        &[
+            "trust".into(),
+            "add".into(),
+            host_id.trim().to_owned(),
+            "--name".into(),
+            "nas-box".into(),
+        ],
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the guest names the host: {out}{err}"
     );
     let (ok, out, err) = vox_once(
         &host_dir,
