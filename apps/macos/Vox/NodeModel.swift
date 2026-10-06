@@ -717,7 +717,12 @@ final class NodeModel: ObservableObject {
             notifier.post(message, room: room, roomName: name, me: me)
         }
         if case .room(room) = selection {
-            if !messages.contains(where: { $0.id == message.id }) {
+            // A message already shown is replaced: one whose body had not arrived ("not received
+            // yet", owed) is shown, and read, once it has; before, it stayed owed until the room
+            // was opened again, and was never read.
+            if let i = messages.firstIndex(where: { $0.id == message.id }) {
+                messages[i] = message
+            } else {
                 messages.append(message)
             }
             return

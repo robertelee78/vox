@@ -225,6 +225,9 @@ private struct RoomView: View {
                     }
                     .background(WindowReader(seen: window))
                     .onChange(of: window.seen) { _ in markSeen() }
+                    // A row whose body has just arrived is read now, even if its frame is
+                    // unchanged (no new measure to trigger it).
+                    .onChange(of: model.messages) { _ in markSeen() }
                     // A file dropped on the timeline, or pasted into it, is attached (M-24, F-1).
                     .onDrop(of: [.fileURL], isTargeted: nil) { providers in
                         firstFile(in: providers) { attaching = Attaching(url: $0) }
