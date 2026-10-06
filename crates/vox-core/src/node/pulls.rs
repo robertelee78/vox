@@ -9,6 +9,11 @@
 //! place, under `<data root>/nodes/<node>/files/<room>/`, never over anything already there.
 //! Nothing is written outside the node's files directory.
 //!
+//! **A pull never fills the disk.** Whatever its size, a share is pulled only while it leaves
+//! [`RESERVE`] free on the disk it lands on, which also holds the node's store: one that would not
+//! is not dialled, and the node says so once; it is looked at again on every scan and pulled when
+//! there is room. A transfer re-checks every [`CHECK_EVERY`] bytes and stops below the reserve.
+//!
 //! Each pull is recorded in `<node>/pulls/<entry>.<nonce>.json`, by this daemon or by `vox room
 //! get` into the same directory, so it is not pulled again, and so what was pulled can be found by
 //! its announcement.
@@ -44,6 +49,77 @@ const RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// How long one read of a transfer may wait before the pull is abandoned and tried again.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a pull must leave free on the disk it lands on: enough that the node's store and the
+/// system can still write.
+pub const RESERVE: u64 = 1_000_000_000;
+
+/// How many bytes a transfer writes between looks at the free space.
+pub const CHECK_EVERY: u64 = 64 << 20;
+
+/// Free bytes for this user on the disk holding `dir`.
+///
+/// # Errors
+/// The disk cannot be asked.
+pub fn free_space(dir: &Path) -> Result<u64, String> {
+    let s = rustix::fs::statvfs(dir)
+        .map_err(|e| format!("cannot read the free space of {}: {e}", dir.display()))?;
+    // The field's width differs by platform.
+    #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+    let unit = u64::try_from(s.f_frsize).unwrap_or(0).max(1);
+    Ok(s.f_bavail.saturating_mul(unit))
+}
+
+/// Why `size` more bytes may not land in `dir`: a clause ending with what is free, or `None` when
+/// they may. A disk that cannot be asked refuses nothing here; a write that fails says why.
+#[must_use]
+pub fn short_of_space(dir: &Path, size: u64) -> Option<String> {
+    let free = free_space(dir).ok()?;
+    (size.saturating_add(RESERVE) > free).then(|| {
+        format!(
+            "it would leave less than {} free on the disk holding {} ({} free now)",
+            bytes(RESERVE),
+            dir.display(),
+            bytes(free)
+        )
+    })
+}
+
+/// A size as a person reads it: `12.0 GB`, `3.4 MB`, `512 bytes`.
+#[must_use]
+pub fn bytes(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let f = n as f64;
+    match n {
+        0..=999 => format!("{n} bytes"),
+        1_000..=999_999 => format!("{:.1} KB", f / 1e3),
+        1_000_000..=999_999_999 => format!("{:.1} MB", f / 1e6),
+        1_000_000_000..=999_999_999_999 => format!("{:.1} GB", f / 1e9),
+        _ => format!("{:.1} TB", f / 1e12),
+    }
+}
+
+/// Whether a transfer into `dir` that has written `since` bytes since its last look must stop: it
+/// looks every [`CHECK_EVERY`] bytes, and stops below [`RESERVE`].
+///
+/// # Errors
+/// The sentence that stops it.
+pub fn still_room(dir: &Path, since: &mut u64, written: u64) -> Result<(), String> {
+    *since += written;
+    if *since < CHECK_EVERY {
+        return Ok(());
+    }
+    *since = 0;
+    match free_space(dir) {
+        Ok(free) if free < RESERVE => Err(format!(
+            "stopped: the disk holding {} has less than {} free ({} free now)",
+            dir.display(),
+            bytes(RESERVE),
+            bytes(free)
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// A share this node may pull: what its announcement says.
 #[derive(Debug, Clone)]
@@ -195,6 +271,9 @@ pub(crate) struct Pulls {
     paths: Paths,
     cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
     view: watch::Receiver<NodeView>,
+    events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>,
+    /// Entries held back for want of room on the disk, already said once.
+    short: Mutex<HashSet<Digest32>>,
     /// Entries decided for good: pulled, or never this node's to pull.
     settled: Mutex<HashSet<Digest32>>,
     pending: Mutex<BTreeMap<Digest32, State>>,
@@ -257,8 +336,11 @@ impl Pulls {
         paths: Paths,
         cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
         view: watch::Receiver<NodeView>,
+        events: tokio::sync::broadcast::Sender<crate::node::api::NodeEvent>,
     ) {
         let pulls = Arc::new(Self {
+            events,
+            short: Mutex::new(HashSet::new()),
             settled: Mutex::new(recorded(&paths).into_iter().map(|p| p.entry).collect()),
             paths,
             cmd,
@@ -354,6 +436,33 @@ impl Pulls {
         for offer in found {
             if running >= AT_ONCE {
                 break;
+            }
+            // **Not dialled while it would fill the disk**, and said once; looked at again on the
+            // next scan rather than retried on a timer.
+            let dir = room_dir(&self.paths, &offer.room);
+            let _ = crate::node::paths::create_private_dir(&dir);
+            if let Some(why) = short_of_space(&dir, offer.size) {
+                if self.short.lock().await.insert(offer.entry) {
+                    let who = self
+                        .view
+                        .borrow()
+                        .trusted
+                        .iter()
+                        .find(|(fp, _)| *fp == offer.author)
+                        .map_or_else(
+                            || b32_encode(&offer.author)[..12].to_owned(),
+                            |(_, n)| n.clone(),
+                        );
+                    let _ = self.events.send(crate::node::api::NodeEvent::NodeNote {
+                        note: format!(
+                            "not pulled: {} ({}) from {who} — {why}; it is pulled when there is \
+                             room, or with `vox room get`",
+                            safe_file_name(&offer.name),
+                            bytes(offer.size)
+                        ),
+                    });
+                }
+                continue;
             }
             let wait = match pending.get(&offer.entry) {
                 Some(State::Running) => continue,
@@ -503,13 +612,16 @@ async fn receive(bound: std::net::SocketAddr, part: &Path, offer: &Offer) -> Res
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total: u64 = 0;
-    let mut take = |bytes: &[u8], total: &mut u64| -> Result<(), String> {
-        *total += bytes.len() as u64;
+    let dir = part.parent().unwrap_or(part).to_path_buf();
+    let mut since = 0u64;
+    let mut take = |chunk: &[u8], total: &mut u64| -> Result<(), String> {
+        *total += chunk.len() as u64;
         if *total > offer.size {
             return Err("the sharer sent more than it announced".into());
         }
-        hasher.update(bytes);
-        file.write_all(bytes)
+        still_room(&dir, &mut since, chunk.len() as u64)?;
+        hasher.update(chunk);
+        file.write_all(chunk)
             .map_err(|e| format!("writing the pull: {e}"))
     };
     if offer.http {

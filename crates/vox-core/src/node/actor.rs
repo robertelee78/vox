@@ -4573,6 +4573,7 @@ impl Node {
             node.paths.clone(),
             cmd_tx.downgrade(),
             node.view_tx.subscribe(),
+            handle_event_tx.clone(),
         );
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {

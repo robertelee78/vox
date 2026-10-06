@@ -2992,6 +2992,16 @@ async fn collect_offer(
         }
     };
 
+    // **A pull never fills the disk** (ADR-028 F-3): one that would leave less than the reserve
+    // free is refused before anything is dialled.
+    if let Some(why) = vox_core::node::pulls::short_of_space(&dest.dir(), offer.size) {
+        return Err(AppError::Usage(format!(
+            "refusing to pull {} ({}): {why}",
+            safe_file_name(&offer.name),
+            vox_core::node::pulls::bytes(offer.size)
+        )));
+    }
+
     // **Why a transfer failed is the node's to say** (ADR-020 11.8): followed from before the
     // forward opens, so its refusal is not missed.
     let mut events = match crate::client::one_shot(paths) {
@@ -3176,7 +3186,7 @@ async fn collect(
                 dir.display()
             ))
         })?;
-    let result = receive(bound, file, offer).await;
+    let result = receive(bound, file, &dir, offer).await;
     let total = match result {
         Ok(total) => total,
         Err(e) => {
@@ -3235,7 +3245,14 @@ fn place(part: &Path, dest: &Destination) -> Result<std::path::PathBuf, AppError
 
 /// Read the transfer into `file`, refusing more bytes than were announced, a stall, and any
 /// result whose SHA-256 is not the announced one. Returns the byte count.
-async fn receive(bound: &str, mut file: std::fs::File, offer: &Offer) -> Result<u64, AppError> {
+async fn receive(
+    bound: &str,
+    mut file: std::fs::File,
+    dir: &std::path::Path,
+    offer: &Offer,
+) -> Result<u64, AppError> {
+    // **A pull never fills the disk** (ADR-028 F-3): it stops below the reserve.
+    let mut since = 0u64;
     use sha2::{Digest as _, Sha256};
     use tokio::io::AsyncReadExt as _;
 
@@ -3303,6 +3320,8 @@ async fn receive(bound: &str, mut file: std::fs::File, offer: &Offer) -> Result<
                 offer.size
             )));
         }
+        vox_core::node::pulls::still_room(dir, &mut since, n as u64)
+            .map_err(|e| AppError::Usage(format!("{e}; nothing was kept")))?;
         hasher.update(&buf[..n]);
         std::io::Write::write_all(&mut file, &buf[..n])
             .map_err(|e| AppError::Usage(format!("writing the download: {e}")))?;

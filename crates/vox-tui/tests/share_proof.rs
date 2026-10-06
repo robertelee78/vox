@@ -23,7 +23,8 @@
 //! Mutants: post the note as a message of its own (red: two rows carry the note); serve only while
 //! `vox share` runs (red: bob's curl gets nothing after it exits); a share keeps a fresh hop budget
 //! (red: the folder's announcement carries the default, not its parent's less one); pull a share
-//! addressed to another node (red: bob's node pulls carol's).
+//! addressed to another node (red: bob's node pulls carol's); pull whatever the disk has free (red:
+//! bob's node and `vox room get` try a 2^60-byte share).
 
 #![cfg(unix)]
 
@@ -502,6 +503,36 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     let (carols_get_ok, carols_get_said) = bob.run(&["room", "get", &room, "for-carol.txt"]);
     let bob_got_carols = std::fs::read(bob_dl.join("for-carol.txt")).unwrap_or_default();
 
+    // **A pull never fills the disk** (#495): alice, as a test-side attacker, announces a share of
+    // 2^60 bytes, more than any disk has free. bob's node must not pull it, must say why once, and
+    // `vox room get` must refuse it before dialling, saying why.
+    let huge = format!(
+        r#"{{"v":1,"type":"file","body":"a share no disk can hold","data":{{"name":"huge.bin","size":{},"sha256":"{}","tag":"file-0000000000000000-0000000000000000","http":true}}}}"#,
+        1u64 << 60,
+        "0".repeat(64)
+    );
+    let (huge_ok, huge_said) = alice.run(&["room", "post", &room, &huge]);
+    assert!(
+        huge_ok,
+        "PRODUCT (staging): alice posts the oversized announcement: {huge_said}"
+    );
+    bob.sees(&room, "huge.bin");
+    let short_note = bob
+        .daemon
+        .as_mut()
+        .expect("APPARATUS: bob's daemon")
+        .line_within(Duration::from_secs(10), |l| {
+            l.contains("not pulled: huge.bin")
+        });
+    let huge_landed: Vec<String> = std::fs::read_dir(&bob_dl)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("huge.bin"))
+        .collect();
+    let (huge_get_ok, huge_get_said) = bob.run(&["room", "get", &room, "huge.bin"]);
+
     // A folder, as one tar, shared as a reply to the report's announcement; then stopped by hand
     // (`vox share stop`). **A share follows a post's hop rule** (ADR-020 §9): a reply carries its
     // `re` and spends a hop of its parent's budget, so agents sharing back and forth cannot wake
@@ -617,6 +648,26 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         carols_get_ok && bob_got_carols == b"carol's eyes only, by address",
         "PRODUCT: bob may still pull the share for carol with `vox room get`; it said (ok \
          {carols_get_ok}): {carols_get_said}"
+    );
+    assert!(
+        short_note.as_deref().is_some_and(|l| l.contains(
+            "it would leave less than 1.0 GB free \
+            on the disk holding"
+        ) && l.contains("it is pulled when there is room")),
+        "PRODUCT: bob's node must say once why it does not pull a share larger than its disk's \
+         free space; his daemon said: {short_note:?}"
+    );
+    assert!(
+        huge_landed.is_empty(),
+        "PRODUCT: bob's node must write nothing of a share larger than its disk's free space; \
+         his files directory holds {huge_landed:?}"
+    );
+    assert!(
+        !huge_get_ok
+            && huge_get_said.contains("refusing to pull huge.bin (")
+            && huge_get_said.contains("free on the disk holding"),
+        "PRODUCT: `vox room get` must refuse a share larger than the disk's free space before \
+         dialling, saying why; it said (ok {huge_get_ok}): {huge_get_said}"
     );
     // #494: served by the daemon once `vox share` has exited.
     assert!(
