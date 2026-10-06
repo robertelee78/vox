@@ -42,6 +42,18 @@ const PARTIAL: &str = ".Vox.app.partial";
 const UNPACK_PARTIAL: &str = ".Vox.app.unpack.partial";
 /// The CLI inside the bundle.
 const HELPER: &str = "Contents/Helpers/vox";
+/// The journal of a publish under way: it holds the version being published and the bundle that
+/// was [`PREVIOUS`], so a publish cut short is finished or undone by the next transition
+/// ([`recover`]) instead of losing the replaced bundle.
+const PUBLISHING: &str = ".Vox.app.publishing";
+/// In [`PUBLISHING`]: the version the publish puts in place.
+const PUBLISHING_VERSION: &str = "version";
+
+/// **Test-only**: abort the process right after a publish's swap, before the replaced bundle is
+/// renamed to [`PREVIOUS`], so a proof can stand a publish cut short at its one awkward moment.
+/// Nothing a person runs sets it; not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+const TEST_ABORT_AFTER_SWAP_ENV: &str = "VOX_TEST_ABORT_AFTER_SWAP";
 
 /// `vox update [--check]` for the Vox.app in `apps`.
 ///
@@ -81,6 +93,9 @@ pub(super) fn update(
         return Ok(());
     }
 
+    // The lock first: what is in `apps` is read only while no other transition changes it.
+    let _lock = InstallLock::acquire(apps)?;
+    recover(apps)?;
     let active = apps.join(BUNDLE);
     if !active.join(HELPER).is_file() {
         return Err(usage(format!(
@@ -88,7 +103,6 @@ pub(super) fn update(
             apps.display()
         )));
     }
-    let _lock = InstallLock::acquire(apps)?;
 
     let mut downloading = tempfile::Builder::new()
         .prefix("vox-update.")
@@ -107,7 +121,7 @@ pub(super) fn update(
         let _ = clear(&staged);
         return Err(refused);
     }
-    publish(apps)?;
+    publish(apps, &vox.version_text)?;
 
     println!("updated: {} -> Vox {}", active.display(), vox.version_text);
     println!(
@@ -128,6 +142,7 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
     let active = apps.join(BUNDLE);
     let previous = apps.join(PREVIOUS);
     let _lock = InstallLock::acquire(apps)?;
+    recover(apps)?;
     if !previous.join(HELPER).is_file() {
         return Err(usage(format!(
             "no previous Vox.app was retained in {} — nothing to roll back to",
@@ -162,15 +177,73 @@ fn swap(a: &Path, b: &Path) -> Result<(), AppError> {
 }
 
 /// Make the verified `.Vox.app.partial` the bundle, keeping the one it replaces.
-fn publish(apps: &Path) -> Result<(), AppError> {
+///
+/// **Journalled** ([`PUBLISHING`]): the bundle that was [`PREVIOUS`] is moved into the journal
+/// rather than removed, so a swap that fails puts it back, and a publish cut short between the
+/// swap and the rename (which leaves the replaced bundle under the partial name) is finished by
+/// [`recover`] rather than having that bundle cleared as scratch.
+fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
     let staged = apps.join(PARTIAL);
     let previous = apps.join(PREVIOUS);
-    clear(&previous)?;
-    swap(&staged, &apps.join(BUNDLE))?;
+    let journal = apps.join(PUBLISHING);
+    clear(&journal)?;
+    fs::create_dir(&journal).map_err(AppError::Io)?;
+    fs::write(journal.join(PUBLISHING_VERSION), version).map_err(AppError::Io)?;
+    if fs::symlink_metadata(&previous).is_ok() {
+        fs::rename(&previous, journal.join(BUNDLE)).map_err(AppError::Io)?;
+    }
     sync_dir(apps)?;
+    if let Err(failed) = swap(&staged, &apps.join(BUNDLE)) {
+        // Nothing was swapped: the previous bundle goes back where it was.
+        let _ = recover(apps);
+        return Err(failed);
+    }
+    sync_dir(apps)?;
+    #[cfg(feature = "test-knobs")]
+    if std::env::var_os(TEST_ABORT_AFTER_SWAP_ENV).is_some_and(|v| !v.is_empty()) {
+        std::process::abort();
+    }
     // The swap left the replaced bundle under the partial name.
     fs::rename(&staged, &previous).map_err(AppError::Io)?;
-    sync_dir(apps)
+    sync_dir(apps)?;
+    clear(&journal)
+}
+
+/// Finish or undo a publish that was cut short (see [`publish`]); nothing when none was. Run
+/// under the install lock, before anything else reads `apps`.
+///
+/// With no [`PREVIOUS`] but a bundle under [`PARTIAL`], the journal's version says which side of
+/// the swap the publish stopped on: if [`BUNDLE`] is that version, the swap happened and the
+/// partial name holds the replaced bundle, which becomes [`PREVIOUS`]; otherwise the partial is
+/// the unpublished candidate, and goes. Either way the journal's earlier previous bundle comes
+/// back when nothing has taken its place.
+fn recover(apps: &Path) -> Result<(), AppError> {
+    let journal = apps.join(PUBLISHING);
+    if fs::symlink_metadata(&journal).is_err() {
+        return Ok(());
+    }
+    let staged = apps.join(PARTIAL);
+    let previous = apps.join(PREVIOUS);
+    let published = fs::read_to_string(journal.join(PUBLISHING_VERSION)).unwrap_or_default();
+    if fs::symlink_metadata(&previous).is_err() && staged.join(HELPER).is_file() {
+        if app_version(&apps.join(BUNDLE)).as_deref() == Some(published.trim()) {
+            fs::rename(&staged, &previous).map_err(AppError::Io)?;
+            println!(
+                "vox: an update was cut short after Vox {} was put in place; the Vox.app it \
+                 replaced is kept at {} for `vox update --rollback`",
+                published.trim(),
+                previous.display()
+            );
+        } else {
+            clear(&staged)?;
+        }
+    }
+    let kept = journal.join(BUNDLE);
+    if fs::symlink_metadata(&previous).is_err() && fs::symlink_metadata(&kept).is_ok() {
+        fs::rename(&kept, &previous).map_err(AppError::Io)?;
+    }
+    sync_dir(apps)?;
+    clear(&journal)
 }
 
 /// Unpack the downloaded zip beside the bundle, on its filesystem, and return the one Vox.app

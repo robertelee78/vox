@@ -736,7 +736,11 @@ fn bundle_install(home: &Path, channel: Option<&str>) -> PathBuf {
 /// ADR-014 M-29: a Vox.app install is updated and rolled back as a whole.
 #[cfg(target_os = "macos")]
 fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String>) {
-    test_knobs::require(&["VOX_TEST_RELEASE_BASE", "VOX_TEST_APPLE_VERIFY"]);
+    test_knobs::require(&[
+        "VOX_TEST_RELEASE_BASE",
+        "VOX_TEST_APPLE_VERIFY",
+        "VOX_TEST_ABORT_AFTER_SWAP",
+    ]);
     let tree = tmpdir();
     let zeros = "0".repeat(64);
     bundle_release(tree.path(), &[("stable", None), ("badvox", Some(&zeros))]);
@@ -860,6 +864,43 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             format!(
                 "after --rollback (it said {text:?}): vox reports {cli:?}, Vox.app says {app:?}, \
                  .Vox.app.previous says {kept:?}"
+            ),
+        ));
+    }
+
+    // ---- an update cut short after its swap keeps the bundle it replaced ----------------------
+    // The process is aborted (test-only VOX_TEST_ABORT_AFTER_SWAP) between the swap and the rename
+    // that names the replaced bundle `.Vox.app.previous`; the next transition must find it, and
+    // `--rollback` bring it back, rather than clearing it as a leftover.
+    {
+        let tmp = tmpdir();
+        let home = tmp.path();
+        let link = bundle_install(home, Some("stable"));
+        let apps = home.join("Apps");
+        let env: Vec<(&str, &str)> = base
+            .iter()
+            .copied()
+            .chain([("VOX_TEST_ABORT_AFTER_SWAP", "1")])
+            .collect();
+        let cut = vox(&link, home, &["update"], &env);
+        let cut_app = app_says(&apps.join("Vox.app"));
+        let out = vox(&link, home, &["update", "--rollback"], &base);
+        let text = said(&out);
+        let app = app_says(&apps.join("Vox.app"));
+        let kept = app_says(&apps.join(".Vox.app.previous"));
+        claims.push(claim(
+            "bundle.a_cut_update_keeps_the_bundle_it_replaced",
+            !cut.status.success()
+                && cut_app == NEWER
+                && out.status.success()
+                && app == VERSION
+                && kept == NEWER
+                && text.contains("an update was cut short"),
+            format!(
+                "the cut update (exit_ok={}) left Vox.app {cut_app:?}; then --rollback (exit_ok={}) \
+                 said {text:?}: Vox.app says {app:?}, .Vox.app.previous says {kept:?}",
+                cut.status.success(),
+                out.status.success()
             ),
         ));
     }

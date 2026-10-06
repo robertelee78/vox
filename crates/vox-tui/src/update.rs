@@ -801,7 +801,13 @@ impl InstallLock {
             .write(true)
             .mode(0o600)
             .open(install_dir.join(LOCK_NAME))
-            .map_err(AppError::Io)?;
+            .map_err(|e| {
+                usage(format!(
+                    "cannot open {}: {e}\n       is this install another account's? it is changed \
+                     only by the account that installed it",
+                    install_dir.join(LOCK_NAME).display()
+                ))
+            })?;
         rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .map_err(|_| usage("another vox install transition is already running"))?;
         Ok(Self { _file: file })
