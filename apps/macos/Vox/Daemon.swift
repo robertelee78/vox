@@ -63,6 +63,29 @@ enum Daemon {
         }
     }
 
+    /// The login item's last word on why it would not start, with when: its daemon writes it to
+    /// `~/Library/Logs/Vox/login-item.log` (as `<unix seconds> <reason>`) and ends, rather than
+    /// being started again every ten seconds.
+    static func loginItemSaid() -> String? {
+        let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
+        let log = URL(fileURLWithPath: home).appendingPathComponent("Library/Logs/Vox/login-item.log")
+        guard let text = try? String(contentsOf: log, encoding: .utf8),
+              let last = text.split(separator: "\n").last(where: { !$0.isEmpty }) else { return nil }
+        let parts = last.split(separator: " ", maxSplits: 1)
+        guard parts.count == 2, let secs = Double(parts[0]) else { return String(last) }
+        let when = Date(timeIntervalSince1970: secs).formatted(date: .abbreviated, time: .shortened)
+        return "\(parts[1]) (\(when))"
+    }
+
+    /// Keep Running off: the login item unregistered (when it is registered), and the answer
+    /// kept as Not Now.
+    static func stopKeeping() throws {
+        if loginItem.status != .notRegistered {
+            try loginItem.unregister()
+        }
+        remember(kept: false)
+    }
+
     // ---- the first run's answer, kept beside vox's own settings -----------------------------
 
     /// What the person answered at first run: keep the daemon running (`true`), not now

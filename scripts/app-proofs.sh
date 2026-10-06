@@ -31,6 +31,33 @@ DERIVED="$ROOT/target/xcode"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/vox-app-proofs.XXXXXX")"
 trap 'rm -rf "$SCRATCH"' EXIT
 
+# **Never the person's own Vox** (APPARATUS before anything runs). A login item registered on this
+# Mac runs the bundle's `vox daemon` under launchd, with none of this run's scratch directories:
+# on the person's real profile. And whatever the run does, the real data root and config
+# directory must be as they were: listed (names, sizes, times; never contents) before and after.
+REAL="$HOME/Library/Application Support/vox"
+if launchctl print "gui/$(id -u)/us.vox.daemon" >/dev/null 2>&1; then
+    echo "app-proofs: APPARATUS (precondition unmet): a Vox login item (us.vox.daemon) is loaded on" \
+        "this Mac, and it runs on the real profile; turn it off (System Settings, General, Login" \
+        "Items, Vox) before a run" >&2
+    exit 2
+fi
+real_listing() {
+    if [ -e "$REAL" ]; then find "$REAL" -exec stat -f '%N %z %m' {} + | sort; else echo absent; fi
+}
+REAL_BEFORE="$(real_listing)"
+check_real() {
+    if [ "$(real_listing)" != "$REAL_BEFORE" ]; then
+        echo "app-proofs: APPARATUS: the run changed the real profile ($REAL): a Vox started without" \
+            "this run's scratch directories (a crash dialog's Reopen does that: click Ignore), or" \
+            "the person used Vox meanwhile. Before:" >&2
+        echo "$REAL_BEFORE" >&2
+        echo "After:" >&2
+        real_listing >&2
+        return 1
+    fi
+}
+
 XCFRAMEWORK_SLICES=macos scripts/build-xcframework.sh
 cargo build --release --bin vox
 
@@ -62,6 +89,7 @@ launch_status=0
 if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
     python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
     if [ "$*" = "LaunchProof" ]; then
+        check_real || exit 2
         exit "$launch_status"
     fi
 else
@@ -96,6 +124,7 @@ TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?
+check_real || exit 2
 if grep -q "enabling automation mode" "$SCRATCH/xcodebuild.log"; then
     echo "app-proofs: APPARATUS (precondition unmet): UI automation is not allowed on this Mac, so" \
         "no proof ran. Allow it once: sudo DevToolsSecurity -enable, then approve the prompt" \

@@ -31,6 +31,16 @@ struct RootView: View {
                 Text("Vox could not reach the vox daemon.")
                     .font(Theme.heading)
                 Said(text: said)
+                if let why = model.loginItemSaid {
+                    // The login item's daemon ended on a refusal no retry changes: said here,
+                    // with the way out (ADR-014 M-8).
+                    Text("Vox's login item did not start: \(why)")
+                        .secondaryText()
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("login-item-said")
+                    Button("Turn Keep Running Off") { Task { await model.stopKeepingRunning() } }
+                        .accessibilityIdentifier("login-item-off")
+                }
                 Button("Try Again") { Task { await model.start() } }
                     .accessibilityIdentifier("retry")
             case let .choosing(nodes):

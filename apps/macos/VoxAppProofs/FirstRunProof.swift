@@ -28,14 +28,16 @@
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
 // 7. The lanes view (ADR-014 M-15, ADR-028 W-3, #442): bob posting `working` without a claim is
-//    not working; once he claims a resource and posts `working`, his lane's chip says working.
+//    not working; once he claims a resource and posts `working`, his lane's chip says working;
+//    ⌘O there opens the file panel, as on the timeline.
 // 8. Notifications (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
 //    to alice posts one local notification, titled with the room, saying who wrote to her, and
 //    never the message's text. Preconditions, not the proof's to arrange: Vox allowed to notify
 //    (the app says "notifications off" otherwise, an APPARATUS red) and no Focus on.
 // 9. Keys (ADR-014 M-20, #446): with quiet rooms aaa and bbb and mission needing alice, ⌘J from
-//    aaa goes to mission, not to bbb, the next room in the sidebar's order; ⌘⇧C on a selected
-//    service card copies the address `vox service list` gives.
+//    aaa goes to mission, not to bbb, the next room in the sidebar's order; To: bob ticked in
+//    mission is not carried into aaa; NEEDS-YOU-9, shown in mission and left at once, is recorded
+//    read in mission; ⌘⇧C on a selected service card copies the address `vox service list` gives.
 // 10. The decision record (ADR-014 M-18, ADR-028 §7, #445): carol's join with a wrong passphrase,
 //     refused by alice's node, is at the top of the view, above the trust changes of steps 3 and 5.
 // 11. Untrust cuts a live forward (ADR-014 M-31, ADR-028 K-6, E-5): bob forwards to a service
@@ -51,7 +53,10 @@
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. An app that never
 // reads the menu bar choice again (its delegate not observed): (1) goes red. An inspector
 // that lists the members only when the room is opened: (3) goes red. The timeline drops
-// the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
+// the read-by line, or marks rows read while the window is hidden: (4) goes red. A read batch sent
+// for the room on screen when it is flushed, not the room it was drawn in; To: kept across rooms;
+// ⌘O on the timeline only: (9), (9) and (7) go red. Remove untrusts at once, saying nothing
+// first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
 // the sidebar's order: (9) goes red. The decision record oldest first: (10) goes red.
@@ -73,6 +78,18 @@ func shown(_ element: XCUIElement) -> String {
     element.label.isEmpty ? (element.value as? String ?? "") : element.label
 }
 
+/// Refuse (APPARATUS) to launch the app with a data root or config directory outside this run's
+/// scratch: a Vox started without them acts on the person's real profile.
+func scratchOnly(_ env: [String: String], under scratch: String) throws {
+    let root = URL(fileURLWithPath: scratch).standardizedFileURL.path + "/"
+    for key in ["VOX_DATA_DIR", "VOX_CONFIG_DIR"] {
+        guard let value = env[key],
+              URL(fileURLWithPath: value).standardizedFileURL.path.hasPrefix(root) else {
+            throw Apparatus("refusing to launch Vox.app: \(key) is \(env[key] ?? "unset"), not under this run's scratch \(scratch)")
+        }
+    }
+}
+
 /// A red that is the apparatus's, not the product's: staging was not achieved.
 struct Apparatus: Error, CustomStringConvertible {
     let why: String
@@ -92,6 +109,51 @@ final class FirstRunProof: XCTestCase {
     override func tearDown() {
         daemon?.terminate()
         super.tearDown()
+    }
+
+    /// The login item's daemon ended on a refusal no retry changes (`vox daemon --login-item`
+    /// writes why to ~/Library/Logs/Vox/login-item.log): with Keep Running chosen and the daemon
+    /// unreachable, the app quotes that line and offers Turn Keep Running Off, which keeps the
+    /// answer as Not Now (ADR-014 M-8). Staged in scratch: a data root of an earlier release, the
+    /// Keep Running answer, and the log under a scratch HOME; no login item is registered.
+    /// Mutation: the app not reading the log → red at the quoted line.
+    func testALoginItemThatWillNotStartIsSaidWithAWayOut() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let appPath = env["VOX_PROOF_APP"], let scratchPath = env["VOX_PROOF_SCRATCH"] else {
+            throw Apparatus("VOX_PROOF_APP and VOX_PROOF_SCRATCH are set by scripts/app-proofs.sh")
+        }
+        let root = URL(fileURLWithPath: scratchPath).appendingPathComponent("login-item")
+        let data = root.appendingPathComponent("data").path
+        let config = root.appendingPathComponent("config").path
+        let home = root.appendingPathComponent("home").path
+        // A data root as v0.2.x left it, which this version refuses; the answer Keep Running; and
+        // the line the login item's daemon wrote as it ended.
+        try stager.write(Data("an earlier release's vault".utf8), to: data + "/default/vault.cbor")
+        try stager.write(Data("an earlier release's store".utf8), to: data + "/default/store.redb")
+        try stager.write(Data("keep\n".utf8), to: config + "/app/login-item")
+        let reason = "vox daemon will not start: STAGED-REASON is not a Vox data directory this version reads"
+        try stager.write(Data("1791262600 \(reason)\n".utf8),
+                         to: home + "/Library/Logs/Vox/login-item.log")
+
+        let ui = XCUIApplication(url: URL(fileURLWithPath: appPath))
+        ui.launchEnvironment = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "HOME": home,
+                                "VOX_PROXY": "127.0.0.1:0"]
+        try scratchOnly(ui.launchEnvironment, under: scratchPath)
+        ui.launch()
+        defer { ui.terminate() }
+        let said = ui.descendants(matching: .any)["login-item-said"]
+        XCTAssertTrue(said.waitForExistence(timeout: 30),
+                      "PRODUCT: with Keep Running chosen and its daemon refusing for good, the app must say why the login item did not start")
+        let words = shown(said)
+        XCTAssertTrue(words.contains("STAGED-REASON is not a Vox data directory this version reads"),
+                      "PRODUCT: the app must quote the login item's own line; it said \"\(words)\"")
+        ui.buttons["login-item-off"].click()
+        XCTAssertTrue(said.waitForNonExistence(timeout: 30),
+                      "PRODUCT: Turn Keep Running Off must leave Keep Running off; the login item's line is still shown")
+        let answer = stager.run(["/bin/cat", config + "/app/login-item"], env: [:]).out
+        XCTAssertEqual(answer.trimmingCharacters(in: .whitespacesAndNewlines), "no",
+                       "PRODUCT: Turn Keep Running Off must keep the answer as Not Now; the answer file says \(answer.debugDescription)")
+        print("[proof] login item: quoted \"\(words)\"; after Turn Keep Running Off the answer is \(answer.debugDescription)")
     }
 
     func testFirstRunAttachesTheNodeAndQuitDetachesIt() throws {
@@ -119,6 +181,7 @@ final class FirstRunProof: XCTestCase {
 
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
+        try scratchOnly(ui.launchEnvironment, under: scratchPath)
         ui.launch()
 
         // (1) First run: the login item is asked about once, and declined here (approving it is
@@ -435,6 +498,13 @@ final class FirstRunProof: XCTestCase {
                        .completed,
                        "PRODUCT: bob, holding ticket-1 with a working post, must show working in his lane; it said \(bobLane.exists ? bobLane.label : "no lane")")
         print("[proof] lanes: \(bobLane.label)")
+        // ⌘O works with the lanes view shown, as with the timeline: the open panel shows.
+        ui.typeKey("o", modifierFlags: .command)
+        let panelAttach = ui.buttons["Attach"].firstMatch
+        XCTAssertTrue(panelAttach.waitForExistence(timeout: 10),
+                      "PRODUCT: ⌘O in the lanes view must open the file panel to attach a file; nothing opened")
+        ui.typeKey(.escape, modifierFlags: [])
+        _ = panelAttach.waitForNonExistence(timeout: 10)
         lanesToggle.buttons["Timeline"].click()
 
         // (8) Notifications: the room off screen, bob writes to alice.
@@ -486,6 +556,31 @@ final class FirstRunProof: XCTestCase {
             .matching(NSPredicate(format: "label CONTAINS %@", "NEEDS-YOU-9")).firstMatch
         XCTAssertTrue(landed.waitForExistence(timeout: 15),
                       "PRODUCT: ⌘J from room aaa must open mission, the room that needs alice; its message NEEDS-YOU-9 is not on screen")
+        // To: is the room's own: bob ticked in mission is not carried into aaa.
+        let to = ui.menuButtons["compose-to"]
+        XCTAssertTrue(to.waitForExistence(timeout: 10), "PRODUCT: the composer offers no To:")
+        to.click()
+        ui.menuItems["bob"].click()
+        XCTAssertEqual(to.label, "To: bob", "PRODUCT: ticking bob in To: must say so; it says \(to.label)")
+        // Seen in mission, then at once another room: the read record names mission, the room the
+        // message is in.
+        aaa.click()
+        XCTAssertTrue(to.waitForExistence(timeout: 10), "PRODUCT: room aaa offers no To:")
+        XCTAssertEqual(to.label, "To: the room",
+                       "PRODUCT: To: set in mission must not carry into aaa; aaa's composer says \(to.label)")
+        var nine: [String] = []
+        let nineUntil = Date().addingTimeInterval(30)
+        while Date() < nineUntil && !nine.contains("alice") {
+            for line in run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+                .split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("NEEDS-YOU-9") == true else { continue }
+                nine = row["read_by"] as? [String] ?? []
+            }
+            if !nine.contains("alice") { Thread.sleep(forTimeInterval: 1) }
+        }
+        XCTAssertTrue(nine.contains("alice"),
+                      "PRODUCT: NEEDS-YOU-9, shown in mission and left at once for aaa, must be recorded read in mission; bob's `vox room read --json` says read_by \(nine)")
         // ⌘⇧C: a service bob shares, selected, copies its address.
         let echo = try EchoServer(stager)
         try staged(vox, ["service", "add", "--node", "bob", room, "web", "127.0.0.1:\(echo.port)"],
@@ -612,6 +707,7 @@ final class FirstRunProof: XCTestCase {
         guard held.contains("WHILE-APP-CLOSED") else {
             throw Apparatus("alice's node never held bob's WHILE-APP-CLOSED in 60 s: \(held)")
         }
+        try scratchOnly(ui.launchEnvironment, under: scratchPath)
         ui.launch()
         let reopened = ui.descendants(matching: .any)["group-needs you"]
         let counted = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")

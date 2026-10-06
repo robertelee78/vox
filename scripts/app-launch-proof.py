@@ -80,9 +80,21 @@ def log_text(data):
         return ""
 
 
+def scratch_only(env):
+    """Refuse (APPARATUS) to launch with a data root or config directory that is not this run's
+    scratch: a Vox started without them acts on the person's real profile."""
+    tmp = os.path.realpath(tempfile.gettempdir())
+    for key in ("VOX_DATA_DIR", "VOX_CONFIG_DIR"):
+        value = env.get(key)
+        if not value or not os.path.realpath(value).startswith(tmp + os.sep):
+            fail("APPARATUS", f"refusing to launch Vox.app: {key} is {value!r}, not a scratch "
+                              f"directory under {tmp}")
+
+
 def launch(app, env, out):
     """Start Vox.app's executable as a person's launch does; what it prints goes to `out`. A launch
     the system refuses is the build's, not the product's."""
+    scratch_only(env)
     exe = os.path.join(app, "Contents", "MacOS", "Vox")
     try:
         return subprocess.Popen([exe], env=env, stdin=subprocess.DEVNULL,

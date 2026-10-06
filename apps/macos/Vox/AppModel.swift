@@ -25,7 +25,16 @@ final class AppModel: ObservableObject {
         case attached(node: String, fingerprint: String)
     }
 
-    @Published private(set) var phase: Phase = .starting
+    @Published private(set) var phase: Phase = .starting {
+        didSet {
+            // Read once, as the daemon is found unreachable, not each time a view draws.
+            if case .unreachable = phase {
+                loginItemSaid = keepRunning ? Daemon.loginItemSaid() : nil
+            } else if loginItemSaid != nil {
+                loginItemSaid = nil
+            }
+        }
+    }
     /// Whether the menu bar extra is shown: off until the person turns it on (M-22).
     @Published private(set) var menuBar = MenuBarChoice.on()
 
@@ -157,6 +166,24 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// What the login item last said of why it would not start, when Keep Running is chosen and
+    /// the daemon is unreachable: its daemon ends quietly on a refusal no retry can change
+    /// (`vox daemon --login-item`).
+    @Published private(set) var loginItemSaid: String?
+
+    /// Keep Running off: the login item is unregistered, the answer kept as Not Now, and the
+    /// daemon reached as `vox` starts it.
+    func stopKeepingRunning() async {
+        do {
+            try Daemon.stopKeeping()
+        } catch {
+            phase = .unreachable(sentence(error))
+            return
+        }
+        keepRunning = false
+        await reach()
+    }
+
     /// Let go of the node and end the client (A-4).
     func quit() async {
         await client?.close()
@@ -169,9 +196,15 @@ final class AppModel: ObservableObject {
     private func use(_ node: NodeSummary) async {
         guard let client else { return }
         if node.state != "attached" && keepRunning {
-            // Refused for a node that has a passphrase, which is then asked for.
+            // Refused for a node that has a passphrase, which is then asked for; but a daemon that
+            // no longer answers is said as that, not as a passphrase to type.
             if (try? await client.keep(node: node.name, passphrase: nil)) == nil {
-                phase = .passphrase(node: node.name, said: nil)
+                do {
+                    _ = try await client.nodes()
+                    phase = .passphrase(node: node.name, said: nil)
+                } catch {
+                    phase = .unreachable(sentence(error))
+                }
                 return
             }
         }
