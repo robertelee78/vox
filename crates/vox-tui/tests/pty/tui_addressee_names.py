@@ -10,6 +10,11 @@ Carol as "mom". Bob trusts Alice as "alice" and has no name for Carol. Alice pos
   never "to mom", which is Alice's name for her and not his;
 - Alice's must show it as `you to mom:`, her own name.
 
+Then (ADR-028 K-4, #474) Bob trusts Carol as "Alice", which differs from his "alice" only by case.
+His TUI must show them as `alice#<6 characters of Alice's fingerprint>` and `Alice#<6 of Carol's>`,
+never either bare; and "@alice …" typed in his composer must carry Alice's whole fingerprint in
+`to`.
+
 Exit 0 = pass, 1 = red (the product's), 2 = apparatus (CANNOT MEASURE). A `vox` step on the way that
 fails is the product's red (`PRODUCT (staging):`). Every process is recorded and killed by PID.
 Every wait is bounded by what the product allows, as in `tui_member_names.py`.
@@ -18,13 +23,14 @@ import json, os, re, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
 # Sized for the debug build, as `tui_member_names.py` is: two joins at JOIN_SECS each, and the rest.
 BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1260"))
 JOIN_SECS = 540
 MARK = "ADDRESSEE-MARK"
+AT_MARK = "AT-ALIAS-MARK"
 SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix="vox-tui-to-")
 S = f"{SP}/tuito-{TAG}"
 subprocess.run(["rm", "-rf", S])
@@ -174,7 +180,68 @@ try:
     if not (bob_ok and alice_ok):
         print(f"{TAG} PRODUCT: each node's TUI must show the addressee by its own name for her, or "
               f"her fingerprint where it has none, never another node's name")
-    code = 0 if (bob_ok and alice_ok) else 1
+
+    # ADR-028 K-4 (#474): Bob trusts Carol as "Alice", an alias his "alice" differs from only by
+    # case. His TUI must tell the two apart by a fingerprint suffix, and his composer's "@alice"
+    # must address Alice's whole fingerprint.
+    stage("lookalike aliases, and @alias in the composer")
+    # Bob's daemon was stopped for his TUI: a keyring change asks the node, so it runs again for it.
+    daemons["bob"] = spawn("bob", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                           "--passphrase-file", f"{S}/idpass", out="bob-again")
+    if not until(lambda: run("bob", "room", "list").returncode == 0, 60):
+        staging("bob's daemon, started again, never answered `vox room list` within 60 s: "
+                + open(f"{S}/bob-again.err").read())
+    trust("bob", "carol", "Alice")
+    stop(daemons["bob"])
+    t = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec], env("bob"))
+    try:
+        t.pump(4)
+        t.key("id pass\r", 4)
+        t.key("\r", 2)
+        t.key("room pass\r", 4)
+        t.key("\r", 2)
+        t.until(lambda: MARK in "\n".join(t.display()), 60, 1)
+        t.key("\t", 1)  # timeline -> composer
+        t.key(f"@alice {AT_MARK} for you", 1)
+        t.key("\r", 3)
+        def sent_to():
+            r = run("bob", "room", "read", room, "--json")
+            rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
+            got = next((x for x in rows if AT_MARK in (x.get("text") or "")), None)
+            return None if got is None else (got.get("envelope") or {}).get("to")
+        t.until(lambda: sent_to() is not None, 30, 1)
+        to_at = sent_to()
+        t.pump(3)
+        lookalike = [r.rstrip() for r in t.display()]
+        print(f"{TAG} bob's TUI with alice and Alice (carol) in his keyring:")
+        for r in lookalike:
+            if "lice" in r:
+                print(f"  |{r}")
+        print(f"{TAG} its members pane:")
+        for r in pane(lookalike, "Members"):
+            if r.strip():
+                print(f"  |{r.rstrip()}")
+    finally:
+        if not t.stop():
+            print(f"{TAG} APPARATUS: bob's vox tui (pid {t.pid}) outlived SIGKILL and could not be reaped")
+            sys.exit(2)
+    a6, c6 = fp["alice"][:6], fp["carol"][:6]
+    members = [r.strip() for r in pane(lookalike, "Members")]
+    # Each member's row is its trust glyph and name; neither alias may stand there without its
+    # suffix, and the timeline names alice's message to carol by both suffixed names.
+    told_apart = (any(r.endswith(f"alice#{a6}") for r in members)
+                  and any(r.endswith(f"Alice#{c6}") for r in members)
+                  and not any(re.search(r"\b[aA]lice$", r) for r in members)
+                  and f"alice#{a6} to Alice#{c6}:" in "\n".join(lookalike))
+    at_ok = to_at == [fp["alice"]]
+    print(f"{TAG} bob's TUI shows alice#{fp['alice'][:6]} and Alice#{fp['carol'][:6]}, and neither "
+          f"bare: {told_apart}; bob's '@alice' went to alice's whole fingerprint: {at_ok} ({to_at!r})")
+    if not told_apart:
+        print(f"{TAG} PRODUCT: two aliases that differ only by case must each be shown with a "
+              f"fingerprint suffix")
+    if not at_ok:
+        print(f"{TAG} PRODUCT: '@alice' typed in the composer must address alice's whole fingerprint")
+    code = 0 if (bob_ok and alice_ok and told_apart and at_ok) else 1
     print(f"{TAG} {'PASS' if code == 0 else 'RED'}")
 except Red:
     code = 1

@@ -17,8 +17,13 @@
 //! bob, who has no name for carol, sees alice's message to `mom` in his own `vox tui` as `alice to
 //! <carol's fingerprint>:`, never `to mom`; alice sees `you to mom:`.
 //!
+//! Then (ADR-028 K-4, #474) bob trusts carol as `Alice`, which his `alice` differs from only by
+//! case: his TUI must show `alice#<6 of alice's fingerprint>` and `Alice#<6 of carol's>` in the
+//! members pane and on alice's message, never either bare; and `@alice …` typed in his composer
+//! must carry alice's whole fingerprint in `to`.
+//!
 //! Mutation: `vox room read` that does not name addressees goes red at (1); a TUI that does not goes
-//! red on its screen.
+//! red on its screen; a TUI that drops the suffix for a case-only clash goes red on its screen.
 
 #![cfg(unix)]
 
@@ -174,7 +179,9 @@ fn the_tui_shows_each_node_its_own_name_for_the_addressee() {
         ),
         Some(1) => panic!(
             "PRODUCT: each node's TUI must show the addressee by its own name for her, or her \
-             fingerprint, never another node's name: {said}"
+             fingerprint, never another node's name; tell two aliases that differ only by case \
+             apart by a fingerprint suffix; and send `@alias` to the member's whole fingerprint \
+             (the driver's PRODUCT line says which): {said}"
         ),
         _ => panic!(
             "CANNOT MEASURE: APPARATUS: the TUI driver ended after {:?} at stage {:?} with exit \

@@ -718,7 +718,10 @@ fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
         vm.keyring
             .iter()
             .map(|(fp, alias)| {
-                let mut lines = vec![Line::from(format!("  {}", vox_text::shown(alias, 64)))];
+                // An alias another differs from only by case is told apart (ADR-028 K-4).
+                let alias =
+                    crate::ident::alias_of(&vm.keyring, fp).unwrap_or_else(|| alias.clone());
+                let mut lines = vec![Line::from(format!("  {}", vox_text::shown(&alias, 64)))];
                 for row in vox_text::fingerprint::card(&vox_core::node::link::b32_encode(fp)) {
                     lines.push(Line::from(format!("    {row}")));
                 }
