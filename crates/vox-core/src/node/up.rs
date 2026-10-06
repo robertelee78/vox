@@ -98,6 +98,27 @@ impl Names for VoxResolver {
     }
 }
 
+/// `name` looked up, and **looked up again until the room's log says what it shares**, for at
+/// most [`HOST_PATIENCE`]: a room this node joined and has not yet synced does not hold the share
+/// statements, and a service named by its fingerprint (the canonical address, ADR-028 S-1) is
+/// known only from them. Asked before that, the fingerprint went to the host as the service's
+/// name, and the host refused it as no such service — a person's first `ssh` after joining was
+/// refused for a share that was there. `vox forward` waits the same way.
+async fn lookup_settled<N: Names>(
+    resolver: &N,
+    name: &str,
+) -> std::result::Result<ServiceRoom, String> {
+    let deadline = tokio::time::Instant::now() + HOST_PATIENCE;
+    let mut room = resolver.lookup(name).await?;
+    while room.share == crate::node::resolver::ShareState::NotYetKnown
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        room = resolver.lookup(name).await?;
+    }
+    Ok(room)
+}
+
 /// Serve SOCKS5 on `bind` until the task is dropped.
 ///
 /// Loopback only, and enforced: this proxy carries traffic into rooms this machine is a
@@ -404,7 +425,7 @@ where
             ));
         }
     };
-    let room = match resolver.lookup(&name).await {
+    let room = match lookup_settled(resolver, &name).await {
         Ok(room) => room,
         Err(why) => {
             // Said to this machine's operator only, and only about this machine's own
