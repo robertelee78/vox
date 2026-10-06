@@ -229,8 +229,9 @@ service being reachable are separate facts.
   is not running), or its `vox forward` is still running;
 - the ordinary client uses that loopback proxy or forward.
 
-Copy the address your own `service list` prints, not one from someone else's screen: the node
-and room parts are each viewer's own names.
+A readable address from someone else's screen uses their names for the node and room, which may
+mean nothing on your machine. Use the readable address your own `service list` prints, or the
+canonical address under it, which is the same on every member's machine.
 
 **Fix:** restore the missing piece. A forward that says `tunnel refused or cut — the host
 refused "ssh" — it has not trusted this identity, or offers nothing there, or its service did not
