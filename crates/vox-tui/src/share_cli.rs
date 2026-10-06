@@ -96,6 +96,23 @@ pub async fn share(
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     let to = addressees(&mut client, channel_id, &opts.to).await?;
+    // Who it is to reach, said before it is offered (ADR-028 E-5).
+    let which = crate::room_cli::room_named(&mut client, channel_id).await;
+    let reach = crate::room_cli::trusted_in(&mut client, channel_id).await;
+    let base = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let what = if path.is_dir() {
+        format!("{base} (a folder, as one archive)")
+    } else {
+        base
+    };
+    println!("vox: about to share {what} in {which}");
+    println!(
+        "     the members of it in your keyring are to fetch it: {}",
+        crate::room_cli::listed(&reach, "none yet")
+    );
     let note = opts.note.as_deref().map(str::trim).unwrap_or_default();
     let session = crate::coord::session_if_named();
     let me = client
@@ -194,6 +211,10 @@ pub async fn share(
 pub async fn stop(paths: &Paths, room: &str, selector: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
+    // What it is to end, said before it is ended (ADR-028 E-5).
+    let which = crate::room_cli::room_named(&mut client, channel_id).await;
+    println!("vox: about to stop sharing {selector:?} in {which}");
+    println!("     no member is to fetch it from this node after this");
     let stopped = shares_of(
         client
             .request(&Request::ShareStop {

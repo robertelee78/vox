@@ -85,7 +85,11 @@
 //!   defaults, stays green while the other two hold.
 //! - **Withdrawing trust cuts a live session and refuses the next request** (ADR-017 M17.11,
 //!   RP-10). An `ssh` session opened while the guest was trusted is reset the moment the host's
-//!   operator runs `vox trust remove`, and `vox up` says the host withdrew access. A new CONNECT
+//!   operator runs `vox trust remove`, and `vox up` says the host withdrew access. `vox trust
+//!   remove` names that session before it acts and says after that it cut it, and that the host's
+//!   own sessions into the guest's services are untouched, naming one the host holds into a
+//!   service the guest shares; that session still echoes after. Before it acts it says the guest
+//!   is to reach none of the host's services, naming the one it offers as lost (ADR-028 E-5). A new CONNECT
 //!   through the **same** proxy — whose connection to the host was made while trusted — is
 //!   refused in the SOCKS reply, and the service behind it never accepts a connection. The
 //!   host's decision record (ADR-028 §7) then holds each of the three decisions once, naming the
@@ -152,9 +156,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use world::{
-    args, counting_echo_service, echo_service, read_to_end_within, resetting_service, round_trip,
-    socks5_connect, socks5_connect_within, vox_once, vox_once_attached, Ending, VoxProc, World,
-    PARTIAL,
+    address_in, args, counting_echo_service, echo_service, read_to_end_within, resetting_service,
+    round_trip, socks5_connect, socks5_connect_within, vox_once, vox_once_attached, Ending,
+    VoxProc, World, PARTIAL,
 };
 
 /// How soon a refused connection must fail for its application once the path to the host is
@@ -1788,6 +1792,80 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
     let (mut up, at) = w.up("guest-up", &guest_dir);
     let name = w.service_host();
 
+    // Step 0: the other direction. The guest shares a service of its own and trusts the host, and
+    // the host holds a live session into it: that one is the guest's keyring's to grant, so the
+    // host's `vox trust remove` must leave it alone (ADR-028 E-5).
+    let theirs = echo_service();
+    let (ok, out, err) = vox_once(
+        &guest_dir,
+        &args(&["trust", "add", &w.host_fp, "--name", "the host"]),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the guest's `vox trust add` of the host failed.\nstdout:\n{out}\n\
+         stderr:\n{err}"
+    );
+    let (ok, out, err) = vox_once(
+        &guest_dir,
+        &args(&[
+            "service",
+            "add",
+            &w.room,
+            "notes",
+            &format!("127.0.0.1:{theirs}"),
+        ]),
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): the guest's `vox service add` failed.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    // The guest's share reaches the host through the room's log, and a forward to a service the
+    // host has not heard of is refused: so the host lists it first.
+    let deadline = Instant::now() + first_reach();
+    loop {
+        let (ok, out, err) = vox_once(&w.host_dir, &args(&["service", "list", &w.room]));
+        if ok && out.lines().any(|l| l.trim().starts_with("notes.")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): the host's `vox service list` never listed the guest's `notes`:\n\
+             {out}{err}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let mut fwd = VoxProc::spawn(
+        "host-forward",
+        &w.host_dir,
+        &args(&[
+            "forward",
+            &format!("notes.{}.{}.vox", w.guest_fp, w.room),
+            "127.0.0.1:0",
+            "--anchor",
+            &w.host_anchor,
+            "--listen",
+            w.path.host_listen(),
+        ]),
+    );
+    let line = fwd.expect_line("the host's forward's bound address", |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let into_guest = address_in(&mut fwd, &line, 2);
+    // The first session may wait on the reach to the guest, so it is retried for a while.
+    let deadline = Instant::now() + first_reach();
+    let mut ours = loop {
+        match echoes(into_guest, b"the host reaching in") {
+            Ok(s) => break s,
+            Err(e) if Instant::now() >= deadline => panic!(
+                "PRODUCT (staging): the host's session into the guest's `notes` never echoed: \
+                 {e}\nthe forward said:\n{}",
+                fwd.transcript()
+            ),
+            Err(_) => std::thread::sleep(Duration::from_millis(500)),
+        }
+    };
+    eprintln!("[test] step 0: the host's session into the guest's notes echoed");
+
     // Step 1: a live session, as `ssh user@<service>.<node>.<room>.vox` holds one.
     let mut s = live_session(&mut up, at, &name, port);
     let dialled = accepted.load(std::sync::atomic::Ordering::SeqCst) - probed;
@@ -1807,6 +1885,41 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
          stderr:\n{err}"
     );
     eprintln!("[test] step 2: {}", out.trim());
+    // It said, before it acted, which live session it was to cut, and after, that it cut it; and
+    // that the host's own session into the guest's service is left alone (ADR-028 E-5).
+    let session = format!("the guest reaching your {port}");
+    let lines: Vec<&str> = out.lines().collect();
+    let to_cut = lines.iter().position(|l| {
+        l.starts_with("     its live sessions into your services are to be cut: tunnel ")
+            && l.contains(&session)
+    });
+    let was_cut = lines
+        .iter()
+        .position(|l| l.starts_with("     cut: tunnel ") && l.contains(&session));
+    let untouched = lines.iter().any(|l| {
+        l.starts_with("     your sessions into its services are untouched: tunnel ")
+            && l.contains("you reaching the guest's notes")
+    });
+    // And that the guest is to reach none of the host's services: the one it offers is named as
+    // lost, never as one the guest is to reach.
+    let acted = lines
+        .iter()
+        .position(|l| l.starts_with("vox: no longer trusting"));
+    let loses = lines.iter().position(|l| {
+        l.starts_with("     and to reach none of your services from now on: it loses ")
+            && l.contains(&format!("{port} in \"service\""))
+    });
+    assert!(
+        matches!((loses, acted), (Some(b), Some(a)) if b < a),
+        "PRODUCT: before it acts, `vox trust remove` must say the guest is to reach none of the \
+         host's services, naming the {port} it offers as lost:\n{out}"
+    );
+    assert!(
+        matches!((to_cut, was_cut), (Some(b), Some(a)) if b < a) && untouched,
+        "PRODUCT: `vox trust remove` must name the live session it is to cut ({session:?}) before \
+         it acts, say after that it cut it, and name the host's own session into the guest's \
+         `notes` as untouched:\n{out}"
+    );
 
     // Step 3: the live session is cut — a reset, not a quiet EOF — within a second.
     let (tail, ending) = read_to_end_within(&mut s, Duration::from_secs(1));
@@ -1896,6 +2009,20 @@ fn withdrawing_trust_cuts_a_live_session_and_refuses_the_next_request() {
             w.guest_fp
         );
     }
+
+    // Step 6: the host's own session into the guest's service, said to be untouched, still
+    // carries bytes both ways.
+    let still = ours.write_all(b"still here").and_then(|()| {
+        let mut back = [0u8; 10];
+        ours.read_exact(&mut back).map(|()| back)
+    });
+    assert!(
+        matches!(&still, Ok(b) if b == b"still here"),
+        "PRODUCT: `vox trust remove` said the host's session into the guest's `notes` was \
+         untouched, but it no longer echoes: {still:?}\nthe forward said:\n{}",
+        fwd.transcript()
+    );
+    eprintln!("[test] step 6: the host's session into the guest's notes still echoed");
 }
 
 #[test]

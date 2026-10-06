@@ -37,6 +37,12 @@ pub enum PromptKind {
     /// Rename the room `Prompt::target` for every member: `[name, identity passphrase]`
     /// (ADR-028 R-1), as `vox room rename` asks.
     RenameRoom,
+    /// Leave `Prompt::target`: `[the word "leave"]`, typed to confirm what the title says it does
+    /// (ADR-028 E-5).
+    LeaveRoom,
+    /// End `Prompt::target` for everyone: `[the word "end"]`, typed to confirm what the title says
+    /// it does (ADR-028 E-5).
+    EndRoom,
 }
 
 impl PromptKind {
@@ -50,6 +56,8 @@ impl PromptKind {
             PromptKind::OpenChannel => &["room passphrase"],
             PromptKind::JoinChannel => &["room link (vox://…)", "room passphrase"],
             PromptKind::RenameRoom => &["new room name", "identity passphrase"],
+            PromptKind::LeaveRoom => &["type leave to leave it"],
+            PromptKind::EndRoom => &["type end to end it for everyone"],
         }
     }
 
@@ -61,6 +69,8 @@ impl PromptKind {
             PromptKind::CreateChannel | PromptKind::RenameRoom => i != 0,
             // The link is not; only the passphrase.
             PromptKind::JoinChannel => i == 1,
+            // A confirming word is no secret.
+            PromptKind::LeaveRoom | PromptKind::EndRoom => false,
             _ => true,
         }
     }
@@ -85,6 +95,15 @@ impl PromptKind {
             PromptKind::OpenChannel => "Open room",
             PromptKind::JoinChannel => "Join room",
             PromptKind::RenameRoom => "Rename room",
+            // What it is to do, said before it is done (ADR-028 E-5).
+            PromptKind::LeaveRoom => {
+                "Leave this room? Its other members are to see that you left, and this node is \
+                 to delete it with everything it holds of it"
+            }
+            PromptKind::EndRoom => {
+                "End this room for everyone? Every member's node is to take no new message in it \
+                 and delete it"
+            }
         }
     }
 }
@@ -588,6 +607,22 @@ impl UiState {
                     }
                 }
             }
+            PromptKind::LeaveRoom | PromptKind::EndRoom => {
+                let leave = p.kind == PromptKind::LeaveRoom;
+                let word = if leave { "leave" } else { "end" };
+                match p.target {
+                    Some(channel_id) if p.fields[0].trim() == word => Action::Dispatch(if leave {
+                        Command::LeaveRoom { channel_id }
+                    } else {
+                        Command::EndRoom { channel_id }
+                    }),
+                    _ => {
+                        self.status_message =
+                            Some(format!("nothing was done: type {word} to {word} the room"));
+                        Action::Redraw
+                    }
+                }
+            }
         }
     }
 
@@ -684,6 +719,10 @@ impl UiState {
                         Action::Redraw
                     }
                     Some(Parsed::CloseTunnel) => self.close_selected_tunnel(vm),
+                    Some(Parsed::Confirm(kind, channel_id)) => {
+                        self.mode = Mode::Prompt(Prompt::new(kind, Some(channel_id)));
+                        Action::Redraw
+                    }
                     Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
                     Some(Parsed::Prompt(kind, name)) => {
                         // A rename is of the room on screen.
@@ -779,6 +818,8 @@ pub enum Parsed {
     Prompt(PromptKind, Option<String>),
     /// Close the tunnel selected in the tunnel list (V030-11).
     CloseTunnel,
+    /// Ask the person to confirm a change of access to a room, saying what it does (ADR-028 E-5).
+    Confirm(PromptKind, Digest32),
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -848,12 +889,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         "close" => Command::CloseChannel {
             channel_id: channel,
         },
-        "leave" => Command::LeaveRoom {
-            channel_id: channel,
-        },
-        "end" => Command::EndRoom {
-            channel_id: channel,
-        },
+        // Each says what it does and waits for the person to confirm it (ADR-028 E-5).
+        "leave" => return Some(Parsed::Confirm(PromptKind::LeaveRoom, channel)),
+        "end" => return Some(Parsed::Confirm(PromptKind::EndRoom, channel)),
         // The room's new name is not secret; the identity passphrase that follows is, so like
         // `new` it opens the masked prompt.
         "rename" => {

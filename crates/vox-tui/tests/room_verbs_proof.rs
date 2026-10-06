@@ -27,7 +27,13 @@
 //!   take the deploy") is posted and claims nothing; a `decline` with no resource, which refuses an
 //!   `assign` in conversation, is posted, not refused (ADR-021 §4);
 //! - the failures an operator will actually hit say something useful: no node
-//!   running, an unknown room, a malformed cursor.
+//!   running, an unknown room, a malformed cursor;
+//! - **every change of access says what it is to do before it acts, and what it did after**
+//!   (ADR-028 E-5): `vox room retention`, `vox service add` and `remove`, `vox share`, and
+//!   `vox trust add` and `remove` each print a "vox: about to …" line naming the room or the node,
+//!   then the line saying it was done, in that order; `vox trust remove` and `vox service remove`
+//!   name the live sessions there were (none here). `vox room leave` and `end` are proved in
+//!   `a_room_can_be_left_and_ended_proof.rs`.
 //!
 //! **Mutation** (RP-01): drop the raw-claim refusal from `post_cmd` and it goes red on the raw
 //! `claim`: it is posted.
@@ -460,6 +466,184 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     assert!(
         out.lines().any(|l| l.trim() == me),
         "PRODUCT: the roster must list this member ({me}), got: {out:?}"
+    );
+
+    // ---- every change of access says what it is to do, then what it did (ADR-028 E-5) ----
+    let pass_file = pass.to_str().expect("APPARATUS: a UTF-8 temp path");
+    // The first line starting `before` that holds every one of `naming`, and after it a line
+    // starting `after` that holds `then`: both, in that order.
+    let said = |out: &str, before: &str, naming: &[&str], after: &str, then: &str| {
+        let lines: Vec<&str> = out.lines().collect();
+        let b = lines
+            .iter()
+            .position(|l| l.starts_with(before) && naming.iter().all(|n| l.contains(n)));
+        b.is_some_and(|b| {
+            lines[b + 1..]
+                .iter()
+                .any(|l| l.starts_with(after) && l.contains(then))
+        })
+    };
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "room",
+            "retention",
+            &room_prefix,
+            "1w",
+            "--identity-passphrase-file",
+            pass_file,
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT: room retention failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to set how long",
+            &["\"team\""],
+            "vox: ",
+            "keeps messages for"
+        ),
+        "PRODUCT: `vox room retention` must say what it is to do, naming the room, then what it \
+         did: {out:?}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["service", "add", &room_prefix, "echo", "127.0.0.1:9"],
+        None,
+    );
+    assert!(ok, "PRODUCT: service add failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to offer \"echo\"",
+            &["\"team\""],
+            "vox: offering \"echo\"",
+            ""
+        ),
+        "PRODUCT: `vox service add` must say what it is to do, naming the room, then what it \
+         did: {out:?}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["service", "remove", &room_prefix, "echo"],
+        None,
+    );
+    assert!(ok, "PRODUCT: service remove failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to stop offering \"echo\"",
+            &["\"team\""],
+            "vox: no longer offering \"echo\"",
+            "live sessions cut: none was open"
+        ),
+        "PRODUCT: `vox service remove` must say what it is to do, naming the room, then what it \
+         did, naming the live sessions it cut: {out:?}"
+    );
+    let shared = tmp.path().join("shared.txt");
+    std::fs::write(&shared, "a file shared for the access proof\n")
+        .expect("APPARATUS: cannot write the shared file");
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "share",
+            &room_prefix,
+            shared.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT: vox share failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to share shared.txt",
+            &["\"team\""],
+            "vox: sharing shared.txt",
+            ""
+        ),
+        "PRODUCT: `vox share` must say what it is to do, naming the room, then that it shares: \
+         {out:?}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["share", "stop", &room_prefix, "shared.txt"],
+        None,
+    );
+    assert!(ok, "PRODUCT: vox share stop failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to stop sharing \"shared.txt\"",
+            &["\"team\""],
+            "vox: no longer sharing shared.txt",
+            "fetched 0"
+        ),
+        "PRODUCT: `vox share stop` must say what it is to end, naming the room, then that it \
+         stopped: {out:?}"
+    );
+    // A node this one shares no room with: a fingerprint nobody holds.
+    let stranger = "a".repeat(52);
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "trust",
+            "add",
+            &stranger,
+            "--name",
+            "stranger",
+            "--identity-passphrase-file",
+            pass_file,
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT: trust add failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to trust",
+            &["\"stranger\""],
+            "vox: trusting",
+            "\"stranger\""
+        ) && out.contains("you share no open room with it yet"),
+        "PRODUCT: `vox trust add` must say what it is to cover (no room shared yet), then what it \
+         did: {out:?}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &[
+            "trust",
+            "remove",
+            &stranger,
+            "--identity-passphrase-file",
+            pass_file,
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT: trust remove failed: {err}");
+    assert!(
+        said(
+            &out,
+            "vox: about to stop trusting",
+            &[],
+            "vox: no longer trusting",
+            ""
+        ) && said(
+            &out,
+            "vox: no longer trusting",
+            &[],
+            "     cut: none was open",
+            ""
+        ),
+        "PRODUCT: `vox trust remove` must say what it is to stop, then what it did, naming the \
+         live sessions it cut: {out:?}"
     );
 
     // ---- the remaining failures say something useful ----
