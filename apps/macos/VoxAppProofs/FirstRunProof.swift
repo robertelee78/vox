@@ -326,16 +326,14 @@ final class FirstRunProof: XCTestCase {
         tap(pick, "node alice")
         let field = ui.secureTextFields["passphrase"]
         present(ui, field, timeout: 10, "the app must ask for node alice's passphrase")
-        tap(field, "the passphrase field")
-        field.typeText("not the passphrase")
+        type(field, "not the passphrase", "the passphrase field")
         tap(ui.buttons["attach"], "Attach")
         words(ui, ui.descendants(matching: .any)["said"], timeout: 30,
               "a wrong passphrase must show the daemon's own sentence where it was typed",
               until: { $0.contains("that passphrase does not open node alice's identity") })
 
         // (2) The right one attaches it.
-        tap(field, "the passphrase field")
-        field.typeText("alice identity")
+        type(field, "alice identity", "the passphrase field")
         tap(ui.buttons["attach"], "Attach")
         present(ui, ui.descendants(matching: .any)["attached"], timeout: 60,
                 "the right passphrase must attach node alice")
@@ -360,11 +358,9 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey("n", modifierFlags: .command)
         let roomName = ui.textFields["room-form-name"]
         present(ui, roomName, timeout: 10, "⌘N must open the New Room form")
-        tap(roomName, "the room's name field")
-        roomName.typeText("mission")
+        type(roomName, "mission", "the room's name field")
         let roomSecret = ui.secureTextFields["room-form-passphrase"]
-        tap(roomSecret, "the room's passphrase field")
-        roomSecret.typeText("mission room")
+        type(roomSecret, "mission room", "the room's passphrase field")
         tap(ui.buttons["room-form-submit"], "Create")
         var rooms = ""
         let madeUntil = Date().addingTimeInterval(60)
@@ -488,8 +484,7 @@ final class FirstRunProof: XCTestCase {
         // Alice posts; bob's agent reads it in a drain, as a harness does before every prompt.
         let compose = ui.textFields["compose"]
         present(ui, compose, timeout: 10, "the room must have a field to post")
-        tap(compose, "the composer")
-        compose.typeText("FROM-ALICE\r")
+        type(compose, "FROM-ALICE\r", "the composer")
         var drained = ""
         let drainUntil = Date().addingTimeInterval(60)
         while Date() < drainUntil && !drained.contains("FROM-ALICE") {
@@ -516,11 +511,9 @@ final class FirstRunProof: XCTestCase {
         tap(ui.descendants(matching: .any)["keyring"], "Keyring in the sidebar")
         let addFp = ui.textFields["keyring-add-fingerprint"]
         present(ui, addFp, timeout: 10, "the keyring view must offer to add a node")
-        tap(addFp, "the fingerprint field")
-        addFp.typeText(carolFp)
+        type(addFp, carolFp, "the fingerprint field")
         let addAlias = ui.textFields["keyring-add-alias"]
-        tap(addAlias, "the alias field")
-        addAlias.typeText("carol")
+        type(addAlias, "carol", "the alias field")
         // The effect sentences are Texts: their words are their accessibility value.
         words(ui, ui.descendants(matching: .any)["keyring-add-effect"], timeout: 10,
               "adding must say what trusting does before it is done",
@@ -560,21 +553,26 @@ final class FirstRunProof: XCTestCase {
         let attachButton = ui.buttons["attach"]
         present(ui, attachButton, timeout: 10, "the room must offer Attach")
         tap(attachButton, "Attach (the paperclip)")
-        // The open panel, a window of the app: go to the file's path, then its Attach. Looked for
-        // among the windows only: an app-wide query also finds the Touch Bar's Attach.
-        ui.typeKey("g", modifierFlags: [.command, .shift])
-        ui.typeText(file.path + "\r")
-        let choose = ui.windows.buttons["Attach"].firstMatch
-        if !choose.waitForExistence(timeout: 10) {
-            XCTFail("PRODUCT: Attach must open the file panel; no window has its Attach button; the window shows: \(onScreen(ui))")
+        // The file panel, a dialog of the app (open-panel): go to the file's path, then the
+        // panel's own Attach (OKButton), once the Go To sheet has closed and it is enabled. Never
+        // an app-wide query: that also finds the Touch Bar's Attach.
+        if let panel = openPanel(ui, timeout: 10) {
+            ui.typeKey("g", modifierFlags: [.command, .shift])
+            ui.typeText(file.path + "\r")
+            let choose = panel.buttons["OKButton"]
+            let enabled = NSPredicate(format: "exists == true AND isEnabled == true")
+            if XCTWaiter.wait(for: [expectation(for: enabled, evaluatedWith: choose)], timeout: 10) != .completed {
+                XCTFail("APPARATUS: the file panel's Attach never became enabled after going to \(file.path): the Go To sheet did not take the path")
+            }
+            tap(choose, "the file panel's Attach")
+        } else {
+            XCTFail("PRODUCT: Attach must open the file panel; no file panel showed; the window shows: \(onScreen(ui))")
         }
-        tap(choose, "the file panel's Attach")
         let toBob = ui.descendants(matching: .any)["attach-to-bob"]
         present(ui, toBob, timeout: 10, "attaching a file must ask To:")
         tap(toBob, "To: bob")
         let noteField = ui.textFields["attach-note"]
-        tap(noteField, "the note field")
-        noteField.typeText("FOR-BOB-NOTE")
+        type(noteField, "FOR-BOB-NOTE", "the note field")
         tap(ui.buttons["attach-send"], "Send")
         let bobCopy = URL(fileURLWithPath: data).appendingPathComponent("nodes/bob/files/\(room)/for-bob.bin")
         var pulledBytes: Data?
@@ -616,12 +614,12 @@ final class FirstRunProof: XCTestCase {
         // ⌘O works with the lanes view shown, as with the timeline: the open panel shows.
         if windowReadable(ui) {
             ui.typeKey("o", modifierFlags: .command)
-            let panelAttach = ui.windows.buttons["Attach"].firstMatch
-            if !panelAttach.waitForExistence(timeout: 10) {
-                XCTFail("PRODUCT: ⌘O in the lanes view must open the file panel to attach a file; no window has its Attach button; the window shows: \(onScreen(ui))")
+            if let panel = openPanel(ui, timeout: 10) {
+                tap(panel.buttons["CancelButton"], "the file panel's Cancel")
+                _ = panel.waitForNonExistence(timeout: 10)
+            } else {
+                XCTFail("PRODUCT: ⌘O in the lanes view must open the file panel to attach a file; no file panel showed; the window shows: \(onScreen(ui))")
             }
-            ui.typeKey(.escape, modifierFlags: [])
-            _ = panelAttach.waitForNonExistence(timeout: 10)
         }
         tap(lanesToggle.buttons["Timeline"], "Timeline")
 
@@ -970,6 +968,20 @@ final class FirstRunProof: XCTestCase {
         }
         element.click()
         return true
+    }
+
+    /// Type `text` into `element`, only once it was clicked: typing into one that is not there is
+    /// an XCTest exception that names no side.
+    private func type(_ element: XCUIElement, _ text: String, _ what: String,
+                      file: StaticString = #filePath, line: UInt = #line) {
+        if tap(element, what, file: file, line: line) { element.typeText(text) }
+    }
+
+    /// The file panel (an NSOpenPanel: a dialog of the app, `open-panel`, not one of its
+    /// windows), once it shows.
+    private func openPanel(_ ui: XCUIApplication, timeout: TimeInterval) -> XCUIElement? {
+        let panel = ui.dialogs["open-panel"]
+        return panel.waitForExistence(timeout: timeout) ? panel : nil
     }
 
     /// A staging step: `vox` must succeed, else the staging was not achieved. Its output, trimmed.
