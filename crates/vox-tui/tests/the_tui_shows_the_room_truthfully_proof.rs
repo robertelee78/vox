@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks twenty-two claims, each
+//! 160x50. It checks twenty-four claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -53,6 +53,10 @@
 //! - `regions`: the sidebar names Bob's node attached; once Alice writes to him there, the room is
 //!   listed under "needs you (1)" reading "to you 1"; and the nodes on his machine are listed, his
 //!   attached and a second one detached (ADR-028 W-1, W-2, #511);
+//! - `newcomer`: Frank joins while Bob's TUI is open, and it says "<frank> joined. No one you trust
+//!   trusts it yet.", then, once Alice (whom Bob trusts) trusts Frank, "<frank> joined. alice trusts
+//!   it.", naming neither Erin (in Bob's keyring, never in the room, never granting Frank) nor
+//!   anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is added to no keyring of Bob's;
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
@@ -79,7 +83,8 @@
 //! carries the message text or is raised per message, a room with a message to Bob grouped other
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`). It passes only on the
-//! script's PASS with all 23 claims ok.
+//! script's PASS with all 24 claims ok; or a join line naming a trusted member that has not
+//! granted the newcomer (`newcomer`).
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -153,23 +158,23 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (#240).
     // Its bounds are the product's: a member waits 480 s for a joiner's proof of work (V210-87),
     // which a debug build can take minutes to grind, and the driver joins three members at once, then
-    // opens the TUI three times more (`depths`, about 90 s). So
-    // the driver's budget is 1260 s, it is stopped from outside at 1290 s, and the watchdog is past
-    // both. A release run takes about two minutes.
-    watchdog::arm_for(Duration::from_secs(1390));
+    // a fourth while the TUI is open, then opens the TUI three times more (`depths`, about 90 s).
+    // So the driver's budget is 1750 s, it is stopped from outside at 1780 s, and the watchdog is
+    // past both. A release run takes about two minutes.
+    watchdog::arm_for(Duration::from_secs(1880));
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_truth.py");
     let clock = StallClock::start();
     let out = pty_driver::run_within(
         script,
         &[env!("CARGO_BIN_EXE_vox"), "truth"],
-        Duration::from_secs(1290),
+        Duration::from_secs(1780),
     );
     let stall = clock.stop();
     let said = out.stdout.clone();
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (23 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (24 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -183,8 +188,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (23, 23),
-                "APPARATUS: the driver said PASS without all 23 claims ok: {said}"
+                (24, 24),
+                "APPARATUS: the driver said PASS without all 24 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

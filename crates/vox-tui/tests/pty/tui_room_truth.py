@@ -57,7 +57,12 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   regions   the sidebar names bob's node attached; once Alice writes to him there, the room is
             listed under "needs you (1)" reading "to you 1"; and the nodes on this machine are
             listed, his attached and a second one detached (ADR-028 W-1, W-2, #511);
-  unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
+  newcomer  Frank joins while Bob's TUI is open, through Alice: Bob's TUI says "<frank> joined. No
+            one you trust trusts it yet." and, once Alice (whom Bob trusts) trusts Frank, "<frank>
+            joined. alice trusts it.", naming neither Erin, whom Bob trusts and who never granted
+            Frank, nor anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is in no keyring of
+            Bob's after;
+  unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
             "only on this machine"; once Alice's daemon is started again and has synced, "on 1 of
@@ -94,10 +99,10 @@ HEX = {k: v["hex"].lstrip("#").lower() for k, v in TOKENS.items()}
 BOX = set("─│┌┐└┘╭╮╰╯")
 
 VOX, TAG = sys.argv[1], sys.argv[2]
-# Sized for the debug build, whose joins grind their proof of work for minutes: two joins at
-# JOIN_SECS each, and the rest (about 150 s in debug, and 90 s more for the depths' three TUIs).
-# The Rust wrapper's bound sits above it.
-BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1260"))
+# Sized for the debug build, whose joins grind their proof of work for minutes: three joins at
+# JOIN_SECS each (two at once, then Frank's), and the rest (about 150 s in debug, and 90 s more for
+# the depths' three TUIs). The Rust wrapper's bound sits above it.
+BUDGET = int(os.environ.get("VOX_PTY_BUDGET_SECS", "1750"))
 # A member waits 480 s for a joiner's proof of work (V210-87), plus its 5 s slack: a join that has
 # not returned by then is past what the product allows, and is a named RED.
 JOIN_SECS = 490
@@ -105,7 +110,9 @@ SP = os.environ.get("VOX_PTY_SCRATCH") or __import__("tempfile").mkdtemp(prefix=
 S = f"{SP}/tuit-{TAG}"
 POSTS = 70  # the timeline pane holds 43 lines at 160x50
 subprocess.run(["rm", "-rf", S])
-WHO = ["anchor", "alice", "bob", "carol", "dave"]
+# Frank joins while Bob's TUI is open; Erin is a node Bob trusts that is never in the room: a join
+# line may name only who granted.
+WHO = ["anchor", "alice", "bob", "carol", "dave", "frank", "erin"]
 for w in WHO:
     for d in ("data", "cfg"):
         os.makedirs(f"{S}/{w}/{d}")
@@ -221,7 +228,7 @@ try:
         if m is None: product(f"{w}'s `vox id` printed no fingerprint: {r.stdout!r}")
         fp[w] = m.group(0)
     daemons = {w: spawn(w, "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
-                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol", "dave")}
+                        "--passphrase-file", f"{S}/idpass", out=w) for w in ("alice", "bob", "carol", "dave", "frank")}
     for w in daemons:
         if not until(lambda: run(w, "room", "list").returncode == 0, 60):
             product(f"{w}'s daemon never answered `vox room list` within 60 s: " + open(f"{S}/{w}.err").read())
@@ -253,7 +260,7 @@ try:
     # owner trusts (V210-118).
     # Bob trusts Dave, and Dave trusts nobody: the one way of the three (ADR-028 L-4's `→`).
     for (w, other, name) in (("bob", "alice", "alice"), ("alice", "bob", "bob"), ("carol", "bob", "bob"),
-                             ("bob", "dave", "dave")):
+                             ("bob", "dave", "dave"), ("bob", "erin", "erin")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
     stage("alice posts")
@@ -681,10 +688,32 @@ try:
     tui.until(regions, 30, 1)
     claim("regions", regions(), f"sidebar: {side()!r}")
 
+    stage("newcomer")
+    # Frank joins through Alice's link while Bob's TUI is open. Bob trusts Alice; nobody trusts Frank
+    # yet, so Bob's TUI must say so, and must not name Alice until her node has granted Frank.
+    frank_name = f"{fp['frank'][:26]} (not in keyring)"
+    alone = f"{frank_name} joined. No one you trust trusts it yet."
+    trusted = f"{frank_name} joined. alice trusts it."
+    flat = lambda: " ".join(r.strip() for r in tui.display())
+    j = run("frank", "room", "join", "--passphrase-file", "-", link, stdin="room pass")
+    if j.returncode != 0: product(f"frank's `vox room join` failed: {j.stderr.strip()}")
+    said_alone = tui.until(lambda: alone in flat(), 120, 1)
+    before_grant = [r.strip() for r in tui.display() if "joined" in r]
+    t = run("alice", "trust", "add", fp["frank"], "--name", "frank", "--identity-passphrase-file", f"{S}/idpass")
+    if t.returncode != 0: product(f"alice's `vox trust add` of frank failed: {t.stderr.strip()}")
+    said_trusted = tui.until(lambda: trusted in flat(), 120, 1)
+    after_grant = [r.strip() for r in tui.display() if "joined" in r]
+    ring = run("bob", "trust", "list")
+    if ring.returncode != 0: product(f"bob's `vox trust list` failed: {ring.stderr.strip()}")
+    unadded = fp["frank"] not in ring.stdout
+    claim("newcomer", said_alone and said_trusted and unadded,
+          f"before alice trusted frank, bob's TUI said {before_grant!r} (wanted {alone!r}); after, "
+          f"{after_grant!r} (wanted {trusted!r}); frank absent from bob's keyring: {unadded}")
+
     stage("unreach")
-    for w in ("alice", "carol", "dave"):
+    for w in ("alice", "carol", "dave", "frank"):
         daemons[w].terminate()
-    for w in ("alice", "carol", "dave"):
+    for w in ("alice", "carol", "dave", "frank"):
         stop(daemons[w])
     gone = tui.until(lambda: any("○ offline" in r for r in rows()), 30, 1)
     claim("unreach", gone, f"with every other member's daemon stopped, list rows: {rows()!r}")
@@ -705,7 +734,7 @@ try:
     if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
         product("alice's daemon, started again, never answered `vox room list` within 60 s: "
                 + open(f"{S}/alice-again.err").read())
-    WHERE = "on 1 of 3 members' nodes"  # alice of alice, carol and dave
+    WHERE = "on 1 of 4 members' nodes"  # alice of alice, carol, dave and frank
     tui.until(lambda: under("d-001") == WHERE, 90, 1)
     synced = under("d-001")
     claim("where", alone == "only on this machine" and synced == WHERE,

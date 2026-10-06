@@ -3279,13 +3279,23 @@ impl ChannelState {
         MembershipView::new(&self.evaluator).readers_of(&self.me())
     }
 
-    /// Every other member that consents to this identity reading it here: the inbound half of
-    /// [`consented`](Self::consented), off the log the same way (V030-17).
+    /// **Who trusts each member here** (ADR-028 K-7): for every member some other member consents
+    /// to reading it, those other members, off the log like [`consented`](Self::consented). This
+    /// identity's own entry is who consents to it reading them, the inbound half of `consented`
+    /// (V030-17). A consent grant is what a member's node writes once its owner trusts the other (ADR-007
+    /// G-9), so this is what a client says of a newcomer: which members already trust it.
     #[must_use]
-    pub fn consenting(&self) -> BTreeSet<Digest32> {
-        let me = self.me();
-        let mut by = MembershipView::new(&self.evaluator).readable_authors(&me, &self.members());
-        by.remove(&me);
+    pub fn trusted_by(&self) -> BTreeMap<Digest32, BTreeSet<Digest32>> {
+        let view = MembershipView::new(&self.evaluator);
+        let members = self.members();
+        let mut by: BTreeMap<Digest32, BTreeSet<Digest32>> = BTreeMap::new();
+        for author in &members {
+            for reader in view.readers_of(author) {
+                if reader != *author && members.contains(&reader) {
+                    by.entry(reader).or_default().insert(*author);
+                }
+            }
+        }
         by
     }
 

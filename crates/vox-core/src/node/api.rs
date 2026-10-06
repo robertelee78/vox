@@ -473,6 +473,10 @@ pub struct ChannelDetail {
     /// The other members that consent to this identity reading them here, in fingerprint order:
     /// the inbound half of `consented`, off the log the same way (V030-17).
     pub consenting: Vec<Digest32>,
+    /// Who trusts each member here (ADR-028 K-7): `(member, the other members that consent to it
+    /// reading them)`, in fingerprint order, a member no one trusts left out. `consenting` is this
+    /// identity's own entry.
+    pub trusted_by: Vec<(Digest32, Vec<Digest32>)>,
     /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
     /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
     /// so a reader never has to take the room's lock, which a sync session holds while it runs.

@@ -279,6 +279,9 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
             crate::node::api::StructuredIndex::default().appended(0, rows.iter().map(|r| &r.text)),
         ),
     };
+    // Who trusts each member (ADR-028 K-7), once: this identity's own entry is `consenting`.
+    let trusted_by = ch.trusted_by();
+    let consenting = trusted_by.get(&ch.me()).cloned().unwrap_or_default();
     ChannelDetail {
         channel_id: ch.channel_id(),
         name: ch.name().map(str::to_owned),
@@ -299,7 +302,11 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         creator: ch.genesis().creator_pubkey().fingerprint(),
         consented: ch.consented().into_iter().collect(),
         admins: ch.admins(),
-        consenting: ch.consenting().into_iter().collect(),
+        consenting: consenting.into_iter().collect(),
+        trusted_by: trusted_by
+            .into_iter()
+            .map(|(member, by)| (member, by.into_iter().collect()))
+            .collect(),
         retention: ch.effective_retention(),
         key_generations: ch.key_generations(),
         received_key_generations: ch.received_key_generations(),
