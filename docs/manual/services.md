@@ -9,18 +9,34 @@ authentication. Do not enable a new service merely to follow an example.
 
 ## How a service is named
 
-Every shared service has a name the sharer chose, and a member reaches it only by its address:
+Every shared service has a name the sharer chose, and a member reaches it only by its address.
+Each service has two addresses, and both reach it.
+
+The **readable address** is the one you type:
 
 ```text
 SERVICE.NODE.ROOM.vox
 ```
 
 `SERVICE` is the sharer's name for the service, `NODE` is **your** name for the sharing node (the
-name you gave it with `vox trust add`, or its fingerprint) and `ROOM` is **your** name for the
-room. Two members can therefore see different addresses for the same service; copy yours from
-`vox service list`, never from someone else's screen. `NODE.ROOM.vox` and `ROOM.vox` reach
-nothing. Names are matched without regard to case, so your alias `robertGPT` appears as
-`robertgpt` in an address.
+name you gave it with `vox trust add`) and `ROOM` is **your** name for the room. Two members can
+therefore see different readable addresses for the same service: `web.robertgpt.family.vox` on
+your machine may be `web.rob.home.vox` on someone else's. Names are matched without regard to
+case, so your alias `robertGPT` appears as `robertgpt` in an address. A part that names nothing
+you know is refused with the reason, for example ``no node you trust is called `nobody` — only
+trusted nodes have names here``.
+
+The **canonical address** is the one to copy and send. It is made of fingerprints and IDs only,
+`SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox`, so it reaches the same service on every member's
+machine. `vox service list` prints it under the readable one:
+
+```text
+vox: shared in family (pym47virdp2b)
+  web.robertgpt.family.vox  by robertgpt  http
+    lnprznanqhhlxnmpzbtyfwrlomjfpzxzzovs5la2ru27smorscjq.xcxrnsegnn74dd5mxxmdrch7zfvooa4ekqxaswamlgzjwejmrwsq.pym47virdp2bauqugugmjbqa3tm6qeu762dxggg663vglzd44zua.vox
+```
+
+`NODE.ROOM.vox` and `ROOM.vox` reach nothing.
 
 ## A port shared into a new room
 
@@ -32,9 +48,9 @@ vox serve ssh=22
 
 `serve` creates a room, shares `127.0.0.1:22` in it as `ssh`, and keeps running. It prints the
 room ID, the room link, a generated room passphrase (`^ send this another way than the address (in
-person, a call, a different app)`) and the address the service answers on, with fingerprints in the
-node and room places, followed by the [kind](#what-kind-of-service-it-is) Vox detected:
-`sharing 127.0.0.1:22 as ssh.FINGERPRINT.ROOM_ID.vox (ssh)`.
+person, a call, a different app)`) and the service's [canonical address](#how-a-service-is-named),
+followed by the [kind](#what-kind-of-service-it-is) Vox detected:
+`sharing 127.0.0.1:22 as ssh — SERVICE_ID.FINGERPRINT.ROOM_ID.vox (ssh)`.
 Send the link and the passphrase separately. Protect this output: it includes the room passphrase.
 Several shares can be named at once, such as `vox serve ssh=22 dns=53/udp`; `--at` names a local
 endpoint other than `127.0.0.1:PORT`, and `--name` sets the new room's name, which every member sees (default
@@ -109,9 +125,10 @@ vox service list ROOM_ID
 ```
 
 Vox replies `offering "ssh" at 127.0.0.1:22 … it is dark until you vox trust add someone — and they
-join this room`. On the host, `service list` prints the address, `by you` and the kind under
-`shared in`, and the endpoint under `services offered`. On a guest it prints the address, who
-shares it and the kind, for example `ssh.robertgpt.family.vox  by robertgpt  ssh`. This offers
+join this room`. On the host, `service list` prints the readable address, `by you` and the kind
+under `shared in`, the canonical address under it, and the endpoint under `services offered`. On a
+guest it prints the readable address, who shares it and the kind, for example
+`ssh.robertgpt.family.vox  by robertgpt  ssh`, and the canonical address under it. This offers
 an existing endpoint; it does not start
 `sshd`. The host's trust keyring controls reach, not the service name. Bind your underlying
 service appropriately: a service already listening on every LAN interface is still exposed there
