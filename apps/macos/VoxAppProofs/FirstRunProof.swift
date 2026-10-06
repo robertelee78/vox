@@ -419,6 +419,9 @@ final class FirstRunProof: XCTestCase {
                        env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
             try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
             try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+            // Only the app holds alice from here, as after step 2: `vox node attach` is an
+            // explicit attach that outlives the app (step 12 checks the app's quit detaches her).
+            try staged(vox, ["node", "detach", "alice"], env: voxEnv)
             print("[proof] started at step \(from): steps 1–5 NOT RUN; what they leave was staged by vox")
         }
 
@@ -428,6 +431,11 @@ final class FirstRunProof: XCTestCase {
         ui.launch()
 
         if from > 5 {
+            // The app attaches alice itself, her passphrase typed, as in step 2.
+            let field = Key.id("passphrase")
+            present(ui, field, timeout: 30, "the app must ask for node alice's passphrase")
+            type(ui, field, "alice identity", "the passphrase field")
+            tap(ui, Key.id("attach"), "Attach")
             present(ui, Key.id("attached"), timeout: 60, "the app, its first run answered, must open attached as alice")
             listed = run(vox, ["node", "list"], env: voxEnv).out
         } else {
