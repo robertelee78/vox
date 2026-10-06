@@ -950,7 +950,9 @@ final class FirstRunProof: XCTestCase {
                     file: file, line: line)
             return false
         }
-        guard ui.windows.firstMatch.waitForExistence(timeout: 5), !onScreen(ui).isEmpty else {
+        // One text read is the premise; the full listing is for a red's message only.
+        let text = ui.windows.firstMatch.staticTexts.firstMatch
+        guard ui.windows.firstMatch.waitForExistence(timeout: 5), text.exists, !shown(text).isEmpty else {
             XCTFail("APPARATUS: XCTest reads no words in what Vox shows, so nothing in it can be checked",
                     file: file, line: line)
             return false
@@ -974,13 +976,35 @@ final class FirstRunProof: XCTestCase {
         .filter { !$0.isEmpty }.joined(separator: " | ")
     }
 
-    /// Where `key` is in what the app shows now, searched in every container; nil when nowhere.
+    /// Where `key` is now, looked for while waiting: the windows (with their sheets and
+    /// popovers) and the dialogs, two queries a turn. A menu item, in the menus.
     private func locate(_ ui: XCUIApplication, _ key: Key) -> XCUIElement? {
+        let quick: [XCUIElementQuery]
+        if case .menuItem = key { quick = [ui.menus] } else { quick = [ui.windows, ui.dialogs] }
+        for container in quick {
+            let found = key.query(in: container).firstMatch
+            if found.exists { return found }
+        }
+        return nil
+    }
+
+    /// Where `key` is, searched in every container the app can show: before any verdict that it
+    /// is missing.
+    private func locateEverywhere(_ ui: XCUIApplication, _ key: Key) -> XCUIElement? {
         for container in key.containers(ui, all: containers(ui)) {
             let found = key.query(in: container).firstMatch
             if found.exists { return found }
         }
         return nil
+    }
+
+    /// The app's whole accessibility tree, attached to the result, so a red carries its own
+    /// evidence.
+    private func keepTree(_ ui: XCUIApplication, _ why: String) {
+        let tree = XCTAttachment(string: ui.debugDescription)
+        tree.name = "Vox's UI tree when \(why)"
+        tree.lifetime = .keepAlways
+        add(tree)
     }
 
     /// The element `key` names, where it is now (else a query that finds nothing): for reading
@@ -1001,6 +1025,7 @@ final class FirstRunProof: XCTestCase {
             if locate(ui, key) != nil { return true }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
+        if locateEverywhere(ui, key) != nil { return true }
         missing(ui, key, product, file: file, line: line)
         return false
     }
@@ -1009,6 +1034,7 @@ final class FirstRunProof: XCTestCase {
     /// person, PRODUCT otherwise, quoting everything shown.
     private func missing(_ ui: XCUIApplication, _ key: Key, _ product: String, file: StaticString,
                          line: UInt) {
+        keepTree(ui, "\(key) was not shown")
         let anywhere = key.query(in: ui.descendants(matching: .any)).firstMatch
         if anywhere.exists {
             XCTFail("APPARATUS: \(key) is in the app only outside its windows, dialogs, sheets, popovers and menus (\(anywhere.elementType.rawValue)); the proof's search missed it",
@@ -1038,12 +1064,19 @@ final class FirstRunProof: XCTestCase {
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
+        if !seen, let e = locateEverywhere(ui, key) {
+            seen = true
+            last = shown(e)
+            if !last.isEmpty && holds(last) { return last }
+        }
         if !seen {
             missing(ui, key, product, file: file, line: line)
         } else if last.isEmpty {
+            keepTree(ui, "\(key) could not be read")
             XCTFail("APPARATUS: \(key) is shown and XCTest reads neither its label nor its value",
                     file: file, line: line)
         } else {
+            keepTree(ui, "\(key) showed the wrong words")
             XCTFail("PRODUCT: \(product); it shows \"\(last)\"", file: file, line: line)
         }
         return nil
@@ -1062,7 +1095,8 @@ final class FirstRunProof: XCTestCase {
             }
             Thread.sleep(forTimeInterval: 0.25)
         } while Date() < end
-        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): \(locate(ui, key) == nil ? "not shown" : "not hittable")",
+        keepTree(ui, "\(what) could not be clicked")
+        XCTFail("APPARATUS: XCTest cannot click \(what) (\(key)): \(locateEverywhere(ui, key) == nil ? "not shown" : "not hittable")",
                 file: file, line: line)
         return false
     }
