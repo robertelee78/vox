@@ -425,6 +425,9 @@ fn render_row(
         &addressed(&r.text, me, crate::ident::names()),
         &words(&r.text),
     );
+    if let Some(line) = share_line(r, me, parents) {
+        row.push_str(&line);
+    }
     let Some(preview) = reply_preview(r, parents) else {
         out.push_str(&row);
         return;
@@ -447,6 +450,50 @@ struct Parents {
     /// Whether the node answered the lookup. When it did not, a message not found may still be
     /// held, so its absence is not claimed.
     looked_up: bool,
+    /// The copies this node pulled in the room, by announcement (ADR-028 F-6).
+    pulled: Vec<vox_core::node::pulls::Pulled>,
+    /// Where this node puts what it pulls from the room (F-4).
+    files: std::path::PathBuf,
+}
+
+/// The directory, under the cursors, holding the shares each session was shown before their
+/// copies landed: a later turn says where each landed (ADR-028 F-6).
+const PULLING_DIR: &str = "pulling";
+
+/// The line after a share's row: where its verified copy is.
+pub const PULLED_TO: &str = "  \u{21b3} pulled to ";
+
+/// The entry of a share this node pulls by itself (F-3): a file announcement addressed to this
+/// node or to no one, from another member. `None` for any other row.
+fn pulled_share(r: &vox_core::node::api::MessageRow, me: Option<&Digest32>) -> Option<String> {
+    let e = vox_agentcomms::envelope::Envelope::parse(&r.text).ok()?;
+    let me = me?;
+    let fp = b32_encode(me);
+    (e.kind == crate::room_cli::FILE && r.author != *me && (e.to.is_empty() || e.to.contains(&fp)))
+        .then(|| e.data["name"].as_str().map(str::to_owned))
+        .flatten()
+}
+
+/// **An agent is given the local path of the copy** (ADR-028 F-6): the line after a share this
+/// node pulls says where its verified copy is, or, before it has landed, where it will, and that a
+/// later turn says so. The path is this node's own record, never text from the message.
+fn share_line(
+    r: &vox_core::node::api::MessageRow,
+    me: Option<&Digest32>,
+    parents: &Parents,
+) -> Option<String> {
+    let name = pulled_share(r, me)?;
+    Some(
+        match parents.pulled.iter().find(|p| p.entry == r.entry_hash) {
+            Some(p) => format!("{PULLED_TO}{}\n", p.path.display()),
+            None => format!(
+                "  \u{21b3} not pulled yet: it lands in {}/ once its SHA-256 is verified, and a \
+                 later turn says where; `vox room get` pulls {} now\n",
+                parents.files.display(),
+                vox_core::node::pulls::safe_file_name(&name)
+            ),
+        },
+    )
 }
 
 /// The one-line preview of the message `r` replies to, or `None` when it names none (V030-19).
@@ -1255,12 +1302,20 @@ struct RoomDrain {
     reader: Reader,
     /// The messages the news replies to (V030-19).
     parents: Parents,
+    /// Where the shares an earlier turn showed before their copies landed have landed since, one
+    /// line each, said once (F-6).
+    landed: Vec<String>,
+    /// The shares still waiting for their copies, from earlier turns.
+    pulling: std::collections::BTreeSet<String>,
 }
 
 impl RoomDrain {
     /// Whether this room has anything to say this turn.
     fn has_news(&self) -> bool {
-        !self.fresh.is_empty() || self.refused.is_some() || !self.lost.is_empty()
+        !self.fresh.is_empty()
+            || self.refused.is_some()
+            || !self.lost.is_empty()
+            || !self.landed.is_empty()
     }
 
     /// Where the cursor stands once the first `shown` of [`Self::fresh`] are shown, and what
@@ -1315,6 +1370,32 @@ impl RoomDrain {
             if let Err(e) = save_held(paths, &self.key, session, now) {
                 eprintln!("vox agent hook: could not record held claims: {e}");
             }
+        }
+        // The shares shown before their copies landed, for a later turn to say where.
+        let me = self.reader.me;
+        let mut pulling = self.pulling.clone();
+        for r in &self.fresh[..shown] {
+            if pulled_share(r, me.as_ref()).is_some()
+                && !self.parents.pulled.iter().any(|p| p.entry == r.entry_hash)
+            {
+                pulling.insert(b32_encode(&r.entry_hash));
+            }
+        }
+        let file = under_cursors(paths, &self.key, session, PULLING_DIR);
+        let body: String = pulling.iter().map(|e| format!("{e}\n")).collect();
+        let saved = if body.is_empty() {
+            match std::fs::remove_file(&file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            std::fs::create_dir_all(paths.cursor_dir().join(PULLING_DIR)).and_then(|()| {
+                vox_core::node::paths::write_private_file_unique(&file, body.as_bytes())
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+        };
+        if let Err(e) = saved {
+            eprintln!("vox agent hook: could not record the shares still being pulled: {e}");
         }
     }
 }
@@ -1415,6 +1496,17 @@ async fn drain(
                  `vox room post --work` exit 3.\n\n"
             ));
         }
+    }
+    for d in &news {
+        if d.landed.is_empty() {
+            continue;
+        }
+        context.push_str(&format!("Files pulled in room {}:\n", d.heading));
+        for line in &d.landed {
+            context.push_str(line);
+            context.push('\n');
+        }
+        context.push('\n');
     }
     // Bounded (PRD-001 D9) for the whole turn, and shared between the rooms with news: what
     // did not fit is delivered next turn, so a room's cursor moves only as far as the last
@@ -1738,9 +1830,44 @@ async fn read_room(
     };
     let mut parent_rows = targets;
     parent_rows.extend(rows.iter().cloned());
+    let pulled: Vec<vox_core::node::pulls::Pulled> = vox_core::node::pulls::recorded(paths)
+        .into_iter()
+        .filter(|p| p.room == channel_id)
+        .collect();
+    // **Where a share shown before it landed has landed since** (F-6), said once; one whose copy
+    // is not there yet waits for a later turn.
+    let mut pulling: std::collections::BTreeSet<String> = std::fs::read_to_string(under_cursors(
+        paths,
+        &room_key,
+        &input.session_id,
+        PULLING_DIR,
+    ))
+    .map(|t| {
+        t.lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default();
+    let mut landed = Vec::new();
+    pulling.retain(
+        |entry| match pulled.iter().find(|p| b32_encode(&p.entry) == *entry) {
+            Some(p) => {
+                landed.push(format!(
+                    "[{}] the file offered there is pulled: {}",
+                    &entry[..8.min(entry.len())],
+                    p.path.display()
+                ));
+                false
+            }
+            None => true,
+        },
+    );
     let parents = Parents {
         rows: parent_rows,
         looked_up,
+        pulled,
+        files: vox_core::node::pulls::room_dir(paths, &channel_id),
     };
 
     Ok(RoomDrain {
@@ -1759,6 +1886,8 @@ async fn read_room(
         lost,
         refused,
         held_now,
+        landed,
+        pulling,
     })
 }
 
