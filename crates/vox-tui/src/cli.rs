@@ -1095,8 +1095,9 @@ pub struct RoomArgs {
     /// process's environment is readable by whatever runs as its user, and is inherited by
     /// everything it starts.
     ///
-    /// Use `--passphrase-file`, or let it prompt (it reads a line from stdin when stdin is
-    /// not a terminal).
+    /// Use `--passphrase-file <path>` (`-` reads it from stdin), or, at a terminal, let it
+    /// prompt. A piped stdin is never read unasked: whatever was piped in for something else
+    /// would be taken as the passphrase.
     #[arg(long)]
     pub passphrase: Option<String>,
     /// Read the room passphrase from this file (first line). The scripted way to give it: a
@@ -1594,8 +1595,9 @@ pub struct ConnectArgs {
     /// process's environment is readable by whatever runs as its user, and is inherited by
     /// everything it starts.
     ///
-    /// Use `--passphrase-file`, or let it prompt (it reads a line from stdin when stdin is
-    /// not a terminal).
+    /// Use `--passphrase-file <path>` (`-` reads it from stdin), or, at a terminal, let it
+    /// prompt. A piped stdin is never read unasked: whatever was piped in for something else
+    /// would be taken as the passphrase.
     #[arg(long)]
     pub passphrase: Option<String>,
     /// Read the room passphrase from this file (first line). The scripted way to give it: a
