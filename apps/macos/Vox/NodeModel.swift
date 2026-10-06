@@ -359,10 +359,10 @@ final class NodeModel: ObservableObject {
         await withPassphrase(typed) { [client] p in try await client.createRoom(name: name, passphrase: p) }
     }
 
-    /// Join a room by its link and passphrase, naming it `name` here, and show it.
-    func joinRoom(_ link: String, as name: String, passphrase typed: Data) async -> Bool {
+    /// Join a room by its link and passphrase, and show it. It keeps the name its members gave it.
+    func joinRoom(_ link: String, passphrase typed: Data) async -> Bool {
         await withPassphrase(typed) { [client] p in
-            try await client.joinRoom(link: link, name: name, passphrase: p)
+            try await client.joinRoom(link: link, passphrase: p)
         }
     }
 

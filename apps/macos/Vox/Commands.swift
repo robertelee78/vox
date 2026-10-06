@@ -174,7 +174,8 @@ struct NodeSheets: View {
     }
 }
 
-/// New Room, or Join Room with its link: a name for it here and its passphrase.
+/// New Room, with the name every member sees, or Join Room with its link; and its passphrase. A
+/// joined room keeps the name its members gave it (ADR-028 R-1).
 private struct RoomForm: View {
     @ObservedObject var model: NodeModel
     let joining: Bool
@@ -187,9 +188,10 @@ private struct RoomForm: View {
             Text(joining ? "Join a room" : "New room").font(Theme.heading)
             if joining {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
+            } else {
+                TextField("Its name, as every member sees it", text: $name)
+                    .accessibilityIdentifier("room-form-name")
             }
-            TextField("Your name for it", text: $name)
-                .accessibilityIdentifier("room-form-name")
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
             SecureInput(holder: field) { submit() }.frame(width: 320)
@@ -198,7 +200,7 @@ private struct RoomForm: View {
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(joining ? "Join" : "Create") { submit() }.keyboardShortcut(.defaultAction)
-                    .disabled(name.isEmpty || (joining && link.isEmpty))
+                    .disabled(joining ? link.isEmpty : name.isEmpty)
                     .accessibilityIdentifier("room-form-submit")
             }
         }
@@ -210,7 +212,7 @@ private struct RoomForm: View {
         let bytes = field.take()
         let (l, n) = (link, name)
         Task {
-            let ok = joining ? await model.joinRoom(l, as: n, passphrase: bytes)
+            let ok = joining ? await model.joinRoom(l, passphrase: bytes)
                 : await model.createRoom(n, passphrase: bytes)
             if ok { model.sheet = nil }
         }
