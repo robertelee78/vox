@@ -15,8 +15,14 @@
 //!    in the peer's `vox room read`; read back at once, its own room holds the post: a post is
 //!    answered once the node has it.
 //! 2. A message the peer posts reaches the Swift program **through its listener**.
-//! 3. When the client closes, the daemon detaches the node it attached (`vox node list` says
+//! 3. A service the peer shares (`vox service add`) is listed by `services` at the address the
+//!    app's own `vox service list` prints; `forward` to that address carries bytes to the peer's
+//!    service and back; `stopForward` ends it; `status` is the report `vox status --json` gives
+//!    for the same node (ADR-014 #436).
+//! 4. When the client closes, the daemon detaches the node it attached (`vox node list` says
 //!    `detached`): the app's hold ends with it (M-6).
+//!
+//! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -94,7 +100,8 @@ impl Daemon {
         let out = child.wait_with_output().unwrap();
         assert!(
             out.status.success(),
-            "vox {args:?} failed: {}{}",
+            "PRODUCT (staging): `vox {}` failed: {}{}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -479,7 +486,72 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     peer.run(&["room", "post", &room, "hello from the peer"], "");
     writeln!(to_app).unwrap();
     let got = expect(&from_app, &seen, "GOT hello from the peer");
-    // (3) The app closes; the daemon lets the node go.
+
+    // (3) The peer shares an echo service; the app lists it, forwards to it, and reports.
+    let echo = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let echo_at = echo.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for conn in echo.incoming() {
+            let Ok(mut conn) = conn else { return };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = conn.read(&mut buf) {
+                    if n == 0 || conn.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    peer.run(&["service", "add", &room, "echo", &echo_at], "");
+    writeln!(to_app).unwrap();
+    let shared = expect(&from_app, &seen, "SHARED ");
+    let address = shared
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    // What the app's own data root's `vox service list` prints for the same node and room.
+    let cli_list = mine.run(&["service", "list", &joined[7..]], "");
+    let cli_address = cli_list
+        .lines()
+        .find(|l| l.contains(" by ") && !l.contains(" by you "))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !cli_address.is_empty(),
+        "APPARATUS: `vox service list` on the app's data root listed no share of the peer's to \
+         compare with: {cli_list}"
+    );
+    assert_eq!(
+        address, cli_address,
+        "PRODUCT: `services` must list the peer's share at the address `vox service list` \
+         prints; it said {shared:?}"
+    );
+    writeln!(to_app).unwrap();
+    let bound = expect(&from_app, &seen, "BOUND ")[6..].to_owned();
+    let mut through = String::new();
+    if let Ok(mut s) = std::net::TcpStream::connect(&bound) {
+        let _ = s.set_read_timeout(Some(TIMEOUT));
+        let _ = s.write_all(b"through vox\n");
+        let mut buf = [0u8; 64];
+        while !through.ends_with('\n') {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => through.push_str(&String::from_utf8_lossy(&buf[..n])),
+            }
+        }
+    }
+    writeln!(to_app, "{bound}").unwrap();
+    expect(&from_app, &seen, "STOPPED");
+    let refused_after = std::net::TcpStream::connect(&bound).is_err();
+    let status = expect(&from_app, &seen, "STATUS ")[7..].to_owned();
+    let status: serde_json::Value = serde_json::from_str(&status).unwrap_or_default();
+    let cli_status: serde_json::Value =
+        serde_json::from_str(&mine.run(&["status", "--json"], "")).unwrap_or_default();
+
+    // (4) The app closes; the daemon lets the node go.
     writeln!(to_app).unwrap();
     expect(&from_app, &seen, "CLOSED");
     let until = Instant::now() + TIMEOUT;
@@ -497,9 +569,12 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
 
     eprintln!(
         "{joined}\nwhile attached, `vox node list` said: {listed}{posted}\npeer's read shows the \
-         app's post: {}\n{got}\nafter close, `vox node list` said: {after}all the Swift program \
-         said: {:?}",
+         app's post: {}\n{got}\n{shared}\n`vox service list` said: {cli_list}BOUND {bound}, \
+         echoed {through:?}, refused once stopped: {refused_after}\nstatus identity {} (vox \
+         status: {})\nafter close, `vox node list` said: {after}all the Swift program said: {:?}",
         read.contains("hello from swift"),
+        status["identity"],
+        cli_status["identity"],
         seen.lock().unwrap()
     );
     assert!(
@@ -517,6 +592,21 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "PRODUCT: the peer must read the app's post: {read}"
     );
     assert_eq!(got, "GOT hello from the peer");
+    assert_eq!(
+        through, "through vox\n",
+        "PRODUCT: a forward to {address} must carry bytes to the peer's service and back"
+    );
+    assert!(
+        refused_after,
+        "PRODUCT: once stopped, the forward at {bound} must accept nothing"
+    );
+    assert!(
+        status["identity"].is_string() && status["identity"] == cli_status["identity"],
+        "PRODUCT: `status` must be the node's report, as `vox status --json` gives it: identity \
+         {} against {}",
+        status["identity"],
+        cli_status["identity"]
+    );
     assert!(
         after
             .lines()
