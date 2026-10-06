@@ -5,7 +5,7 @@ import SwiftUI
 
 struct DecisionsView: View {
     @ObservedObject var model: NodeModel
-    @State private var events: [DecisionEvent] = []
+    private var events: [DecisionEvent] { model.decisionEvents }
     /// The node the record is filtered to, by fingerprint; nil for every node.
     @State private var about: String?
 
@@ -51,7 +51,7 @@ struct DecisionsView: View {
         .task {
             // Read again every few seconds while on screen: the node appends as it decides.
             while !Task.isCancelled {
-                events = await model.decisions()
+                model.decisionEvents = await model.decisions()
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }

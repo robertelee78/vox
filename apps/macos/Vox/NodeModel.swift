@@ -121,13 +121,19 @@ final class NodeModel: ObservableObject {
 
     /// Whether macOS lets Vox notify; nil until it says.
     @Published private(set) var notifying: Bool?
+    /// Whether this model posts notifications at all.
+    private let notifies: Bool
     /// Local notifications for messages in rooms the person is not looking at (M-23).
     private let notifier = Notifier()
 
-    init(client: VoxClient, node: String, me: String) {
+    /// `notify`: whether this model posts notifications; the app's does, and the screenshot
+    /// renderer's (apps/macos/Screenshots, never shipped) does not, so it asks nobody anything.
+    init(client: VoxClient, node: String, me: String, notify: Bool = true) {
         self.client = client
         self.node = node
         self.me = me
+        notifies = notify
+        guard notify else { return }
         notifier.open = { [weak self] room in Task { await self?.show(.room(room)) } }
         notifier.allowed = { [weak self] granted in self?.notifying = granted }
         notifier.ask()
@@ -179,6 +185,9 @@ final class NodeModel: ObservableObject {
     /// Show `selection`; a room shown is read, so its unread counts end.
     func show(_ selection: Selection?) async {
         self.selection = selection
+        if case .decisions = selection {
+            decisionEvents = await decisions()
+        }
         guard case let .room(id) = selection else { return }
         if let i = rooms.firstIndex(where: { $0.id == id }) {
             rooms[i].addressed = 0
@@ -394,6 +403,9 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// The decision record as last read, newest first (M-18).
+    @Published var decisionEvents: [DecisionEvent] = []
+
     /// This node's decision record, newest first (M-18).
     func decisions() async -> [DecisionEvent] {
         do {
@@ -517,7 +529,8 @@ final class NodeModel: ObservableObject {
         }()
         // A message the person is not looking at is notified: never this node's own, nor
         // coordination traffic, nor one whose body has not arrived.
-        if !focused && message.author != me && message.level != .coordination && !message.owed {
+        if notifies && !focused && message.author != me && message.level != .coordination
+            && !message.owed {
             let name = rooms.first { $0.id == room }?.name ?? String(room.prefix(12))
             notifier.post(message, room: room, roomName: name, me: me)
         }
