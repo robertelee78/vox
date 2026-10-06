@@ -130,6 +130,16 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
         return all
     }
 
+    /// The containers themselves that `self` names (a dialog by its identifier, say): a search
+    /// of a container's descendants never meets the container.
+    func selves(in container: XCUIElementQuery) -> XCUIElementQuery? {
+        switch self {
+        case let .id(i): return container.matching(identifier: i)
+        case let .idPrefix(p): return container.matching(NSPredicate(format: "identifier BEGINSWITH %@", p))
+        default: return nil
+        }
+    }
+
     func query(in container: XCUIElementQuery) -> XCUIElementQuery {
         switch self {
         case let .id(i):
@@ -982,18 +992,23 @@ final class FirstRunProof: XCTestCase {
         let quick: [XCUIElementQuery]
         if case .menuItem = key { quick = [ui.menus] } else { quick = [ui.windows, ui.dialogs] }
         for container in quick {
-            let found = key.query(in: container).firstMatch
-            if found.exists { return found }
+            if let found = find(key, in: container) { return found }
         }
         return nil
+    }
+
+    /// `key` as one of `container`'s elements themselves, else among their descendants.
+    private func find(_ key: Key, in container: XCUIElementQuery) -> XCUIElement? {
+        if let own = key.selves(in: container)?.firstMatch, own.exists { return own }
+        let found = key.query(in: container).firstMatch
+        return found.exists ? found : nil
     }
 
     /// Where `key` is, searched in every container the app can show: before any verdict that it
     /// is missing.
     private func locateEverywhere(_ ui: XCUIApplication, _ key: Key) -> XCUIElement? {
         for container in key.containers(ui, all: containers(ui)) {
-            let found = key.query(in: container).firstMatch
-            if found.exists { return found }
+            if let found = find(key, in: container) { return found }
         }
         return nil
     }
