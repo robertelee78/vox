@@ -14,7 +14,9 @@ it is kept.
 vox share ROOM_ID ./report.txt -m "the report"
 ```
 
-Vox hands the file to the daemon and returns once the daemon serves it:
+Vox first says who is to fetch it (`vox: about to share report.txt in "family"` / `the members of
+it in your keyring are to fetch it: ann`), then hands the file to the daemon and returns once the
+daemon serves it:
 
 ```text
 vox: sharing report.txt (22 bytes) as file-ff174003a0a82197-58af8b08440c4061
@@ -101,7 +103,10 @@ vox share stop ROOM_ID report.txt
 ```
 
 `share list` prints each of your node's shares in the room with its tag, size and how many times
-it was fetched. `share stop` takes a name, a tag or a SHA-256 prefix and says, for example,
+it was fetched. Under your own share, `vox room read` and the TUI name who has pulled it, by
+your names for them: `pulled by ann`. `share stop` takes a name, a tag or a SHA-256 prefix, says
+first `vox: about to stop sharing "report.txt" in "family"` / `no member is to fetch it from this
+node after this`, then, for example,
 `vox: no longer sharing report.txt (file-ff174003a0a82197-58af8b08440c4061; fetched 2 time(s))`.
 
 A pull after that is told the share is gone. Copies already pulled stay where they are until the
