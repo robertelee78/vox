@@ -63,16 +63,23 @@ fn limits() -> image::Limits {
     l
 }
 
-/// The preview of the file at `path`, or `None` when it is not an image this daemon reads.
+/// The image in the file at `path`, decoded within [`limits`], or `None` when it is not one this
+/// build reads (JPEG, PNG, GIF, WebP).
 #[must_use]
-pub fn of_file(path: &Path) -> Option<Preview> {
+pub fn decode(path: &Path) -> Option<image::DynamicImage> {
     let mut reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
     reader.format()?;
     reader.limits(limits());
-    let img = reader.decode().ok()?;
+    reader.decode().ok()
+}
+
+/// The preview of the file at `path`, or `None` when it is not an image this daemon reads.
+#[must_use]
+pub fn of_file(path: &Path) -> Option<Preview> {
+    let img = decode(path)?;
     let (width, height) = (img.width(), img.height());
     let thumb = thumbnail(&img)?;
     let small = img.thumbnail(32, 32).to_rgba8();

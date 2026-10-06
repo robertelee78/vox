@@ -30,6 +30,7 @@ pub mod daemon_proxy;
 pub mod doctor;
 pub mod host;
 pub mod ident;
+pub mod images;
 pub mod lan_cli;
 pub mod live;
 pub mod node_tasks;

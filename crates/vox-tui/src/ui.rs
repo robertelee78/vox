@@ -22,7 +22,7 @@ use vox_core::hash::Digest32;
 use crate::state::{Focus, Mode, Prompt, PromptKind, Screen, UiState};
 use crate::theme;
 use crate::viewmodel::{
-    MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
+    ImageState, MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
 };
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
@@ -44,6 +44,12 @@ pub const SELECTED_MARKER: &str = "▶ ";
 
 /// The mark before a reply's quote of the message it answers, on the row above it.
 pub const QUOTE_MARKER: &str = "  ┆ ";
+
+/// The mark before an image a message shares, when it is named rather than drawn (ADR-028 F-11).
+pub const IMAGE_MARKER: &str = "\u{25a3} image ";
+
+/// What is said of an image a message shares until this node's copy is verified (ADR-028 F-11).
+pub const IMAGE_UNVERIFIED: &str = "drawn once it is pulled and verified";
 
 /// Where a member stands with you, in words: who reads whom, and what is still to do (ADR-028
 /// R-5, #481), the states `vox room join` names ([`crate::ident::Reading`]). Nothing for yourself.
@@ -502,8 +508,9 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             scroll: ui.timeline_scroll,
             selected: ui.selected_message,
             reveal: std::mem::take(&mut ui.reveal_selected),
+            focus: focused(ui, Focus::Timeline),
         },
-        focused(ui, Focus::Timeline),
+        &mut ui.images.borrow_mut(),
     );
     // What a reply answers, named in its composer's title until it is sent (ADR-028 R-9).
     let replying = ui.replying.map(|re| {
@@ -607,11 +614,12 @@ fn focused(ui: &UiState, pane: Focus) -> bool {
 }
 
 /// Where the timeline is: scrolled `scroll` lines up from its newest, and the message selected,
-/// which `reveal` says to scroll into view on this draw.
+/// which `reveal` says to scroll into view on this draw; and whether it has the focus.
 struct Selection {
     scroll: usize,
     selected: Option<Digest32>,
     reveal: bool,
+    focus: bool,
 }
 
 fn render_timeline(
@@ -622,12 +630,13 @@ fn render_timeline(
     // What happened to the room, and its retention, for the header.
     (room_notices, retention): (&[NoticeView], &str),
     at: Selection,
-    focus: bool,
+    images: &mut crate::images::Images,
 ) -> (usize, Vec<Digest32>) {
     let Selection {
         mut scroll,
         selected,
         reveal,
+        focus,
     } = at;
     // Who this room holds back for equivocating comes first, one line each (V210-66).
     let notices = held_back.iter().map(|n| {
@@ -657,10 +666,17 @@ fn render_timeline(
     let mut rows: Vec<Line> = Vec::new();
     // Which message each row belongs to, so the frame can say which messages it showed.
     let mut owners: Vec<Option<Digest32>> = Vec::new();
-    let mut push = |rows: &mut Vec<Line<'static>>, owner: Option<Digest32>, l: Line<'static>| {
+    // The rows kept for an image drawn over them, by which image (ADR-028 F-11).
+    let mut pics: Vec<Option<usize>> = Vec::new();
+    let mut drawn: Vec<(Digest32, std::sync::Arc<image::DynamicImage>)> = Vec::new();
+    let mut push = |rows: &mut Vec<Line<'static>>,
+                    owner: Option<Digest32>,
+                    pic: Option<usize>,
+                    l: Line<'static>| {
         for row in wrap(l, width).into_iter().rev() {
             rows.push(row);
             owners.push(owner);
+            pics.push(pic);
         }
     };
     let mut reached_oldest = true;
@@ -673,7 +689,7 @@ fn render_timeline(
             break;
         }
         while let Some(n) = said.next_if(|n| n.timestamp > m.timestamp) {
-            push(&mut rows, None, notice_line(n));
+            push(&mut rows, None, None, notice_line(n));
         }
         // Under a message it sent, who has read it, or where it is while nobody is known to
         // have (ADR-028 R-6). Rows run newest first here, so it goes before the message's own.
@@ -693,10 +709,40 @@ fn render_timeline(
                 format!("  {under}"),
                 Style::default().add_modifier(Modifier::DIM),
             ));
-            push(&mut rows, Some(m.entry_hash), l);
+            push(&mut rows, Some(m.entry_hash), None, l);
+        }
+        // **An image it shares, under it** (ADR-028 F-11): drawn once this node's copy is
+        // verified, on a terminal that draws images; otherwise said in words.
+        if let Some(img) = &m.image {
+            match &img.state {
+                ImageState::Ready(decoded) if images.draws() => {
+                    let at = drawn.len();
+                    drawn.push((m.entry_hash, std::sync::Arc::clone(decoded)));
+                    for _ in 0..crate::images::IMAGE_ROWS {
+                        push(&mut rows, Some(m.entry_hash), Some(at), Line::default());
+                    }
+                }
+                state => {
+                    let l = Line::from(Span::styled(
+                        format!(
+                            "  {IMAGE_MARKER}{} {}\u{d7}{} \u{2014} {}",
+                            vox_agentcomms::envelope::reveal_keeping(&img.name, |_| false),
+                            img.width,
+                            img.height,
+                            match state {
+                                ImageState::Unverified => IMAGE_UNVERIFIED,
+                                ImageState::Ready(_) => "verified; this terminal draws no images",
+                                ImageState::NotDrawn(why) => why,
+                            }
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                    push(&mut rows, Some(m.entry_hash), None, l);
+                }
+            }
         }
         let chosen = selected == Some(m.entry_hash);
-        push(&mut rows, Some(m.entry_hash), message_line(m, chosen));
+        push(&mut rows, Some(m.entry_hash), None, message_line(m, chosen));
         // **The one message this replies to, quoted above it** (ADR-028 R-9, #485).
         if let Some(q) = &m.quote {
             let l = Line::from(Span::styled(
@@ -709,17 +755,18 @@ fn render_timeline(
                 ),
                 Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
             ));
-            push(&mut rows, Some(m.entry_hash), l);
+            push(&mut rows, Some(m.entry_hash), None, l);
         }
         found |= chosen;
     }
     if reached_oldest {
         for l in said.map(notice_line).chain(notices.rev()) {
-            push(&mut rows, None, l);
+            push(&mut rows, None, None, l);
         }
     }
     rows.reverse();
     owners.reverse();
+    pics.reverse();
     if seek {
         // Into view: its top row no higher than the window's, its bottom no lower. Counted up
         // from the newest row, as `scroll` is.
@@ -743,7 +790,7 @@ fn render_timeline(
     let bottom = rows.len() - scroll;
     let window = bottom.saturating_sub(height)..bottom;
     let shown: Vec<Line> = rows[window.clone()].to_vec();
-    let mut on_screen: Vec<Digest32> = owners[window].iter().flatten().copied().collect();
+    let mut on_screen: Vec<Digest32> = owners[window.clone()].iter().flatten().copied().collect();
     on_screen.dedup();
     // The room's header always says its retention (ADR-028 R-7).
     let title = if scroll > 0 {
@@ -753,6 +800,20 @@ fn render_timeline(
     };
     let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
+    // Each image whose rows are all in the window is drawn over them; one cut by its edge is not.
+    for (at, (entry, img)) in drawn.iter().enumerate() {
+        let mine: Vec<usize> = window.clone().filter(|i| pics[*i] == Some(at)).collect();
+        if mine.len() == usize::from(crate::images::IMAGE_ROWS) {
+            let y = u16::try_from(mine[0] - window.start).unwrap_or(u16::MAX);
+            let rect = Rect::new(
+                area.x + 1,
+                area.y.saturating_add(1).saturating_add(y),
+                area.width.saturating_sub(2),
+                crate::images::IMAGE_ROWS,
+            );
+            images.draw(frame, rect, *entry, img);
+        }
+    }
     (scroll, on_screen)
 }
 

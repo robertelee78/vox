@@ -288,6 +288,8 @@ pub struct UiState {
     pub reveal_selected: bool,
     /// The message the composer is replying to, when it is.
     pub replying: Option<Digest32>,
+    /// The images ready to draw inline, and how this terminal draws them (ADR-028 F-11).
+    pub images: std::rc::Rc<std::cell::RefCell<crate::images::Images>>,
     /// A transient status/alert line shown at the bottom (e.g. the result of the
     /// last command, an error, a recovery hint). `None` when clear.
     pub status_message: Option<String>,
@@ -320,6 +322,7 @@ impl Default for UiState {
             selected_message: None,
             reveal_selected: false,
             replying: None,
+            images: std::rc::Rc::default(),
             status_message: None,
             composer: String::new(),
             selected_tunnel: None,

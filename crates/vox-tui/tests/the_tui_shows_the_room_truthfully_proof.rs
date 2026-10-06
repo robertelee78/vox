@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks thirty-one claims, each
+//! 160x50. It checks thirty-two claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -95,7 +95,12 @@
 //! - `copies`: Alice shares an ssh stand-in; Bob's Shared pane lists it, and `y` on it puts
 //!   `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full under the
 //!   service and says "copied" on the status line, the address Alice's `vox service list --json`
-//!   gives (ADR-028 S-3, #490).
+//!   gives (ADR-028 S-3, #490);
+//! - `inline`: in a TUI run as kitty, an image Bob's node pulled whose copy the driver then
+//!   overwrites on his disk (an attacker's bytes), and one Alice shares to Carol, which his node
+//!   does not pull, are each named ("image carols.png 96×64 — drawn once it is pulled and
+//!   verified") and no kitty graphics are written; one she shares to the room is drawn as kitty
+//!   graphics once Bob's node has pulled and verified it (ADR-028 F-11, #502).
 //!
 //! The `target`, `delivers` and `revoke` claims are gone with `:consent grant|revoke` (V210-148): a
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
@@ -114,8 +119,9 @@
 //! warning left out (`serve`), a quote of the thread's root rather than `re`, Enter on a reply not
 //! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
-//! a pasted fingerprint that is not the node's let through to the keyring (`trust`). It passes only
-//! on the script's PASS with all 31 claims ok.
+//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), or an image
+//! drawn before this node's copy is verified (`inline`). It passes only on the script's PASS with
+//! all 32 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -211,7 +217,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (31 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (32 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -225,8 +231,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (31, 31),
-                "APPARATUS: the driver said PASS without all 31 claims ok: {said}"
+                (32, 32),
+                "APPARATUS: the driver said PASS without all 32 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

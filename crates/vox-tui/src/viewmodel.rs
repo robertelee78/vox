@@ -93,7 +93,48 @@ pub struct MessageView {
     /// The one message this replies to, quoted (ADR-028 R-9, #485): the entry its `re` names,
     /// never that one's own quote or the thread's root.
     pub quote: Option<QuoteView>,
+    /// An image this message shares (ADR-028 F-9, F-11): drawn inline once verified.
+    pub image: Option<ImageView>,
 }
+
+/// **An image a message shares** (ADR-028 F-11, #502): drawn only once this node's copy is verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageView {
+    /// Its file name, as announced.
+    pub name: String,
+    /// Its width and height in pixels, as announced.
+    pub width: u64,
+    /// Its height.
+    pub height: u64,
+    /// Where this node's copy stands: drawn only once it is verified and decoded.
+    pub state: ImageState,
+}
+
+/// **Where a shared image stands on this node** (ADR-028 F-11): its copy is hashed and decoded
+/// off the TUI's thread, and only an image that is both verified and decoded is drawn.
+#[derive(Clone, Debug)]
+pub enum ImageState {
+    /// Not pulled here, its copy not yet checked, or its bytes not what was announced.
+    Unverified,
+    /// Verified, and decoded within the limits the sharer's daemon decodes with (and scaled to
+    /// at most [`crate::images::DECODED_EDGE`] on its longest edge): ready to draw.
+    Ready(std::sync::Arc<image::DynamicImage>),
+    /// Verified, and not drawn here: why, in words.
+    NotDrawn(&'static str),
+}
+
+impl PartialEq for ImageState {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Unverified, Self::Unverified) => true,
+            (Self::Ready(a), Self::Ready(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Self::NotDrawn(a), Self::NotDrawn(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ImageState {}
 
 /// **A reply's quote: one level** (ADR-028 R-9, #485): the message its `re` names.
 #[derive(Clone, Debug, PartialEq, Eq)]
