@@ -45,6 +45,15 @@ The joiner gives no name: the room keeps the one its creator gave it. Join asks 
 `--passphrase-file`; `-` selects stdin. Do not put a secret in a command-line argument or
 paste it into an agent conversation merely to get through a prompt.
 
+A room takes at most 1,024 members. Before the member answering a join lets a newcomer in, it
+asks every member it can reach to agree, and it admits the newcomer only if each one does. So two
+newcomers joining at the same moment never push the room past its cap. A member that is offline
+is not asked. If the room's members are split, and each half admits a newcomer while it cannot
+reach the other, the room can end up one past its cap once they meet again. When that happens, a
+member's daemon log names the newcomer and says it was admitted `past its cap of 1024, now 1025
+members: another member admitted it`. [The room is full or has ended](troubleshooting.md#the-room-is-full-or-has-ended)
+explains each refusal a newcomer can see.
+
 ## Rename a room
 
 ```sh

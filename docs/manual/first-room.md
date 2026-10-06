@@ -119,7 +119,7 @@ These are two independent decisions. Vox says what each one grants: the node `ma
 you write in every room you share — now and later`, you read it `once it trusts you too`, and it
 may `reach every service you bind to a room you are both in`. It is not restricted to this
 room. A keyring change asks for your identity passphrase again once 30 minutes have passed since
-you last gave it.
+you last gave it; `vox status` says how long is left (`keyring open 30m`).
 
 ## 6. Prove receipt both ways
 

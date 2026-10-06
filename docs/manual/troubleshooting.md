@@ -125,15 +125,27 @@ trust and readable messages. If refusal remains, report the exact explanation, n
 
 ### The room is full or has ended
 
-**Exact symptoms:** `the room is full, so you were not admitted`, or `that room has ended — a
-member or its board said so — so it takes nobody in`.
+**Exact symptoms:** after `vox: cannot join:`, one of
 
-**Meaning:** the first means your passphrase was accepted but the room takes no more members.
-The second means its creator or an admin ended it, or it ended itself after an idle time its
-creator chose; your passphrase was never checked.
+- `the room is full, so you were not admitted`
+- `another newcomer took the room's last place at the same moment, so you were not admitted`
+- `a member of the room did not agree to take you in, so you were not admitted`, with a `said:`
+  line naming the member, for example `member bob did not answer within 5s, and every member
+  online must agree before the room takes a newcomer`
+- `that room has ended — a member or its board said so — so it takes nobody in`
 
-**Fix:** ask the room's creator. An ended room is gone; they can make a new room and share its
-link.
+**Meaning:** in the first three your passphrase was accepted. A room takes at most 1,024
+members, and every member online must agree before it takes a newcomer (see
+[Create or join](rooms.md#create-or-join)). The first means the room is at its cap. The second
+means you and another newcomer asked for its last place together, and the other got it. The third
+means a member the room could reach did not answer in time or does not yet count the member that
+answered you as part of the room. The last means its creator or an admin ended the room, or it
+ended itself after an idle time its creator chose; your passphrase was never checked.
+
+**Fix:** for a full or ended room, ask the room's creator; an ended room is gone, and they can
+make a new room and share its link. After the second or third, run the join again: a place
+another newcomer did not take is free again, and a member that was busy or still syncing usually
+answers the next time. If the same member is named again, ask its owner whether it is running.
 
 ### No board or no member answered
 
