@@ -413,6 +413,11 @@ private struct StatusBar: View {
             Text("node \(model.node)")
             Text(model.peers == 1 ? "1 peer" : "\(model.peers) peers")
             Text(model.keyring)
+            if model.notifying == false {
+                // M-23: said where the person works, so a missing notification is explained.
+                Text("notifications off (System Settings, Notifications, Vox)")
+                    .accessibilityIdentifier("notifications-off")
+            }
             Spacer()
             if let ended = model.ended {
                 StateMark(kind: .danger, words: ended)

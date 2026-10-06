@@ -1,0 +1,70 @@
+// Notifications (ADR-014 M-23, ADR-028 R-10): local only, one per message that arrives in a room
+// the person is not looking at, grouped by room, and never with the message's text — who wrote, to
+// whom and whether it is urgent, nothing of what it says. There is no remote push.
+
+import AppKit
+import UserNotifications
+
+@MainActor
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    /// Opens the room a notification is about.
+    var open: ((String) -> Void)?
+    /// Told whether Vox may notify, once macOS says: the status bar says when it may not.
+    var allowed: ((Bool) -> Void)?
+    private var asked = false
+
+    /// Ask once whether Vox may notify; macOS asks the person.
+    func ask() {
+        guard !asked else { return }
+        asked = true
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
+            Task { @MainActor in self?.allowed?(granted) }
+        }
+    }
+
+    /// One notification for `message` in `room`, named `roomName`: who wrote, whether to this node,
+    /// whether urgent, grouped under the room (R-10). The text stays in Vox.
+    func post(_ message: RoomMessage, room: String, roomName: String, me: String) {
+        let content = UNMutableNotificationContent()
+        content.title = roomName
+        let who = message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
+        content.body = Notifier.body(who: who, toYou: message.to.contains(me),
+                                     urgent: message.urgent, file: message.file != nil)
+        content.threadIdentifier = room
+        content.userInfo = ["room": room]
+        content.sound = message.urgent && message.to.contains(me) ? .default : nil
+        let request = UNNotificationRequest(identifier: message.id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request) { _ in }
+    }
+
+    /// What a notification says: never the message's text.
+    nonisolated static func body(who: String, toYou: Bool, urgent: Bool, file: Bool) -> String {
+        let what = file ? "shared a file" : "wrote"
+        switch (toYou, urgent) {
+        case (true, true): return "\(who) \(what) to you, urgent"
+        case (true, false): return "\(who) \(what) to you"
+        case (false, _): return "\(who) \(what)"
+        }
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            didReceive response: UNNotificationResponse,
+                                            withCompletionHandler done: @escaping () -> Void) {
+        let room = response.notification.request.content.userInfo["room"] as? String
+        Task { @MainActor in
+            if let room { self.open?(room) }
+            NSApp.activate(ignoringOtherApps: true)
+            done()
+        }
+    }
+
+    /// Shown even while Vox is in front, for a room other than the one on screen.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification,
+                                            withCompletionHandler done:
+                                            @escaping (UNNotificationPresentationOptions) -> Void) {
+        done([.banner, .list])
+    }
+}

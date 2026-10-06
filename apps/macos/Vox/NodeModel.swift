@@ -2,6 +2,7 @@
 // (ADR-028 W-2), the room on screen, its members and their trust (L-4), and the status bar's facts
 // (W-1).
 
+import AppKit
 import Foundation
 import ServiceManagement
 
@@ -99,10 +100,18 @@ final class NodeModel: ObservableObject {
     /// The node ended: detached, or the daemon stopped.
     @Published private(set) var ended: String?
 
+    /// Whether macOS lets Vox notify; nil until it says.
+    @Published private(set) var notifying: Bool?
+    /// Local notifications for messages in rooms the person is not looking at (M-23).
+    private let notifier = Notifier()
+
     init(client: VoxClient, node: String, me: String) {
         self.client = client
         self.node = node
         self.me = me
+        notifier.open = { [weak self] room in Task { await self?.show(.room(room)) } }
+        notifier.allowed = { [weak self] granted in self?.notifying = granted }
+        notifier.ask()
     }
 
     /// The rooms in `need`, urgent first, then by name.
@@ -362,6 +371,16 @@ final class NodeModel: ObservableObject {
     }
 
     fileprivate func arrived(_ message: RoomMessage, in room: String) {
+        let focused: Bool = {
+            if case .room(room) = selection { return NSApp.isActive }
+            return false
+        }()
+        // A message the person is not looking at is notified: never this node's own, nor
+        // coordination traffic, nor one whose body has not arrived.
+        if !focused && message.author != me && message.level != .coordination && !message.owed {
+            let name = rooms.first { $0.id == room }?.name ?? String(room.prefix(12))
+            notifier.post(message, room: room, roomName: name, me: me)
+        }
         if case .room(room) = selection {
             if !messages.contains(where: { $0.id == message.id }) {
                 messages.append(message)

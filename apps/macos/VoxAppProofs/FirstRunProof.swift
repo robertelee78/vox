@@ -27,13 +27,18 @@
 //    in the share's announcement, never a message of its own.
 // 7. The lanes view (ADR-014 M-15, ADR-028 W-3, #442): bob posting `working` without a claim is
 //    not working; once he claims a resource and posts `working`, his lane's chip says working.
-// 8. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 8. Notifications (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
+//    to alice posts one local notification, titled with the room, saying who wrote to her, and
+//    never the message's text. Preconditions, not the proof's to arrange: Vox allowed to notify
+//    (the app says "notifications off" otherwise, an APPARATUS red) and no Focus on.
+// 9. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (8) goes red. A room with a message
+// place of the app's hold), and quitting leaves it attached: (9) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
+// A notification that carries the message's text: (8) goes red.
 
 import XCTest
 
@@ -357,7 +362,27 @@ final class FirstRunProof: XCTestCase {
         print("[proof] lanes: \(bobLane.label)")
         lanesToggle.buttons["Timeline"].click()
 
-        // (8) Quitting detaches it.
+        // (8) Notifications: the room off screen, bob writes to alice.
+        ui.descendants(matching: .any)["keyring"].click()
+        let statusNow = ui.descendants(matching: .any)["status"].label
+        if statusNow.contains("notifications off") {
+            throw Apparatus("Vox is not allowed to notify on this Mac: allow it in System Settings, Notifications, Vox, then run again; the app said \(statusNow)")
+        }
+        try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "SECRET-TEXT-8"],
+                   env: voxEnv)
+        let centre = XCUIApplication(bundleIdentifier: "com.apple.notificationcenterui")
+        let banner = centre.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", "bob wrote to you")).firstMatch
+        XCTAssertTrue(banner.waitForExistence(timeout: 30),
+                      "PRODUCT: bob's message to alice in a room off screen posted no notification saying \"bob wrote to you\" (with Vox allowed to notify and no Focus on)")
+        let leaked = centre.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@",
+                                  "SECRET-TEXT-8", "SECRET-TEXT-8")).firstMatch
+        XCTAssertFalse(leaked.exists,
+                       "PRODUCT: a notification must not carry the message's text; one said \(leaked.label)")
+        print("[proof] notification: \(banner.label)")
+
+        // (9) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
