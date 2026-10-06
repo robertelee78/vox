@@ -1422,7 +1422,12 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
     let said_by = |driver: std::thread::JoinHandle<pty_driver::Driven>| {
         driver.join().map_or_else(
             |_| "the TUI driver thread panicked".to_owned(),
-            |d| format!("the driver exited {:?} saying:\n{}", d.code, d.stdout),
+            |d| {
+                format!(
+                    "the driver exited {:?} saying:\n{}\nand on stderr:\n{}",
+                    d.code, d.stdout, d.stderr
+                )
+            },
         )
     };
     if !cue(&cues.join("open"), Duration::from_secs(240)) {
@@ -1437,6 +1442,11 @@ fn the_tui_lists_tunnels_and_closes_the_one_selected() {
             !said.contains("guest APPARATUS: pyte is not importable"),
             "APPARATUS: the TUI driver could not run (set VOX_PYTE_PATH to where `pyte` is \
              importable); {said}"
+        );
+        // A driver's exit 2 is its own fault — its script not found, a crash — never a verdict.
+        assert!(
+            !said.starts_with("the driver exited Some(2)"),
+            "APPARATUS: the TUI driver failed before it drove the TUI; {said}"
         );
         panic!("PRODUCT (staging): the guest's TUI never opened its room; {said}");
     }
