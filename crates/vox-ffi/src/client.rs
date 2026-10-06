@@ -1884,6 +1884,27 @@ impl VoxClient {
             .collect())
     }
 
+    /// What this node's person has not read in `room`, oldest first (ADR-028 R-8): the messages
+    /// after the newest one the node recorded as read, by someone else. A client counts its unread
+    /// from these when it starts, then from the node's events.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (the room not open).
+    pub async fn unread(&self, room: String) -> Result<Vec<RoomMessage>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
+            match ask(c, &Request::Unread { channel_id }).await? {
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .map(|r| rendered(r, &names, me.as_deref()))
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// Each other member's lane in `room`, in the room's member order (ADR-028 W-3), as
     /// `vox room board` shows it.
     ///

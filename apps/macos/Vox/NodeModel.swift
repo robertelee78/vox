@@ -150,10 +150,34 @@ final class NodeModel: ObservableObject {
     /// Load everything and follow the node's events.
     func start() async {
         await refresh()
+        await seedUnread()
         do {
             try await client.subscribe(listener: Listener(model: self))
         } catch {
             said = sentence(error)
+        }
+    }
+
+    /// Rooms whose unread was counted from what the node recorded as read.
+    private var seeded: Set<String> = []
+
+    /// Each open room's unread, the first time it is seen, from what the node recorded as read
+    /// (ADR-028 R-8): what came while the app was closed. The node's events count from there.
+    func seedUnread() async {
+        for room in rooms where room.open && !seeded.contains(room.id) {
+            if case .room(room.id) = selection { continue }
+            guard let rows = try? await client.unread(room: room.id),
+                  let i = rooms.firstIndex(where: { $0.id == room.id }) else { continue }
+            seeded.insert(room.id)
+            for message in rows where message.author != me {
+                switch message.level {
+                case .toYou:
+                    rooms[i].addressed += 1
+                    if message.urgent { rooms[i].urgent += 1 }
+                case .new: rooms[i].new += 1
+                case .coordination: rooms[i].coordination += 1
+                }
+            }
         }
     }
 

@@ -40,6 +40,9 @@
 //     alice shares and carries bytes through it; alice removes bob in the keyring view, and that
 //     live connection is cut within 30 s.
 // 12. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 13. What came while the app was closed (ADR-028 R-8): alice's node, attached by hand, takes
+//     bob's message to her while no app runs; opened again, the app lists mission under "needs
+//     you (1)" at once, from what her node recorded as read.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
@@ -48,7 +51,8 @@
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
 // the sidebar's order: (9) goes red. The decision record oldest first: (10) goes red.
-// Untrust that leaves a member's live sessions running: (11) goes red.
+// Untrust that leaves a member's live sessions running: (11) goes red. An app that counts
+// nothing from before it opened (no seeding from VoxClient.unread): (13) goes red.
 
 import XCTest
 
@@ -559,6 +563,35 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(nodeLine(after, "alice")?.contains(" detached") ?? false,
                       "PRODUCT: once the app quit, node alice must be detached; `vox node list` said: \(after)")
         print("[proof] while attached: \(listed)[proof] after quit: \(after)")
+
+        // (13) What came while the app was closed is counted when it opens (ADR-028 R-8). Alice's
+        // node, attached by hand and trusting bob again, takes bob's message to her while no app
+        // runs; opened again, the app lists mission under "needs you (1)" from what her node
+        // recorded as read, with nothing arriving after it opened.
+        try staged(vox, ["node", "attach", "alice", "--passphrase-file", alicePass], env: voxEnv)
+        try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
+                         "--identity-passphrase-file", alicePass], env: voxEnv)
+        try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "WHILE-APP-CLOSED"],
+                   env: bobSession)
+        var held = ""
+        let heldUntil = Date().addingTimeInterval(60)
+        while Date() < heldUntil && !held.contains("WHILE-APP-CLOSED") {
+            held = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out
+            if !held.contains("WHILE-APP-CLOSED") { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        guard held.contains("WHILE-APP-CLOSED") else {
+            throw Apparatus("alice's node never held bob's WHILE-APP-CLOSED in 60 s: \(held)")
+        }
+        ui.launch()
+        let reopened = ui.descendants(matching: .any)["group-needs you"]
+        let counted = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: counted, evaluatedWith: reopened)],
+                                      timeout: 30), .completed,
+                       "PRODUCT: bob's message to alice came while the app was closed; opened again, the app must count it from what her node recorded as read, mission under \"needs you (1)\"; the sidebar says \(reopened.exists ? reopened.label : "no needs-you group")")
+        print("[proof] opened again: \(reopened.label)")
+        ui.typeKey("q", modifierFlags: .command)
+        _ = ui.wait(for: .notRunning, timeout: 30)
+        _ = run(vox, ["node", "detach", "alice"], env: voxEnv)
     }
 
     /// A staging step: `vox` must succeed, else the staging was not achieved. Its output, trimmed.
