@@ -160,6 +160,40 @@ fn raise(note: &Note, command: Option<&std::ffi::OsStr>) {
     }
 }
 
+/// Raise `note` from the TUI (ADR-028 R-10): to the node's notification program when it has one
+/// (`notify-command`, `VOX_NOTIFY_COMMAND`), run off the TUI's thread; else to the terminal the TUI
+/// draws in, as an OSC 9 desktop notification, or as a bell over SSH, where a terminal's OSC 9
+/// reaches no desktop.
+pub(crate) fn raise_from_tui(note: &Note, command: Option<&std::ffi::OsStr>) {
+    use std::io::Write as _;
+    if let Some(cmd) = command {
+        let (cmd, title, body) = (cmd.to_owned(), note.title.clone(), note.body.clone());
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new(cmd)
+                .arg(title)
+                .arg(body)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+        return;
+    }
+    let over_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    // The terminal shows the escape's text: control characters are taken out, as everywhere a
+    // member's name is shown.
+    let plain = |s: &str| s.chars().filter(|c| !c.is_control()).collect::<String>();
+    let seq = if over_ssh {
+        "\x07".to_owned()
+    } else {
+        format!("\x1b]9;{}: {}\x07", plain(&note.title), plain(&note.body))
+    };
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
 /// Watch `node`'s status for as long as the daemon runs, raising a notification when a
 /// condition starts and when it clears.
 pub async fn watch(node: NodeHandle, paths: Paths) {
