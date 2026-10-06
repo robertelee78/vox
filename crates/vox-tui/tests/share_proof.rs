@@ -24,13 +24,17 @@
 //! The folder is shared as a reply to the report's announcement (`--re`): it carries that entry
 //! and spends a hop of its budget, as a `vox room post` reply does (ADR-020 §9).
 //!
+//! A photo alice shares is announced with its dimensions, a JPEG thumbnail of at most 16 KB and a
+//! BlurHash, which bob reads with her daemon stopped (ADR-028 F-9).
+//!
 //! Mutants: post the note as a message of its own (red: two rows carry the note); serve only while
 //! `vox share` runs (red: bob's curl gets nothing after it exits); a share keeps a fresh hop budget
 //! (red: the folder's announcement carries the default, not its parent's less one); pull a share
 //! addressed to another node (red: bob's node pulls carol's); pull whatever the disk has free (red:
 //! bob's node and `vox room get` try a 2^60-byte share); count a fetch cut short as pulled (red:
 //! alice's card says carol pulled report.bin); refetch every file of a folder (red: the re-pull
-//! says 10 fetched).
+//! says 10 fetched); announce an image without its thumbnail (red: bob reads no
+//! thumbnail for photo.png).
 
 #![cfg(unix)]
 
@@ -733,6 +737,65 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         }
     }
     let (many_ok, many_said) = alice.run(&["share", &room, many.to_str().unwrap()]);
+
+    // **An image's preview rides in its announcement** (ADR-028 F-9, #500): a photo alice shares
+    // is announced with its dimensions, a JPEG thumbnail of at most 16 KB and a BlurHash, inside
+    // the encrypted message, so bob reads them with alice's daemon stopped. Noise, so a careless
+    // thumbnail would not fit.
+    let photo = tmp.path().join("photo.png");
+    let mut seed = 0x2545_f491_u32;
+    image::RgbImage::from_fn(800, 600, |_, _| {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let [r, g, b, _] = seed.to_le_bytes();
+        image::Rgb([r, g, b])
+    })
+    .save(&photo)
+    .expect("APPARATUS: write the photo");
+    let (photo_ok, photo_said) = alice.run(&["share", &room, photo.to_str().unwrap()]);
+    assert!(
+        photo_ok,
+        "PRODUCT (staging): alice shares photo.png: {photo_said}"
+    );
+    bob.sees(&room, "photo.png");
+    alice.daemon = None;
+    let photo_data = rows_of(&bob, &room)
+        .into_iter()
+        .map(|r| r["envelope"]["data"].clone())
+        .find(|d| d["name"] == "photo.png")
+        .unwrap_or_default();
+    let thumb = photo_data["image"]["thumb"].as_str().map(|t| {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(t)
+            .unwrap_or_default()
+    });
+    let thumb_drawn = thumb
+        .as_deref()
+        .and_then(|t| image::load_from_memory_with_format(t, image::ImageFormat::Jpeg).ok())
+        .map(|i| (i.width(), i.height()));
+    eprintln!(
+        "[proof] photo.png, alice offline: {}x{} thumbnail {:?} bytes drawn {thumb_drawn:?}, \
+         blurhash {}",
+        photo_data["image"]["width"],
+        photo_data["image"]["height"],
+        thumb.as_ref().map(Vec::len),
+        photo_data["image"]["blurhash"]
+    );
+    assert!(
+        photo_data["image"]["width"] == 800
+            && photo_data["image"]["height"] == 600
+            && thumb
+                .as_ref()
+                .is_some_and(|t| !t.is_empty() && t.len() <= 16 * 1024)
+            && thumb_drawn.is_some_and(|(w, h)| w > 0 && h > 0 && w * 3 == h * 4)
+            && photo_data["image"]["blurhash"]
+                .as_str()
+                .is_some_and(|b| b.len() >= 6),
+        "PRODUCT: an image's announcement must carry its dimensions (800x600), a JPEG \
+         thumbnail of at most 16 KB in its shape, and a BlurHash, read by bob with alice's \
+         daemon stopped; bob read the announcement's data as: {photo_data}"
+    );
+    alice.start(&spec);
 
     // And one left behind when alice leaves the room: leaving ends it (F-2).
     let left_file = tmp.path().join("notes.txt");

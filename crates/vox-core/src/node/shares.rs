@@ -448,6 +448,7 @@ impl Shares {
         // SHA-256, served from where it is; the share's SHA-256 is its list's.
         let folder = meta.is_dir();
         let root = req.path.clone();
+        // An image's preview is made as it is hashed (ADR-028 F-9): a folder has none.
         let hashed = tokio::task::spawn_blocking(move || {
             if folder {
                 crate::node::folder::walk(&root).map(|found| {
@@ -456,15 +457,18 @@ impl Shares {
                         crate::node::folder::list_sha256(&list),
                         list.iter().map(|f| f.size).sum(),
                         found,
+                        None,
                     )
                 })
             } else {
-                crate::node::folder::digest(&root).map(|(sha, size)| (sha, size, Vec::new()))
+                crate::node::folder::digest(&root).map(|(sha, size)| {
+                    (sha, size, Vec::new(), crate::node::preview::of_file(&root))
+                })
             }
         })
         .await
         .map_err(|e| format!("hashing the share: {e}"))?;
-        let (sha256, size, files) = hashed?;
+        let (sha256, size, files, preview) = hashed?;
         let (served, name) = (req.path.clone(), base);
         // The tag names the content and **this share**: two shares of the same file are two
         // services, and stopping one never withdraws the other (V210-72).
@@ -499,6 +503,9 @@ impl Shares {
                 // the SHA-256 above pins it.
                 if folder {
                     d.insert("files".into(), (files.len() as u64).into());
+                }
+                if let Some(p) = &preview {
+                    d.insert("image".into(), p.json());
                 }
             }
         }

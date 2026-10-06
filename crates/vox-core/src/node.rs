@@ -58,6 +58,7 @@ pub mod pending_lock;
 pub mod ports;
 pub mod prekeys;
 pub mod presence;
+pub mod preview;
 pub mod probe;
 pub mod profile;
 pub mod pulls;

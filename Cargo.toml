@@ -51,6 +51,13 @@ subtle = { version = "2.6", default-features = false }
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "zeroize"] }
 ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize", "getrandom"] }
 getrandom = "0.3"
+# An image share's preview (ADR-028 F-9): decoded, scaled and re-encoded as a JPEG of at most
+# 16 KB by the sharer's daemon, with a BlurHash. Only the formats a person shares as photos and
+# screenshots are compiled in: JPEG, PNG, GIF and WebP, all decoded in pure Rust.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+blurhash = { version = "0.2", default-features = false }
+# The thumbnail rides in the announcement's JSON as base64.
+base64 = "0.22"
 # PQXDH + Double Ratchet symmetric crypto (ADR-004, M2). RustCrypto, pinned to
 # the digest-0.10 / sha2-0.10 island the identity layer already uses so HKDF and
 # the HMAC chain KDF share one SHA-256 implementation:

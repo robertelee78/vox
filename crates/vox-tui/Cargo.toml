@@ -92,6 +92,10 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 # `tempfile` is a normal dependency above and is in scope for the integration proofs too.
 [dev-dependencies]
+# The share proof makes a photo to share, and reads the thumbnail its announcement carries
+# (ADR-028 F-9).
+image.workspace = true
+base64.workspace = true
 # The at-rest floor proof re-derives the vault key the binary wrote, independently of
 # vox-core, with the ADR-010 floor parameters hard-coded in the test.
 argon2.workspace = true
