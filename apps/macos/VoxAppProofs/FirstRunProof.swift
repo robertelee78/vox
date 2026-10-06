@@ -154,8 +154,9 @@ enum Key: ExpressibleByStringLiteral, CustomStringConvertible {
             return container.descendants(matching: .menuItem)
                 .matching(NSPredicate(format: "title == %@ OR label == %@", t, t))
         case let .child(of, button):
+            // Any type: a segmented picker's segments are radio buttons on macOS, not buttons.
             return container.descendants(matching: .any).matching(identifier: of)
-                .descendants(matching: .button).matching(NSPredicate(format: "title == %@ OR label == %@", button, button))
+                .descendants(matching: .any).matching(NSPredicate(format: "title == %@ OR label == %@", button, button))
         }
     }
 }
@@ -363,12 +364,70 @@ final class FirstRunProof: XCTestCase {
         let made = run(vox, ["node", "create", "alice"],
                        env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "alice identity"]) { $1 })
         XCTAssertEqual(made.status, 0, "APPARATUS: `vox node create alice` failed: \(made.out)")
+        let bobEnv = voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "bob identity"]) { $1 }
+        let roomPass = scratch.appendingPathComponent("room.pass").path
+        let alicePass = scratch.appendingPathComponent("alice.pass").path
+        let bobPass = scratch.appendingPathComponent("bob.pass").path
+        try stager.write(Data("mission room\n".utf8), to: roomPass)
+        try stager.write(Data("alice identity\n".utf8), to: alicePass)
+        try stager.write(Data("bob identity\n".utf8), to: bobPass)
+        // What steps 6 and on use from steps 1 to 5.
+        var listed = ""
+        var room = ""
+        var aliceFp = ""
+        var bobFp = ""
+
+        // **Starting at step 6** (VOX_PROOF_FROM=6, for troubleshooting a later step without
+        // steps 1 to 5): what they leave is staged by `vox` instead (alice attached, the room
+        // mission with bob in it, each trusting the other, carol made), and the app opens as
+        // alice, its first run answered.
+        let from = Int(env["VOX_PROOF_FROM"] ?? "") ?? 1
+        if from > 5 {
+            try staged(vox, ["node", "create", "bob"], env: bobEnv)
+            try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
+            try staged(vox, ["node", "attach", "alice", "--passphrase-file", alicePass], env: voxEnv)
+            aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+            bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+            try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
+                             "--name", "mission"], env: voxEnv)
+            room = try line(staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)) {
+                $0.contains(" mission")
+            }.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+            let stagedLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
+                $0.hasPrefix("vox://")
+            }
+            try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", roomPass, stagedLink],
+                       env: voxEnv)
+            try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
+                             "--identity-passphrase-file", alicePass], env: voxEnv)
+            try staged(vox, ["trust", "add", "--node", "bob", aliceFp, "--name", "alice",
+                             "--identity-passphrase-file", bobPass], env: voxEnv)
+            var readable = false
+            let staging = Date().addingTimeInterval(120)
+            var n = 0
+            while !readable && Date() < staging {
+                n += 1
+                try staged(vox, ["room", "post", "--node", "bob", room, "STAGE-\(n)"], env: voxEnv)
+                Thread.sleep(forTimeInterval: 1)
+                readable = run(vox, ["room", "read", "--node", "alice", room], env: voxEnv).out.contains("STAGE-")
+            }
+            guard readable else { throw Apparatus("alice never read a post of bob's in 120 s") }
+            try staged(vox, ["node", "create", "carol"],
+                       env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
+            try stager.write(Data("no\n".utf8), to: config + "/app/login-item")
+            try stager.write(Data("alice\n".utf8), to: config + "/app/node")
+            print("[proof] started at step \(from): steps 1–5 NOT RUN; what they leave was staged by vox")
+        }
 
         let ui = XCUIApplication(url: app)
         ui.launchEnvironment = voxEnv
         try scratchOnly(ui.launchEnvironment, under: scratchPath)
         ui.launch()
 
+        if from > 5 {
+            present(ui, Key.id("attached"), timeout: 60, "the app, its first run answered, must open attached as alice")
+            listed = run(vox, ["node", "list"], env: voxEnv).out
+        } else {
         // (1) First run: the login item is asked about once, and declined here (approving it is
         // the manual check manual.login_item); then pick the node, and a wrong passphrase is the
         // daemon's sentence.
@@ -404,23 +463,16 @@ final class FirstRunProof: XCTestCase {
         tap(ui, Key.id("attach"), "Attach")
         present(ui, Key.id("attached"), timeout: 60,
                 "the right passphrase must attach node alice")
-        let listed = run(vox, ["node", "list"], env: voxEnv).out
+        listed = run(vox, ["node", "list"], env: voxEnv).out
         XCTAssertTrue(nodeLine(listed, "alice")?.contains(" attached ") ?? false,
                       "PRODUCT: `vox node list` must say alice is attached; it said: \(listed)")
 
         // (3) The main window groups the room by what it needs from alice. Bob is a second node of
         // the same daemon: a member reached directly, no anchor.
-        let bobEnv = voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "bob identity"]) { $1 }
-        let roomPass = scratch.appendingPathComponent("room.pass").path
-        let alicePass = scratch.appendingPathComponent("alice.pass").path
-        let bobPass = scratch.appendingPathComponent("bob.pass").path
-        try stager.write(Data("mission room\n".utf8), to: roomPass)
-        try stager.write(Data("alice identity\n".utf8), to: alicePass)
-        try stager.write(Data("bob identity\n".utf8), to: bobPass)
         try staged(vox, ["node", "create", "bob"], env: bobEnv)
         try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
-        let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
-        let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
+        aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
+        bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
         // The app makes the room (⌘N, M-31: create) and copies its link (⌘L).
         ui.typeKey("n", modifierFlags: .command)
         let roomName = Key.id("room-form-name")
@@ -435,10 +487,11 @@ final class FirstRunProof: XCTestCase {
             rooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
             if !rooms.contains(" mission") { Thread.sleep(forTimeInterval: 0.5) }
         }
-        guard let room = rooms.split(separator: "\n").first(where: { $0.contains(" mission") })?
+        guard let made = rooms.split(separator: "\n").first(where: { $0.contains(" mission") })?
             .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
             throw Product("the app's New Room made no room alice's `vox room list` lists: \(rooms)")
         }
+        room = made
         NSPasteboard.general.clearContents()
         ui.typeKey("l", modifierFlags: .command)
         var link = ""
@@ -610,6 +663,8 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: once untrusted, carol must be gone from the keyring view; it still shows \"\(shown(row))\"")
         }
         print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
+
+        }
 
         // (6) Attach a file to the room, To: bob, with a note.
         tap(ui, Key.id("room-mission"), "mission in the sidebar")

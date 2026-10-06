@@ -179,6 +179,7 @@ status=0
 TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
     TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
     TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
+    TEST_RUNNER_VOX_PROOF_FROM="${VOX_PROOF_FROM:-}" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?
