@@ -6241,7 +6241,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let (anchors, own) = {
+        let (anchors, own, members) = {
             let mut channel = shared.lock().await;
             if let Some(profile) = self.profile.as_ref() {
                 let mut add = self.anchors.clone();
@@ -6253,19 +6253,26 @@ impl Node {
             // A link names the member who issued it too, last; a member is reached at the
             // addresses its board record gives, not kept like an anchor at the link's.
             let mut own = BootstrapSet::new();
+            let mut members = std::collections::BTreeSet::new();
             for n in channel.anchors().nodes() {
-                if !channel.is_author(&n.id) {
+                if channel.is_author(&n.id) {
+                    members.insert(n.id);
+                } else {
                     let _ = own.add(n.clone());
                 }
             }
-            (channel.anchors().clone(), own)
+            (channel.anchors().clone(), own, members)
         };
         self.room_anchors.insert(*channel_id, own);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
         for anchor in anchors.nodes() {
-            if anchor.id == net.local_id() {
+            // **A member is never dialled as an anchor** (V030-51, AGENTS.md "Anchors"): an
+            // anchor's dial is direct only, and its failure backed off the member's sync, so a
+            // member only a circuit reaches — the room's host, named by its link — was not
+            // reached at all. A member is reached by the sync, which asks a relay when it must.
+            if anchor.id == net.local_id() || members.contains(&anchor.id) {
                 continue;
             }
             self.anchor_ids.insert(anchor.id);
@@ -7030,6 +7037,20 @@ impl Node {
                 puts.extend(self.withdrawn.values().cloned());
                 Self::put_withdraws(&conn, puts);
                 self.read_anchor_boards(Some(peer)).await;
+                // A room that has not had its first sync reaches its members now that a relay is
+                // here to carry what its direct dials cannot (V030-51).
+                let unsynced: Vec<Digest32> = {
+                    let mut rooms = Vec::new();
+                    for (id, ch) in &self.channels {
+                        if !ch.lock().await.is_settled() {
+                            rooms.push(*id);
+                        }
+                    }
+                    rooms
+                };
+                for channel_id in unsynced {
+                    self.reach_members_of(&channel_id).await;
+                }
             }
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
@@ -11872,10 +11893,10 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let (me, members, anchored) = {
+        let (me, members, anchored, settled) = {
             let ch = shared.lock().await;
             let anchored = ch.anchors().nodes().iter().any(|a| a.id != net.local_id());
-            (ch.me(), ch.members(), anchored)
+            (ch.me(), ch.members(), anchored, ch.is_settled())
         };
         // **A room with an anchor is left to its board.** The board says where every member is
         // within moments of opening, and a dial started before it from where a member was last
@@ -11883,19 +11904,30 @@ impl Node {
         // landed, the circuit stayed on the anchor for its idle timeout, and anything else that
         // reached the member meanwhile took the relayed path (#226: a `vox forward` beside a
         // reopened room left a circuit on the anchor in 5 of 5 runs, where v0.2.10 left none).
-        // This dial is for a room with no anchor, whose members are found nowhere else.
-        if anchored {
+        // This dial is for a room with no anchor, whose members are found nowhere else — and for
+        // a room that has not had its first sync (V030-51): a joiner that stopped before it owes
+        // no member a key, and nothing else dials a member it holds no connection to, so a member
+        // only a circuit reaches, the room's host, was never reached and the room never synced.
+        if anchored && settled {
             return;
         }
         for member in members.into_iter().filter(|m| *m != me) {
             // Only a member there is an address for: with none in the book either, there is
             // nothing to dial.
-            if net.board_endpoints(channel_id, &member).is_empty()
+            // A room that has synced reaches only a member there is an address for. One that has
+            // not reaches every member, addressed or not, now: the joiner held no address for a
+            // member it reached only through a relay, and the ladder asks a relay for it (reading
+            // a connected board first), which is the one path such a member has.
+            if settled
+                && net.board_endpoints(channel_id, &member).is_empty()
                 && self.peer_book.endpoints(&member).is_empty()
             {
                 continue;
             }
-            let _ = self.reach_member(channel_id, member, false).await;
+            if net.manager().existing(&member).is_some() {
+                continue;
+            }
+            let _ = self.reach_member(channel_id, member, !settled).await;
         }
     }
 
