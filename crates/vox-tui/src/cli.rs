@@ -641,7 +641,8 @@ pub struct ShareArgs {
     /// The room's id, or a unique prefix of it.
     #[arg(required = true)]
     pub room: Option<String>,
-    /// The file or folder to share. A folder is served as one tar.
+    /// The file or folder to share. A folder's announcement lists every file in it, and a
+    /// member pulling it again fetches only the files that changed.
     #[arg(required = true)]
     pub path: Option<PathBuf>,
     /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint

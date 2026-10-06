@@ -16,8 +16,10 @@
 //! curl --socks5-hostname 127.0.0.1:1080 http://<tag>.<sharer>.<room>.vox/<name> -o <name>
 //! ```
 //!
-//! A folder is served as one deterministic tar (sorted, zero timestamps), so it has one hash like
-//! a file does.
+//! A folder is listed, not packed (ADR-028 F-8): its announcement carries every file's path, size
+//! and SHA-256, and its own SHA-256 is that of the list. Each file is served at its own path, from
+//! the folder, and one that changed since it was listed is refused. A receiver fetches only what it
+//! does not already hold, so pulling it again after one file changed fetches that file alone.
 //!
 //! Reach is the keyring's, as for any room-bound service: a member this node has not trusted can
 //! neither read the announcement nor open the service.
@@ -174,8 +176,16 @@ pub async fn share(
             eprintln!("vox: {line}");
         }
     }
-    println!("vox: sharing {} ({} bytes) as {}", s.name, s.size, s.tag);
-    println!("     sha256 {}", s.sha256);
+    if s.files > 0 {
+        println!(
+            "vox: sharing {}/ ({} files, {} bytes) as {}",
+            s.name, s.files, s.size, s.tag
+        );
+        println!("     sha256 {} (of its file list)", s.sha256);
+    } else {
+        println!("vox: sharing {} ({} bytes) as {}", s.name, s.size, s.tag);
+        println!("     sha256 {}", s.sha256);
+    }
     if !env.to.is_empty() {
         let names: Vec<String> = env
             .to
@@ -186,11 +196,19 @@ pub async fn share(
         println!("     for {}", names.join(", "));
     }
     println!("     collect it with: vox room get {room} {}", s.name);
-    println!(
-        "     or through `vox up`: curl --socks5-hostname <proxy> \
-         http://{}.<your-name-for-this-node>.<room>.vox/{} -o {}",
-        s.tag, s.name, s.name
-    );
+    if s.files > 0 {
+        println!(
+            "     or one file through `vox up`: curl --socks5-hostname <proxy> \
+             http://{}.<your-name-for-this-node>.<room>.vox/<path in {}/>",
+            s.tag, s.name
+        );
+    } else {
+        println!(
+            "     or through `vox up`: curl --socks5-hostname <proxy> \
+             http://{}.<your-name-for-this-node>.<room>.vox/{} -o {}",
+            s.tag, s.name, s.name
+        );
+    }
     match (opts.count, opts.for_) {
         (Some(n), _) => println!("     the daemon serves it for {n} fetch(es) at most"),
         (None, Some(d)) => println!("     the daemon serves it for {}s at most", d.as_secs()),

@@ -24,6 +24,10 @@ repository = "https://github.com/robertelee78/vox"
 # PRD-001 R30/R31). One pin, so the scaffolding and the bindgen agree.
 uniffi = { version = "0.32.2" }
 sha2 = "0.10"
+# A shared folder's file list (ADR-028 F-8): its paths travel percent-encoded in the share's
+# requests, and two that one filesystem would treat as one name (NFC/NFD) are refused.
+percent-encoding = "2.3"
+unicode-normalization = "0.1.25"
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
