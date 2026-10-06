@@ -56,6 +56,21 @@ slot=()
 
 mkdir -p "$out"/{vox,app,signed,repo}
 
+# **No scratch Vox.app stays registered as us.vox.app.** Xcode's build registers what it built
+# with LaunchServices (and its share extension with pluginkit), so something asking for the
+# bundle id later (Spotlight, a notification, a login item) can open this scratch copy on the
+# person's real profile. Every copy made here is unregistered on the way out, pass or fail.
+unregister() {
+  local lsregister=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister
+  while IFS= read -r -d '' app; do
+    "$lsregister" -u "$app" >/dev/null 2>&1 || true
+    for appex in "$app"/Contents/PlugIns/*.appex; do
+      [[ -e "$appex" ]] && /usr/bin/pluginkit -r "$appex" >/dev/null 2>&1 || true
+    done
+  done < <(find "$out" -name Vox.app -type d -prune -print0 2>/dev/null)
+}
+trap unregister EXIT
+
 # 1. vox, as the macOS job builds it, then the stand-in for sign_notarize_release.sh.
 note "building vox $VERSION (release, default features)"
 ${slot[@]+"${slot[@]}"} cargo build --release --bin vox >&2
