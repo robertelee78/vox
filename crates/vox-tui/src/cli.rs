@@ -1753,7 +1753,8 @@ enum Cmd {
     Serve(ServeArgs),
     /// Join a room from the address you were given, and print the name its services
     /// answer on. One-shot: joining is durable, so there is nothing to keep
-    /// running — `vox up` is what makes the name resolve.
+    /// running: the daemon's proxy resolves the name while a node is attached (`vox up` says
+    /// where it listens).
     Connect(ConnectArgs),
     /// Offer a local TCP service to a room, or list what is offered.
     ///
