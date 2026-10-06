@@ -132,6 +132,9 @@ pub struct DaemonCore {
     /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
     /// ever, for a room that is over.
     mark_refused: Option<MarkRefused>,
+    /// The room on screen's lane states as the node last gave them, for which room, and when
+    /// (ADR-028 W-3).
+    lanes: (Option<Instant>, Option<Digest32>, Vec<(Digest32, String)>),
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -174,6 +177,10 @@ struct Timeline {
     /// The projection, and what it was projected with.
     projected: Option<Projected>,
 }
+
+/// How often the room on screen's lane states are asked of the node (ADR-028 W-3): as often as the
+/// snapshot, since a state changes when the room does.
+const LANES_EVERY: Duration = SNAPSHOT_EVERY;
 
 /// The least time between two asks to record what a room showed, after the node did not take one.
 const MARK_RETRY: Duration = Duration::from_secs(3);
@@ -329,6 +336,7 @@ impl DaemonCore {
             timeline: None,
             marked: std::collections::BTreeSet::new(),
             mark_refused: None,
+            lanes: (None, None, Vec::new()),
             ended: None,
             stop,
         };
@@ -532,8 +540,10 @@ impl DaemonCore {
             // command's own status puts over every notice, and `:link` showed a person nothing to
             // give anyone. A room link is no secret: the passphrase travels apart.
             Ok(Frame::Link { url, .. }) => {
-                self.notice = Some(format!("room link: {url}"));
-                CommandStatus::Said(format!("room link: {url}"))
+                // Add to room (ADR-028 W-5): the link, and that its passphrase goes another way.
+                let said = format!("room link: {url} — send its passphrase another way");
+                self.notice = Some(said.clone());
+                CommandStatus::Said(said)
             }
             Ok(Frame::Error { reason }) => failed(&reason),
             Ok(_) => CommandStatus::Failed(UiError::Internal),
@@ -682,7 +692,9 @@ impl DaemonCore {
             // and a count are all public facts; nothing here can carry plaintext or key material
             // (ADR-015).
             NodeEvent::InviteLink { url, .. } => {
-                self.notice = Some(format!("room link: {url}"));
+                self.notice = Some(format!(
+                    "room link: {url} — send its passphrase another way"
+                ));
             }
             NodeEvent::AddressNote { note, .. }
             | NodeEvent::NodeNote { note }
@@ -848,6 +860,34 @@ impl DaemonCore {
         }
     }
 
+    /// The room on screen's lane states (ADR-028 W-3, #512), from the node: asked again at most
+    /// every [`LANES_EVERY`], and at once for a room that just came on screen. None without one.
+    fn lanes(&mut self) -> Vec<(Digest32, String)> {
+        let Some(cid) = self.active else {
+            return Vec::new();
+        };
+        let fresh =
+            self.lanes.1 == Some(cid) && self.lanes.0.is_some_and(|at| at.elapsed() < LANES_EVERY);
+        if !fresh {
+            if let Some(conn) = self.conn.as_mut() {
+                let asked = Request::Lanes { channel_id: cid };
+                match until_stopped(&self.rt, &self.stop, conn.client.request(&asked)) {
+                    Some(Ok(Frame::Lanes { lanes })) => {
+                        self.lanes = (Some(Instant::now()), Some(cid), lanes)
+                    }
+                    // Not answered this time (a room not open yet): asked again at the next.
+                    Some(Ok(_)) => self.lanes = (Some(Instant::now()), Some(cid), Vec::new()),
+                    None | Some(Err(_)) => {}
+                }
+            }
+        }
+        if self.lanes.1 == Some(cid) {
+            self.lanes.2.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Read the room on screen: whole when it first comes on screen, or when a late row or an
     /// unknown cursor says the order changed above what is shown; else only what arrived since.
     fn read_timeline(&mut self) {
@@ -991,6 +1031,9 @@ impl DaemonCore {
             late: r.late,
             read_by: readers(r),
             whereabouts: whereabouts(r),
+            coordination: !r.owed
+                && vox_agentcomms::envelope::Envelope::parse(&r.text)
+                    .is_ok_and(|e| vox_agentcomms::attention::CHATTER.contains(&e.kind.as_str())),
         };
         match t.projected.as_mut() {
             Some(p)
@@ -1021,6 +1064,7 @@ impl DaemonCore {
     }
 
     fn project(&mut self) -> ViewModel {
+        let lanes = self.lanes();
         let snap = self.snapshot.clone();
         let me = snap.me;
         // A room is reachable when this node holds a connection to another of its members. A
@@ -1184,6 +1228,7 @@ impl DaemonCore {
                         })
                         .collect(),
                     reachability: reachability(&cid),
+                    lanes: lanes.clone(),
                 })
         });
         ViewModel {

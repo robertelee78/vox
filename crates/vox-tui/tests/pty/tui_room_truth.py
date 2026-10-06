@@ -57,6 +57,12 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
   regions   the sidebar names bob's node attached; once Alice writes to him there, the room is
             listed under "needs you (1)" reading "to you 1"; and the nodes on this machine are
             listed, his attached and a second one detached (ADR-028 W-1, W-2, #511);
+  lanes     Alice's node claims work and posts `working`, `status` and an `ask` as an agent, and
+            Carol's claims work too: in Bob's lanes (`:lanes`), Alice's lane is headed "alice ·
+            working" and shows her ask, with her coordination folded into one counted line and
+            none of it shown; Carol's, whom Bob cannot read, "carol · away" (ADR-028 W-3, #513);
+  to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
+            message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
   unreach   once Alice's, Carol's and Dave's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -680,6 +686,63 @@ try:
                 and bool(s) and s[0] == "node default · attached")
     tui.until(regions, 30, 1)
     claim("regions", regions(), f"sidebar: {side()!r}")
+
+    stage("lanes")
+    # The room's lanes (ADR-028 W-3, #513): Alice's node acts as an agent here, claiming work and
+    # saying so; Carol's does too, but Bob cannot read Carol, so all he can say of her is away.
+    def as_agent(w, session, *args):
+        e = env(w)
+        e["VOX_SESSION"] = session
+        r = subprocess.run([VOX, *args], env=e, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0: product(f"{w}'s `vox {' '.join(args[:2])}` as an agent failed: {r.stderr.strip()}")
+        return r
+    as_agent("alice", "alice-agent", "room", "claim", room, "codec-port")
+    as_agent("alice", "alice-agent", "room", "post", room, "--type", "working", "LANE-WORKING porting")
+    as_agent("alice", "alice-agent", "room", "post", room, "--type", "status", "LANE-STATUS half way")
+    as_agent("alice", "alice-agent", "room", "post", room, "--type", "ask", "LANE-ASK which codec stays?")
+    as_agent("carol", "carol-agent", "room", "claim", room, "flaky-test")
+    tui.key("\r", 2)  # into the room, selected in the sidebar
+    tui.key(":lanes\r", 2)
+    def lane(name):
+        """(the lane's title row, its rows) for the member `name`, by its title on Bob's screen."""
+        for r in tui.display():
+            for g in ("⇄ ", "→ ", "· ", ""):
+                at = r.find("┌" + g + name + " · ")
+                if at >= 0:
+                    title = r[at + 1:r.find("┐", at)].strip("─")
+                    return title, [bare(x) for x in pane(tui.display(), g + name + " · ")]
+        return None, []
+    tui.until(lambda: (lane("alice")[0] or "").endswith("working") and "LANE-ASK" in " ".join(lane("alice")[1]), 60, 1)
+    (at, arows), (ct, _) = lane("alice"), lane("carol")
+    atext = " ".join(arows)
+    folded = re.search(r"\b(\d+) coordination posts?\b", atext)
+    claim("lanes", (at or "").endswith("· working") and (ct or "").endswith("· away")
+          and "LANE-ASK which codec stays?" in atext and folded is not None
+          and "LANE-WORKING" not in atext and "LANE-STATUS" not in atext,
+          f"alice's lane {at!r}: {arows!r}; carol's lane {ct!r}")
+
+    stage("to")
+    # To: and urgent in the composer (ADR-028 W-4): the message carries them, as `vox room post
+    # --to … --urgent` writes it, posted as Bob into this room.
+    tui.key(":to alice\r", 1)
+    tui.key(":urgent\r", 1)
+    composer = next((r for r in tui.display() if "Composer — " in r), "")
+    tui.key(":send TO-ALICE-513\r", 2)
+    def sent():
+        r = run("alice", "room", "read", room, "--json")
+        for l in r.stdout.splitlines():
+            row = json.loads(l) if l.strip() else {}
+            if "TO-ALICE-513" in json.dumps(row):
+                return row
+        return None
+    until(lambda: sent() is not None, 60)
+    row = sent() or {}
+    env_ = row.get("envelope") or {}
+    claim("to", "To: alice · urgent" in composer and env_.get("to") == [fp["alice"]]
+          and env_.get("urgent") is True,
+          f"bob's composer: {composer.strip()!r}; alice reads the message as {row!r}")
+    tui.key(":lanes\r", 1)  # back to the timeline
+    tui.key("\x1b", 2)  # Esc back to the sidebar
 
     stage("unreach")
     for w in ("alice", "carol", "dave"):

@@ -22,7 +22,7 @@ use vox_core::hash::Digest32;
 use crate::state::{Focus, Mode, Prompt, Screen, UiState};
 use crate::theme;
 use crate::viewmodel::{
-    MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
+    ChannelView, MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
 };
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
@@ -361,16 +361,44 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(cols[0]);
 
-    (ui.timeline_scroll, ui.on_screen) = render_timeline(
+    if ui.lanes {
+        ui.on_screen = render_lanes(frame, body[0], channel, ui);
+    } else {
+        (ui.timeline_scroll, ui.on_screen) = render_timeline(
+            frame,
+            body[0],
+            &channel.held_back,
+            channel.timeline.as_slice(),
+            &channel.notices,
+            ui.timeline_scroll,
+            focused(ui, Focus::Timeline),
+        );
+    }
+    // Whom the next message is to, and whether it is urgent (ADR-028 W-4), by this node's names.
+    let mut about = Vec::new();
+    if !ui.to.is_empty() {
+        let names: Vec<String> = ui
+            .to
+            .iter()
+            .map(|id| {
+                channel.members.iter().find(|m| m.id == *id).map_or_else(
+                    || vox_core::node::link::b32_encode(id),
+                    |m| m.nickname.clone(),
+                )
+            })
+            .collect();
+        about.push(format!("To: {}", names.join(", ")));
+    }
+    if ui.urgent {
+        about.push("urgent".to_owned());
+    }
+    render_composer(
         frame,
-        body[0],
-        &channel.held_back,
-        channel.timeline.as_slice(),
-        &channel.notices,
-        ui.timeline_scroll,
-        focused(ui, Focus::Timeline),
+        body[1],
+        &ui.composer,
+        &about.join(" · "),
+        focused(ui, Focus::Composer),
     );
-    render_composer(frame, body[1], &ui.composer, focused(ui, Focus::Composer));
     // Members above, and under them what is shared in the room (V030-25), when anything is.
     let side = if channel.shared.is_empty() {
         vec![cols[1]]
@@ -553,7 +581,7 @@ fn wrap(line: Line<'_>, width: usize) -> Vec<Line<'_>> {
     rows
 }
 
-fn render_composer(frame: &mut Frame, area: Rect, text: &str, focus: bool) {
+fn render_composer(frame: &mut Frame, area: Rect, text: &str, about: &str, focus: bool) {
     let shown = if text.is_empty() && !focus {
         "type a message — Tab to focus the composer, : for commands".to_owned()
     } else if focus {
@@ -561,8 +589,100 @@ fn render_composer(frame: &mut Frame, area: Rect, text: &str, focus: bool) {
     } else {
         text.to_owned()
     };
-    let p = Paragraph::new(shown).block(pane_block("Composer", focus));
+    let title = if about.is_empty() {
+        "Composer".to_owned()
+    } else {
+        format!("Composer — {about}")
+    };
+    let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
+}
+
+/// The room's lanes (ADR-028 W-3): one column per other member, headed by its name, trust glyph
+/// and lane state, holding that member's posts in this room (a filter of the room's own timeline)
+/// with what is new since the person last looked marked, and its coordination traffic folded into
+/// one counted line. Never an agent's tool calls or turns (W-6): only what was posted to the room.
+/// Returns the posts drawn, which the person has been shown.
+fn render_lanes(
+    frame: &mut Frame,
+    area: Rect,
+    channel: &ChannelView,
+    ui: &UiState,
+) -> Vec<Digest32> {
+    let mut shown = Vec::new();
+    if channel.lanes.is_empty() {
+        let p = Paragraph::new("no other member in this room yet")
+            .block(pane_block("Lanes (Esc: the room)", true));
+        frame.render_widget(p, area);
+        return shown;
+    }
+    let n = u32::try_from(channel.lanes.len()).unwrap_or(u32::MAX);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![Constraint::Ratio(1, n); channel.lanes.len()])
+        .split(area);
+    for ((member, state), col) in channel.lanes.iter().zip(cols.iter()) {
+        let (glyph, name) = channel
+            .members
+            .iter()
+            .find(|m| m.id == *member)
+            .map_or(("", String::new()), |m| {
+                (trust_mark(m.trust).0, m.nickname.clone())
+            });
+        let posts: Vec<&MessageView> = channel
+            .timeline
+            .iter()
+            .filter(|m| m.author == *member)
+            .collect();
+        let chatter = posts.iter().filter(|m| m.coordination).count();
+        let talk: Vec<&&MessageView> = posts.iter().filter(|m| !m.coordination).collect();
+        let seen = ui
+            .lanes_seen
+            .get(&(channel.channel_id, *member))
+            .copied()
+            .unwrap_or(0);
+        let width = usize::from(col.width.saturating_sub(2)).max(1);
+        let height = usize::from(col.height.saturating_sub(2));
+        // Newest at the bottom, as the timeline; the coordination line under them all.
+        let mut rows: Vec<Line> = Vec::new();
+        let mut owners: Vec<Option<Digest32>> = Vec::new();
+        for (i, m) in talk.iter().enumerate() {
+            let body = m.body.as_deref().map_or_else(
+                || UNDECRYPTABLE_MARKER.to_owned(),
+                |b| vox_agentcomms::envelope::reveal_keeping(b, |c| c == '\n' || c == '\t'),
+            );
+            let mark = if i >= seen { "new " } else { "" };
+            let line = Line::from(vec![
+                Span::styled(mark, Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(if m.addressed.is_empty() {
+                    body
+                } else {
+                    format!("{} {body}", m.addressed)
+                }),
+            ]);
+            for row in wrap(line, width) {
+                rows.push(row);
+                owners.push(Some(m.entry_hash));
+            }
+        }
+        if chatter > 0 {
+            rows.push(Line::from(Span::styled(
+                format!(
+                    "{chatter} coordination post{}",
+                    if chatter == 1 { "" } else { "s" }
+                ),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            owners.push(None);
+        }
+        let from = rows.len().saturating_sub(height);
+        shown.extend(owners[from..].iter().flatten().copied());
+        let title = format!("{glyph}{name} · {state}");
+        let p = Paragraph::new(rows[from..].to_vec()).block(pane_block(&title, false));
+        frame.render_widget(p, *col);
+    }
+    shown.dedup();
+    shown
 }
 
 fn render_members(
@@ -730,8 +850,11 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         Screen::ChannelList => {
             " ↑/↓ select · Enter open · t tunnels · k keyring · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
         }
+        Screen::Channel if ui.lanes => {
+            " Enter send · :to <name> · :urgent · :lanes or Esc the room's timeline · : command"
+        }
         Screen::Channel => {
-            " Tab switch pane · Enter send · PgUp/PgDn scroll · :link · : command · Esc back"
+            " Tab switch pane · Enter send · PgUp/PgDn scroll · :lanes · :to <name> · :urgent · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Keyring => " : command · Esc back",

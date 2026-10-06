@@ -87,6 +87,10 @@ pub struct MessageView {
     /// R-6): "only on this machine", or "on N of M members' nodes" from what their nodes said they
     /// hold. Empty when the node does not say.
     pub whereabouts: String,
+    /// Agents coordinating rather than talking (presence, progress, the claim protocol;
+    /// `vox_agentcomms::attention::CHATTER`): a lane folds these into one counted line (ADR-028
+    /// W-3, ADR-020 6.6).
+    pub coordination: bool,
 }
 
 impl MessageView {
@@ -158,6 +162,9 @@ pub struct ChannelView {
     pub shared: Vec<String>,
     /// This channel's reachability.
     pub reachability: Reachability,
+    /// Each other member and its lane state's words, in the room's member order, as the node
+    /// derives them (ADR-028 W-3, #512): what heads each lane.
+    pub lanes: Vec<(Digest32, String)>,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many
