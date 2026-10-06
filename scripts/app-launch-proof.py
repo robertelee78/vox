@@ -60,10 +60,31 @@ def log_text(data):
         return ""
 
 
-def launch(app, env):
+def launch(app, env, out):
+    """Start Vox.app's executable as a person's launch does; what it prints goes to `out`. A launch
+    the system refuses is the build's, not the product's."""
     exe = os.path.join(app, "Contents", "MacOS", "Vox")
-    return subprocess.Popen([exe], env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        return subprocess.Popen([exe], env=env, stdin=subprocess.DEVNULL,
+                                stdout=open(out, "ab"), stderr=subprocess.STDOUT)
+    except OSError as e:
+        fail("APPARATUS", f"could not start {exe}: {e}")
+
+
+# What the system says when it will not run the built app at all: a build or signing fault.
+NOT_LAUNCHED = ("dyld", "Library not loaded", "code signature", "Code Signature", "killed: 9")
+
+
+def exited(p, out, when):
+    """The red for an app that exited `when`: the build's when the system would not run it, the
+    product's otherwise, quoting what it printed."""
+    try:
+        said = open(out, encoding="utf-8", errors="replace").read()
+    except FileNotFoundError:
+        said = ""
+    side = "APPARATUS" if any(n in said for n in NOT_LAUNCHED) or p.returncode in (-9, 137) \
+        else "PRODUCT"
+    fail(side, f"Vox.app exited ({p.returncode}) {when}; it printed: {said.strip()!r}")
 
 
 def watch(data, seconds):
@@ -93,20 +114,23 @@ def main():
     env.update({"VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config})
 
     started = []
+    proved = False
     try:
         if daemons(data):
             fail("APPARATUS", "a daemon already names the fresh data root")
 
         # (1) and (2), first launch: no daemon runs; the app starts one.
-        first = launch(app, env)
+        out = os.path.join(scratch, "app.out")
+        first = launch(app, env, out)
         started.append(first)
         until = time.monotonic() + 30
         while not daemons(data) and time.monotonic() < until:
             if first.poll() is not None:
-                fail("PRODUCT", f"Vox.app exited ({first.returncode}) before any daemon ran")
+                exited(first, out, "before any daemon ran")
             time.sleep(0.05)
         if not daemons(data):
-            fail("PRODUCT", f"30 s after launch no vox daemon serves the data root; its log: {log_text(data)!r}")
+            fail("PRODUCT", f"30 s after launch no vox daemon serves the data root; the daemon's log "
+                            f"says: {log_text(data)!r}; the app printed: {open(out, errors='replace').read().strip()!r}")
         most, pids = watch(data, 10)
         log = log_text(data)
         print(f"[launch-proof] first launch: at most {most} daemon(s), now {pids}; "
@@ -135,28 +159,47 @@ def main():
             fail("PRODUCT", f"`vox node attach` must use daemon {daemon}; now {daemons(data)}")
         first.send_signal(signal.SIGTERM)
         first.wait(timeout=30)
-        second = launch(app, env)
+        second = launch(app, env, out)
         started.append(second)
         most, pids = watch(data, 10)
         log = log_text(data)
         print(f"[launch-proof] second launch: at most {most} daemon(s), now {pids}; "
               f"log starts {log.count(START)}, second daemons {log.count(SECOND)}")
         if second.poll() is not None:
-            fail("PRODUCT", f"Vox.app exited ({second.returncode}) on its second launch")
+            exited(second, out, "on its second launch")
         if most != 1 or pids != [daemon] or log.count(START) != 1 or SECOND in log:
             fail("PRODUCT", f"launched again, the app must use daemon {daemon} and start none: at "
                             f"most {most} ran at once, now {pids}; the daemon's log says: {log!r}")
         print("[launch-proof] ok: one daemon, started by the app as vox starts it, used again")
+        proved = True
     finally:
         for p in started:
             if p.poll() is None:
                 p.kill()
                 p.wait()
+        # Only this proof's own: the apps it started, and the daemons naming its scratch data root.
         for pid in daemons(data):
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+        until = time.monotonic() + 15
+        while daemons(data) and time.monotonic() < until:
+            time.sleep(0.1)
+        left = daemons(data) + [p.pid for p in started if p.poll() is None]
+        for pid in left:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if left:
+            # Said whatever the verdict; it fails a run that had none of its own.
+            print(f"[launch-proof] APPARATUS: processes of this proof outlived it and were killed: "
+                  f"{left}", file=sys.stderr)
+            if proved:
+                sys.exit(1)
+        else:
+            print("[launch-proof] nothing of this proof is left running")
 
 
 if __name__ == "__main__":
