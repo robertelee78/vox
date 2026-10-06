@@ -2,14 +2,16 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.0 (the decider, 2026-10-05). Nothing in this ADR is built unless a requirement says so.
+**Status**: Accepted for v0.4.0 (the decider, 2026-10-05); §2a added from the decider's answers of
+2026-10-06. Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
 **Tags**: ux, tui, macos, keyring, rooms, services, files, look, install
 **Related**: ADR-001, ADR-005, ADR-007, ADR-008, ADR-014, ADR-015, ADR-016, ADR-017, ADR-020, ADR-021, ADR-023, ADR-026, ADR-027
 **Inputs**: [docs/ux/v040-ux-research.md](../ux/v040-ux-research.md) and the decider's answers in
 [docs/ux/v040-ux-interview-decisions.md](../ux/v040-ux-interview-decisions.md) (2026-10-03, 2026-10-04,
-2026-10-05, including the answers to this ADR's first draft's open questions); the website's app study (`voxlux.us` `src/components/Experience.astro`); the session
+2026-10-05, including the answers to this ADR's first draft's open questions, and 2026-10-06 for
+§2a); the website's app study (`voxlux.us` `src/components/Experience.astro`); the session
 grid of Bromure's agent-coding interface (`/opt/bromure/Sources/AgentCoding`, `RoomStage.swift`,
 `AgentSessions.swift`) as a reference for W-2–W-4.
 
@@ -76,6 +78,54 @@ named: read records, the room's shared name, the decision record and the token f
 - **K-10.** The app MAY store a node's identity passphrase in the macOS Keychain, opt-in per node,
   off by default. The prompt MUST say that anyone who can unlock this Mac's login keychain can then
   attach the node.
+
+### 2a. Passphrases and trust offers (the decider, 2026-10-06)
+
+These rules are the same for every node. A person's node and an agent's node MUST NOT be told apart
+by any of them (ADR-001: there is no typed agent or human).
+
+- **K-11. Every node has a passphrase.** Creating a node (`vox node create`, the TUI's or the app's
+  onboarding, an agent skill pack's setup) MUST require a non-empty identity passphrase. The
+  passphrase MUST be asked for in exactly two cases: attaching the node, and changing its keyring
+  (trust add, remove, rename, a capability change). A retention change MUST NOT ask for it
+  (ADR-010 AR-28 as amended).
+- **K-12. Attaching does not open the keyring window.** A passphrase given to attach a node MUST
+  NOT open the keyring window (ADR-026 N-2). Only a passphrase entered for a keyring change MUST
+  open it, for 30 minutes. K-9 shows the window.
+- **K-13. A passphrase is typed outside an agent's session.** When an agent's hook finds its node
+  not attached, or a keyring change is to be made for its node, the hook MUST show the operator, in
+  the harness session, the command for each step to run in a terminal outside that session, for
+  example
+  `vox node attach claude-code-mbp` or `vox trust add <fingerprint> --node claude-code-mbp`. That
+  command MUST read the passphrase from its own terminal. A hook MUST NOT attach a node, and MUST
+  NOT take a passphrase from the environment, a file or the session. A keyring change MUST NOT take
+  its passphrase from an environment variable, a file or the Keychain (K-10 covers attach only).
+- **K-14. Capabilities.** A keyring entry MUST carry what it grants: **read** (what trust means
+  today, ADR-020 §3), or **read + drive**, stored in the sealed keyring with the entry. Both clients
+  and `vox trust list` MUST show it. What drive permits is to be specified with Sessions, which are
+  not in v0.4.0; until then, an entry with drive MUST grant exactly what read grants.
+- **K-15. A join offers trust.** When a node joins a room, each member whose keyring does not hold
+  it MUST be offered the newcomer: an item under **needs you** (W-2) showing its fingerprint grouped
+  with its art (K-1) and what K-7 says about it. The offer MUST be derived from the join on the log;
+  it MUST NOT add an entry type.
+- **K-16. Accepting.** Accepting an offer is ADR-020 3.7's second entry point, `vox trust add` with
+  the offered fingerprint. It MUST ask for an alias (K-3) and for **read** or **read + drive**, with
+  read the default, and MUST pass ADR-020 3.1's passphrase gate as amended by K-12. It MUST NOT
+  require comparing the
+  fingerprint: the client shows it, and the person accepting does whatever check their threat model
+  needs (K-5's compare action stays available).
+- **K-17. Accepting offers back.** Once a node accepts a newcomer, the newcomer's client MUST show
+  an offer of that node, derived from the consent grant on the log (ADR-007 G-9), accepted as in
+  K-16. One accept on each side completes a pair.
+- **K-18. An offer waits.** An offer MUST stay under needs you until it is accepted, dismissed, or
+  the offered node leaves the room. Dismissing MUST be local and silent: the offered node is not
+  told and stays not in keyring. Trust stays reachable later from the member pane (K-5).
+- **K-19. An agent's node is offered in its harness.** For an agent's node, the hook MUST show the
+  offer in the harness session, in the agent's per-turn read (ADR-020 6.6), with K-13's command to
+  accept it outside the session. An accept MUST pass ADR-020 3.1's passphrase gate whichever
+  client or command makes it.
+- **K-20. No trust file.** There MUST be no provision-time import, bulk trust file or other trust
+  path beyond ADR-020 3.7's two entry points.
 
 ### 3. Rooms
 
@@ -290,7 +340,8 @@ structure for both clients; the TUI renders the same regions in text.
   status bar with the node, its peers and the keyring window (K-9). Keyring and Services MUST be
   views of the same window, not separate windows.
 - **W-2.** The sidebar MUST group rooms by what they need from the person, with counts: **needs
-  you** (a message addressed to this node unread, urgent first), **active** (new messages, or a
+  you** (a message addressed to this node unread, urgent first, or a trust offer waiting, K-15),
+  **active** (new messages, or a
   member holding a claim), and **quiet**. A key MUST move to the next room that needs the person.
 - **W-3.** A room whose members include agents' nodes MUST offer a **lanes** view: one column per
   member, each that member's posts in this room (a filter of the room's own timeline, not a second
@@ -385,6 +436,24 @@ Each line below is amended as stated. Where code already matches, the ADR text i
 | ADR-020 11.5 | Default destination `downloads` setting, else `~/Downloads` | `<data root>/nodes/<node>/files/<room>/`; a person may save a copy elsewhere (F-4) |
 | ADR-020 11.2 | The receiver pulls when asked | Pulled automatically when addressed to this node or to no one, from a keyring member (F-3) |
 | ADR-026 S-6 | `vox daemon install` deferred | On macOS, a login item via `SMAppService` (A-5); Linux unchanged |
+| ADR-005 J-1 | "the two people swap fingerprints … each then runs `vox trust add` for the other" | Swapping fingerprints first is optional; each accepts the other's offer (K-15–K-17) |
+| ADR-005 J-2 | An identity passphrase is OPTIONAL (V030-36) | Required for every node (K-11); a room passphrase stays optional |
+| ADR-020 2.1 | The skill pack's setup creates the agent's node | With a passphrase the operator types (K-11) |
+| ADR-020 3.1 | The keyring window runs from when the passphrase "was last entered" | From when it was last entered for a keyring change; attaching does not open it (K-12) |
+| ADR-020 3.7 | Entry point 2, in-room approval, not built | Specified as offers on join (K-15–K-19) |
+| ADR-020 3.8 | A provision-time import MAY be provided | No import (K-20) |
+| ADR-026 N-2 | The window runs from the passphrase given at attach | Attaching does not open it (K-12) |
+| ADR-026 N-6 | Agent node created "with no passphrase or one from an environment variable" | With a passphrase the operator types (K-11); a hook never supplies one (K-13) |
+| ADR-026 L-2 | A hook may attach a node implicitly | A hook never attaches; it shows the attach command (K-13) |
+| ADR-026 C-6 | Passphrases may come from an environment variable resolved in the client | Never for a keyring change (K-13) |
+| ADR-010 AR-28 | A retention request over the socket is gated on the identity passphrase | Not gated: retention is not one of the passphrase's two cases (K-11) |
+| ADR-026 L-4 | Passphrase source: none, or a file path | None only for an anchor's headless key; a file serves attach only (K-13) |
+| ADR-026 S-2, Context | A hook may attach; a session brings its node in | A hook may start the daemon but never attaches (K-13) |
+| ADR-015 16.2 | Passphrase from a file, `VOX_IDENTITY_PASSPHRASE`, then a prompt | File and variable for attach only; a keyring change is prompted (K-13) |
+| ADR-016 NR-13 note | "after the keyring window only keyring changes ask again" | The window opens only for a keyring change (K-12) |
+| ADR-017 3.4 | Window counted from when the passphrase was last entered | From when it was last entered for a keyring change (K-12) |
+| ADR-020 6.10, 12.2 | A hook starts the daemon and attaches its node implicitly | Starts the daemon; never attaches (K-13) |
+| ADR-028 W-2 | Needs you: an unread message addressed to this node | Also a waiting trust offer (K-15) |
 
 ## Fixes outside this repository
 
@@ -399,6 +468,9 @@ Each line below is amended as stated. Where code already matches, the ADR text i
   trusted members, and only to them (RR-2, RR-3), when each message was seen.
 - Copied commands carry 162-character canonical addresses: long, but the same on every machine.
 - The daemon holds file offers and the proxy for as long as a node is attached.
+- For 30 minutes after a passphrase is typed for a keyring change, any program running as the
+  user, an agent included, can make further keyring changes on that node without typing it
+  (K-12 keeps the window; the decider, 2026-10-06).
 - Every member keyring-trusted by a sharer pulls an unaddressed share at once, so a large
   unaddressed share costs every such member its size in transfer and disk until it expires.
 - Thumbnails and link cards put up to 32 KB of non-text bytes into a message; the sender's node

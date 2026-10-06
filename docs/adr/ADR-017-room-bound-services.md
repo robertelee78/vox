@@ -81,7 +81,8 @@ is what a person offers. A tunnel is how bytes reach it.
   operator is any process running as the node's user, a person at a terminal or an agent acting for
   them; Vox MUST NOT tell the two apart, because a process running as the user already holds what
   the user holds. A trust add or remove MUST need the identity passphrase again when it was last
-  entered more than 30 minutes ago (V210-159). Nothing else causes a grant. In particular:
+  entered for a keyring change more than 30 minutes ago (V210-159; attaching does not count, ADR-028
+  K-12). Nothing else causes a grant. In particular:
   - `join` MUST NOT release this node's sender key to the responder. The responder's sending chain
     comes from `PairwiseFrame::Open`, an empty sealed message that carries no key and no grant.
   - A member bundle record MUST carry an `Admission` (`Creator`, or `Witnessed(JoinWitness)`, struct

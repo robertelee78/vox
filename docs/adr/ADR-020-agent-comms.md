@@ -59,7 +59,8 @@ caps are the only loop guards that provably terminate.
 - **2.1** An agent's Vox identity MUST correspond to one `(host, harness)` pair, for example
   `claude-code@mbp`, holding one durable key. Its node is hosted by the system's daemon (§12,
   ADR-016). *Built (ADR-026 N-6; #405, #408):* the skill pack's setup creates the agent's node
-  (`vox node create <harness>-<host>`) and installs its hooks as `vox agent hook --node <name>`; a
+  (`vox node create <harness>-<host>`, with a passphrase the operator types, ADR-028 K-11) and
+  installs its hooks as `vox agent hook --node <name>`; a
   hook MUST act only as that node, and MUST refuse without `--node`, never falling back to another
   node. An agent MUST NOT use a person's node: each agent is its own node, one per (host, harness).
 - **2.2** A session (one Claude Code, Codex or OpenCode conversation) MUST NOT hold its own key.
@@ -76,7 +77,8 @@ caps are the only loop guards that provably terminate.
   operator-chosen name (a petname, local to this node) (M19.2). The keyring MUST be sealed at rest
   under a key derived from the identity (`vox/trust-keyring-sek/v1`), so a changed keyring requires
   an unlocked identity. A keyring change MUST require the identity passphrase again once
-  `KEYRING_WINDOW_SECS` (30 minutes) have passed since it was last entered (V210-159).
+  `KEYRING_WINDOW_SECS` (30 minutes) have passed since it was last entered for a keyring change
+  (V210-159); the passphrase given at attach MUST NOT open the window (ADR-028 K-12).
 - **3.2** When a member is admitted to a room and its fingerprint is in the keyring, the node MUST
   release its sender key to that member without any further act. A release owed to an offline
   member MUST be retried on the tick. No member is dialled on the actor.
@@ -99,10 +101,10 @@ caps are the only loop guards that provably terminate.
   1. `vox trust add <fingerprint> --name <name>` (built);
   2. approving a member in a room, which MUST add that member to the keyring and MUST NOT create a
      room-scoped grant. The approval surface MUST say, at the moment of approval, that the trust
-     covers every room shared with that member, now and later. **Not built**: no in-room approval
-     surface exists on this tree.
-- **3.8** A provision-time import MAY be provided as a bulk wrapper over entry point 1. It MUST NOT
-  be a third path. Not built.
+     covers every room shared with that member, now and later. Specified as offers on join by
+     ADR-028 K-15–K-19 (v0.4.0). **Not built.**
+- **3.8** There MUST be no provision-time import or bulk trust file (the decider, 2026-10-06;
+  ADR-028 K-20). A key enters the keyring only by 3.7.
 - **3.9** Trust-on-first-use MUST NOT be implemented. Transitive introduction MUST NOT be
   implemented (§10).
 - **3.10** The client MUST offer per-message read metadata: which nodes have read a message this
@@ -261,7 +263,9 @@ they are not a defence against one that lies.
   removes the registration, both through `vox agent hook`, printing nothing; `UserPromptSubmit`
   records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook activity MUST count
   as idle. *Built (ADR-026 L-2, L-3, D-3; #404, #405):* session registration and unregistration
-  move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly. A
+  move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly.
+  *Amended by ADR-028 K-13:* a hook MAY start the daemon but MUST NOT attach its node; it shows the
+  operator the attach command to run outside the session. A
   registered session is a holder of its node; when `SessionEnd` unregisters the last holder of a node
   attached implicitly, the daemon detaches it, atomically with the unregister.
 - **6.11** `agent_wake_hold`, `agent_busy_idle` and `agent_reply_nudges` are settings in the
@@ -412,8 +416,8 @@ they are not a defence against one that lies.
   (M19.5c). It MUST NOT lock on SIGHUP; SIGHUP stops it cleanly (ADR-016 NR-15). It is the node
   `vox room` and `vox agent hook` attach to.
 - **12.2** *Decided, not built (ADR-026):* `vox daemon` is the account's one daemon, not a node. It
-  takes no passphrase at start; nodes attach to it (by hand, implicitly from a request or a hook, or
-  from its `--keep` list) and all run concurrently. `vox room` and `vox agent hook` are its clients
+  takes no passphrase at start; nodes attach to it (by hand, implicitly from a session-holding
+  request or the TUI, or from its `--keep` list; never from a hook, ADR-028 K-13) and all run concurrently. `vox room` and `vox agent hook` are its clients
   and act as the node they name. 12.1 is replaced when this is built.
 
 ### Non-goals

@@ -72,3 +72,16 @@ From an outside review, noting a pattern; whether Vox keeps such a record is the
 - **Addresses are communicated as fingerprints, every part.** The canonical address is `<service id>.<node fingerprint>.<room id>.vox`: the service part is a stable ID of the share (from its share statement), the node part the node's fingerprint, the room part the room's ID. Copy actions, pasted text, messages and agent hooks carry this form, so it resolves the same on every member's machine. Each client renders it human-readable by each part's own rule (service name; the viewer's alias for the node; the room's shared name) and accepts the readable form typed locally, translating it back.
 - **A rename that clashes on one node.** On that node only, the rooms involved lose the readable name and are shown by their room IDs until the clash is gone.
 - **Read records** are visible only to members the reader trusts (sealed like messages).
+
+## Passphrases and trust offers (2026-10-06)
+
+Input to ADR-028 §2a.
+
+- **Every node has a passphrase**, an agent's node as well as a person's. It is used only to start a session as the node (attach) and to change its keyring. This replaces the 2026-10-02 rulings that agent nodes have no passphrase or take one from an environment variable, and that passphrases are optional.
+- **The same rules for every node.** "We have no typed entity of agent/human -- same rules apply to both."
+- **Attaching does not open the keyring window.** Only a passphrase typed for a keyring change opens it; the 30-minute window applies to every node.
+- **Typed outside the agent's session.** The Claude, Codex or OpenCode session gives the operator a command to run from a command line outside that session, where the passphrase is typed.
+- **No trust file.** Trust is offered when a node joins a room: its fingerprint is offered to the members already there, each may trust it, and accepting offers that member's fingerprint back. One symmetric pair at a time.
+- **Accepting asks "read, or read + drive?"**, with read the default.
+- **An unanswered offer waits** under needs you until accepted, dismissed (silently) or the joiner leaves.
+- **No forced fingerprint comparison.** "It's expected that the user who is accepting the fingerprint knows how to do validation that they required for their threat model."
