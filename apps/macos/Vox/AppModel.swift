@@ -5,6 +5,11 @@ import Foundation
 final class AppModel: ObservableObject {
     /// Where the app is, from launch to an attached node.
     enum Phase: Equatable {
+        /// First run: whether to keep the daemon running while the person is logged in (M-8).
+        case askingLoginItem
+        /// The login item waits for the person's approval in System Settings; the system's
+        /// sentence when registering it failed.
+        case loginItemApproval(said: String?)
         /// Reaching the daemon.
         case starting
         /// The daemon did not answer; its sentence.
@@ -31,11 +36,42 @@ final class AppModel: ObservableObject {
         return false
     }
 
-    /// Reach the daemon, and attach the node chosen at first run, or ask which.
+    /// Ask about the login item at first run; then reach the daemon, and attach the node chosen at
+    /// first run, or ask which.
     func start() async {
+        if Daemon.kept() == nil {
+            phase = .askingLoginItem
+            return
+        }
+        await reach()
+    }
+
+    /// The person's answer at first run: keep the daemon running while logged in, or not now.
+    func answerLoginItem(keep: Bool) async {
+        Daemon.remember(kept: keep)
+        guard keep else {
+            await reach()
+            return
+        }
+        do {
+            try Daemon.loginItem.register()
+        } catch {
+            phase = .loginItemApproval(said: error.localizedDescription)
+            return
+        }
+        if Daemon.loginItem.status == .requiresApproval {
+            phase = .loginItemApproval(said: nil)
+            return
+        }
+        await reach()
+    }
+
+    /// Reach the daemon (the login item's, else one started as `vox` does), then attach the node
+    /// chosen at first run, or ask which.
+    func reach() async {
         phase = .starting
         do {
-            let client = try await VoxClient.open(dataRoot: "")
+            let client = try await Daemon.reach()
             self.client = client
             let nodes = try await client.nodes()
             if let chosen = chosenNode(client), let node = nodes.first(where: { $0.name == chosen }) {

@@ -5,6 +5,7 @@
 #
 #   scripts/app-proofs.sh                     # every proof
 #   scripts/app-proofs.sh FirstRunProof       # one class (xcodebuild's -only-testing)
+#   scripts/app-proofs.sh LaunchProof         # scripts/app-launch-proof.py alone: no UI automation
 #
 # It builds the macOS slice of VoxFFI.xcframework, the release `vox`, and the app; puts `vox` in
 # the bundle at Contents/Helpers/vox and signs the bundle ad hoc, inside out; then runs the suite.
@@ -34,6 +35,16 @@ cp target/release/vox "$APP/Contents/Helpers/vox"
 codesign --force --sign - --options runtime --identifier us.vox.cli "$APP/Contents/Helpers/vox"
 codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
 
+# The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
+# when asked for by name.
+launch_status=0
+if [ "$#" -eq 0 ] || [ "$*" = "LaunchProof" ]; then
+    python3 scripts/app-launch-proof.py "$APP" || launch_status=$?
+    if [ "$*" = "LaunchProof" ]; then
+        exit "$launch_status"
+    fi
+fi
+
 only=()
 for class in "$@"; do
     only+=("-only-testing:VoxAppProofs/$class")
@@ -51,4 +62,5 @@ if grep -q "enabling automation mode" "$SCRATCH/xcodebuild.log"; then
         "macOS shows on the next run." >&2
     exit 2
 fi
-exit "$status"
+[ "$status" -ne 0 ] && exit "$status"
+exit "$launch_status"

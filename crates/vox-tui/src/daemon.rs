@@ -173,7 +173,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     }
 
     // The foreground node.
-    let foreground = if args.as_detached {
+    let foreground = if args.as_detached || args.no_node {
         None
     } else {
         resolve(&account, named)
@@ -193,14 +193,14 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 return Ok(());
             }
         }
-        None if !args.as_detached && account.nodes_on_disk().is_empty() => {
+        None if !args.as_detached && !args.no_node && account.nodes_on_disk().is_empty() => {
             eprintln!(
                 "vox daemon: no node here yet, so it runs with none; nodes attach to it as they \
                  are made and used"
             );
             println!("vox daemon: control socket {}", account.socket().display());
         }
-        None if !args.as_detached => {
+        None if !args.as_detached && !args.no_node => {
             let nodes = account.nodes_on_disk();
             eprintln!(
                 "vox daemon: {} node(s) here and none named, so none is attached: name one with \
@@ -612,7 +612,7 @@ fn already_running(
             account.data_root.display()
         )
     };
-    if args.as_detached {
+    if args.as_detached || args.no_node {
         eprintln!("vox daemon: {}", running(""));
         return Ok(());
     }

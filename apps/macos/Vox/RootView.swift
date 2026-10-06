@@ -2,6 +2,7 @@
 // main window once the node is attached.
 
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 struct RootView: View {
@@ -20,6 +21,10 @@ struct RootView: View {
     private var setup: some View {
         VStack(alignment: .leading, spacing: 16) {
             switch model.phase {
+            case .askingLoginItem:
+                LoginItemQuestion(model: model)
+            case let .loginItemApproval(said):
+                LoginItemApproval(said: said, model: model)
             case .starting:
                 ProgressView("Reaching the vox daemon…")
             case let .unreachable(said):
@@ -55,6 +60,48 @@ private struct Said: View {
             .textSelection(.enabled)
             .accessibilityIdentifier("said")
             .accessibilityLabel("Failed: \(text)")
+    }
+}
+
+/// First run: whether the daemon keeps running while the person is logged in (ADR-014 M-8).
+private struct LoginItemQuestion: View {
+    let model: AppModel
+
+    var body: some View {
+        Text("Keep Vox running while you're logged in?").font(Theme.heading)
+        Text("Vox keeps your rooms reachable while you are logged in, even with the app closed.")
+            .secondaryText()
+            .accessibilityIdentifier("login-item-why")
+        HStack {
+            Button("Keep Running") { Task { await model.answerLoginItem(keep: true) } }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("login-item-keep")
+            Button("Not Now") { Task { await model.answerLoginItem(keep: false) } }
+                .accessibilityIdentifier("login-item-not-now")
+        }
+    }
+}
+
+/// The login item waits for the person in System Settings; the app opens it and goes on.
+private struct LoginItemApproval: View {
+    let said: String?
+    let model: AppModel
+
+    var body: some View {
+        Text("Allow Vox in Login Items").font(Theme.heading)
+        Text("To keep running while you're logged in, Vox needs your approval in System Settings, "
+            + "General, Login Items. Until then Vox runs while it is open.")
+            .secondaryText()
+        if let said {
+            Said(text: said)
+        }
+        HStack {
+            Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                .accessibilityIdentifier("login-item-settings")
+            Button("Continue") { Task { await model.reach() } }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("login-item-continue")
+        }
     }
 }
 

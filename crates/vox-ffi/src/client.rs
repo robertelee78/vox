@@ -156,6 +156,19 @@ pub enum RoomGroup {
     Quiet,
 }
 
+/// The account's config directory for the data root `data_root` (empty: the default one), as
+/// `vox` finds it: what a client keeps its own choices in, readable before any daemon answers.
+///
+/// # Errors
+/// The data root cannot be found.
+#[uniffi::export]
+pub fn config_dir(data_root: String) -> Result<String, VoxError> {
+    let root = (!data_root.is_empty()).then(|| PathBuf::from(&data_root));
+    Account::of(root.as_deref(), None)
+        .map(|a| a.config_dir.display().to_string())
+        .map_err(|e| failed(format!("data root: {e}")))
+}
+
 /// The group a room's unread counts, by [`UnreadLevel`], put it in: the TUI's rule
 /// (`vox_agentcomms::attention::group`).
 #[uniffi::export]
@@ -342,6 +355,10 @@ pub struct VoxClient {
     data_root: PathBuf,
     config_dir: PathBuf,
     held: Slot,
+    /// A connection to the daemon, kept while the client lives: a daemon a client started exits
+    /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
+    /// client from the moment it opens, before any node is attached.
+    daemon_hold: Mutex<Option<DaemonClient>>,
 }
 
 /// A failure to reach the daemon, said for a person.
@@ -594,14 +611,14 @@ impl VoxClient {
             Account::of(root.as_deref(), None).map_err(|e| failed(format!("data root: {e}")))?;
         let socket = account.socket();
         let probe = socket.clone();
-        rt.spawn(async move {
-            DaemonClient::open(&probe)
-                .await
-                .map(drop)
-                .map_err(|e| said(&probe, e))
-        })
-        .await
-        .map_err(|_| failed("the app's vox runtime stopped"))??;
+        let hold = rt
+            .spawn(async move {
+                DaemonClient::open(&probe)
+                    .await
+                    .map_err(|e| said(&probe, e))
+            })
+            .await
+            .map_err(|_| failed("the app's vox runtime stopped"))??;
         Ok(Arc::new(Self {
             runtime: Mutex::new(Some(runtime)),
             rt,
@@ -609,6 +626,7 @@ impl VoxClient {
             data_root: account.data_root.clone(),
             config_dir: account.config_dir.clone(),
             held: Arc::new(tokio::sync::Mutex::new(None)),
+            daemon_hold: Mutex::new(Some(hold)),
         }))
     }
 
@@ -731,6 +749,18 @@ impl VoxClient {
     /// Stop: release the node and end the client's work. The object is unusable afterwards.
     pub async fn close(&self) {
         self.release().await;
+        let hold = self
+            .daemon_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        // Dropped on the runtime its connection belongs to.
+        let _ = self
+            .on_rt(async move {
+                drop(hold);
+                Ok(())
+            })
+            .await;
         if let Some(rt) = self
             .runtime
             .lock()
