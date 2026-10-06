@@ -9,7 +9,8 @@ its status line.
 
 The TUI runs in a pty at 160x50 and its screen is read through the `pyte` terminal emulator.
 
-Prints `<tag> SAID: <status line>`. Exit 0 = it answered; 1 = the TUI failed (`<tag> RED:
+Prints `<tag> FIRST RUN: <the prompt's rows>`, what the first-run prompt says before anything is
+typed (ADR-028 K-8: that a node has no backup), then `<tag> SAID: <status line>`. Exit 0 = it answered; 1 = the TUI failed (`<tag> RED:
 PRODUCT: <what>`, with its screen) or the driver hung (`HUNG at <stage>`); 2 = apparatus (pyte
 missing). The caller judges the words. The TUI is killed by its PID, with a bounded wait.
 """
@@ -42,6 +43,11 @@ try:
     if not tui.until(lambda: "create identity" in tui.text().lower(), 60):
         print(f"{TAG} RED: PRODUCT: the TUI never asked to create an identity:\n{tui.text()}")
         sys.exit(1)
+
+    # The prompt's rows, joined: what a person reads before typing anything.
+    rows = tui.display()
+    top = next((i for i, r in enumerate(rows) if "Create identity" in r), len(rows))
+    print(f"{TAG} FIRST RUN: {' '.join(' '.join(r.strip('│ ').split()) for r in rows[top:])}")
 
     stage("the create")
     before = status()

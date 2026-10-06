@@ -664,6 +664,7 @@ pub fn node_create(
             "vox: created headless node {name}; `vox node --node {name}` runs it as an anchor"
         );
         println!("{}", vox_core::node::link::b32_encode(&fp));
+        eprintln!("vox: {}", crate::ident::NO_BACKUP);
         return Ok(());
     }
     let passphrase = Zeroizing::new(crate::tunnel_cli::identity_passphrase_for(
@@ -674,6 +675,8 @@ pub fn node_create(
     let fp = create_identity(&paths, &passphrase)?;
     println!("vox: created node {name}");
     println!("{}", vox_core::node::link::b32_encode(&fp));
+    // On stderr, so stdout stays what a script reads: the name, then the fingerprint.
+    eprintln!("vox: {}", crate::ident::NO_BACKUP);
     Ok(())
 }
 
