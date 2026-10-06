@@ -1150,6 +1150,9 @@ pub struct ServiceListArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
+    /// Print the listing as one JSON object; every address in it is canonical (ADR-028 S-3).
+    #[arg(long)]
+    pub json: bool,
     /// **Refused**, as for every verb: a command line is readable by every process on the
     /// machine while it runs. Use `--identity-passphrase-file`, or `VOX_IDENTITY_PASSPHRASE`,
     /// or let it prompt.
@@ -2663,7 +2666,9 @@ pub fn run() -> ExitCode {
                         crate::room_cli::service_remove(&paths, &r.room.room, &label_of(&r.tag))
                             .await
                     }
-                    ServiceCmd::List(r) => crate::room_cli::service_list(&paths, &r.room).await,
+                    ServiceCmd::List(r) => {
+                        crate::room_cli::service_list(&paths, &r.room, r.json).await
+                    }
                 }
             })
         }

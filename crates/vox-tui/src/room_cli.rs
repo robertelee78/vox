@@ -2416,7 +2416,7 @@ pub async fn service_remove(paths: &Paths, room: &str, tag: &str) -> Result<(), 
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the node cannot say.
-pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
+pub async fn service_list(paths: &Paths, room: &str, json: bool) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     let channel_id = room_of(&mut client, room).await?;
     match client.request(&Request::Services { channel_id }).await {
@@ -2425,7 +2425,17 @@ pub async fn service_list(paths: &Paths, room: &str) -> Result<(), AppError> {
             services,
             shared,
         }) => {
-            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared);
+            // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL.
+            let proxy = match crate::client::one_shot(paths) {
+                Ok(at) => vox_core::node::nameipc::proxy(&at)
+                    .await
+                    .map_err(|e| match e {
+                        vox_core::error::Error::AppRefused(reason) => reason,
+                        other => other.to_string(),
+                    }),
+                Err(e) => Err(e.to_string()),
+            };
+            crate::tunnel_cli::print_services(&room, &channel_id, &services, &shared, &proxy, json);
             Ok(())
         }
         // The node's reason, as `vox service list` without a daemon gives it.

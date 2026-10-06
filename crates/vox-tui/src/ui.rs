@@ -465,6 +465,11 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         focused(ui, Focus::Composer),
     );
     // Members above, and under them what is shared in the room (V030-25), when anything is.
+    let shared_focus = focused(ui, Focus::Shared);
+    // The pane's inner width: the command under the selected service is printed in full there,
+    // wrapped, since it is longer than a line (ADR-028 S-3).
+    let inner = usize::from(cols[1].width.saturating_sub(2)).max(20);
+    let shared_lines = shared_lines(&channel.shared, ui.selected_share, shared_focus, inner);
     let side = if channel.shared.is_empty() {
         vec![cols[1]]
     } else {
@@ -473,7 +478,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             .constraints([
                 Constraint::Min(3),
                 Constraint::Length(
-                    u16::try_from(channel.shared.len().saturating_add(2)).unwrap_or(u16::MAX),
+                    u16::try_from(shared_lines.len().saturating_add(2)).unwrap_or(u16::MAX),
                 ),
             ])
             .split(cols[1])
@@ -487,13 +492,45 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         focused(ui, Focus::Members),
     );
     if let Some(area) = side.get(1) {
-        let items: Vec<ListItem> = channel
-            .shared
-            .iter()
-            .map(|s| ListItem::new(Line::from(s.clone())))
-            .collect();
-        frame.render_widget(List::new(items).block(pane_block("Shared", false)), *area);
+        let items: Vec<ListItem> = shared_lines.into_iter().map(ListItem::new).collect();
+        frame.render_widget(
+            List::new(items).block(pane_block("Shared", shared_focus)),
+            *area,
+        );
     }
+}
+
+/// The Shared pane's lines (ADR-028 S-3): each service, and under the one selected while the pane
+/// has focus, what it needs that does not hold and, in full, the command `y` copies.
+fn shared_lines(
+    shared: &[crate::viewmodel::SharedView],
+    selected: usize,
+    focus: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (i, s) in shared.iter().enumerate() {
+        let here = focus && i == selected.min(shared.len().saturating_sub(1));
+        lines.push(Line::from(format!(
+            "{}{}",
+            if here { "▶ " } else { "  " },
+            s.line
+        )));
+        if here {
+            for m in &s.missing {
+                lines.push(Line::from(format!("    needs: {m}")));
+            }
+            lines.push(Line::from("    y copies:"));
+            let chars: Vec<char> = s.copy.chars().collect();
+            for chunk in chars.chunks(width.saturating_sub(6).max(10)) {
+                lines.push(Line::from(format!(
+                    "      {}",
+                    chunk.iter().collect::<String>()
+                )));
+            }
+        }
+    }
+    lines
 }
 
 fn focused(ui: &UiState, pane: Focus) -> bool {

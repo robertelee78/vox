@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks twenty-seven claims, each
+//! 160x50. It checks twenty-eight claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -79,6 +79,10 @@
 //!   Carol ". <her fingerprint>", every state still read by glyph, weight and word; in 16 colours (`TERM=xterm`)
 //!   every colour drawn is one of the 16; in 256 colours Alice's name is index 255 and Carol's 247.
 //!   In each the words are as in truecolour and the accent is on the focused border alone.
+//! - `copies`: Alice shares an ssh stand-in; Bob's Shared pane lists it, and `y` on it puts
+//!   `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full under the
+//!   service and says "copied" on the status line, the address Alice's `vox service list --json`
+//!   gives (ADR-028 S-3, #490).
 //!
 //! The `target`, `delivers` and `revoke` claims are gone with `:consent grant|revoke` (V210-148): a
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
@@ -94,8 +98,9 @@
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`), a join line naming a
 //! trusted member that has not granted the newcomer (`newcomer`), a quote of the thread's root
 //! rather than `re`, Enter on a reply not moving the selection, a trusted member shown as
-//! "verified" (`consent`), or `:node <name>` acting as another node again. It passes only on the
-//! script's PASS with all 27 claims ok.
+//! "verified" (`consent`), `:node <name>` acting as another node again, or a copied command that
+//! is not the service's canonical address (`copies`). It passes only on the script's PASS with all
+//! 28 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -185,7 +190,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (27 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (28 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -199,8 +204,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (27, 27),
-                "APPARATUS: the driver said PASS without all 27 claims ok: {said}"
+                (28, 28),
+                "APPARATUS: the driver said PASS without all 28 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
