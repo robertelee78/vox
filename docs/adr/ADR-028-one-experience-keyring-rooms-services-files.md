@@ -225,10 +225,12 @@ keep code in sync through GitHub.
 - **D-1.** Each node MUST keep a local record of what it decided: every refusal and every change of
   access (a refused join, dial, circuit or tunnel; a trust added or removed; a share stopped; a
   session cut), one event per decision with its time, what was asked, by whom (fingerprint and
-  alias), what was decided, and why.
-- **D-2.** The record MUST hold no message text, file name or content, passphrase, key or token. It
-  MUST be stored under the node's directory (`nodes/<name>/decisions/<YYYY-MM-DD>.jsonl`, mode
-  `0600`), kept 14 days, and never sent anywhere.
+  alias), what was decided, and why, and, for a decision about a room (a join, a share stopped),
+  that room's ID.
+- **D-2.** The record MUST hold no message text, file name or content, passphrase, key or token,
+  and of a room only its ID, never its name. It MUST be stored under the node's directory
+  (`nodes/<name>/decisions/<YYYY-MM-DD>.jsonl`, mode `0600`), kept 14 days, and never sent
+  anywhere.
 - **D-3.** `vox status` MUST name the most recent refusals; the TUI and the app MUST show the record
   as a timeline.
 

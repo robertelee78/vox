@@ -5026,6 +5026,7 @@ impl Node {
                             why: "this node's person removed them from the keyring: they read \
                                   nothing new from it and reach none of its services"
                                 .to_owned(),
+                            room: None,
                         },
                     );
                 }
@@ -5055,6 +5056,7 @@ impl Node {
                     self.decided(
                         "to stop sharing a service",
                         me,
+                        Some(channel_id),
                         crate::node::decisions::Decided::Stopped,
                         format!(
                             "this node's person stopped sharing {service_tag} in room {}: nobody \
@@ -7660,6 +7662,9 @@ impl Node {
                                         alias: alias.clone(),
                                         decided: d,
                                         why: why.to_owned(),
+                                        // The request names a service; which room serves it is
+                                        // decided past here, and a refusal may come before any.
+                                        room: None,
                                     },
                                 );
                             };
@@ -7853,6 +7858,7 @@ impl Node {
             self.decided(
                 "to join a room",
                 peer,
+                Some(channel_id),
                 crate::node::decisions::Decided::Refused,
                 format!("this node was already answering {JOINS_IN_FLIGHT} joins"),
             );
@@ -7882,6 +7888,7 @@ impl Node {
             self.decided(
                 "to join a room",
                 ended.peer,
+                Some(channel_id),
                 crate::node::decisions::Decided::Cut,
                 format!(
                     "all {JOINS_IN_FLIGHT} join slots were held, and its join gave way to {}'s",
@@ -8019,6 +8026,7 @@ impl Node {
                 self.decided(
                     "to join a room",
                     peer,
+                    Some(channel_id),
                     crate::node::decisions::Decided::Refused,
                     reason.clone(),
                 );
@@ -14868,6 +14876,7 @@ impl Node {
         &self,
         asked: &'static str,
         by: Digest32,
+        room: Option<Digest32>,
         decided: crate::node::decisions::Decided,
         why: String,
     ) {
@@ -14879,6 +14888,7 @@ impl Node {
                 alias: self.trust.petname(&by).map(str::to_owned),
                 decided,
                 why,
+                room,
             },
         );
     }
@@ -14889,6 +14899,7 @@ impl Node {
             self.decided(
                 "to trust a member",
                 fingerprint,
+                None,
                 crate::node::decisions::Decided::Trusted,
                 "this node's person added them to the keyring".to_owned(),
             );

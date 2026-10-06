@@ -66,6 +66,10 @@ pub struct Decision {
     pub decided: Decided,
     /// Why, in this node's words.
     pub why: String,
+    /// The room it concerns, by its ID — never its name or anything in it (D-2) — when the
+    /// decision is about one: a join, a share stopped. `None` for one about no room (a trust, a
+    /// stream or relay circuit asked of the connection).
+    pub room: Option<Digest32>,
 }
 
 /// A node's decision record: where it is, and which day it was last pruned on. Cheap to clone;
@@ -184,7 +188,7 @@ impl DecisionLog {
     /// changes nothing the node does, and is said on stderr.
     pub fn record(&self, now_ms: u64, d: &Decision) {
         let day = days_from_epoch(now_ms);
-        let line = serde_json::json!({
+        let mut event = serde_json::json!({
             "at_ms": now_ms,
             "asked": d.asked,
             "by": crate::node::link::b32_encode(&d.by),
@@ -197,8 +201,12 @@ impl DecisionLog {
             }),
             "decided": d.decided.as_str(),
             "why": d.why,
-        })
-        .to_string();
+        });
+        // Only on an event about a room: its ID, nothing else of it (D-2).
+        if let (Some(room), Some(fields)) = (d.room, event.as_object_mut()) {
+            fields.insert("room".into(), crate::node::link::b32_encode(&room).into());
+        }
+        let line = event.to_string();
         if let Err(e) = self.append(day, &line) {
             eprintln!(
                 "vox: could not write the decision record in {}: {e}",
