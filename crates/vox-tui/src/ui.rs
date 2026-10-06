@@ -31,6 +31,9 @@ pub const UNDECRYPTABLE_MARKER: &str = "[locked — not shared with you]";
 pub const LATE_MARKER: &str = "[late] ";
 /// What begins the line under a message this node sent that names who has read it (ADR-028 R-6).
 pub const READ_BY: &str = "read by ";
+/// What marks a room's retention: in its header, and before each line saying it changed (ADR-028
+/// R-7).
+pub const RETENTION: &str = "⏱";
 
 /// Where a member stands with you, in words: whether you trust it, and whether it reads you here.
 /// Nothing for yourself.
@@ -319,6 +322,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         body[0],
         &channel.held_back,
         channel.timeline.as_slice(),
+        (&channel.retention, &channel.retention_changes),
         ui.timeline_scroll,
         focused(ui, Focus::Timeline),
     );
@@ -364,9 +368,20 @@ fn render_timeline(
     area: Rect,
     held_back: &[String],
     timeline: &[MessageView],
+    (retention, changes): (&str, &[(u64, String)]),
     scroll: usize,
     focus: bool,
 ) -> (usize, Vec<Digest32>) {
+    // A retention change is one line in its place among the messages (ADR-028 R-7), by its time.
+    let said = |text: &str| {
+        Line::from(Span::styled(
+            format!("{RETENTION} {text}"),
+            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        ))
+    };
+    let oldest = timeline.first().map_or(u64::MAX, |m| m.timestamp);
+    let (before, among): (Vec<_>, Vec<_>) = changes.iter().partition(|(at, _)| at / 1_000 < oldest);
+    let mut among = among.into_iter().rev().peekable();
     // Who this room holds back for equivocating comes first, one line each (V210-66).
     let notices = held_back.iter().map(|n| {
         Line::from(Span::styled(
@@ -379,7 +394,12 @@ fn render_timeline(
     let lines = timeline
         .iter()
         .rev()
-        .flat_map(|m| {
+        .flat_map(move |m| {
+            // The changes newer than this message come before it: lines run newest first.
+            let mut newer: Vec<(Option<Digest32>, Line)> = Vec::new();
+            while let Some((_, text)) = among.next_if(|(at, _)| at / 1_000 >= m.timestamp) {
+                newer.push((None, said(text)));
+            }
             // Characters a reader cannot see are shown as escapes (#331).
             let body = m.body.as_deref().map_or_else(
                 || UNDECRYPTABLE_MARKER.to_owned(),
@@ -415,11 +435,14 @@ fn render_timeline(
                     Style::default().add_modifier(Modifier::DIM),
                 ))
             });
-            read_by
-                .into_iter()
-                .chain(std::iter::once(Line::from(spans)))
-                .map(move |l| (Some(m.entry_hash), l))
+            newer.into_iter().chain(
+                read_by
+                    .into_iter()
+                    .chain(std::iter::once(Line::from(spans)))
+                    .map(move |l| (Some(m.entry_hash), l)),
+            )
         })
+        .chain(before.into_iter().rev().map(|(_, text)| (None, said(text))))
         .chain(notices.rev().map(|l| (None, l)));
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
@@ -450,12 +473,13 @@ fn render_timeline(
     let shown: Vec<Line> = rows[window.clone()].to_vec();
     let mut on_screen: Vec<Digest32> = owners[window].iter().flatten().copied().collect();
     on_screen.dedup();
+    // The room's header always says its retention (ADR-028 R-7).
     let title = if scroll > 0 {
-        "Timeline (scrolled — End: newest)"
+        format!("Timeline · {RETENTION} {retention} (scrolled — End: newest)")
     } else {
-        "Timeline"
+        format!("Timeline · {RETENTION} {retention}")
     };
-    let p = Paragraph::new(shown).block(pane_block(title, focus));
+    let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
     (scroll, on_screen)
 }

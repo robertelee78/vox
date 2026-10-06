@@ -3,7 +3,7 @@
 //!
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob and Carol
 //! (Alice and Bob trust each other, nobody trusts Carol), Alice posts 70 lines, and Bob's real
-//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks nineteen claims, each
+//! `vox tui` is read through the `pyte` terminal emulator at 160x50. It checks twenty claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -20,6 +20,9 @@
 //! - `nostorm`: read records never answer read records (the decider; ADR-028 RR-2): with Alice's
 //!   real `vox tui` on the room beside Bob's and both agents draining, once each TUI says the other
 //!   has read its post, the entries `vox status --json` says each node holds stay the same for 15 s;
+//! - `retention`: with both TUIs open, Alice sets the room's retention to 1 week: each header, which
+//!   said "⏱ forever", says "⏱ 1 week", and each timeline shows one line saying who set it and that
+//!   older messages were removed (ADR-028 R-7, #483);
 //! - `words`: `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
 //!   never an "invite link" (the decider's words, #406);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
@@ -59,10 +62,10 @@
 //! top, a scroll not clamped to the oldest line, every member shown `Trust::Trusted`, a stub command
 //! restored, the message pane's `reveal` removed, a member whose read records Bob cannot open named
 //! as not having read, every message marked read whether drawn or not, a message called held by a
-//! node that has not said it holds it, a read record named by a read record, `SyncStatus`
+//! node that has not said it holds it, a read record named by a read record, a retention change with no line in the timeline, `SyncStatus`
 //! hard-coded (idle, or any one count), `Reachability` hard-coded either way, a notification that
 //! carries the message text or is raised per message, or a room with a message to Bob grouped
-//! other than "needs you". It passes only on the script's PASS with all 19 claims ok.
+//! other than "needs you". It passes only on the script's PASS with all 20 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -151,7 +154,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (19 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (20 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -165,8 +168,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (19, 19),
-                "APPARATUS: the driver said PASS without all 19 claims ok: {said}"
+                (20, 20),
+                "APPARATUS: the driver said PASS without all 20 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

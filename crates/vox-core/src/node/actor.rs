@@ -306,6 +306,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         refused_below_checkpoint,
         read_by: ch.read_by_own(),
         held: ch.held_own(),
+        retention_changes: ch.retention_changes(),
     }
 }
 

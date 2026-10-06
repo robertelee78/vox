@@ -493,6 +493,9 @@ pub struct ChannelDetail {
     /// other members' nodes said they hold it)`, oldest first, for the same messages as
     /// [`Self::read_by`] looks at.
     pub held: Vec<(Digest32, u64)>,
+    /// Each change of the room's retention, in the room's order (ADR-028 R-7): `(who set it,
+    /// ttl seconds with `0` forever, when by its entry's clock in ms)`.
+    pub retention_changes: Vec<(Digest32, u64, u64)>,
 }
 
 /// The node's latest-wins view (published over a `watch`).

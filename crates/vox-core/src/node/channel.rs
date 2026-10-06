@@ -3841,6 +3841,23 @@ impl ChannelState {
         Ok(())
     }
 
+    /// Each change of the room's retention that took effect, in the room's order: `(who set it,
+    /// ttl seconds, when by its entry's clock in ms)` (ADR-028 R-7).
+    #[must_use]
+    pub fn retention_changes(&self) -> Vec<(Digest32, u64, u64)> {
+        self.evaluator
+            .retention_changes()
+            .iter()
+            .map(|(entry, author, ttl)| {
+                let at = self
+                    .dag
+                    .get_by_hash(entry)
+                    .map_or(0, |e| e.skeleton.claimed_ms);
+                (*author, *ttl, at)
+            })
+            .collect()
+    }
+
     /// The room's retention, seconds (`0` = forever): the ADR-007 policy-update `ttl` in
     /// force, as the evaluator folds it from the log.
     #[must_use]

@@ -131,6 +131,10 @@ pub enum DenyReason {
     Revoked,
 }
 
+/// A change of the room's retention that took effect: `(its entry, who set it, ttl seconds)`,
+/// `0` forever (ADR-028 R-7).
+pub type RetentionChange = (Digest32, Digest32, u64);
+
 /// The deterministic evaluator over a channel's governance log.
 ///
 /// Built once from the genesis + the governance entries via [`Evaluator::build`],
@@ -153,6 +157,9 @@ pub struct Evaluator {
     denied: BTreeMap<Digest32, DenyReason>,
     /// The effective channel policy after applying policy-updates over genesis.
     policy: ChannelPolicy,
+    /// Each policy-update that took effect, in the room's order: `(entry, author, ttl)`. What a
+    /// client shows as the room's retention changes (ADR-028 R-7).
+    retention_changes: Vec<RetentionChange>,
     /// The channel-global epoch: the genesis epoch, 0. Passphrase rotation, the only
     /// thing that advanced it, is removed (V030-32).
     current_epoch: u64,
@@ -301,7 +308,7 @@ impl Evaluator {
         let authority = head.authority;
         let denied = head.denied;
         let current_epoch = head.epoch;
-        let policy = resolver.resolve_policy(genesis)?;
+        let (policy, retention_changes) = resolver.resolve_policy(genesis)?;
         let consent = resolver.resolve_consent()?;
         let lifecycle = resolver.resolve_lifecycle()?;
 
@@ -311,6 +318,7 @@ impl Evaluator {
             authority,
             denied,
             policy,
+            retention_changes,
             current_epoch,
             consent,
             members,
@@ -353,6 +361,13 @@ impl Evaluator {
     #[must_use]
     pub fn policy(&self) -> ChannelPolicy {
         self.policy
+    }
+
+    /// Each change of the room's retention that took effect, in the room's order:
+    /// `(entry, author, ttl seconds)`, `0` forever (ADR-028 R-7).
+    #[must_use]
+    pub fn retention_changes(&self) -> &[RetentionChange] {
+        &self.retention_changes
     }
 
     /// The current channel-global epoch: the genesis epoch, 0 (V030-32 removed the
@@ -700,8 +715,12 @@ impl<'a> Resolver<'a> {
     /// ([`Resolver::resolve_lifecycle`]): a delegated admin, cut off while the creator takes its
     /// admin back, sets the room's retention on its own node, which rightly took it; an
     /// authorized revocation of that admin concurrent with the update voids it once the logs meet.
-    fn resolve_policy(&mut self, genesis: &Genesis) -> Result<ChannelPolicy> {
+    fn resolve_policy(
+        &mut self,
+        genesis: &Genesis,
+    ) -> Result<(ChannelPolicy, Vec<RetentionChange>)> {
         let mut policy = genesis.body.policy;
+        let mut changes = Vec::new();
         let order: Vec<&GovEntry> = self.causality.order.clone();
         for e in order {
             let GovBody::PolicyUpdate(p) = &e.body else {
@@ -721,9 +740,10 @@ impl<'a> Resolver<'a> {
             }
             if let Some(ttl) = p.body.ttl {
                 policy.ttl = ttl;
+                changes.push((e.entry_hash, e.author_id, ttl));
             }
         }
-        Ok(policy)
+        Ok((policy, changes))
     }
 
     /// Resolve consent edges. Consent is single-writer (`A` alone authors `A`'s

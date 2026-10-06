@@ -1157,6 +1157,32 @@ impl DaemonCore {
                         })
                         .collect(),
                     reachability: reachability(&cid),
+                    retention: vox_core::node::retention::describe(d.retention),
+                    // Who set what, and what it did to what was older (ADR-028 R-7).
+                    retention_changes: d
+                        .retention_changes
+                        .iter()
+                        .map(|(who, ttl, at)| {
+                            let who = if me == Some(*who) {
+                                "you".to_owned()
+                            } else {
+                                crate::ident::member_name(&snap.trusted, who)
+                            };
+                            let line = if *ttl == 0 {
+                                format!(
+                                    "{who} set the room's retention to forever: nothing is \
+                                     removed for its age"
+                                )
+                            } else {
+                                format!(
+                                    "{who} set the room's retention to {}: older messages were \
+                                     removed",
+                                    vox_core::node::retention::describe(*ttl)
+                                )
+                            };
+                            (*at, line)
+                        })
+                        .collect(),
                 })
         });
         ViewModel {

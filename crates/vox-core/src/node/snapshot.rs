@@ -51,6 +51,12 @@ pub struct OpenRoomSnap {
     /// Where this node's own recent messages are: `(entry, how many of the other members' nodes
     /// hold it)` ([`crate::node::api::ChannelDetail::held`]).
     pub held: Vec<(Digest32, u64)>,
+    /// The retention this node applies here, seconds, `0` forever
+    /// ([`crate::node::api::ChannelDetail::retention`]): what a room's header shows (ADR-028 R-7).
+    pub retention: u64,
+    /// Each change of the room's retention: `(who, ttl seconds, when in ms)`
+    /// ([`crate::node::api::ChannelDetail::retention_changes`]).
+    pub retention_changes: Vec<(Digest32, u64, u64)>,
 }
 
 /// One node as a client draws it.
@@ -108,6 +114,8 @@ impl NodeSnapshot {
                     equivocations: d.equivocations.clone(),
                     read_by: d.read_by.clone(),
                     held: d.held.clone(),
+                    retention: d.retention,
+                    retention_changes: d.retention_changes.clone(),
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
@@ -139,7 +147,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(8).bytes(&o.channel_id).text(&o.local_name);
+            e.array(10).bytes(&o.channel_id).text(&o.local_name);
             digests(&mut e, &o.members);
             digests(&mut e, &o.consented);
             e.array(o.shares.len());
@@ -162,6 +170,11 @@ impl NodeSnapshot {
             e.array(o.held.len());
             for (entry, n) in &o.held {
                 e.array(2).bytes(entry).uint(*n);
+            }
+            e.uint(o.retention);
+            e.array(o.retention_changes.len());
+            for (who, ttl, at) in &o.retention_changes {
+                e.array(3).bytes(who).uint(*ttl).uint(*at);
             }
         }
         e.array(self.trusted.len());
@@ -233,7 +246,7 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 8, "ipc snapshot open room")?;
+            want(&mut d, 10, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
             let local_name = d.text().map_err(bad("ipc snapshot open name"))?.to_owned();
             let members = read_digests(&mut d)?;
@@ -274,6 +287,15 @@ impl NodeSnapshot {
                 let entry = digest(&mut d)?;
                 held.push((entry, d.uint().map_err(bad("ipc snapshot held count"))?));
             }
+            let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
+            let mut retention_changes = Vec::new();
+            for _ in 0..d.array().map_err(bad("ipc snapshot retention changes"))? {
+                want(&mut d, 3, "ipc snapshot retention change")?;
+                let who = digest(&mut d)?;
+                let ttl = d.uint().map_err(bad("ipc snapshot retention ttl"))?;
+                let at = d.uint().map_err(bad("ipc snapshot retention at"))?;
+                retention_changes.push((who, ttl, at));
+            }
             open.push(OpenRoomSnap {
                 channel_id,
                 local_name,
@@ -283,6 +305,8 @@ impl NodeSnapshot {
                 equivocations,
                 read_by,
                 held,
+                retention,
+                retention_changes,
             });
         }
         let mut trusted = Vec::new();
@@ -447,6 +471,8 @@ mod tests {
                 equivocations: vec![([4; 32], 7)],
                 read_by: vec![([5; 32], vec![[4; 32]])],
                 held: vec![([5; 32], 1)],
+                retention: 604_800,
+                retention_changes: vec![([4; 32], 604_800, 9)],
             }],
             trusted: vec![([4; 32], "bob".into())],
             connected_peers: vec![[4; 32]],

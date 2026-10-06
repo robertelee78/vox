@@ -143,6 +143,12 @@ pub struct ChannelView {
     pub shared: Vec<String>,
     /// This channel's reachability.
     pub reachability: Reachability,
+    /// The retention this node applies here, as a person reads it ("1 week", "forever"): what the
+    /// room's header always shows (ADR-028 R-7).
+    pub retention: String,
+    /// Each change of the room's retention, oldest first: `(when, ms; the line the timeline shows
+    /// for it)` (ADR-028 R-7).
+    pub retention_changes: Vec<(u64, String)>,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many

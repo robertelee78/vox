@@ -34,6 +34,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             draining, the entries `vox status --json` says each node holds stay the same for 15 s;
             Alice's TUI and the daemon it started are then stopped and her `vox daemon` started
             again;
+  retention while both TUIs are open, Alice runs `vox room retention <room> 1w`: each header,
+            which said "⏱ forever", says "⏱ 1 week", and each timeline gains one line, "you set
+            the room's retention to 1 week: older messages were removed" on Alice's and the same
+            naming alice on Bob's (ADR-028 R-7, #483);
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
   unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
@@ -443,6 +447,27 @@ try:
     claim("nostorm", len(set(counts)) == 1,
           f"entries held (alice, bob) over 15 s, both TUIs on the room and both agents draining: "
           f"{counts[0]} to {counts[-1]} ({len(counts)} samples, {len(set(counts))} distinct)")
+
+    stage("retention")
+    # A retention change is one line in each member's timeline, saying who set what and that
+    # older messages went; the room's header always says the retention (ADR-028 R-7, #483).
+    def header(t):
+        return next((bare(r) for r in t.display() if "Timeline ·" in r), "")
+    def says(t, want):
+        return any(want in bare(r) for r in pane(t.display(), "Timeline"))
+    before = (header(atui), header(tui))
+    r = run("alice", "room", "retention", room, "1w", "--identity-passphrase-file", f"{S}/idpass")
+    if r.returncode != 0: product(f"alice's `vox room retention {room} 1w` failed: {r.stderr.strip()}")
+    LINE = "set the room's retention to 1 week: older messages were removed"
+    both_until(lambda: says(atui, f"you {LINE}") and says(tui, f"alice {LINE}")
+               and "⏱ 1 week" in header(atui) and "⏱ 1 week" in header(tui), 60)
+    after = (header(atui), header(tui))
+    claim("retention", all("⏱ forever" in h for h in before) and all("⏱ 1 week" in h for h in after)
+          and says(atui, f"you {LINE}") and says(tui, f"alice {LINE}"),
+          f"headers (alice, bob) before: {before!r}; after: {after!r}; alice's timeline says "
+          f"'you {LINE}': {says(atui, f'you {LINE}')}; bob's says 'alice {LINE}': "
+          f"{says(tui, f'alice {LINE}')}")
+
     if not atui.stop():
         product(f"alice's vox tui (pid {atui.pid}) outlived SIGKILL and could not be reaped")
     TUIS.remove(atui)
