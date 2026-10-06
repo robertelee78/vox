@@ -675,7 +675,7 @@ try:
         s = side()
         heads = [i for i, r in enumerate(s) if r == "needs you (1)"]
         under = s[heads[0] + 1] if heads and heads[0] + 1 < len(s) else ""
-        return (bool(heads) and under.lstrip("▶ ").startswith("m ") and "to you 1" in under
+        return (bool(heads) and under.lstrip("▶ ").startswith("family ") and "to you 1" in under
                 and "spare  detached" in s and "default  attached" in s
                 and bool(s) and s[0] == "node default · attached")
     tui.until(regions, 30, 1)
