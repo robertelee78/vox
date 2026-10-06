@@ -2487,3 +2487,57 @@ fn taper_arms(
 
     drop(rt);
 }
+
+// SPIKE r41b (not to be committed): stage, then push the tunnel for a while and say which path it took.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "spike"]
+fn r41b_spike_path() {
+    let _alone = one_run();
+    watchdog::arm_for(Duration::from_secs(1700));
+    let iters: usize = std::env::var("R41B_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+    for i in 0..iters {
+        let s = stage(&[]);
+        if let Ok(secs) = std::env::var("R41B_BLACKHOLE_SECS").map(|v| v.parse::<u64>().unwrap_or(40)) {
+            // Black-hole the emulated link, so the connection over it dies, then let it pass again.
+            *s.link.lock().unwrap() = Some(Link { name: "blackhole", loss: 1.0, ..CLEAN_LAN });
+            shown(&format!("r41b iter {i}: emulated link black-holed for {secs}s"));
+            std::thread::sleep(Duration::from_secs(secs));
+            *s.link.lock().unwrap() = None;
+            shown(&format!("r41b iter {i}: emulated link restored"));
+        }
+        let start = Instant::now();
+        let mut k = 0;
+        while start.elapsed() < Duration::from_secs(90) {
+            let before = s.carried.load(std::sync::atomic::Ordering::Relaxed);
+            let rate = transfer(s.tunnel, &s.done);
+            let crossed = s.carried.load(std::sync::atomic::Ordering::Relaxed) - before;
+            k += 1;
+            shown(&format!("r41b iter {i} transfer {k}: {:.1} Mbit/s, crossed {crossed} of {BYTES}", rate * 8.0 / 1e6));
+            if crossed < BYTES {
+                shown(&format!("r41b BYPASS iter {i} transfer {k} at {:?}", start.elapsed()));
+                for p in [&s.host, &s.forward, &s.anchor] {
+                    for l in p.said() { shown(&format!("[{}] {l}", p.name)); }
+                }
+                for d in [&s.host_dir, &s.guest_dir] {
+                    let log = std::fs::read_to_string(d.join(".daemon").join("log")).unwrap_or_default();
+                    shown(&format!("[daemon log {}]\n{log}", d.display()));
+                }
+                let (_, so, se) = vox_once_env_plain(&s.guest_dir, &["status"], &[]);
+                shown(&format!("[guest status]\n{so}{se}"));
+                let (_, so, se) = vox_once_env_plain(&s.host_dir, &["status"], &[]);
+                shown(&format!("[host status]\n{so}{se}"));
+                break;
+            }
+        }
+        shown(&format!("r41b iter {i} done: forward at {}", s.tunnel));
+        for d in [&s.host_dir, &s.guest_dir] {
+            if let Some(pid) = std::fs::read_to_string(d.join(".daemon").join("lock")).ok().and_then(|t| t.trim().parse::<u32>().ok()) {
+                shown(&format!("r41b reaping daemon {pid} of {}", d.display()));
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+        }
+        drop(s);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
