@@ -487,6 +487,13 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
                 ),
             ),
         });
+        if cfg!(target_os = "macos") {
+            claims.push(claim(
+                "check.a_standalone_install_on_a_mac_is_told_about_vox_app",
+                text.contains("vox now comes with Vox.app") && text.contains("install.sh"),
+                format!("`vox update --check` on a standalone install said {text:?}"),
+            ));
+        }
         claims.push(claim(
             "check.changes_nothing",
             snapshot(&dir) == before,
