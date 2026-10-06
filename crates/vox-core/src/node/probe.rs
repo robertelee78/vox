@@ -254,3 +254,183 @@ fn kind_of_command(command: &str, udp: bool) -> Option<ServiceKind> {
     };
     kind.fits(udp).then_some(kind)
 }
+
+/// A service listening on this machine (ADR-028 S-4): what a person picks from to share.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listening {
+    /// The listening program's command name, where this user may read it: unprivileged, a
+    /// root-owned daemon's usually cannot be.
+    pub command: Option<String>,
+    /// Its port.
+    pub port: u16,
+    /// Whether it takes datagrams rather than connections.
+    pub udp: bool,
+    /// Every address it listens on: `0.0.0.0` or `::` for every interface.
+    pub addrs: Vec<IpAddr>,
+}
+
+impl Listening {
+    /// Whether it listens on every interface of this machine, not just loopback or one address.
+    #[must_use]
+    pub fn on_every_interface(&self) -> bool {
+        self.addrs.iter().any(IpAddr::is_unspecified)
+    }
+
+    /// The endpoint a share carries connections to: loopback where it listens there (every
+    /// interface includes it), else its first address.
+    #[must_use]
+    pub fn endpoint(&self) -> SocketAddr {
+        let v4_loop = self
+            .addrs
+            .iter()
+            .any(|a| matches!(a, IpAddr::V4(ip) if ip.is_loopback() || ip.is_unspecified()));
+        let v6_loop = self
+            .addrs
+            .iter()
+            .any(|a| matches!(a, IpAddr::V6(ip) if ip.is_loopback() || ip.is_unspecified()));
+        let ip = if v4_loop {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else if v6_loop {
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        } else {
+            self.addrs
+                .first()
+                .copied()
+                .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        };
+        SocketAddr::new(ip, self.port)
+    }
+}
+
+/// The lowest port of the ephemeral range on every system Vox runs on (Linux starts there;
+/// macOS higher): a UDP socket bound above it is a client's, not a service.
+const EPHEMERAL: u16 = 32768;
+
+/// The services listening on this machine, by port: every TCP listener, and every UDP socket on a
+/// fixed port, other than Vox's own. Read with `lsof` on macOS and `ss` on Linux; empty where
+/// neither can be run.
+#[must_use]
+pub fn listening() -> Vec<Listening> {
+    let mut found: Vec<(Option<String>, IpAddr, u16, bool)> = Vec::new();
+    for udp in [false, true] {
+        if cfg!(target_os = "macos") {
+            let args: &[&str] = if udp {
+                &["-nP", "-iUDP", "-Fctn"]
+            } else {
+                &["-nP", "-iTCP", "-sTCP:LISTEN", "-Fctn"]
+            };
+            if let Some(out) = run("lsof", args) {
+                found.extend(parse_lsof(&out, udp));
+            }
+        } else if cfg!(target_os = "linux") {
+            let flags = if udp { "-Hlunp" } else { "-Hltnp" };
+            if let Some(out) = run("ss", &[flags]) {
+                found.extend(parse_ss(&out, udp));
+            }
+        }
+    }
+    let mut out: Vec<Listening> = Vec::new();
+    for (command, ip, port, udp) in found {
+        if command.as_deref() == Some("vox") || (udp && port >= EPHEMERAL) || port == 0 {
+            continue;
+        }
+        match out.iter_mut().find(|l| l.port == port && l.udp == udp) {
+            Some(l) => {
+                if !l.addrs.contains(&ip) {
+                    l.addrs.push(ip);
+                }
+                if l.command.is_none() {
+                    l.command = command;
+                }
+            }
+            None => out.push(Listening {
+                command,
+                port,
+                udp,
+                addrs: vec![ip],
+            }),
+        }
+    }
+    out.sort_by_key(|l| (l.udp, l.port));
+    out
+}
+
+/// `lsof -F ctn` records: `c<command>`, then per file `t<IPv4|IPv6>` and `n<address>`.
+fn parse_lsof(out: &str, udp: bool) -> Vec<(Option<String>, IpAddr, u16, bool)> {
+    let (mut command, mut v6) = (None::<String>, false);
+    let mut found = Vec::new();
+    for line in out.lines() {
+        let (tag, rest) = (line.get(..1).unwrap_or(""), line.get(1..).unwrap_or(""));
+        match tag {
+            "p" => command = None,
+            "c" => command = Some(rest.to_owned()),
+            "t" => v6 = rest == "IPv6",
+            "n" if !rest.contains("->") => {
+                if let Some((ip, port)) = split_address(rest, v6) {
+                    found.push((command.clone(), ip, port, udp));
+                }
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// `ss -H -l -n -p` rows: the local address is the fourth column; the process, where this user
+/// may see it, `users:(("sshd",pid=812,fd=3))`.
+fn parse_ss(out: &str, udp: bool) -> Vec<(Option<String>, IpAddr, u16, bool)> {
+    out.lines()
+        .filter_map(|row| {
+            let local = row.split_whitespace().nth(3)?;
+            let v6 = local.starts_with('[');
+            let (ip, port) = split_address(local, v6)?;
+            let command = row
+                .split("((\"")
+                .nth(1)
+                .and_then(|a| a.split('"').next())
+                .map(str::to_owned);
+            Some((command, ip, port, udp))
+        })
+        .collect()
+}
+
+/// `127.0.0.1:22`, `[::1]:22`, `*:22`, `127.0.0.53%lo:53`, `[fe80::1%en0]:22` → address and port;
+/// `*` is every interface.
+fn split_address(text: &str, v6: bool) -> Option<(IpAddr, u16)> {
+    let (host, port) = text.rsplit_once(':')?;
+    let port = port.parse().ok()?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.split('%').next()?;
+    let ip = if host == "*" {
+        if v6 {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        }
+    } else {
+        host.parse().ok()?
+    };
+    Some((ip, port))
+}
+
+/// What a well-known sensitive port is, for a warning before it is shared (ADR-028 S-4): a
+/// database or a machine's administration, which a share hands to every member its sharer
+/// trusts. A warning only: the kind of a share is never taken from its port (S-2).
+#[must_use]
+pub fn sensitive_port(port: u16) -> Option<&'static str> {
+    Some(match port {
+        1433 => "SQL Server's",
+        1521 => "Oracle's",
+        2375 | 2376 => "the Docker API's",
+        3306 => "MySQL's",
+        3389 => "Remote Desktop's",
+        5432 => "PostgreSQL's",
+        5900 => "VNC's",
+        5984 => "CouchDB's",
+        6379 => "Redis's",
+        9200 => "Elasticsearch's",
+        11211 => "memcached's",
+        27017 => "MongoDB's",
+        _ => return None,
+    })
+}
