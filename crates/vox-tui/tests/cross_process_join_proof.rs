@@ -359,7 +359,7 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     // ---- the file leg: agent-comms file transfer, across processes ----
     //
     // This is a **different subsystem** from everything above. Posting and claiming
-    // ride the log and its sync; `vox room send|get` rides a room-bound service and
+    // ride the log and its sync; `vox share` and `vox room get` ride a room-bound service and
     // a `Forward` — a QUIC tunnel over the overlay. ADR-012 currently records that
     // path failing at establishment and mid-stream, so this leg is expected to be
     // the flaky one, and it is named separately for exactly that reason: a single
@@ -369,17 +369,20 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     let source = tmp.path().join("artifact.bin");
     std::fs::write(&source, &payload).expect("APPARATUS: write a staging file");
 
-    let mut offer = VoxProc::spawn(
-        "alice-send",
+    // `vox share` returns once alice's daemon serves the file (ADR-028 F-2).
+    let (ok, shared, err) = vox(
         &alice_dir,
         &[
-            "room".into(),
-            "send".into(),
+            "share".into(),
             room_for_file.clone(),
             source.to_string_lossy().into_owned(),
         ],
+        None,
     );
-    offer.expect_line("the offer's announcement", |l| l.contains("offering"));
+    assert!(
+        ok && shared.contains("vox: sharing artifact.bin"),
+        "PRODUCT (staging): alice's `vox share` did not say it serves the file: {shared}{err}"
+    );
 
     // The announcement is a log entry and has to reach bob before he can ask for it.
     // Without this wait the collector reports "no offer in this room matches", which
@@ -409,10 +412,9 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
     );
     if !ok {
         panic!(
-            "PRODUCT: a file transfer across processes failed — {err}\n`vox room send|get` rides a \
-             room-bound service and a `Forward`\n--- alice's send ---\n{}\n--- alice's daemon \
-             ---\n{}\n--- bob's daemon ---\n{}",
-            offer.transcript(),
+            "PRODUCT: a file transfer across processes failed — {err}\n`vox share` and `vox room \
+             get` ride a room-bound service and a `Forward`\n--- alice's share ---\n{shared}\n--- \
+             alice's daemon ---\n{}\n--- bob's daemon ---\n{}",
             daemons[0].transcript(),
             daemons[1].transcript()
         );
@@ -429,7 +431,6 @@ fn two_agents_on_separate_processes_join_through_an_anchor_and_talk() {
         payload.len()
     );
 
-    drop(offer);
     drop(daemons);
     drop(anchor);
 }

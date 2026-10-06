@@ -3463,6 +3463,8 @@ pub struct NodeHandle {
     /// When the identity passphrase was last entered, shared with the actor, and the actor's
     /// clock: how long the keyring window has left (ADR-028 K-9).
     keyring: KeyringWindow,
+    /// The files this node serves (ADR-028 F-2).
+    shares: Arc<crate::node::shares::Shares>,
 }
 
 /// When the identity passphrase was last entered, shared with the actor, and the actor's clock.
@@ -3479,6 +3481,12 @@ impl std::fmt::Debug for KeyringWindow {
 }
 
 impl NodeHandle {
+    /// The files this node shares and serves (ADR-028 F-1, F-2).
+    #[must_use]
+    pub fn shares(&self) -> &Arc<crate::node::shares::Shares> {
+        &self.shares
+    }
+
     /// How many seconds a keyring change still goes without the identity passphrase, or `None`
     /// when the next one will ask for it (ADR-028 K-9, V210-159).
     #[must_use]
@@ -4544,6 +4552,17 @@ impl Node {
             node.start_network()?;
         }
         node.publish_initial();
+        let shares = crate::node::shares::Shares::spawn(
+            node.paths.clone(),
+            cmd_tx.downgrade(),
+            node.view_tx.subscribe(),
+            handle_event_tx.clone(),
+        );
+        crate::node::pulls::Pulls::spawn(
+            node.paths.clone(),
+            cmd_tx.downgrade(),
+            node.view_tx.subscribe(),
+        );
         let actor = tokio::spawn(node.run(cmd_rx, net_rx));
         let handle = NodeHandle {
             cmd_tx,
@@ -4555,6 +4574,7 @@ impl Node {
             net_tx: handle_net_tx,
             sync_book,
             keyring,
+            shares,
         };
         Ok((handle, actor))
     }

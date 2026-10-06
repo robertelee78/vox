@@ -8,7 +8,7 @@
 //!
 //! **The scene, as people would make it.** A real `vox node` anchor; alice, a `vox daemon` on IPv4,
 //! and bob, a `vox daemon` on IPv6, so the only path between them is a circuit through the anchor.
-//! They trust each other and share a room, and alice offers a file (`vox room send`). Then, [`CYCLES`]
+//! They trust each other and share a room, and alice shares a file (`vox share`). Then, [`CYCLES`]
 //! times: bob's daemon is restarted, and the moment it answers, **two `vox room get`s of that file
 //! are started together**. Each asks bob's daemon for a forward to alice, and the daemon's own sync
 //! reaches for her too: three reaches to one peer, none with a connection to reuse.
@@ -449,7 +449,11 @@ fn two_fetches_at_once_share_one_dial() {
          {out}{err}"
     );
 
-    let _offer = alice.spawn(&["room", "send", &room, &source.to_string_lossy()]);
+    let (ok, shared, err) = alice.vox(&["share", &room, &source.to_string_lossy()]);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `vox share` failed: {shared}{err}"
+    );
     until(
         &bob,
         "the offer to reach bob",

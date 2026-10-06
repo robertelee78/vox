@@ -36,19 +36,20 @@
 //! each a clean stop: people run these verbs in tmux, over ssh and under systemd, whose stop and
 //! whose closed window send SIGTERM and SIGHUP. `vox serve` died silently on SIGHUP and SIGTERM,
 //! `vox daemon` ignored SIGHUP, `vox up` and `vox forward` heard only Ctrl-C, and `vox room tail`
-//! and `vox room send` heard nothing or Ctrl-C alone.
+//! heard nothing or Ctrl-C alone. (`vox room send` was among them; it is gone: `vox share` returns
+//! once the daemon serves, and has nothing to stop.)
 //!
 //! The scene: one anchor, one `vox serve` host and a trusted guest that has joined (the shared
-//! `World`). Each of `vox up`, `vox forward`, `vox daemon` (holding the room), `vox room tail` and
-//! `vox room send` (through that daemon) on the guest, and `vox serve` on the host, is started,
-//! brought to where it is serving, and sent one signal — each verb once per signal, 24 stops. And
-//! `vox up` and `vox forward` are each stopped once per signal while they wait at their identity
-//! passphrase prompt on a terminal of their own (a pty), 8 stops more, 32 in all. Each
+//! `World`). Each of `vox up`, `vox forward`, `vox daemon` (holding the room) and `vox room tail`
+//! (through that daemon) on the guest, and `vox serve` on the host, is started, brought to where
+//! it is serving, and sent one signal — each verb once per signal, 20 stops. And `vox up` and
+//! `vox forward` are each stopped once per signal while they wait at their identity passphrase
+//! prompt on a terminal of their own (a pty), 8 stops more, 28 in all. Each
 //! must be gone within [`STOP_BOUND`], not killed by the signal's default action, and, as the
 //! person sees it:
 //! - a **server** (`vox daemon`, `vox serve`) says `stopped by <SIGNAL>` and exits 0: being stopped
 //!   is how a server ends, and a service manager counts a non-zero exit on its stop as a failure;
-//! - a **client** (`vox up`, `vox forward`, `vox room tail`, `vox room send`) says on stderr
+//! - a **client** (`vox up`, `vox forward`, `vox room tail`) says on stderr
 //!   `vox: stopped by <SIGNAL>` and exits 128 + the signal's number, as a shell reports it.
 //! - stopped at its prompt, a client also hands its terminal back with echo on: the prompt's raw
 //!   mode left behind is a shell where nothing typed shows.
@@ -560,13 +561,10 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         stops += 1;
     }
 
-    // ---- vox room tail, vox room send: through a daemon on the guest ---------------------------
+    // ---- vox room tail: through a daemon on the guest -------------------------------------------
     let pass_file = w.tmp.path().join("daemon-passphrases");
     std::fs::write(&pass_file, format!("{IDENTITY}\n{}\n", w.passphrase))
         .expect("APPARATUS: write the daemon's passphrase file");
-    let offered = w.tmp.path().join("offered.txt");
-    std::fs::write(&offered, "a file offered in the room\n")
-        .expect("APPARATUS: write the file to offer");
     let mut held = daemon(&w, &guest, &pass_file);
     for (i, sig) in STOP_SIGNALS.into_iter().enumerate() {
         let mut tail = VoxProc::spawn("tail", &guest, &args(&["room", "tail", &w.room]));
@@ -595,26 +593,6 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         stops_cleanly(&mut tail, "`vox room tail`", Kind::Client, sig);
         stops += 1;
     }
-    for sig in STOP_SIGNALS {
-        let mut send = VoxProc::spawn(
-            "send",
-            &guest,
-            &args(&[
-                "room",
-                "send",
-                &w.room,
-                offered
-                    .to_str()
-                    .expect("APPARATUS: a temp path is not UTF-8"),
-            ]),
-        );
-        staged("`vox room send` offering", || {
-            send.expect_line("the offer", |l| l.starts_with("vox: offering "))
-        });
-        stops_cleanly(&mut send, "`vox room send`", Kind::Client, sig);
-        stops += 1;
-    }
-
     // ---- vox daemon: the one above, then one per remaining signal -------------------------------
     stops_cleanly(&mut held, "`vox daemon`", DAEMON, STOP_SIGNALS[0]);
     stops += 1;
@@ -650,5 +628,5 @@ fn every_long_running_verb_stops_cleanly_on_every_stop_signal() {
         stops_cleanly(&mut serve, "`vox serve`", SERVE, *sig);
         stops += 1;
     }
-    println!("[proof] {stops} of 32 stops were clean");
+    println!("[proof] {stops} of 28 stops were clean");
 }

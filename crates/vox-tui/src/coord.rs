@@ -78,6 +78,15 @@ fn named_session(flag: Option<&str>) -> Option<(&'static str, String)> {
         .filter(|(_, s)| !s.is_empty())
 }
 
+/// The session, when something names a valid one; `None` otherwise. For a verb a person runs as
+/// often as an agent (`vox share`), where a session is said when there is one and never required.
+#[must_use]
+pub fn session_if_named() -> Option<String> {
+    named_session(None)
+        .map(|(_, s)| s)
+        .filter(|s| is_valid_name(s, MAX_NAME))
+}
+
 /// The session, or a refusal that says how to name one.
 ///
 /// # Errors

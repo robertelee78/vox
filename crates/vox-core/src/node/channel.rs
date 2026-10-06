@@ -668,9 +668,10 @@ pub struct ChannelState {
     /// What each shared service in `services` was detected to be when it was shared (ADR-028
     /// S-2), persisted with it, so a share said only once the room settles says the same kind.
     kinds: BTreeMap<String, ServiceKind>,
-    /// The tags in `services` that live only as long as whatever offered them (V210-72): a
-    /// `vox room send` offer, withdrawn when its process goes. Never persisted, so a node
-    /// that stops while one runs does not come back offering a port nobody serves any more.
+    /// The tags in `services` that live only as long as whatever offered them (V210-72): a file
+    /// share, which the node's shares offer again when they serve it again. Never persisted, so
+    /// a node that stops while one runs does not come back offering a port nobody serves any
+    /// more.
     transient: BTreeSet<String>,
     /// How **this node** came to be a member here (M17.6), persisted in
     /// `SEG_ADMISSION`: it created the channel, or a member witnessed its join. Needed

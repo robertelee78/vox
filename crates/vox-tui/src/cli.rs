@@ -404,18 +404,6 @@ enum RoomCmd {
     /// Show what is held or pending, by whom, until when — and whether coordination
     /// is refused because a participant runs another vox version.
     Board(RoomBoardArgs),
-    /// Offer a file to the room and announce it.
-    ///
-    /// The bytes never enter the log: they ride a room-bound service, and what
-    /// goes on the log is a signed announcement carrying the name, the size and
-    /// the **SHA-256**. Runs until stopped (SIGINT (Ctrl-C), SIGTERM, SIGHUP or SIGQUIT each stops
-    /// it cleanly), because the bytes are served
-    /// live — the announcement outlives the offer, so an agent that wakes late
-    /// sees what was sent and is told plainly if it can no longer be collected.
-    ///
-    /// Nobody is granted anything: whoever can read the announcement can reach
-    /// the bytes, because both are gated on this node's trust keyring.
-    Send(SendFileArgs),
     /// Join a room from a `vox://` address, over a running node.
     ///
     /// The passphrase is asked for at the terminal, or read from `--passphrase-file`
@@ -536,17 +524,6 @@ pub struct RetentionArgs {
     pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
-/// `vox room send`
-#[derive(Args, Debug, Clone)]
-pub struct SendFileArgs {
-    #[command(flatten)]
-    pub profile: NodeArgs,
-    /// The room's id, or a unique prefix of it.
-    pub room: String,
-    /// The file to offer.
-    pub path: PathBuf,
-}
-
 /// `vox room get`
 #[derive(Args, Debug, Clone)]
 pub struct GetFileArgs {
@@ -630,19 +607,68 @@ pub struct TunnelCloseArgs {
 
 /// `vox share`
 #[derive(Args, Debug, Clone)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ShareArgs {
+    /// `vox share stop|list`; without one, `vox share ROOM PATH` shares.
+    #[command(subcommand)]
+    pub cmd: Option<ShareCmd>,
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's id, or a unique prefix of it.
+    #[arg(required = true)]
+    pub room: Option<String>,
+    /// The file or folder to share. A folder is served as one tar.
+    #[arg(required = true)]
+    pub path: Option<PathBuf>,
+    /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint
+    /// (`vox room roster`). Repeat for several. Without one, the share is for the whole room.
+    #[arg(long)]
+    pub to: Vec<String>,
+    /// May interrupt the addressed members' agents mid-turn.
+    #[arg(long)]
+    pub urgent: bool,
+    /// The entry hash this share answers. A session woken by one message answers it without.
+    #[arg(long)]
+    pub re: Option<String>,
+    /// A note, carried in the share itself.
+    #[arg(short = 'm', long = "message")]
+    pub note: Option<String>,
+    /// Stop serving after this many completed fetches.
+    #[arg(long)]
+    pub count: Option<u64>,
+    /// Stop serving after this long: `90s`, `10m`, `2h`.
+    #[arg(long = "for")]
+    pub for_: Option<String>,
+}
+
+/// `vox share stop|list`
+#[derive(Subcommand, Debug, Clone)]
+pub enum ShareCmd {
+    /// Stop serving a share of this node's: named by its name, its tag, or a prefix of its
+    /// SHA-256. A member who pulls it afterwards is told it is gone.
+    Stop(ShareStopArgs),
+    /// This node's shares in a room, and how often each was fetched.
+    List(ShareListArgs),
+}
+
+/// `vox share stop`
+#[derive(Args, Debug, Clone)]
+pub struct ShareStopArgs {
     #[command(flatten)]
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// The file or folder to share. A folder is served as one tar.
-    pub path: PathBuf,
-    /// Stop after this many completed fetches.
-    #[arg(long)]
-    pub count: Option<u64>,
-    /// Stop after this long: `90s`, `10m`, `2h`.
-    #[arg(long = "for")]
-    pub for_: Option<String>,
+    /// The share's name, its tag, or a prefix of its SHA-256.
+    pub share: String,
+}
+
+/// `vox share list`
+#[derive(Args, Debug, Clone)]
+pub struct ShareListArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
 }
 
 /// `vox status`
@@ -1720,10 +1746,12 @@ enum Cmd {
     /// peer must be a member of the room.
     #[command(subcommand)]
     App(AppCmd),
-    /// Share a file or a folder with a room: served over HTTP as a room-bound service,
-    /// announced with its name, size and SHA-256. Members you trust pull
-    /// it with `vox room get`, or with curl through `vox up`. Stops after `--count`
-    /// fetches, after `--for`, or on ^C.
+    /// Share a file or a folder with a room, addressed like a message: one announcement
+    /// carries the note (`-m`), who it is for (`--to`) and `--urgent`, with the name, size and
+    /// SHA-256. The daemon serves it over HTTP as a room-bound service, and this returns once
+    /// it does. Members you trust pull it with `vox room get`, or with curl through `vox up`.
+    /// It is served until its message expires, `vox share stop`, you leave the room or it ends
+    /// — or sooner, after `--count` fetches or `--for`.
     Share(ShareArgs),
     /// What the running node is doing, and what needs attention: rooms and
     /// their sync, peers and their paths, tunnels, datagram and app counters, and the sync
@@ -1964,7 +1992,6 @@ pub fn run() -> ExitCode {
                 RoomCmd::Claim(a) => &a.profile,
                 RoomCmd::Release(a) | RoomCmd::Decline(a) | RoomCmd::Renew(a) => &a.profile,
                 RoomCmd::Handoff(a) => &a.profile,
-                RoomCmd::Send(a) => &a.profile,
                 RoomCmd::Get(a) => &a.profile,
                 RoomCmd::Join(a) => &a.profile,
                 RoomCmd::Create(a) => &a.profile,
@@ -1992,8 +2019,7 @@ pub fn run() -> ExitCode {
             };
             // **A stop signal ends a room verb cleanly** (V210-108): `vox room tail` runs until
             // stopped, and Ctrl-C, SIGTERM or a closed terminal ended it on the spot, saying
-            // nothing. `vox room send` handles its own stop, because it withdraws its offer first.
-            let handles_its_own_stop = matches!(sub, RoomCmd::Send(_));
+            // nothing.
             let outcome = rt.block_on(async {
                 let work = async {
                     match &sub {
@@ -2095,9 +2121,6 @@ pub fn run() -> ExitCode {
                             crate::room_cli::board(&paths, &a.room, a.json, a.session.as_deref())
                                 .await
                         }
-                        RoomCmd::Send(a) => {
-                            crate::room_cli::send_file(&paths, &a.room, &a.path).await
-                        }
                         RoomCmd::Join(a) => {
                             crate::room_cli::join(
                                 &paths,
@@ -2144,14 +2167,10 @@ pub fn run() -> ExitCode {
                         }
                     }
                 };
-                if handles_its_own_stop {
-                    work.await
-                } else {
-                    let stop = crate::app::stop_requested("vox room");
-                    tokio::select! {
-                        done = work => done,
-                        signal = stop => Err(crate::app::AppError::stopped_by(signal)),
-                    }
+                let stop = crate::app::stop_requested("vox room");
+                tokio::select! {
+                    done = work => done,
+                    signal = stop => Err(crate::app::AppError::stopped_by(signal)),
                 }
             });
             match outcome {
@@ -2165,6 +2184,25 @@ pub fn run() -> ExitCode {
                 }
             }
         }
+        Cmd::Share(ShareArgs { cmd: Some(sub), .. }) => {
+            let profile = match &sub {
+                ShareCmd::Stop(a) => &a.profile,
+                ShareCmd::List(a) => &a.profile,
+            };
+            let paths = match profile.paths() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            run_attached(async move {
+                match &sub {
+                    ShareCmd::Stop(a) => crate::share_cli::stop(&paths, &a.room, &a.share).await,
+                    ShareCmd::List(a) => crate::share_cli::list(&paths, &a.room).await,
+                }
+            })
+        }
         Cmd::Share(args) => {
             let paths = match args.profile.paths() {
                 Ok(p) => p,
@@ -2172,6 +2210,10 @@ pub fn run() -> ExitCode {
                     eprintln!("vox: {e}");
                     return ExitCode::FAILURE;
                 }
+            };
+            let (Some(room), Some(path)) = (args.room.clone(), args.path.clone()) else {
+                eprintln!("vox: vox share needs a room and a path");
+                return ExitCode::FAILURE;
             };
             let for_ = match args
                 .for_
@@ -2185,9 +2227,15 @@ pub fn run() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            run_attached(async move {
-                crate::share_cli::share(&paths, &args.room, &args.path, args.count, for_).await
-            })
+            let opts = crate::share_cli::ShareOpts {
+                to: args.to.clone(),
+                urgent: args.urgent,
+                re: args.re.clone(),
+                note: args.note.clone(),
+                count: args.count,
+                for_,
+            };
+            run_attached(async move { crate::share_cli::share(&paths, &room, &path, &opts).await })
         }
         Cmd::Tunnel(TunnelCmd::Close(args)) => {
             let at = match args

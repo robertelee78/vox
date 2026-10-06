@@ -3,32 +3,32 @@
 //!
 //! Seven findings from the v0.2.10 defect sweep, one claim each:
 //!
-//! 1. **A file offer is withdrawn however `vox room send` ends.** It was withdrawn only on
-//!    Ctrl-C: a SIGTERM, a SIGHUP or a SIGKILL left the service registered, so a member's dial
-//!    was carried to a port nobody served any more — or to whatever took that port next.
-//!    Staged: alice offers a file, the offer is killed with each signal, bob asks for it, and
+//! 1. **A stopped share is withdrawn.** A share whose service stayed registered once it ended
+//!    carried a member's dial to a port nobody served any more — or to whatever took that port
+//!    next. Staged: alice shares a file and stops it (`vox share stop`), bob asks for it, and
 //!    alice's own daemon says why it refused bob. "no such service is offered in that room" is
-//!    the withdrawn offer; "the local service did not accept the connection" is the leaked one.
-//!    And **two offers of the same file are two offers**: their tags were the content's, so
-//!    ending one withdrew the other while it still ran. Staged: two `room send`s of one file,
-//!    the first ended by SIGTERM, and bob collects the file whole by the second's tag. And a
-//!    get **by name** is not hidden by a newer offer that has ended: a third offer is announced
-//!    and ended, and `vox room get twin.bin` still collects the file through the second. The
+//!    the withdrawn share; "the local service did not accept the connection" is the leaked one.
+//!    And **two shares of the same file are two shares**: their tags were the content's, so
+//!    ending one withdrew the other while it still ran. Staged: two `vox share`s of one file,
+//!    the first stopped, and bob collects the file whole by the second's tag. And a get **by
+//!    name** is not hidden by a newer share that has ended: a third share is announced and
+//!    stopped, and `vox room get twin.bin` still collects the file through the second. The
 //!    fallback is only ever the same file from the same member: a newer `twin.bin` with other
-//!    content is offered and ended, and the get by name must fail, leave nothing, and name only
-//!    the live offers of that name, each by its exact tag; every suggested command is run and
+//!    content is shared and stopped, and the get by name must fail, leave nothing, and name only
+//!    the live shares of that name, each by its exact tag; every suggested command is run and
 //!    must collect the right bytes. The verifier's arms (v1, v2) add a third member, carol:
-//!    alice's newest offer ends while bob's copy of the same file runs, carol's get by name
-//!    fails rather than taking another member's offer, and the refusal names bob's copy as the
+//!    alice's newest share ends while bob's copy of the same file is served, carol's get by name
+//!    fails rather than taking another member's share, and the refusal names bob's copy as the
 //!    same file with a command that collects it.
-//! 2. **An offer is never persisted.** It was: a daemon that stopped while an offer ran came
-//!    back offering its port. Staged: alice's daemon is stopped with an offer live, and
-//!    `vox service list` reads alice's store; a `vox service add` afterwards is the control
-//!    that the listing shows a persisted service at all.
+//! 2. **A share that outlives its daemon is served, never a port nobody serves.** A daemon that
+//!    stopped while an offer ran came back offering its port with nothing behind it. A share now
+//!    outlives its daemon's restart by design (ADR-028 F-2), so what must hold is that the port
+//!    it is offered on after the restart is served: staged by stopping alice's daemon with a share
+//!    live, bringing the node back (`vox node attach`), and bob collecting the share whole.
 //! 3. **A get's forward is withdrawn however `vox room get` ends.** An interrupted get left
-//!    bob's daemon listening on the forward's port. Staged: alice's offer is stopped (SIGSTOP)
-//!    so the transfer stalls; the get is killed with each signal while bob's daemon listens on
-//!    its forward (`lsof`), and the port must close.
+//!    bob's daemon listening on the forward's port. Staged: alice's daemon, which serves the
+//!    share, is stopped (SIGSTOP) so the transfer stalls; the get is killed with each signal
+//!    while bob's daemon listens on its forward (`lsof`), and the port must close.
 //! 4. **The control socket's fallback is private to its user** (Linux put it in `/tmp` under a
 //!    predictable name). A profile path over the socket-address limit puts the socket in
 //!    `<tmp>/vox-<uid>/`, which is `0700` — tightened if it was left wider — with the socket
@@ -52,10 +52,11 @@
 //! renamed into place) has no observable window a proof can stage reliably; it rests on code
 //! review, and the directory being `0700` is what (4) asserts.
 //!
-//! Mutations, each red for its own reason: (1) the daemon not releasing what a closed
-//! connection held, an offer's tag being its content's alone, a get trying only the newest
-//! matching offer, and a get falling back to a different file of that name (the twin cases); (2) an offer over the control socket persisted; (3) the
-//! same as (1), for the forward; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the
+//! Mutations, each red for its own reason: (1) `vox share stop` not withdrawing the service, a
+//! share's tag being its content's alone, a get trying only the newest matching share, and a get
+//! falling back to a different file of that name (the twin cases); (2) a restarted daemon offering
+//! a share's service without serving it; (3) the daemon not releasing the forward a closed
+//! connection held; (4) the old flat `<tmp>/vox-<hex>.sock` fallback; (5) the
 //! client's owner check removed; (6) the accept loop returning on its first error; (7) the rc
 //! written `0644` over the path; (8) `--passphrase` accepted.
 
@@ -465,121 +466,101 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         );
     }
 
-    // ---- (1) an offer ended by SIGTERM, SIGHUP or SIGKILL is withdrawn ----
-    let mut withdrawn = 0usize;
-    for (i, sig) in ["TERM", "HUP", "KILL"].into_iter().enumerate() {
-        let name = format!("offer-{sig}.bin");
-        let file = tmp.path().join(&name);
-        std::fs::write(&file, vec![i as u8 + 1; 4096]).expect("APPARATUS: the offered file");
-        let mut send = alice.spawn(&[
-            "room",
-            "send",
+    // `vox share` returns once the sharer's daemon serves the file, naming its tag.
+    let share = |who: &Profile, file: &Path| -> String {
+        let (ok, out, err) = who.vox(&[
+            "share",
             &room,
             file.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ]);
-        send.wait_for("vox: offering", Duration::from_secs(60));
-        until(
-            "PRODUCT",
-            &bob,
-            "the offer to reach bob",
-            &["room", "read", &room],
-            |o| o.contains(&name),
-        );
-        signal(send.pid(), sig);
-        assert!(
-            send.exited_within(Duration::from_secs(10)).is_some(),
-            "PRODUCT (staging): `vox room send` did not end on SIG{sig}"
-        );
-        let mark = alice_daemon.said().len();
-        let out = tmp.path().join(format!("got-{sig}.bin"));
-        let (ok, stdout, stderr) = bob.vox(&[
-            "room",
-            "get",
-            &room,
-            &name,
-            "--out",
-            out.to_str().expect("APPARATUS: a UTF-8 temp path"),
-        ]);
-        assert!(
-            !ok,
-            "PRODUCT: a withdrawn offer was collected: {stdout} {stderr}"
-        );
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let why = loop {
-            let said = alice_daemon.said()[mark..].to_owned();
-            if said.contains("no such service is offered in that room")
-                || said.contains("did not accept the connection")
-            {
-                break said;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "PRODUCT (staging): alice's daemon never said why it refused bob after SIG{sig}; \
-                 bob's get said: {stdout} {stderr}\nalice's daemon since:\n{said}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        eprintln!(
-            "[proof] SIG{sig} of `room send`: alice's daemon said: {}",
-            why.trim()
-        );
-        assert!(
-            why.contains("no such service is offered in that room")
-                && !why.contains("did not accept the connection"),
-            "PRODUCT: `vox room send` ended by SIG{sig} left its offer registered: alice's daemon \
-             carried bob's dial to a port nobody serves:\n{why}"
-        );
-        withdrawn += 1;
-    }
-    eprintln!("[proof] offers withdrawn after SIGTERM/SIGHUP/SIGKILL: {withdrawn} of 3");
+        assert!(ok, "PRODUCT (staging): `vox share`: {out}{err}");
+        out.split_whitespace()
+            .find(|w| w.starts_with("file-"))
+            .unwrap_or_else(|| panic!("PRODUCT: `vox share` named no tag: {out}"))
+            .to_owned()
+    };
+    let stop = |who: &Profile, tag: &str| {
+        let (ok, out, err) = who.vox(&["share", "stop", &room, tag]);
+        assert!(ok, "PRODUCT (staging): `vox share stop {tag}`: {out}{err}");
+    };
 
-    // ---- (1b) two offers of the same file: ending one leaves the other serving ----
+    // ---- (1) a stopped share is withdrawn ----
+    let name = "stopped.bin";
+    let file = tmp.path().join(name);
+    std::fs::write(&file, vec![1u8; 4096]).expect("APPARATUS: the shared file");
+    let tag = share(&alice, &file);
+    until(
+        "PRODUCT",
+        &bob,
+        "the share to reach bob",
+        &["room", "read", &room],
+        |o| o.contains(name),
+    );
+    stop(&alice, &tag);
+    let mark = alice_daemon.said().len();
+    let out = tmp.path().join("got-stopped.bin");
+    let (ok, stdout, stderr) = bob.vox(&[
+        "room",
+        "get",
+        &room,
+        name,
+        "--out",
+        out.to_str().expect("APPARATUS: a UTF-8 temp path"),
+    ]);
+    assert!(
+        !ok,
+        "PRODUCT: a stopped share was collected: {stdout} {stderr}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let why = loop {
+        let said = alice_daemon.said()[mark..].to_owned();
+        if said.contains("no such service is offered in that room")
+            || said.contains("did not accept the connection")
+        {
+            break said;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT (staging): alice's daemon never said why it refused bob after the stop; \
+             bob's get said: {stdout} {stderr}\nalice's daemon since:\n{said}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    eprintln!(
+        "[proof] after `vox share stop`: alice's daemon said: {}",
+        why.trim()
+    );
+    assert!(
+        why.contains("no such service is offered in that room")
+            && !why.contains("did not accept the connection"),
+        "PRODUCT: a share stopped with `vox share stop` left its service registered: alice's \
+         daemon carried bob's dial to a port nobody serves:\n{why}"
+    );
+
+    // ---- (1b) two shares of the same file: stopping one leaves the other serving ----
     let twin = tmp.path().join("twin.bin");
     let twin_bytes: Vec<u8> = (0..65_536u32).map(|i| (i % 253) as u8).collect();
     std::fs::write(&twin, &twin_bytes).expect("APPARATUS: the twin file");
-    let mut first = alice.spawn(&[
-        "room",
-        "send",
-        &room,
-        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    let first_said = first.wait_for("vox: offering", Duration::from_secs(60));
-    // Collected by the second offer's own tag, so the get asks for exactly the offer that is
-    // still running.
+    let t1 = share(&alice, &twin);
     until(
         "PRODUCT",
         &bob,
-        "the first twin offer to reach bob",
+        "the first twin share to reach bob",
         &["room", "read", &room],
         |o| o.contains("twin.bin"),
     );
-    let mut second = alice.spawn(&[
-        "room",
-        "send",
-        &room,
-        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    let second_said = second.wait_for("vox: offering", Duration::from_secs(60));
-    let tag_of = |said: &str| {
-        said.split_whitespace()
-            .find(|w| w.starts_with("file-"))
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let (t1, t2) = (tag_of(&first_said), tag_of(&second_said));
-    eprintln!("[proof] twin offers of one file: tags {t1} and {t2}");
+    // Collected by the second share's own tag, so the get asks for exactly the share that is
+    // still served.
+    let t2 = share(&alice, &twin);
+    eprintln!("[proof] twin shares of one file: tags {t1} and {t2}");
     until(
         "PRODUCT",
         &bob,
-        "the second twin offer to reach bob",
+        "the second twin share to reach bob",
         &["room", "read", &room, "--json"],
         |o| o.contains(&t2),
     );
-    signal(first.pid(), "TERM");
-    assert!(
-        first.exited_within(Duration::from_secs(10)).is_some(),
-        "PRODUCT: `vox room send` (the first twin offer) was still running 10 s after SIGTERM"
-    );
+    stop(&alice, &t1);
     let got = tmp.path().join("twin-got.bin");
     let (ok, stdout, stderr) = bob.vox(&[
         "room",
@@ -596,30 +577,20 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     );
     assert!(
         ok && collected.as_deref() == Some(&twin_bytes[..]),
-        "PRODUCT: ending one offer of a file withdrew another offer of the same file that was still \
-         running (tags {t1} and {t2}): {stdout} {stderr}"
+        "PRODUCT: stopping one share of a file withdrew another share of the same file that was \
+         still served (tags {t1} and {t2}): {stdout} {stderr}"
     );
 
-    // ---- (1c) a get by name is not hidden by a newer offer that has ended ----
-    let mut third = alice.spawn(&[
-        "room",
-        "send",
-        &room,
-        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    let t3 = tag_of(&third.wait_for("vox: offering", Duration::from_secs(60)));
+    // ---- (1c) a get by name is not hidden by a newer share that has ended ----
+    let t3 = share(&alice, &twin);
     until(
         "PRODUCT",
         &bob,
-        "the third twin offer to reach bob",
+        "the third twin share to reach bob",
         &["room", "read", &room, "--json"],
         |o| o.contains(&t3),
     );
-    signal(third.pid(), "TERM");
-    assert!(
-        third.exited_within(Duration::from_secs(10)).is_some(),
-        "PRODUCT: `vox room send` (the newest twin offer) was still running 10 s after SIGTERM"
-    );
+    stop(&alice, &t3);
     let by_name = tmp.path().join("twin-by-name.bin");
     let (ok, stdout, stderr) = bob.vox(&[
         "room",
@@ -650,30 +621,20 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     std::fs::create_dir_all(&other_dir).expect("APPARATUS: the other dir");
     let other_twin = other_dir.join("twin.bin");
     std::fs::write(&other_twin, vec![0x5au8; 65_536]).expect("APPARATUS: the other twin");
-    let mut different = alice.spawn(&[
-        "room",
-        "send",
-        &room,
-        other_twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    let t4 = tag_of(&different.wait_for("vox: offering", Duration::from_secs(60)));
+    let t4 = share(&alice, &other_twin);
     assert!(
         t4.len() > 21 && t4[..21] != t2[..21],
-        "PRODUCT: `vox room send` offered two files with different contents under the same \
-         content hash ({t4} vs {t2})"
+        "PRODUCT: `vox share` shared two files with different contents under the same content \
+         hash ({t4} vs {t2})"
     );
     until(
         "PRODUCT",
         &bob,
-        "the different twin offer to reach bob",
+        "the different twin share to reach bob",
         &["room", "read", &room, "--json"],
         |o| o.contains(&t4),
     );
-    signal(different.pid(), "TERM");
-    assert!(
-        different.exited_within(Duration::from_secs(10)).is_some(),
-        "PRODUCT: `vox room send` (the different twin offer) was still running 10 s after SIGTERM"
-    );
+    stop(&alice, &t4);
     let wrong = tmp.path().join("twin-wrong.bin");
     let (ok, stdout, stderr) = bob.vox(&[
         "room",
@@ -736,11 +697,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     let v1 = ok && got.as_deref() == Some(&twin_bytes[..]);
 
     // ---- (verifier v2) a same-sha offer from ANOTHER member is not the fallback; carol collects ----
-    signal(second.pid(), "TERM");
-    assert!(
-        second.exited_within(Duration::from_secs(10)).is_some(),
-        "PRODUCT (staging): second did not end"
-    );
+    stop(&alice, &t2);
     let carol = Profile::new(&tmp.path().join("carol"), &[]);
     let carol_fp = carol.id();
     let (_carol_daemon, _) = carol.daemon(Some(&spec));
@@ -789,13 +746,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             |o| o.contains(word),
         );
     }
-    let bobs = bob.spawn(&[
-        "room",
-        "send",
-        &room,
-        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    let tb = tag_of(&bobs.wait_for("vox: offering", Duration::from_secs(60)));
+    let tb = share(&bob, &twin);
     until(
         "PRODUCT",
         &carol,
@@ -821,13 +772,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         okc && std::fs::read(&ctl).ok().as_deref() == Some(&twin_bytes[..]),
         "PRODUCT (staging): carol cannot collect bob's offer by tag"
     );
-    let mut newest = alice.spawn(&[
-        "room",
-        "send",
-        &room,
-        twin.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    let tn = tag_of(&newest.wait_for("vox: offering", Duration::from_secs(60)));
+    let tn = share(&alice, &twin);
     until(
         "PRODUCT",
         &carol,
@@ -835,11 +780,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         &["room", "read", &room, "--json"],
         |o| o.contains(&tn),
     );
-    signal(newest.pid(), "TERM");
-    assert!(
-        newest.exited_within(Duration::from_secs(10)).is_some(),
-        "PRODUCT (staging): newest did not end"
-    );
+    stop(&alice, &tn);
     let cross = tmp.path().join("twin-cross.bin");
     let (ok2, _o, se2) = carol.vox(&[
         "room",
@@ -885,7 +826,7 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         ran2 >= 1,
         "PRODUCT (staging): v2 suggested no command: {se2}"
     );
-    drop(bobs);
+    stop(&bob, &tb);
     assert!(
         v1,
         "PRODUCT: v1: the suggested `vox room get <room> {sug}` did not collect exactly the named \
@@ -897,7 +838,6 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
          left); it said: {se2}",
         got2.as_ref().map_or(0, Vec::len)
     );
-    drop(second);
 
     // ---- (3) a get ended by SIGTERM, SIGHUP or SIGKILL closes its forward ----
     let Some(_) = listening(bob_daemon.pid()) else {
@@ -909,22 +849,17 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     };
     let big = tmp.path().join("stalled.bin");
     std::fs::write(&big, vec![7u8; 1 << 20]).expect("APPARATUS: the stalled file");
-    let stalled = alice.spawn(&[
-        "room",
-        "send",
-        &room,
-        big.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    stalled.wait_for("vox: offering", Duration::from_secs(60));
+    share(&alice, &big);
     until(
         "PRODUCT",
         &bob,
-        "the stalled offer to reach bob",
+        "the stalled share to reach bob",
         &["room", "read", &room],
         |o| o.contains("stalled.bin"),
     );
-    // Stopped, so the transfer stalls and the get is still running when it is signalled.
-    signal(stalled.pid(), "STOP");
+    // Alice's daemon, which serves it, is stopped, so the transfer stalls and the get is still
+    // running when it is signalled.
+    signal(alice_daemon.pid(), "STOP");
     let mut closed = 0usize;
     for sig in ["TERM", "HUP", "KILL"] {
         let before = ports(bob_daemon.pid());
@@ -977,25 +912,21 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
         );
         closed += 1;
     }
-    signal(stalled.pid(), "CONT");
-    drop(stalled);
+    signal(alice_daemon.pid(), "CONT");
     eprintln!("[proof] forwards closed after SIGTERM/SIGHUP/SIGKILL: {closed} of 3");
 
-    // ---- (2) an offer is never persisted: the daemon stops while one runs ----
+    // ---- (2) a share that outlives its daemon is served after the restart ----
     let live = tmp.path().join("live.bin");
-    std::fs::write(&live, b"offered while the daemon stops").expect("APPARATUS: the live file");
-    let live_send = alice.spawn(&[
-        "room",
-        "send",
-        &room,
-        live.to_str().expect("APPARATUS: a UTF-8 temp path"),
-    ]);
-    let offered = live_send.wait_for("vox: offering", Duration::from_secs(60));
-    let tag = offered
-        .split_whitespace()
-        .find(|w| w.starts_with("file-"))
-        .unwrap_or_else(|| panic!("PRODUCT: `vox room send` named no tag: {offered}"))
-        .to_owned();
+    let live_bytes = b"shared while the daemon stops".to_vec();
+    std::fs::write(&live, &live_bytes).expect("APPARATUS: the live file");
+    let tag = share(&alice, &live);
+    until(
+        "PRODUCT",
+        &bob,
+        "the live share to reach bob",
+        &["room", "read", &room],
+        |o| o.contains("live.bin"),
+    );
     let mut alice_daemon = alice_daemon;
     signal(alice_daemon.pid(), "TERM");
     assert!(
@@ -1004,9 +935,8 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
             .is_some(),
         "PRODUCT: alice's `vox daemon` was still running 30 s after SIGTERM"
     );
-    drop(live_send);
     // The node again, as a person brings it back after its daemon stopped (ADR-026 L-2: a
-    // one-shot verb refuses a node nothing holds); what it lists is what was kept.
+    // one-shot verb refuses a node nothing holds).
     let (ok, _, err) = alice.vox(&["node", "attach", "default", "--passphrase-file", alice.p()]);
     assert!(
         ok,
@@ -1014,49 +944,36 @@ fn an_offer_and_a_get_are_withdrawn_however_the_verb_ends() {
     );
     // That attach started a daemon of its own: stopped by its lock's pid however this ends.
     let _reaper = layout::Reaper(vec![alice.data.clone()]);
-    let room_pass = tmp.path().join("room.pass");
-    std::fs::write(&room_pass, ROOM_PASS).expect("APPARATUS: the room passphrase file");
-    let list = |what: &str| {
-        let (ok, out, err) = alice.vox(&[
-            "service",
-            "list",
+    // Bob collects it from the restarted daemon: the port it is offered on is served. Asked again
+    // while bob's daemon has not yet reached alice's new one; the last answer is the verdict.
+    let back = tmp.path().join("live-back.bin");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (ok, stdout, stderr) = loop {
+        let _ = std::fs::remove_file(&back);
+        let r = bob.vox(&[
+            "room",
+            "get",
             &room,
-            "--identity-passphrase-file",
-            alice.p(),
-            "--listen",
-            "127.0.0.1:0",
+            &tag,
+            "--out",
+            back.to_str().expect("APPARATUS: a UTF-8 temp path"),
         ]);
-        assert!(ok, "PRODUCT (staging): vox service list ({what}): {err}");
-        eprintln!("[proof] vox service list ({what}): {}", out.trim());
-        out
+        if r.0 || Instant::now() > deadline {
+            break r;
+        }
+        std::thread::sleep(Duration::from_secs(1));
     };
-    let after = list("after the daemon stopped with an offer live");
-    // The control: the listing shows a persisted service when there is one.
-    let (ok, _, err) = alice.vox(&[
-        "service",
-        "add",
-        &room,
-        "kept",
-        "127.0.0.1:9",
-        "--passphrase-file",
-        room_pass.to_str().expect("APPARATUS: a UTF-8 temp path"),
-        "--identity-passphrase-file",
-        alice.p(),
-        "--listen",
-        "127.0.0.1:0",
-    ]);
-    assert!(ok, "PRODUCT (staging): vox service add: {err}");
-    let control = list("control, after `vox service add kept`");
-    assert!(
-        control.contains("kept"),
-        "PRODUCT (staging): `vox service list` does not show a persisted service: {control}"
+    let collected = std::fs::read(&back).ok();
+    eprintln!(
+        "[proof] the share after its daemon's restart: ok={ok}, {} bytes; said: {}",
+        collected.as_ref().map_or(0, Vec::len),
+        stderr.trim()
     );
     assert!(
-        !after.contains(&tag) && !after.contains("file-"),
-        "PRODUCT: an offer over the control socket was persisted: alice's store still offers {tag} \
-         after her daemon stopped:\n{after}"
+        ok && collected.as_deref() == Some(&live_bytes[..]),
+        "PRODUCT: a share live when its daemon stopped was not served by the restarted daemon \
+         within 60 s: {stdout} {stderr}"
     );
-    eprintln!("[proof] offers persisted across a daemon stop: 0 (control service listed: 1)");
 }
 
 #[test]

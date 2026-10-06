@@ -1,14 +1,29 @@
-//! PRD-001 R18 — `vox share`: a file offered to a room over a room-bound HTTP service,
-//! announced with its name, size and SHA-256, pulled with curl through `vox up` or with
-//! `vox room get`. Proved with the shipped binary only: every member is a `vox daemon`, and
-//! everything they do is a `vox` verb (`vox trust add`, `vox room create/invite/join/post/
-//! read/get`, `vox share`, `vox up`).
+//! ADR-028 F-1, F-2 (PRD-001 R18) — `vox share`: a file handed to a room as one addressed
+//! message, served by the daemon over a room-bound HTTP service, announced with its name, size and
+//! SHA-256, pulled with curl through `vox up` or with `vox room get`. Proved with the shipped
+//! binary only: every member is a `vox daemon`, and everything they do is a `vox` verb (`vox trust
+//! add`, `vox room create/link/join/post/read/get/leave`, `vox share`, `vox share list/stop`, `vox
+//! up`).
 //!
-//! alice shares; bob, whom she trusts, pulls it twice — once with `curl` through his own
-//! `vox up`, once with `vox room get`, which lands it in his downloads directory. mallory
-//! is in the same room and is not trusted: she can neither read the announcement nor open
-//! the service, and her attempts are not fetches. After two fetches (`--count 2`) the share
-//! stops by itself. A folder is shared as one tar, and arrives as a valid one.
+//! alice shares a file `--to bob --urgent -m <note>`, and `vox share` returns. bob reads **one**
+//! announcement carrying the note, his whole fingerprint and the urgent flag, and no message of its
+//! own carries the note. bob's node, which trusts her, pulls it by itself, verified, into
+//! `nodes/<node>/files/<room>/` (F-3, F-4); then bob pulls it twice more — once with `curl` through
+//! his own `vox up`, once with `vox room get`, which lands it beside his node's copy — all from
+//! her daemon, the command that shared it long gone. mallory is in the same room and is not
+//! trusted: she can neither read the announcement nor open the service, and her attempts are not
+//! fetches. A share alice addresses to carol is pulled by carol's node, and shows on bob as a card
+//! naming carol until bob pulls it with `vox room get`. After three fetches (`--count 3`) the daemon stops serving it by itself, and a late pull is told
+//! the offer is gone. A folder is shared as one tar, arrives as a valid one, and after `vox share
+//! stop` a pull is told it is gone. A share alice leaves behind when she leaves the room ends.
+//!
+//! The folder is shared as a reply to the report's announcement (`--re`): it carries that entry
+//! and spends a hop of its budget, as a `vox room post` reply does (ADR-020 §9).
+//!
+//! Mutants: post the note as a message of its own (red: two rows carry the note); serve only while
+//! `vox share` runs (red: bob's curl gets nothing after it exits); a share keeps a fresh hop budget
+//! (red: the folder's announcement carries the default, not its parent's less one); pull a share
+//! addressed to another node (red: bob's node pulls carol's).
 
 #![cfg(unix)]
 
@@ -177,6 +192,35 @@ impl Member {
         panic!("PRODUCT: {what} never reached {}", self.name);
     }
 
+    /// How often this member's daemon says `tag` was fetched (`vox share list`), or `None` if it
+    /// does not list it.
+    fn fetched(&self, room: &str, tag: &str) -> Option<u64> {
+        let (ok, out) = self.run(&["share", "list", room]);
+        assert!(
+            ok,
+            "PRODUCT (staging): {} lists its shares: {out}",
+            self.name
+        );
+        out.lines()
+            .find(|l| l.starts_with(tag))
+            .and_then(|l| l.split("fetched ").nth(1))
+            .and_then(|n| n.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+    }
+
+    /// Whether this member's daemon stops listing `tag` within `within`.
+    fn stops_sharing(&self, room: &str, tag: &str, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        while Instant::now() < until {
+            let (ok, out) = self.run(&["share", "list", room]);
+            if !ok || !out.contains(tag) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        false
+    }
+
     /// A `vox up` with no room, carried by this member's daemon, and where it listens.
     fn up(&self) -> (VoxProc, SocketAddr) {
         let mut p = VoxProc::spawn(
@@ -192,6 +236,52 @@ impl Member {
             .unwrap_or_else(|| panic!("PRODUCT (staging): no address in {line:?}"));
         (p, addr)
     }
+}
+
+/// The tag `vox share` said it serves the share as: `vox: sharing <name> (<n> bytes) as <tag>`.
+fn tag_of(said: &str) -> String {
+    said.lines()
+        .find(|l| l.starts_with("vox: sharing "))
+        .and_then(|l| l.rsplit(" as ").next())
+        .map(|t| t.trim().to_owned())
+        .unwrap_or_else(|| panic!("PRODUCT: `vox share` did not say what it serves: {said}"))
+}
+
+/// Whether a file with SHA-256 `want` appears at `path` within `within`: only a verified pull is
+/// ever put there, under its own name.
+fn arrives(path: &Path, want: &str, within: Duration) -> bool {
+    let until = Instant::now() + within;
+    while Instant::now() < until {
+        if std::fs::read(path).is_ok_and(|b| sha(&b) == want) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Where `who`'s node puts what it pulls from `room` (ADR-028 F-4): `nodes/<node>/files/<room>/`,
+/// named by the room's whole id, of which `room` (as `vox room list` prints it) is the start.
+fn files_of(who: &Member, room: &str) -> PathBuf {
+    let (ok, out) = who.run(&["room", "link", room]);
+    assert!(ok, "PRODUCT (staging): {}'s room link: {out}", who.name);
+    let id = out
+        .trim()
+        .strip_prefix("vox://")
+        .and_then(|l| l.split(['?', '/', '@']).next())
+        .filter(|id| id.starts_with(room))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): no room id in {out:?}"))
+        .to_owned();
+    who.dir.join("nodes").join("default").join("files").join(id)
+}
+
+/// Every row `vox room read --json` shows `who`.
+fn rows_of(who: &Member, room: &str) -> Vec<serde_json::Value> {
+    let (ok, out) = who.run(&["room", "read", room, "--json"]);
+    assert!(ok, "PRODUCT (staging): {} reads the room: {out}", who.name);
+    out.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 /// `curl` through `proxy`: whether it succeeded, and the bytes.
@@ -247,12 +337,17 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     let mut alice = member(tmp.path(), "alice");
     let mut bob = member(tmp.path(), "bob");
     let mut mallory = member(tmp.path(), "mallory");
+    let mut carol = member(tmp.path(), "carol");
     alice.trust(&bob, "bob");
     bob.trust(&alice, "alice");
+    alice.trust(&carol, "carol");
+    carol.trust(&alice, "alice");
+    // bob names carol, so a card addressed to her says so.
+    bob.trust(&carol, "carol");
     // mallory trusts alice — she would like what alice shares — but alice has not
     // trusted her.
     mallory.trust(&alice, "alice");
-    for m in [&mut alice, &mut bob, &mut mallory] {
+    for m in [&mut alice, &mut bob, &mut mallory, &mut carol] {
         m.start(&spec);
     }
 
@@ -279,7 +374,7 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         .to_owned();
     let (ok, link, err) = vox(&alice.dir, &["room", "link", &room], None);
     assert!(ok, "vox room link: {err}");
-    for who in [&bob, &mallory] {
+    for who in [&bob, &mallory, &carol] {
         let (ok, out, err) = vox(
             &who.dir,
             &[
@@ -301,88 +396,174 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     let (ok, said) = alice.run(&["room", "post", &room, "hello from alice"]);
     assert!(ok, "alice posts: {said}");
     bob.sees(&room, "hello from alice");
+    carol.sees(&room, "hello from alice");
 
-    let bob_dl = tmp.path().join("bob-downloads");
-    std::fs::write(
-        bob.dir.join("cfg").join("config"),
-        format!("downloads = {}\n", bob_dl.display()),
-    )
-    .unwrap();
+    // Where each node's pulls land (ADR-028 F-4): `<data root>/nodes/<node>/files/<room>/`.
+    let bob_dl = files_of(&bob, &room);
+    let carol_dl = files_of(&carol, &room);
 
-    let mut share = VoxProc::spawn(
-        "alice share",
-        &alice.dir,
-        &args(&["share", &room, file.to_str().unwrap(), "--count", "2"]),
+    // **One message, addressed** (ADR-028 F-1): the note, who it is for and the urgent flag ride
+    // in the share itself. And **the daemon serves it** (F-2): `vox share` returns once it does.
+    let note = "the quarterly numbers, for your review";
+    let posted_before = rows_of(&bob, &room).len();
+    let (shared_ok, shared_said) = alice.run(&[
+        "share",
+        &room,
+        file.to_str().unwrap(),
+        "--count",
+        "3",
+        "--to",
+        "bob",
+        "--urgent",
+        "-m",
+        note,
+    ]);
+    assert!(
+        shared_ok,
+        "PRODUCT: `vox share` must return once the daemon serves the file; it said: {shared_said}"
     );
-    let line = share.expect_within(TIMEOUT, "the share's port", |l| {
-        l.starts_with("vox: sharing ")
-    });
-    let port: u16 = line
-        .split("on port ")
-        .nth(1)
-        .and_then(|p| p.trim().parse().ok())
-        .unwrap_or_else(|| panic!("no port in {line:?}"));
+    let tag = tag_of(&shared_said);
     let (_bob_up, bob_proxy) = bob.up();
     let (_mal_up, mal_proxy) = mallory.up();
-    // `<service>.<node>.<room>.vox` (V030-25): the share's service is named for its port, `alice`
-    // is what bob and mallory each call her, and `files` what each calls the room.
-    let url = format!("http://{port}.alice.files.vox:{port}/report.bin");
+    // `<service>.<node>.<room>.vox` (V030-25): the share's service is its tag, `alice` is what bob
+    // and mallory each call her, and `files` what each calls the room.
+    let url = format!("http://{tag}.alice.files.vox/report.bin");
 
-    // Fetch 1: bob, with curl through his own `vox up`.
+    // Fetch 1: **bob's node pulls it by itself** (F-3): it is addressed to him, from a member he
+    // trusts. Nothing is asked of bob, and it lands verified in his node's files directory.
+    let auto = arrives(&bob_dl.join("report.bin"), &sha(&payload), TIMEOUT);
+    // Fetch 2: bob, with curl through his own `vox up` — after `vox share` has exited.
     let (curl_ok, curled) = curl(bob_proxy, &url);
     // mallory: the same URL through her own proxy, and `vox room get`. Neither is a fetch.
     let (mal_curl_ok, mal_curled) = curl(mal_proxy, &url);
     let (mal_get_ok, mal_get_said) = mallory.run(&["room", "get", &room, "report.bin"]);
-    let fetches_before_get = share.transcript().matches("vox: fetched ").count();
-    // Fetch 2: bob, with `vox room get`, into his downloads directory, once the
-    // announcement has reached him.
+    let fetches_before_get = alice.fetched(&room, &tag);
+    // What bob reads: the share's one announcement.
     bob.sees(&room, "report.bin");
+    let after: Vec<serde_json::Value> = rows_of(&bob, &room).split_off(posted_before);
+    let announcements: Vec<&serde_json::Value> = after
+        .iter()
+        .filter(|r| {
+            r["envelope"]["type"] == "file" && r["envelope"]["data"]["name"] == "report.bin"
+        })
+        .collect();
+    let carrying_note = after
+        .iter()
+        .filter(|r| r["text"].as_str().is_some_and(|t| t.contains(note)))
+        .count();
+    // Fetch 3: bob, with `vox room get`, into his node's files directory beside the copy his node
+    // pulled — never over it.
     let (get_ok, get_said) = bob.run(&["room", "get", &room, "report.bin"]);
-    let landed = bob_dl.join("report.bin");
+    let landed = bob_dl.join("report (1).bin");
     let got = std::fs::read(&landed).unwrap_or_default();
-    // Two fetches: the share stops by itself.
-    let until = Instant::now() + Duration::from_secs(20);
-    let mut ended = None;
-    while Instant::now() < until {
-        if let Ok(Some(s)) = share.child.try_wait() {
-            ended = Some(s);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Its last words, drained after it has exited.
-    std::thread::sleep(Duration::from_millis(200));
-    let share_said = share.transcript();
+    // Three fetches: the daemon stops serving it by itself.
+    let ended = alice.stops_sharing(&room, &tag, Duration::from_secs(20));
 
     // **A late collector is told the offer is gone** (ADR-020 11.8): the announcement stays on the
-    // log, the bytes were live. The share has ended (above: it stopped after `--count 2`, and
-    // withdrew its service before it exited), and bob, who reads the announcement, asks again.
+    // log, the bytes were live. The share has ended (above: after `--count 2`), and bob, who reads
+    // the announcement, asks again.
     let (late_ok, late_said) = bob.run(&["room", "get", &room, "report.bin"]);
     eprintln!("[proof] bob's get after the share ended (ok {late_ok}): {late_said}");
 
-    // A folder, as one tar.
-    let mut folder_share = VoxProc::spawn(
-        "alice share folder",
-        &alice.dir,
-        &args(&["share", &room, folder.to_str().unwrap(), "--for", "120s"]),
+    // **A share for someone else is a card, not a pull** (F-3): carol's node pulls what alice
+    // shares with her; bob's node, which reads it too, leaves it — and shows it naming carol —
+    // until bob asks for it with `vox room get`.
+    let for_carol = tmp.path().join("for-carol.txt");
+    std::fs::write(&for_carol, b"carol's eyes only, by address").unwrap();
+    let (carol_ok, carol_said) = alice.run(&[
+        "share",
+        &room,
+        for_carol.to_str().unwrap(),
+        "--to",
+        "carol",
+        "-m",
+        "for carol",
+    ]);
+    assert!(
+        carol_ok,
+        "PRODUCT (staging): vox share --to carol: {carol_said}"
     );
-    folder_share.expect_within(TIMEOUT, "the folder share", |l| {
-        l.starts_with("vox: sharing ")
-    });
+    let carol_got = arrives(
+        &carol_dl.join("for-carol.txt"),
+        &sha(b"carol's eyes only, by address"),
+        TIMEOUT,
+    );
+    bob.sees(&room, "for-carol.txt");
+    // bob's node looks over the room every second: three seconds after it reads the card, a pull
+    // it was going to make has had its time to land.
+    std::thread::sleep(Duration::from_secs(3));
+    let bob_pulled_carols = bob_dl.join("for-carol.txt").exists();
+    let (_, bob_reads) = bob.run(&["room", "read", &room]);
+    let card: Vec<&str> = bob_reads
+        .lines()
+        .skip_while(|l| !l.contains("file offered: for-carol.txt"))
+        .take(2)
+        .collect();
+    let (carols_get_ok, carols_get_said) = bob.run(&["room", "get", &room, "for-carol.txt"]);
+    let bob_got_carols = std::fs::read(bob_dl.join("for-carol.txt")).unwrap_or_default();
+
+    // A folder, as one tar, shared as a reply to the report's announcement; then stopped by hand
+    // (`vox share stop`). **A share follows a post's hop rule** (ADR-020 §9): a reply carries its
+    // `re` and spends a hop of its parent's budget, so agents sharing back and forth cannot wake
+    // each other for ever.
+    let report_entry = announcements
+        .first()
+        .and_then(|a| a["entry_hash"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    let report_hops = announcements
+        .first()
+        .and_then(|a| a["envelope"]["hops"].as_u64());
+    let (folder_ok, folder_said) = alice.run(&[
+        "share",
+        &room,
+        folder.to_str().unwrap(),
+        "--for",
+        "120s",
+        "--re",
+        &report_entry,
+    ]);
+    assert!(
+        folder_ok,
+        "PRODUCT (staging): vox share of a folder: {folder_said}"
+    );
     bob.sees(&room, "photos.tar");
+    let folder_row = rows_of(&bob, &room)
+        .into_iter()
+        .find(|r| r["envelope"]["type"] == "file" && r["envelope"]["data"]["name"] == "photos.tar");
     let (tar_ok, tar_said) = bob.run(&["room", "get", &room, "photos.tar"]);
     let listing = Command::new("tar")
         .args(["-tf", bob_dl.join("photos.tar").to_str().unwrap()])
         .output()
         .unwrap();
     let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let (stop_ok, stop_said) = alice.run(&["share", "stop", &room, "photos.tar"]);
+    let (stopped_get_ok, stopped_get_said) = bob.run(&["room", "get", &room, "photos.tar"]);
+
+    // And one left behind when alice leaves the room: leaving ends it (F-2).
+    let left_file = tmp.path().join("notes.txt");
+    std::fs::write(&left_file, b"what alice left behind").unwrap();
+    let (left_ok, left_said) = alice.run(&["share", &room, left_file.to_str().unwrap()]);
+    assert!(
+        left_ok,
+        "PRODUCT (staging): vox share before leaving: {left_said}"
+    );
+    let left_tag = tag_of(&left_said);
+    bob.sees(&room, "notes.txt");
+    let (leave_ok, leave_said) = alice.run(&["room", "leave", &room]);
+    assert!(leave_ok, "PRODUCT (staging): alice leaves: {leave_said}");
+    let left_ended = alice.stops_sharing(&room, &left_tag, Duration::from_secs(20));
+    let (after_leave_ok, after_leave_said) = bob.run(&["room", "get", &room, "notes.txt"]);
 
     eprintln!(
-        "curl by bob: ok {curl_ok}, {} bytes, sha {}\nsent {} bytes, sha {}\n\
-         mallory curl: ok {mal_curl_ok}, {} bytes; mallory get: ok {mal_get_ok}: {mal_get_said}\
-         fetches counted before bob's get: {fetches_before_get}\nbob's get: ok {get_ok}: \
-         {get_said}landed {} ({} bytes, sha {})\nshare ended {ended:?}; it said:\n{share_said}\n\
-         folder get: ok {tar_ok}: {tar_said}tar lists:\n{listing}",
+        "share said: {shared_said}\ncurl by bob: ok {curl_ok}, {} bytes, sha {}\nsent {} bytes, sha \
+         {}\nmallory curl: ok {mal_curl_ok}, {} bytes; mallory get: ok {mal_get_ok}: \
+         {mal_get_said}fetches counted before bob's get: {fetches_before_get:?}\nbob reads: \
+         {announcements:?} ({carrying_note} row(s) carry the note)\nbob's get: ok {get_ok}: \
+         {get_said}landed {} ({} bytes, sha {})\nshare ended {ended}\nfolder get: ok {tar_ok}: \
+         {tar_said}tar lists:\n{listing}\nstop: ok {stop_ok}: {stop_said}get after stop: ok \
+         {stopped_get_ok}: {stopped_get_said}\nafter leave (ended {left_ended}): ok \
+         {after_leave_ok}: {after_leave_said}",
         curled.len(),
         sha(&curled),
         payload.len(),
@@ -392,44 +573,108 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
         got.len(),
         sha(&got),
     );
+    // #493: one announcement, carrying the note, the addressee and the urgent flag.
+    assert_eq!(
+        announcements.len(),
+        1,
+        "PRODUCT: bob must read exactly one announcement of report.bin; he read: {after:?}"
+    );
+    let a = announcements[0];
+    assert!(
+        a["envelope"]["data"]["note"] == note
+            && a["envelope"]["to"] == serde_json::json!([bob.fp])
+            && a["envelope"]["urgent"] == true,
+        "PRODUCT: the announcement must carry the note, bob's whole fingerprint as its addressee \
+         and the urgent flag; bob read: {a}"
+    );
+    assert_eq!(
+        carrying_note, 1,
+        "PRODUCT: the note must travel in the share, never as a message of its own; bob read: \
+         {after:?}"
+    );
+    // #495: pulled by bob's node by itself, verified, into its files directory.
+    assert!(
+        auto,
+        "PRODUCT: a share addressed to bob from a member he trusts must appear, verified, in {} \
+         without any command",
+        bob_dl.display()
+    );
+    assert!(
+        carol_got,
+        "PRODUCT: a share addressed to carol must appear, verified, in her node's files directory"
+    );
+    assert!(
+        !bob_pulled_carols,
+        "PRODUCT: bob's node must not pull a share addressed to carol; it landed {} before he \
+         asked for it",
+        bob_dl.join("for-carol.txt").display()
+    );
+    assert!(
+        card.len() == 2 && card[1].contains("to carol"),
+        "PRODUCT: bob must see the share for carol as a card naming her; he read: {card:?}"
+    );
+    assert!(
+        carols_get_ok && bob_got_carols == b"carol's eyes only, by address",
+        "PRODUCT: bob may still pull the share for carol with `vox room get`; it said (ok \
+         {carols_get_ok}): {carols_get_said}"
+    );
+    // #494: served by the daemon once `vox share` has exited.
     assert!(
         curl_ok && sha(&curled) == sha(&payload),
-        "curl through vox up must get the same bytes"
+        "PRODUCT: curl through vox up must get the same bytes after `vox share` has exited"
     );
     assert!(
         !mal_curl_ok && mal_curled.is_empty(),
-        "an untrusted member's curl must get nothing"
+        "PRODUCT: an untrusted member's curl must get nothing"
     );
     assert!(
         !mal_get_ok,
-        "an untrusted member's `vox room get` must get nothing"
+        "PRODUCT: an untrusted member's `vox room get` must get nothing; it said: {mal_get_said}"
     );
-    assert_eq!(fetches_before_get, 1, "only bob's curl was a fetch");
-    assert!(get_ok, "bob's `vox room get` must succeed");
+    assert_eq!(
+        fetches_before_get,
+        Some(2),
+        "PRODUCT: only bob's node's pull and bob's curl were fetches (`vox share list`)"
+    );
+    assert!(
+        get_ok,
+        "PRODUCT: bob's `vox room get` must succeed: {get_said}"
+    );
     assert_eq!(
         sha(&got),
         sha(&payload),
-        "and land the same bytes in his downloads directory"
+        "PRODUCT: and land the same bytes in his downloads directory"
     );
     assert!(
-        ended.is_some_and(|s| s.success()) && share_said.contains("fetched 2 time(s)"),
-        "the share must stop by itself after --count 2"
+        ended,
+        "PRODUCT: the daemon must stop serving the share by itself after --count 3"
     );
+    let gone = |ok: bool, said: &str, name: &str| {
+        !ok && said.contains(&format!("the offer of {name} is gone"))
+            && said.contains("no longer serves it")
+            && !said.contains("reset by peer")
+    };
     assert!(
-        ended.is_some_and(|s| s.success()),
-        "CANNOT MEASURE: the share did not end, so a late collector was not staged: share ended \
-         {ended:?}"
-    );
-    assert!(
-        !late_ok
-            && late_said.contains("the offer of report.bin is gone")
-            && late_said.contains("no longer serves it")
-            && !late_said.contains("reset by peer"),
+        gone(late_ok, &late_said, "report.bin"),
         "PRODUCT: a collector of an offer whose share has ended must be told the offer is gone \
          (ADR-020 11.8), not a transport error; bob's `vox room get` said (ok {late_ok}): \
          {late_said}"
     );
-    assert!(tar_ok, "the folder share must be collectable");
+    let folder_env = folder_row.map(|r| r["envelope"].clone());
+    assert!(
+        folder_env
+            .as_ref()
+            .is_some_and(|e| e["re"] == report_entry.as_str()
+                && e["hops"].as_u64().is_some()
+                && e["hops"].as_u64() == report_hops.map(|h| h.saturating_sub(1))),
+        "PRODUCT: a share replying to an entry must carry it as `re` and its parent's hop budget \
+         less one ({report_hops:?} - 1, as `vox room post` does); bob read the folder's \
+         announcement as: {folder_env:?}"
+    );
+    assert!(
+        tar_ok,
+        "PRODUCT: the folder share must be collectable: {tar_said}"
+    );
     for entry in [
         "photos/",
         "photos/a.txt",
@@ -438,10 +683,24 @@ fn a_share_is_pulled_by_the_trusted_and_by_nobody_else() {
     ] {
         assert!(
             listing.lines().any(|l| l == entry),
-            "the tar must hold {entry}"
+            "PRODUCT: the tar must hold {entry}"
         );
     }
-    drop((folder_share, share, alice, bob, mallory, anchor));
+    assert!(
+        stop_ok && stop_said.contains("no longer sharing photos.tar"),
+        "PRODUCT: `vox share stop` must stop the folder share; it said: {stop_said}"
+    );
+    assert!(
+        gone(stopped_get_ok, &stopped_get_said, "photos.tar"),
+        "PRODUCT: a pull after `vox share stop` must be told the offer is gone; bob's `vox room \
+         get` said (ok {stopped_get_ok}): {stopped_get_said}"
+    );
+    assert!(
+        left_ended && gone(after_leave_ok, &after_leave_said, "notes.txt"),
+        "PRODUCT: leaving the room must end the share (ended {left_ended}); bob's `vox room get` \
+         after alice left said (ok {after_leave_ok}): {after_leave_said}"
+    );
+    drop((alice, bob, mallory, carol, anchor));
 }
 
 /// The last fetch reaches its receiver whole, however slowly it reads.
@@ -520,25 +779,23 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
     );
     assert!(ok, "PRODUCT (staging): bob joins files: {out}{err}");
 
-    let mut share = VoxProc::spawn(
-        "alice share",
-        &alice.dir,
-        &args(&[
-            "share",
-            &room,
-            file.to_str().expect("APPARATUS: a UTF-8 path"),
-            "--count",
-            "1",
-        ]),
+    let (shared_ok, shared_said) = alice.run(&[
+        "share",
+        &room,
+        file.to_str().expect("APPARATUS: a UTF-8 path"),
+        "--count",
+        "2",
+    ]);
+    assert!(shared_ok, "PRODUCT (staging): vox share: {shared_said}");
+    let tag = tag_of(&shared_said);
+    // bob's node pulls it by itself first (ADR-028 F-3): that is the first fetch, so the slow curl
+    // below is the last.
+    let bob_files = files_of(&bob, &room);
+    assert!(
+        arrives(&bob_files.join("big.bin"), &sha(&payload), SETUP),
+        "PRODUCT (staging): bob's node never pulled the share by itself, so the slow fetch would \
+         not be the last"
     );
-    let line = share.expect_within(TIMEOUT, "the share's port", |l| {
-        l.starts_with("vox: sharing ")
-    });
-    let port: u16 = line
-        .split("on port ")
-        .nth(1)
-        .and_then(|p| p.trim().parse().ok())
-        .unwrap_or_else(|| panic!("PRODUCT (staging): no port in {line:?}"));
     let (_bob_up, bob_proxy) = bob.up();
     let out = Command::new("curl")
         .args([
@@ -551,25 +808,14 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
             "--socks5-hostname",
             &bob_proxy.to_string(),
             // `<service>.<node>.<room>.vox`: a node's name alone resolves to nothing (PRD-001
-            // R20), and the share's service is named by its port.
-            &format!("http://{port}.alice.files.vox:{port}/big.bin"),
+            // R20), and the share's service is its tag.
+            &format!("http://{tag}.alice.files.vox/big.bin"),
         ])
         .output()
         .expect("APPARATUS: run curl");
-    let until = Instant::now() + Duration::from_secs(20);
-    let mut ended = None;
-    while Instant::now() < until {
-        if let Ok(Some(s)) = share.child.try_wait() {
-            ended = Some(s);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    std::thread::sleep(Duration::from_millis(200));
-    let share_said = share.transcript();
+    let ended = alice.stops_sharing(&room, &tag, Duration::from_secs(20));
     eprintln!(
-        "slow curl: exit {:?}, {} of {} bytes, sha {} (sent {})\nshare ended {ended:?}; it \
-         said:\n{share_said}",
+        "slow curl: exit {:?}, {} of {} bytes, sha {} (sent {})\nshare ended {ended}",
         out.status.code(),
         out.stdout.len(),
         payload.len(),
@@ -581,8 +827,8 @@ fn the_last_fetch_is_delivered_before_the_share_ends() {
         "PRODUCT: the last fetch must arrive whole before the share ends"
     );
     assert!(
-        ended.is_some_and(|s| s.success()) && share_said.contains("fetched 1 time(s)"),
-        "PRODUCT: the share must still stop by itself after --count 1"
+        ended,
+        "PRODUCT: the daemon must still stop serving the share by itself after --count 2"
     );
-    drop((share, alice, bob, anchor));
+    drop((alice, bob, anchor));
 }

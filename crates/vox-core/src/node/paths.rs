@@ -47,11 +47,6 @@ pub const CONFIG_FILE: &str = "config";
 /// The node's retention policy file (ADR-023 decision 2), in the config directory.
 pub const RETENTION_FILE: &str = "retention";
 
-/// The download-directory file inside a profile's **config** directory (PRD-001 R18): one
-/// line naming where `vox room get` puts a collected file when no `--dir` or `--out` is
-/// given. A leading `~/` means the home directory. Absent, it is `~/Downloads`.
-pub const DOWNLOADS_FILE: &str = "downloads";
-
 /// The config file saying how long a tunnel's bytes may wait to be taken before it is closed as
 /// stuck (V030-11): one line, `600`, `600s`, `10m` or `1h`. Absent or unreadable, it is 10
 /// minutes ([`STUCK_AFTER`](crate::tunnel::session::STUCK_AFTER)).
@@ -542,12 +537,6 @@ impl Paths {
         (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
-    /// The download-directory file for this node ([`DOWNLOADS_FILE`]; [`Self::config_path`]).
-    #[must_use]
-    pub fn downloads_file(&self) -> PathBuf {
-        self.config_path(DOWNLOADS_FILE)
-    }
-
     /// Where an agent session's read cursor for one room is kept
     /// (`<profile_dir>/cursors/<room>-<session>`).
     ///
@@ -605,6 +594,25 @@ impl Paths {
         self.profile_dir
             .join(SESSION_DIR)
             .join(format!("{}.json", sanitize(session)))
+    }
+
+    /// `<profile_dir>/files`: what this node pulled, a directory per room (ADR-028 F-4).
+    #[must_use]
+    pub fn files_dir(&self) -> PathBuf {
+        self.profile_dir.join("files")
+    }
+
+    /// `<profile_dir>/pulls`: a record of each share this node pulled (ADR-028 F-3).
+    #[must_use]
+    pub fn pulls_dir(&self) -> PathBuf {
+        self.profile_dir.join("pulls")
+    }
+
+    /// `<profile_dir>/shares`: a record of each share this node serves, and a folder share's
+    /// archive (ADR-028 F-2).
+    #[must_use]
+    pub fn shares_dir(&self) -> PathBuf {
+        self.profile_dir.join("shares")
     }
 
     /// The directory holding every session's wake channel.

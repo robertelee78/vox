@@ -516,52 +516,16 @@ pub async fn post_cmd(
             data.insert("attempt".into(), a);
         }
     }
-    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
-    // chain of its own with a fresh hop budget, and two agents answering each other urgently
-    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
-    // with several, the agent must say which.
-    let re = match &opts.re {
-        Some(re) => Some(re.clone()),
-        None => {
-            // The wakes and what followed the oldest of them, read from there (V210-120).
-            let rows = coord::wake_context(&mut client, cid, paths, &session, &room_key).await?;
-            let open = crate::wake::open_wakes(paths, &session, &room_key, &rows, &snap.me);
-            match &open[..] {
-                [] => None,
-                [only] => {
-                    eprintln!(
-                        "vox: replying to {} (the message that woke this session); pass --re to \
-                         answer another",
-                        &only[..12.min(only.len())]
-                    );
-                    Some(only.clone())
-                }
-                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
-                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
-                // that left two wakes unanswered stayed that way: every later wake added to the
-                // set rather than being inherited, and two such sessions woke each other for ever.
-                several if opts.urgent => {
-                    return Err(AppError::Usage(format!(
-                        "refusing an urgent message with no --re from session {session}: it was \
-                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
-                         which one this answers.",
-                        several.len(),
-                        several.join(", ")
-                    )));
-                }
-                _ => None,
-            }
-        }
-    };
-    // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
-    // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
-    let hops_of_reply = match &re {
-        Some(re) => Some(crate::wake::reply_hops(
-            re,
-            &coord::reply_chain(&mut client, cid, re).await?,
-        )),
-        None => None,
-    };
+    let (re, hops_of_reply) = answers(
+        &mut client,
+        cid,
+        paths,
+        Some(&session),
+        &snap.me,
+        opts.re.as_deref(),
+        opts.urgent,
+    )
+    .await?;
     let draft = Draft {
         kind,
         to,
@@ -1019,6 +983,72 @@ fn plain_row(r: &vox_core::node::api::MessageRow) -> String {
         crate::ident::name_of(&r.author),
         text
     )
+}
+
+/// What a post answers and the hop budget it starts with, by the one rule `vox room post` and
+/// `vox share` follow (V210-121, ADR-020 §9): `re` if given, else the one unanswered message that
+/// woke `session`; and that parent's budget less one.
+///
+/// # Errors
+/// An urgent post from a session woken by several unanswered messages names none of them, or a
+/// parent cannot be read.
+pub(crate) async fn answers(
+    client: &mut IpcClient,
+    cid: Digest32,
+    paths: &Paths,
+    session: Option<&str>,
+    me: &Digest32,
+    re: Option<&str>,
+    urgent: bool,
+) -> Result<(Option<String>, Option<u32>), AppError> {
+    // **A woken session's post answers what woke it** (V210-121). With no `--re` it started a
+    // chain of its own with a fresh hop budget, and two agents answering each other urgently
+    // that way woke each other for ever. When exactly one wake is unanswered, that is the reply;
+    // with several, the agent must say which.
+    let re = match (re, session) {
+        (Some(re), _) => Some(re.to_owned()),
+        (None, None) => None,
+        (None, Some(session)) => {
+            // The wakes and what followed the oldest of them, read from there (V210-120).
+            let rows = coord::wake_context(client, cid, paths, session, &id(&cid)).await?;
+            let open = crate::wake::open_wakes(paths, session, &id(&cid), &rows, me);
+            match &open[..] {
+                [] => None,
+                [only] => {
+                    eprintln!(
+                        "vox: replying to {} (the message that woke this session); pass --re to \
+                         answer another",
+                        &only[..12.min(only.len())]
+                    );
+                    Some(only.clone())
+                }
+                // **Several unanswered, and an urgent post must say which it answers** (V210-121).
+                // Sent with no `re` it started a chain of its own at a fresh budget, and a session
+                // that left two wakes unanswered stayed that way: every later wake added to the
+                // set rather than being inherited, and two such sessions woke each other for ever.
+                several if urgent => {
+                    return Err(AppError::Usage(format!(
+                        "refusing an urgent message with no --re from session {session}: it was \
+                         woken by {} messages it has not answered ({}). Pass --re <entry> to say \
+                         which one this answers.",
+                        several.len(),
+                        several.join(", ")
+                    )));
+                }
+                _ => None,
+            }
+        }
+    };
+    // **A reply spends a hop** (ADR-020 §9): what it may still travel is its parent's budget
+    // less one. Its parents are fetched by entry hash (V210-120), not by reading the room.
+    let hops_of_reply = match &re {
+        Some(re) => Some(crate::wake::reply_hops(
+            re,
+            &coord::reply_chain(client, cid, re).await?,
+        )),
+        None => None,
+    };
+    Ok((re, hops_of_reply))
 }
 
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
@@ -2198,7 +2228,7 @@ pub async fn service_add(
 /// The one-shot form opens the profile itself, which redb refuses while a daemon holds it
 /// — and a running host is exactly when removing a service matters, because that is when
 /// it is carrying sessions the removal must cut (PRD-001 R22). The request is the one
-/// `vox room send` already makes when its offer ends; it only ever narrows what is exposed.
+/// daemon makes when a share ends; it only ever narrows what is exposed.
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the service was not offered.
@@ -2629,220 +2659,15 @@ pub async fn board(
 // 0. Verifying against a hash the sender signed turns that into a loud failure.
 
 /// The envelope type an offer is announced with.
-pub(crate) const FILE: &str = "file";
+pub(crate) const FILE: &str = vox_core::node::shares::FILE;
 
-/// Read a file and return its SHA-256 and length.
-pub(crate) fn digest_file(path: &std::path::Path) -> Result<(String, u64), AppError> {
-    use sha2::{Digest as _, Sha256};
-    let mut f = std::fs::File::open(path)
-        .map_err(|e| AppError::Usage(format!("opening {}: {e}", path.display())))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = std::io::Read::read(&mut f, &mut buf)
-            .map_err(|e| AppError::Usage(format!("reading {}: {e}", path.display())))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        total += n as u64;
-    }
-    Ok((hex(&hasher.finalize()), total))
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
+fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write as _;
         let _ = write!(s, "{b:02x}");
     }
     s
-}
-
-/// How long a stopped `vox room send` waits for its daemon to withdraw the offer: as long as
-/// `vox daemon` gives its own node to stop.
-const REMOVE_SERVICE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// `vox room send` — offer a file to a room and announce it.
-///
-/// Runs until interrupted: the bytes are served live, so stopping this stops the
-/// offer. Every member that collects it gets the same file.
-///
-/// # Errors
-/// If the node cannot be reached, the room is unknown, the file cannot be read, or
-/// the node refuses to offer the service.
-pub async fn send_file(paths: &Paths, room: &str, path: &std::path::Path) -> Result<(), AppError> {
-    // Every stop signal, not Ctrl-C alone (V210-108): SIGTERM and SIGHUP ended the offer on the
-    // spot, leaving it on the node. Taken first, so a stop sent while the offer is being made is
-    // not the default action's silent death; the loop below acts on it.
-    let interrupted = crate::app::stop_requested("vox room send");
-    let (sha256, size) = digest_file(path)?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_owned());
-    // The tag names the content and **this offer**: `file-<16 hex of the SHA-256>-<16 hex of
-    // randomness>`. It was the content alone, so two offers of the same file shared one
-    // service, and whichever ended first withdrew the other's while it still ran (V210-72):
-    // the daemon withdraws an offer by its tag when the connection that made it closes.
-    let mut nonce = [0u8; 8];
-    getrandom::fill(&mut nonce)
-        .map_err(|e| AppError::Usage(format!("no randomness for the offer's tag: {e}")))?;
-    let tag = format!("file-{}-{}", &sha256[..16], hex(&nonce));
-
-    let mut client = attach(paths).await?;
-    let channel_id = room_of(&mut client, room).await?;
-
-    // A listener that hands the file to whoever connects, for as long as we run.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|e| AppError::Usage(format!("cannot listen locally: {e}")))?;
-    let local = listener
-        .local_addr()
-        .map_err(|e| AppError::Usage(format!("cannot read the local address: {e}")))?;
-
-    match client
-        .request(&Request::AddService {
-            channel_id,
-            service_tag: tag.clone(),
-            local: local.to_string(),
-            persist: false,
-        })
-        .await
-    {
-        Ok(Frame::Ok) => {}
-        Ok(Frame::Error { reason }) => {
-            // Not "needs bind:<tag>, which the room's admin grants": that capability was
-            // deleted in ADR-017's third revision — offering a port of your own machine
-            // is not the room's business — and `add_service` stopped checking it at M17.7.
-            // The message named a permission nobody can hold and an admin nobody has.
-            return Err(AppError::Usage(format!("cannot offer {tag:?}: {reason}")));
-        }
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    }
-
-    // A `dial:` grant per member used to be issued here, "so it works under either
-    // model". There is one model: reach is the host's trust keyring (M17.7), and the
-    // capability has not been consulted since. The loop wrote a governance fact per
-    // member per offer onto the room's log, which nothing read — and it kept the
-    // withdrawn model alive in the one verb a person uses most.
-
-    let env = {
-        let mut e = Envelope::new(FILE, &format!("offering {name} ({size} bytes)"));
-        e.data = serde_json::json!({
-            "name": name,
-            "size": size,
-            "sha256": sha256,
-            "tag": tag,
-        });
-        e
-    };
-    post(paths, room, Some(&env.to_text())).await?;
-
-    println!("vox: offering {name} ({size} bytes) as {tag}");
-    println!("     sha256 {sha256}");
-    println!(
-        "     collect it with: vox room get {} {name}",
-        &room_of_label(channel_id)
-    );
-    println!("     Ctrl-C stops the offer; the announcement stays on the log");
-
-    let path = path.to_owned();
-    // Every transfer in flight, and the word to stop them: a stopped offer ends each one with a
-    // reset, never a clean close (see below).
-    let (stop, stopping) = tokio::sync::watch::channel(false);
-    let mut transfers = tokio::task::JoinSet::new();
-    // One stop listener for the whole loop, taken above: one made per turn misses a SIGINT that
-    // lands in the same turn as another arm (see `app::run_node`).
-    tokio::pin!(interrupted);
-    let signal = loop {
-        tokio::select! {
-            accepted = listener.accept() => {
-                let Ok((sock, _)) = accepted else { continue };
-                while transfers.try_join_next().is_some() {}
-                transfers.spawn(serve_file(path.clone(), sock, stopping.clone()));
-            }
-            signal = &mut interrupted => break signal,
-        }
-    };
-    crate::app::say(format_args!("vox: no longer offering {tag}"));
-    // Bounded: a daemon that does not answer (stopped, wedged) left this waiting for ever, and
-    // a stop that only SIGKILL could end. Its sessions are reset below either way.
-    let removed = tokio::time::timeout(
-        REMOVE_SERVICE_PATIENCE,
-        client.request(&Request::RemoveService {
-            channel_id,
-            service_tag: tag,
-        }),
-    )
-    .await;
-    if removed.is_err() {
-        eprintln!(
-            "vox: the daemon did not answer within {}s; stopping anyway — the offer's transfers \
-             are reset, and there is nothing left for it to serve",
-            REMOVE_SERVICE_PATIENCE.as_secs()
-        );
-    }
-    // Then reset what is still in flight, and wait for the resets to leave before exiting:
-    // an exit would close these sockets gracefully.
-    let _ = stop.send(true);
-    let _ = tokio::time::timeout(
-        vox_core::tunnel::session::DRAIN_BOUND + std::time::Duration::from_secs(1),
-        async { while transfers.join_next().await.is_some() {} },
-    )
-    .await;
-    Err(AppError::stopped_by(signal))
-}
-
-/// Send the file at `path` to one collector's connection, and close it cleanly only if all of
-/// it was sent.
-///
-/// **Any other ending is a reset** — the offer stopped (`stopping`), or the file could not be
-/// read. A clean close says "that was all of it", so a transfer cut short that way reached the
-/// collector as a clean, truncated end (V210-81): when `vox room send` was stopped, its exit
-/// closed each connection gracefully, and that close could reach the collector before the
-/// node's own cut of the session did.
-async fn serve_file(
-    path: std::path::PathBuf,
-    mut sock: tokio::net::TcpStream,
-    mut stopping: tokio::sync::watch::Receiver<bool>,
-) {
-    use tokio::io::AsyncWriteExt as _;
-    // `std::fs` because this workspace's tokio has no `fs` feature, and widening a dependency
-    // for one CLI verb is the wrong trade. The reads are chunked, so a large file is not held
-    // in memory.
-    let whole = {
-        let send = async {
-            let Ok(mut f) = std::fs::File::open(&path) else {
-                return false;
-            };
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                match std::io::Read::read(&mut f, &mut buf) {
-                    Ok(0) => return sock.flush().await.is_ok(),
-                    Ok(n) => {
-                        if sock.write_all(&buf[..n]).await.is_err() {
-                            return false;
-                        }
-                    }
-                    Err(_) => return false,
-                }
-            }
-        };
-        tokio::select! {
-            whole = send => whole,
-            _ = stopping.wait_for(|stop| *stop) => false,
-        }
-    };
-    if !whole {
-        vox_core::tunnel::session::abort_after_drain(sock).await;
-    }
-}
-
-fn room_of_label(channel_id: Digest32) -> String {
-    b32_encode(&channel_id).chars().take(12).collect()
 }
 
 /// An offer read off the room's log.
@@ -2852,7 +2677,8 @@ struct Offer {
     size: u64,
     sha256: String,
     tag: String,
-    /// Served over HTTP (`vox share`) rather than as raw bytes (`vox room send`).
+    /// Served over HTTP, as `vox share` serves; an announcement without it is answered with the
+    /// raw bytes.
     http: bool,
 }
 
@@ -2863,9 +2689,10 @@ struct Offer {
 /// `../../.ssh/authorized_keys` or `/etc/…` was honoured, `File::create` truncated whatever was
 /// there before a single byte was verified, and a mismatch then *deleted* it. Now:
 ///
-/// - the file goes into a download directory — `--dir`, else the profile's `downloads` config
-///   file, else `~/Downloads` — under the sender's name reduced to a bare file name
-///   ([`safe_file_name`]); `--out` names an exact path instead;
+/// - the file goes into the node's files directory for the room, `<data root>/nodes/<node>/files/
+///   <room>/` (ADR-028 F-4), or `--dir` when the person names another, under the sender's name
+///   reduced to a bare file name ([`safe_file_name`]); `--out` names an exact path instead.
+///   Nothing is written outside the node's files directory unless the person asked for it here;
 /// - **nothing that exists is ever overwritten**: a taken name gets a ` (1)`, ` (2)` … suffix,
 ///   and an `--out` that exists is refused;
 /// - the bytes go to a hidden `.part` file beside it, and only a transfer whose SHA-256 and size
@@ -2895,7 +2722,7 @@ pub async fn get_file(
 
     // Newest first: re-offering a file supersedes. But **an offer that has ended does not
     // hide one that is still served** (V210-84): each offer has a tag of its own, so the newest
-    // match may be one whose `vox room send` has stopped while an older offer of the same file
+    // match may be one whose share has stopped while an older offer of the same file
     // still runs. So the older offers are tried in turn — but only those of **the same file
     // from the same member** as the newest match: same author, same SHA-256. A fallback to
     // anything else would hand over a different file that only shares a name.
@@ -3098,12 +2925,20 @@ async fn collect_offer(
         }
         None => {
             let dir = match dir {
-                Some(d) => d.to_owned(),
-                None => download_dir(paths)?,
+                Some(d) => {
+                    std::fs::create_dir_all(d).map_err(|e| {
+                        AppError::Usage(format!("cannot use {} for the file: {e}", d.display()))
+                    })?;
+                    d.to_owned()
+                }
+                None => {
+                    let d = vox_core::node::pulls::room_dir(paths, &channel_id);
+                    vox_core::node::paths::create_private_dir(&d).map_err(|e| {
+                        AppError::Usage(format!("cannot use {} for the file: {e}", d.display()))
+                    })?;
+                    d
+                }
             };
-            std::fs::create_dir_all(&dir).map_err(|e| {
-                AppError::Usage(format!("cannot use {} for downloads: {e}", dir.display()))
-            })?;
             Destination::Into(dir, safe_file_name(&offer.name))
         }
     };
@@ -3242,81 +3077,8 @@ impl Destination {
     }
 }
 
-/// The directory a collected file goes in when `--dir` and `--out` are both absent: the
-/// profile's `downloads` config file if it names one, else `~/Downloads`.
-fn download_dir(paths: &Paths) -> Result<std::path::PathBuf, AppError> {
-    let home = || {
-        std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| {
-                AppError::Usage("HOME is not set, so there is no ~/Downloads; pass --dir".into())
-            })
-    };
-    let expand = |line: &str| -> Result<std::path::PathBuf, AppError> {
-        Ok(match line.strip_prefix("~/") {
-            Some(rest) => home()?.join(rest),
-            None => std::path::PathBuf::from(line),
-        })
-    };
-    if let Ok(text) = std::fs::read_to_string(paths.downloads_file()) {
-        if let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) {
-            return expand(line);
-        }
-    }
-    // Or `downloads = <dir>` in the profile's settings file (`vox share`'s form, PRD-001 R18
-    // and R37): the two changes that built R18 chose different files, and both are honoured.
-    if let Ok(text) = std::fs::read_to_string(paths.config_file()) {
-        let set = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with('#'))
-            .filter_map(|l| l.split_once('='))
-            .find(|(k, _)| k.trim() == "downloads")
-            .map(|(_, v)| v.trim().to_owned());
-        if let Some(dir) = set.filter(|d| !d.is_empty()) {
-            return expand(&dir);
-        }
-    }
-    Ok(home()?.join("Downloads"))
-}
-
-/// The sender's file name reduced to a **bare file name** that cannot leave the directory it
-/// is put in.
-///
-/// Everything up to the last `/` or `\` is dropped, so `../../x`, `/etc/passwd` and
-/// `..\\x` all become their last component. Control characters go, leading dots go (no
-/// `..`, and no file hidden from a listing by a name somebody else chose), and the result is
-/// cut to 200 bytes. Whatever is left empty becomes `download`.
-#[must_use]
-pub fn safe_file_name(name: &str) -> String {
-    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
-    let trimmed = cleaned.trim().trim_start_matches('.').trim();
-    let mut out = String::new();
-    for c in trimmed.chars() {
-        if out.len() + c.len_utf8() > 200 {
-            break;
-        }
-        out.push(c);
-    }
-    if out.is_empty() {
-        "download".to_owned()
-    } else {
-        out
-    }
-}
-
-/// `name`, then `name (1)`, `name (2)` … with the number before the extension.
-fn numbered(name: &str, n: usize) -> String {
-    if n == 0 {
-        return name.to_owned();
-    }
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
-        _ => format!("{name} ({n})"),
-    }
-}
+use vox_core::node::pulls::numbered;
+pub use vox_core::node::pulls::safe_file_name;
 
 /// How long one read of the transfer may wait before the transfer is abandoned. A sender
 /// that has gone quiet must not hold the collector for ever.

@@ -1,0 +1,493 @@
+//! Shares pulled without being asked (ADR-028 F-3, F-4).
+//!
+//! **An agent cannot click.** A node pulls a share by itself when it is addressed to this node, or
+//! to no one, and the sharer is in this node's keyring — whatever its size, file or folder. A share
+//! addressed to other nodes is left alone: any member may still pull it with `vox room get`.
+//!
+//! **Every pull is verified before it is saved** (ADR-020 11.4): the bytes go to a hidden `.part`
+//! file, and only bytes whose size and SHA-256 match the signed announcement are linked into
+//! place, under `<data root>/nodes/<node>/files/<room>/`, never over anything already there.
+//! Nothing is written outside the node's files directory.
+//!
+//! Each pull is recorded in `<node>/pulls/<entry>.json`, so it is not pulled again, and so what
+//! was pulled can be found by its announcement.
+
+use std::collections::{BTreeMap, HashSet};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
+
+use crate::hash::Digest32;
+use crate::node::api::{Fault, NodeCommand, NodeView, Outcome};
+use crate::node::link::{b32_decode, b32_encode};
+use crate::node::paths::Paths;
+
+/// How often the rooms are looked over for a share to pull, at most.
+const SCAN: Duration = Duration::from_secs(1);
+
+/// Pulls at once, across every room.
+const AT_ONCE: usize = 2;
+
+/// The first wait before a pull that failed is tried again; it doubles up to [`RETRY_MAX`].
+const RETRY_MIN: Duration = Duration::from_secs(10);
+/// The longest wait between tries of one pull.
+const RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// How long one read of a transfer may wait before the pull is abandoned and tried again.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A share this node may pull: what its announcement says.
+#[derive(Debug, Clone)]
+struct Offer {
+    room: Digest32,
+    entry: Digest32,
+    author: Digest32,
+    name: String,
+    size: u64,
+    sha256: String,
+    tag: String,
+    http: bool,
+    /// When it was announced, seconds.
+    created: u64,
+}
+
+/// A pull, as it is recorded once done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pulled {
+    /// The room.
+    pub room: Digest32,
+    /// The announcement's entry.
+    pub entry: Digest32,
+    /// Where the verified copy is.
+    pub path: PathBuf,
+    /// When it was announced, seconds.
+    pub created: u64,
+}
+
+impl Pulled {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "room": b32_encode(&self.room),
+            "entry": b32_encode(&self.entry),
+            "path": self.path.to_string_lossy(),
+            "created": self.created,
+        })
+    }
+
+    fn from_json(v: &serde_json::Value) -> Option<Self> {
+        let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+        Some(Self {
+            room: b32_decode(s("room")?, "pull record room").ok()?,
+            entry: b32_decode(s("entry")?, "pull record entry").ok()?,
+            path: PathBuf::from(s("path")?),
+            created: v.get("created").and_then(serde_json::Value::as_u64)?,
+        })
+    }
+}
+
+/// Every pull this node has recorded, oldest record first.
+#[must_use]
+pub fn recorded(paths: &Paths) -> Vec<Pulled> {
+    let Ok(dir) = std::fs::read_dir(paths.pulls_dir()) else {
+        return Vec::new();
+    };
+    dir.filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| std::fs::read(p).ok())
+        .filter_map(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .filter_map(|v| Pulled::from_json(&v))
+        .collect()
+}
+
+/// The directory a room's pulled files land in.
+#[must_use]
+pub fn room_dir(paths: &Paths, room: &Digest32) -> PathBuf {
+    paths.files_dir().join(b32_encode(room))
+}
+
+/// The sender's file name reduced to a **bare file name** that cannot leave the directory it is
+/// put in.
+///
+/// Everything up to the last `/` or `\` is dropped, so `../../x`, `/etc/passwd` and `..\\x` all
+/// become their last component. Control characters go, leading dots go (no `..`, and no file
+/// hidden from a listing by a name somebody else chose), and the result is cut to 200 bytes.
+/// Whatever is left empty becomes `download`.
+#[must_use]
+pub fn safe_file_name(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = last.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim().trim_start_matches('.').trim();
+    let mut out = String::new();
+    for c in trimmed.chars() {
+        if out.len() + c.len_utf8() > 200 {
+            break;
+        }
+        out.push(c);
+    }
+    if out.is_empty() {
+        "download".to_owned()
+    } else {
+        out
+    }
+}
+
+/// `name`, then `name (1)`, `name (2)` … with the number before the extension.
+#[must_use]
+pub fn numbered(name: &str, n: usize) -> String {
+    if n == 0 {
+        return name.to_owned();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} ({n}).{ext}"),
+        _ => format!("{name} ({n})"),
+    }
+}
+
+/// What is known about one announcement this node may pull.
+enum State {
+    /// Pulling now.
+    Running,
+    /// Failed; tried again once this instant has passed, after waiting `wait`.
+    Waiting { until: Instant, wait: Duration },
+}
+
+/// The pulls of one node.
+pub(crate) struct Pulls {
+    paths: Paths,
+    cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
+    view: watch::Receiver<NodeView>,
+    /// Entries decided for good: pulled, or never this node's to pull.
+    settled: Mutex<HashSet<Digest32>>,
+    pending: Mutex<BTreeMap<Digest32, State>>,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// The share `text` announces, if it is one this node may pull: a `file` announcement addressed to
+/// `me` or to no one. `None` for anything else, for good.
+fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool)> {
+    let v: serde_json::Value = serde_json::from_str(text.trim_start()).ok()?;
+    if v.get("type").and_then(serde_json::Value::as_str) != Some(crate::node::shares::FILE) {
+        return None;
+    }
+    let to: Vec<&str> = v
+        .get("to")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    if !to.is_empty() && !to.contains(&me) {
+        return None;
+    }
+    let d = v.get("data")?;
+    let s = |k: &str| {
+        d.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let sha256 = s("sha256")?;
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((
+        s("name")?,
+        d.get("size").and_then(serde_json::Value::as_u64)?,
+        sha256.to_ascii_lowercase(),
+        s("tag")?,
+        d.get("http")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
+impl Pulls {
+    /// Pull what is this node's to pull, for as long as the node runs: the task ends when the
+    /// node's view does.
+    pub(crate) fn spawn(
+        paths: Paths,
+        cmd: mpsc::WeakSender<(NodeCommand, oneshot::Sender<Outcome>)>,
+        view: watch::Receiver<NodeView>,
+    ) {
+        let pulls = Arc::new(Self {
+            settled: Mutex::new(recorded(&paths).into_iter().map(|p| p.entry).collect()),
+            paths,
+            cmd,
+            view,
+            pending: Mutex::new(BTreeMap::new()),
+        });
+        tokio::spawn(async move {
+            let mut view = pulls.view.clone();
+            loop {
+                tokio::select! {
+                    changed = view.changed() => if changed.is_err() { break },
+                    () = tokio::time::sleep(SCAN) => {}
+                }
+                Arc::clone(&pulls).scan().await;
+                tokio::time::sleep(SCAN).await;
+            }
+        });
+    }
+
+    async fn apply(&self, command: NodeCommand) -> Outcome {
+        let Some(cmd) = self.cmd.upgrade() else {
+            return Outcome::Failed(Fault::ShuttingDown);
+        };
+        let (tx, rx) = oneshot::channel();
+        if cmd.send((command, tx)).await.is_err() {
+            return Outcome::Failed(Fault::ShuttingDown);
+        }
+        rx.await.unwrap_or(Outcome::Failed(Fault::ShuttingDown))
+    }
+
+    /// Look over every open room, and start what is due.
+    async fn scan(self: Arc<Self>) {
+        let now = now_secs();
+        let mut found: Vec<Offer> = Vec::new();
+        let mut never: Vec<Digest32> = Vec::new();
+        {
+            let settled = self.settled.lock().await;
+            let view = self.view.borrow();
+            let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
+                return;
+            };
+            if view.locked {
+                return;
+            }
+            let me_b32 = b32_encode(&me);
+            for d in &view.open_channels {
+                for r in d.timeline.iter() {
+                    if r.owed || settled.contains(&r.entry_hash) {
+                        continue;
+                    }
+                    if r.author == me {
+                        never.push(r.entry_hash);
+                        continue;
+                    }
+                    let Some((name, size, sha256, tag, http)) = offer_in(&r.text, &me_b32) else {
+                        never.push(r.entry_hash);
+                        continue;
+                    };
+                    let created = r.created_millis / 1000;
+                    // Expired under the room's retention: there is nothing left to pull.
+                    if d.retention > 0 && now >= created.saturating_add(d.retention) {
+                        never.push(r.entry_hash);
+                        continue;
+                    }
+                    // From a member this node has not trusted: not yet. A later trust pulls it.
+                    if !view.trusted.iter().any(|(fp, _)| *fp == r.author) {
+                        continue;
+                    }
+                    found.push(Offer {
+                        room: d.channel_id,
+                        entry: r.entry_hash,
+                        author: r.author,
+                        name,
+                        size,
+                        sha256,
+                        tag,
+                        http,
+                        created,
+                    });
+                }
+            }
+        }
+        self.settled.lock().await.extend(never);
+        let mut pending = self.pending.lock().await;
+        let mut running = pending
+            .values()
+            .filter(|s| matches!(s, State::Running))
+            .count();
+        let at = Instant::now();
+        for offer in found {
+            if running >= AT_ONCE {
+                break;
+            }
+            let wait = match pending.get(&offer.entry) {
+                Some(State::Running) => continue,
+                Some(State::Waiting { until, .. }) if *until > at => continue,
+                Some(State::Waiting { wait, .. }) => *wait,
+                None => RETRY_MIN / 2,
+            };
+            pending.insert(offer.entry, State::Running);
+            running += 1;
+            let pulls = Arc::clone(&self);
+            tokio::spawn(async move {
+                let done = pulls.pull(&offer).await;
+                let mut pending = pulls.pending.lock().await;
+                match done {
+                    Ok(()) => {
+                        pending.remove(&offer.entry);
+                        pulls.settled.lock().await.insert(offer.entry);
+                    }
+                    Err(_) => {
+                        let wait = (wait * 2).clamp(RETRY_MIN, RETRY_MAX);
+                        pending.insert(
+                            offer.entry,
+                            State::Waiting {
+                                until: Instant::now() + wait,
+                                wait,
+                            },
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    /// Pull `offer`, verify it, and put it in place.
+    async fn pull(&self, offer: &Offer) -> Result<(), String> {
+        let dir = room_dir(&self.paths, &offer.room);
+        crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+        let bound = match self
+            .apply(NodeCommand::Forward {
+                channel_id: offer.room,
+                host: offer.author,
+                service_tag: offer.tag.clone(),
+                local: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            })
+            .await
+        {
+            Outcome::Bound(local) => local,
+            other => return Err(other.to_string()),
+        };
+        let name = safe_file_name(&offer.name);
+        let part = dir.join(format!(".{name}.{}.part", hex(&offer.entry[..8])));
+        let received = receive(bound, &part, offer).await;
+        let _ = self.apply(NodeCommand::StopForward { local: bound }).await;
+        if let Err(e) = received {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+        let placed = place(&part, &dir, &name);
+        let _ = std::fs::remove_file(&part);
+        let path = placed?;
+        let record = Pulled {
+            room: offer.room,
+            entry: offer.entry,
+            path,
+            created: offer.created,
+        };
+        crate::node::paths::create_private_dir(&self.paths.pulls_dir())
+            .and_then(|()| {
+                crate::node::paths::write_private_file(
+                    &self
+                        .paths
+                        .pulls_dir()
+                        .join(format!("{}.json", b32_encode(&offer.entry))),
+                    record.to_json().to_string().as_bytes(),
+                )
+            })
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Link a verified `.part` into `dir` under `name` or the first free variant of it, never
+/// replacing anything: a hard link fails if the name is taken.
+fn place(part: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
+    for n in 0..1000 {
+        let candidate = dir.join(numbered(name, n));
+        match std::fs::hard_link(part, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        }
+    }
+    Err(format!(
+        "every name from {name} on is taken in {}",
+        dir.display()
+    ))
+}
+
+/// Read the share through the forward at `bound` into `part`, refusing more bytes than were
+/// announced, a stall, and any result whose SHA-256 or size is not the announced one.
+async fn receive(bound: std::net::SocketAddr, part: &Path, offer: &Offer) -> Result<(), String> {
+    use sha2::{Digest as _, Sha256};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(part)
+        .map_err(|e| format!("{}: {e}", part.display()))?;
+    let mut sock = tokio::time::timeout(READ_TIMEOUT, tokio::net::TcpStream::connect(bound))
+        .await
+        .map_err(|_| "the forward did not answer".to_owned())?
+        .map_err(|e| format!("connecting to the forward: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    let mut take = |bytes: &[u8], total: &mut u64| -> Result<(), String> {
+        *total += bytes.len() as u64;
+        if *total > offer.size {
+            return Err("the sharer sent more than it announced".into());
+        }
+        hasher.update(bytes);
+        file.write_all(bytes)
+            .map_err(|e| format!("writing the pull: {e}"))
+    };
+    if offer.http {
+        let req = format!(
+            "GET /{} HTTP/1.1\r\nHost: vox\r\nConnection: close\r\n\r\n",
+            offer.name
+        );
+        sock.write_all(req.as_bytes())
+            .await
+            .map_err(|e| format!("asking for the share: {e}"))?;
+        let mut head = Vec::new();
+        let start = loop {
+            let n = tokio::time::timeout(READ_TIMEOUT, sock.read(&mut buf))
+                .await
+                .map_err(|_| "the sharer did not answer".to_owned())?
+                .map_err(|e| format!("reading the reply: {e}"))?;
+            if n == 0 {
+                return Err("the sharer closed before answering".into());
+            }
+            head.extend_from_slice(&buf[..n]);
+            if let Some(i) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+            if head.len() > 16 * 1024 {
+                return Err("the sharer's reply is not HTTP".into());
+            }
+        };
+        if !head.starts_with(b"HTTP/1.1 200") && !head.starts_with(b"HTTP/1.0 200") {
+            return Err("the sharer refused the request".into());
+        }
+        take(&head[start..], &mut total)?;
+    }
+    loop {
+        let n = tokio::time::timeout(READ_TIMEOUT, sock.read(&mut buf))
+            .await
+            .map_err(|_| "the transfer stalled".to_owned())?
+            .map_err(|e| format!("reading the transfer: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        take(&buf[..n], &mut total)?;
+    }
+    file.sync_all()
+        .map_err(|e| format!("flushing the pull: {e}"))?;
+    let got = hex(&hasher.finalize());
+    if got != offer.sha256 || total != offer.size {
+        return Err(format!(
+            "the transfer does not match what was announced: expected sha256 {} over {} bytes, \
+             got {got} over {total}",
+            offer.sha256, offer.size
+        ));
+    }
+    Ok(())
+}

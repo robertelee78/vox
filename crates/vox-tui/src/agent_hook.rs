@@ -551,7 +551,13 @@ pub(crate) fn words(text: &str) -> String {
     };
     if e.kind == crate::room_cli::FILE {
         if let (Some(name), Some(size)) = (e.data["name"].as_str(), e.data["size"].as_u64()) {
-            return format!("file offered: {name} ({size} bytes)");
+            // The note travels in the share itself (ADR-028 F-1), and is read with it.
+            return match e.data["note"].as_str().map(str::trim) {
+                Some(note) if !note.is_empty() => {
+                    format!("file offered: {name} ({size} bytes): {note}")
+                }
+                _ => format!("file offered: {name} ({size} bytes)"),
+            };
         }
     }
     let work = e.data.get(WORK_KEY).and_then(serde_json::Value::as_str);

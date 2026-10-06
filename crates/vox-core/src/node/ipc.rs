@@ -335,6 +335,12 @@ const T_ADMINS: u64 = 35;
 /// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
 const T_ROOM_ENDED: u64 = 2440;
 const T_ROOM_REMOVED: u64 = 2441;
+// File shares the daemon serves (ADR-028 F-1, F-2). Additive.
+const T_SHARE: u64 = 4930;
+const T_SHARE_STOP: u64 = 4931;
+const T_SHARE_LIST: u64 = 4932;
+/// [`Frame::Shares`].
+const T_SHARES: u64 = 4933;
 
 /// What a client sends.
 ///
@@ -409,6 +415,35 @@ pub enum Request {
     },
     /// The services this node offers in a room, answered with [`Frame::Services`] (V030-24).
     Services {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Share a file or a folder (ADR-028 F-1, F-2): the daemon hashes it, serves it and posts
+    /// `envelope` as its announcement, answered with [`Frame::Shares`] holding the one share once
+    /// it is served. The daemon serves it until its message expires, it is stopped, this node
+    /// leaves the room or the room ends; not for as long as this connection.
+    Share {
+        /// The room.
+        channel_id: Digest32,
+        /// The file or folder, absolute.
+        path: String,
+        /// The announcement as addressed (see [`crate::node::shares::ShareRequest`]).
+        envelope: String,
+        /// Stop after this many completed fetches; `0` for none.
+        count: u64,
+        /// Stop after this many seconds; `0` for none.
+        for_secs: u64,
+    },
+    /// Stop this node's shares in a room that `selector` names, answered with [`Frame::Shares`]
+    /// holding those stopped.
+    ShareStop {
+        /// The room.
+        channel_id: Digest32,
+        /// A name, a tag, or a prefix of a SHA-256 or of the announcement's entry.
+        selector: String,
+    },
+    /// This node's shares in a room, answered with [`Frame::Shares`].
+    ShareList {
         /// The room.
         channel_id: Digest32,
     },
@@ -703,6 +738,33 @@ impl Request {
             }
             Request::Services { channel_id } => {
                 e.array(2).uint(T_SERVICES_REQ).bytes(channel_id);
+            }
+            Request::Share {
+                channel_id,
+                path,
+                envelope,
+                count,
+                for_secs,
+            } => {
+                e.array(6)
+                    .uint(T_SHARE)
+                    .bytes(channel_id)
+                    .text(path)
+                    .text(envelope)
+                    .uint(*count)
+                    .uint(*for_secs);
+            }
+            Request::ShareStop {
+                channel_id,
+                selector,
+            } => {
+                e.array(3)
+                    .uint(T_SHARE_STOP)
+                    .bytes(channel_id)
+                    .text(selector);
+            }
+            Request::ShareList { channel_id } => {
+                e.array(2).uint(T_SHARE_LIST).bytes(channel_id);
             }
             Request::Rooms { after } => {
                 e.array(2)
@@ -1099,6 +1161,40 @@ impl Request {
                     after,
                 })
             }
+            (T_SHARE, 6) => {
+                let channel_id = digest(&mut d)?;
+                let path = text(&mut d, "ipc share path")?;
+                let envelope = text(&mut d, "ipc share envelope")?;
+                let count = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc share count"))?;
+                let for_secs = d.uint().map_err(|_| Error::MalformedIpc("ipc share for"))?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Share {
+                    channel_id,
+                    path,
+                    envelope,
+                    count,
+                    for_secs,
+                })
+            }
+            (T_SHARE_STOP, 3) => {
+                let channel_id = digest(&mut d)?;
+                let selector = text(&mut d, "ipc share selector")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::ShareStop {
+                    channel_id,
+                    selector,
+                })
+            }
+            (T_SHARE_LIST, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::ShareList { channel_id })
+            }
             (T_ADD_SERVICE, 5) => {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
@@ -1357,6 +1453,12 @@ pub enum Frame {
         /// as this node writes it, the kind as its sharer's node detected it (ADR-028 S-2).
         shared: Vec<(String, String, bool, String)>,
     },
+    /// File shares, as a [`Request::Share`], [`Request::ShareStop`] or [`Request::ShareList`]
+    /// asked for.
+    Shares {
+        /// Each share.
+        shares: Vec<crate::node::shares::ShareRow>,
+    },
 }
 
 impl Frame {
@@ -1482,6 +1584,18 @@ impl Frame {
                         .text(who)
                         .uint(u64::from(*udp))
                         .text(kind);
+                }
+            }
+            Frame::Shares { shares } => {
+                e.array(2).uint(T_SHARES).array(shares.len());
+                for r in shares {
+                    e.array(6)
+                        .text(&r.tag)
+                        .text(&r.name)
+                        .uint(r.size)
+                        .text(&r.sha256)
+                        .text(&r.entry)
+                        .uint(r.fetched);
                 }
             }
         }
@@ -2003,6 +2117,39 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 services,
                 shared,
             });
+        }
+        (T_SHARES, 2) => {
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc shares array"))?;
+            let mut shares = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc share row"))?
+                    != 6
+                {
+                    return Err(Error::MalformedIpc("ipc share row arity"));
+                }
+                let tag = text(d, "ipc share tag")?;
+                let name = text(d, "ipc share name")?;
+                let size = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc share size"))?;
+                let sha256 = text(d, "ipc share sha256")?;
+                let entry = text(d, "ipc share entry")?;
+                let fetched = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc share fetched"))?;
+                shares.push(crate::node::shares::ShareRow {
+                    tag,
+                    name,
+                    size,
+                    sha256,
+                    entry,
+                    fetched,
+                });
+            }
+            return Ok(Frame::Shares { shares });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -2576,8 +2723,8 @@ pub fn bind(handle: NodeHandle, paths: &crate::node::paths::Paths) -> Result<Ipc
 /// What a client opened over its connection and has not closed: a file offer's service,
 /// a get's forward.
 ///
-/// **They last as long as the connection** (V210-72). `vox room send` and `vox room get`
-/// withdrew them only on Ctrl-C, so a SIGTERM, a SIGHUP, a closed terminal or a crash left
+/// **They last as long as the connection** (V210-72). `vox room send` (since replaced by
+/// `vox share`) and `vox room get` withdrew them only on Ctrl-C, so a SIGTERM, a SIGHUP, a closed terminal or a crash left
 /// the offer's service registered — persisted, and pointing at a port some later process
 /// could take — and the get's forward listening. The daemon sees the connection close
 /// however the process ends, so it withdraws them itself.
@@ -3581,6 +3728,35 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         // Open or not by the node's own count, not by whether the view has caught up with an
         // open (V210-149): the one-shot form asks the same question the same way.
+        Request::Share {
+            channel_id,
+            path,
+            envelope,
+            count,
+            for_secs,
+        } => match handle
+            .shares()
+            .start(crate::node::shares::ShareRequest {
+                channel_id,
+                path: PathBuf::from(path),
+                envelope,
+                count,
+                for_secs,
+            })
+            .await
+        {
+            Ok(row) => Frame::Shares { shares: vec![row] },
+            Err(reason) => Frame::Error { reason },
+        },
+        Request::ShareStop {
+            channel_id,
+            selector,
+        } => Frame::Shares {
+            shares: handle.shares().stop(&channel_id, &selector).await,
+        },
+        Request::ShareList { channel_id } => Frame::Shares {
+            shares: handle.shares().list(&channel_id).await,
+        },
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
             Some(detail) => Frame::Services {
                 room: detail.local_name.clone(),

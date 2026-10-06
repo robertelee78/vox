@@ -13,22 +13,24 @@
 //!
 //! What it proves:
 //!
-//! 1. **A file crosses.** `vox room send` offers it and announces it; `vox room
-//!    get` on a *different node with a different identity* collects it, and the
-//!    bytes are identical.
+//! 1. **A file crosses.** `vox share` hands it to the sharer's daemon, which serves it and
+//!    announces it; `vox room get` on a *different node with a different identity*
+//!    collects it, and the bytes are identical.
 //! 2. **The announcement is durable and the bytes are live.** The offer is
 //!    discoverable from the log by name.
 //! 3. **A transfer that does not match what was announced is refused, and the
-//!    partial file is removed.** This is the property the hash exists for, and it
-//!    has nothing to do with secrecy: `cat | nc` **truncates silently** — the
-//!    connection drops, the receiver gets a partial file, and `nc` exits 0. A
-//!    receiver that kept those bytes would reproduce that failure with extra steps.
+//!    received file is removed.** This is the property the hash exists for, and it
+//!    has nothing to do with secrecy: bytes that are not the ones announced — a file
+//!    changed under its share, `cat | nc` truncating silently — must never be kept
+//!    looking complete.
 //! 4. **Asking for something nobody offered says so**, rather than hanging or
 //!    producing an empty file.
-//! 5. **Where the file lands is the receiver's decision** (PRD-001 R18, D4). It goes to
-//!    `~/Downloads` by default; a file already there is never overwritten; and an
-//!    announcement naming `../../x` or an absolute path — text another member wrote —
-//!    lands as a bare name inside the download directory, never where it points. A failed
+//! 5. **Where the file lands is the receiver's decision** (PRD-001 R18, D4; ADR-028 F-4). It goes
+//!    to the node's files directory for the room, `nodes/<node>/files/<room>/`, by default —
+//!    where bob's node has already pulled it by itself (F-3) — and a file already there is never
+//!    overwritten; and an announcement naming `../../x` or an absolute path — text another member
+//!    wrote — lands as a bare name inside the directory bob chose (`--dir`), never where it
+//!    points. A failed
 //!    transfer leaves nothing behind and never touches a file that was already there,
 //!    which the old code did twice over: `File::create` truncated it before a byte was
 //!    verified, and the mismatch path then deleted it.
@@ -150,8 +152,8 @@ impl Agent {
         )
     }
 
-    /// `vox` as a person runs it from a shell: with a home directory of its own (so the
-    /// `~/Downloads` default is observable) and from a working directory of its own (so a
+    /// `vox` as a person runs it from a shell: with a home directory of its own (so a file put
+    /// there unasked would be seen) and from a working directory of its own (so a
     /// relative path the sender wrote would resolve somewhere this proof can look).
     fn vox_at(
         &self,
@@ -389,12 +391,13 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     );
 
     // ---- (1) and (2) alice offers; the announcement reaches bob; bob collects ----
-    let _offer = alice.spawn(&[
-        "room",
-        "send",
+    // `vox share` returns once alice's daemon serves the file (ADR-028 F-2).
+    let (ok, shared, err) = alice.vox(&[
+        "share",
         &room,
         source.to_str().expect("APPARATUS: a UTF-8 temp path"),
     ]);
+    assert!(ok, "PRODUCT (staging): alice's `vox share`: {shared}{err}");
     until(
         &bob,
         "the announcement to reach bob",
@@ -440,7 +443,8 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     // A home directory and a working directory of bob's own, three levels deep, so that a
     // sender-chosen `../../x` would resolve to `work/x` — somewhere this proof can look.
     let home = tmp.path().join("home");
-    let downloads = home.join("Downloads");
+    // The directory bob names with `--dir`, where nothing lands unless he asks.
+    let downloads = home.join("incoming");
     let cwd = tmp.path().join("work").join("a").join("b");
     std::fs::create_dir_all(&cwd).expect("APPARATUS: create a staging dir");
     std::fs::create_dir_all(&downloads).expect("APPARATUS: create a staging dir");
@@ -450,27 +454,39 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     let escaped_from_downloads = tmp.path().join("x");
     let absolute = tmp.path().join("absolute-target.bin");
 
-    // (5a) the default is ~/Downloads, and a file already there is never overwritten: the
-    // collected one takes the next free name and the old bytes stay exactly as they were.
-    let precious = b"bob's own artifact.bin, which nobody may overwrite".to_vec();
-    std::fs::write(downloads.join("artifact.bin"), &precious)
-        .expect("APPARATUS: write a staging file");
+    // (5a) the default is the node's files directory for the room (ADR-028 F-4), where bob's
+    // node has pulled the share by itself (F-3); that copy is never overwritten: the collected one
+    // takes the next free name and the node's copy stays exactly as it was.
+    let files = bob
+        .data
+        .join("nodes")
+        .join("default")
+        .join("files")
+        .join(&room);
+    let t0 = std::time::Instant::now();
+    while !std::fs::read(files.join("artifact.bin")).is_ok_and(|b| b == payload) {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "PRODUCT: bob's node must pull a share for the room from a member it trusts, by \
+             itself, into {}",
+            files.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let (ok, out, err) = bob.vox_at(&["room", "get", &room, "artifact.bin"], &home, &cwd);
     assert!(
         ok,
-        "PRODUCT: collecting into ~/Downloads: stdout={out:?} stderr={err:?}"
-    );
-    let now = std::fs::read(downloads.join("artifact.bin")).unwrap_or_default();
-    assert!(
-        now == precious,
-        "PRODUCT: a file already in the download directory must be untouched — it holds {} bytes, it held {}",
-        now.len(),
-        precious.len()
+        "PRODUCT: collecting into the node's files directory: stdout={out:?} stderr={err:?}"
     );
     assert!(
-        std::fs::read(downloads.join("artifact (1).bin")).is_ok_and(|b| b == payload),
+        std::fs::read(files.join("artifact.bin")).is_ok_and(|b| b == payload),
+        "PRODUCT: the node's own copy must be untouched"
+    );
+    assert!(
+        std::fs::read(files.join("artifact (1).bin")).is_ok_and(|b| b == payload),
         "PRODUCT: the collected file must land beside it under the next free name: {out:?}"
     );
+    let dir = downloads.to_str().expect("APPARATUS: a UTF-8 temp path");
 
     // (5b) a hostile sender: announcements naming a path outside the download directory,
     // relative and absolute, for bytes that are genuinely on offer (the same service, size
@@ -482,18 +498,12 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     };
-    // The live offer's own tag, as `vox room send` printed it: it names the content and the
-    // offer (V210-72), so it is read rather than derived.
-    let tag = _offer
-        .said()
+    // The live share's own tag, as `vox share` printed it: it names the content and the
+    // share (V210-72), so it is read rather than derived.
+    let tag = shared
         .split_whitespace()
         .find(|w| w.starts_with(&format!("file-{}-", &sha[..16])))
-        .unwrap_or_else(|| {
-            panic!(
-                "PRODUCT: `vox room send` did not print its tag: {}",
-                _offer.said()
-            )
-        })
+        .unwrap_or_else(|| panic!("PRODUCT: `vox share` did not print its tag: {shared}"))
         .to_owned();
     for (hostile, lands_as) in [
         ("../../x", "x"),
@@ -506,7 +516,13 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             "v": 1,
             "type": "file",
             "body": "offering something",
-            "data": { "name": hostile, "size": payload.len(), "sha256": sha, "tag": tag },
+            "data": {
+                "name": hostile,
+                "size": payload.len(),
+                "sha256": sha,
+                "tag": tag,
+                "http": true,
+            },
         })
         .to_string();
         let (ok, _, err) = alice.vox(&["room", "post", &room, &forged]);
@@ -517,7 +533,8 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
             &["room", "read", &room],
             |o| o.contains(hostile),
         );
-        let (ok, out, err) = bob.vox_at(&["room", "get", &room, hostile], &home, &cwd);
+        let (ok, out, err) =
+            bob.vox_at(&["room", "get", &room, hostile, "--dir", dir], &home, &cwd);
         assert!(
             ok,
             "PRODUCT: collecting {hostile:?}: stdout={out:?} stderr={err:?}"
@@ -551,31 +568,28 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     let before = listed(&downloads);
     assert_eq!(
         before,
-        [
-            "absolute-target.bin",
-            "artifact (1).bin",
-            "artifact.bin",
-            "x"
-        ],
-        "PRODUCT: exactly the four files, and no leftover `.part`"
+        ["absolute-target.bin", "x"],
+        "PRODUCT: exactly the two files, and no leftover `.part`"
     );
 
-    // ---- (3) a real truncation is refused, and the partial file is removed ----
+    // ---- (3) bytes that are not the ones announced are refused, and removed ----
     //
-    // Not a hand-written announcement claiming the wrong hash — an actual short
-    // transfer, which is the failure this exists to catch. `cat | nc` truncates
-    // silently: the connection drops, the receiver gets a partial file, and `nc`
-    // exits 0. Here the offered file is shortened on disk **after** it was
-    // announced, so the sender serves fewer bytes than it signed for, exactly as a
-    // dropped connection would.
+    // Not a hand-written announcement claiming the wrong hash — an actual transfer of
+    // other bytes, which is the failure this exists to catch. Here the shared file is
+    // changed on disk **after** it was announced, at the same length, so the sharer's
+    // daemon serves every byte it promised and the transfer ends cleanly: only the
+    // hash can tell.
     let flaky = tmp.path().join("flaky.bin");
     std::fs::write(&flaky, &payload).expect("APPARATUS: write a staging file");
-    let _flaky_offer = alice.spawn(&[
-        "room",
-        "send",
+    let (ok, out, err) = alice.vox(&[
+        "share",
         &room,
         flaky.to_str().expect("APPARATUS: a UTF-8 temp path"),
     ]);
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's second `vox share`: {out}{err}"
+    );
     until(
         &bob,
         "the second announcement to reach bob",
@@ -583,10 +597,11 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
         |o| o.contains("flaky.bin"),
     );
 
-    // The offer re-opens the path for each collector, so shortening it now means the
-    // next transfer is short — while the announced size and hash still describe the
-    // whole file.
-    std::fs::write(&flaky, &payload[..100_000]).expect("APPARATUS: write a staging file");
+    // The daemon re-opens the path for each collector, so changing it now means the next
+    // transfer carries other bytes — while the announced size and hash still describe the
+    // file as it was shared.
+    let changed: Vec<u8> = payload.iter().map(|b| b ^ 0x5a).collect();
+    std::fs::write(&flaky, &changed).expect("APPARATUS: write a staging file");
 
     let bad = tmp.path().join("truncated.bin");
     let (ok, out, err) = bob.vox(&[
@@ -599,7 +614,7 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     ]);
     assert!(
         !ok,
-        "PRODUCT: a short transfer must be refused, not accepted silently: stdout={out:?}"
+        "PRODUCT: a transfer of other bytes must be refused, not accepted silently: stdout={out:?}"
     );
     assert!(
         err.contains("does not match what was announced"),
@@ -607,19 +622,23 @@ fn a_file_crosses_between_two_agents_and_a_mismatch_is_refused() {
     );
     assert!(
         !bad.exists(),
-        "PRODUCT: the partial file must be removed, not left looking complete: {err:?}"
+        "PRODUCT: the received file must be removed, not left looking complete: {err:?}"
     );
 
-    // (3b) the same short transfer into the download directory, where a file of that name
+    // (3b) the same transfer into the download directory, where a file of that name
     // already exists: refused, nothing new is left behind, and — the old code's worst case —
     // the file that was already there is neither truncated nor deleted.
     let theirs = b"bob's own flaky.bin, which a failed transfer must not touch".to_vec();
     std::fs::write(downloads.join("flaky.bin"), &theirs).expect("APPARATUS: write a staging file");
     let before = listed(&downloads);
-    let (ok, out, err) = bob.vox_at(&["room", "get", &room, "flaky.bin"], &home, &cwd);
+    let (ok, out, err) = bob.vox_at(
+        &["room", "get", &room, "flaky.bin", "--dir", dir],
+        &home,
+        &cwd,
+    );
     assert!(
         !ok,
-        "PRODUCT: a short transfer must be refused: stdout={out:?}"
+        "PRODUCT: a transfer of other bytes must be refused: stdout={out:?}"
     );
     assert!(
         err.contains("does not match what was announced"),
