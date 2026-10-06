@@ -151,18 +151,6 @@ pub struct FileOffer {
     pub note: String,
 }
 
-/// One member's lane in a room (ADR-028 W-3): its state, derived by the node from what the room
-/// carries.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct Lane {
-    /// The member's fingerprint, base32.
-    pub fingerprint: String,
-    /// This node's name for it, from the keyring; empty when it has none.
-    pub name: String,
-    /// `needs you`, `working`, `ready`, `done` or `away`, as `vox room board` says it.
-    pub state: String,
-}
-
 /// One event of this node's decision record (ADR-028 §7): what it decided, about whom, and why,
 /// in its own words; never message text, a file name, a passphrase or a key.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -2079,29 +2067,6 @@ impl VoxClient {
                 Frame::Rows { rows } => Ok(rows
                     .iter()
                     .map(|r| rendered(r, &names, me.as_deref()))
-                    .collect()),
-                other => Err(unexpected(&other)),
-            }
-        })
-    }
-
-    /// Each other member's lane in `room`, in the room's member order (ADR-028 W-3), as
-    /// `vox room board` shows it.
-    ///
-    /// # Errors
-    /// A malformed id, or the node's refusal.
-    pub async fn lanes(&self, room: String) -> Result<Vec<Lane>, VoxError> {
-        let channel_id = digest(&room, "room id")?;
-        on_held!(self, |c| {
-            let names = names(c).await?;
-            match ask(c, &Request::Lanes { channel_id }).await? {
-                Frame::Lanes { lanes } => Ok(lanes
-                    .into_iter()
-                    .map(|(member, state)| Lane {
-                        fingerprint: b32_encode(&member),
-                        name: names.get(&member).cloned().unwrap_or_default(),
-                        state: shown_name(&state),
-                    })
                     .collect()),
                 other => Err(unexpected(&other)),
             }

@@ -38,9 +38,9 @@ uniffi::setup_scaffolding!();
 mod client;
 pub use client::{
     config_dir, room_group, room_group_words, ClientListener, DecisionEvent, FileOffer, FileShare,
-    Lane, Member, NodeSummary, NodeView, OfferedService, Passphrase, PulledFile, ReadBy,
-    RoomConsents, RoomGroup, RoomLink, RoomMessage, RoomServices, RoomSummary, SharedService,
-    TrustedNode, UnreadLevel, VoxClient,
+    Member, NodeSummary, NodeView, OfferedService, Passphrase, PulledFile, ReadBy, RoomConsents,
+    RoomGroup, RoomLink, RoomMessage, RoomServices, RoomSummary, SharedService, TrustedNode,
+    UnreadLevel, VoxClient,
 };
 
 /// Anything that went wrong, with the core's reason.

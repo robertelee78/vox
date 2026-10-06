@@ -61,12 +61,6 @@ Task { @MainActor in
         await model.show(.room(room.id))
         settle(3)
         try render(MainWindow(model: model), "main-window")
-        if model.roomHasAgents {
-            model.showLanes = true
-            settle(1)
-            try render(MainWindow(model: model), "lanes")
-            model.showLanes = false
-        }
         await model.show(.keyring)
         settle(1)
         try render(MainWindow(model: model), "keyring")

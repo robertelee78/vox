@@ -158,20 +158,7 @@ private struct RoomView: View {
                     }
                     Divider()
                 }
-                if model.roomHasAgents {
-                    Picker("", selection: $model.showLanes) {
-                        Text("Timeline").tag(false)
-                        Text("Lanes").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 220)
-                    .padding(8)
-                    .accessibilityIdentifier("lanes-toggle")
-                }
-                if model.showLanes && model.roomHasAgents {
-                    LanesView(model: model)
-                } else {
+                Group {
                     GeometryReader { viewport in
                         ScrollViewReader { scroller in
                             // A scroll view of its own, not a List: a List's rows are cells whose frames
@@ -274,13 +261,13 @@ private struct RoomView: View {
                 .frame(width: 240)
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
-        // with the lanes view shown too.
+        // wherever the room's focus is.
         .sheet(item: $attaching) { file in
             AttachSheet(model: model, file: file) { attaching = nil }
         }
         .onChange(of: model.attachAsked) { _ in
             // After the update, not inside it: a modal panel run from within a view update did
-            // not open (⌘O in the lanes view, seen in the QE pass).
+            // not open (⌘O, seen in the QE pass).
             DispatchQueue.main.async {
                 if let url = chooseFile() { attaching = Attaching(url: url) }
             }

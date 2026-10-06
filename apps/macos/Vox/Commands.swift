@@ -81,11 +81,6 @@ extension VoxAction {
             VoxAction("Keyring", "Rename…", enabled: picked) { node?.askKeyring(.rename) },
             VoxAction("Keyring", "Remove…", enabled: picked) { node?.askKeyring(.remove) },
             VoxAction("View", "Command Palette", "k", enabled: live) { node?.sheet = .palette },
-            VoxAction("View", "Room", enabled: inRoom) { node?.showLanes = false },
-            VoxAction("View", "Lanes", "l", [.command, .shift],
-                      enabled: inRoom && node?.roomHasAgents == true) {
-                node?.showLanes = true
-            },
             VoxAction("View", "Keyring", "k", [.command, .shift], enabled: live) {
                 Task { await node?.show(.keyring) }
             },

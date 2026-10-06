@@ -28,9 +28,7 @@
 // 6. Attaching a file (ADR-014 M-24, ADR-028 F-1, #449): chosen with Attach…, addressed To: bob
 //    with a note, it is one share: bob's node pulls it by itself, byte for byte, and the note is
 //    in the share's announcement, never a message of its own.
-// 7. The lanes view (ADR-014 M-15, ADR-028 W-3, #442): bob posting `working` without a claim is
-//    not working; once he claims a resource and posts `working`, his lane's chip says working;
-//    ⌘O there opens the file panel, as on the timeline.
+// 7. (The lanes view: removed, ADR-029.)
 // 8. Notifications, a case of its own (testNotificationSaysWhoWroteNeverWhat), the one step that
 //    needs a person at the Mac (ADR-014 M-23, ADR-028 R-10, #448): with the keyring on screen, bob's message
 //    to alice posts one local notification, titled with the room, saying who wrote to her, and
@@ -60,10 +58,10 @@
 // that lists the members only when the room is opened: (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. A read batch sent
 // for the room on screen when it is flushed, not the room it was drawn in; To: kept across rooms;
-// ⌘O on the timeline only: (9), (9) and (7) go red. A copy of the readable address, by ⌘⇧C or the
+// (9) and (9) go red. A copy of the readable address, by ⌘⇧C or the
 // services view's Copy: (9) goes red. Remove untrusts at once, saying nothing
 // first: (5) goes red. The note is posted as a message
-// of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
+// of its own: (6) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
 // the sidebar's order: (9) goes red. The decision record oldest first: (10) goes red.
 // Untrust that leaves a member's live sessions running: (11) goes red. An app that counts
@@ -771,40 +769,7 @@ final class FirstRunProof: XCTestCase {
         let pulledBytes: Data? = got == want ? bytes : nil
         print("[proof] attached for-bob.bin To: bob; bob pulled \(pulledBytes?.count ?? 0) bytes; rows with the note: \(bobRows.count)")
 
-        // (7) Lanes. Working without a claim is not working.
-        // Coordination is owned per session: bob's posts and claims here are his session's.
-        try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "NO-CLAIM"],
-                   env: bobSession)
-        Thread.sleep(forTimeInterval: 10)
-        let lanesToggle = Key.id("lanes-toggle")
-        let bobLane = Key.id("lane-state-bob")
-        if locate(ui, lanesToggle) != nil {
-            tap(ui, Key.child(of: "lanes-toggle", button: "Lanes"), "Lanes")
-            if windowReadable(ui), el(ui, bobLane).waitForExistence(timeout: 5),
-               shown(el(ui, bobLane)) == "bob: working" {
-                XCTFail("PRODUCT: bob posted `working` holding no claim; his lane must not say working, and it says \"\(shown(el(ui, bobLane)))\"")
-            }
-            tap(ui, Key.child(of: "lanes-toggle", button: "Timeline"), "Timeline")
-        }
-        try staged(vox, ["room", "claim", "--node", "bob", room, "ticket-1"], env: bobSession)
-        try staged(vox, ["room", "post", "--node", "bob", "--type", "working", room, "ON-TICKET-1"],
-                   env: bobSession)
-        present(ui, lanesToggle, timeout: 30, "a room whose member works on a claim must offer the lanes view")
-        tap(ui, Key.child(of: "lanes-toggle", button: "Lanes"), "Lanes")
-        let laneWords = words(ui, bobLane, timeout: 30,
-                              "bob, holding ticket-1 with a working post, must show working in his lane",
-                              until: { $0 == "bob: working" }) ?? ""
-        print("[proof] lanes: \(laneWords)")
-        // ⌘O works with the lanes view shown, as with the timeline: the open panel shows.
-        if windowReadable(ui) {
-            ui.typeKey("o", modifierFlags: .command)
-            if present(ui, Key.id("open-panel"), timeout: 10,
-                       "⌘O in the lanes view must open the file panel to attach a file") {
-                tap(ui, Key.id("CancelButton"), "the file panel's Cancel")
-                _ = el(ui, Key.id("open-panel")).waitForNonExistence(timeout: 10)
-            }
-        }
-        tap(ui, Key.child(of: "lanes-toggle", button: "Timeline"), "Timeline")
+        // (7) The lanes view was removed (ADR-029 Sessions replace it; ADR-028 W-3 withdrawn).
 
         // (8) Notifications are their own case, testNotificationSaysWhoWroteNeverWhat: the one
         // step that needs a person at the Mac (Vox allowed to notify, no Focus on), run alone.

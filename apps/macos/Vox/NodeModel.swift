@@ -65,13 +65,10 @@ final class NodeModel: ObservableObject {
     @Published private(set) var messages: [RoomMessage] = [] {
         didSet {
             byID = Dictionary(messages.map { ($0.id, $0) }) { $1 }
-            helloSeen = messages.contains { $0.kind == "hello" && $0.author != me }
         }
     }
     /// The room on screen's messages by id, for what is in view.
     private(set) var byID: [String: RoomMessage] = [:]
-    /// Whether another member of the room on screen announced an agent session.
-    private(set) var helloSeen = false
     /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
     @Published private(set) var readBy: [String: [String]] = [:]
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
@@ -84,8 +81,6 @@ final class NodeModel: ObservableObject {
 
     /// The sheet a menu, key or palette action opened.
     @Published var sheet: NodeSheet?
-    /// The lanes view in place of the room's timeline (W-3).
-    @Published var showLanes = false
     /// Asks the room on screen to choose a file to attach (⌘O); each ask counts one up.
     @Published var attachAsked = 0
     /// Asks the room on screen to send its draft urgent (⌘↩).
@@ -98,11 +93,6 @@ final class NodeModel: ObservableObject {
     /// What a menu action last did, said where the person is (E-5).
     @Published var did: String?
 
-    /// Each other member's lane in the room on screen (ADR-028 W-3), as the node derives it.
-    @Published private(set) var lanes: [Lane] = []
-    /// The newest message of each member's lane when the person last looked at the lanes, by
-    /// fingerprint: what changed since is what came after (W-3).
-    @Published var laneLooked: [String: String] = [:]
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
     /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
@@ -280,7 +270,6 @@ final class NodeModel: ObservableObject {
         readBy = [:]
         pulled = [:]
         members = []
-        lanes = []
         roomServices = []
         selectedMessage = nil
         selectedService = nil
@@ -307,11 +296,9 @@ final class NodeModel: ObservableObject {
             guard case .room(id) = self.selection else { return }
             messages = read
             let services = (try? await client.services(room: id).shared) ?? []
-            let laneRows = (try? await client.lanes(room: id)) ?? []
             let rows = try await memberRows(id)
             guard case .room(id) = self.selection else { return }
             roomServices = services
-            lanes = laneRows
             members = rows
             watchReads(id)
         } catch {
@@ -690,7 +677,7 @@ final class NodeModel: ObservableObject {
 
     /// The room on screen, read again every few seconds while it is there, each part published
     /// only when it changed: who has read this node's messages (read records arrive with the
-    /// room's syncs and draw nothing of their own), the lanes, the pulled copies, the services
+    /// room's syncs and draw nothing of their own), the pulled copies, the services
     /// shared, and the members with their trust (one who joins while the room is on screen).
     private func watchReads(_ room: String) {
         watching?.cancel()
@@ -699,7 +686,6 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self, case .room(room) = self.selection else { return }
                 let reads = try? await self.client.readBy(room: room)
-                let laneRows = try? await self.client.lanes(room: room)
                 let copies = try? await self.client.pulled(room: room)
                 let services = try? await self.client.services(room: room).shared
                 let rows = try? await self.memberRows(room)
@@ -708,7 +694,6 @@ final class NodeModel: ObservableObject {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
                 }
-                if let laneRows, laneRows != self.lanes { self.lanes = laneRows }
                 if let copies {
                     let now = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
                     if now != self.pulled { self.pulled = now }
