@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks twenty-four claims, each
+//! 160x50. It checks twenty-five claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -70,6 +70,10 @@
 //!   Carol ". <her fingerprint>", every state still read by glyph, weight and word; in 16 colours (`TERM=xterm`)
 //!   every colour drawn is one of the 16; in 256 colours Alice's name is index 255 and Carol's 247.
 //!   In each the words are as in truecolour and the accent is on the focused border alone.
+//! - `copies`: Alice shares an ssh stand-in; Bob's Shared pane lists it, and `y` on it puts
+//!   `ssh $USER@<its canonical address>` on the clipboard by OSC 52, prints it in full under the
+//!   service and says "copied" on the status line, the address Alice's `vox service list --json`
+//!   gives (ADR-028 S-3, #490).
 //!
 //! The `target`, `delivers` and `revoke` claims are gone with `:consent grant|revoke` (V210-148): a
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
@@ -83,7 +87,7 @@
 //! carries the message text or is raised per message, a room with a message to Bob grouped other
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`). It passes only on the
-//! script's PASS with all 24 claims ok; or a join line naming a trusted member that has not
+//! script's PASS with all 25 claims ok; or a join line naming a trusted member that has not
 //! granted the newcomer (`newcomer`).
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
@@ -174,7 +178,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (24 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (25 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -188,8 +192,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (24, 24),
-                "APPARATUS: the driver said PASS without all 24 claims ok: {said}"
+                (25, 25),
+                "APPARATUS: the driver said PASS without all 25 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

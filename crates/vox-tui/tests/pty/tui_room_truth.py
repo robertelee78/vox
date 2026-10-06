@@ -75,6 +75,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             in 16 colours (TERM=xterm) every colour drawn is one of the 16 and the trust glyphs,
             weights and words are as in truecolour; in 256 colours (TERM=xterm-256color) Alice's
             name is index 255 and Carol's 247. In each the accent is on the focused border alone.
+  copies    Alice shares an ssh stand-in; in Bob's TUI the room's Shared pane lists it, and `y` on it
+            puts `ssh $USER@<its canonical address>` on the clipboard by OSC 52 and says "copied:"
+            on the status line, the address the one Alice's `vox service list --json` gives
+            (ADR-028 S-3, #490).
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
@@ -86,7 +90,7 @@ and exits 1. An exception in the driver itself prints `APPARATUS: driver crashed
 traceback and exits 2. Every process is recorded and killed by PID. Bounded throughout
 (`vox_pty.py`, V210-54).
 """
-import json, os, re, signal, subprocess, sys, time, traceback
+import base64, json, os, re, signal, socket, subprocess, sys, threading, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -263,6 +267,29 @@ try:
                              ("bob", "dave", "dave"), ("bob", "erin", "erin")):
         t = run(w, "trust", "add", fp[other], "--name", name, "--identity-passphrase-file", f"{S}/idpass")
         if t.returncode != 0: product(f"{w}'s `vox trust add` failed: {t.stderr.strip()}")
+    stage("alice shares an ssh stand-in")
+    # It greets as sshd does, so Alice's node detects it as ssh (ADR-028 S-2).
+    ssh_srv = socket.socket()
+    ssh_srv.bind(("127.0.0.1", 0)); ssh_srv.listen(8)
+    def ssh_greets():
+        while True:
+            try:
+                c, _ = ssh_srv.accept()
+                c.sendall(b"SSH-2.0-VoxProofStandIn\r\n"); c.close()
+            except OSError:
+                return
+    threading.Thread(target=ssh_greets, daemon=True).start()
+    a = run("alice", "service", "add", room, "nas-ssh", f"127.0.0.1:{ssh_srv.getsockname()[1]}")
+    if a.returncode != 0: product(f"alice's `vox service add` failed: {a.stderr.strip()}")
+    def ssh_canonical():
+        r = run("alice", "service", "list", room, "--json")
+        if r.returncode != 0: return None
+        return next((x["address"] for x in json.loads(r.stdout)["shared"]
+                     if x["readable"].startswith("nas-ssh.") and x["kind"] == "ssh"), None)
+    if not until(lambda: ssh_canonical() is not None, 60, 1):
+        product("alice's `vox service list --json` never listed nas-ssh as ssh within 60 s: "
+                + run("alice", "service", "list", room, "--json").stdout)
+    SSH_COPY = f"ssh $USER@{ssh_canonical()}"
     stage("alice posts")
     for i in range(1, POSTS + 1):
         p = run("alice", "room", "post", room, f"m-{i:03d}")
@@ -484,6 +511,24 @@ try:
     ok, detail = trust_look(tui, ("⇄ ", "→ ", "· "), HEX["text.primary"], HEX["text.secondary"],
                             {HEX["accent"]})
     claim("look", ok, f"in truecolour: {detail}")
+
+    stage("copies")
+    tui.key("\t", 1)   # members -> shared
+    shared_pane = lambda: [row.rstrip() for row in pane(tui.display(), "Shared")]
+    if not tui.until(lambda: any("▶" in r and "nas-ssh." in r for r in shared_pane()), 30, 1):
+        product("bob's `vox tui` never showed alice's nas-ssh selected in the room's Shared pane: "
+                + repr(shared_pane()))
+    mark = len(tui.raw)
+    tui.key("y", 2)
+    sent = bytes(tui.raw[mark:])
+    m = re.search(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(\x07|\x1b\\)", sent)
+    copied = base64.b64decode(m.group(1)).decode() if m else None
+    bar = tui.display()[-1] + tui.display()[-2]
+    claim("copies", copied == SSH_COPY and "copied: ssh $USER@" in bar,
+          f"OSC 52 carried {copied!r}, want {SSH_COPY!r}; status line: {bar.strip()!r}")
+    # Back round to the members pane, where the stages after this one expect focus.
+    for _ in range(3):
+        tui.key("\t", 0.5)
 
     stage("readby")
     p = run("bob", "room", "post", room, "r-001 read me")
