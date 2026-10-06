@@ -830,6 +830,8 @@ pub async fn post_raw(w: &Worker, cid: [u8; 32], text: &str) {
         .request(&vox_core::node::ipc::Request::Post {
             channel_id: cid,
             text: text.to_owned(),
+            // Exactly the text given: no link card.
+            card: false,
         })
         .await
     {

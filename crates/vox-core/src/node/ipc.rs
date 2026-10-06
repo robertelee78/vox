@@ -378,6 +378,9 @@ pub enum Request {
         channel_id: Digest32,
         /// The message text (an agent-comms envelope is JSON in here).
         text: String,
+        /// Whether the node fetches a link card for its first URL (ADR-028 F-10): `vox room post
+        /// --no-card` says not to.
+        card: bool,
     },
     /// Read a room's rendered timeline, optionally only what follows a cursor.
     Read {
@@ -728,8 +731,16 @@ impl Request {
                     e.bytes(h);
                 }
             }
-            Request::Post { channel_id, text } => {
-                e.array(3).uint(T_POST).bytes(channel_id).text(text);
+            Request::Post {
+                channel_id,
+                text,
+                card,
+            } => {
+                e.array(4)
+                    .uint(T_POST)
+                    .bytes(channel_id)
+                    .text(text)
+                    .uint(u64::from(*card));
             }
             Request::MarkRead {
                 channel_id,
@@ -992,15 +1003,20 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Ping)
             }
-            (T_POST, 3) => {
+            (T_POST, 4) => {
                 let channel_id = digest(&mut d)?;
                 let text = d
                     .text()
                     .map_err(|_| Error::MalformedIpc("ipc post text"))?
                     .to_owned();
+                let card = d.uint().map_err(|_| Error::MalformedIpc("ipc post card"))? != 0;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Post { channel_id, text })
+                Ok(Request::Post {
+                    channel_id,
+                    text,
+                    card,
+                })
             }
             (T_READ, 5) => {
                 let channel_id = digest(&mut d)?;
@@ -3622,7 +3638,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        Request::Post { channel_id, text } => {
+        Request::Post {
+            channel_id,
+            text,
+            card,
+        } => {
+            // **A link card is fetched here, by the sender's node, once** (ADR-028 F-10), and
+            // travels in the message: no reader's node ever contacts the linked site.
+            let text = if card {
+                crate::node::card::attach(&text).await
+            } else {
+                text
+            };
             // A room just joined is written to once its first sync with another member has ended
             // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
             // that rather than failing.

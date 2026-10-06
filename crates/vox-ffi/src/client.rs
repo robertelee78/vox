@@ -789,7 +789,16 @@ impl VoxClient {
                 });
             }
             let text = env.to_text();
-            done(c, &Request::Post { channel_id, text }).await
+            // A link card, fetched by this node (ADR-028 F-10).
+            done(
+                c,
+                &Request::Post {
+                    channel_id,
+                    text,
+                    card: true,
+                },
+            )
+            .await
         })
     }
 

@@ -268,7 +268,12 @@ fn body_of(text: Option<&str>) -> Result<String, AppError> {
 
 /// Append raw text, exactly as given. The internal path for verbs that build their
 /// own envelope (a file offer), and what `vox room post` does with no structured flag.
-pub(crate) async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Result<(), AppError> {
+pub(crate) async fn post(
+    paths: &Paths,
+    room: &str,
+    text: Option<&str>,
+    card: bool,
+) -> Result<(), AppError> {
     let body = body_of(text)?;
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
@@ -279,6 +284,7 @@ pub(crate) async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Resul
         .request(&Request::Post {
             channel_id,
             text: body,
+            card,
         })
         .await
     {
@@ -311,6 +317,8 @@ pub struct PostOpts {
     pub data: Option<String>,
     /// Session, operation id, JSON output.
     pub coord: CoordOpts,
+    /// Post without fetching a link card for the first URL (ADR-028 F-10).
+    pub no_card: bool,
 }
 
 impl PostOpts {
@@ -448,7 +456,7 @@ pub async fn post_cmd(
                 }
             }
         }
-        return post(paths, room, Some(&body)).await;
+        return post(paths, room, Some(&body), !opts.no_card).await;
     }
 
     let kind = opts.kind.clone().unwrap_or_else(|| "say".into());
@@ -585,6 +593,8 @@ pub async fn post_cmd(
         hops: hops_of_reply,
         body: body.trim_end().to_owned(),
         data,
+        // A link card for the body's first URL, fetched by this node (ADR-028 F-10).
+        card: !opts.no_card,
     };
     let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;

@@ -21,6 +21,9 @@ vox-agentcomms = { path = "../vox-agentcomms" }
 # The structured-post index (V210-120) reads a body's `type`: generic JSON, no app vocabulary.
 serde_json.workspace = true
 sha2.workspace = true
+# A link card, fetched once by the sender's node (ADR-028 F-10).
+reqwest.workspace = true
+base64.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 ed25519-dalek.workspace = true
