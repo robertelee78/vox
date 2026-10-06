@@ -26,6 +26,10 @@
 //   LISTED_FILES <n> <name> `shares`: this node's shares in the room
 //   (waits for a line on stdin: the peer has shared a file to this node)
 //   PULLED <path>           `pulled`: the file this node pulled by itself (up to 90 s)
+//   (waits for a line on stdin: a stand-in LAN helper's socket)
+//   LAN_UP <line>           `lanUp`, allowing port 5000, answered with the daemon's first line
+//   LAN_SAID <lines>        `lanSaid`: what the LAN has said, joined with " | "
+//   LAN_DOWN                `lanDown` took it down
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -122,6 +126,19 @@ do {
         if pulled.isEmpty { try await Task.sleep(nanoseconds: 250_000_000) }
     }
     say("PULLED \(pulled.first?.path ?? "")")
+    // The family LAN, through the helper the proof stands in for.
+    let helper = readLine() ?? ""
+    say("LAN_UP \(try await client.lanUp(room: room, allow: [5000], helperSocket: helper))")
+    // The lines after the first arrive as the LAN says them: up to 10 s for the next two.
+    var lanLines = try await client.lanSaid(room: room)
+    let saidUntil = Date().addingTimeInterval(10)
+    while lanLines.count < 3 && Date() < saidUntil {
+        try await Task.sleep(nanoseconds: 100_000_000)
+        lanLines = try await client.lanSaid(room: room)
+    }
+    say("LAN_SAID \(lanLines.joined(separator: " | "))")
+    try await client.lanDown(room: room)
+    say("LAN_DOWN")
     _ = readLine()
     await client.close()
     say("CLOSED")

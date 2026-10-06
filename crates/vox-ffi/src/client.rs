@@ -1501,13 +1501,19 @@ impl VoxClient {
 
     /// Bring this Mac onto `room`'s family LAN (ADR-013), as `vox lan up` does: the daemon asks the
     /// root helper for the interface and runs the LAN until [`Self::lan_down`] or the node is let
-    /// go of. `allow` are the local ports members may reach over it; none by default. Answers the
+    /// go of. `allow` are the local ports members may reach over it; none by default. The root
+    /// helper is asked on `helper_socket` (empty: where Vox.app's helper listens). Answers the
     /// daemon's first line, once the LAN is up: the interface and this node's LAN addresses.
     ///
     /// # Errors
     /// A malformed id, the room not open, the helper not running or refusing, or the LAN not
     /// started, with why.
-    pub async fn lan_up(&self, room: String, allow: Vec<u16>) -> Result<String, VoxError> {
+    pub async fn lan_up(
+        &self,
+        room: String,
+        allow: Vec<u16>,
+        helper_socket: String,
+    ) -> Result<String, VoxError> {
         use vox_core::node::lan_request::{LanRequest, LanSaid, DEFAULT_HELPER_SOCKET};
         let channel_id = digest(&room, "room id")?;
         let held = Arc::clone(&self.held);
@@ -1523,7 +1529,11 @@ impl VoxClient {
                 .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
             let req = LanRequest {
                 channel_id,
-                helper: PathBuf::from(DEFAULT_HELPER_SOCKET),
+                helper: PathBuf::from(if helper_socket.is_empty() {
+                    DEFAULT_HELPER_SOCKET
+                } else {
+                    &helper_socket
+                }),
                 stats_file: None,
                 allow: allow.into_iter().collect(),
             };

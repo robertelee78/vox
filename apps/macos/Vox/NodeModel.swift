@@ -172,7 +172,7 @@ final class NodeModel: ObservableObject {
         lanFailed[room] = nil
         do {
             if on {
-                lanSaid[room] = try await client.lanUp(room: room, allow: [])
+                lanSaid[room] = try await client.lanUp(room: room, allow: [], helperSocket: "")
                 lanOn.insert(room)
             } else {
                 try await client.lanDown(room: room)

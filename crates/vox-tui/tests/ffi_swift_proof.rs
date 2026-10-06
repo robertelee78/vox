@@ -23,7 +23,12 @@
 //!    it by itself into its files directory, byte for byte, and `shares` lists it as the app's own
 //!    `vox share list` does. A file the peer shares to the app (`vox share --to`) is pulled by the
 //!    app's node by itself, and `pulled` gives where, byte for byte (ADR-028 F-1–F-4, #436).
-//! 5. When the client closes, the daemon detaches the node it attached (`vox node list` says
+//! 5. `lanUp` brings the app's node onto the room's family LAN through the root helper, here a
+//!    stand-in answering the helper's protocol (apparatus, no root: `support/lan_standin.rs`):
+//!    the helper is asked for the node's LAN addresses, the answer names the interface it handed
+//!    over, the LAN says the port it was told to allow, and `lanDown` takes it down (ADR-013,
+//!    ADR-014 M-10, #439). The real helper and `utun` are `scripts/family-lan-proof.sh`.
+//! 6. When the client closes, the daemon detaches the node it attached (`vox node list` says
 //!    `detached`): the app's hold ends with it (M-6).
 //!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
@@ -43,6 +48,9 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/lan_standin.rs"]
+mod lan_standin;
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -595,7 +603,16 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     let pulled = expect(&from_app, &seen, "PULLED ")[7..].to_owned();
     let at_app = std::fs::read(&pulled).ok();
 
-    // (5) The app closes; the daemon lets the node go.
+    // (5) The family LAN, through a stand-in helper.
+    let helper = tmp.path().join("helper.sock");
+    let os = lan_standin::Os::default();
+    os.serve(&helper);
+    writeln!(to_app, "{}", helper.display()).unwrap();
+    let lan_up = expect(&from_app, &seen, "LAN_UP ");
+    let lan_said = expect(&from_app, &seen, "LAN_SAID ");
+    expect(&from_app, &seen, "LAN_DOWN");
+    let asked = os.asked.lock().unwrap().clone();
+    // (6) The app closes; the daemon lets the node go.
     writeln!(to_app).unwrap();
     expect(&from_app, &seen, "CLOSED");
     let until = Instant::now() + TIMEOUT;
@@ -615,8 +632,9 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "{joined}\nwhile attached, `vox node list` said: {listed}{posted}\npeer's read shows the \
          app's post: {}\n{got}\n{shared}\n`vox service list` said: {cli_list}BOUND {bound}, \
          echoed {through:?}, refused once stopped: {refused_after}\nstatus identity {} (vox \
-         status: {})\n{shared_file}; {listed_files}; the peer has it: {}; PULLED {pulled}, matches: {}\nafter \
-         close, `vox node list` said: {after}all the Swift program said: {:?}",
+         status: {})\n{shared_file}; {listed_files}; the peer has it: {}; PULLED {pulled}, matches: {}\n\
+         helper asked {asked:?}; {lan_up}; {lan_said}\nafter close, `vox node list` said: {after}all \
+         the Swift program said: {:?}",
         read.contains("hello from swift"),
         status["identity"],
         cli_status["identity"],
@@ -671,6 +689,26 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
          {} against {}",
         status["identity"],
         cli_status["identity"]
+    );
+    assert!(
+        asked.len() == 1
+            && asked[0].starts_with("up 100.")
+            && asked[0]
+                .split_whitespace()
+                .nth(2)
+                .is_some_and(|v6| v6.starts_with("fd")),
+        "PRODUCT: `lanUp` must ask the helper once for the node's LAN addresses (100.64.0.0/10, \
+         fd00::/8); it asked {asked:?}"
+    );
+    assert!(
+        lan_up.starts_with("LAN_UP vox lan up on utun-standin"),
+        "PRODUCT: `lanUp` must answer once the LAN is up on the interface the helper handed over; \
+         it said {lan_up:?}"
+    );
+    assert!(
+        lan_said.contains("reachable over the LAN: ports 5000"),
+        "PRODUCT: the LAN must carry the port `lanUp` was told to allow, as `vox lan up --allow` \
+         says it; it said {lan_said:?}"
     );
     assert!(
         after
