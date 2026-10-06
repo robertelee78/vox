@@ -54,9 +54,14 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   every buffer Rust owns after that (the `Passphrase` object, each request's copy, the encoded
   frame) is zeroized when dropped.
 - **M-6.** The app MUST act as one node, chosen at first run and shown in the sidebar
-  (ADR-028 E-4). It MUST attach that node on launch, with the passphrase from the Keychain when
-  stored there (ADR-028 K-10) or else asked for, and MUST detach it on quit (ADR-028 A-4) unless
-  the node is kept attached by `--keep` or held by another client.
+  (ADR-028 E-4). It MUST attach that node on launch, or find it attached, asking for its
+  passphrase when it needs one. The app MUST keep the node attached after it quits only when the
+  person chose Keep Running (M-8) and either stored the node's passphrase in the Keychain when
+  attaching it (ADR-028 K-10) or the node needs none; then the daemon keeps it as `--keep` does,
+  and attaches it again whenever it starts. The passphrase MUST be stored by the daemon, only
+  after it has attached the node with it, and read back by the daemon alone. In every other case
+  quitting MUST detach the node (ADR-028 A-4), unless another client holds it or it was kept by
+  hand.
 - **M-7.** Every user-visible failure MUST be the daemon's sentence, shown where the action was
   taken, never a generic error.
 
@@ -66,7 +71,9 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
   `SMAppService.agent(plistName:)`, from a launch agent plist inside the bundle
   (`Contents/Library/LaunchAgents/us.vox.daemon.plist`) running the bundle's own `vox daemon`
   (ADR-028 A-5). The app MUST ask once, at first run, and say what it does: Vox keeps your rooms
-  reachable while you are logged in, even with the app closed.
+  reachable while you are logged in, even with the app closed. Choosing Keep Running also keeps the
+  node attached after quit, by M-6's rule; when the person declines to store the passphrase, the
+  app MUST say plainly that the rooms are reachable only while Vox is open.
 - **M-9.** The app MUST start and reach that daemon; it MUST NOT start a second one for the same
   data root (ADR-026 D-1). With the login item declined, the app MUST start the daemon as `vox`
   does (ADR-026 S-2).

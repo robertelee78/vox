@@ -319,11 +319,63 @@ impl Router {
         rooms: Vec<Zeroizing<String>>,
         anchors: Vec<String>,
     ) -> Result<(NodeInfo, Vec<String>), Refusal> {
-        let g = self
+        // **Kept with its passphrase in the Keychain** (ADR-028 K-10, ADR-014 M-6): stored only
+        // once this very request attached the node with it, so a passphrase nothing checked is
+        // never stored. The daemon names the item by the node's own directory.
+        let keychain = match &keep {
+            Some(KeepSource::Keychain(_)) => {
+                let Some(secret) = passphrase.clone() else {
+                    return Err(Refusal::Failed {
+                        node: node.clone(),
+                        why: "keeping a node with its passphrase in the Keychain needs the \
+                              passphrase"
+                            .into(),
+                    });
+                };
+                if lock(&self.inner.slots).contains_key(node) {
+                    return Err(Refusal::Failed {
+                        node: node.clone(),
+                        why: format!(
+                            "node {node} is attached already, so its passphrase would be stored \
+                             unchecked; detach it, then keep it"
+                        ),
+                    });
+                }
+                Some((self.keychain_account(node), secret))
+            }
+            _ => None,
+        };
+        let keep = match (&keychain, keep) {
+            (Some((account, _)), _) => Some(KeepSource::Keychain(account.clone())),
+            (None, keep) => keep,
+        };
+        let mut g = self
             .want(node, Want::Explicit(keep), passphrase, rooms, anchors)
             .await?;
+        if let Some((account, secret)) = keychain {
+            if let Err(e) = crate::keychain::store(&account, &secret) {
+                // Attached, but not kept: nothing could attach it again at the next start.
+                if let Some(Slot::Attached(a)) = lock(&self.inner.slots).get_mut(node) {
+                    a.keep = None;
+                    g.info = info_of_attached(node, a);
+                }
+                g.notes.push(format!(
+                    "node {node} is attached, but not kept: its passphrase could not be stored \
+                     in the Keychain: {e}"
+                ));
+            }
+        }
         self.write_attach_file(None);
         Ok((g.info, g.notes))
+    }
+
+    /// The Keychain account a kept node's passphrase is stored under: its directory.
+    fn keychain_account(&self, node: &NodeName) -> String {
+        self.inner
+            .account
+            .node_dir(node)
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// Grant a connection's `Use` (C-2), attaching the node implicitly when the `Use` holds it.
@@ -499,6 +551,16 @@ impl Router {
             self.inner.rt.spawn(async move {
                 let (passphrase, rooms) = match &source {
                     KeepSource::None => (None, Vec::new()),
+                    KeepSource::Keychain(account) => match crate::keychain::read(account) {
+                        Ok(p) => (Some(p), Vec::new()),
+                        Err(e) => {
+                            eprintln!(
+                                "vox daemon: could not attach kept node {node}: its passphrase in \
+                                 the Keychain: {e}"
+                            );
+                            return;
+                        }
+                    },
                     KeepSource::File(path) => match crate::tunnel_cli::passphrase_file_text(path) {
                         Ok(text) => split_passphrases(&text),
                         Err(e) => {
@@ -917,6 +979,10 @@ impl Router {
             self.inner.unfinished_stop.store(true, Ordering::SeqCst);
         }
         let forget_keep = matches!(cause, DetachCause::Requested) && a.keep.is_some();
+        // Detached by hand: a passphrase kept for it in the Keychain goes too.
+        if let (true, Some(KeepSource::Keychain(account))) = (forget_keep, &a.keep) {
+            crate::keychain::forget(account);
+        }
         drop(a);
         lock(&self.inner.slots).remove(&node);
         self.inner
@@ -973,6 +1039,10 @@ impl Router {
                 KeepSource::File(p) => {
                     text.push_str("file:");
                     text.push_str(&p.to_string_lossy());
+                }
+                KeepSource::Keychain(account) => {
+                    text.push_str("keychain:");
+                    text.push_str(account);
                 }
             }
             text.push('\n');
@@ -1071,8 +1141,8 @@ fn split_passphrases(text: &str) -> (Option<Zeroizing<String>>, Vec<Zeroizing<St
     (identity, lines.filter(|l| !l.is_empty()).collect())
 }
 
-/// `.daemon/attach`: one line per kept node, `<name>\t(none|file:<path>)`. A line that does not
-/// parse is skipped.
+/// `.daemon/attach`: one line per kept node, `<name>\t(none|file:<path>|keychain:<account>)`. A
+/// line that does not parse is skipped.
 fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSource)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -1083,6 +1153,8 @@ fn read_attach_file(path: &std::path::Path) -> Vec<(NodeName, KeepSource)> {
             let name = NodeName::parse(name).ok()?;
             let source = if source == "none" {
                 KeepSource::None
+            } else if let Some(account) = source.strip_prefix("keychain:") {
+                KeepSource::Keychain(account.to_owned())
             } else {
                 KeepSource::File(source.strip_prefix("file:")?.into())
             };

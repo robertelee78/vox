@@ -25,8 +25,21 @@ struct VoxApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let model = AppModel()
+    /// SIGTERM, SIGHUP and SIGINT, each a clean quit (ADR-026 S-4).
+    private var stops: [DispatchSourceSignal] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // **A stop signal quits the app as ⌘Q does** (ADR-026 S-4): the node is let go of by the
+        // same rule, rather than the process ending under it.
+        for sig in [SIGTERM, SIGHUP, SIGINT] {
+            signal(sig, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            // Out of the queue's callout: terminating runs a nested event loop until the node is
+            // let go of, and that work is on the main queue, which a callout would hold.
+            source.setEventHandler { RunLoop.main.perform { NSApp.terminate(nil) } }
+            source.resume()
+            stops.append(source)
+        }
         Task { await model.start() }
     }
 

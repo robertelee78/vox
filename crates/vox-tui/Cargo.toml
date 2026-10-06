@@ -83,6 +83,9 @@ getrandom.workspace = true
 # nix's safe wrappers so `#![forbid(unsafe_code)]` holds.
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
+# A kept node's identity passphrase in the login keychain, stored and read by the daemon only
+# (ADR-028 K-10, ADR-014 M-6): the crate's safe password calls.
+security-framework = "3"
 
 # A daemon a client starts closes every descriptor it inherited past stdio (ADR-026 S-2), with
 # nix's safe `close`, so `#![forbid(unsafe_code)]` holds on Linux too.

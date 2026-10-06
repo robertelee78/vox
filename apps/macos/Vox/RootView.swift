@@ -137,6 +137,8 @@ private struct PassphraseForm: View {
     let said: String?
     let model: AppModel
     @State private var field = SecureFieldHolder()
+    /// ADR-028 K-10: off until the person turns it on, for this node.
+    @State private var keepInKeychain = false
 
     var body: some View {
         Text("Attach node \(node)").font(Theme.heading)
@@ -145,6 +147,16 @@ private struct PassphraseForm: View {
             .frame(width: 320)
             .accessibilityIdentifier("passphrase")
             .accessibilityLabel("Identity passphrase for node \(node)")
+        if model.keepRunning {
+            Toggle("Store the passphrase in the Keychain, so node \(node) stays attached when "
+                + "Vox quits", isOn: $keepInKeychain)
+                .accessibilityIdentifier("keep-in-keychain")
+            Text(keepInKeychain
+                ? "Anyone who can unlock this Mac's login keychain can then attach node \(node)."
+                : "Without it, your rooms are reachable only while Vox is open.")
+                .secondaryText()
+                .accessibilityIdentifier("keep-in-keychain-why")
+        }
         if let said {
             Said(text: said)
         }
@@ -155,7 +167,8 @@ private struct PassphraseForm: View {
 
     private func submit() {
         let bytes = field.take()
-        Task { await model.attach(node, passphrase: bytes) }
+        let keep = keepInKeychain
+        Task { await model.attach(node, passphrase: bytes, keepInKeychain: keep) }
     }
 }
 
