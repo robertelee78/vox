@@ -85,3 +85,20 @@ Input to ADR-028 §2a.
 - **Accepting asks "read, or read + drive?"**, with read the default.
 - **An unanswered offer waits** under needs you until accepted, dismissed (silently) or the joiner leaves.
 - **No forced fingerprint comparison.** "It's expected that the user who is accepting the fingerprint knows how to do validation that they required for their threat model."
+
+## Sessions (2026-10-05 and 2026-10-06)
+
+Input to ADR-029. Sessions are in v0.4.0.
+
+- **Two jobs, kept apart.** ctm mirrors one session to a place the person can drive 1:1 from anywhere; agent comms is n sessions, on any harness and computer, collaborating on one repository. "I kind of want both ... session level, and repo level groupings."
+- **One room per repository** is the central place where every node with a session on it talks. Inside it, a **Session** per harness session, like a Telegram forum topic: a sidebar of Sessions beside the room's own conversation ("General") and everything merged ("All").
+- **A Session appears automatically** for every interactive harness session; headless runs get none; `resume` keeps it.
+- **Retention.** A Session's content follows the room's retention and is never deleted because the session ended; an ended Session is only moved out of the way.
+- **Drive is a capability on trust**, not a separate trust: one keyring entry per node, with "may read me" and "may drive my sessions". Capabilities apply in every room shared, limited by room membership: "she might not be in all the rooms."
+- **Only nodes with drive see inside a Session.** Others see only that it exists.
+- **First version of driving:** see activity with Details, see replies and turn ends, type in, interrupt or stop, approve or reject tool calls, answer its questions, send slash commands, send files or images, receive files. Not mute.
+- **Talking is not driving.** Another session may ask one specific session something ("the project 4 session should have a way to ask a question of the project 5 agent separately from the project 6 agent, even though it's the same node"). Waking a session is talking: "it's not driving ... it's 'yo, let's chat'."
+- **Every agent message carries its session id and session name** (the harness's /rename), filled in automatically.
+- **The room a session works in** comes from a per-machine file like `~/.ssh/config`: `/path/to/repo` → room link + passphrase, readable by every node on the machine. Only the exact start path matters ("I never start a new session directly from a work tree"); the room stays the same for the session's life, whatever branch, worktree or other repository's files it touches. With no entry, the operator tells it which room. A manual change moves the session; "I don't plan to do that."
+- **Setup** detects the installed harnesses and creates one node per harness, plus an optional node for the person on macOS or iOS, and prints each node's fingerprint with facts about the node.
+- **Clients:** the TUI and the macOS app, kept in sync; the iOS app is not designed yet.

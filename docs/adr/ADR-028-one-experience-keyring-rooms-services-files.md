@@ -102,8 +102,7 @@ by any of them (ADR-001: there is no typed agent or human).
   its passphrase from an environment variable, a file or the Keychain (K-10 covers attach only).
 - **K-14. Capabilities.** A keyring entry MUST carry what it grants: **read** (what trust means
   today, ADR-020 §3), or **read + drive**, stored in the sealed keyring with the entry. Both clients
-  and `vox trust list` MUST show it. What drive permits is to be specified with Sessions, which are
-  not in v0.4.0; until then, an entry with drive MUST grant exactly what read grants.
+  and `vox trust list` MUST show it. What drive permits is ADR-029 §3 (Sessions, v0.4.0).
 - **K-15. A join offers trust.** When a node joins a room, each member whose keyring does not hold
   it MUST be offered the newcomer: an item under **needs you** (W-2) showing its fingerprint grouped
   with its art (K-1) and what K-7 says about it. The offer MUST be derived from the join on the log;
@@ -340,7 +339,8 @@ structure for both clients; the TUI renders the same regions in text.
   status bar with the node, its peers and the keyring window (K-9). Keyring and Services MUST be
   views of the same window, not separate windows.
 - **W-2.** The sidebar MUST group rooms by what they need from the person, with counts: **needs
-  you** (a message addressed to this node unread, urgent first, or a trust offer waiting, K-15),
+  you** (a message addressed to this node unread, urgent first, a trust offer waiting, K-15, or a
+  Session waiting on this node, ADR-029 CL-2),
   **active** (new messages, or a
   member holding a claim), and **quiet**. A key MUST move to the next room that needs the person.
 - **W-3.** A room whose members include agents' nodes MUST offer a **lanes** view: one column per
@@ -361,8 +361,9 @@ structure for both clients; the TUI renders the same regions in text.
 - **W-5.** "Add to room" MUST show the room link with a copy action and a reminder to send the
   passphrase another way; a node joins only by its own `vox room join` (ADR-005 J-1). The client
   MUST NOT join, trust or act for another node.
-- **W-6.** A client MUST NOT show an agent's tool calls, thoughts or turn-by-turn activity: Vox is
-  not a mirror of agent activity (ADR-020, Non-goals). Progress stays on the GitHub issue (ADR-021).
+- **W-6.** A client MUST NOT show an agent's tool calls, thoughts or turn-by-turn activity in the
+  room's timeline or lanes. *Amended by ADR-029 SC-4:* that activity is shown only in the session's
+  Session, to members with drive. Progress stays on the GitHub issue (ADR-021).
 
 ### 10. The app's shell (input to the ADR-014 rewrite)
 
