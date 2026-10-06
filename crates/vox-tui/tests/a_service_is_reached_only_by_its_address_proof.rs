@@ -817,6 +817,9 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         Some(&format!("{passphrase}\n")),
     );
     assert!(ok, "PRODUCT (staging): dave joins alice's room: {out}{err}");
+    // dave's node sleeps while alice shares, so the share cannot reach it before he pastes.
+    let dave_pid = pid_of(&dave_dir);
+    assert!(signal("STOP", dave_pid), "APPARATUS: SIGSTOP dave");
     let web_at = echo("web");
     let (ok, out, err) = vox(
         &alice_dir,
@@ -838,6 +841,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          {alice_list}"
     );
     let others = [alice_pid, others[0], others[1]];
+    let _ = signal("CONT", dave_pid);
     let dave_started = Instant::now();
     let (dave_up, dave_proxy) = up("dave up", &dave_dir);
     let by_proxy = std::thread::spawn({
