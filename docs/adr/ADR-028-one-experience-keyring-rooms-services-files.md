@@ -2,24 +2,24 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.0 (the decider, 2026-10-05); §2a added from the decider's answers of
-2026-10-06. Nothing in this ADR is built unless a requirement says so.
+**Status**: Accepted for v0.4.0 (the decider, 2026-10-05); §2a added, and the lanes view (W-3)
+removed, from the decider's answers of 2026-10-06. Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
 **Tags**: ux, tui, macos, keyring, rooms, services, files, look, install
-**Related**: ADR-001, ADR-005, ADR-007, ADR-008, ADR-014, ADR-015, ADR-016, ADR-017, ADR-020, ADR-021, ADR-023, ADR-026, ADR-027
+**Related**: ADR-001, ADR-005, ADR-007, ADR-008, ADR-014, ADR-015, ADR-016, ADR-017, ADR-020, ADR-021, ADR-023, ADR-026, ADR-027, ADR-029
 **Inputs**: [docs/ux/v040-ux-research.md](../ux/v040-ux-research.md) and the decider's answers in
 [docs/ux/v040-ux-interview-decisions.md](../ux/v040-ux-interview-decisions.md) (2026-10-03, 2026-10-04,
 2026-10-05, including the answers to this ADR's first draft's open questions, and 2026-10-06 for
-§2a); the website's app study (`voxlux.us` `src/components/Experience.astro`).
+§2a, W-3 and W-4); the website's app study (`voxlux.us` `src/components/Experience.astro`).
 
 ## Context
 
 v0.4.0 is the native macOS app (ADR-014, to be rewritten) beside the TUI (ADR-015). Both are
-clients of the daemon (ADR-026 S-4). Vox has only rooms, nodes, trust and services; this ADR
-defines how a person sees and uses them, once, for both clients, and amends the ADR lines the
-decider's answers overrule. It adds no concept beyond those four, except the four the decider
-named: read records, the room's shared name, the decision record and the token file.
+clients of the daemon (ADR-026 S-4). Vox has only rooms, nodes, Sessions (ADR-029), trust and
+services; this ADR defines how a person sees and uses them, once, for both clients, and amends the
+ADR lines the decider's answers overrule. It adds no concept beyond those, except the four the
+decider named: read records, the room's shared name, the decision record and the token file.
 
 ## Requirements
 
@@ -29,7 +29,7 @@ named: read records, the room's shared name, the decision record and the token f
   (where its members talk and share), and services and files (what is reachable through a room).
   A task MUST take the same steps and the same words in both clients.
 - **E-2.** The words MUST be: node, fingerprint, keyring, alias, room, room link, passphrase,
-  service, address, file, trust, untrust. "Contact", "channel", "invite", "consent", "safety code",
+  Session, service, address, file, trust, untrust. "Contact", "channel", "invite", "consent", "safety code",
   "verified" and "block" MUST NOT appear in what either client or the CLI says.
 - **E-3.** There MUST be no contacts list, no directory and no separate 1:1 path (ADR-001): a
   direct message is a two-member room.
@@ -343,8 +343,9 @@ structure for both clients; the TUI renders the same regions in text.
   member holding a claim), and **quiet**. A key MUST move to the next room that needs the person.
 - **W-3.** *Removed (the decider, 2026-10-06):* there MUST be no lanes view. A room shows its own
   conversation and its Sessions (ADR-029 §8): Vox has rooms, nodes and Sessions.
-- **W-4.** The room's composer MUST carry a **To:** selector of members and of their open Sessions
-  (written into `to`, ADR-020 4.6 as amended by ADR-029 TA-1) and an urgent switch (ADR-020 4.5). There MUST be no hidden
+- **W-4.** The room's composer MUST carry a **To:** selector of members and of their open
+  Sessions (written into `to`, ADR-020 4.6 as amended by ADR-029 TA-1) and an urgent switch
+  (ADR-020 4.5). There MUST be no hidden
   coordinator: the composer posts as this node, into this room, like any message.
 - **W-5.** "Add to room" MUST show the room link with a copy action and a reminder to send the
   passphrase another way; a node joins only by its own `vox room join` (ADR-005 J-1). The client

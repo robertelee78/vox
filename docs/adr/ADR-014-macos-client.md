@@ -2,11 +2,12 @@
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC 2119] [RFC 8174] when, and only when, they appear in all capitals, as shown here.
 
-**Status**: Accepted for v0.4.0 (the decider, 2026-10-05). Nothing in this ADR is built unless a requirement says so.
+**Status**: Accepted for v0.4.0 (the decider, 2026-10-05); M-15, M-20 and M-21 amended to remove
+the lanes view (the decider, 2026-10-06). Nothing in this ADR is built unless a requirement says so.
 **Date**: 2026-10-05
 **Deciders**: Robert E. Lee
 **Tags**: client, macos, swiftui, appkit, daemon-client, packaging
-**Related**: ADR-001, ADR-013, ADR-015, ADR-017, ADR-018, ADR-020, ADR-026, ADR-028
+**Related**: ADR-001, ADR-013, ADR-015, ADR-017, ADR-018, ADR-020, ADR-026, ADR-028, ADR-029
 
 ## Context
 
@@ -146,7 +147,7 @@ app (v0.4.1) hosts its own node and is not covered here; calls are v0.5.0.
 
 ### 4. ADR-028 requirements the app must meet
 
-The app MUST meet, and each story is to cite: E-1–E-6; K-1–K-10; R-1–R-10; S-1, S-1a, S-1b, S-3,
+The app MUST meet, and each story is to cite: E-1–E-6; K-1–K-20; R-1–R-10; S-1, S-1a, S-1b, S-3,
 S-4 (S-2 and S-5 are the daemon's); F-1, F-3, F-4, F-6 (the hook's part is the agent's node), F-7,
 F-9–F-11; RR-1, RR-3, RR-4 (RR-2 is the daemon's); D-3; L-1–L-10; W-1–W-6; A-1–A-5; I-1–I-3.
 
