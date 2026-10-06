@@ -131,6 +131,34 @@ pub struct RoomMessage {
     pub owed: bool,
     /// What it is to this node while unread (ADR-028 R-8), by the rule the TUI counts by.
     pub level: UnreadLevel,
+    /// The file or folder it shares, when it is a share's announcement (ADR-028 F-1): the message
+    /// is its card, its text the note.
+    pub file: Option<FileOffer>,
+}
+
+/// What a share's announcement offers, as its signed envelope states it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FileOffer {
+    /// The name it is offered under.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its SHA-256, hex.
+    pub sha256: String,
+    /// A folder, served as one archive.
+    pub folder: bool,
+    /// The sharer's note, or empty.
+    pub note: String,
+}
+
+/// Who has read one of this node's own messages (ADR-028 R-6).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReadBy {
+    /// The message's id.
+    pub id: String,
+    /// This node's names for the members who read it, sorted; a fingerprint's first 12
+    /// characters for one it has no name for.
+    pub names: Vec<String>,
 }
 
 /// **The three unread levels** (ADR-028 R-8): what one unread message is to this node.
@@ -424,22 +452,25 @@ fn shown_name(s: &str) -> String {
 fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str>) -> RoomMessage {
     use vox_agentcomms::attention::{unread_level, UnreadLevel as L};
     let reveal = |s: &str| vox_agentcomms::envelope::reveal_keeping(s, |c| c == '\n' || c == '\t');
-    let (kind, text, to, re, urgent) = match vox_agentcomms::envelope::Envelope::parse(&row.text) {
-        Ok(env) => (
-            shown_name(&env.kind),
-            reveal(&env.body),
-            env.to.iter().map(|t| shown_name(t)).collect(),
-            env.re.as_deref().map(shown_name).unwrap_or_default(),
-            env.urgent,
-        ),
-        Err(_) => (
-            vox_agentcomms::envelope::SAY.to_owned(),
-            reveal(&row.text),
-            Vec::new(),
-            String::new(),
-            false,
-        ),
-    };
+    let (kind, text, to, re, urgent, file) =
+        match vox_agentcomms::envelope::Envelope::parse(&row.text) {
+            Ok(env) => (
+                shown_name(&env.kind),
+                reveal(&env.body),
+                env.to.iter().map(|t| shown_name(t)).collect(),
+                env.re.as_deref().map(shown_name).unwrap_or_default(),
+                env.urgent,
+                file_offer(&env),
+            ),
+            Err(_) => (
+                vox_agentcomms::envelope::SAY.to_owned(),
+                reveal(&row.text),
+                Vec::new(),
+                String::new(),
+                false,
+                None,
+            ),
+        };
     RoomMessage {
         id: b32_encode(&row.entry_hash),
         author: b32_encode(&row.author),
@@ -457,7 +488,24 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str
             L::New => UnreadLevel::New,
             L::Coordination => UnreadLevel::Coordination,
         },
+        file,
     }
+}
+
+/// The file a `file` envelope offers, from the fields its sharer's daemon filled in.
+fn file_offer(env: &vox_agentcomms::envelope::Envelope) -> Option<FileOffer> {
+    if env.kind != vox_core::node::shares::FILE {
+        return None;
+    }
+    let d = &env.data;
+    let text = |k: &str| d.get(k).and_then(|v| v.as_str()).map(shown_name);
+    Some(FileOffer {
+        name: text("name")?,
+        size: d.get("size").and_then(|v| v.as_u64())?,
+        sha256: text("sha256")?,
+        folder: text("kind").as_deref() == Some("folder"),
+        note: text("note").unwrap_or_default(),
+    })
 }
 
 /// The keyring's names, by fingerprint. A read: the node checks no passphrase.
@@ -1644,6 +1692,74 @@ impl VoxClient {
                 .unwrap_or_default())
         })
         .await
+    }
+
+    /// Who has read this node's own recent messages in `room` (ADR-028 R-6), from the read
+    /// records the node can open, as `vox room read --json` says it: a member whose records it
+    /// cannot open is in none.
+    ///
+    /// # Errors
+    /// A malformed id, or the daemon's refusal.
+    pub async fn read_by(&self, room: String) -> Result<Vec<ReadBy>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let body = vox_core::node::snapshot::request_body();
+        let (reply, names) = on_held!(self, |c| {
+            let names = names(c).await?;
+            let reply = c
+                .exchange(&body)
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            Ok((reply, names))
+        })?;
+        let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
+            return Err(failed(
+                "the vox daemon did not answer with the node's state",
+            ));
+        };
+        let name = |fp: &Digest32| {
+            names
+                .get(fp)
+                .cloned()
+                .unwrap_or_else(|| b32_encode(fp).chars().take(12).collect())
+        };
+        Ok(snap
+            .open
+            .into_iter()
+            .find(|o| o.channel_id == channel_id)
+            .map(|o| o.read_by)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, who)| !who.is_empty())
+            .map(|(entry, who)| {
+                let mut names: Vec<String> = who.iter().map(name).collect();
+                names.sort();
+                ReadBy {
+                    id: b32_encode(&entry),
+                    names,
+                }
+            })
+            .collect())
+    }
+
+    /// The messages `ids` in `room` were shown to the person: the node records them read, and
+    /// its read records tell the room's members (ADR-028 R-6), as the TUI does for what it draws.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (a room left or ended).
+    pub async fn mark_read(&self, room: String, ids: Vec<String>) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in &ids {
+            entries.push(digest(id, "message id")?);
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let req = Request::MarkRead {
+            channel_id,
+            entries,
+        };
+        on_held!(self, |c| done(c, &req).await)
     }
 
     /// Deliver the held node's events to `listener` until it is detached or the daemon stops.

@@ -55,6 +55,12 @@ final class NodeModel: ObservableObject {
     @Published private(set) var rooms: [Room] = []
     @Published var selection: Selection?
     @Published private(set) var messages: [RoomMessage] = []
+    /// Who has read each of this node's own messages in the room on screen, by message id (R-6).
+    @Published private(set) var readBy: [String: [String]] = [:]
+    /// The services members share in the room on screen, as cards above its timeline.
+    @Published private(set) var roomServices: [SharedService] = []
+    /// Follows who has read what while a room is on screen.
+    private var watching: Task<Void, Never>?
     @Published private(set) var members: [MemberRow] = []
     @Published private(set) var trusted: [TrustedNode] = []
     @Published private(set) var nodes: [NodeSummary] = []
@@ -136,6 +142,8 @@ final class NodeModel: ObservableObject {
         }
         do {
             messages = try await client.read(room: id, after: "", limit: 0)
+            roomServices = (try? await client.services(room: id).shared) ?? []
+            watchReads(id)
             let roster = try await client.roster(room: id)
             let consents = try await client.consents(room: id)
             let keyring = Set(trusted.map(\.fingerprint))
@@ -201,6 +209,49 @@ final class NodeModel: ObservableObject {
     }
 
     // ---- what the node says -------------------------------------------------------------------
+
+    /// The messages drawn on screen are read (R-6): the node is told, as the TUI tells it what it
+    /// draws, once each, in batches. This node's own, and those not received yet, are not.
+    func drawn(_ message: RoomMessage) {
+        guard case let .room(room) = selection, message.author != me, !message.owed,
+              !marked.contains(message.id) else { return }
+        marked.insert(message.id)
+        unmarked.append(message.id)
+        guard flushing == nil else { return }
+        flushing = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self else { return }
+            let ids = self.unmarked
+            self.unmarked = []
+            self.flushing = nil
+            do {
+                try await self.client.markRead(room: room, ids: ids)
+            } catch {
+                // Not recorded: drawn again, it is told again.
+                ids.forEach { self.marked.remove($0) }
+                self.said = sentence(error)
+            }
+        }
+    }
+
+    private var marked: Set<String> = []
+    private var unmarked: [String] = []
+    private var flushing: Task<Void, Never>?
+
+    /// Who has read this node's messages in `room`, read again every few seconds while it is on
+    /// screen: read records arrive with the room's syncs and draw nothing of their own.
+    private func watchReads(_ room: String) {
+        watching?.cancel()
+        watching = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, case .room(room) = self.selection else { return }
+                if let reads = try? await self.client.readBy(room: room) {
+                    self.readBy = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+    }
 
     fileprivate func arrived(_ message: RoomMessage, in room: String) {
         if case .room(room) = selection {

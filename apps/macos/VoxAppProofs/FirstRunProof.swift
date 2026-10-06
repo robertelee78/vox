@@ -15,11 +15,15 @@
 //    the room a message addressed to alice, the sidebar lists the room under "needs you (1)"; the
 //    inspector lists bob with his trust glyph; the status bar says the node, its peers and the
 //    keyring window.
-// 4. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 4. Read each way (ADR-028 R-6, ADR-014 M-14, #441): bob's message, drawn in alice's timeline,
+//    is read, and bob's `vox room read --json` says alice read it; a message alice posts, read by
+//    bob's agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
+// 5. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (4) goes red. A room with a message
-// addressed to this node grouped as quiet (`attention::group`): (3) goes red.
+// place of the app's hold), and quitting leaves it attached: (5) goes red. A room with a message
+// addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
+// the read-by line: (4) goes red.
 
 import XCTest
 
@@ -171,7 +175,44 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: the room shown is read, so nothing needs alice; the sidebar said \"\(regrouped)\"")
         print("[proof] grouped: needs you (1), then \(regrouped); inspector: \(bob.label); status: \(bar)")
 
-        // (4) Quitting detaches it.
+        // (4) Read each way. Bob's NEEDS-YOU is on alice's screen now: her node says she read it.
+        var readByAlice: [String] = []
+        let readUntil = Date().addingTimeInterval(60)
+        while Date() < readUntil {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains("NEEDS-YOU") == true else { continue }
+                readByAlice = row["read_by"] as? [String] ?? []
+            }
+            if readByAlice.contains("alice") { break }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        XCTAssertTrue(readByAlice.contains("alice"),
+                      "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
+        // Alice posts; bob's agent reads it in a drain, as a harness does before every prompt.
+        let compose = ui.textFields["compose"]
+        XCTAssertTrue(compose.waitForExistence(timeout: 10), "PRODUCT: the room has no field to post")
+        compose.click()
+        compose.typeText("FROM-ALICE\r")
+        var drained = ""
+        let drainUntil = Date().addingTimeInterval(60)
+        while Date() < drainUntil && !drained.contains("FROM-ALICE") {
+            drained += run(vox, ["agent", "hook", "--node", "bob", "--room", room, "--format", "text"],
+                           env: voxEnv,
+                           input: "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"bob-proof\"}").out
+            Thread.sleep(forTimeInterval: 1)
+        }
+        guard drained.contains("FROM-ALICE") else {
+            throw Apparatus("bob's agent drain never read alice's FROM-ALICE in 60 s: \(drained)")
+        }
+        let readLine = ui.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'read-by-'")).firstMatch
+        XCTAssertTrue(readLine.waitForExistence(timeout: 30) && readLine.label == "read by bob",
+                      "PRODUCT: alice's message read by bob must show \"read by bob\" under it; the timeline shows \(readLine.exists ? readLine.label : "no read-by line")")
+        print("[proof] bob's message read by \(readByAlice); alice's message: \(readLine.exists ? readLine.label : "none")")
+
+        // (5) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
@@ -210,7 +251,8 @@ final class FirstRunProof: XCTestCase {
     }
 
     /// Run `vox` to its end; its exit status and what it printed.
-    private func run(_ vox: String, _ args: [String], env: [String: String]) -> (status: Int32, out: String) {
+    private func run(_ vox: String, _ args: [String], env: [String: String],
+                     input: String? = nil) -> (status: Int32, out: String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: vox)
         p.arguments = args
@@ -218,9 +260,14 @@ final class FirstRunProof: XCTestCase {
         let out = Pipe()
         p.standardOutput = out
         p.standardError = out
-        p.standardInput = FileHandle.nullDevice
+        let stdin = Pipe()
+        p.standardInput = input == nil ? FileHandle.nullDevice : stdin
         do { try p.run() } catch {
             return (-1, "APPARATUS: could not start \(vox): \(error)")
+        }
+        if let input {
+            stdin.fileHandleForWriting.write(Data(input.utf8))
+            try? stdin.fileHandleForWriting.close()
         }
         let bytes = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()

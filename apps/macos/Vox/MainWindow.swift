@@ -106,9 +106,20 @@ private struct RoomView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
+                if !model.roomServices.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(model.roomServices, id: \.address) { ServiceCard(service: $0) }
+                        }
+                        .padding(8)
+                    }
+                    Divider()
+                }
                 ScrollViewReader { scroller in
                     List(model.messages, id: \.id) { message in
-                        MessageRow(message: message, me: model.me)
+                        MessageRow(message: message, me: model.me,
+                                   readBy: model.readBy[message.id] ?? [])
+                            .onAppear { model.drawn(message) }
                     }
                     .onChange(of: model.messages.count) { _ in
                         if let last = model.messages.last { scroller.scrollTo(last.id, anchor: .bottom) }
@@ -136,6 +147,8 @@ private struct RoomView: View {
 private struct MessageRow: View {
     let message: RoomMessage
     let me: String
+    /// Who has read it, when it is this node's own (R-6).
+    let readBy: [String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -143,15 +156,80 @@ private struct MessageRow: View {
                 Text(author).fontWeight(.bold)
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
                 if message.to.contains(me) { Text("to you").font(Theme.eyebrow) }
+                if message.late {
+                    // ADR-023: it took its place above messages already shown.
+                    Text("arrived late").font(Theme.eyebrow).secondaryText()
+                        .accessibilityIdentifier("late-\(message.id)")
+                }
             }
-            Text(message.owed ? "not received yet" : message.text)
-                .textSelection(.enabled)
+            if let file = message.file {
+                FileCard(file: file)
+            }
+            if message.file == nil || !(message.file?.note.isEmpty ?? true) {
+                Text(message.owed ? "not received yet" : shownText)
+                    .textSelection(.enabled)
+            }
+            if !readBy.isEmpty {
+                Text("read by \(readBy.joined(separator: ", "))")
+                    .font(Theme.eyebrow).secondaryText()
+                    .accessibilityIdentifier("read-by-\(message.id)")
+                    .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
+            }
         }
     }
+
+    /// A share's text is its note.
+    private var shownText: String { message.file?.note ?? message.text }
 
     private var author: String {
         if message.author == me { return "you" }
         return message.authorName.isEmpty ? String(message.author.prefix(12)) : message.authorName
+    }
+}
+
+/// A file or folder offered in the room (ADR-028 F-1): its name, size and SHA-256, as the share's
+/// signed announcement states them.
+private struct FileCard: View {
+    let file: FileOffer
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: file.folder ? "folder" : "doc")
+                .font(.system(size: 22))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(file.name).fontWeight(.bold)
+                Text("\(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file))"
+                    + "  ·  sha256 \(file.sha256.prefix(16))…")
+                    .font(Theme.mono).secondaryText()
+            }
+        }
+        .padding(8)
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("file-\(file.name)")
+        .accessibilityLabel("\(file.folder ? "folder" : "file") \(file.name), \(file.size) bytes")
+    }
+}
+
+/// A service a member shares in the room: its address, who shares it, and what it is (ADR-028 S-2).
+private struct ServiceCard: View {
+    let service: SharedService
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "point.3.connected.trianglepath.dotted").accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(service.address).font(Theme.mono).textSelection(.enabled)
+                Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
+                    .font(Theme.eyebrow).secondaryText()
+            }
+        }
+        .padding(8)
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("service-\(service.address)")
+        .accessibilityLabel("service \(service.address), shared by \(service.by), \(service.kind)")
     }
 }
 
