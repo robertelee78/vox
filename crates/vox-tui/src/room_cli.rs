@@ -148,8 +148,17 @@ pub(crate) async fn room_of(client: &mut IpcClient, prefix: &str) -> Result<Dige
         .map(|(id, _, _, _)| *id)
         .collect();
     let id = match named.as_slice() {
+        [] => resolve_prefix(prefix, &ids)?,
         [one] => *one,
-        _ => resolve_prefix(prefix, &ids)?,
+        // Two rooms of one name (ADR-028 R-3): neither is meant more than the other.
+        many => {
+            return Err(AppError::Usage(format!(
+                "{} rooms on this node are called {}; name one by its room ID: {}",
+                many.len(),
+                prefix.trim(),
+                many.iter().map(b32_encode).collect::<Vec<_>>().join(", ")
+            )))
+        }
     };
     // A closed room's name is sealed in its manifest, so a node that has not opened it does
     // not know it: the name here is empty, and printing it said `room "" is not open` (#208).
@@ -197,12 +206,21 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
         println!("no rooms");
         return Ok(());
     }
-    for (id, name, open, over) in rooms {
+    // **Two rooms of one name are each shown by their room ID** (ADR-028 R-3): a rename can give
+    // a room the name of another this node holds. Said once, under the list.
+    let clashing = clashing_names(rooms.iter().map(|(_, name, _, _)| name.as_str()));
+    for (id, name, open, over) in &rooms {
+        let shown = if clashing.contains(name.as_str()) {
+            b32_encode(id)
+        } else if name.is_empty() {
+            "(unnamed)".to_owned()
+        } else {
+            name.clone()
+        };
         println!(
-            "{}  {}{}{}",
-            short(&id),
-            if name.is_empty() { "(unnamed)" } else { &name },
-            if open { "" } else { "  [closed]" },
+            "{}  {shown}{}{}",
+            short(id),
+            if *open { "" } else { "  [closed]" },
             if over.is_empty() {
                 String::new()
             } else {
@@ -210,7 +228,28 @@ pub async fn list(paths: &Paths) -> Result<(), AppError> {
             }
         );
     }
+    for name in &clashing {
+        println!(
+            "vox: {} rooms on this node are called {name}, so each is shown by its room ID until \
+             one is renamed (`vox room rename`)",
+            rooms.iter().filter(|(_, n, _, _)| n == name).count()
+        );
+    }
     Ok(())
+}
+
+/// The names more than one of `names` has (ADR-028 R-3), in order.
+pub(crate) fn clashing_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+) -> std::collections::BTreeSet<&'a str> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut twice = std::collections::BTreeSet::new();
+    for n in names.filter(|n| !n.is_empty()) {
+        if !seen.insert(n) {
+            twice.insert(n);
+        }
+    }
+    twice
 }
 
 /// Read a message body: the argument, or stdin when it is omitted or `-`.
@@ -3549,8 +3588,23 @@ pub async fn create(
             }
         },
     };
-    let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let mut client = attach(paths).await?;
+    // A node holds one room of a name (ADR-028 R-3): said with the room that holds it, before a
+    // passphrase is asked for.
+    if let Some((id, _, _, _)) = rooms_of(&mut client)
+        .await?
+        .into_iter()
+        .find(|(_, held, _, _)| *held == name)
+    {
+        return Err(AppError::Usage(format!(
+            "cannot create the room: the room {} on this node is already called {name}, and a \
+             node holds one room of a name\n       rename it (`vox room rename {} <name>`) or \
+             name this one otherwise",
+            short(&id),
+            short(&id)
+        )));
+    }
+    let passphrase = room_passphrase(passphrase_file, "a passphrase for the new room", true)?;
     let before: Vec<Digest32> = match idle_secs {
         Some(_) => rooms_of(&mut client)
             .await?

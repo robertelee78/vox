@@ -3913,7 +3913,11 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
             Some(detail) => Frame::Services {
-                room: crate::node::resolver::room_shown(detail.name.as_deref(), &channel_id),
+                room: crate::node::resolver::room_shown_here(
+                    detail.name.as_deref(),
+                    &channel_id,
+                    handle.view().channels.iter().map(|c| c.name.as_deref()),
+                ),
                 services: detail
                     .services
                     .iter()

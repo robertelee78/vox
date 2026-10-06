@@ -1040,6 +1040,9 @@ pub enum Fault {
     NotAdmin,
     /// A room's name was not one DNS label (ADR-028 R-2).
     NotARoomName,
+    /// A room was to be created or joined under a name a room this node holds already has
+    /// (ADR-028 R-3).
+    RoomNameTaken,
     /// A member who is not the room's creator or an admin asked to keep the room's messages
     /// **longer** than the room does (V030-32). A member may set a shorter retention, which
     /// governs only their own node; never a longer one.
@@ -1210,6 +1213,9 @@ impl Fault {
             Fault::NotAServiceRoom => {
                 "that room offers no service by name, so it has no .vox name to resolve\n       reach a shared service by its address, `vox forward <service>.<node>.<room>.vox`"
             }
+            Fault::RoomNameTaken => {
+                "a room this node holds already has that name, and a node holds one room of a name: nothing was made\n       it is the room part of every service address; rename the room it holds (`vox room rename`), or name the new one otherwise"
+            }
             Fault::NotARoomName => {
                 "a room name is one DNS label: 1 to 63 of a-z, 0-9 and `-`, not starting or ending with `-`\n       it is the room part of every service address"
             }
@@ -1364,6 +1370,7 @@ fault_names!(
     NoSuchForward,
     NotAdmin,
     NotARoomName,
+    RoomNameTaken,
     AboveRoomRetention,
     RoomEnded,
     RoomLeft,

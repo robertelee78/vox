@@ -6794,8 +6794,11 @@ impl Node {
                 service,
             } => {
                 let room = genesis.channel_id();
+                // Asked again here: another room may have taken the name while the key sealed.
+                let taken = self.room_named(&room_name).is_some();
                 let outcome = match sealed {
                     Err(e) => Outcome::Failed(fault_of(&e)),
+                    Ok(_) if taken => Outcome::Failed(Fault::RoomNameTaken),
                     Ok((sek, wrap)) => match self.profile.as_ref() {
                         None => Outcome::Failed(Fault::NoIdentity),
                         Some(profile) => match ChannelState::create_from_sealed(
@@ -8879,6 +8882,26 @@ impl Node {
             sealed,
             steps: _,
         } = won;
+        // **One room of a name** (ADR-028 R-3): a room joined under a name a room here already
+        // has is refused, naming the room that holds it. Only a name the member said is known
+        // yet; one the log brings later shows both rooms by their ids until one is renamed.
+        if let Some(holder) = joined
+            .room_name
+            .as_deref()
+            .and_then(|name| self.room_named(name).map(|id| (name, id)))
+        {
+            let _ = self.event_tx.send(NodeEvent::JoinFailed {
+                reason: format!(
+                    "the room is called {}, and the room {} on this node already is",
+                    holder.0,
+                    crate::node::link::b32_encode(&holder.1)
+                        .chars()
+                        .take(12)
+                        .collect::<String>()
+                ),
+            });
+            return Outcome::Failed(Fault::RoomNameTaken);
+        }
         let channel = {
             let Some(profile) = self.profile.as_ref() else {
                 return Outcome::Failed(Fault::NoIdentity);
@@ -12606,6 +12629,9 @@ impl Node {
 
     /// [`Self::create_channel`], unboxed: see [`Boxed`].
     async fn create_channel_unboxed(&mut self, room_name: &str, passphrase: &Secret) -> Outcome {
+        if self.room_named(room_name).is_some() {
+            return Outcome::Failed(Fault::RoomNameTaken);
+        }
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
@@ -12710,6 +12736,11 @@ impl Node {
         service: Option<(String, SocketAddr)>,
         reply: oneshot::Sender<Outcome>,
     ) {
+        // A node holds one room of a name (ADR-028 R-3): it is the room part of every address.
+        if self.room_named(&room_name).is_some() {
+            let _ = reply.send(Outcome::Failed(Fault::RoomNameTaken));
+            return;
+        }
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
@@ -13784,7 +13815,15 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let room = crate::node::resolver::room_shown(shared.lock().await.name(), channel_id);
+        let name = shared.lock().await.name().map(str::to_owned);
+        let room = {
+            let view = self.view_tx.borrow();
+            crate::node::resolver::room_shown_here(
+                name.as_deref(),
+                channel_id,
+                view.channels.iter().map(|c| c.name.as_deref()),
+            )
+        };
         // The name to tell the person: a service shared in the room is
         // `<service>.<node>.<room>.vox` (V030-25), and nothing shorter is an address.
         let hostname = format!("<service>.<node>.{room}.vox");
@@ -14161,7 +14200,11 @@ impl Node {
             // while it runs, and a status read must not wait on it or come back blank (#58).
             report.rooms.push(RoomStatus {
                 id: room.channel_id,
-                name: crate::node::resolver::room_shown(room.name.as_deref(), &room.channel_id),
+                name: crate::node::resolver::room_shown_here(
+                    room.name.as_deref(),
+                    &room.channel_id,
+                    view.channels.iter().map(|c| c.name.as_deref()),
+                ),
                 epoch: room.epoch,
                 last_sync: self.status.room_synced.get(&room.channel_id).copied(),
                 retention: room.retention,
@@ -14653,6 +14696,16 @@ impl Node {
             boards_connected: Vec::new(),
             relaying: 0,
         });
+    }
+
+    /// The room this node holds under `name`, as last published (ADR-028 R-3).
+    fn room_named(&self, name: &str) -> Option<Digest32> {
+        self.view_tx
+            .borrow()
+            .channels
+            .iter()
+            .find(|c| c.name.as_deref() == Some(name))
+            .map(|c| c.channel_id)
     }
 
     async fn publish(&mut self) {

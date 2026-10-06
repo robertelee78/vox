@@ -716,6 +716,7 @@ pub(crate) fn join_advice(fault: Option<Fault>) -> &'static str {
         Some(Fault::WrongPassphrase) => {
             "the room passphrase is wrong\n       the address is not in question — this is the passphrase alone"
         }
+        Some(Fault::RoomNameTaken) => Fault::RoomNameTaken.explain(),
         Some(Fault::BadLink) => {
             "that address will not parse, or names a room this node cannot use\n       this one IS the address — check you copied all of it"
         }

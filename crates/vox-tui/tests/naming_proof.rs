@@ -30,6 +30,11 @@
 //!    bob's rename of family to *home* reaches her, `22.nas.home.vox` then reaches bob and
 //!    `22.nas.family.vox` leads nowhere. **Mutation:** a member keeps the name it heard at its
 //!    join over the log's (`ChannelState::name`), and alice still lists family.
+//! 8. **One room of a name on a node** (ADR-028 R-3). carol cannot create a second *home*, and
+//!    alice cannot join bob's room called *work*, each told which room holds the name. When bob
+//!    renames his room *extra* to *work*, carol, in both, lists each by its room ID and says why
+//!    once, and alice, in one, sees nothing change; renamed again, carol sees names again.
+//!    **Mutation:** a clashing join is let through, and alice holds two rooms called work.
 //!
 //! 5. **A service added to a running daemon is offered without a restart** (V030-06, #238). bob and
 //!    carol add theirs with `vox service add` while their daemons run; `vox service add` asks the
@@ -714,6 +719,96 @@ fn a_local_name_reaches_the_node_it_names() {
                 .1
                 .contains("no room on this machine is called `family`"),
         "PRODUCT: the room's old name must lead nowhere once it is renamed: {old_name:?}"
+    );
+
+    // (8) **One room of a name on a node** (ADR-028 R-3). carol, who holds family (now home),
+    // cannot create another home; alice, who holds work, cannot join bob's new room called work,
+    // and is told which of hers holds the name. A rename that clashes is not refused: carol, in
+    // bob's room extra, sees both rooms by their ids once bob calls it work, and says why once;
+    // when he renames it again, the names come back. alice, not in extra, never sees the clash.
+    let made_home = vox(
+        &carol.dir,
+        &["room", "create", "--passphrase-file", "-", "--name", "home"],
+        Some("another passphrase\n"),
+    );
+    let bobs_work = bob.create("work", "bob's work passphrase");
+    let join_work = vox(
+        &alice.dir,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &bob.invite(&bobs_work),
+        ],
+        Some("bob's work passphrase\n"),
+    );
+    let extra = bob.create("extra", "extra passphrase");
+    carol.join(&bob.invite(&extra), "extra", "extra passphrase");
+    let to_work = vox(&bob.dir, &["room", "rename", &extra, "work"], None);
+    let listed_by = |m: &Member, what: &dyn Fn(&str) -> bool| {
+        let started = Instant::now();
+        loop {
+            let (_, out, _) = vox(&m.dir, &["room", "list"], None);
+            if what(&out) || started.elapsed() >= SETUP {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let clashed = listed_by(&carol, &|out| out.contains("are called work"));
+    let alice_meanwhile = vox(&alice.dir, &["room", "list"], None).1;
+    let to_spare = vox(&bob.dir, &["room", "rename", &extra, "spare"], None);
+    let unclashed = listed_by(&carol, &|out| out.contains(" spare"));
+    eprintln!(
+        "carol creates home: {made_home:?}\nalice joins bob's work: {join_work:?}\nbob renames \
+         extra to work: {to_work:?}\ncarol's rooms: {clashed:?}\nalice's rooms meanwhile: \
+         {alice_meanwhile:?}\nbob renames it spare: {to_spare:?}\ncarol's rooms then: \
+         {unclashed:?}"
+    );
+    assert!(
+        !made_home.0
+            && made_home.2.contains(&format!(
+                "the room {family} on this node is already called home"
+            )),
+        "PRODUCT: carol holds home, and a second room of that name must be refused, naming the \
+         room that holds it: {made_home:?}"
+    );
+    assert!(
+        !join_work.0
+            && join_work.2.contains(&format!(
+                "the room is called work, and the room {work} on this node already is"
+            )),
+        "PRODUCT: alice holds work, and joining bob's room called work must be refused, naming \
+         her room that holds the name: {join_work:?}"
+    );
+    assert!(
+        to_work.0 && to_spare.0,
+        "PRODUCT (staging): bob's renames: {to_work:?} {to_spare:?}"
+    );
+    let full = |id: &str| {
+        clashed
+            .lines()
+            .find(|l| l.starts_with(id))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .is_some_and(|shown| shown.len() == 52 && shown.starts_with(id))
+    };
+    assert!(
+        full(&work)
+            && full(&extra)
+            && clashed.matches("are called work").count() == 1
+            && !clashed.lines().any(|l| l.split_whitespace().nth(1) == Some("work")),
+        "PRODUCT: carol holds two rooms called work, and must list each by its room ID and say why \
+         once: {clashed:?}"
+    );
+    assert!(
+        alice_meanwhile.contains(" work") && !alice_meanwhile.contains("are called"),
+        "PRODUCT: alice is not in extra, and her list must not change: {alice_meanwhile:?}"
+    );
+    assert!(
+        unclashed.contains(" work") && unclashed.contains(" spare") && !unclashed.contains("are called"),
+        "PRODUCT: once bob renamed extra to spare, carol must list both rooms by their names again: \
+         {unclashed:?}"
     );
 
     // (5) No daemon was restarted: bob's and carol's are the processes that ran when their
