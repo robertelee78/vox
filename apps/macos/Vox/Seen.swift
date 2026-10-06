@@ -48,18 +48,31 @@ final class WindowSeen: ObservableObject {
     }
 }
 
-/// Hands the view's window to `seen` once the view is in one.
+/// Hands the view's window to `seen` when the view joins it. Asked once, a beat after the view was
+/// made, a view not yet in its window gave nil and was never asked again: a room opened that way
+/// never counted as seen, and nothing in it was read (seen in the QE pass's read log).
 struct WindowReader: NSViewRepresentable {
     let seen: WindowSeen
 
     func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        DispatchQueue.main.async { [weak view] in seen.attach(view?.window) }
+        let view = WindowWatcher()
+        view.joined = { [weak seen] window in seen?.attach(window) }
         return view
     }
 
     func updateNSView(_ view: NSView, context: Context) {
-        DispatchQueue.main.async { [weak view] in seen.attach(view?.window) }
+        if let window = view.window { seen.attach(window) }
+    }
+
+    /// Says when it joins a window.
+    final class WindowWatcher: NSView {
+        var joined: ((NSWindow?) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            let window = window
+            MainActor.assumeIsolated { joined?(window) }
+        }
     }
 }
 
