@@ -668,6 +668,22 @@ impl NodeNet {
         let class = self.classify(&peer);
         if !PeerPolicy::allows(class, kind) {
             crate::node::net::refuse_disallowed(class, kind, &mut send, &mut recv);
+            // A refused stream is a refused dial (ADR-028 D-1). A joiner not yet a member here
+            // is refused every few seconds until it is, so repeats are folded, once an hour.
+            if let Some(log) = lock(&self.decisions).as_ref() {
+                let why = format!("it may not open a {kind:?} stream here, as {class:?}");
+                log.record_folded(
+                    (self.clock)().saturating_mul(1_000),
+                    &format!("stream {} {why}", crate::node::link::b32_encode(&peer)),
+                    &crate::node::decisions::Decision {
+                        asked: "to open a stream",
+                        by: peer,
+                        alias: None,
+                        decided: crate::node::decisions::Decided::Refused,
+                        why,
+                    },
+                );
+            }
             return Err(crate::error::Error::StreamRefused(
                 "peer may not open this stream kind",
             ));

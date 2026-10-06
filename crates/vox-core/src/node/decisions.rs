@@ -20,6 +20,10 @@ pub const DECISIONS_DIR: &str = "decisions";
 /// How many days of the record are kept: today's file and the 13 before it (D-2).
 pub const KEEP_DAYS: i64 = 14;
 
+/// How long a repeating decision is folded before it is written again
+/// ([`DecisionLog::record_folded`]): an hour.
+pub const FOLD_MS: u64 = 3_600_000;
+
 /// What was decided (D-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decided {
@@ -73,6 +77,19 @@ pub struct DecisionLog {
     /// This node's names for the members it trusts, as last published: what an event names
     /// someone as when the decision was taken where the keyring is not at hand.
     aliases: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Digest32, String>>>,
+    /// Each decision that repeats ([`DecisionLog::record_folded`]), by what makes it the same.
+    folded: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Folded>>>,
+}
+
+/// A decision being folded ([`DecisionLog::record_folded`]).
+#[derive(Debug, Clone)]
+struct Folded {
+    /// When it was written, ms since the Unix epoch: its hour runs from here.
+    since: u64,
+    /// How many times it was decided again since, not written.
+    repeats: u64,
+    /// The decision, as written.
+    decision: Decision,
 }
 
 impl DecisionLog {
@@ -83,6 +100,68 @@ impl DecisionLog {
             dir: node_dir.join(DECISIONS_DIR),
             pruned: std::sync::Arc::new(std::sync::Mutex::new(None)),
             aliases: std::sync::Arc::default(),
+            folded: std::sync::Arc::default(),
+        }
+    }
+
+    /// [`Self::record`] for a decision that can repeat many times a minute (a stream refused
+    /// until a joiner's membership reaches this node): written at once, then not again for
+    /// [`FOLD_MS`] for the same `same` (who, what, why). The repeats in that hour are counted and
+    /// written as one event when it is over ([`Self::flush_folded`]), so a reader sees that they
+    /// were folded and how many there were.
+    pub fn record_folded(&self, now_ms: u64, same: &str, d: &Decision) {
+        self.flush_folded(now_ms);
+        {
+            let mut seen = self
+                .folded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(f) = seen.get_mut(same) {
+                f.repeats += 1;
+                return;
+            }
+            seen.insert(
+                same.to_owned(),
+                Folded {
+                    since: now_ms,
+                    repeats: 0,
+                    decision: d.clone(),
+                },
+            );
+        }
+        let mut d = d.clone();
+        d.why = format!(
+            "{} (repeats in the next hour are counted, and recorded as one event)",
+            d.why
+        );
+        self.record(now_ms, &d);
+    }
+
+    /// Write each folded decision whose hour is over: one event saying how many times it was
+    /// decided again in that hour, when it was at all. Called by every folded record and by the
+    /// node's tick, so a count is written even when nothing repeats after it.
+    pub fn flush_folded(&self, now_ms: u64) {
+        let due: Vec<Folded> = {
+            let mut seen = self
+                .folded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let over: Vec<String> = seen
+                .iter()
+                .filter(|(_, f)| now_ms >= f.since.saturating_add(FOLD_MS))
+                .map(|(k, _)| k.clone())
+                .collect();
+            over.into_iter().filter_map(|k| seen.remove(&k)).collect()
+        };
+        for f in due.into_iter().filter(|f| f.repeats > 0) {
+            let mut d = f.decision;
+            d.why = format!(
+                "{} — {} more times in the hour from {} UTC, folded into this one event",
+                d.why,
+                f.repeats,
+                time_of(f.since)
+            );
+            self.record(now_ms, &d);
         }
     }
 
@@ -192,6 +271,18 @@ pub fn date_of(days: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) of `ms` since the Unix epoch.
+#[must_use]
+pub fn time_of(ms: u64) -> String {
+    let mins = ms / 60_000;
+    format!(
+        "{} {:02}:{:02}",
+        date_of(days_from_epoch(ms)),
+        (mins / 60) % 24,
+        mins % 60
+    )
 }
 
 /// The day counted from 1970-01-01 that `YYYY-MM-DD` names, if it is one.

@@ -4828,6 +4828,8 @@ impl Node {
                     }
                     // A read record held back by the 5-second batch goes out when it is due.
                     self.flush_reads().await;
+                    // A folded decision's count is written once its hour is over (ADR-028 D-1).
+                    self.decisions.flush_folded((self.millis_clock)());
                 }
             }
         }
