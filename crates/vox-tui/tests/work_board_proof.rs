@@ -34,6 +34,11 @@
 //! 4. **A release frees it**, and only the owner's release counts.
 //! 5. **A lapsed `--ttl` frees it with nobody acting** — the property that stops a
 //!    dead agent holding a resource forever.
+//! 6. **Each member's lane state** (ADR-028 W-3, #512), on the other's `vox room board`: bob,
+//!    holding claims and posting `working`, is "working" to alice; alice posting `working` with
+//!    nothing held is "ready" to bob, not working; alice's `ask` to bob makes her "needs you" to
+//!    him until he answers it with `--re`. Mutation: "working" derived without a claim turns it
+//!    red at alice's `working` post (she reads "working" to bob).
 //!
 //! Real wall-clock time is used rather than a fixed test clock, because `--ttl`
 //! expiry is compared against the *client's* clock and a node pinned to a fixed
@@ -77,6 +82,18 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("APPARATUS: the system clock is before 1970")
         .as_millis() as u64
+}
+
+/// The lane state `vox room board` printed for the member named `name`, from its `lanes:` block.
+fn lane_of(board: &str, name: &str) -> Option<String> {
+    board
+        .lines()
+        .skip_while(|l| *l != "lanes:")
+        .skip(1)
+        .find_map(|l| {
+            let (who, state) = l.trim_start().split_once('\t')?;
+            (who == name).then(|| state.to_owned())
+        })
 }
 
 /// How long `--ttl` gives the claim in (5). Bob must see it and be refused inside this,
@@ -235,5 +252,93 @@ fn two_agents_split_work_and_only_one_holds_a_contested_resource() {
     println!(
         "[proof] contested claim: 1 winner, loser refused naming the holder; release freed it; \
          a {TTL_SECS}s ttl bound bob while live and freed itself once it lapsed"
+    );
+
+    // ---- (6) each member's lane state (ADR-028 W-3) ----
+    // Bob holds port-the-codec and flaky-test; he says he is working on them.
+    let (ok, _, err) = vox(
+        bob,
+        &["room", "post", &room, "--type", "working", "porting"],
+    );
+    assert!(ok, "PRODUCT (staging): bob's `working` post failed: {err}");
+    let seen = until(
+        alice,
+        Some("alice"),
+        "bob's lane to read working",
+        &["room", "board", &room],
+        |o| lane_of(&o.stdout, &bob.name).as_deref() == Some("working"),
+    );
+    println!(
+        "[proof] alice's board, bob holding claims and working:\n{}",
+        seen.stdout
+    );
+    // Alice holds nothing, and posts `working` all the same: that is no claim, so she is ready.
+    let (ok, _, err) = vox(
+        alice,
+        &["room", "post", &room, "--type", "working", "looking"],
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's `working` post failed: {err}"
+    );
+    let (ok, asked, err) = vox(
+        alice,
+        &[
+            "room",
+            "post",
+            &room,
+            "--type",
+            "ask",
+            "--to",
+            &bob.b32(),
+            "--json",
+            "which codec?",
+        ],
+    );
+    assert!(ok, "PRODUCT (staging): alice's `ask` to bob failed: {err}");
+    let asked: serde_json::Value = serde_json::from_str(asked.trim()).unwrap_or_else(|e| {
+        panic!("PRODUCT: `vox room post --json` printed no JSON ({e}): {asked}")
+    });
+    let entry = asked["entry_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("PRODUCT: `vox room post --json` named no entry: {asked}"))
+        .to_owned();
+    // Her `working` came before the ask on her own chain, so a board with the ask has it too.
+    let seen = until(
+        bob,
+        Some("bob"),
+        "alice's unanswered ask to make her lane \"needs you\" on bob's board",
+        &["room", "board", &room],
+        |o| lane_of(&o.stdout, &alice.name).as_deref() == Some("needs you"),
+    );
+    println!(
+        "[proof] bob's board, alice's ask unanswered:\n{}",
+        seen.stdout
+    );
+    // Bob answers it: she no longer needs him, and her `working` without a claim is no work.
+    let (ok, _, err) = vox(
+        bob,
+        &[
+            "room",
+            "post",
+            &room,
+            "--type",
+            "answer",
+            "--re",
+            &entry,
+            "the new one",
+        ],
+    );
+    assert!(ok, "PRODUCT (staging): bob's answer failed: {err}");
+    let board = vox(bob, &["room", "board", &room]).1;
+    let lane = lane_of(&board, &alice.name);
+    assert_eq!(
+        lane.as_deref(),
+        Some("ready"),
+        "PRODUCT: alice holds no claim, so her `working` post is no work, and bob answered her \
+         ask: her lane on his board must read \"ready\"; it said {lane:?}:\n{board}"
+    );
+    println!(
+        "[proof] lanes: bob working to alice; alice needs you to bob until answered, then ready"
     );
 }

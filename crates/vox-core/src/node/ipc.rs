@@ -318,6 +318,10 @@ const T_OPEN_ROOM: u64 = 4400;
 const T_CLOSE_ROOM: u64 = 4401;
 /// [`Frame::Count`] (V210-120), in the frame and event tag space, far from the others.
 const T_COUNT: u64 = 1200;
+// ADR-028 W-3 (#512): each member's lane state. Numbered by its item, far from the others.
+const T_LANES_REQ: u64 = 512;
+/// [`Frame::Lanes`] (#512).
+const T_LANES: u64 = 1512;
 // The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
 // `remove` reached the daemon (V030-06) while `list` still opened the profile, which the daemon
 // holds, so a service just added could not be listed. Not a protocol bump: additive, and a node
@@ -634,6 +638,11 @@ pub enum Request {
         /// Count only rows **after** this one.
         since: Option<Digest32>,
     },
+    /// Each other member's lane state in a room (ADR-028 W-3), as [`Frame::Lanes`].
+    Lanes {
+        /// The room.
+        channel_id: Digest32,
+    },
     /// The rows of a room with these entry hashes, those it holds, as [`Frame::Rows`] (V210-120).
     Find {
         /// The room.
@@ -693,6 +702,9 @@ impl Request {
                     .uint(T_COUNT_REQ)
                     .bytes(channel_id)
                     .bytes(since.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Request::Lanes { channel_id } => {
+                e.array(2).uint(T_LANES_REQ).bytes(channel_id);
             }
             Request::Find {
                 channel_id,
@@ -1077,6 +1089,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Count { channel_id, since })
             }
+            (T_LANES_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Lanes { channel_id })
+            }
             (T_AGREE, 4) => {
                 let channel_id = digest(&mut d)?;
                 let entry = digest(&mut d)?;
@@ -1423,6 +1441,12 @@ pub enum Frame {
         /// The entry hash of the room's newest row, if it has any.
         last: Option<Digest32>,
     },
+    /// Each other member of a room and its lane state's words (`needs you`, `working`, `ready`,
+    /// `done`, `away`), in the room's member order, answering [`Request::Lanes`].
+    Lanes {
+        /// `(member, state)`.
+        lanes: Vec<(Digest32, String)>,
+    },
     /// The rows a [`Request::Read`] asked for, oldest first.
     Rows {
         /// The rendered entries.
@@ -1539,6 +1563,12 @@ impl Frame {
                     .uint(T_COUNT)
                     .uint(*n)
                     .bytes(last.as_ref().map_or(&[][..], |d| &d[..]));
+            }
+            Frame::Lanes { lanes } => {
+                e.array(2).uint(T_LANES).array(lanes.len());
+                for (member, state) in lanes {
+                    e.array(2).bytes(member).text(state);
+                }
             }
             Frame::Rows { rows } => {
                 e.array(2).uint(T_ROWS).array(rows.len());
@@ -2000,6 +2030,22 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             let n = d.uint().map_err(|_| Error::MalformedIpc("ipc count"))?;
             let last = optional_digest(d)?;
             return Ok(Frame::Count { n, last });
+        }
+        (T_LANES, 2) => {
+            let n = d.array().map_err(|_| Error::MalformedIpc("ipc lanes"))?;
+            let mut lanes = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                if d.array().map_err(|_| Error::MalformedIpc("ipc lane"))? != 2 {
+                    return Err(Error::MalformedIpc("ipc lane arity"));
+                }
+                let member = digest(d)?;
+                let state = d
+                    .text()
+                    .map_err(|_| Error::MalformedIpc("ipc lane state"))?
+                    .to_owned();
+                lanes.push((member, state));
+            }
+            return Ok(Frame::Lanes { lanes });
         }
         (T_ROWS, 2) => {
             let n = d.array().map_err(|_| Error::MalformedIpc("ipc rows"))?;
@@ -3865,6 +3911,28 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             {
                 Some(detail) => Frame::Members {
                     members: detail.members.clone(),
+                },
+                None => Frame::Error {
+                    reason: "room not open".into(),
+                },
+            }
+        }
+        // ADR-028 W-3 (#512): each other member's lane state, from the room's posts as this node
+        // holds them. Bounded like the roster: one short row per member.
+        Request::Lanes { channel_id } => {
+            let view = handle.view();
+            let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
+                return Frame::Error {
+                    reason: "the identity is locked".into(),
+                };
+            };
+            match view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            {
+                Some(detail) => Frame::Lanes {
+                    lanes: crate::node::lanes::of_room(detail, &me, &view.connected_peers),
                 },
                 None => Frame::Error {
                     reason: "room not open".into(),
