@@ -97,6 +97,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
   seen      Bob leaves his lanes and Alice posts again: looking again, only her new post is marked
             new in her lane, her earlier ask not (W-3, #513);
+  attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
+            message: a `file` announcement carrying the note in it and `to` naming her, no second
+            message for the note (ADR-028 F-1, #493);
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -1105,6 +1108,29 @@ try:
     claim("seen", "newLANE-AFTERsincebob" in joined and "LANE-ASK" in joined and "newask:LANE-ASK" not in joined,
           f"alice's lane after bob looked and she posted again: {lane('alice')[1]!r}")
     tui.key(":lanes\r", 1)  # back to the timeline
+
+    stage("attach")
+    # A file shared from the composer is one message, addressed like one (ADR-028 F-1, #493): its
+    # note the composer's words, its To: the composer's, as `vox share --to … -m …` posts it.
+    attached = f"{S}/attach-493.txt"
+    with open(attached, "w") as f:
+        f.write("attached from bob's TUI\n")
+    tui.key(":to alice\r", 1)
+    focus("Composer")
+    tui.key("ATTACH-NOTE for alice", 1)
+    focus("Timeline")  # away from the composer: what was typed stays, and `:` is a command again
+    tui.key(f":share {attached}\r", 4)
+    said_share = " ".join(r.strip() for r in tui.display()[-4:])
+    def announced():
+        rows = [json.loads(l) for l in run("alice", "room", "read", room, "--json").stdout.splitlines() if l.strip()]
+        return [r for r in rows if "ATTACH-NOTE" in json.dumps(r)]
+    until(lambda: announced(), 60, 1)
+    found = announced()
+    a_env = (found[0].get("envelope") or {}) if found else {}
+    claim("attach", len(found) == 1 and a_env.get("type") == "file"
+          and (a_env.get("data") or {}).get("note") == "ATTACH-NOTE for alice"
+          and a_env.get("to") == [fp["alice"]] and "attach-493.txt" in said_share,
+          f"bob's TUI said {said_share!r}; alice's rows naming the note: {found!r}")
     tui.key("\x1b", 2)  # Esc back to the sidebar
 
     stage("unreach")

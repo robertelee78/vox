@@ -1068,6 +1068,20 @@ impl UiState {
                             })
                         }
                     }
+                    Some(Parsed::Attach(channel_id, path)) => {
+                        // The composer's words are the note, its To: and urgent the share's: one
+                        // announcement carries all of them (F-1), and the composer is spent.
+                        let note = std::mem::take(&mut self.composer).trim().to_owned();
+                        let to = std::mem::take(&mut self.to);
+                        let urgent = std::mem::replace(&mut self.urgent, false);
+                        Action::Dispatch(Command::ShareFile {
+                            channel_id,
+                            path,
+                            note,
+                            to,
+                            urgent,
+                        })
+                    }
                     Some(Parsed::Lanes) => {
                         if self.lanes {
                             self.leave_lanes(vm)
@@ -1278,6 +1292,8 @@ pub enum Parsed {
     Trust(Digest32),
     /// Send a message to this room, with the composer's To: and urgent (ADR-028 W-4).
     Send(Digest32, String),
+    /// Share the file or folder at this path in the room, from the composer (ADR-028 F-1).
+    Attach(Digest32, String),
     /// Show or leave the room's lanes (ADR-028 W-3).
     Lanes,
     /// Set the composer's To: from these names (W-4); none clears it.
@@ -1376,6 +1392,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     match verb {
         "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
         "lanes" => return Some(Parsed::Lanes),
+        // Share a file or folder here, from the composer (F-1): its words the note. `share`, as
+        // `vox share` is; `:attach` is the node's.
+        "share" if !rest.is_empty() => return Some(Parsed::Attach(channel, rest.to_owned())),
         "to" => return Some(Parsed::To(rest.to_owned())),
         "urgent" => return Some(Parsed::Urgent),
         _ => {}
