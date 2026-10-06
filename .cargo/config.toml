@@ -5,4 +5,6 @@
 # decider's real daemon on the same machine, nor fight the proofs running beside it. So a daemon
 # started from a cargo-run test binary binds a free port, and says which in its log and in `vox up`.
 # Not forced: a run that sets VOX_PROXY itself keeps its own. A shipped binary never reads this file.
+# A proof binary run outside cargo (run-slot.sh, a checker) gets the same default from the proofs'
+# own support (crates/vox-core/tests/support/temp_home.rs), which every proof includes.
 VOX_PROXY = "127.0.0.1:0"

@@ -12,7 +12,9 @@
 //! unsets `CODEX_HOME`, `CLAUDE_CONFIG_DIR` and `OPENCODE_CONFIG_DIR` (which name an agent's
 //! config outside HOME) and the variables naming the agent session that runs the proof. A
 //! child inherits its parent's environment, so every child of every proof gets the temporary
-//! HOME by default, through every helper, with no call site to remember. A proof that passes
+//! HOME by default, through every helper, with no call site to remember. The same constructor
+//! gives every child `VOX_PROXY=127.0.0.1:0` unless the run set its own, so no proof's daemon takes
+//! port 1080 (see `init`). A proof that passes
 //! `HOME` explicitly passes either a directory of its own or `std::env::var("HOME")`, which is
 //! now this one.
 //!
@@ -71,6 +73,11 @@ const UNSET: [&str; 11] = [
     "VOX_OPENCODE_WAKE_TOKEN",
 ];
 
+/// Where a `vox` daemon listens for its `.vox` proxy, and the value every proof's child gets unless
+/// the run set its own: a free port of the loopback address.
+const PROXY: &str = "VOX_PROXY";
+const FREE_PROXY: &str = "127.0.0.1:0";
+
 /// The sentinel [`check`] has a child write in its HOME.
 const SENTINEL: &str = ".vox-proof-sentinel";
 
@@ -119,6 +126,14 @@ extern "C" fn init() {
     }
     for var in UNSET {
         std::env::remove_var(var);
+    }
+    // A daemon a proof starts binds its `.vox` proxy on a free port, never 127.0.0.1:1080 (ADR-028
+    // S-5), so it takes that port from no real daemon and no other proof. `.cargo/config.toml` says
+    // so for what `cargo test` runs; a proof binary run on its own (`run-slot.sh`, a checker) gets
+    // nothing from cargo, and its daemons took 1080. A run that sets VOX_PROXY keeps its own, and
+    // a proof that sets it on a child (the proxy-port proofs) passes its own value there.
+    if std::env::var_os(PROXY).is_none() {
+        std::env::set_var(PROXY, FREE_PROXY);
     }
     let _ = REAL_HOME.set(real);
     let _ = REAL_XDG_DATA_HOME.set(real_data);
