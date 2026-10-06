@@ -85,6 +85,7 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
         Screen::ChannelList => render_channel_list(frame, chunks[0], vm, ui),
         Screen::Channel => render_channel(frame, chunks[0], vm, ui),
         Screen::Tunnels => render_tunnels(frame, chunks[0], vm, ui),
+        Screen::Keyring => render_keyring(frame, chunks[0], vm),
     }
     render_status_bar(frame, chunks[1], vm);
     frame.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), chunks[2]);
@@ -443,10 +444,45 @@ fn render_members(
             if let Some(label) = trust_label(m.trust) {
                 lines.push(Line::from(format!("    {label}")));
             }
+            // The selected member's card (ADR-028 K-1, L-9): its fingerprint whole and grouped,
+            // with its art beside it, never the art alone.
+            if selected == Some(m.id) && focus {
+                for row in vox_text::fingerprint::card(&vox_core::node::link::b32_encode(&m.id)) {
+                    lines.push(Line::from(format!("    {row}")));
+                }
+            }
             ListItem::new(lines)
         })
         .collect();
     let list = List::new(items).block(pane_block("Members", focus));
+    frame.render_widget(list, area);
+}
+
+/// The trust keyring (ADR-028 W-1, K-1): each node by your name for it, with its fingerprint
+/// whole and grouped and its art beside it.
+fn render_keyring(frame: &mut Frame, area: Rect, vm: &ViewModel) {
+    let items: Vec<ListItem> = if vm.keyring.is_empty() {
+        vec![ListItem::new(Line::from(
+            "  you trust no node yet (`vox trust add`)",
+        ))]
+    } else {
+        vm.keyring
+            .iter()
+            .map(|(fp, alias)| {
+                let mut lines = vec![Line::from(format!("  {}", vox_text::shown(alias, 64)))];
+                for row in vox_text::fingerprint::card(&vox_core::node::link::b32_encode(fp)) {
+                    lines.push(Line::from(format!("    {row}")));
+                }
+                lines.push(Line::from(""));
+                ListItem::new(lines)
+            })
+            .collect()
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Keyring (Esc: back)"),
+    );
     frame.render_widget(list, area);
 }
 
@@ -537,12 +573,13 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
     }
     match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · t tunnels · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · k keyring · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
         }
         Screen::Channel => {
             " Tab switch pane · Enter send · PgUp/PgDn scroll · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
+        Screen::Keyring => " : command · Esc back",
     }
     .to_owned()
 }

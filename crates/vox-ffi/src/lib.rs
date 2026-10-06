@@ -76,6 +76,27 @@ fn digest(text: &str, what: &'static str) -> Result<Digest32, VoxError> {
     b32_decode(text.trim(), what).map_err(|e| failed(format!("{what}: {e}")))
 }
 
+/// A node's fingerprint as a person reads it (ADR-028 K-1, L-9): what the app draws wherever it
+/// shows a node, the same as `vox status` and the TUI draw.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FingerprintCard {
+    /// The whole fingerprint in groups of four, separated by spaces.
+    pub grouped: String,
+    /// Its art: five rows of five cells, each cell two characters of `◢◣◤◥`. Shown beside the
+    /// text, never instead of it. Empty for text that is not a fingerprint.
+    pub art: Vec<String>,
+}
+
+/// The card for `fingerprint` (base32, as every other call gives it).
+#[uniffi::export]
+#[must_use]
+pub fn fingerprint_card(fingerprint: String) -> FingerprintCard {
+    FingerprintCard {
+        grouped: vox_text::fingerprint::grouped(&fingerprint),
+        art: vox_text::fingerprint::art(&fingerprint).unwrap_or_default(),
+    }
+}
+
 /// A room this node holds.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Room {

@@ -29,6 +29,9 @@ bindgen = ["uniffi/cli"]
 vox-core = { path = "../vox-core" }
 # The envelope a post with addressees, a reply or urgency is written as (ADR-020 4.5, 4.6).
 vox-agentcomms = { path = "../vox-agentcomms" }
+# A fingerprint as a person reads it, with its art (ADR-028 K-1, L-9): the one renderer the CLI
+# and the TUI draw too.
+vox-text = { path = "../vox-text" }
 zeroize.workspace = true
 uniffi.workspace = true
 tokio.workspace = true

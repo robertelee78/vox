@@ -3159,6 +3159,7 @@ dependencies = [
  "uniffi",
  "vox-agentcomms",
  "vox-core",
+ "vox-text",
  "zeroize",
 ]
 
@@ -3214,6 +3215,7 @@ dependencies = [
  "tokio-util",
  "vox-agentcomms",
  "vox-core",
+ "vox-text",
  "vox-theme",
  "vt100",
  "zeroize",

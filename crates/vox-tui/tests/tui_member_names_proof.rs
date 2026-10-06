@@ -1,5 +1,9 @@
 //! The TUI names a member by the name you gave it, or by 26 characters of its fingerprint marked
-//! "(not in keyring)" (#198, V210-24), through the shipped `vox tui` in a pty.
+//! "(not in keyring)" (#198, V210-24), through the shipped `vox tui` in a pty; and (ADR-028 K-1,
+//! L-9, W-1, #472) draws the selected member's card, its fingerprint grouped beside its art, and a
+//! keyring view (`k`) of every node you trust with the same card, each node's art its own.
+//! Mutation: the art drawn from the alias instead of the fingerprint turns it red (Alice's art and
+//! Erin's are then one).
 //!
 //! The work is in `tests/pty/tui_member_names.py` (real daemons; the TUI's screen read through the
 //! `pyte` terminal emulator). This wrapper is what makes CI run it: a script nobody runs guards
@@ -65,7 +69,8 @@ fn the_tui_names_a_trusted_member_by_name_and_anyone_else_by_fingerprint_marked(
         }
         Some(1) if said.contains("cargo RED") => panic!(
             "PRODUCT: the TUI must name alice \"alice\" and carol by 26 characters + \"(not in \
-             keyring)\": {said}"
+             keyring)\", and draw each node's own card in the members pane and the keyring view: \
+             {said}"
         ),
         _ => panic!(
             "CANNOT MEASURE: APPARATUS: the TUI driver ended after {:?} at stage {:?} with exit \
