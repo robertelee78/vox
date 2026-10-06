@@ -1843,7 +1843,7 @@ pub struct LiveTunnel {
     pub id: u64,
     /// The member at the other end.
     pub peer: Digest32,
-    /// The service it reaches: a port, or a `vox room send` offer's tag.
+    /// The service it reaches: a port, or a share's tag.
     pub service: String,
     /// Whether this node opened it (to reach the member's service), rather than serving it.
     pub outbound: bool,

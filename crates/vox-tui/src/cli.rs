@@ -556,8 +556,9 @@ pub struct GetFileArgs {
     pub room: String,
     /// The file's name, or a prefix of its SHA-256, or its service tag.
     pub file: String,
-    /// The directory to put it in, under the sender's name made safe. Defaults to the
-    /// directory named in the `downloads` file of the config directory, else `~/Downloads`.
+    /// The directory to put it in, under the sender's name made safe. Without it (or --out),
+    /// the file lands in the node's files directory for the room:
+    /// `<data root>/nodes/<node>/files/<room id>/`, and is deleted when its message expires.
     #[arg(long, conflicts_with = "out")]
     pub dir: Option<PathBuf>,
     /// An exact path to write it to instead. Refused if something is already there.
