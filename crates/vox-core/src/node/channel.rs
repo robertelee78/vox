@@ -303,6 +303,14 @@ pub const AUTHORS_HARD_LIMIT: usize = 2 * MAX_AUTHORS;
 #[cfg(feature = "test-knobs")]
 pub const TEST_MAX_AUTHORS_ENV: &str = "VOX_TEST_MAX_AUTHORS";
 
+/// **Test-only**: when set, this node never counts a room as synced since it joined, so a proof can
+/// stand a forward in a room whose first sync has provably not happened, whatever the timing of
+/// the join (a joiner's first sync otherwise races the end of `vox connect`). Unset, nothing
+/// changes; nothing a person runs sets it, and without the `test-knobs` feature (V210-105) it is
+/// not compiled in.
+#[cfg(feature = "test-knobs")]
+pub const TEST_NEVER_SETTLE_ENV: &str = "VOX_TEST_NEVER_SETTLE";
+
 /// The most authors a room admits: [`MAX_AUTHORS`], or `TEST_MAX_AUTHORS_ENV`'s.
 #[must_use]
 pub fn max_authors() -> usize {
@@ -6327,6 +6335,10 @@ impl ChannelState {
     /// and may write. Returns whether that is new.
     pub fn settle(&mut self, store: &Store) -> Result<bool> {
         if self.settled {
+            return Ok(false);
+        }
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_NEVER_SETTLE_ENV).is_some_and(|v| !v.is_empty()) {
             return Ok(false);
         }
         store.delete_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_UNSETTLED)?;

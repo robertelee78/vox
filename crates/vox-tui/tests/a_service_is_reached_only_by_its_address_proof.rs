@@ -36,8 +36,11 @@
 //! 12. The canonical address pasted before the share has reached the machine: dave joins, alice
 //!     then shares `nas-web` and copies its canonical address, every
 //!     member that could sync with him is stopped (SIGSTOP), and with his node holding no such
-//!     share his proxy and his `vox forward` must reach nas-web once they resume. A node that
-//!     already held it is CANNOT MEASURE (the staging did not happen), not a pass.
+//!     share his proxy and his `vox forward` must reach nas-web once they resume. His daemon runs
+//!     with the test-only `VOX_TEST_NEVER_SETTLE`, and a forward by name says his room has not
+//!     synced, so the forward by fingerprint provably meets an unsynced room; a run where either
+//!     premise fails is CANNOT MEASURE (the staging did not happen), not a pass. Mutation:
+//!     `vox forward` refuses an unknown fingerprint in an unsynced room.
 //!     And pasted on a member whose copy of the room is behind: carol, synced,
 //!     sleeps (SIGSTOP) while alice shares `nas-www`; with alice and bob stopped too she wakes
 //!     holding no such share, and her proxy and `vox forward` must still reach it once alice is
@@ -61,6 +64,9 @@ mod world;
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
@@ -152,10 +158,15 @@ fn trust(dir: &Path, who: &str, fp: &str, as_name: &str) {
 
 /// `vox daemon` on `dir`, its identity passphrase from a file; returned once it answers.
 fn daemon(name: &str, dir: &Path, anchor: &str) -> VoxProc {
+    daemon_env(name, dir, anchor, &[])
+}
+
+/// [`daemon`], with `env` added to the daemon's environment (a test-only knob).
+fn daemon_env(name: &str, dir: &Path, anchor: &str, env: &[(&str, &str)]) -> VoxProc {
     let pass_file = dir.join("passphrases");
     std::fs::write(&pass_file, format!("{IDENTITY}\n"))
         .expect("APPARATUS: write the passphrase file");
-    let mut p = VoxProc::spawn(
+    let mut p = VoxProc::spawn_env(
         name,
         dir,
         &args(&[
@@ -167,6 +178,7 @@ fn daemon(name: &str, dir: &Path, anchor: &str) -> VoxProc {
             "--passphrase-file",
             pass_file.to_str().expect("APPARATUS: a UTF-8 path"),
         ]),
+        env,
     );
     let deadline = Instant::now() + SETUP;
     while !vox(dir, &["room", "list"], None).0 {
@@ -785,7 +797,11 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     for pid in &others {
         assert!(signal("STOP", *pid), "APPARATUS: SIGSTOP {pid}");
     }
-    // Plain, as the person types it: no node held for him around it, which would sync the room.
+    // **dave's room provably never syncs**: his daemon runs with the test-only
+    // VOX_TEST_NEVER_SETTLE, so whether the join's first sync beat the end of `vox connect` (it
+    // did about half the time) no longer decides what this scene measures.
+    test_knobs::require(&["VOX_TEST_NEVER_SETTLE", "VOX_TEST_SHARE_PATIENCE_MS"]);
+    let mut dave_daemon = daemon_env("dave", &dave_dir, &spec, &[("VOX_TEST_NEVER_SETTLE", "1")]);
     let (ok, out, err) = vox_plain(
         &dave_dir,
         &[
@@ -828,14 +844,39 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         let canonical = web_canonical.clone();
         move || who_answers(dave_proxy, &canonical)
     });
+    // The premise, in dave's own node's words: a forward by a name in that room is refused because
+    // the room has not synced since he joined (its patience shortened), so his room is unsynced
+    // when he pastes.
+    let mut probe = VoxProc::spawn_env(
+        "dave forward nosuch",
+        &dave_dir,
+        &args(&[
+            "forward",
+            &format!("nosuch.{alice_fp}.{room}.vox"),
+            "127.0.0.1:0",
+        ]),
+        &[("VOX_TEST_SHARE_PATIENCE_MS", "500")],
+    );
+    let unsynced = probe.line_within(Duration::from_secs(30), |l| {
+        l.contains("has not synced with its members since this node joined it")
+    });
+    if unsynced.is_none() {
+        for pid in &others {
+            let _ = signal("CONT", *pid);
+        }
+        panic!(
+            "CANNOT MEASURE (APPARATUS): dave's room was not provably unsynced when he pasted; a \
+             forward by name there said:\n{}",
+            probe.transcript()
+        );
+    }
+    drop(probe);
     let mut early = VoxProc::spawn(
         "dave forward",
         &dave_dir,
         &args(&["forward", &web_canonical, "127.0.0.1:0"]),
     );
-    // The premise, from dave's own node while every member is still stopped: it holds no
-    // nas-web, so his paste names a share his copy of the room lacks. (Whether his room counts as
-    // synced yet varies with the join's timing, and no longer matters: alice resolves it.)
+    // And it holds no nas-web, so his paste names a share his copy of the room lacks.
     let (_, dave_saw, _) = vox(&dave_dir, &["service", "list", &room], None);
     let waited = early.line_within(Duration::from_secs(3), |l| {
         l.contains("waiting for this room's first sync")
@@ -1067,5 +1108,14 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         carol_daemon.transcript(),
         carol_up.transcript(),
     );
-    drop((serve, bob_up, carol_up, bob_daemon, carol_daemon, anchor));
+    let _ = dave_daemon.transcript();
+    drop((
+        serve,
+        bob_up,
+        carol_up,
+        bob_daemon,
+        carol_daemon,
+        dave_daemon,
+        anchor,
+    ));
 }
