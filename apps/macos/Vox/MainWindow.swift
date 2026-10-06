@@ -138,10 +138,16 @@ private struct RoomView: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
                             ForEach(model.roomServices, id: \.address) { service in
+                                let selected = model.selectedService?.address == service.address
                                 ServiceCard(service: service)
-                                    .background(model.selectedService?.address == service.address
+                                    .background(selected
                                                 ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
+                                    // The whole card takes the click: without a shape only its
+                                    // drawn text and icon did, and a click between them (as at
+                                    // its centre) selected nothing.
+                                    .contentShape(Rectangle())
                                     .onTapGesture { model.selectedService = service }
+                                    .accessibilityAddTraits(selected ? .isSelected : [])
                             }
                         }
                         .padding(8)

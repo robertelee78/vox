@@ -859,7 +859,14 @@ final class FirstRunProof: XCTestCase {
         let card = Key.id("service-\(cliAddress)")
         present(ui, card, timeout: 30, "the room must show a card for bob's service \(cliAddress)")
         tap(ui, card, "the service card")
-        // Selected, the card enables Room > Copy Selected Service's Address (⌘⇧C).
+        // Clicked, the card is selected (it says so to VoiceOver), and enables Room > Copy
+        // Selected Service's Address (⌘⇧C).
+        let selectedUntil = Date().addingTimeInterval(5)
+        while Date() < selectedUntil && !el(ui, card).isSelected { Thread.sleep(forTimeInterval: 0.2) }
+        if !el(ui, card).isSelected {
+            keepTree(ui, "the service card was not selected")
+            XCTFail("PRODUCT: clicking bob's service card must select it; it does not say it is selected")
+        }
         let copyItem = el(ui, Key.menuItem("Copy Selected Service's Address"))
         if !copyItem.exists {
             keepTree(ui, "the copy menu item was not found")
