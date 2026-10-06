@@ -224,17 +224,7 @@ final class NodeModel: ObservableObject {
             roomServices = (try? await client.services(room: id).shared) ?? []
             lanes = (try? await client.lanes(room: id)) ?? []
             watchReads(id)
-            let roster = try await client.roster(room: id)
-            let consents = try await client.consents(room: id)
-            let keyring = Set(trusted.map(\.fingerprint))
-            let back = Set(consents.inbound)
-            members = roster.filter { $0.fingerprint != me }.map { m in
-                let trust: Trust = keyring.contains(m.fingerprint)
-                    ? (back.contains(m.fingerprint) ? .mutual : .oneWay) : .none
-                return MemberRow(id: m.fingerprint,
-                                 name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
-                                 trust: trust)
-            }
+            members = try await memberRows(id)
         } catch {
             said = sentence(error)
         }
@@ -527,6 +517,21 @@ final class NodeModel: ObservableObject {
 
     /// Who has read this node's messages in `room`, read again every few seconds while it is on
     /// screen: read records arrive with the room's syncs and draw nothing of their own.
+    /// The members of `room` other than this node, with the trust each has here.
+    private func memberRows(_ room: String) async throws -> [MemberRow] {
+        let roster = try await client.roster(room: room)
+        let consents = try await client.consents(room: room)
+        let keyring = Set(trusted.map(\.fingerprint))
+        let back = Set(consents.inbound)
+        return roster.filter { $0.fingerprint != me }.map { m in
+            let trust: Trust = keyring.contains(m.fingerprint)
+                ? (back.contains(m.fingerprint) ? .mutual : .oneWay) : .none
+            return MemberRow(id: m.fingerprint,
+                             name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
+                             trust: trust)
+        }
+    }
+
     private func watchReads(_ room: String) {
         watching?.cancel()
         watching = Task { [weak self] in
@@ -540,6 +545,14 @@ final class NodeModel: ObservableObject {
                 }
                 if let copies = try? await self.client.pulled(room: room) {
                     self.pulled = Dictionary(copies.map { ($0.entry, $0.path) }) { $1 }
+                }
+                // A member who joins, or whose trust changes, while the room is on screen.
+                if let keyring = try? await self.client.trustList(), keyring != self.trusted {
+                    self.trusted = keyring
+                }
+                if let rows = try? await self.memberRows(room), rows != self.members,
+                   case .room(room) = self.selection {
+                    self.members = rows
                 }
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }

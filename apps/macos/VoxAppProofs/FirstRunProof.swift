@@ -11,8 +11,9 @@
 //    what that does (ADR-014 M-8); the person says Not Now. Then it lists the Mac's nodes; the person picks one and types its passphrase.
 //    A wrong passphrase shows the daemon's own sentence where it was typed.
 // 2. The right one attaches the node: the app says so, and `vox node list` says `attached`.
-// 3. The main window (ADR-028 W-1, W-2; ADR-014 M-13): once bob, a member alice trusts, posts to
-//    the room a message addressed to alice, the sidebar lists the room under "needs you (1)"; the
+// 3. The main window (ADR-028 W-1, W-2; ADR-014 M-13): ⌘N makes the room and shows it; bob joins
+//    and alice trusts him while it is on screen, and its inspector lists him in her keyring. Off
+//    the room, once bob posts to it a message addressed to alice, the sidebar lists the room under "needs you (1)"; the
 //    inspector lists bob with his trust glyph; the status bar says the node, its peers and the
 //    keyring window.
 // 4. Read each way (ADR-028 R-6, ADR-014 M-14, #441): bob's message, drawn in alice's timeline,
@@ -46,7 +47,8 @@
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
-// addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
+// addressed to this node grouped as quiet (`attention::group`), or an inspector that lists the
+// members only when the room is opened: (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
@@ -214,6 +216,15 @@ final class FirstRunProof: XCTestCase {
         guard readable else {
             throw Apparatus("alice never read a post of bob's in 120 s; `vox room read` said: \(seen)")
         }
+        // The room has been on screen since ⌘N made it: bob, who joined meanwhile and whom alice
+        // trusted meanwhile, is listed in its inspector without the room being opened again.
+        let joined = ui.descendants(matching: .any)["member-bob"]
+        let inKeyring = NSPredicate(format: "exists == true AND label BEGINSWITH %@", "bob, in keyring")
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: inKeyring, evaluatedWith: joined)],
+                                      timeout: 30), .completed,
+                       "PRODUCT: bob joined and was trusted while the room was on screen, and its inspector does not list him in alice's keyring; it said \"\(joined.exists ? joined.label : "no bob")\"")
+        // Off the room, so a message to alice is unread: a room on screen is read.
+        ui.descendants(matching: .any)["keyring"].click()
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
                    env: bobSession)
         let needsYou = ui.descendants(matching: .any)["group-needs you"]
