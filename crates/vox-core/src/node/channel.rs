@@ -181,6 +181,49 @@ const SEG_HELD: u64 = 14;
 /// Encoding version of [`SEG_HELD`].
 const HELD_VERSION: u64 = 1;
 
+/// The members this node knows to be members before their records are admitted (V030-51), within
+/// [`SegmentKind::KeyMaterial`]: the member that answered this node's join. A room link names it
+/// with an address, as it names the room's anchors; without this a joiner that admitted fewer
+/// records than the room has members kept it as an anchor, dialled direct only and passed over by
+/// the sync, until a sync admitted it — and again on every reopen before then.
+const SEG_KNOWN_MEMBERS: u64 = 15;
+
+/// Encoding version of [`SEG_KNOWN_MEMBERS`].
+const KNOWN_MEMBERS_VERSION: u64 = 1;
+
+fn known_members_bytes(known: &BTreeSet<Digest32>) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(2).uint(KNOWN_MEMBERS_VERSION).array(known.len());
+    for id in known {
+        e.bytes(id);
+    }
+    e.finish()
+}
+
+fn parse_known_members(bytes: &[u8]) -> Result<BTreeSet<Digest32>> {
+    let mut d = Decoder::new(bytes);
+    if d.array()? != 2 {
+        return Err(Error::MalformedAtRest("known members arity"));
+    }
+    if d.uint()? != KNOWN_MEMBERS_VERSION {
+        return Err(Error::MalformedAtRest("known members version"));
+    }
+    let n = d.array()?;
+    if n > AUTHORS_HARD_LIMIT {
+        return Err(Error::SizeLimitExceeded("known members"));
+    }
+    let mut out = BTreeSet::new();
+    for _ in 0..n {
+        let id: Digest32 = d
+            .bytes()?
+            .try_into()
+            .map_err(|_| Error::MalformedAtRest("known member"))?;
+        out.insert(id);
+    }
+    d.finish()?;
+    Ok(out)
+}
+
 fn held_bytes(held: &BTreeMap<Digest32, u64>) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(2).uint(HELD_VERSION).array(held.len());
@@ -788,6 +831,9 @@ pub struct ChannelState {
     /// Identity → `(decision, chain_id, iteration)` at the trust decision (V210-45),
     /// persisted in `SEG_TRUST_MARKS`. See [`ChannelState::mark_trust`].
     trust_marks: BTreeMap<Digest32, TrustMark>,
+    /// Members known before their records are admitted (V030-51), persisted in
+    /// `SEG_KNOWN_MEMBERS`. See [`ChannelState::note_member`].
+    known_members: BTreeSet<Digest32>,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -1586,6 +1632,7 @@ impl ChannelState {
             history: BTreeMap::new(),
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
+            known_members: BTreeSet::new(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled: true,
@@ -1973,6 +2020,15 @@ impl ChannelState {
                 }
                 None => BTreeMap::new(),
             };
+        let known_members =
+            match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_KNOWN_MEMBERS)? {
+                Some(seg) => {
+                    let bytes =
+                        open_segment(&sek, SegmentKind::KeyMaterial, SEG_KNOWN_MEMBERS, &seg)?;
+                    parse_known_members(&bytes)?
+                }
+                None => BTreeSet::new(),
+            };
 
         Self::refresh_gov_preds(&dag, &mut gov_entries);
         let evaluator = Arc::new(Self::build_evaluator(
@@ -2034,6 +2090,7 @@ impl ChannelState {
             history,
             entitled,
             trust_marks,
+            known_members,
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled,
@@ -2273,6 +2330,7 @@ impl ChannelState {
             history: BTreeMap::new(),
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
+            known_members: BTreeSet::new(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled: false,
@@ -2816,6 +2874,42 @@ impl ChannelState {
     #[must_use]
     pub fn is_author(&self, fingerprint: &Digest32) -> bool {
         self.authors.contains_key(fingerprint)
+    }
+
+    /// Whether `fingerprint` is known to be a member here: an admitted author, or a member this
+    /// node knows before its record is admitted ([`Self::note_member`]). What a room link names
+    /// that passes this is a member at an address, never an anchor (V030-51).
+    #[must_use]
+    pub fn is_known_member(&self, fingerprint: &Digest32) -> bool {
+        self.is_author(fingerprint) || self.known_members.contains(fingerprint)
+    }
+
+    /// Record `member` as a member of this room before its record is admitted: the member that
+    /// answered this node's join, which proved it holds the room (V030-51). Persisted, so a reopen
+    /// before the first sync still knows it. Admits nothing: it reads and writes as before.
+    ///
+    /// # Errors
+    /// If the store cannot take the record.
+    pub fn note_member(&mut self, store: &Store, member: Digest32) -> Result<()> {
+        if self.is_author(&member) || !self.known_members.insert(member) {
+            return Ok(());
+        }
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_KNOWN_MEMBERS,
+            &known_members_bytes(&self.known_members),
+        )?;
+        if let Err(e) = store.put_segment(
+            &self.channel_id,
+            SegmentKind::KeyMaterial,
+            SEG_KNOWN_MEMBERS,
+            &seg,
+        ) {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// The admitted authors' keys, in fingerprint order.

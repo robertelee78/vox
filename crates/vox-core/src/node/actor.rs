@@ -6147,7 +6147,7 @@ impl Node {
         // A peer that said it was stopping stopped, however the connection then ended: by its
         // close, by this end's close on hearing it, or by a close that never arrived.
         let why = match (silent, conn.quinn().close_reason()) {
-            _ if conn.peer_stopped() => "the anchor stopped".to_owned(),
+            _ if conn.peer_stopped() => format!("the {} stopped", self.board_word(&id)),
             // Its peer is still running, but its only path ran through a relay that stopped: that
             // is the cause, not the probe's verdict on a path that no longer exists (V210-93).
             _ if conn.carrier_stopped().is_some() => format!(
@@ -6171,8 +6171,9 @@ impl Node {
             net.manager().note(
                 id,
                 format!(
-                    "the connection to this anchor is gone {}s after it was made ({why}); it is \
+                    "the connection to this {} is gone {}s after it was made ({why}); it is \
                      redialled in {wait}s",
+                    self.board_word(&id),
                     lasted.unwrap_or(0)
                 ),
             );
@@ -6180,7 +6181,10 @@ impl Node {
             self.anchor_backoff.remove(&id);
             net.manager().note(
                 id,
-                format!("the connection to this anchor is gone ({why}); it is redialled now"),
+                format!(
+                    "the connection to this {} is gone ({why}); it is redialled now",
+                    self.board_word(&id)
+                ),
             );
         }
     }
@@ -6241,7 +6245,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let (anchors, own) = {
+        let (anchors, own, members) = {
             let mut channel = shared.lock().await;
             if let Some(profile) = self.profile.as_ref() {
                 let mut add = self.anchors.clone();
@@ -6253,19 +6257,26 @@ impl Node {
             // A link names the member who issued it too, last; a member is reached at the
             // addresses its board record gives, not kept like an anchor at the link's.
             let mut own = BootstrapSet::new();
+            let mut members = std::collections::BTreeSet::new();
             for n in channel.anchors().nodes() {
-                if !channel.is_author(&n.id) {
+                if channel.is_known_member(&n.id) {
+                    members.insert(n.id);
+                } else {
                     let _ = own.add(n.clone());
                 }
             }
-            (channel.anchors().clone(), own)
+            (channel.anchors().clone(), own, members)
         };
         self.room_anchors.insert(*channel_id, own);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
         for anchor in anchors.nodes() {
-            if anchor.id == net.local_id() {
+            // **A member is never dialled as an anchor** (V030-51, AGENTS.md "Anchors"): an
+            // anchor's dial is direct only, and its failure backed off the member's sync, so a
+            // member only a circuit reaches — the room's host, named by its link — was not
+            // reached at all. A member is reached by the sync, which asks a relay when it must.
+            if anchor.id == net.local_id() || members.contains(&anchor.id) {
                 continue;
             }
             self.anchor_ids.insert(anchor.id);
@@ -7030,6 +7041,20 @@ impl Node {
                 puts.extend(self.withdrawn.values().cloned());
                 Self::put_withdraws(&conn, puts);
                 self.read_anchor_boards(Some(peer)).await;
+                // A room that has not had its first sync reaches its members now that a relay is
+                // here to carry what its direct dials cannot (V030-51).
+                let unsynced: Vec<Digest32> = {
+                    let mut rooms = Vec::new();
+                    for (id, ch) in &self.channels {
+                        if !ch.lock().await.is_settled() {
+                            rooms.push(*id);
+                        }
+                    }
+                    rooms
+                };
+                for channel_id in unsynced {
+                    self.reach_members_of(&channel_id).await;
+                }
             }
             NetEvent::BetterPath { conn } => {
                 self.adopt_connection(conn);
@@ -8232,11 +8257,25 @@ impl Node {
             return Outcome::Failed(Fault::UnknownChannel);
         }
         let anchors = self.link_boards(channel_id).await;
-        let link =
-            match crate::node::link::InviteLink::new(*channel_id, anchors, Some(net.local_id())) {
-                Ok(l) => l,
-                Err(e) => return Outcome::Failed(fault_of(&e)),
-            };
+        // Each entry that is a member of the room — this node, and any other whose address the
+        // room keeps — is marked one, so a joiner never keeps it as an anchor (V030-51).
+        let me = net.local_id();
+        let members: Vec<Digest32> = match self.channels.get(channel_id).map(Arc::clone) {
+            Some(shared) => {
+                let channel = shared.lock().await;
+                anchors
+                    .iter()
+                    .map(|a| a.id)
+                    .filter(|id| *id == me || channel.is_known_member(id))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let link = match crate::node::link::InviteLink::new(*channel_id, anchors, Some(me), members)
+        {
+            Ok(l) => l,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
         let _ = self.event_tx.send(NodeEvent::InviteLink {
             channel_id: *channel_id,
             url: link.to_url(),
@@ -8328,6 +8367,22 @@ impl Node {
             .collect()
     }
 
+    /// The anchors `room`'s address names: [`Self::named_anchors`] less the members it names.
+    /// **A member the address names is a member at an address, never an anchor** (V030-51,
+    /// AGENTS.md "Anchors"): the address carries members' addresses too (V210-167), and a member
+    /// was said to be an anchor that "has not taken" the room it is in.
+    async fn named_anchors_not_members(&self, room: &Digest32) -> Vec<Digest32> {
+        let named = self.named_anchors(room).await;
+        let Some(shared) = self.channels.get(room) else {
+            return named;
+        };
+        let channel = shared.lock().await;
+        named
+            .into_iter()
+            .filter(|id| !channel.is_known_member(id))
+            .collect()
+    }
+
     /// The routes of this node's own an address would name: what it advertises.
     fn own_routes(&self) -> Vec<crate::nat::multiaddr::Multiaddr> {
         self.net
@@ -8392,7 +8447,7 @@ impl Node {
         let short = crate::node::network::short_id;
         let routes = self.own_routes();
         let pending: Vec<Digest32> = self
-            .named_anchors(&room)
+            .named_anchors_not_members(&room)
             .await
             .into_iter()
             .filter(|b| !self.on_board.contains(&(room, *b)))
@@ -8737,7 +8792,7 @@ impl Node {
         if let Some(shared) = self.channels.get(&room).map(Arc::clone) {
             let channel = shared.lock().await;
             for n in named.nodes() {
-                if channel.is_author(&n.id) {
+                if channel.is_known_member(&n.id) {
                     members.push((n.id, n.endpoints.direct_candidates()));
                 }
             }
@@ -8826,7 +8881,7 @@ impl Node {
             let mut channel = shared.lock().await;
             let mut kept = BootstrapSet::new();
             for n in named.nodes() {
-                if answered.contains(&n.id) || !channel.is_author(&n.id) {
+                if answered.contains(&n.id) || !channel.is_known_member(&n.id) {
                     let _ = kept.add(n.clone());
                 }
             }
@@ -8835,13 +8890,13 @@ impl Node {
             }
             let mut own = BootstrapSet::new();
             for n in channel.anchors().nodes() {
-                if !channel.is_author(&n.id) {
+                if !channel.is_known_member(&n.id) {
                     let _ = own.add(n.clone());
                 }
             }
             self.room_anchors.insert(room, own);
             for n in named.nodes() {
-                if !channel.is_author(&n.id) {
+                if !channel.is_known_member(&n.id) {
                     anchors.push((n.id, n.endpoints.direct_candidates()));
                 }
             }
@@ -8961,6 +9016,20 @@ impl Node {
         self.refresh_reachers().await;
         self.adopt_join_session(parsed.channel_id, responder, joined.session, true)
             .await;
+        // **The member that answered the join is a member, not an anchor** (V030-51): the link
+        // names it with an address, as it names the room's anchors, and its record may not be
+        // among those admitted yet. Recorded first, so the anchors adopted below leave it out.
+        if let (Some(profile), Some(shared)) = (
+            self.profile.as_ref(),
+            self.channels.get(&parsed.channel_id).map(Arc::clone),
+        ) {
+            let mut channel = shared.lock().await;
+            let _ = channel.note_member(profile.store(), responder);
+            // And every member the link marks one (`m=`).
+            for member in parsed.members.iter().filter(|m| **m != me) {
+                let _ = channel.note_member(profile.store(), *member);
+            }
+        }
         // The link's anchors are this channel's anchors from now on (persisted, so a
         // restart still knows where the swarm's board is), together with our own.
         let mut learned = BootstrapSet::new();
@@ -11890,10 +11959,10 @@ impl Node {
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
             return;
         };
-        let (me, members, anchored) = {
+        let (me, members, anchored, settled) = {
             let ch = shared.lock().await;
             let anchored = ch.anchors().nodes().iter().any(|a| a.id != net.local_id());
-            (ch.me(), ch.members(), anchored)
+            (ch.me(), ch.members(), anchored, ch.is_settled())
         };
         // **A room with an anchor is left to its board.** The board says where every member is
         // within moments of opening, and a dial started before it from where a member was last
@@ -11901,19 +11970,30 @@ impl Node {
         // landed, the circuit stayed on the anchor for its idle timeout, and anything else that
         // reached the member meanwhile took the relayed path (#226: a `vox forward` beside a
         // reopened room left a circuit on the anchor in 5 of 5 runs, where v0.2.10 left none).
-        // This dial is for a room with no anchor, whose members are found nowhere else.
-        if anchored {
+        // This dial is for a room with no anchor, whose members are found nowhere else — and for
+        // a room that has not had its first sync (V030-51): a joiner that stopped before it owes
+        // no member a key, and nothing else dials a member it holds no connection to, so a member
+        // only a circuit reaches, the room's host, was never reached and the room never synced.
+        if anchored && settled {
             return;
         }
         for member in members.into_iter().filter(|m| *m != me) {
             // Only a member there is an address for: with none in the book either, there is
             // nothing to dial.
-            if net.board_endpoints(channel_id, &member).is_empty()
+            // A room that has synced reaches only a member there is an address for. One that has
+            // not reaches every member, addressed or not, now: the joiner held no address for a
+            // member it reached only through a relay, and the ladder asks a relay for it (reading
+            // a connected board first), which is the one path such a member has.
+            if settled
+                && net.board_endpoints(channel_id, &member).is_empty()
                 && self.peer_book.endpoints(&member).is_empty()
             {
                 continue;
             }
-            let _ = self.reach_member(channel_id, member, false).await;
+            if net.manager().existing(&member).is_some() {
+                continue;
+            }
+            let _ = self.reach_member(channel_id, member, !settled).await;
         }
     }
 
@@ -14891,15 +14971,25 @@ impl Node {
     /// (`--anchor`, the anchors file) or a room names that is not one of its members; any other
     /// board is a room host's own (V210-107).
     fn board_note(&self, peer: &Digest32) -> &'static str {
+        if self.board_word(peer) == "anchor" {
+            "connected to this anchor"
+        } else {
+            "connected to this room host's board"
+        }
+    }
+
+    /// What the board `peer` is called, by [`Self::board_note`]'s rule: `anchor`, or `room host's
+    /// board` (V030-51: a room host is never called an anchor, made or lost).
+    fn board_word(&self, peer: &Digest32) -> &'static str {
         let anchor = self.anchors.get(peer).is_some()
             || self
                 .room_anchors
                 .values()
                 .any(|set| set.get(peer).is_some());
         if anchor {
-            "connected to this anchor"
+            "anchor"
         } else {
-            "connected to this room host's board"
+            "room host's board"
         }
     }
 

@@ -434,7 +434,7 @@ impl Looks {
     }
 }
 
-fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
+pub fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
     let (data, cfg) = (tmp.join("anchor/data"), tmp.join("anchor/cfg"));
     mkdir(&cfg);
     let (out, err) = (tmp.join("anchor.out"), tmp.join("anchor.err"));
@@ -476,7 +476,7 @@ fn spawn_anchor(tmp: &std::path::Path) -> (Proc, String) {
     }
 }
 
-fn worker(tmp: &std::path::Path, name: &str) -> Worker {
+pub fn worker(tmp: &std::path::Path, name: &str) -> Worker {
     let data = tmp.join(name).join("data");
     let cfg = tmp.join(name).join("cfg");
     mkdir(&cfg);
@@ -505,7 +505,7 @@ fn worker(tmp: &std::path::Path, name: &str) -> Worker {
     w
 }
 
-fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
+pub fn start_daemon(w: &mut Worker, anchor: &str, err: &std::path::Path) {
     start_daemon_as(w, VOX, &[], anchor, err);
 }
 

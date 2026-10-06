@@ -649,7 +649,8 @@ fn without_entry_of(address: &str, who: &str) -> String {
         } else if !part.starts_with("b=") {
             skipping = false;
         }
-        if !skipping {
+        // Its member mark goes with it: a mark naming no entry is no link.
+        if !skipping && part != format!("m={who}") {
             kept.push(part);
         }
     }

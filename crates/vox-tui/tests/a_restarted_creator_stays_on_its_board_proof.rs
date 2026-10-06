@@ -117,6 +117,11 @@ fn without_endpoint_of(address: &str, who: &str) -> String {
             i += 2;
             continue;
         }
+        // Its member mark goes with it: a mark naming no entry is no link.
+        if parts[i] == format!("m={who}") {
+            i += 1;
+            continue;
+        }
         kept.push(parts[i]);
         i += 1;
     }

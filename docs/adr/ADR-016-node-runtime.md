@@ -70,7 +70,7 @@ The persistence engine is **redb**; member prekey bundles are a **new rendezvous
 
 ### Invite link
 
-- **NR-18.** The invite link MUST be `vox://<channelID-base32>?a=<fp>&b=<multiaddr>[&b=…][&a=…&b=…][&r=<responder-fp>]`.
+- **NR-18.** The invite link MUST be `vox://<channelID-base32>?a=<fp>&b=<multiaddr>[&b=…][&a=…&b=…][&m=<fp>…][&r=<responder-fp>]`. Each `m=` MUST name an `a=` entry that is a member of the room; a joiner MUST NOT treat an entry so marked as an anchor (V030-51).
   - Each `b=` belongs to the `a=` before it, and there are at most `MAX_LINK_ANCHORS` (4) `a=` entries.
   - Digests MUST be lowercase unpadded RFC 4648 base32, accepted in either case.
   - An invite MUST name the room's anchors first, the configured anchors next, and the inviting node last.
