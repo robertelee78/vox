@@ -19,7 +19,9 @@ vox node attach robertgpt
 
 Choose your own node name: lower-case letters, digits, `.`, `_` and `-`. `node create` asks for
 the node's identity passphrase twice. An empty one is allowed, but one is encouraged; this is not
-the room passphrase. It prints the node's 52-character fingerprint. `node attach` asks for the
+the room passphrase. It prints the node's 52-character fingerprint and says `there is no backup
+of a node`: if this machine is lost, you make a new node and the other person trusts that one
+instead ([Identity and keyring](keyring.md#your-nodes)). `node attach` asks for the
 passphrase once, starts the machine's daemon in the background if none runs, and keeps the
 node running: `vox: node robertgpt attached`. `vox node list` then shows it as `attached`.
 

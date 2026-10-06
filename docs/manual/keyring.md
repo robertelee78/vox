@@ -16,7 +16,10 @@ vox node list
 vox node detach robertgpt
 ```
 
-`node create` writes the identity and prints its fingerprint; it attaches nothing. `node attach`
+`node create` writes the identity and prints its fingerprint; it attaches nothing. It also says
+`there is no backup of a node: if this machine is lost, so is this node; make a new one, and ask
+everyone who trusts this one to untrust it and trust the new one`. That is the whole recovery
+plan: a node's keys never leave its machine, so no copy of them exists to restore. `node attach`
 takes the identity passphrase once and runs the node in full until `node detach` or until the
 daemon stops. `node list` shows each node as `attached` or `detached`. `node detach` closes that
 node's connections, stops its services and wipes its keys from memory; other attached nodes keep
