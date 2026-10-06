@@ -9,8 +9,13 @@
 //! place, under `<data root>/nodes/<node>/files/<room>/`, never over anything already there.
 //! Nothing is written outside the node's files directory.
 //!
-//! Each pull is recorded in `<node>/pulls/<entry>.json`, so it is not pulled again, and so what
-//! was pulled can be found by its announcement.
+//! Each pull is recorded in `<node>/pulls/<entry>.<nonce>.json`, by this daemon or by `vox room
+//! get` into the same directory, so it is not pulled again, and so what was pulled can be found by
+//! its announcement.
+//!
+//! **A pulled copy ends with its message** (ADR-028 F-5): once the announcement has expired here,
+//! under the retention this node applies to the room, the daemon deletes the copy and its record.
+//! A copy the person put elsewhere (`--dir`, `--out`) is theirs and is never recorded.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
@@ -89,19 +94,48 @@ impl Pulled {
     }
 }
 
-/// Every pull this node has recorded, oldest record first.
+/// Every pull this node has recorded.
 #[must_use]
 pub fn recorded(paths: &Paths) -> Vec<Pulled> {
+    records(paths).into_iter().map(|(_, p)| p).collect()
+}
+
+/// Every pull this node has recorded, with the file that records it.
+fn records(paths: &Paths) -> Vec<(PathBuf, Pulled)> {
     let Ok(dir) = std::fs::read_dir(paths.pulls_dir()) else {
         return Vec::new();
     };
     dir.filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .filter_map(|p| std::fs::read(p).ok())
-        .filter_map(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .filter_map(|v| Pulled::from_json(&v))
+        .filter_map(|p| {
+            let v = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&p).ok()?).ok()?;
+            Some((p, Pulled::from_json(&v)?))
+        })
         .collect()
+}
+
+/// Record that `pulled` was put in the node's files directory, so it is deleted when its message
+/// expires (F-5). A record of its own per copy: the same share pulled twice is two copies.
+///
+/// # Errors
+/// The record cannot be written.
+pub fn record(paths: &Paths, pulled: &Pulled) -> Result<(), String> {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce).map_err(|e| format!("no randomness for the record: {e}"))?;
+    let dir = paths.pulls_dir();
+    crate::node::paths::create_private_dir(&dir)
+        .and_then(|()| {
+            crate::node::paths::write_private_file(
+                &dir.join(format!(
+                    "{}.{}.json",
+                    b32_encode(&pulled.entry),
+                    hex(&nonce)
+                )),
+                pulled.to_json().to_string().as_bytes(),
+            )
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// The directory a room's pulled files land in.
@@ -239,6 +273,7 @@ impl Pulls {
                     () = tokio::time::sleep(SCAN) => {}
                 }
                 Arc::clone(&pulls).scan().await;
+                pulls.expire();
                 tokio::time::sleep(SCAN).await;
             }
         });
@@ -283,7 +318,9 @@ impl Pulls {
                         never.push(r.entry_hash);
                         continue;
                     };
-                    let created = r.created_millis / 1000;
+                    // Its age runs from the author's time, never later than now (retention.rs):
+                    // a future-dated share must not outlive its message.
+                    let created = (r.created_millis / 1000).min(now);
                     // Expired under the room's retention: there is nothing left to pull.
                     if d.retention > 0 && now >= created.saturating_add(d.retention) {
                         never.push(r.entry_hash);
@@ -377,23 +414,59 @@ impl Pulls {
         let placed = place(&part, &dir, &name);
         let _ = std::fs::remove_file(&part);
         let path = placed?;
-        let record = Pulled {
-            room: offer.room,
-            entry: offer.entry,
-            path,
-            created: offer.created,
+        record(
+            &self.paths,
+            &Pulled {
+                room: offer.room,
+                entry: offer.entry,
+                path,
+                created: offer.created,
+            },
+        )
+    }
+
+    /// Delete every pulled copy whose message has expired here, and its record (ADR-028 F-5).
+    /// A room this node does not hold open is left until it does: its retention is not known.
+    fn expire(&self) {
+        let now = now_secs();
+        // Read before the view is borrowed: a borrow held holds up the node's next view.
+        let all = records(&self.paths);
+        if all.is_empty() {
+            return;
+        }
+        let due: Vec<(PathBuf, Pulled)> = {
+            let view = self.view.borrow();
+            if view.locked {
+                return;
+            }
+            all.into_iter()
+                .filter(|(_, p)| {
+                    view.open_channels.iter().any(|d| {
+                        d.channel_id == p.room
+                            && d.retention > 0
+                            && now >= p.created.saturating_add(d.retention)
+                    })
+                })
+                .collect()
         };
-        crate::node::paths::create_private_dir(&self.paths.pulls_dir())
-            .and_then(|()| {
-                crate::node::paths::write_private_file(
-                    &self
-                        .paths
-                        .pulls_dir()
-                        .join(format!("{}.json", b32_encode(&offer.entry))),
-                    record.to_json().to_string().as_bytes(),
-                )
-            })
-            .map_err(|e| e.to_string())
+        let files = self.paths.files_dir();
+        for (file, p) in due {
+            // Only what lies in the node's files directory is the node's to delete.
+            if p.path.starts_with(&files)
+                && !p
+                    .path
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+            {
+                match std::fs::remove_file(&p.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Tried again on the next look.
+                    Err(_) => continue,
+                }
+            }
+            let _ = std::fs::remove_file(file);
+        }
     }
 }
 
