@@ -859,12 +859,20 @@ final class FirstRunProof: XCTestCase {
         let card = Key.id("service-\(cliAddress)")
         present(ui, card, timeout: 30, "the room must show a card for bob's service \(cliAddress)")
         tap(ui, card, "the service card")
-        NSPasteboard.general.clearContents()
-        ui.typeKey("c", modifierFlags: [.command, .shift])
-        Thread.sleep(forTimeInterval: 1)
-        let copied = NSPasteboard.general.string(forType: .string) ?? ""
-        XCTAssertEqual(copied, canonical,
-                       "PRODUCT: ⌘⇧C on the selected service must copy its canonical address, as `vox service list --json` gives it (\(canonical)), not the readable one shown (\(cliAddress))")
+        // Selected, the card enables Room > Copy Selected Service's Address (⌘⇧C).
+        let copyItem = el(ui, Key.menuItem("Copy Selected Service's Address"))
+        if !copyItem.exists {
+            keepTree(ui, "the copy menu item was not found")
+            XCTFail("APPARATUS: XCTest finds no menu item \"Copy Selected Service's Address\" in the app's menus")
+        } else if !copyItem.isEnabled {
+            keepTree(ui, "the copy menu item was disabled")
+            XCTFail("PRODUCT: clicking bob's service card must select it, enabling Room > Copy Selected Service's Address; it is disabled")
+        }
+        let copied = copiedBy(ui) { ui.typeKey("c", modifierFlags: [.command, .shift]) }
+        if copied != canonical {
+            keepTree(ui, "⌘⇧C copied the wrong thing")
+            XCTFail("PRODUCT: ⌘⇧C on the selected service must copy its canonical address, as `vox service list --json` gives it (\(canonical)), not the readable one shown (\(cliAddress)); the pasteboard holds \(copied.debugDescription)")
+        }
         // ... and used: `vox forward` to what was copied carries bytes to bob's service and back.
         let forward = try start(vox, ["forward", "--node", "alice", copied, "127.0.0.1:0"],
                                 env: voxEnv, until: "vox: forwarding ", product: true)
@@ -881,12 +889,13 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey("s", modifierFlags: [.command, .shift])
         let box = Key.id("service-box-\(cliAddress)")
         present(ui, box, timeout: 30, "the services view must list bob's web share \(cliAddress)")
-        NSPasteboard.general.clearContents()
-        tap(ui, Key.id("copy-forward-\(cliAddress)"), "Copy on the forward command")
-        Thread.sleep(forTimeInterval: 1)
-        let pasted = NSPasteboard.general.string(forType: .string) ?? ""
-        XCTAssertEqual(pasted, "vox forward \(canonical) 127.0.0.1:0",
-                       "PRODUCT: Copy on the forward command must copy it with the canonical address, as `vox service list` gives it")
+        let pasted = copiedBy(ui) {
+            tap(ui, Key.id("copy-forward-\(cliAddress)"), "Copy on the forward command")
+        }
+        if pasted != "vox forward \(canonical) 127.0.0.1:0" {
+            keepTree(ui, "Copy on the forward command copied the wrong thing")
+            XCTFail("PRODUCT: Copy on the forward command must copy it with the canonical address, as `vox service list` gives it; the pasteboard holds \(pasted.debugDescription)")
+        }
         let pastedArgs = pasted.split(separator: " ").dropFirst().map(String.init)
         let pastedForward = try start(vox, Array(pastedArgs.prefix(1)) + ["--node", "alice"]
                                       + Array(pastedArgs.dropFirst()),
@@ -1184,6 +1193,28 @@ final class FirstRunProof: XCTestCase {
             XCTFail("PRODUCT: \(product); it shows \"\(last)\"", file: file, line: line)
         }
         return nil
+    }
+
+    /// What `act` puts on the pasteboard, within 3 s. Premise: the runner reads the pasteboard (a
+    /// string it writes reads back), else APPARATUS.
+    private func copiedBy(_ ui: XCUIApplication, _ act: () -> Void,
+                          file: StaticString = #filePath, line: UInt = #line) -> String {
+        let board = NSPasteboard.general
+        board.clearContents()
+        board.setString("PASTEBOARD-PREMISE", forType: .string)
+        guard board.string(forType: .string) == "PASTEBOARD-PREMISE" else {
+            XCTFail("APPARATUS: the proof cannot read back what it puts on the pasteboard", file: file, line: line)
+            return ""
+        }
+        board.clearContents()
+        act()
+        let end = Date().addingTimeInterval(3)
+        var got = ""
+        while Date() < end && got.isEmpty {
+            got = board.string(forType: .string) ?? ""
+            if got.isEmpty { Thread.sleep(forTimeInterval: 0.1) }
+        }
+        return got
     }
 
     /// Click `key`, once it is shown and hittable: APPARATUS when XCTest cannot click it, never an
