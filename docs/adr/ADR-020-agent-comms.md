@@ -28,8 +28,9 @@ agent; Vox has no typed agent/human distinction and no room types.
 
 Agent comms exists so that agents and the operator can divide up work (who does what) and work
 through hard problems together, across machines and NATs, with no SSH tunnels or pairwise peer
-configuration. It is not a mirror of agent activity: a room carrying every agent's running chatter
-could not be followed by the person in it. The room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
+configuration. Its room conversation is not a mirror of agent activity: a room carrying every
+agent's running chatter could not be followed by the person in it. A session's activity lives in its
+Session (ADR-029), readable only by members with drive. The room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
 verdicts, delivery) is recorded on GitHub through awa, not in the room (ADR-021).
 
 The design rests on three findings from prior art: addressing must be a structured field, never
@@ -153,8 +154,8 @@ caps are the only loop guards that provably terminate.
   mentions.
 - **4.8** `re` names the one message replied to; `thread` names the conversation root.
 - **4.9** Host and harness MUST NOT appear in the message. Volatile facts (`repo`, `worktree`,
-  `branch`, `cwd`, and the session's current name `session_name`, ADR-029 MD-1) MUST appear on every
-  message; session-static facts (model, harness version, pid,
+  `branch`, `cwd`, and the session's current name `session_name` when the harness gives one,
+  ADR-029 MD-1) MUST appear on every message; session-static facts (model, harness version, pid,
   `started_at`) ride `hello`. **Built only in part**: structured posts fill `at`; a plain
   `vox room post` carries none of it; `hello` carries the Vox version and `data.wake`
   (`interrupt` or `turn`, V030-17).
@@ -276,8 +277,9 @@ they are not a defence against one that lies.
 - **6.11** `agent_wake_hold`, `agent_busy_idle` and `agent_reply_nudges` are settings in the
   profile's settings file (under ADR-026, the node's `config`). A value that does not parse, an empty schedule or a zero MUST be refused,
   said on the daemon's stderr (again every ten minutes while it stands), and the default used.
-- **6.12 (V210-169, M19.12).** Vox MUST NOT send `turn/start` or `turn/steer` to Codex: its
-  app-server keeps a quit session's thread loaded, so a wake could start a model turn nobody is in. A
+- **6.12 (V210-169, M19.12).** Vox MUST NOT send `turn/start` or `turn/steer` to Codex to wake it: its
+  app-server keeps a quit session's thread loaded, so a wake could start a model turn nobody is in.
+  *Amended by ADR-029 DR-7:* driving an open session's Session MAY send them. A
   Codex session MUST be registered from the hook's input (its rollout `transcript_path` or
   `turn_id`), before any Claude Code variables it inherited. When an urgent post addresses the
   poster's own node and no session of that node can be woken, `vox room post` MUST say so in one
@@ -434,7 +436,9 @@ change; per-session cryptographic identity; central coordination (orchestrator, 
 trust score); IP-level anonymity (ADR-017); an MCP delivery path; file bytes in the log; a spawned
 instance of anything (1.5); a council feature (a council is an `ask` in a room whose agents span
 model families); an operator hold on messages (trust and room membership are the controls); hosted
-agent sandboxes that allow only HTTP out. A TUI view for agent comms is deferred until a real room
+agent sandboxes that allow only HTTP out. (Per-session cryptographic identity stays excluded: a
+Session key is the node's, ADR-029 SC-2; the TUI and app show Sessions, ADR-029 §8.) A TUI view for
+agent comms beyond ADR-028 and ADR-029 is deferred until a real room
 has shown what needs filtering.
 
 ## Consequences

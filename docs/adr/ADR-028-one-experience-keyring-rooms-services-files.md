@@ -339,7 +339,8 @@ structure for both clients; the TUI renders the same regions in text.
   status bar with the node, its peers and the keyring window (K-9). Keyring and Services MUST be
   views of the same window, not separate windows.
 - **W-2.** The sidebar MUST group rooms by what they need from the person, with counts: **needs
-  you** (a message addressed to this node unread, urgent first, or a trust offer waiting, K-15),
+  you** (a message addressed to this node unread, urgent first, a trust offer waiting, K-15, or a
+  Session waiting on this node, ADR-029 CL-2),
   **active** (new messages, or a
   member holding a claim), and **quiet**. A key MUST move to the next room that needs the person.
 - **W-3.** A room whose members include agents' nodes MUST offer a **lanes** view: one column per
