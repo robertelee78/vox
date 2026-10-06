@@ -1400,11 +1400,10 @@ impl DaemonCore {
 
     /// List what listens on this machine (ADR-028 S-4), as `vox serve` does.
     fn probe_listening(&mut self) {
+        // Spawned inside the runtime: `spawn_blocking` made outside it panics.
         self.listening = self
             .rt
-            .block_on(tokio::task::spawn_blocking(
-                vox_core::node::probe::listening,
-            ))
+            .block_on(async { tokio::task::spawn_blocking(vox_core::node::probe::listening).await })
             .unwrap_or_default();
     }
 
