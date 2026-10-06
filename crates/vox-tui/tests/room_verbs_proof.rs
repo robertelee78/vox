@@ -554,8 +554,6 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
             "share",
             &room_prefix,
             shared.to_str().expect("APPARATUS: a UTF-8 temp path"),
-            "--for",
-            "1s",
         ],
         None,
     );
@@ -567,15 +565,27 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
             &["\"agents\""],
             "vox: sharing shared.txt",
             ""
-        ) && said(
+        ),
+        "PRODUCT: `vox share` must say what it is to do, naming the room, then that it shares: \
+         {out:?}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["share", "stop", &room_prefix, "shared.txt"],
+        None,
+    );
+    assert!(ok, "PRODUCT: vox share stop failed: {err}");
+    assert!(
+        said(
             &out,
-            "vox: sharing shared.txt",
-            &[],
+            "vox: about to stop sharing \"shared.txt\"",
+            &["\"agents\""],
             "vox: no longer sharing shared.txt",
             "fetched 0"
         ),
-        "PRODUCT: `vox share` must say what it is to do, naming the room, then that it shares, \
-         then that it stopped: {out:?}"
+        "PRODUCT: `vox share stop` must say what it is to end, naming the room, then that it \
+         stopped: {out:?}"
     );
     // A node this one shares no room with: a fingerprint nobody holds.
     let stranger = "a".repeat(52);
