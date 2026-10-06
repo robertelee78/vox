@@ -884,6 +884,9 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             .collect();
         let cut = vox(&link, home, &["update"], &env);
         let cut_app = app_says(&apps.join("Vox.app"));
+        // The release's helper is a version stub, not vox; the next transition is run by a vox,
+        // so the stub is replaced by this build (the bundle's version is its Info.plist's).
+        copy(Path::new(VOX), &apps.join("Vox.app/Contents/Helpers/vox"));
         let out = vox(&link, home, &["update", "--rollback"], &base);
         let text = said(&out);
         let app = app_says(&apps.join("Vox.app"));
