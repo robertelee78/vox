@@ -26,7 +26,14 @@
 //! 5. When the client closes, the daemon detaches the node it attached (`vox node list` says
 //!    `detached`): the app's hold ends with it (M-6).
 //!
+//! 6. **One-step sharing** (ADR-028 S-4, #444): with a stand-in listening on every interface,
+//!    `listening` lists it (its port, `every_interface`) and says under the list that another
+//!    user's listeners may be missing; `servicePreview` says, before anything is shared, that it
+//!    listens on every interface; `serviceAdd` with the preview's tag and endpoint shares it, and
+//!    the peer reaches it by its own `vox service list` and `vox forward`.
+//!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
+//! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -594,6 +601,100 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     writeln!(to_app).unwrap();
     let pulled = expect(&from_app, &seen, "PULLED ")[7..].to_owned();
     let at_app = std::fs::read(&pulled).ok();
+
+    // (6) One-step sharing (ADR-028 S-4, #444): a stand-in listens on every interface here; the
+    // app lists it, previews it (the warning said first), shares it, and the peer reaches it.
+    let stand_in = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let stand_in_port = stand_in.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for conn in stand_in.incoming() {
+            let Ok(mut conn) = conn else { return };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = conn.read(&mut buf) {
+                    if n == 0 || conn.write_all(&buf[..n]).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    writeln!(to_app, "{stand_in_port}").unwrap();
+    let listening = expect(&from_app, &seen, "LISTENING ");
+    let missing = expect(&from_app, &seen, "MISSING ");
+    let preview = expect(&from_app, &seen, "PREVIEW ");
+    let offered = expect(&from_app, &seen, "OFFERED ");
+    let tag = offered[8..].trim().to_owned();
+    // The peer finds it by its own `vox service list`, and forwards to it as a person would.
+    let until = Instant::now() + TIMEOUT;
+    let mut peer_list = String::new();
+    let mut peer_address = String::new();
+    while Instant::now() < until {
+        peer_list = peer.run(&["service", "list", &room], "");
+        if let Some(a) = peer_list
+            .lines()
+            .find(|l| l.contains(" by swift") && l.trim_start().starts_with(&format!("{tag}.")))
+            .and_then(|l| l.split_whitespace().next())
+        {
+            peer_address = a.to_owned();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let mut reached = String::new();
+    if !peer_address.is_empty() {
+        let mut fwd = peer
+            .command(&["forward", &peer_address, "127.0.0.1:0"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("APPARATUS: could not start the peer's vox forward");
+        let fwd_out = lines(fwd.stdout.take().unwrap());
+        let _fwd = Proc(fwd);
+        let at = fwd_out
+            .recv_timeout(TIMEOUT)
+            .ok()
+            .and_then(|l| {
+                l.strip_prefix("vox: forwarding ")
+                    .and_then(|r| r.split_whitespace().next())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        if let Ok(mut s) = std::net::TcpStream::connect(&at) {
+            let _ = s.set_read_timeout(Some(TIMEOUT));
+            let _ = s.write_all(b"shared in one step\n");
+            let mut buf = [0u8; 64];
+            while !reached.ends_with('\n') {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => reached.push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{listening}\n{missing}\n{preview}\n{offered}\nthe peer's `vox service list`: \
+         {peer_list}the peer reached {peer_address:?}: {reached:?}"
+    );
+    assert!(
+        listening.contains(&format!(":{stand_in_port}")) && listening.ends_with("EVERY true"),
+        "PRODUCT: `listening` must list the stand-in on port {stand_in_port}, on every interface: \
+         {listening}"
+    );
+    assert!(
+        missing.contains("another user's services"),
+        "PRODUCT: `listening` must say that another user's listeners may be missing: {missing}"
+    );
+    assert!(
+        preview.contains("listens on every interface of this machine"),
+        "PRODUCT: `servicePreview` must say, before it is shared, that the stand-in listens on \
+         every interface: {preview}"
+    );
+    assert_eq!(
+        reached, "shared in one step\n",
+        "PRODUCT: the peer must reach the service the app shared in one step, by its own `vox \
+         service list` and `vox forward`: it found {peer_address:?} in {peer_list}"
+    );
 
     // (5) The app closes; the daemon lets the node go.
     writeln!(to_app).unwrap();
