@@ -29,6 +29,7 @@ struct MainWindow: View {
             StatusBar(model: model)
         }
         .contentSurface()
+        .sheet(item: $model.sheet) { NodeSheets(model: model, sheet: $0) }
         .toolbar {
             // W-2: a key moves to the next room that needs the person; Control-N, as in the TUI.
             Button("Next Room That Needs You") { Task { await model.nextNeedingYou() } }
@@ -107,9 +108,8 @@ private struct RoomView: View {
     @State private var attaching: Attaching?
     /// The pulled copy Quick Look shows.
     @State private var looking: URL?
-    /// The lanes view in place of the timeline (W-3).
-    @State private var showLanes = false
-    /// What the composer posts is addressed to, and whether it is urgent (M-15).
+
+/// What the composer posts is addressed to, and whether it is urgent (M-15).
     @State private var to: Set<String> = []
     @State private var urgent = false
     /// The rows inside the visible part of the timeline, as last measured.
@@ -121,14 +121,19 @@ private struct RoomView: View {
                 if !model.roomServices.isEmpty {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
-                            ForEach(model.roomServices, id: \.address) { ServiceCard(service: $0) }
+                            ForEach(model.roomServices, id: \.address) { service in
+                                ServiceCard(service: service)
+                                    .background(model.selectedService?.address == service.address
+                                                ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
+                                    .onTapGesture { model.selectedService = service }
+                            }
                         }
                         .padding(8)
                     }
                     Divider()
                 }
                 if model.roomHasAgents {
-                    Picker("", selection: $showLanes) {
+                    Picker("", selection: $model.showLanes) {
                         Text("Timeline").tag(false)
                         Text("Lanes").tag(true)
                     }
@@ -138,7 +143,7 @@ private struct RoomView: View {
                     .padding(8)
                     .accessibilityIdentifier("lanes-toggle")
                 }
-                if showLanes && model.roomHasAgents {
+                if model.showLanes && model.roomHasAgents {
                     LanesView(model: model)
                 } else {
                     GeometryReader { viewport in
@@ -153,6 +158,11 @@ private struct RoomView: View {
                                                    readBy: model.readBy[message.id] ?? [],
                                                    pulled: model.pulled[message.id]) { looking = $0 }
                                             .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(4)
+                                            .background(model.selectedMessage == message.id
+                                                        ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
+                                            .contentShape(Rectangle())
+                                            .onTapGesture { model.selectedMessage = message.id }
                                             .reportsFrame(of: message.id)
                                             .id(message.id)
                                     }
@@ -190,6 +200,10 @@ private struct RoomView: View {
                         AttachSheet(model: model, file: file) { attaching = nil }
                     }
                     .quickLookPreview($looking)
+                    .onChange(of: model.attachAsked) { _ in
+                        if let url = chooseFile() { attaching = Attaching(url: url) }
+                    }
+                    .onChange(of: model.urgentAsked) { _ in send(urgent: true) }
                     .onChange(of: model.incoming) { url in
                         if let url {
                             attaching = Attaching(url: url)
@@ -204,6 +218,16 @@ private struct RoomView: View {
                     }
                 }
                 Divider()
+                if let reply = model.replyTo {
+                    HStack {
+                        Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
+                            .lineLimit(1).secondaryText()
+                        Spacer()
+                        Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
+                    }
+                    .padding(.horizontal, 12).padding(.top, 8)
+                    .accessibilityIdentifier("replying-to")
+                }
                 HStack(spacing: 8) {
                     Button {
                         if let url = chooseFile() { attaching = Attaching(url: url) }
@@ -216,12 +240,7 @@ private struct RoomView: View {
                     .accessibilityIdentifier("attach")
                     TextField("Say something to the room", text: $draft)
                         .textFieldStyle(.plain)
-                        .onSubmit {
-                            let (text, recipients, now) = (draft, Array(to), urgent)
-                            draft = ""
-                            urgent = false
-                            Task { await model.post(text, to: recipients, urgent: now) }
-                        }
+                        .onSubmit { send(urgent: urgent) }
                         .accessibilityIdentifier("compose")
                     ComposerAddress(model: model, to: $to, urgent: $urgent)
                 }
@@ -231,6 +250,16 @@ private struct RoomView: View {
             Inspector(model: model, room: room)
                 .frame(width: 240)
         }
+    }
+
+    /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
+    private func send(urgent now: Bool) {
+        let (text, recipients, re) = (draft, Array(to), model.replyTo?.id ?? "")
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        draft = ""
+        urgent = false
+        model.replyTo = nil
+        Task { await model.post(text, to: recipients, urgent: now, re: re) }
     }
 
     /// The rows in view are read, only while the window is in front of the person (R-6).
@@ -413,7 +442,10 @@ private struct StatusBar: View {
             Text("node \(model.node)")
             Text(model.peers == 1 ? "1 peer" : "\(model.peers) peers")
             Text(model.keyring)
-            if model.notifying == false {
+            if let did = model.did {
+                Text(did)
+            }
+if model.notifying == false {
                 // M-23: said where the person works, so a missing notification is explained.
                 Text("notifications off (System Settings, Notifications, Vox)")
                     .accessibilityIdentifier("notifications-off")

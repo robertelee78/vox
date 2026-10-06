@@ -18,6 +18,7 @@ struct VoxApp: App {
                 // Dark is the one theme (ADR-028 L-2).
                 .preferredColorScheme(.dark)
         }
+        .commands { VoxCommands(app: delegate.model) }
         // Off until the person turns it on (M-22).
         MenuBarExtra("Vox", systemImage: "bubble.left.and.bubble.right",
                      isInserted: Binding(get: { delegate.model.menuBar },

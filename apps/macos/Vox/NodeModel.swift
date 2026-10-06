@@ -64,6 +64,24 @@ final class NodeModel: ObservableObject {
     /// A file handed to Vox from elsewhere (the Finder Services item, M-24), waiting for the room
     /// on screen to take it: its To: and note are asked there.
     @Published var incoming: URL?
+    // ---- what the menus, keys and palette ask for (M-19–M-21) ---------------------------------
+
+    /// The sheet a menu, key or palette action opened.
+    @Published var sheet: NodeSheet?
+    /// The lanes view in place of the room's timeline (W-3).
+    @Published var showLanes = false
+    /// Asks the room on screen to choose a file to attach (⌘O); each ask counts one up.
+    @Published var attachAsked = 0
+    /// Asks the room on screen to send its draft urgent (⌘↩).
+    @Published var urgentAsked = 0
+    /// The message selected in the timeline, and the one the composer replies to (⌘R).
+    @Published var selectedMessage: String?
+    @Published var replyTo: RoomMessage?
+    /// The service card selected above the timeline, whose command ⌘⇧C copies.
+    @Published var selectedService: SharedService?
+    /// What a menu action last did, said where the person is (E-5).
+    @Published var did: String?
+
     /// Each other member's lane in the room on screen (ADR-028 W-3), as the node derives it.
     @Published private(set) var lanes: [Lane] = []
     /// The newest message of each member's lane when the person last looked at the lanes, by
@@ -289,6 +307,117 @@ final class NodeModel: ObservableObject {
         }
     }
 
+    /// The room at sidebar position `n` (1-based): needs you, then active, then quiet (⌘1–⌘9).
+    func showRoom(at n: Int) async {
+        let ordered = group(.needsYou) + group(.active) + group(.quiet)
+        guard n >= 1 && n <= ordered.count else { return }
+        await show(.room(ordered[n - 1].id))
+    }
+
+    /// The room on screen's id, if a room is on screen.
+    var roomOnScreen: String? {
+        if case let .room(id) = selection { return id }
+        return nil
+    }
+
+    /// Create a room named `name` under `passphrase`, and show it.
+    func createRoom(_ name: String, passphrase typed: Data) async -> Bool {
+        await withPassphrase(typed) { [client] p in try await client.createRoom(name: name, passphrase: p) }
+    }
+
+    /// Join a room by its link and passphrase, naming it `name` here, and show it.
+    func joinRoom(_ link: String, as name: String, passphrase typed: Data) async -> Bool {
+        await withPassphrase(typed) { [client] p in
+            try await client.joinRoom(link: link, name: name, passphrase: p)
+        }
+    }
+
+    private func withPassphrase(_ typed: Data,
+                                _ act: (Passphrase) async throws -> String) async -> Bool {
+        var bytes = typed
+        defer { bytes.resetBytes(in: 0..<bytes.count) }
+        do {
+            let passphrase = try Passphrase(bytes: bytes)
+            defer { passphrase.wipe() }
+            let room = try await act(passphrase)
+            await refresh()
+            await show(.room(room))
+            return true
+        } catch {
+            said = sentence(error)
+            return false
+        }
+    }
+
+    /// Copy the room on screen's link (⌘L), saying what it carries.
+    func copyRoomLink() async {
+        guard let id = roomOnScreen else { return }
+        do {
+            let link = try await client.link(room: id)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(link.url, forType: .string)
+            did = link.note.isEmpty ? "Room link copied." : "Room link copied. \(link.note)"
+        } catch {
+            said = sentence(error)
+        }
+    }
+
+    /// Leave the room on screen, or end it for everyone.
+    func leaveRoom(endingIt: Bool) async {
+        guard let id = roomOnScreen else { return }
+        do {
+            if endingIt { try await client.end(room: id) } else { try await client.leave(room: id) }
+            did = endingIt ? "The room is ended for everyone." : "You left the room."
+            selection = nil
+            await refresh()
+        } catch {
+            said = sentence(error)
+        }
+    }
+
+    /// Set the room on screen's retention.
+    func setRetention(_ seconds: UInt64, passphrase typed: Data) async -> Bool {
+        guard let id = roomOnScreen else { return false }
+        var bytes = typed
+        defer { bytes.resetBytes(in: 0..<bytes.count) }
+        do {
+            let passphrase = try Passphrase(bytes: bytes)
+            defer { passphrase.wipe() }
+            try await client.setRetention(room: id, ttlSecs: seconds, identityPassphrase: passphrase)
+            did = seconds == 0 ? "Messages here are kept for good."
+                : "Messages here are kept for \(Retention.words(seconds)), then deleted everywhere."
+            return true
+        } catch {
+            said = sentence(error)
+            return false
+        }
+    }
+
+    /// The room on screen's admins, creator first.
+    func admins() async -> [String] {
+        guard let id = roomOnScreen else { return [] }
+        return (try? await client.admins(room: id)) ?? []
+    }
+
+    /// Make a member an admin of the room on screen, or take it back.
+    func setAdmin(_ member: String, _ admin: Bool) async {
+        guard let id = roomOnScreen else { return }
+        do {
+            try await client.setAdmin(room: id, member: member, admin: admin)
+        } catch {
+            said = sentence(error)
+        }
+    }
+
+    /// Copy the selected service's command (⌘⇧C): its address, which `vox forward` and a
+    /// browser through the .vox proxy take.
+    func copyServiceCommand() {
+        guard let service = selectedService else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(service.address, forType: .string)
+        did = "Copied \(service.address)."
+    }
+
     /// The next room that needs the person, if any (W-2).
     func nextNeedingYou() async {
         guard let room = group(.needsYou).first else { return }
@@ -310,10 +439,10 @@ final class NodeModel: ObservableObject {
     }
 
     /// Post `text` to the room on screen.
-    func post(_ text: String, to: [String] = [], urgent: Bool = false) async {
+    func post(_ text: String, to: [String] = [], urgent: Bool = false, re: String = "") async {
         guard case let .room(id) = selection else { return }
         do {
-            try await client.post(room: id, text: text, to: to, re: "", urgent: urgent)
+            try await client.post(room: id, text: text, to: to, re: re, urgent: urgent)
         } catch {
             said = sentence(error)
         }

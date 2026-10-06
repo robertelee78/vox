@@ -1115,6 +1115,59 @@ impl VoxClient {
         on_held!(self, |c| done(c, &Request::End { channel_id }).await)
     }
 
+    /// Keep `room`'s message bodies for `ttl_secs` seconds (0: forever), as
+    /// `vox room retention` does (ADR-023 decision 2); its creator or an admin only. Shortening
+    /// it deletes stored history, so the identity passphrase is always asked for.
+    ///
+    /// # Errors
+    /// A malformed id, a wrong passphrase, or the node's refusal (not the creator or an admin).
+    pub async fn set_retention(
+        &self,
+        room: String,
+        ttl_secs: u64,
+        identity_passphrase: Arc<Passphrase>,
+    ) -> Result<(), VoxError> {
+        let req = Request::SetRetention {
+            channel_id: digest(&room, "room id")?,
+            ttl: ttl_secs,
+            identity_passphrase: identity_passphrase.copy(),
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// `room`'s admins, its creator first, as fingerprints.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (the room not open).
+    pub async fn admins(&self, room: String) -> Result<Vec<String>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::Admins { channel_id }).await? {
+                Frame::Members { members } => Ok(members.iter().map(b32_encode).collect()),
+                other => Err(unexpected(&other)),
+            }
+        )
+    }
+
+    /// Make `member` an admin of `room`, or (`admin` false) take it back; its creator only.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal.
+    pub async fn set_admin(
+        &self,
+        room: String,
+        member: String,
+        admin: bool,
+    ) -> Result<(), VoxError> {
+        let req = Request::SetAdmin {
+            channel_id: digest(&room, "room id")?,
+            member: digest(&member, "member's fingerprint")?,
+            admin,
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
     /// Trust `fingerprint` under `name`. The identity passphrase is needed once the keyring
     /// window has passed; within it, pass none.
     ///

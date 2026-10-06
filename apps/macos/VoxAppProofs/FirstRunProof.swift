@@ -31,14 +31,18 @@
 //    to alice posts one local notification, titled with the room, saying who wrote to her, and
 //    never the message's text. Preconditions, not the proof's to arrange: Vox allowed to notify
 //    (the app says "notifications off" otherwise, an APPARATUS red) and no Focus on.
-// 9. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 9. Keys (ADR-014 M-20, #446): with quiet rooms aaa and bbb and mission needing alice, ⌘J from
+//    aaa goes to mission, not to bbb, the next room in the sidebar's order; ⌘⇧C on a selected
+//    service card copies the address `vox service list` gives.
+// 10. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (9) goes red. A room with a message
+// place of the app's hold), and quitting leaves it attached: (10) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
-// A notification that carries the message's text: (8) goes red.
+// A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
+// the sidebar's order: (9) goes red.
 
 import XCTest
 
@@ -382,7 +386,63 @@ final class FirstRunProof: XCTestCase {
                        "PRODUCT: a notification must not carry the message's text; one said \(leaked.label)")
         print("[proof] notification: \(banner.label)")
 
-        // (9) Quitting detaches it.
+        // (9) Keys. Two quiet rooms of alice's, made here; each takes a post of hers, so the app
+        // learns of it, and her own posts are never unread.
+        let roomPassFile = roomPass
+        for name in ["aaa", "bbb"] {
+            try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPassFile,
+                             "--name", name], env: voxEnv)
+            let listing = try staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)
+            guard let id = listing.split(separator: "\n").first(where: { $0.contains(" \(name)") })?
+                .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+                throw Apparatus("`vox room list` does not list \(name): \(listing)")
+            }
+            try staged(vox, ["room", "post", "--node", "alice", id, "HELLO-\(name)"], env: voxEnv)
+        }
+        let aaa = ui.descendants(matching: .any)["room-aaa"]
+        XCTAssertTrue(aaa.waitForExistence(timeout: 30), "PRODUCT: room aaa never showed in the sidebar")
+        XCTAssertTrue(ui.descendants(matching: .any)["room-bbb"].waitForExistence(timeout: 30),
+                      "PRODUCT: room bbb never showed in the sidebar")
+        aaa.click()
+        try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
+                   env: voxEnv)
+        let needs = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: needs, evaluatedWith:
+            ui.descendants(matching: .any)["group-needs you"])], timeout: 60), .completed,
+                       "PRODUCT: bob's message to alice must put mission under needs you")
+        ui.typeKey("j", modifierFlags: .command)
+        let landed = ui.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", "NEEDS-YOU-9")).firstMatch
+        XCTAssertTrue(landed.waitForExistence(timeout: 15),
+                      "PRODUCT: ⌘J from room aaa must open mission, the room that needs alice; its message NEEDS-YOU-9 is not on screen")
+        // ⌘⇧C: a service bob shares, selected, copies its address.
+        try staged(vox, ["service", "add", "--node", "bob", room, "web", "127.0.0.1:9"], env: voxEnv)
+        var cliAddress = ""
+        let shareUntil = Date().addingTimeInterval(60)
+        while Date() < shareUntil && cliAddress.isEmpty {
+            let listed = run(vox, ["service", "list", "--node", "alice", room], env: voxEnv).out
+            cliAddress = listed.split(separator: "\n").first { $0.contains(" by ") && $0.contains("web.") }?
+                .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+            if cliAddress.isEmpty { Thread.sleep(forTimeInterval: 1) }
+        }
+        guard !cliAddress.isEmpty else {
+            throw Apparatus("alice's `vox service list` never listed bob's web share")
+        }
+        aaa.click()
+        ui.descendants(matching: .any)["room-mission"].click()
+        let card = ui.descendants(matching: .any)["service-\(cliAddress)"]
+        XCTAssertTrue(card.waitForExistence(timeout: 30),
+                      "PRODUCT: the room shows no card for bob's service \(cliAddress)")
+        card.click()
+        NSPasteboard.general.clearContents()
+        ui.typeKey("c", modifierFlags: [.command, .shift])
+        Thread.sleep(forTimeInterval: 1)
+        let copied = NSPasteboard.general.string(forType: .string) ?? ""
+        XCTAssertEqual(copied, cliAddress,
+                       "PRODUCT: ⌘⇧C on the selected service must copy its address as `vox service list` gives it")
+        print("[proof] ⌘J opened mission; ⌘⇧C copied \(copied)")
+
+        // (10) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""

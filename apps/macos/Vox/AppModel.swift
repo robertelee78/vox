@@ -137,6 +137,19 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Detach the node from the daemon now (Node > Detach): its connections close and its keys
+    /// are wiped; the app then asks which node to act as.
+    func detachNode() async {
+        guard let client, case let .attached(node, _) = phase else { return }
+        do {
+            try await client.detach(node: node)
+            self.node = nil
+            phase = .choosing(try await client.nodes().map(\.name))
+        } catch {
+            phase = .unreachable(sentence(error))
+        }
+    }
+
     /// Let go of the node and end the client (A-4).
     func quit() async {
         await client?.close()
