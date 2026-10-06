@@ -38,12 +38,17 @@
 //!     member that could sync with him is stopped (SIGSTOP), and his `vox forward` must say it is
 //!     waiting for the room's first sync, then reach nas-web once they resume. A
 //!     forward that never waited is CANNOT MEASURE (the staging did not happen), not a pass.
+//! 12b. The canonical address pasted on a member whose copy of the room is behind: carol, synced,
+//!     sleeps (SIGSTOP) while alice shares `nas-www`; with alice and bob stopped too she wakes
+//!     holding no such share, and her proxy and `vox forward` must still reach it once alice is
+//!     back, because alice's node resolves its own share fingerprint.
 //! 13. A readable part that names two things is refused, saying which: bob calls carol `Nas Box`,
 //!     whose label is his name for alice too.
 //!
-//! **Mutation that must turn it red** (#487): the room part resolved by this machine's own name
-//! only, the room id refused. Carol's paste of bob's canonical address then fails at her proxy, and
-//! (10) is red as PRODUCT.
+//! **Mutations that must turn it red** (#487): the room part resolved by this machine's own name
+//! only, the room id refused, and carol's paste of bob's canonical address fails at her proxy:
+//! (10) is red as PRODUCT. The host resolving a service by its name only: carol's paste in (12b)
+//! is refused, red as PRODUCT.
 //!
 //! **A red names its side.** A `vox` command that fails while the scene is set is PRODUCT
 //! (staging); what this proof claims is PRODUCT, quoting what vox said; the proof's own files,
@@ -879,6 +884,91 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         early.transcript()
     );
     drop((early, dave_up));
+
+    // (12b) The canonical address pasted on a member whose copy of the room is behind: carol has
+    // synced the room, then sleeps (SIGSTOP) while alice shares nas-www. With alice and bob
+    // stopped too, nothing can bring carol's log up to date, so when she wakes her node holds no
+    // such share, and her proxy and her `vox forward` ask alice by the fingerprint alone. Alice's
+    // node, which always holds its own shares, must resolve it once she is back.
+    let carol_pid = pid_of(&carol_dir);
+    assert!(signal("STOP", carol_pid), "APPARATUS: SIGSTOP carol");
+    let www_at = echo("www");
+    let (ok, out, err) = vox(
+        &alice_dir,
+        &["service", "add", &room, "nas-www", &www_at.to_string()],
+        None,
+    );
+    assert!(ok, "PRODUCT (staging): alice shares nas-www: {out}{err}");
+    let (_, alice_list) = listed(&alice_dir, &room, &["nas-www.".to_owned()]);
+    let www_canonical = alice_list
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("nas-www."))
+        .nth(1)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let (alice_pid, bob_pid) = (pid_of(&alice_dir), pid_of(&bob_dir));
+    assert!(
+        www_canonical.len() == 52 * 3 + 6 && signal("STOP", alice_pid) && signal("STOP", bob_pid),
+        "PRODUCT (staging): alice's `vox service list` shows no canonical address for nas-www: \
+         {alice_list}"
+    );
+    let _ = signal("CONT", carol_pid);
+    let (_, carol_saw, _) = vox(&carol_dir, &["service", "list", &room], None);
+    if carol_saw.contains("nas-www.") {
+        let _ = (signal("CONT", alice_pid), signal("CONT", bob_pid));
+        panic!(
+            "CANNOT MEASURE (APPARATUS): carol's node already held nas-www when she woke, so her \
+             paste did not meet a log that is behind: {carol_saw}"
+        );
+    }
+    let stale_by_proxy = std::thread::spawn({
+        let canonical = www_canonical.clone();
+        move || who_answers(carol_proxy, &canonical)
+    });
+    let mut stale_fwd = VoxProc::spawn(
+        "carol forward",
+        &carol_dir,
+        &args(&["forward", &www_canonical, "127.0.0.1:0"]),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = (signal("CONT", alice_pid), signal("CONT", bob_pid));
+    let stale_line = stale_fwd.line_within(vox_core::node::up::HOST_PATIENCE, |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let stale_answer = stale_line.as_ref().and_then(|l| {
+        let at: SocketAddr = l.split_whitespace().nth(2)?.parse().ok()?;
+        let mut s = TcpStream::connect(at).ok()?;
+        s.set_read_timeout(Some(vox_core::node::up::HOST_PATIENCE))
+            .ok()?;
+        s.write_all(b"hello\n").ok()?;
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).ok()?;
+        Some(line)
+    });
+    let stale_proxied = stale_by_proxy
+        .join()
+        .unwrap_or_else(|_| panic!("APPARATUS: the proxy client thread panicked"));
+    eprintln!(
+        "carol, behind: listing {carol_saw:?}; through her proxy {stale_proxied:?}; her forward \
+         {stale_line:?} answered {stale_answer:?}"
+    );
+    assert_eq!(
+        stale_proxied.as_deref(),
+        Ok("www"),
+        "PRODUCT: the canonical address {www_canonical}, pasted into the proxy of carol, whose copy \
+         of the room lacked the share, must reach alice's nas-www: alice's node holds its own \
+         shares"
+    );
+    assert!(
+        stale_answer
+            .as_deref()
+            .is_some_and(|a| a.starts_with("www:")),
+        "PRODUCT: the canonical address {www_canonical}, given to carol's `vox forward` while her \
+         copy of the room lacked the share, must reach alice's nas-www; it said:\n{}",
+        stale_fwd.transcript()
+    );
+    drop(stale_fwd);
 
     // (13) A readable part that names two things is refused, saying which: bob now calls carol
     // `Nas Box`, which as a label is `nas-box`, his name for alice too.

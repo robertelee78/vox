@@ -459,6 +459,10 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
             address.clone(),
             "--passphrase-file".into(),
             room_pass_file(&guest_dir, &passphrase),
+            // The guest's own name for the room, not the host's: a command copied on the host
+            // must carry nothing that only means something there (ADR-028 S-1).
+            "--name".into(),
+            "at-the-host".into(),
             "--anchor".into(),
             anchor_spec.clone(),
             "--listen".into(),
