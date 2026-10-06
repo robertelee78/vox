@@ -52,6 +52,13 @@
 //! within 120 s bob renders **every** post she made after trusting him, those under the retired
 //! generation included, in both rooms.
 //!
+//!
+//! **Nor by the log.** Dave trusts bob while bob's daemon is stopped: dave's node says it could
+//! not reach bob (else APPARATUS), so his key goes to bob as a key-package in the room's log.
+//! Dave posts (alice renders it, or `PRODUCT (staging)`); bob comes back (he renders a new post of
+//! carol's); after 10 s more bob's read and his drain show **0** of dave's posts. Then bob trusts
+//! dave, and within 120 s renders them: the key was held, not lost.
+//!
 //! ## The mutations that must turn it red
 //! - M1: the join releases the joiner's key to its responder — `self.consent(&parsed.channel_id,
 //!   responder, false).await` restored before `NodeEvent::Joined` in `crates/vox-core/src/node/actor.rs`.
@@ -62,6 +69,9 @@
 //! - M4 (V210-118): only the live generation is offered again once trusted — the
 //!   `owe_entitled_history` calls removed from `ChannelState::reoffer` and from the `NotTrusted`
 //!   refusal. Bob never renders the posts under the retired generation.
+//! - M5 (V210-118, the log): a key-package's key taken from any author — the `is_trusted` check
+//!   removed from `install_key_packages` in `crates/vox-core/src/node/actor.rs`. Bob renders
+//!   dave's posts.
 #![cfg(unix)]
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
@@ -358,7 +368,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let (_anchor, spec) = anchor(tmp.path());
     let alice = member(tmp.path(), "alice", &spec);
-    let bob = member(tmp.path(), "bob", &spec);
+    let mut bob = member(tmp.path(), "bob", &spec);
     let carol = member(tmp.path(), "carol", &spec);
     // Dave reads alice only once he trusts her, while she is online (V210-118 c2).
     let dave = member(tmp.path(), "dave", &spec);
@@ -618,10 +628,92 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         );
     }
 
+    // **Nor by the log** (V210-118): dave trusts bob while bob's daemon is stopped, so dave's dial
+    // fails and his key goes to bob as a key-package in the room's log, which every member
+    // carries. Bob never trusted dave: once he is back, none of dave's posts opens for him, read
+    // or drained. Then bob trusts dave, and reads them: the key was held, not lost.
+    let tmp_path = tmp.path().to_owned();
+    bob.daemon = None;
+    dave.trust(&bob);
+    let dave_log = tmp_path.join("dave.daemon.err");
+    let bob_short: String = bob.fp.chars().take(26).collect();
+    assert!(
+        until(
+            "dave's node says it could not reach bob",
+            Duration::from_secs(120),
+            || std::fs::read_to_string(&dave_log)
+                .is_ok_and(|t| t.contains(&format!("could not reach {bob_short}")))
+        ),
+        "APPARATUS: staging not achieved: within 120 s of trusting bob, dave's node never said it \
+         could not reach him, so his key may not have gone by the log"
+    );
+    for (name, room, _) in &alice_posted {
+        let line = format!("DAVE-BY-LOG-IN-{name}");
+        let (ok, _, e) = dave.vox(&["room", "post", room, &line], None);
+        assert!(ok, "PRODUCT (staging): dave posts: {e}");
+        assert!(
+            until(
+                &format!("alice renders {line}"),
+                Duration::from_secs(60),
+                || alice.reads(room, &line)
+            ),
+            "PRODUCT (staging): alice (trusting dave, and trusted by him) never rendered his post \
+             in room {name}, so dave's posts did not go out"
+        );
+    }
+    start_daemon(&mut bob, &tmp_path, &spec, "daemon-after-log");
+    for (name, room, _) in &alice_posted {
+        let line = format!("CAROL-AFTER-BOB-BACK-IN-{name}");
+        let (ok, _, e) = carol.vox(&["room", "post", room, &line], None);
+        assert!(ok, "PRODUCT (staging): carol posts: {e}");
+        assert!(
+            until(
+                &format!("bob renders {line}"),
+                Duration::from_secs(120),
+                || bob.reads(room, &line)
+            ),
+            "PRODUCT (staging): bob, back, never rendered carol's post in room {name}: he is not \
+             receiving the room"
+        );
+    }
+    std::thread::sleep(Duration::from_secs(10));
+    let mut by_log = 0;
+    for (name, room, _) in &alice_posted {
+        let seen = bob.vox(&["room", "read", room], None).1;
+        let (_, drained, _) = bob.vox(
+            &[
+                "agent", "hook", "--node", "default", "--room", room, "--format", "text",
+            ],
+            Some("{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"by-log\"}"),
+        );
+        let n = count(&seen, "DAVE-BY-LOG-") + count(&drained, "DAVE-BY-LOG-");
+        eprintln!(
+            "[proof] room {name}: bob reads or is drained {n} of dave's posts, never trusting him"
+        );
+        by_log += n;
+    }
+    assert_eq!(
+        by_log, 0,
+        "PRODUCT: bob reads {by_log} of dave's posts (his read and his drain), but he never put \
+         dave in his ring: his node took the key dave's node sent him by the room's log"
+    );
+    bob.trust(&dave);
+    for (name, room, _) in &alice_posted {
+        let line = format!("DAVE-BY-LOG-IN-{name}");
+        assert!(
+            until(
+                &format!("bob renders {line} once he trusts dave"),
+                Duration::from_secs(120),
+                || bob.reads(room, &line)
+            ),
+            "PRODUCT: bob trusted dave, yet within 120 s he never rendered dave's post in room \
+             {name}: the key dave sent by the log was lost, not held"
+        );
+    }
+
     // Bob holds no key of alice's: with her daemon stopped, so nothing can be delivered, bob
     // trusts her, and still none of her posts opens. A key taken earlier and merely not shown
     // would render the moment his ring names her.
-    let tmp_path = tmp.path().to_owned();
     let mut alice = alice;
     alice.daemon = None;
     bob.trust(&alice);
