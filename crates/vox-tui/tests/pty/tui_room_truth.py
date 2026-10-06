@@ -89,6 +89,14 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             nothing and is never shown;
   onenode   `:node spare` is refused, naming the one node this window acts as, and the window
             still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
+  lanes     Alice's node claims work and posts `working`, `status` and an `ask` as an agent, and
+            Carol's claims work too: in Bob's lanes (`:lanes`), Alice's lane is headed "alice ·
+            working" and shows her ask, with her coordination folded into one counted line and
+            none of it shown; Carol's lane carries one of the five state chips (ADR-028 W-3, #513);
+  to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
+            message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
+  seen      Bob leaves his lanes and Alice posts again: looking again, only her new post is marked
+            new in her lane, her earlier ask not (W-3, #513);
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -1005,6 +1013,100 @@ try:
     claim("onenode", said and "node default" in bar and "node spare" not in bar
           and top == "node default · attached",
           f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
+    stage("lanes")
+    # The room's lanes (ADR-028 W-3, #513): Alice's node acts as an agent here, claiming work and
+    # saying so; Carol's claims work too. What Bob's lanes are judged by is Alice's; Carol's lane
+    # must carry one of the five chips, whatever Bob's node can read of her.
+    def as_agent(w, session, *args):
+        e = env(w)
+        e["VOX_SESSION"] = session
+        r = subprocess.run([VOX, *args], env=e, capture_output=True, text=True, timeout=120)
+        # A claim some member cannot agree to (Carol and Dave, whom not everyone trusts) is posted
+        # all the same, and says so: what Bob's lanes are about is what it posted.
+        posted = args[1] == "claim" and "Your claim is posted" in r.stderr
+        if r.returncode != 0 and not posted:
+            product(f"{w}'s `vox {' '.join(args[:2])}` as an agent failed: {r.stderr.strip()}")
+        return r
+    as_agent("alice", "alice-agent", "room", "claim", room, "codec-port")
+    as_agent("alice", "alice-agent", "room", "post", room, "--type", "working", "LANE-WORKING porting")
+    as_agent("alice", "alice-agent", "room", "post", room, "--type", "status", "LANE-STATUS half way")
+    as_agent("alice", "alice-agent", "room", "post", room, "--type", "ask", "LANE-ASK which codec stays?")
+    as_agent("carol", "carol-agent", "room", "claim", room, "flaky-test")
+    tui.key("\r", 2)  # into the room, selected in the sidebar
+    tui.key(":lanes\r", 2)
+    def lane(name):
+        """(the lane's title, its rows) for the member Bob calls `name` (his name for it, or the
+        start of its fingerprint), found by its title on Bob's screen."""
+        rows = tui.display()
+        for r in rows:
+            for g in ("⇄ ", "→ ", "· ", ""):
+                start = r.find("┌" + g + name)
+                if start >= 0:
+                    end = r.find("┐", start)
+                    title = r[start + 1:end if end > 0 else len(r)].strip("─")
+                    return title, [bare(x) for x in pane(rows, g + name)]
+        return None, []
+    tui.until(lambda: (lane("alice")[0] or "").endswith("working") and "LANE-ASK" in " ".join(lane("alice")[1]), 60, 1)
+    (a_title, arows), (c_title, crows) = lane("alice"), lane(fp["carol"][:6])
+    carol_read = [l for l in run("bob", "room", "read", room, "--json").stdout.splitlines()
+                  if fp["carol"] in l]
+    atext = " ".join(arows)
+    # A lane is narrow, so its rows wrap: read it as one text, without the spaces a wrap took.
+    joined = "".join(arows).replace(" ", "")
+    CHIPS = ("needs you", "working", "ready", "done", "away")
+    claim("lanes", (a_title or "").endswith("· working")
+          and any((c_title or "").endswith("· " + c) for c in CHIPS)
+          and "LANE-ASKwhichcodecstays?" in joined
+          and re.search(r"(\d+)coordinationposts?", joined) is not None
+          and "LANE-WORKING" not in joined and "LANE-STATUS" not in joined,
+          f"alice's lane {a_title!r}: {arows!r}; carol's lane {c_title!r}: {crows!r}; carol's rows "
+          f"in bob's `vox room read --json`: {carol_read!r}"
+          + ("" if a_title else "; screen:\n" + tui.text()))
+
+    stage("to")
+    # To: and urgent in the composer (ADR-028 W-4): the message carries them, as `vox room post
+    # --to … --urgent` writes it, posted as Bob into this room.
+    # A name that is no member is refused with a sentence, and sets nothing (#513).
+    tui.key(":to zz-nobody\r", 1)
+    refused = " ".join(r.strip() for r in tui.display()[-4:])
+    unset = not any("Composer — " in r and "To:" in r for r in tui.display())
+    tui.key(":to alice\r", 1)
+    tui.key(":urgent\r", 1)
+    composer = next((r for r in tui.display() if "Composer — " in r), "")
+    tui.key(":send TO-ALICE-513\r", 2)
+    def sent():
+        r = run("alice", "room", "read", room, "--json")
+        for l in r.stdout.splitlines():
+            row = json.loads(l) if l.strip() else {}
+            if "TO-ALICE-513" in json.dumps(row):
+                return row
+        return None
+    until(lambda: sent() is not None, 60)
+    row = sent() or {}
+    env_ = row.get("envelope") or {}
+    claim("to", "To: alice · urgent" in composer and env_.get("to") == [fp["alice"]]
+          and env_.get("urgent") is True
+          and "no member of this room is named zz-nobody" in refused and unset
+          # A person's message says nothing of where they ran vox: no `at` (ADR-020 4.9 is agents').
+          and "at" not in env_,
+          f"bob's composer: {composer.strip()!r}; alice reads the message as {row!r}; `:to zz-nobody` "
+          f"said {refused!r}, To: left unset: {unset}")
+
+    stage("seen")
+    # A lane marks new what came after the person last looked at the lanes (W-3): Bob leaves
+    # them, Alice says something, and only that is new when he looks again.
+    tui.key(":lanes\r", 1)  # leave the lanes: what they showed is seen
+    p = run("alice", "room", "post", room, "LANE-AFTER since bob looked")
+    if p.returncode != 0: product(f"alice's `vox room post` failed: {p.stderr.strip()}")
+    tui.until(lambda: has(timeline(), "LANE-AFTER"), 60, 1)
+    tui.key(":lanes\r", 2)
+    tui.until(lambda: "LANE-AFTER" in "".join(lane("alice")[1]), 30, 1)
+    joined = "".join(lane("alice")[1]).replace(" ", "")
+    claim("seen", "newLANE-AFTERsincebob" in joined and "LANE-ASK" in joined and "newask:LANE-ASK" not in joined,
+          f"alice's lane after bob looked and she posted again: {lane('alice')[1]!r}")
+    tui.key(":lanes\r", 1)  # back to the timeline
+    tui.key("\x1b", 2)  # Esc back to the sidebar
+
     stage("unreach")
     for w in ("alice", "carol", "dave", "frank"):
         daemons[w].terminate()

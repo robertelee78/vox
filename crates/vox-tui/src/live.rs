@@ -165,6 +165,12 @@ pub struct DaemonCore {
     listening: Vec<vox_core::node::probe::Listening>,
     /// The service the share flow is about to offer, with what was said of it.
     serve_preview: Option<crate::viewmodel::ServePreview>,
+    /// The room on screen's lane states as the node last gave them, for which room, and when
+    /// (ADR-028 W-3).
+    lanes: (Option<Instant>, Option<Digest32>, Vec<(Digest32, String)>),
+    /// What the person last saw of each lane, by room and member (ADR-028 W-3), as kept in the
+    /// node's directory ([`LANES_SEEN_FILE`]); read once.
+    lanes_seen: Option<BTreeMap<String, BTreeMap<String, String>>>,
     /// Why the TUI cannot go on: the daemon stopped.
     ended: Option<String>,
     /// Cancelled when the TUI is asked to stop (SIGHUP, SIGTERM): a wait on the daemon is given up
@@ -210,6 +216,13 @@ struct Timeline {
 
 /// How many of the node's decisions, newest first, the TUI's decision screen holds.
 const DECISIONS_SHOWN: usize = 500;
+/// Where the TUI keeps, in the node's directory, what the person last saw of each lane (ADR-028
+/// W-3): `{room: {member: newest post seen}}`, fingerprints and hashes as `vox` prints them.
+const LANES_SEEN_FILE: &str = "tui-lanes-seen.json";
+
+/// How often the room on screen's lane states are asked of the node (ADR-028 W-3): as often as the
+/// snapshot, since a state changes when the room does.
+const LANES_EVERY: Duration = SNAPSHOT_EVERY;
 
 /// The least time between two asks to record what a room showed, after the node did not take one.
 const MARK_RETRY: Duration = Duration::from_secs(3);
@@ -378,6 +391,8 @@ impl DaemonCore {
             decisions: (None, Vec::new()),
             listening: Vec::new(),
             serve_preview: None,
+            lanes: (None, None, Vec::new()),
+            lanes_seen: None,
             ended: None,
             stop,
         };
@@ -581,8 +596,10 @@ impl DaemonCore {
             // command's own status puts over every notice, and `:link` showed a person nothing to
             // give anyone. A room link is no secret: the passphrase travels apart.
             Ok(Frame::Link { url, .. }) => {
-                self.notice = Some(format!("room link: {url}"));
-                CommandStatus::Said(format!("room link: {url}"))
+                // Add to room (ADR-028 W-5): the link, and that its passphrase goes another way.
+                let said = format!("room link: {url} — send its passphrase another way");
+                self.notice = Some(said.clone());
+                CommandStatus::Said(said)
             }
             Ok(Frame::Error { reason }) => failed(&reason),
             Ok(_) => CommandStatus::Failed(UiError::Internal),
@@ -731,7 +748,9 @@ impl DaemonCore {
             // and a count are all public facts; nothing here can carry plaintext or key material
             // (ADR-015).
             NodeEvent::InviteLink { url, .. } => {
-                self.notice = Some(format!("room link: {url}"));
+                self.notice = Some(format!(
+                    "room link: {url} — send its passphrase another way"
+                ));
             }
             NodeEvent::AddressNote { note, .. }
             | NodeEvent::NodeNote { note }
@@ -1050,6 +1069,71 @@ impl DaemonCore {
         }
     }
 
+    /// What the person last saw of each lane, read from the node's directory the first time.
+    fn lanes_seen(&mut self) -> &mut BTreeMap<String, BTreeMap<String, String>> {
+        let path = self.account.node_dir(&self.node).join(LANES_SEEN_FILE);
+        self.lanes_seen.get_or_insert_with(|| {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default()
+        })
+    }
+
+    /// Keep what the person has now seen of each lane in `channel_id` (W-3), in the node's
+    /// directory, so the next look marks only what is newer, across restarts.
+    fn note_lanes_seen(&mut self, channel_id: Digest32, seen: &[(Digest32, Digest32)]) {
+        let room = vox_core::node::link::b32_encode(&channel_id);
+        let entry = self.lanes_seen().entry(room).or_default();
+        for (member, post) in seen {
+            entry.insert(
+                vox_core::node::link::b32_encode(member),
+                vox_core::node::link::b32_encode(post),
+            );
+        }
+        let path = self.account.node_dir(&self.node).join(LANES_SEEN_FILE);
+        if let Ok(bytes) = serde_json::to_vec(self.lanes_seen()) {
+            let mut open = std::fs::OpenOptions::new();
+            open.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                open.mode(0o600);
+            }
+            if let Ok(mut f) = open.open(&path) {
+                let _ = std::io::Write::write_all(&mut f, &bytes);
+            }
+        }
+    }
+
+    /// The room on screen's lane states (ADR-028 W-3, #512), from the node: asked again at most
+    /// every [`LANES_EVERY`], and at once for a room that just came on screen. None without one.
+    fn lanes(&mut self) -> Vec<(Digest32, String)> {
+        let Some(cid) = self.active else {
+            return Vec::new();
+        };
+        let fresh =
+            self.lanes.1 == Some(cid) && self.lanes.0.is_some_and(|at| at.elapsed() < LANES_EVERY);
+        if !fresh {
+            if let Some(conn) = self.conn.as_mut() {
+                let asked = Request::Lanes { channel_id: cid };
+                match until_stopped(&self.rt, &self.stop, conn.client.request(&asked)) {
+                    Some(Ok(Frame::Lanes { lanes })) => {
+                        self.lanes = (Some(Instant::now()), Some(cid), lanes)
+                    }
+                    // Not answered this time (a room not open yet): asked again at the next.
+                    Some(Ok(_)) => self.lanes = (Some(Instant::now()), Some(cid), Vec::new()),
+                    None | Some(Err(_)) => {}
+                }
+            }
+        }
+        if self.lanes.1 == Some(cid) {
+            self.lanes.2.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Read the room on screen: whole when it first comes on screen, or when a late row or an
     /// unknown cursor says the order changed above what is shown; else only what arrived since.
     fn read_timeline(&mut self) {
@@ -1269,6 +1353,9 @@ impl DaemonCore {
             whereabouts: whereabouts(r),
             quote: if r.owed { None } else { quote_of(r) },
             image: if r.owed { None } else { image_of(r) },
+            coordination: !r.owed
+                && vox_agentcomms::envelope::Envelope::parse(&r.text)
+                    .is_ok_and(|e| vox_agentcomms::attention::CHATTER.contains(&e.kind.as_str())),
         };
         // A quote whose message arrives after its reply is projected again with it.
         let quoted_late = |p: &Projected| {
@@ -1338,6 +1425,26 @@ impl DaemonCore {
     }
 
     fn project(&mut self) -> ViewModel {
+        let lanes = self.lanes();
+        let seen_here: Vec<(Digest32, Digest32)> = match self.active {
+            Some(cid) => {
+                let room = vox_core::node::link::b32_encode(&cid);
+                self.lanes_seen()
+                    .get(&room)
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(member, post)| {
+                                Some((
+                                    vox_core::node::link::b32_decode(member, "member").ok()?,
+                                    vox_core::node::link::b32_decode(post, "post").ok()?,
+                                ))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
         let snap = self.snapshot.clone();
         let me = snap.me;
         // A room is reachable when this node holds a connection to another of its members. A
@@ -1563,6 +1670,8 @@ impl DaemonCore {
                         })
                         .collect(),
                     reachability: reachability(&cid),
+                    lanes: lanes.clone(),
+                    lanes_seen: seen_here.clone(),
                 })
         });
         ViewModel {
@@ -2093,6 +2202,52 @@ impl CoreHandle for DaemonCore {
                     self.notified.remove(&cid);
                 }
                 CommandStatus::Done
+            }
+            Command::LanesSeen { channel_id, seen } => {
+                self.note_lanes_seen(channel_id, &seen);
+                CommandStatus::Done
+            }
+            Command::PostAddressed {
+                channel_id,
+                text,
+                to,
+                urgent,
+                re,
+            } => {
+                let Ok(paths) = self.account.node_paths(&self.node) else {
+                    return CommandStatus::Failed(UiError::NotAttached);
+                };
+                let opts = crate::room_cli::PostOpts {
+                    to: to.iter().map(vox_core::node::link::b32_encode).collect(),
+                    urgent,
+                    re: re.as_ref().map(vox_core::node::link::b32_encode),
+                    ..crate::room_cli::PostOpts::default()
+                };
+                let room = vox_core::node::link::b32_encode(&channel_id);
+                let posted = until_stopped(
+                    &self.rt,
+                    &self.stop,
+                    crate::room_cli::post_structured(&paths, &room, &text, &opts),
+                );
+                if let Some(t) = self
+                    .timeline
+                    .as_mut()
+                    .filter(|t| t.channel_id == channel_id)
+                {
+                    t.stale = true;
+                }
+                match posted {
+                    Some(Ok(report)) => {
+                        let said = report.said();
+                        if said.is_empty() {
+                            CommandStatus::Done
+                        } else {
+                            CommandStatus::Said(said.join(" · "))
+                        }
+                    }
+                    Some(Err(e)) => CommandStatus::Said(e.to_string()),
+                    None => CommandStatus::NotConnected,
+                }
             }
             Command::Reply {
                 channel_id,

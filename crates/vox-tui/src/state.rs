@@ -306,6 +306,14 @@ pub struct UiState {
     pub selected_listening: usize,
     /// The room the share flow offers into.
     pub serve_room: Option<Digest32>,
+    /// The room's lanes are on screen in place of its timeline (ADR-028 W-3): `:lanes`.
+    pub lanes: bool,
+    /// Whom the composer's next message is to (ADR-028 W-4, `to`): `:to <name>…`.
+    pub to: Vec<Digest32>,
+    /// The composer's next message is urgent (W-4, ADR-020 4.5): `:urgent`.
+    pub urgent: bool,
+    /// The room the lanes, To: and urgent belong to: another room starts without them.
+    pub compose_room: Option<Digest32>,
 }
 
 impl Default for UiState {
@@ -329,6 +337,10 @@ impl Default for UiState {
             on_screen: Vec::new(),
             selected_listening: 0,
             serve_room: None,
+            lanes: false,
+            to: Vec::new(),
+            urgent: false,
+            compose_room: None,
         }
     }
 }
@@ -344,6 +356,14 @@ impl UiState {
     /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
     /// draws and the member a command acts on are one member, held by identity from then on.
     pub fn settle(&mut self, vm: &ViewModel) {
+        // The lanes, To: and urgent are the room's: another room starts without them.
+        let room = vm.active.as_ref().map(|c| c.channel_id);
+        if room != self.compose_room {
+            self.compose_room = room;
+            self.lanes = false;
+            self.to.clear();
+            self.urgent = false;
+        }
         match self
             .selected_room
             .and_then(|id| vm.channels.iter().position(|c| c.channel_id == id))
@@ -446,15 +466,30 @@ impl UiState {
                             return Action::Redraw;
                         }
                     };
-                    let text = if to.is_empty() {
-                        text
-                    } else {
-                        let mut e = vox_agentcomms::envelope::Envelope::say(&text);
-                        e.to = to;
-                        e.to_text()
-                    };
+                    // Whom `@alias` names (K-4) join the To: (W-4): both are addressing.
+                    for fp in to {
+                        if let Ok(id) = vox_core::node::link::b32_decode(&fp, "member") {
+                            if !self.to.contains(&id) {
+                                self.to.push(id);
+                            }
+                        }
+                    }
                     self.composer.clear();
-                    return Action::Dispatch(match self.replying.take() {
+                    let re = self.replying.take();
+                    // Addressed or urgent, the message goes the one way a structured message is
+                    // posted, as `vox room post --to … --urgent` posts it (ADR-028 W-4).
+                    if !self.to.is_empty() || self.urgent {
+                        let to = std::mem::take(&mut self.to);
+                        let urgent = std::mem::replace(&mut self.urgent, false);
+                        return Action::Dispatch(Command::PostAddressed {
+                            channel_id,
+                            text,
+                            to,
+                            urgent,
+                            re,
+                        });
+                    }
+                    return Action::Dispatch(match re {
                         Some(re) => Command::Reply {
                             channel_id,
                             re,
@@ -569,6 +604,10 @@ impl UiState {
                     }
                     self.screen = Screen::Channel;
                     return Action::Redraw;
+                }
+                // Out of the lanes, back to the room's timeline.
+                if self.screen == Screen::Channel && self.lanes {
+                    return self.leave_lanes(vm);
                 }
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
@@ -1014,6 +1053,45 @@ impl UiState {
                         self.status_message = Some(why);
                         Action::Redraw
                     }
+                    Some(Parsed::Send(channel_id, text)) => {
+                        if self.to.is_empty() && !self.urgent {
+                            Action::Dispatch(Command::SendText { channel_id, text })
+                        } else {
+                            let to = std::mem::take(&mut self.to);
+                            let urgent = std::mem::replace(&mut self.urgent, false);
+                            Action::Dispatch(Command::PostAddressed {
+                                channel_id,
+                                text,
+                                to,
+                                urgent,
+                                re: None,
+                            })
+                        }
+                    }
+                    Some(Parsed::Lanes) => {
+                        if self.lanes {
+                            self.leave_lanes(vm)
+                        } else {
+                            self.lanes = true;
+                            Action::Redraw
+                        }
+                    }
+                    Some(Parsed::To(names)) => {
+                        self.set_to(&names, vm);
+                        Action::Redraw
+                    }
+                    Some(Parsed::Urgent) => {
+                        self.urgent = !self.urgent;
+                        self.status_message = Some(
+                            if self.urgent {
+                                "the next message is urgent"
+                            } else {
+                                "the next message is not urgent"
+                            }
+                            .into(),
+                        );
+                        Action::Redraw
+                    }
                     Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
                     Some(Parsed::Prompt(kind, name)) => {
                         // A rename is of the room on screen.
@@ -1036,6 +1114,81 @@ impl UiState {
             }
             _ => Action::Redraw,
         }
+    }
+
+    /// Leave the lanes: what each lane showed is what the person has now seen (W-3), kept by
+    /// the node's TUI state so the next look marks only what is newer, across restarts.
+    fn leave_lanes(&mut self, vm: &ViewModel) -> Action {
+        self.lanes = false;
+        let Some(c) = vm.active.as_ref() else {
+            return Action::Redraw;
+        };
+        let seen: Vec<(Digest32, Digest32)> = c
+            .lanes
+            .iter()
+            .filter_map(|(member, _)| {
+                c.timeline
+                    .iter()
+                    .rev()
+                    .find(|m| m.author == *member && !m.coordination)
+                    .map(|m| (*member, m.entry_hash))
+            })
+            .collect();
+        Action::Dispatch(Command::LanesSeen {
+            channel_id: c.channel_id,
+            seen,
+        })
+    }
+
+    /// Set the composer's To: from `names`, this node's names for members of the room or the
+    /// start of their fingerprints (as `vox room post --to` takes them); none clears it. A name
+    /// that is no member, or that names more than one, is refused with a sentence, and changes
+    /// nothing: the next message goes nowhere it was not meant to.
+    fn set_to(&mut self, names: &str, vm: &ViewModel) {
+        let Some(c) = vm.active.as_ref() else {
+            return;
+        };
+        let mut to = Vec::new();
+        for name in names.split([',', ' ']).filter(|n| !n.is_empty()) {
+            let found: Vec<&crate::viewmodel::MemberView> = c
+                .members
+                .iter()
+                .filter(|m| {
+                    m.trust != crate::viewmodel::Trust::You
+                        && (m.nickname == name
+                            || (name.len() >= 8
+                                && vox_core::node::link::b32_encode(&m.id).starts_with(name)))
+                })
+                .collect();
+            match found[..] {
+                [m] => {
+                    if !to.contains(&m.id) {
+                        to.push(m.id);
+                    }
+                }
+                [] => {
+                    self.status_message = Some(format!(
+                        "no member of this room is named {name}: the next message's To: is \
+                         unchanged"
+                    ));
+                    return;
+                }
+                _ => {
+                    self.status_message = Some(format!(
+                        "{name} names {} members of this room; give more of a fingerprint: the \
+                         next message's To: is unchanged",
+                        found.len()
+                    ));
+                    return;
+                }
+            }
+        }
+        self.to = to;
+        self.status_message = Some(if self.to.is_empty() {
+            "the next message is to the room".into()
+        } else {
+            format!("the next message is to {}", names.trim())
+        });
     }
 
     /// Apply a navigation action (the typed-command equivalents of the chord
@@ -1123,6 +1276,14 @@ pub enum Parsed {
     Serve(Digest32, Option<String>),
     /// Open the trust prompt on this node (ADR-028 K-5).
     Trust(Digest32),
+    /// Send a message to this room, with the composer's To: and urgent (ADR-028 W-4).
+    Send(Digest32, String),
+    /// Show or leave the room's lanes (ADR-028 W-3).
+    Lanes,
+    /// Set the composer's To: from these names (W-4); none clears it.
+    To(String),
+    /// Switch the composer's urgent on or off (W-4).
+    Urgent,
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -1212,11 +1373,14 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     }
     // Channel-scoped verbs require an active channel.
     let channel = ui.active_channel_id(vm)?;
+    match verb {
+        "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
+        "lanes" => return Some(Parsed::Lanes),
+        "to" => return Some(Parsed::To(rest.to_owned())),
+        "urgent" => return Some(Parsed::Urgent),
+        _ => {}
+    }
     let cmd = match verb {
-        "send" if !rest.is_empty() => Command::SendText {
-            channel_id: channel,
-            text: rest.to_owned(),
-        },
         "close" => Command::CloseChannel {
             channel_id: channel,
         },

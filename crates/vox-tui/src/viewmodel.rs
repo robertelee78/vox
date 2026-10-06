@@ -90,6 +90,10 @@ pub struct MessageView {
     /// R-6): "only on this machine", or "on N of M members' nodes" from what their nodes said they
     /// hold. Empty when the node does not say.
     pub whereabouts: String,
+    /// Agents coordinating rather than talking (presence, progress, the claim protocol;
+    /// `vox_agentcomms::attention::CHATTER`): a lane folds these into one counted line (ADR-028
+    /// W-3, ADR-020 6.6).
+    pub coordination: bool,
     /// The one message this replies to, quoted (ADR-028 R-9, #485): the entry its `re` names,
     /// never that one's own quote or the thread's root.
     pub quote: Option<QuoteView>,
@@ -216,6 +220,12 @@ pub struct ChannelView {
     pub shared: Vec<SharedView>,
     /// This channel's reachability.
     pub reachability: Reachability,
+    /// Each other member and its lane state's words, in the room's member order, as the node
+    /// derives them (ADR-028 W-3, #512): what heads each lane.
+    pub lanes: Vec<(Digest32, String)>,
+    /// For each member, the newest of its posts the person had seen when they last left the
+    /// lanes (W-3, "what changed since the person last looked"): what is after it is new.
+    pub lanes_seen: Vec<(Digest32, Digest32)>,
 }
 
 /// One service shared in a room, as the TUI shows it (ADR-028 S-3).
@@ -646,6 +656,28 @@ pub enum Command {
     OfferService,
     /// Drop the share flow's preview.
     CancelServe,
+    /// What the person has seen of each member's lane in a room, as they leave the lanes (W-3):
+    /// `(member, the newest post of its seen)`. Kept with this node, across restarts.
+    LanesSeen {
+        /// The room.
+        channel_id: Digest32,
+        /// `(member, newest post seen)`.
+        seen: Vec<(Digest32, Digest32)>,
+    },
+    /// Post `text` to a channel addressed, urgent, or both (ADR-028 W-4): the one way a
+    /// structured message is posted, as `vox room post --to … --urgent` posts it.
+    PostAddressed {
+        /// The target channel.
+        channel_id: Digest32,
+        /// The message's words.
+        text: String,
+        /// The members it is to.
+        to: Vec<Digest32>,
+        /// Whether it may interrupt their agents.
+        urgent: bool,
+        /// The entry it replies to, if it is a reply.
+        re: Option<Digest32>,
+    },
     /// Send `text` to a channel as a reply to its entry `re` (ADR-028 R-9, #485).
     Reply {
         /// The target channel.
