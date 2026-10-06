@@ -147,6 +147,8 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
         render_keyring(frame, chunks[0], vm);
     } else if ui.screen == Screen::Decisions {
         render_decisions(frame, chunks[0], vm);
+    } else if ui.screen == Screen::Serve {
+        render_serve(frame, chunks[0], vm, ui);
     } else {
         let regions = Layout::default()
             .direction(Direction::Horizontal)
@@ -400,6 +402,54 @@ fn render_decisions(frame: &mut Frame, area: Rect, vm: &ViewModel) {
             .borders(Borders::ALL)
             .title("Decisions (newest first · kept 14 days · Esc: back)"),
     );
+    frame.render_widget(list, area);
+}
+
+/// Sharing a service listening on this machine into the room (ADR-028 S-4), as `vox serve` with
+/// no name does: what listens here, then, for the one picked, what is said before it is shared.
+fn render_serve(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
+    if let Some(p) = vm.serve_preview.as_ref() {
+        let lines: Vec<Line> = p
+            .lines
+            .iter()
+            .map(|l| Line::from(format!("  {l}")))
+            .chain(std::iter::once(Line::from("")))
+            .chain(std::iter::once(Line::from(
+                "  Enter: share it in this room · Esc: back to the list",
+            )))
+            .collect();
+        let w = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(pane_block("Share a service", true));
+        frame.render_widget(w, area);
+        return;
+    }
+    let mut items: Vec<ListItem> = vm
+        .listening
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let marker = if i == ui.selected_listening {
+                "▶ "
+            } else {
+                "  "
+            };
+            ListItem::new(format!("{marker}{}", l.line))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(
+            "  nothing listening on this machine can be seen from here",
+        ));
+    }
+    items.push(ListItem::new(format!(
+        "  {}",
+        crate::tunnel_cli::MAY_BE_MISSING
+    )));
+    let list = List::new(items).block(pane_block(
+        "Services listening on this machine (Enter: preview · Esc: back)",
+        true,
+    ));
     frame.render_widget(list, area);
 }
 
@@ -937,6 +987,8 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
             " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
+        Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",
+        Screen::Serve => " ↑/↓ select · Enter preview · :serve <port> · Esc back to the room",
         Screen::Keyring => " : command · Esc back",
         Screen::Decisions => " what this node decided, newest first · : command · Esc back",
     }

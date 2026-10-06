@@ -1430,6 +1430,12 @@ async fn ask(question: &str) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Usage("no answer: nothing shared".into()))
 }
 
+/// Said under a list of what listens on this machine: unprivileged, `lsof` sees only this user's
+/// sockets and `ss` hides another user's program.
+pub(crate) const MAY_BE_MISSING: &str =
+    "another user's services, root's among them, may be missing here or listed without their \
+     program";
+
 /// `vox serve` with no service named (ADR-028 S-4): list what listens on this machine, with
 /// its program's name, have the person pick one, suggest a name for it, and return
 /// `(port, tag, endpoint)`.
@@ -1450,10 +1456,7 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
     }
     // Unprivileged, `lsof` sees only this user's sockets and `ss` hides another user's program:
     // a service missing here may still be listening.
-    println!(
-        "  another user's services, root's among them, may be missing here or listed without \
-         their program; name one with vox serve <name>=<port>"
-    );
+    println!("  {MAY_BE_MISSING}; name one with vox serve <name>=<port>");
     let answer = ask("share which? (its number, or its port)").await?;
     let chosen = answer
         .parse::<usize>()
@@ -1470,18 +1473,7 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
             ))
         })?;
     let endpoint = chosen.endpoint();
-    // Its detected kind is the best name; else its program's (S-2: the kind itself is never
-    // taken from either).
-    let kind = vox_core::node::probe::detect(endpoint, chosen.udp).await;
-    let suggested = match kind {
-        ServiceKind::Tcp | ServiceKind::Udp => chosen
-            .command
-            .as_deref()
-            .map(vox_core::node::resolver::label_of)
-            .filter(|n| !n.is_empty() && n.len() <= vox_core::governance::share::MAX_SERVICE_NAME)
-            .unwrap_or_else(|| "service".to_owned()),
-        other => other.as_str().to_owned(),
-    };
+    let suggested = suggested_name(chosen).await;
     let given = ask(&format!("name it [{suggested}]")).await?;
     let name = if given.is_empty() {
         suggested
@@ -1493,16 +1485,36 @@ async fn pick_service() -> Result<(u16, String, SocketAddr), AppError> {
             "{given:?}: a service's name is letters, digits and `-`, at most 63 of them"
         )));
     }
-    let tag = if chosen.udp {
+    Ok((chosen.port, tag_of(name, chosen.udp), endpoint))
+}
+
+/// The name a listening service is offered under, unless the person gives another (ADR-028 S-4):
+/// its detected kind, which is the best name; else its program's (S-2: the kind itself is never
+/// taken from either). Shared by `vox serve` and the TUI's share flow.
+pub(crate) async fn suggested_name(chosen: &vox_core::node::probe::Listening) -> String {
+    let kind = vox_core::node::probe::detect(chosen.endpoint(), chosen.udp).await;
+    match kind {
+        ServiceKind::Tcp | ServiceKind::Udp => chosen
+            .command
+            .as_deref()
+            .map(vox_core::node::resolver::label_of)
+            .filter(|n| !n.is_empty() && n.len() <= vox_core::governance::share::MAX_SERVICE_NAME)
+            .unwrap_or_else(|| "service".to_owned()),
+        other => other.as_str().to_owned(),
+    }
+}
+
+/// A service's tag from its name: `udp/<name>` for one that takes datagrams.
+pub(crate) fn tag_of(name: String, udp: bool) -> String {
+    if udp {
         format!("udp/{name}")
     } else {
         name
-    };
-    Ok((chosen.port, tag, endpoint))
+    }
 }
 
 /// One listening service as the list shows it: its program, where it listens, and over what.
-fn listing_line(l: &vox_core::node::probe::Listening) -> String {
+pub(crate) fn listing_line(l: &vox_core::node::probe::Listening) -> String {
     let program = l.command.as_deref().unwrap_or("(not visible to you)");
     let addrs: Vec<String> = l
         .addrs
@@ -1537,7 +1549,10 @@ fn said_in_a_sentence(l: &vox_core::node::probe::Listening) -> String {
 /// What a person must hear before `services` are shared (ADR-028 S-4): each one this machine
 /// listens for on every interface, which its networks reach with no Vox at all, and each on a
 /// well-known sensitive port.
-async fn exposure_warnings(services: &[(u16, String)], at: Option<SocketAddr>) -> Vec<String> {
+pub(crate) async fn exposure_warnings(
+    services: &[(u16, String)],
+    at: Option<SocketAddr>,
+) -> Vec<String> {
     let found = tokio::task::spawn_blocking(vox_core::node::probe::listening)
         .await
         .unwrap_or_default();

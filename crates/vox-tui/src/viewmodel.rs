@@ -240,6 +240,36 @@ pub struct ViewModel {
     pub keyring: Vec<(vox_core::hash::Digest32, String)>,
     /// What this node decided, newest first, from its decision record (ADR-028 D-3).
     pub decisions: Vec<vox_core::node::decisions::Event>,
+    /// What listens on this machine, for sharing one into a room (ADR-028 S-4), as `vox serve`
+    /// lists it; empty until the share flow asks.
+    pub listening: Vec<ListeningView>,
+    /// The service the share flow is about to offer, and what is said before it is (S-4).
+    pub serve_preview: Option<ServePreview>,
+}
+
+/// One service listening on this machine, as the share flow lists it (ADR-028 S-4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListeningView {
+    /// Its program, where it listens, and over what: `vox serve`'s line.
+    pub line: String,
+    /// Its port.
+    pub port: u16,
+    /// Whether it takes datagrams.
+    pub udp: bool,
+}
+
+/// A service about to be offered in a room, and what the person is told first (ADR-028 S-4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServePreview {
+    /// The room.
+    pub channel_id: Digest32,
+    /// The tag it is offered under: its suggested name, `udp/` before it for datagrams.
+    pub tag: String,
+    /// Where it listens, which the room's members are carried to.
+    pub local: std::net::SocketAddr,
+    /// What is said before it is offered: its address, who can reach it and who cannot, and
+    /// each warning.
+    pub lines: Vec<String>,
 }
 
 /// The bounded set of user-facing errors the UI surfaces (ADR-015 §"Error & offline
@@ -546,6 +576,22 @@ pub enum Command {
         /// The plaintext to send (becomes ciphertext in the core).
         text: String,
     },
+    /// List what listens on this machine, for the share flow (ADR-028 S-4).
+    ProbeListening,
+    /// Say what offering the service listening on `port` in a room would do, before it is done
+    /// (S-4): `udp` picks one of two on the same port; `None` takes the first.
+    PreviewServe {
+        /// The room.
+        channel_id: Digest32,
+        /// The service's port.
+        port: u16,
+        /// Datagrams or connections, when the person picked one.
+        udp: Option<bool>,
+    },
+    /// Offer the previewed service in its room (S-4), as `vox service add` does.
+    OfferService,
+    /// Drop the share flow's preview.
+    CancelServe,
     /// Send `text` to a channel as a reply to its entry `re` (ADR-028 R-9, #485).
     Reply {
         /// The target channel.
