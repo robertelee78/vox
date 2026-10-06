@@ -271,13 +271,53 @@ put_back() {
 }
 trap put_back EXIT
 trap 'exit 130' INT TERM
+# A bundle is never removed while code from it runs: a daemon not yet restarted after an earlier
+# update runs from the bundle that update replaced. It is retired (renamed aside), and removed by
+# a later transition once nothing runs from it.
+in_use() { # <bundle>: whether any process runs one of its executables
+  files=$(find "$1/Contents" -type f -perm -u+x 2>/dev/null)
+  [ -n "$files" ] || return 1
+  # shellcheck disable=SC2086 # one argument per file
+  # Read the pids, not the status: lsof exits 1 when any one file named is not open.
+  [ -n "$(/usr/sbin/lsof -t $files 2>/dev/null)" ]
+}
+retire() { # <bundle>
+  mv "$1" "$APPS/.Vox.app.retired.$(date +%s).$$" || fail "could not move $1 aside"
+}
+for r in "$APPS"/.Vox.app.retired.*; do
+  [ -e "$r" ] || continue
+  in_use "$r" || gone "$r"
+done
+# A `vox update` cut short between its swap and naming the replaced bundle .Vox.app.previous
+# left a journal (.Vox.app.publishing, as vox update's recover() reads it): finished here the
+# same way, so the replaced bundle under the partial name is kept rather than cleared.
+J="$APPS/.Vox.app.publishing"
+if [ -d "$J" ]; then
+  published=$(cat "$J/version" 2>/dev/null || true)
+  if [ ! -e "$APPS/.Vox.app.previous" ] && [ -f "$APPS/.Vox.app.partial/Contents/Helpers/vox" ]; then
+    active=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+      "$APPS/Vox.app/Contents/Info.plist" 2>/dev/null || true)
+    if [ -n "$published" ] && [ "$active" = "$published" ]; then
+      mv "$APPS/.Vox.app.partial" "$APPS/.Vox.app.previous" \
+        || fail "could not keep the Vox.app a cut-short update replaced"
+      printf 'vox install: an update was cut short after Vox %s was put in place; the Vox.app it replaced is kept at %s\n' \
+        "$published" "$APPS/.Vox.app.previous" >&2
+    fi
+  fi
+  if [ ! -e "$APPS/.Vox.app.previous" ] && [ -e "$J/Vox.app" ]; then
+    mv "$J/Vox.app" "$APPS/.Vox.app.previous" || fail "could not put back $APPS/.Vox.app.previous"
+  fi
+  gone "$J"
+fi
 gone "$APPS/.Vox.app.partial"
 gone "$APPS/.Vox.app.previous.partial"
 /usr/bin/ditto "$NEW" "$APPS/.Vox.app.partial" || fail "could not copy Vox.app into $APPS"
 printf '{"kind":"vox.install-channel","schema_version":1,"package":"vox","channel":"%s"}\n' \
   "$CHANNEL" >"$APPS/.marker.partial" || fail "could not write $APPS/$MARKER"
 if [ -e "$APPS/Vox.app" ]; then
-  gone "$APPS/.Vox.app.previous"
+  if [ -e "$APPS/.Vox.app.previous" ]; then
+    if in_use "$APPS/.Vox.app.previous"; then retire "$APPS/.Vox.app.previous"; else gone "$APPS/.Vox.app.previous"; fi
+  fi
   mv "$APPS/Vox.app" "$APPS/.Vox.app.previous" || fail "could not move the installed Vox.app aside"
   moved=1
 fi

@@ -844,6 +844,111 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             }
         }
         {
+            // A daemon not restarted since an earlier install still runs from the bundle that
+            // install replaced: the next install must not remove it from under it.
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            let apps = system_apps(home);
+            let (ok1, _) = run_installer(&server, home, "stable");
+            let (ok2, _) = run_installer(&server, home, "stable");
+            let running_from = apps.join(".Vox.app.previous/Contents/Helpers/vox");
+            let scratch = home.join("a-node");
+            std::fs::create_dir_all(scratch.join("cfg")).staged();
+            let mut runner = Command::new(&running_from)
+                .args(["node", "--listen", "127.0.0.1:0"])
+                .env("VOX_DATA_DIR", &scratch)
+                .env("VOX_CONFIG_DIR", scratch.join("cfg"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .staged();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let alive = runner.try_wait().staged().is_none();
+            let (ok3, text3) = run_installer(&server, home, "stable");
+            let retired: Vec<PathBuf> = std::fs::read_dir(&apps)
+                .staged()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(".Vox.app.retired."))
+                })
+                .collect();
+            let kept = retired
+                .iter()
+                .any(|r| r.join("Contents/Helpers/vox").is_file());
+            let still_alive = runner.try_wait().staged().is_none();
+            let _ = runner.kill();
+            let _ = runner.wait();
+            let (ok4, _) = run_installer(&server, home, "stable");
+            let swept = !std::fs::read_dir(&apps)
+                .staged()
+                .filter_map(Result::ok)
+                .any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".Vox.app.retired.")
+                });
+            if ok1 && ok2 && alive {
+                claims.push(claim(
+                    "install.keeps_a_bundle_a_daemon_runs_from",
+                    ok3 && kept && still_alive && ok4 && swept,
+                    format!(
+                        "third install exit_ok={ok3}: the bundle the running vox came from kept \
+                         as {retired:?}={kept}, it still running={still_alive}; after it stopped, \
+                         a fourth install (exit_ok={ok4}) removed it={swept}; said {text3:?}"
+                    ),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.keeps_a_bundle_a_daemon_runs_from",
+                    format!(
+                        "staging: installs ok={ok1}/{ok2}, a vox running from the previous bundle \
+                         alive={alive}"
+                    ),
+                ));
+            }
+        }
+        {
+            // A `vox update` cut short between its swap and its rename (its journal says Vox
+            // 9.9.9 was put in place, and the bundle it replaced is under the partial name).
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            let apps = system_apps(home);
+            let (ok1, _) = run_installer(&server, home, "stable");
+            let staged = ok1
+                && std::fs::rename(apps.join("Vox.app"), apps.join(".Vox.app.partial")).is_ok()
+                && Command::new("/usr/bin/ditto")
+                    .arg(apps.join(".Vox.app.partial"))
+                    .arg(apps.join("Vox.app"))
+                    .status()
+                    .is_ok_and(|s| s.success())
+                && Command::new("/usr/libexec/PlistBuddy")
+                    .args(["-c", "Set :CFBundleShortVersionString 9.9.9"])
+                    .arg(apps.join("Vox.app/Contents/Info.plist"))
+                    .status()
+                    .is_ok_and(|s| s.success())
+                && std::fs::create_dir(apps.join(".Vox.app.publishing")).is_ok()
+                && std::fs::write(apps.join(".Vox.app.publishing/version"), "9.9.9").is_ok();
+            if staged {
+                let (ok, text) = run_installer(&server, home, "stable");
+                let journal_left = apps.join(".Vox.app.publishing").exists();
+                claims.push(claim(
+                    "install.finishes_a_cut_vox_update",
+                    ok && !journal_left
+                        && text
+                            .contains("an update was cut short after Vox 9.9.9 was put in place"),
+                    format!("exit_ok={ok}, the journal left behind={journal_left}, said {text:?}"),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.finishes_a_cut_vox_update",
+                    "staging a cut-short vox update's state did not succeed",
+                ));
+            }
+        }
+        {
             let tmp = tempfile::tempdir().staged();
             let home = tmp.path();
             let before = server.requests();
