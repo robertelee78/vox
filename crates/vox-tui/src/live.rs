@@ -44,14 +44,21 @@ use zeroize::Zeroizing;
 
 use crate::app::CoreHandle;
 use crate::viewmodel::{
-    ChannelSummary, ChannelView, Command, CommandStatus, MemberView, MessageView, NoticeView,
-    QuoteView, Reachability, SyncStatus, Trust, UiError, ViewModel,
+    ChannelSummary, ChannelView, Command, CommandStatus, ImageView, MemberView, MessageView,
+    NoticeView, QuoteView, Reachability, SyncStatus, Trust, UiError, ViewModel,
 };
 use vox_agentcomms::attention::{group, RoomGroup};
 
 /// How often the snapshot is asked again when no event has said anything changed: connections,
 /// tunnels and their last moved byte change without a room event.
 const SNAPSHOT_EVERY: Duration = Duration::from_secs(1);
+
+/// What one check of a pulled image found: its announcement, and where it stands.
+type ImageCheck = (Digest32, crate::viewmodel::ImageState);
+
+/// The largest image file the TUI hashes and draws (ADR-028 F-11): a bigger one is a file, not a
+/// picture to show inline.
+const MAX_DRAWN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How much of a quoted message a reply shows: its first line, to this many characters.
 const QUOTE_CHARS: usize = 80;
@@ -138,6 +145,13 @@ pub struct DaemonCore {
     timeline: Option<Timeline>,
     /// The messages already told to the node as shown (ADR-028 RR-1).
     marked: std::collections::BTreeSet<Digest32>,
+    /// Image shares whose pulled copy has been checked off this thread, and what it came to
+    /// (ADR-028 F-11): only a verified, decoded one is drawn.
+    images: BTreeMap<Digest32, crate::viewmodel::ImageState>,
+    /// Pull records already handed to a check: a copy is hashed once.
+    checked: std::collections::BTreeSet<Digest32>,
+    /// Where the checks say what they found.
+    image_checks: (mpsc::Sender<ImageCheck>, mpsc::Receiver<ImageCheck>),
     /// The last time the node did not take what the room on screen showed, and what the room was
     /// then: it is not asked again until the room has changed and [`MARK_RETRY`] has passed, or
     /// ever, for a room that is over.
@@ -212,6 +226,8 @@ struct Own {
 }
 
 struct Projected {
+    /// How many images were verified when this was projected: one more projects again.
+    verified: usize,
     me: Option<Digest32>,
     trusted: Vec<(Digest32, String)>,
     own: Own,
@@ -342,6 +358,9 @@ impl DaemonCore {
             clashes_said: std::collections::BTreeSet::new(),
             timeline: None,
             marked: std::collections::BTreeSet::new(),
+            images: BTreeMap::new(),
+            checked: std::collections::BTreeSet::new(),
+            image_checks: mpsc::channel(),
             mark_refused: None,
             ended: None,
             stop,
@@ -840,6 +859,7 @@ impl DaemonCore {
                 Ok(Some(s)) => {
                     let before = std::mem::replace(&mut self.snapshot, s);
                     self.note_joins(&before);
+                    self.check_pulls();
                 }
                 Ok(None) => match Frame::from_bytes(&reply) {
                     Ok(Frame::NodeDetached { .. }) => self.detached(),
@@ -915,6 +935,61 @@ impl DaemonCore {
                 u.cursor = Some(newest);
             }
             u.pending = 0;
+        }
+    }
+
+    /// **Verify what this node pulled of the room on screen's image shares** (ADR-028 F-11): each
+    /// pull record new here is handed once to a thread of its own, which hashes and decodes the
+    /// copy ([`crate::images::verify_and_decode`]), so a large file never holds up a frame. The
+    /// daemon checked it as it pulled; this checks the file that is there now, which is what is
+    /// drawn. What the checks found is taken in here too.
+    fn check_pulls(&mut self) {
+        while let Ok((entry, state)) = self.image_checks.1.try_recv() {
+            self.images.insert(entry, state);
+        }
+        let Some(t) = self.timeline.as_ref() else {
+            return;
+        };
+        let Ok(paths) = self.account.node_paths(&self.node) else {
+            return;
+        };
+        for p in vox_core::node::pulls::recorded(&paths) {
+            if p.room != t.channel_id || self.checked.contains(&p.entry) {
+                continue;
+            }
+            let Some(row) = t.rows.iter().find(|r| r.entry_hash == p.entry) else {
+                continue;
+            };
+            self.checked.insert(p.entry);
+            let Ok(e) = vox_agentcomms::envelope::Envelope::parse(&row.text) else {
+                continue;
+            };
+            let (Some(sha), Some(size)) = (
+                e.data.get("sha256").and_then(serde_json::Value::as_str),
+                e.data.get("size").and_then(serde_json::Value::as_u64),
+            ) else {
+                continue;
+            };
+            if e.data.get("image").is_none() {
+                continue;
+            }
+            if size > MAX_DRAWN_BYTES {
+                self.images.insert(
+                    p.entry,
+                    crate::viewmodel::ImageState::NotDrawn(crate::images::PAST_LIMITS),
+                );
+                continue;
+            }
+            let (tx, sha, entry) = (self.image_checks.0.clone(), sha.to_owned(), p.entry);
+            let spawned = std::thread::Builder::new()
+                .name("vox-image-check".into())
+                .spawn(move || {
+                    let _ = tx.send((entry, crate::images::verify_and_decode(&p.path, size, &sha)));
+                });
+            if spawned.is_err() {
+                // Not checked now; looked at again with the next snapshot.
+                self.checked.remove(&entry);
+            }
         }
     }
 
@@ -1007,10 +1082,29 @@ impl DaemonCore {
         trusted: &[(Digest32, String)],
         own: &Own,
     ) -> std::sync::Arc<Vec<MessageView>> {
+        let images = &self.images;
         let Some(t) = self.timeline.as_mut() else {
             return std::sync::Arc::default();
         };
         let (held, projected) = (&t.rows, &mut t.projected);
+        // **An image a message shares** (ADR-028 F-9, F-11): as announced, with this node's copy
+        // once it is verified here.
+        let image_of = |r: &MessageRow| {
+            let e = vox_agentcomms::envelope::Envelope::parse(&r.text).ok()?;
+            if e.kind != crate::room_cli::FILE {
+                return None;
+            }
+            let image = e.data.get("image")?;
+            Some(ImageView {
+                name: e.data.get("name")?.as_str()?.to_owned(),
+                width: image.get("width")?.as_u64()?,
+                height: image.get("height")?.as_u64()?,
+                state: images
+                    .get(&r.entry_hash)
+                    .cloned()
+                    .unwrap_or(crate::viewmodel::ImageState::Unverified),
+            })
+        };
         let name_of = |author: &Digest32| {
             if me == Some(*author) {
                 "you".to_owned()
@@ -1108,6 +1202,7 @@ impl DaemonCore {
             pulled_by: pullers(r),
             whereabouts: whereabouts(r),
             quote: if r.owed { None } else { quote_of(r) },
+            image: if r.owed { None } else { image_of(r) },
         };
         // A quote whose message arrives after its reply is projected again with it.
         let quoted_late = |p: &Projected| {
@@ -1120,6 +1215,7 @@ impl DaemonCore {
         match projected.as_mut() {
             Some(p)
                 if p.me == me
+                    && p.verified == images.len()
                     && p.trusted.as_slice() == trusted
                     && p.own == *own
                     && p.len <= held.len()
@@ -1134,6 +1230,7 @@ impl DaemonCore {
             _ => {
                 let rows = std::sync::Arc::new(held.iter().map(view_of).collect::<Vec<_>>());
                 *projected = Some(Projected {
+                    verified: images.len(),
                     me,
                     trusted: trusted.to_vec(),
                     own: own.clone(),

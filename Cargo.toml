@@ -195,6 +195,9 @@ vt100 = "0.15"
 #                  CLI/config inputs (passphrases), complementing `zeroize`.
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
+# Images drawn inline in the TUI (ADR-028 F-11): kitty, iTerm2, sixel or half-blocks, through
+# ratatui's own buffer. 5.0, the last release on ratatui 0.29 and image 0.25.
+ratatui-image = { version = "5.0", default-features = false, features = ["crossterm"] }
 clap = { version = "4", features = ["derive", "cargo", "env", "wrap_help"] }
 clap_complete = "4"
 clap_mangen = "0.2"

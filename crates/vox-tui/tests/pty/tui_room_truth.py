@@ -79,7 +79,12 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             ". <fingerprint>";
             in 16 colours (TERM=xterm) every colour drawn is one of the 16 and the trust glyphs,
             weights and words are as in truecolour; in 256 colours (TERM=xterm-256color) Alice's
-            name is index 255 and Carol's 247. In each the accent is on the focused border alone.
+            name is index 255 and Carol's 247. In each the accent is on the focused border alone;
+  inline    in a TUI run as kitty: an image bob's node pulled and verified, whose copy this driver
+            then overwrites on bob's disk, and one alice shares to carol (not pulled by bob's node)
+            are each named "image <name> <w>×<h> — drawn once it is pulled and verified", and no
+            kitty graphics are written; one she shares to the room is drawn as kitty graphics once
+            bob's node has pulled and verified it (ADR-028 F-11, #502).
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
@@ -874,6 +879,77 @@ try:
         if not tui.stop():
             apparatus(f"`vox tui` ({name}, pid {tui.pid}) could not be stopped")
     claim("depths", all(depths.values()), f"{depths!r}")
+
+    stage("inline")
+    # Images drawn inline, only once verified (ADR-028 F-11, #502). The anchor comes back on its
+    # port, and alice's daemon with it; bob's TUI runs as kitty would, on the room list.
+    # - ours.png, to the room: bob's node pulls and verifies it while the room is off screen; then
+    #   this driver, as an attacker on bob's disk, overwrites the pulled copy. Opened, the room
+    #   must name it unverified and draw nothing: what is on disk is not what was announced.
+    # - carols.png, addressed to carol: bob's node does not pull it; named, never drawn.
+    # - theirs.png, to the room, shared with the room open: drawn once pulled and verified.
+    def png(path, w, h, salt=0):
+        import struct, zlib
+        raw = b"".join(b"\x00" + bytes(v for x in range(w) for v in (x * 255 // w, y * 255 // h, (x ^ y ^ salt) & 255))
+                       for y in range(h))
+        chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+        open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                               + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    port = spec.rsplit("/", 1)[1]
+    anchor = spawn("anchor", "node", "--listen", f"127.0.0.1:{port}", out="anchor-again")
+    daemons["alice"] = spawn("alice", "daemon", "--listen", "127.0.0.1:0", "--anchor", spec,
+                             "--passphrase-file", f"{S}/idpass", out="alice-inline")
+    if not until(lambda: run("alice", "room", "list").returncode == 0, 60):
+        product("alice's daemon, started for the images, never answered `vox room list` within 60 s: "
+                + open(f"{S}/alice-inline.err").read())
+    tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0", "--anchor", spec],
+              tui_env(TERM="xterm-kitty", COLORTERM="truecolor"))
+    tui.pump(4)
+    tui.key("id pass\r", 4)
+    tui.key("\r", 2)
+    tui.key("room pass\r", 4)
+    tui.key("\r", 2)
+    tui.key("\x1b", 2)  # Esc: the room list, the room off screen
+    KITTY = b"\x1b_G"
+    # The pane's rows run together, as the TUI wrapped one line over them.
+    flat = lambda: "".join(r.strip() for r in pane(tui.display(), "Timeline"))
+    for name, w, h, salt in (("ours", 120, 80, 0), ("carols", 96, 64, 1), ("theirs", 88, 56, 2), ("forged", 120, 80, 3)):
+        png(f"{S}/{name}.png", w, h, salt)
+    p = run("alice", "share", room, f"{S}/ours.png")
+    if p.returncode != 0: product(f"alice's `vox share` of ours.png failed: {p.stderr.strip()}")
+    pulls = f"{S}/bob/data/nodes/default/pulls"
+    def pulled(name):
+        import glob
+        for f in glob.glob(f"{pulls}/*.json"):
+            try:
+                path = json.load(open(f))["path"]
+            except (OSError, ValueError, KeyError):
+                continue
+            if path.endswith(name) and os.path.exists(path):
+                return path
+        return None
+    if not until(lambda: pulled("ours.png"), 90, 1):
+        product("bob's node never pulled ours.png within 90 s (no pull record names it): "
+                + repr(os.listdir(pulls) if os.path.isdir(pulls) else "no pulls directory"))
+    os.replace(f"{S}/forged.png", pulled("ours.png"))  # the attacker's bytes, in place
+    p = run("alice", "share", room, f"{S}/carols.png", "--to", fp["carol"])
+    if p.returncode != 0: product(f"alice's `vox share` of carols.png failed: {p.stderr.strip()}")
+    tui.key("\r", 2)  # into the room
+    said = {n: f"image {n} {wh} — drawn once it is pulled and verified"
+            for n, wh in (("ours.png", "120×80"), ("carols.png", "96×64"))}
+    named = tui.until(lambda: all(v in flat() for v in said.values()), 60, 1)
+    tui.pump(5)  # time for a drawing, were the TUI to draw what is not verified
+    before = KITTY in bytes(tui.raw)
+    p = run("alice", "share", room, f"{S}/theirs.png")
+    if p.returncode != 0: product(f"alice's `vox share` of theirs.png failed: {p.stderr.strip()}")
+    # Read from the bytes the TUI wrote from here on: pyte does not draw kitty graphics, and
+    # prints their payload over its screen.
+    drew = tui.until(lambda: KITTY in bytes(tui.raw), 90, 1)
+    claim("inline", named and not before and drew,
+          f"named unverified (ours.png overwritten on bob's disk, carols.png not pulled here): {named}; "
+          f"kitty graphics written before theirs.png was shared: {before}; after, once bob's node "
+          f"had pulled and verified it: {drew}")
+    stop(daemons["alice"])
 
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} screen at the end:")

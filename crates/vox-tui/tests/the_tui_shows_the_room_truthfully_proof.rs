@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks twenty-six claims, each
+//! 160x50. It checks twenty-seven claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -73,7 +73,12 @@
 //!   `LC_ALL=C` it draws no colour at all, and Alice reads "<> alice" and Dave "-> dave", bold, and
 //!   Carol ". <her fingerprint>", every state still read by glyph, weight and word; in 16 colours (`TERM=xterm`)
 //!   every colour drawn is one of the 16; in 256 colours Alice's name is index 255 and Carol's 247.
-//!   In each the words are as in truecolour and the accent is on the focused border alone.
+//!   In each the words are as in truecolour and the accent is on the focused border alone;
+//! - `inline`: in a TUI run as kitty, an image Bob's node pulled whose copy the driver then
+//!   overwrites on his disk (an attacker's bytes), and one Alice shares to Carol, which his node
+//!   does not pull, are each named ("image carols.png 96×64 — drawn once it is pulled and
+//!   verified") and no kitty graphics are written; one she shares to the room is drawn as kitty
+//!   graphics once Bob's node has pulled and verified it (ADR-028 F-11, #502).
 //!
 //! The `target`, `delivers` and `revoke` claims are gone with `:consent grant|revoke` (V210-148): a
 //! key goes only to a member the owner trusts, so the TUI has no per-room grant to aim.
@@ -88,8 +93,8 @@
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`), a join line naming a
 //! trusted member that has not granted the newcomer (`newcomer`), a quote of the thread's root
-//! rather than `re`, or Enter on a reply not moving the selection. It passes only on the script's
-//! PASS with all 26 claims ok.
+//! rather than `re`, Enter on a reply not moving the selection, or an image drawn before this
+//! node's copy is verified (`inline`). It passes only on the script's PASS with all 27 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -179,7 +184,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (26 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (27 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -193,8 +198,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (26, 26),
-                "APPARATUS: the driver said PASS without all 26 claims ok: {said}"
+                (27, 27),
+                "APPARATUS: the driver said PASS without all 27 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
