@@ -22,7 +22,7 @@
 //! step of the staging (a join that was not refused); `APPARATUS:` the driver's own machinery.
 //!
 //! - **decision record** (ADR-028 §7, #506): alice's node records the foreground arm's refusal as
-//!   one event naming bob and why, in `nodes/default/decisions/<today>.jsonl` (0600, its directory
+//!   one event naming bob, why, and the room by its ID (never its name), in `nodes/default/decisions/<today>.jsonl` (0600, its directory
 //!   0700); neither the passphrase bob offered nor a message alice posted is in it; and of two
 //!   earlier days planted before her daemon starts, the one 14 days old is removed and the one 13
 //!   days old kept.
@@ -30,7 +30,8 @@
 //! **Mutations that must turn it red:** the daemon's per-node reporter no longer saying a
 //! `JoinFailed` (`tunnel_cli::say_if_it_explains_a_failure`) — the foreground and auto-started arms
 //! red; the TUI ignoring `JoinFailed` (`DaemonCore::on_node_event`) — the TUI arm red; a node
-//! that records a message's text in its decision record when it posts one — the record arm red.
+//! that records a message's text in its decision record when it posts one — the record arm red;
+//! a join refusal recorded with no room — the record arm red.
 
 #![cfg(unix)]
 
@@ -305,6 +306,22 @@ fn a_refused_join_is_seen_by_the_host() {
             "PRODUCT: alice's decision record must hold one refused join naming bob ({}) and why; \
              it holds {refusals}: {events:?}",
             bob.fp
+        ));
+    }
+    // The room it concerns, by its ID and nothing else of it (ADR-028 D-1, D-2): M-18's room
+    // filter reads it.
+    let refusal = events
+        .iter()
+        .find(|e| decision_record::is(e, "to join a room", "refused", &bob.fp));
+    // `vox room list` shows the ID's first characters; the event holds it whole.
+    let named = refusal.and_then(|e| e["room"].as_str()).unwrap_or_default();
+    if named.len() != vox_core::node::link::B32_DIGEST_LEN
+        || !named.starts_with(room_id.as_str())
+        || refusal.is_some_and(|e| e.to_string().contains("\"home\""))
+    {
+        red.push(format!(
+            "PRODUCT: the refused join's event must name the room by its whole ID ({room_id}…), \
+             and not by its name \"home\": {refusal:?}"
         ));
     }
     let files = decision_record::files(&alice.dir, "default");

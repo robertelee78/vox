@@ -681,6 +681,7 @@ impl NodeNet {
                         alias: None,
                         decided: crate::node::decisions::Decided::Refused,
                         why,
+                        room: None,
                     },
                 );
             }
@@ -947,6 +948,7 @@ impl NodeNet {
                             alias: None,
                             decided: crate::node::decisions::Decided::Refused,
                             why: why.to_owned(),
+                            room: None,
                         },
                     );
                 }
