@@ -257,7 +257,11 @@ private struct RoomView: View {
             AttachSheet(model: model, file: file) { attaching = nil }
         }
         .onChange(of: model.attachAsked) { _ in
-            if let url = chooseFile() { attaching = Attaching(url: url) }
+            // After the update, not inside it: a modal panel run from within a view update did
+            // not open (⌘O in the lanes view, seen in the QE pass).
+            DispatchQueue.main.async {
+                if let url = chooseFile() { attaching = Attaching(url: url) }
+            }
         }
         .onChange(of: model.urgentAsked) { _ in send(urgent: true) }
         .onChange(of: model.incoming) { url in
