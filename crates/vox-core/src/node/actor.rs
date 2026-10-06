@@ -14144,6 +14144,10 @@ impl Node {
             .unwrap_or_default();
         let mut report = StatusReport {
             now,
+            refusals: self.decisions.recent(
+                crate::node::decisions::REFUSALS_SHOWN,
+                Some(crate::node::decisions::Decided::Refused),
+            ),
             keyring_open_secs: keyring_left(
                 self.passphrase_entered_at
                     .load(std::sync::atomic::Ordering::Relaxed),

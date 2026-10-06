@@ -133,11 +133,14 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
         .split(area);
 
     // The window's regions (ADR-028 W-1, #511): the sidebar beside the room, its timeline and its
-    // inspector; the tunnels view and the keyring view (#472) have the window to themselves.
+    // inspector; the tunnels view, the keyring view (#472) and the decision record (ADR-028 D-3)
+    // have the window to themselves.
     if ui.screen == Screen::Tunnels {
         render_tunnels(frame, chunks[0], vm, ui);
     } else if ui.screen == Screen::Keyring {
         render_keyring(frame, chunks[0], vm);
+    } else if ui.screen == Screen::Decisions {
+        render_decisions(frame, chunks[0], vm);
     } else {
         let regions = Layout::default()
             .direction(Direction::Horizontal)
@@ -343,6 +346,53 @@ fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         Block::default()
             .borders(Borders::ALL)
             .title("Tunnels (x: close the selected one · Esc: back)"),
+    );
+    frame.render_widget(list, area);
+}
+
+/// What this node decided, newest first, one line each (ADR-028 D-3): when, what, about whom (this
+/// node's name for them, else their fingerprint's start), what was asked and why.
+fn render_decisions(frame: &mut Frame, area: Rect, vm: &ViewModel) {
+    let now_ms = vox_core::transport::quic::unix_now().saturating_mul(1_000);
+    let ago = |at_ms: u64| {
+        let s = now_ms.saturating_sub(at_ms) / 1_000;
+        if s < 120 {
+            format!("{s}s")
+        } else if s < 7_200 {
+            format!("{}m", s / 60)
+        } else if s < 172_800 {
+            format!("{}h", s / 3_600)
+        } else {
+            format!("{}d", s / 86_400)
+        }
+    };
+    let mut items: Vec<ListItem> = vm
+        .decisions
+        .iter()
+        .map(|e| {
+            let short: String = e.by.chars().take(12).collect();
+            let who = e
+                .alias
+                .as_ref()
+                .map_or_else(|| short.clone(), |a| format!("{a} ({short})"));
+            ListItem::new(format!(
+                "  {:>4} ago  {} {who}: {} — {}",
+                ago(e.at_ms),
+                e.decided,
+                e.asked,
+                e.why
+            ))
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(
+            "  this node has decided nothing in the last 14 days",
+        ));
+    }
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Decisions (newest first · kept 14 days · Esc: back)"),
     );
     frame.render_widget(list, area);
 }
@@ -832,13 +882,14 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
     }
     match ui.screen {
         Screen::ChannelList => {
-            " ↑/↓ select · Enter open · t tunnels · k keyring · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
+            " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :node <name> · :attach · Ctrl-C quit"
         }
         Screen::Channel => {
             " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :link · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Keyring => " : command · Esc back",
+        Screen::Decisions => " what this node decided, newest first · : command · Esc back",
     }
     .to_owned()
 }

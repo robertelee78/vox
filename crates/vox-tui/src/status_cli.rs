@@ -89,6 +89,25 @@ fn render(v: &Value) -> String {
             let _ = writeln!(o, "  ! {}", s(u, "message"));
         }
     }
+    // What this node refused most recently, from its decision record (ADR-028 D-3).
+    let refusals = arr("refusals");
+    if !refusals.is_empty() {
+        let _ = writeln!(o, "\nrecent refusals");
+        for e in refusals {
+            let who = match e.get("alias").and_then(Value::as_str) {
+                Some(alias) => format!("{alias} ({})", short(s(e, "by"))),
+                None => short(s(e, "by")),
+            };
+            let at = e.get("at_ms").and_then(Value::as_u64).map(|ms| ms / 1_000);
+            let _ = writeln!(
+                o,
+                "  {}  refused {who} {}: {}",
+                ago(now, &at.map_or(Value::Null, Value::from)),
+                s(e, "asked"),
+                s(e, "why")
+            );
+        }
+    }
     let _ = writeln!(o, "\nrooms");
     for r in arr("rooms") {
         let _ = writeln!(

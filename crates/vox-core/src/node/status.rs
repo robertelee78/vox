@@ -235,6 +235,8 @@ impl GatewayFamily {
 pub struct StatusReport {
     /// When this was taken, seconds since the epoch.
     pub now: u64,
+    /// The node's most recent refusals, newest first, from its decision record (ADR-028 D-3).
+    pub refusals: Vec<crate::node::decisions::Event>,
     /// How many seconds a keyring change still goes without the identity passphrase, or `None`
     /// when the next one will ask for it (ADR-028 K-9).
     pub keyring_open_secs: Option<u64>,
@@ -447,6 +449,17 @@ impl StatusReport {
             )
         });
         let _ = write!(j, "\"rooms\":[{}],", list(rooms));
+        let refusals = self.refusals.iter().map(|e| {
+            serde_json::json!({
+                "at_ms": e.at_ms,
+                "asked": e.asked,
+                "by": e.by,
+                "alias": e.alias,
+                "why": e.why,
+            })
+            .to_string()
+        });
+        let _ = write!(j, "\"refusals\":[{}],", list(refusals));
         let peers = self.peers.iter().map(|p| {
             format!(
                 "{{\"id\":{},\"path\":{},\"relay\":{},\"rtt_ms\":{},\"tls_group\":{},\"datagrams\":{},\"overflow\":{{\"reports_sent\":{},\"reports_received\":{},\"credit_packets\":{},\"cuts_skipped\":{},\"cuts_undone\":{}}}}}",
