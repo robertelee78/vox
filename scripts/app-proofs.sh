@@ -70,6 +70,19 @@ else
         "run it with: scripts/app-proofs.sh LaunchProof" >&2
 fi
 
+# The stager (apparatus): Xcode signs the UI-test runner into the app sandbox, and whatever a test
+# starts inherits it, so a test's `vox daemon` could not write its scratch data root. The stager
+# runs, outside the sandbox, what the proofs stage, on loopback, for whoever holds its token.
+TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+python3 scripts/app-proof-stager.py "$SCRATCH/stager.port" "$TOKEN" &
+STAGER=$!
+trap 'kill "$STAGER" 2>/dev/null; wait "$STAGER" 2>/dev/null; rm -rf "$SCRATCH"' EXIT
+for _ in $(seq 1 100); do [ -s "$SCRATCH/stager.port" ] && break; sleep 0.1; done
+[ -s "$SCRATCH/stager.port" ] || {
+    echo "app-proofs: APPARATUS: the stager did not start" >&2
+    exit 2
+}
+
 only=()
 for class in "$@"; do
     only+=("-only-testing:VoxAppProofs/$class")
@@ -78,6 +91,8 @@ done
 # its failure message (PRODUCT: or APPARATUS:); a runner that never started is the machine's.
 status=0
 TEST_RUNNER_VOX_PROOF_APP="$APP" TEST_RUNNER_VOX_PROOF_SCRATCH="$SCRATCH" \
+    TEST_RUNNER_VOX_PROOF_STAGER_PORT="$(cat "$SCRATCH/stager.port")" \
+    TEST_RUNNER_VOX_PROOF_STAGER_TOKEN="$TOKEN" \
     xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release \
     -derivedDataPath "$DERIVED" ${only[@]+"${only[@]}"} test-without-building \
     2>&1 | tee "$SCRATCH/xcodebuild.log" || status=$?

@@ -71,11 +71,16 @@ struct Apparatus: Error, CustomStringConvertible {
 }
 
 final class FirstRunProof: XCTestCase {
-    private var daemon: Process?
+    private var daemon: Started?
+    /// Runs what the runner's sandbox forbids: every `vox`, the files, the echo services.
+    private var stager: Stager!
+
+    override func setUpWithError() throws {
+        stager = try Stager.fromEnvironment()
+    }
 
     override func tearDown() {
         daemon?.terminate()
-        daemon?.waitUntilExit()
         super.tearDown()
     }
 
@@ -150,9 +155,9 @@ final class FirstRunProof: XCTestCase {
         let roomPass = scratch.appendingPathComponent("room.pass").path
         let alicePass = scratch.appendingPathComponent("alice.pass").path
         let bobPass = scratch.appendingPathComponent("bob.pass").path
-        try "mission room\n".write(toFile: roomPass, atomically: true, encoding: .utf8)
-        try "alice identity\n".write(toFile: alicePass, atomically: true, encoding: .utf8)
-        try "bob identity\n".write(toFile: bobPass, atomically: true, encoding: .utf8)
+        try stager.write(Data("mission room\n".utf8), to: roomPass)
+        try stager.write(Data("alice identity\n".utf8), to: alicePass)
+        try stager.write(Data("bob identity\n".utf8), to: bobPass)
         try staged(vox, ["node", "create", "bob"], env: bobEnv)
         try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
@@ -350,7 +355,7 @@ final class FirstRunProof: XCTestCase {
         ui.descendants(matching: .any)["room-mission"].click()
         let file = scratch.appendingPathComponent("for-bob.bin")
         let bytes = Data((0..<150_000).map { UInt8(truncatingIfNeeded: $0 &* 31 % 253) })
-        try bytes.write(to: file)
+        try stager.write(bytes, to: file.path)
         let attachButton = ui.buttons["attach"]
         XCTAssertTrue(attachButton.waitForExistence(timeout: 10), "PRODUCT: the room offers no Attach")
         attachButton.click()
@@ -457,7 +462,7 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(landed.waitForExistence(timeout: 15),
                       "PRODUCT: ⌘J from room aaa must open mission, the room that needs alice; its message NEEDS-YOU-9 is not on screen")
         // ⌘⇧C: a service bob shares, selected, copies its address.
-        let echo = try EchoServer()
+        let echo = try EchoServer(stager)
         try staged(vox, ["service", "add", "--node", "bob", room, "web", "127.0.0.1:\(echo.port)"],
                    env: voxEnv)
         var cliAddress = ""
@@ -496,8 +501,8 @@ final class FirstRunProof: XCTestCase {
         // (10) A refused join, newest in the decision record.
         let carolPass = scratch.appendingPathComponent("carol.pass").path
         let wrongPass = scratch.appendingPathComponent("wrong.pass").path
-        try "carol identity\n".write(toFile: carolPass, atomically: true, encoding: .utf8)
-        try "not the room passphrase\n".write(toFile: wrongPass, atomically: true, encoding: .utf8)
+        try stager.write(Data("carol identity\n".utf8), to: carolPass)
+        try stager.write(Data("not the room passphrase\n".utf8), to: wrongPass)
         try staged(vox, ["node", "attach", "carol", "--passphrase-file", carolPass], env: voxEnv)
         let missionLink = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
             $0.hasPrefix("vox://")
@@ -519,7 +524,7 @@ final class FirstRunProof: XCTestCase {
         print("[proof] decision record top: \(top.label)")
 
         // (11) Untrust cuts a live forward into alice's service.
-        let aliceEcho = try EchoServer()
+        let aliceEcho = try EchoServer(stager)
         try staged(vox, ["service", "add", "--node", "alice", room, "notes",
                          "127.0.0.1:\(aliceEcho.port)"], env: voxEnv)
         var bobsAddress = ""
@@ -617,69 +622,31 @@ final class FirstRunProof: XCTestCase {
         list.split(separator: "\n").map(String.init).first { $0.hasPrefix(node + " ") }
     }
 
-    /// Run `vox` to its end; its exit status and what it printed.
+    /// Run `vox` to its end, by the stager (outside the runner's sandbox); its exit status and
+    /// what it printed, stdout and stderr.
     private func run(_ vox: String, _ args: [String], env: [String: String],
                      input: String? = nil) -> (status: Int32, out: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: vox)
-        p.arguments = args
-        p.environment = env
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = out
-        let stdin = Pipe()
-        p.standardInput = input == nil ? FileHandle.nullDevice : stdin
-        do { try p.run() } catch {
-            return (-1, "APPARATUS: could not start \(vox): \(error)")
-        }
-        if let input {
-            stdin.fileHandleForWriting.write(Data(input.utf8))
-            try? stdin.fileHandleForWriting.close()
-        }
-        let bytes = out.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return (p.terminationStatus, String(decoding: bytes, as: UTF8.self))
+        stager.run([vox] + args, env: env, input: input)
     }
 
-    /// Start `vox` and wait until it prints a line starting with `until`.
     /// The line `start` waited for, as `vox` printed it.
     private var startedLine = ""
 
-    /// Start `vox` and wait until it prints a line starting with `until`; that line is kept in
-    /// `startedLine`. A `vox` that never says it is the apparatus's red, unless `product` (it is
-    /// the product's to say, as `vox forward` saying where it forwards).
+    /// Start `vox`, by the stager, and wait until it prints a line starting with `until`; that
+    /// line is kept in `startedLine`. A `vox` that never says it is the apparatus's red, unless
+    /// `product` (it is the product's to say, as `vox forward` saying where it forwards); either
+    /// way the red quotes what it did say, stderr included.
     private func start(_ vox: String, _ args: [String], env: [String: String], until: String,
-                       product: Bool = false) throws -> Process {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: vox)
-        p.arguments = args
-        p.environment = env
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        p.standardInput = FileHandle.nullDevice
-        try p.run()
-        let seen = expectation(description: until)
-        let lock = NSLock()
-        var buffer = ""
-        var met = false
-        out.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = String(decoding: handle.availableData, as: UTF8.self)
-            lock.lock()
-            defer { lock.unlock() }
-            buffer += chunk
-            if !met, let hit = buffer.split(separator: "\n").first(where: { $0.hasPrefix(until) }) {
-                met = true
-                self.startedLine = String(hit)
-                seen.fulfill()
-            }
-        }
-        if XCTWaiter.wait(for: [seen], timeout: 30) != .completed {
-            p.terminate()
-            let why = "`vox \(args.joined(separator: " "))` never said \(until.debugDescription) in 30 s; it said: \(buffer)"
+                       product: Bool = false) throws -> Started {
+        let got = try stager.start([vox] + args, env: env, until: until)
+        let started = Started(stager: stager, id: got.id)
+        guard let line = got.line else {
+            started.terminate()
+            let why = "`vox \(args.joined(separator: " "))` never said \(until.debugDescription) in 30 s; it said: \(got.out)"
             if product { throw Product(why) }
             throw Apparatus(why)
         }
-        return p
+        startedLine = line
+        return started
     }
 }

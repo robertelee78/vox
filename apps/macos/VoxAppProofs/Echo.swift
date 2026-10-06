@@ -1,42 +1,13 @@
-// Apparatus for the app proofs: a TCP echo server on loopback, standing in for a service a member
-// shares, and a client that sends a line and reads it back through a forward.
+// Apparatus for the app proofs: an echo service on loopback (the stager's), standing in for a
+// service a member shares, and a client that sends a line and reads it back through a forward.
 
 import Foundation
 import Network
 
-/// Echoes every byte back, on 127.0.0.1 at a port the system picks.
-final class EchoServer {
-    private let listener: NWListener
+/// Echoes every byte back, on 127.0.0.1: run by the stager, since this runner may not listen.
+struct EchoServer {
     let port: UInt16
-
-    init() throws {
-        let params = NWParameters.tcp
-        params.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
-        listener = try NWListener(using: params)
-        let ready = DispatchSemaphore(value: 0)
-        listener.stateUpdateHandler = { state in
-            if case .ready = state { ready.signal() }
-        }
-        listener.newConnectionHandler = { conn in
-            conn.start(queue: .global())
-            func pump() {
-                conn.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, done, error in
-                    if let data, !data.isEmpty {
-                        conn.send(content: data, completion: .contentProcessed { _ in })
-                    }
-                    if done || error != nil { conn.cancel() } else { pump() }
-                }
-            }
-            pump()
-        }
-        listener.start(queue: .global())
-        guard ready.wait(timeout: .now() + 10) == .success, let port = listener.port?.rawValue else {
-            throw Apparatus("the echo server did not start listening")
-        }
-        self.port = port
-    }
-
-    deinit { listener.cancel() }
+    init(_ stager: Stager) throws { port = try stager.echo() }
 }
 
 /// A TCP connection to `host:port` as a person's program makes one: send, read back, notice a cut.
