@@ -598,12 +598,15 @@ pub(crate) fn words(text: &str) -> String {
     };
     if e.kind == crate::room_cli::FILE {
         if let (Some(name), Some(size)) = (e.data["name"].as_str(), e.data["size"].as_u64()) {
+            // A folder says how many files it lists (ADR-028 F-8).
+            let what = match e.data["files"].as_u64() {
+                Some(files) => format!("folder offered: {name}/ ({files} files, {size} bytes)"),
+                None => format!("file offered: {name} ({size} bytes)"),
+            };
             // The note travels in the share itself (ADR-028 F-1), and is read with it.
             return match e.data["note"].as_str().map(str::trim) {
-                Some(note) if !note.is_empty() => {
-                    format!("file offered: {name} ({size} bytes): {note}")
-                }
-                _ => format!("file offered: {name} ({size} bytes)"),
+                Some(note) if !note.is_empty() => format!("{what}: {note}"),
+                _ => what,
             };
         }
     }
@@ -613,11 +616,21 @@ pub(crate) fn words(text: &str) -> String {
         (false, None) => format!("{}: ", e.kind),
         (false, Some(w)) => format!("{} {w}: ", e.kind),
     };
-    if e.body.trim().is_empty() {
+    let said = if e.body.trim().is_empty() {
         format!("{head}({} message, no text)", e.kind)
     } else {
         format!("{head}{}", e.body)
-    }
+    };
+    // **A link card is read with its message** (ADR-028 F-10): what the sender's node found at
+    // the link, carried in the message, so no reader fetches anything.
+    let card = &e.data["card"];
+    let line = match (card["title"].as_str(), card["description"].as_str()) {
+        (Some(t), Some(d)) => format!("{t} \u{2014} {d}"),
+        (Some(t), None) => t.to_owned(),
+        (None, Some(d)) => d.to_owned(),
+        (None, None) => return said,
+    };
+    format!("{said}\n\u{21b3} link: {line}")
 }
 
 /// [`render_row`]'s rule for any text: `[<entry> from <author> <to>] <first line>`, every

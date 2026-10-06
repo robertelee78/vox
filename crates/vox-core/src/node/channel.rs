@@ -680,6 +680,10 @@ pub const CHECKPOINT_EVERY: usize = 32;
 /// R-6): more than a screen holds, and a bound on what every snapshot of the node carries.
 pub const READ_BY_SHOWN: usize = 128;
 
+/// How far back from a room's newest row its unread are looked for ([`ChannelState::unread`]):
+/// a bound on what every view of the node walks, far more than a person reads at once.
+pub const UNREAD_LOOKED: usize = 1_000;
+
 /// How many owed bodies (V030-10) one sync session asks a peer for at most. The rest are asked of
 /// the next session: a peer that stripped a long run is not asked for all of it at once.
 pub const MAX_OWED_ASKED: usize = 256;
@@ -6061,6 +6065,26 @@ impl ChannelState {
                 Some((r.entry_hash, n as u64))
             })
             .collect();
+        out.reverse();
+        out
+    }
+
+    /// What this node's person has not read here (ADR-028 R-8 at launch): the rows after the newest
+    /// one this node recorded as read, oldest first — rendered, not owed, written by someone else,
+    /// and named by no read record of this node's. A room this node never recorded anything read
+    /// in counts from its first row. At most [`UNREAD_LOOKED`] rows from the newest are looked at.
+    #[must_use]
+    pub fn unread(&self) -> Vec<Digest32> {
+        let me = self.me();
+        let mut out: Vec<Digest32> = Vec::new();
+        for r in self.timeline.iter().rev().take(UNREAD_LOOKED) {
+            if self.read_by(&r.entry_hash).contains(&me) {
+                break;
+            }
+            if r.author != me && !r.owed {
+                out.push(r.entry_hash);
+            }
+        }
         out.reverse();
         out
     }

@@ -322,6 +322,9 @@ const T_COUNT: u64 = 1200;
 const T_LANES_REQ: u64 = 512;
 /// [`Frame::Lanes`] (#512).
 const T_LANES: u64 = 1512;
+// What this node's person has not read in a room, for a client starting (ADR-028 R-8): answered
+// with [`Frame::Rows`]. Numbered by the unread levels' item (#484), far from the others.
+const T_UNREAD_REQ: u64 = 2484;
 // The services a room offers (V030-24): `vox service list` with a daemon running. `add` and
 // `remove` reached the daemon (V030-06) while `list` still opened the profile, which the daemon
 // holds, so a service just added could not be listed. Not a protocol bump: additive, and a node
@@ -378,6 +381,9 @@ pub enum Request {
         channel_id: Digest32,
         /// The message text (an agent-comms envelope is JSON in here).
         text: String,
+        /// Whether the node fetches a link card for its first URL (ADR-028 F-10): `vox room post
+        /// --no-card` says not to.
+        card: bool,
     },
     /// Read a room's rendered timeline, optionally only what follows a cursor.
     Read {
@@ -653,6 +659,13 @@ pub enum Request {
         /// The room.
         channel_id: Digest32,
     },
+    /// What this node's person has not read in a room, oldest first, as [`Frame::Rows`]: the rows
+    /// after the newest one this node recorded as read, by someone else (ADR-028 R-8). A client
+    /// counts its unread from these when it starts, then from the node's events.
+    Unread {
+        /// The room.
+        channel_id: Digest32,
+    },
     /// The rows of a room with these entry hashes, those it holds, as [`Frame::Rows`] (V210-120).
     Find {
         /// The room.
@@ -716,6 +729,9 @@ impl Request {
             Request::Lanes { channel_id } => {
                 e.array(2).uint(T_LANES_REQ).bytes(channel_id);
             }
+            Request::Unread { channel_id } => {
+                e.array(2).uint(T_UNREAD_REQ).bytes(channel_id);
+            }
             Request::Find {
                 channel_id,
                 entries,
@@ -728,8 +744,16 @@ impl Request {
                     e.bytes(h);
                 }
             }
-            Request::Post { channel_id, text } => {
-                e.array(3).uint(T_POST).bytes(channel_id).text(text);
+            Request::Post {
+                channel_id,
+                text,
+                card,
+            } => {
+                e.array(4)
+                    .uint(T_POST)
+                    .bytes(channel_id)
+                    .text(text)
+                    .uint(u64::from(*card));
             }
             Request::MarkRead {
                 channel_id,
@@ -992,15 +1016,20 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Ping)
             }
-            (T_POST, 3) => {
+            (T_POST, 4) => {
                 let channel_id = digest(&mut d)?;
                 let text = d
                     .text()
                     .map_err(|_| Error::MalformedIpc("ipc post text"))?
                     .to_owned();
+                let card = d.uint().map_err(|_| Error::MalformedIpc("ipc post card"))? != 0;
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
-                Ok(Request::Post { channel_id, text })
+                Ok(Request::Post {
+                    channel_id,
+                    text,
+                    card,
+                })
             }
             (T_READ, 5) => {
                 let channel_id = digest(&mut d)?;
@@ -1104,6 +1133,12 @@ impl Request {
                 d.finish()
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Lanes { channel_id })
+            }
+            (T_UNREAD_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Unread { channel_id })
             }
             (T_AGREE, 4) => {
                 let channel_id = digest(&mut d)?;
@@ -1696,13 +1731,14 @@ impl Frame {
             Frame::Shares { shares } => {
                 e.array(2).uint(T_SHARES).array(shares.len());
                 for r in shares {
-                    e.array(6)
+                    e.array(7)
                         .text(&r.tag)
                         .text(&r.name)
                         .uint(r.size)
                         .text(&r.sha256)
                         .text(&r.entry)
-                        .uint(r.fetched);
+                        .uint(r.fetched)
+                        .uint(r.files);
                 }
             }
         }
@@ -2266,7 +2302,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             for _ in 0..count {
                 if d.array()
                     .map_err(|_| Error::MalformedIpc("ipc share row"))?
-                    != 6
+                    != 7
                 {
                     return Err(Error::MalformedIpc("ipc share row arity"));
                 }
@@ -2280,6 +2316,9 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 let fetched = d
                     .uint()
                     .map_err(|_| Error::MalformedIpc("ipc share fetched"))?;
+                let files = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc share files"))?;
                 shares.push(crate::node::shares::ShareRow {
                     tag,
                     name,
@@ -2287,6 +2326,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     sha256,
                     entry,
                     fetched,
+                    files,
                 });
             }
             return Ok(Frame::Shares { shares });
@@ -3639,7 +3679,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 reason: other.to_string(),
             },
         },
-        Request::Post { channel_id, text } => {
+        Request::Post {
+            channel_id,
+            text,
+            card,
+        } => {
+            // **A link card is fetched here, by the sender's node, once** (ADR-028 F-10), and
+            // travels in the message: no reader's node ever contacts the linked site.
+            let text = if card {
+                crate::node::card::attach(&text).await
+            } else {
+                text
+            };
             // A room just joined is written to once its first sync with another member has ended
             // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
             // that rather than failing.
@@ -3870,6 +3921,32 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         }
         // Searched from the newest row back: what a client looks up (a reply's parent) is
         // usually recent.
+        // The rows the view says are unread here, as the timeline holds them (ADR-028 R-8).
+        Request::Unread { channel_id } => {
+            let view = handle.view();
+            let Some(detail) = view
+                .open_channels
+                .iter()
+                .find(|d| d.channel_id == channel_id)
+            else {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            };
+            let mut want: std::collections::BTreeSet<Digest32> =
+                detail.unread.iter().copied().collect();
+            let mut rows: Vec<MessageRow> = Vec::new();
+            for r in detail.timeline.iter().rev() {
+                if want.is_empty() {
+                    break;
+                }
+                if want.remove(&r.entry_hash) {
+                    rows.push(r.clone());
+                }
+            }
+            rows.reverse();
+            Frame::Rows { rows }
+        }
         Request::Find {
             channel_id,
             entries,

@@ -18,9 +18,9 @@
 //! service.
 
 use std::collections::BTreeMap;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +78,8 @@ pub struct ShareRow {
     pub entry: String,
     /// Completed fetches since this node started serving it.
     pub fetched: u64,
+    /// For a folder, how many files it lists (ADR-028 F-8); `0` for a file.
+    pub files: u64,
 }
 
 /// What a share's record keeps, so a restarted node serves it again.
@@ -88,10 +90,10 @@ struct Record {
     name: String,
     size: u64,
     sha256: String,
-    /// The file served: the shared file itself, or the folder's archive in the shares directory.
+    /// What is served: the shared file, or the shared folder, from where it is.
     served: PathBuf,
-    /// Whether `served` is this node's own archive, removed with the share.
-    staged: bool,
+    /// A folder's files as they were listed (ADR-028 F-8); empty for a file.
+    files: Vec<crate::node::folder::Found>,
     entry: String,
     /// When the announcement was made, seconds: the message's age runs from here.
     created: u64,
@@ -108,7 +110,16 @@ impl Record {
             "size": self.size,
             "sha256": self.sha256,
             "served": self.served.to_string_lossy(),
-            "staged": self.staged,
+            "files": self
+                .files
+                .iter()
+                .map(|f| serde_json::json!([
+                    f.listed.path,
+                    f.listed.size,
+                    f.listed.sha256,
+                    f.modified.to_string()
+                ]))
+                .collect::<Vec<_>>(),
             "entry": self.entry,
             "created": self.created,
             "count": self.count,
@@ -130,7 +141,25 @@ impl Record {
             size: n("size")?,
             sha256: s("sha256")?,
             served: PathBuf::from(s("served")?),
-            staged: v.get("staged").and_then(serde_json::Value::as_bool)?,
+            files: v
+                .get("files")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|e| {
+                            let e = e.as_array()?;
+                            Some(crate::node::folder::Found {
+                                listed: crate::node::folder::Listed {
+                                    path: e.first()?.as_str()?.to_owned(),
+                                    size: e.get(1)?.as_u64()?,
+                                    sha256: e.get(2)?.as_str()?.to_owned(),
+                                },
+                                modified: e.get(3)?.as_str()?.parse().ok()?,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             entry: s("entry")?,
             created: n("created")?,
             count: n("count")?,
@@ -146,6 +175,7 @@ impl Record {
             sha256: self.sha256.clone(),
             entry: self.entry.clone(),
             fetched,
+            files: self.files.len() as u64,
         }
     }
 }
@@ -379,6 +409,8 @@ impl Shares {
             tag: tag.to_owned(),
             room,
             owner: self.view.borrow().identity.as_ref().map(|i| i.fingerprint),
+            events: self.events.clone(),
+            said: Arc::default(),
         }
     }
 
@@ -412,37 +444,32 @@ impl Shares {
             .map_or_else(|| "share".to_owned(), |n| n.to_string_lossy().into_owned());
         let mut nonce = [0u8; 8];
         getrandom::fill(&mut nonce).map_err(|e| format!("no randomness for the share: {e}"))?;
-        // A folder becomes one archive in this node's shares directory, which lives as long as
-        // the share does.
-        let (served, name, staged) = if meta.is_dir() {
-            let dir = self.paths.shares_dir();
-            crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
-            (
-                dir.join(format!("{}.tar", hex(&nonce))),
-                format!("{base}.tar"),
-                true,
-            )
-        } else {
-            (req.path.clone(), base, false)
-        };
-        let (source, target) = (req.path.clone(), served.clone());
+        // **A folder is listed, not packed** (ADR-028 F-8): every file by its path, size and
+        // SHA-256, served from where it is; the share's SHA-256 is its list's.
+        let folder = meta.is_dir();
+        let root = req.path.clone();
+        // An image's preview is made as it is hashed (ADR-028 F-9): a folder has none.
         let hashed = tokio::task::spawn_blocking(move || {
-            if staged {
-                tar_dir(&source, &target)?;
+            if folder {
+                crate::node::folder::walk(&root).map(|found| {
+                    let list: Vec<_> = found.iter().map(|f| f.listed.clone()).collect();
+                    (
+                        crate::node::folder::list_sha256(&list),
+                        list.iter().map(|f| f.size).sum(),
+                        found,
+                        None,
+                    )
+                })
+            } else {
+                crate::node::folder::digest(&root).map(|(sha, size)| {
+                    (sha, size, Vec::new(), crate::node::preview::of_file(&root))
+                })
             }
-            digest_file(&target)
         })
         .await
         .map_err(|e| format!("hashing the share: {e}"))?;
-        let (sha256, size) = match hashed {
-            Ok(h) => h,
-            Err(e) => {
-                if staged {
-                    let _ = std::fs::remove_file(&served);
-                }
-                return Err(e);
-            }
-        };
+        let (sha256, size, files, preview) = hashed?;
+        let (served, name) = (req.path.clone(), base);
         // The tag names the content and **this share**: two shares of the same file are two
         // services, and stopping one never withdraws the other (V210-72).
         let tag = format!("file-{}-{}", &sha256[..16], hex(&nonce));
@@ -452,10 +479,12 @@ impl Shares {
                 .and_then(serde_json::Value::as_str)
                 .is_none_or(str::is_empty);
             if body_empty {
-                obj.insert(
-                    "body".into(),
-                    format!("sharing {name} ({size} bytes)").into(),
-                );
+                let said = if folder {
+                    format!("sharing {name}/ ({} files, {size} bytes)", files.len())
+                } else {
+                    format!("sharing {name} ({size} bytes)")
+                };
+                obj.insert("body".into(), said.into());
             }
             let data = obj
                 .entry("data")
@@ -469,23 +498,40 @@ impl Shares {
                 d.insert("sha256".into(), sha256.clone().into());
                 d.insert("tag".into(), tag.clone().into());
                 d.insert("http".into(), true.into());
-                d.insert("kind".into(), if staged { "folder" } else { "file" }.into());
+                d.insert("kind".into(), if folder { "folder" } else { "file" }.into());
+                // The list itself is served (F-8); the message says how many files it holds, and
+                // the SHA-256 above pins it.
+                if folder {
+                    d.insert("files".into(), (files.len() as u64).into());
+                }
+                if let Some(p) = &preview {
+                    d.insert("image".into(), p.json());
+                }
             }
         }
         let text = envelope.to_string();
-
-        let fail = |e: String| {
-            if staged {
-                let _ = std::fs::remove_file(&served);
-            }
-            e
-        };
+        let fail = |e: String| e;
         let (stop, stopping) = watch::channel(false);
         let fetched = Arc::new(AtomicU64::new(0));
+        let what = if folder {
+            let by_path: BTreeMap<_, _> = files
+                .iter()
+                .map(|f| (f.listed.path.clone(), f.clone()))
+                .collect();
+            Served::Folder {
+                root: served.clone(),
+                list: list_bytes(&by_path),
+                files: by_path,
+            }
+        } else {
+            Served::File {
+                path: served.clone(),
+                name: name.clone(),
+                size,
+            }
+        };
         let (server, local) = serve(
-            served.clone(),
-            name.clone(),
-            size,
+            what,
             Arc::clone(&fetched),
             self.witness(&tag, req.channel_id),
             stopping,
@@ -564,7 +610,7 @@ impl Shares {
             size,
             sha256,
             served,
-            staged,
+            files,
             entry,
             created,
             count: req.count,
@@ -649,9 +695,6 @@ impl Shares {
             })
             .await;
         let _ = std::fs::remove_file(self.record_file(&a.record.tag));
-        if a.record.staged {
-            let _ = std::fs::remove_file(&a.record.served);
-        }
         drop(a);
     }
 
@@ -674,29 +717,48 @@ impl Shares {
                 let _ = std::fs::remove_file(&file);
                 continue;
             };
-            let served = record.served.clone();
-            let now = tokio::task::spawn_blocking(move || digest_file(&served))
-                .await
-                .ok()
-                .and_then(Result::ok);
-            if now.as_ref() != Some(&(record.sha256.clone(), record.size)) {
+            // A file by its bytes; a folder by every listed file's bytes, and its times, which its
+            // serving checks.
+            let (served, listed) = (record.served.clone(), record.files.clone());
+            let still = tokio::task::spawn_blocking(move || {
+                if listed.is_empty() {
+                    crate::node::folder::digest(&served).ok()
+                } else {
+                    listed
+                        .iter()
+                        .all(|f| {
+                            let file = served.join(&f.listed.path);
+                            std::fs::symlink_metadata(&file)
+                                .is_ok_and(|m| crate::node::folder::modified_ns(&m) == f.modified)
+                                && crate::node::folder::digest(&file).ok()
+                                    == Some((f.listed.sha256.clone(), f.listed.size))
+                        })
+                        .then(|| {
+                            (
+                                crate::node::folder::list_sha256(
+                                    &listed.iter().map(|f| f.listed.clone()).collect::<Vec<_>>(),
+                                ),
+                                listed.iter().map(|f| f.listed.size).sum(),
+                            )
+                        })
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+            if still.as_ref() != Some(&(record.sha256.clone(), record.size)) {
                 self.say(format!(
                     "no longer sharing {}: it changed or went since it was shared, and a share \
                      serves only the bytes it announced",
                     record.name
                 ));
                 let _ = std::fs::remove_file(&file);
-                if record.staged {
-                    let _ = std::fs::remove_file(&record.served);
-                }
                 continue;
             }
             let (stop, stopping) = watch::channel(false);
             let fetched = Arc::new(AtomicU64::new(0));
             let Ok((server, local)) = serve(
-                record.served.clone(),
-                record.name.clone(),
-                record.size,
+                Served::of(&record),
                 Arc::clone(&fetched),
                 self.witness(&record.tag, record.room),
                 stopping,
@@ -802,12 +864,30 @@ struct Witness {
     room: Digest32,
     /// This node, whose served tunnels say which member a connection is.
     owner: Option<Digest32>,
+    /// Where the node says things to its operator.
+    events: broadcast::Sender<NodeEvent>,
+    /// The listed files already said to have changed, said once each.
+    said: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl Witness {
     /// The member a connection from `from` came through a tunnel for.
     fn member(&self, from: Option<SocketAddr>) -> Option<Digest32> {
         crate::transport::quic::tunnel_peer_at(&self.owner?, from?)
+    }
+
+    /// A listed file changed since it was listed, and was refused: said to the sharer once.
+    fn changed(&self, path: &str) {
+        let first = self
+            .said
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path.to_owned());
+        if first {
+            let _ = self.events.send(NodeEvent::NodeNote {
+                note: format!("{path} changed since you shared it; share the folder again"),
+            });
+        }
     }
 
     fn pulled(&self, member: Digest32) {
@@ -818,10 +898,108 @@ impl Witness {
     }
 }
 
+/// What one share serves.
+enum Served {
+    /// A file: whatever the request names, the answer is the file.
+    File {
+        path: PathBuf,
+        name: String,
+        size: u64,
+    },
+    /// A folder: its list at [`crate::node::folder::LIST_TARGET`], and each listed file at its own
+    /// path, read from the folder (ADR-028 F-8).
+    Folder {
+        root: PathBuf,
+        files: BTreeMap<String, crate::node::folder::Found>,
+        /// The list, as it is served.
+        list: Arc<Vec<u8>>,
+    },
+}
+
+/// What a request is answered with.
+enum Body {
+    /// A file, read as it is sent.
+    File(PathBuf),
+    /// Bytes held here: a folder's list.
+    Bytes(Arc<Vec<u8>>),
+}
+
+/// A folder's list as it is served: the canonical `[[path, size, sha256], …]`.
+fn list_bytes(files: &BTreeMap<String, crate::node::folder::Found>) -> Arc<Vec<u8>> {
+    let list: Vec<_> = files.values().map(|f| f.listed.clone()).collect();
+    Arc::new(crate::node::folder::to_json(&list).to_string().into_bytes())
+}
+
+impl Served {
+    fn of(record: &Record) -> Self {
+        if record.files.is_empty() {
+            Self::File {
+                path: record.served.clone(),
+                name: record.name.clone(),
+                size: record.size,
+            }
+        } else {
+            let files: BTreeMap<_, _> = record
+                .files
+                .iter()
+                .map(|f| (f.listed.path.clone(), f.clone()))
+                .collect();
+            Self::Folder {
+                root: record.served.clone(),
+                list: list_bytes(&files),
+                files,
+            }
+        }
+    }
+
+    /// What a request for `target` is answered with: the body, its name and size; or why not.
+    fn resolve(&self, target: &str) -> Result<(Body, String, u64), Refused> {
+        match self {
+            Self::File { path, name, size } => Ok((Body::File(path.clone()), name.clone(), *size)),
+            Self::Folder { list, .. } if target == crate::node::folder::LIST_TARGET => Ok((
+                Body::Bytes(Arc::clone(list)),
+                "list.json".to_owned(),
+                list.len() as u64,
+            )),
+            Self::Folder { root, files, .. } => {
+                let path = crate::node::folder::from_url_path(target).ok_or(Refused::NotListed)?;
+                let f = files.get(&path).ok_or(Refused::NotListed)?;
+                let file = root.join(&path);
+                // **Announced content or nothing** (F-8): a file whose size or time moved since
+                // it was listed is not served under the announcement.
+                let same = std::fs::symlink_metadata(&file).is_ok_and(|m| {
+                    m.is_file()
+                        && m.len() == f.listed.size
+                        && crate::node::folder::modified_ns(&m) == f.modified
+                });
+                if !same {
+                    return Err(Refused::Changed(path));
+                }
+                let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                Ok((Body::File(file), name, f.listed.size))
+            }
+        }
+    }
+
+    /// How many files a member must fetch whole to have pulled it.
+    fn count(&self) -> usize {
+        match self {
+            Self::File { .. } => 1,
+            Self::Folder { files, .. } => files.len(),
+        }
+    }
+}
+
+/// Why a request was not answered with a file.
+enum Refused {
+    /// It names nothing the share lists.
+    NotListed,
+    /// It names a listed file that changed since it was listed.
+    Changed(String),
+}
+
 async fn serve(
-    file: PathBuf,
-    name: String,
-    size: u64,
+    what: Served,
     fetched: Arc<AtomicU64>,
     witness: Witness,
     stopping: watch::Receiver<bool>,
@@ -832,25 +1010,52 @@ async fn serve(
     let local = listener
         .local_addr()
         .map_err(|e| format!("cannot read the local address: {e}"))?;
+    let what = Arc::new(what);
+    // Which of a folder's files each member has fetched whole, since it last fetched them all.
+    let got: Arc<std::sync::Mutex<BTreeMap<Digest32, std::collections::BTreeSet<String>>>> =
+        Arc::default();
     let server = tokio::spawn(async move {
         while let Ok((sock, from)) = listener.accept().await {
-            let (file, name, fetched, witness, stopping) = (
-                file.clone(),
-                name.clone(),
+            let (what, fetched, witness, stopping, got) = (
+                Arc::clone(&what),
                 Arc::clone(&fetched),
                 witness.clone(),
                 stopping.clone(),
+                Arc::clone(&got),
             );
             tokio::spawn(async move {
                 // Which member this is, asked of the tunnel it came through once it has sent its
                 // request: by then the tunnel has said where its connection comes from.
-                let (whole, member) = serve_one(sock, &file, &name, size, stopping, || {
+                let (whole, member, path) = serve_one(sock, &what, stopping, &witness, || {
                     witness.member(Some(from))
                 })
                 .await;
-                if whole {
+                if !whole {
+                    return;
+                }
+                // **Pulled means the whole share reached it** (F-7): every listed file, each
+                // whole. A fetch cut short is not one.
+                let complete = match (&*what, member) {
+                    (Served::File { .. }, _) => true,
+                    (Served::Folder { .. }, None) => false,
+                    (Served::Folder { .. }, Some(m)) => {
+                        let mut got = got
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let set = got.entry(m).or_default();
+                        // The list is not a file of the folder.
+                        if !path.is_empty() {
+                            set.insert(path);
+                        }
+                        let all = set.len() >= what.count();
+                        if all {
+                            got.remove(&m);
+                        }
+                        all
+                    }
+                };
+                if complete {
                     fetched.fetch_add(1, Ordering::SeqCst);
-                    // **Pulled means the whole file reached it** (F-7): a fetch cut short is not.
                     if let Some(m) = member {
                         witness.pulled(m);
                     }
@@ -861,21 +1066,20 @@ async fn serve(
     Ok((server, local))
 }
 
-/// Answer one HTTP request with the file. Whatever the path, the answer is the share: there is
-/// one thing here. Returns whether the receiver took every byte, and who it is, as `identify` says
-/// once its request has arrived.
+/// Answer one HTTP request: with the file, for a file share; with the listed file it names, for
+/// a folder. Returns whether the receiver took every byte, who it is, as `identify` says once its
+/// request has arrived, and the path it asked for.
 async fn serve_one(
     mut sock: tokio::net::TcpStream,
-    file: &Path,
-    name: &str,
-    size: u64,
+    what: &Served,
     mut stopping: watch::Receiver<bool>,
+    witness: &Witness,
     identify: impl FnOnce() -> Option<Digest32>,
-) -> (bool, Option<Digest32>) {
+) -> (bool, Option<Digest32>, String) {
     let mut member = None;
+    let mut asked = String::new();
     let whole = async {
-        // Read the request head (bounded) so a client that sends one gets a well-formed
-        // exchange; the path is not interpreted.
+        // Read the request head (bounded).
         let mut head = Vec::new();
         let mut buf = [0u8; 1024];
         while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
@@ -886,6 +1090,33 @@ async fn serve_one(
         }
         member = identify();
         let is_head = head.starts_with(b"HEAD ");
+        let target = String::from_utf8_lossy(&head)
+            .lines()
+            .next()
+            .and_then(|l| l.split(' ').nth(1).map(str::to_owned))
+            .unwrap_or_default();
+        let (body, name, size) = match what.resolve(&target) {
+            Ok(found) => found,
+            Err(refused) => {
+                let status = match refused {
+                    Refused::NotListed => "404 Not Found",
+                    Refused::Changed(path) => {
+                        witness.changed(&path);
+                        "409 Conflict"
+                    }
+                };
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                return Some(false);
+            }
+        };
+        asked = crate::node::folder::from_url_path(&target).unwrap_or_default();
         let reply = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: \
              {size}\r\nContent-Disposition: attachment; filename=\"{}\"\r\nConnection: \
@@ -900,8 +1131,12 @@ async fn serve_one(
         }
         // `std::fs`: this workspace's tokio has no `fs` feature. The reads are chunked, so a large
         // file is not held in memory.
-        let Ok(mut f) = std::fs::File::open(file) else {
-            return None;
+        let mut f: Box<dyn std::io::Read + Send> = match body {
+            Body::File(file) => match std::fs::File::open(&file) {
+                Ok(f) => Box::new(f),
+                Err(_) => return None,
+            },
+            Body::Bytes(b) => Box::new(std::io::Cursor::new(b.to_vec())),
         };
         let mut buf = vec![0u8; 64 * 1024];
         let mut sent = 0u64;
@@ -939,119 +1174,11 @@ async fn serve_one(
         _ = stopping.wait_for(|stop| *stop) => None,
     };
     match ended {
-        Some(done) => (done, member),
+        Some(done) => (done, member, asked),
         // Any other ending is a reset: a clean close would say "that was all of it".
         None => {
             crate::tunnel::session::abort_after_drain(sock).await;
-            (false, member)
+            (false, member, asked)
         }
     }
-}
-
-/// Read a file and return its SHA-256 and length.
-fn digest_file(path: &Path) -> Result<(String, u64), String> {
-    use sha2::{Digest as _, Sha256};
-    let mut f =
-        std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total: u64 = 0;
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("reading {}: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        total += n as u64;
-    }
-    Ok((hex(&hasher.finalize()), total))
-}
-
-/// Write `dir` as a ustar archive at `out`: entries in sorted order, every timestamp, owner and
-/// mode fixed, so the same folder always makes the same bytes and the same hash.
-fn tar_dir(dir: &Path, out: &Path) -> Result<(), String> {
-    fn entries(
-        root: &Path,
-        dir: &Path,
-        acc: &mut Vec<(String, PathBuf, bool)>,
-    ) -> std::io::Result<()> {
-        let mut list: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
-        list.sort_by_key(std::fs::DirEntry::file_name);
-        for e in list {
-            let path = e.path();
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let ty = e.file_type()?;
-            if ty.is_dir() {
-                acc.push((format!("{rel}/"), path.clone(), true));
-                entries(root, &path, acc)?;
-            } else if ty.is_file() {
-                acc.push((rel, path, false));
-            }
-            // Symlinks and devices are not carried: a share is files.
-        }
-        Ok(())
-    }
-    let io = |e: std::io::Error| format!("archiving {}: {e}", dir.display());
-    let base = dir
-        .file_name()
-        .map_or_else(|| "share".to_owned(), |n| n.to_string_lossy().into_owned());
-    let mut list = vec![(format!("{base}/"), dir.to_owned(), true)];
-    let mut inner = Vec::new();
-    entries(dir, dir, &mut inner).map_err(io)?;
-    list.extend(
-        inner
-            .into_iter()
-            .map(|(rel, p, d)| (format!("{base}/{rel}"), p, d)),
-    );
-    let mut f = std::fs::File::create(out).map_err(io)?;
-    for (name, path, is_dir) in list {
-        let size = if is_dir {
-            0
-        } else {
-            std::fs::metadata(&path).map_err(io)?.len()
-        };
-        let mut h = [0u8; 512];
-        let (prefix, leaf) = if name.len() > 100 {
-            let cut = name[..name.len() - 1]
-                .rfind('/')
-                .filter(|i| *i <= 155 && name.len() - i - 1 <= 100)
-                .ok_or_else(|| format!("{name}: path too long to archive"))?;
-            (&name[..cut], &name[cut + 1..])
-        } else {
-            ("", name.as_str())
-        };
-        h[..leaf.len()].copy_from_slice(leaf.as_bytes());
-        let octal = |h: &mut [u8], at: usize, len: usize, v: u64| {
-            let s = format!("{v:0width$o}", width = len - 1);
-            h[at..at + len - 1].copy_from_slice(s.as_bytes());
-        };
-        octal(&mut h, 100, 8, if is_dir { 0o755 } else { 0o644 });
-        octal(&mut h, 108, 8, 0);
-        octal(&mut h, 116, 8, 0);
-        octal(&mut h, 124, 12, size);
-        octal(&mut h, 136, 12, 0);
-        h[148..156].copy_from_slice(b"        ");
-        h[156] = if is_dir { b'5' } else { b'0' };
-        h[257..263].copy_from_slice(b"ustar\0");
-        h[263..265].copy_from_slice(b"00");
-        h[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
-        let sum: u64 = h.iter().map(|b| u64::from(*b)).sum();
-        let s = format!("{sum:06o}\0 ");
-        h[148..156].copy_from_slice(s.as_bytes());
-        f.write_all(&h).map_err(io)?;
-        if !is_dir {
-            let mut src = std::fs::File::open(&path).map_err(io)?;
-            let copied = std::io::copy(&mut src, &mut f).map_err(io)?;
-            let pad = (512 - (copied % 512)) % 512;
-            f.write_all(&vec![0u8; pad as usize]).map_err(io)?;
-        }
-    }
-    f.write_all(&[0u8; 1024]).map_err(io)?;
-    f.flush().map_err(io)
 }

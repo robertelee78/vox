@@ -344,6 +344,12 @@ enum RoomCmd {
     /// With no text, or `-`, the message is read from stdin — which is the form to
     /// use for an agent-comms envelope, because JSON on a command line is where
     /// quoting goes wrong.
+    ///
+    /// A message carrying a link gets a link card: this node fetches the page of its first
+    /// http(s) link once, and its title, description and an image of at most 16 KB travel in the
+    /// message, so no reader's node contacts the site. That fetch tells the linked site this
+    /// machine's IP address. Only public addresses are fetched: a link to this machine or a
+    /// private network goes without a card. `--no-card` posts without one.
     Post(RoomPostArgs),
     /// Print a room's messages. The first column is the entry hash, which is the
     /// cursor: pass the last one back as `--since` to read only what is new.
@@ -641,7 +647,8 @@ pub struct ShareArgs {
     /// The room's id, or a unique prefix of it.
     #[arg(required = true)]
     pub room: Option<String>,
-    /// The file or folder to share. A folder is served as one tar.
+    /// The file or folder to share. A folder's announcement lists every file in it, and a
+    /// member pulling it again fetches only the files that changed.
     #[arg(required = true)]
     pub path: Option<PathBuf>,
     /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint
@@ -1071,6 +1078,9 @@ pub struct RoomPostArgs {
     /// Extra payload, as a JSON object. May not set `vox` or `op`.
     #[arg(long)]
     pub data: Option<String>,
+    /// Post without a link card: this node fetches nothing, and the linked site learns nothing.
+    #[arg(long)]
+    pub no_card: bool,
     #[command(flatten)]
     pub coord: CoordArgs,
 }
@@ -2062,6 +2072,7 @@ pub fn run() -> ExitCode {
                                 thread: a.thread.clone(),
                                 data: a.data.clone(),
                                 coord: a.coord.opts(),
+                                no_card: a.no_card,
                             };
                             crate::room_cli::post_cmd(&paths, &a.room, a.text.as_deref(), &opts)
                                 .await

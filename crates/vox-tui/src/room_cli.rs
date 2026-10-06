@@ -268,7 +268,12 @@ fn body_of(text: Option<&str>) -> Result<String, AppError> {
 
 /// Append raw text, exactly as given. The internal path for verbs that build their
 /// own envelope (a file offer), and what `vox room post` does with no structured flag.
-pub(crate) async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Result<(), AppError> {
+pub(crate) async fn post(
+    paths: &Paths,
+    room: &str,
+    text: Option<&str>,
+    card: bool,
+) -> Result<(), AppError> {
     let body = body_of(text)?;
     if body.trim().is_empty() {
         return Err(AppError::Usage("refusing to post an empty message".into()));
@@ -279,6 +284,7 @@ pub(crate) async fn post(paths: &Paths, room: &str, text: Option<&str>) -> Resul
         .request(&Request::Post {
             channel_id,
             text: body,
+            card,
         })
         .await
     {
@@ -311,6 +317,8 @@ pub struct PostOpts {
     pub data: Option<String>,
     /// Session, operation id, JSON output.
     pub coord: CoordOpts,
+    /// Post without fetching a link card for the first URL (ADR-028 F-10).
+    pub no_card: bool,
 }
 
 impl PostOpts {
@@ -448,7 +456,7 @@ pub async fn post_cmd(
                 }
             }
         }
-        return post(paths, room, Some(&body)).await;
+        return post(paths, room, Some(&body), !opts.no_card).await;
     }
 
     let kind = opts.kind.clone().unwrap_or_else(|| "say".into());
@@ -594,6 +602,8 @@ pub async fn post_cmd(
         hops: hops_of_reply,
         body: body.trim_end().to_owned(),
         data,
+        // A link card for the body's first URL, fetched by this node (ADR-028 F-10).
+        card: !opts.no_card,
     };
     let is_result = draft.kind == vox_agentcomms::envelope::work::RESULT;
     let posting = coord::post_once(&mut client, cid, &draft, &session, &op, &snap).await?;
@@ -2870,6 +2880,9 @@ struct Offer {
     /// Served over HTTP, as `vox share` serves; an announcement without it is answered with the
     /// raw bytes.
     http: bool,
+    /// How many files a folder lists (ADR-028 F-8); `None` for a file. Its list is fetched from
+    /// the sharer, and taken only if its SHA-256 is `sha256`.
+    files: Option<u64>,
 }
 
 /// `vox room get` — collect an offered file and verify it.
@@ -2946,6 +2959,16 @@ pub async fn get_file(
         if !matches || offers.iter().any(|o| o.author == r.author && o.tag == tag) {
             continue;
         }
+        // A folder says how many files its list holds (ADR-028 F-8); the list is fetched, and
+        // checked against the announced SHA-256, before any file is.
+        let files = match d.get("files") {
+            None => None,
+            Some(v) => Some(v.as_u64().ok_or_else(|| {
+                AppError::Usage(format!(
+                    "{name}'s announcement does not say how many files it holds"
+                ))
+            })?),
+        };
         let offer = Offer {
             entry: r.entry_hash,
             created: (r.created_millis / 1000).min(
@@ -2959,6 +2982,7 @@ pub async fn get_file(
             sha256,
             tag,
             http,
+            files,
         };
         match offers.first() {
             Some(newest) if newest.author != offer.author || newest.sha256 != offer.sha256 => {
@@ -3109,6 +3133,15 @@ async fn collect_offer(
     out: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
     let managed = out.is_none() && dir.is_none();
+    if let Some(count) = offer.files {
+        if out.is_some() {
+            return Err(AppError::Usage(format!(
+                "{} is a folder, and --out names one file: use --dir",
+                offer.name
+            )));
+        }
+        return collect_folder(client, paths, channel_id, offer, count, dir).await;
+    }
     let dest = match out {
         Some(exact) => {
             if exact.symlink_metadata().is_ok() {
@@ -3150,9 +3183,57 @@ async fn collect_offer(
         )));
     }
 
+    let (bound, mut events) = open_forward(client, paths, channel_id, offer).await?;
+    let result = collect(&bound, &dest, offer).await.and_then(|placed| {
+        // **A copy in the node's files directory ends with its message** (ADR-028 F-5): it is
+        // recorded so the daemon deletes it then. One the person put elsewhere is theirs.
+        if managed {
+            vox_core::node::pulls::record(
+                paths,
+                &vox_core::node::pulls::Pulled {
+                    room: channel_id,
+                    entry: offer.entry,
+                    path: placed,
+                    created: offer.created,
+                    folder: None,
+                    files: Vec::new(),
+                },
+            )
+            .map_err(|e| {
+                AppError::Usage(format!("the file landed, but cannot be recorded: {e}"))
+            })?;
+        }
+        Ok(())
+    });
+    let _ = client
+        .request(&Request::StopForward {
+            local: bound.clone(),
+        })
+        .await;
+    match result {
+        // **An offer its sharer no longer serves is gone, and is said to be** (ADR-020 11.8): the
+        // announcement stays on the log, the bytes were live only while it was shared. A transfer
+        // the sharer refused says that, not the socket's error ("Connection reset by peer"). One
+        // that sent the wrong bytes says that, whatever the node said.
+        Err(e) if !e.to_string().contains("announced") => match events.as_mut() {
+            Some(ev) => Err(why_not_collected(ev, offer).await.unwrap_or(e)),
+            None => Err(e),
+        },
+        other => other,
+    }
+}
+
+/// Open a forward to `offer`'s service, after following the node's events so that why a transfer
+/// fails can be said (ADR-020 11.8). Returns the forward's local address and that event stream.
+async fn open_forward(
+    client: &mut IpcClient,
+    paths: &Paths,
+    channel_id: Digest32,
+    offer: &Offer,
+) -> Result<(String, Option<IpcClient>), AppError> {
     // **Why a transfer failed is the node's to say** (ADR-020 11.8): followed from before the
     // forward opens, so its refusal is not missed.
-    let mut events = match crate::client::one_shot(paths) {
+    let events = match crate::client::one_shot(paths) {
         Ok(at) => crate::client::events(&at).await.ok(),
         Err(_) => None,
     };
@@ -3190,42 +3271,134 @@ async fn collect_offer(
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
     };
+    Ok((bound, events))
+}
 
-    let result = collect(&bound, &dest, offer).await.and_then(|placed| {
-        // **A copy in the node's files directory ends with its message** (ADR-028 F-5): it is
-        // recorded so the daemon deletes it then. One the person put elsewhere is theirs.
-        if managed {
-            vox_core::node::pulls::record(
-                paths,
-                &vox_core::node::pulls::Pulled {
-                    room: channel_id,
-                    entry: offer.entry,
-                    path: placed,
-                    created: offer.created,
-                },
-            )
-            .map_err(|e| {
-                AppError::Usage(format!("the file landed, but cannot be recorded: {e}"))
+/// `vox room get` of a folder (ADR-028 F-8): into the node's files directory for the room, where
+/// an earlier get or pull of the same folder from the same member went, or into `--dir`. Only what
+/// is not already there as listed is fetched; a file the person changed there is kept.
+async fn collect_folder(
+    client: &mut IpcClient,
+    paths: &Paths,
+    channel_id: Digest32,
+    offer: &Offer,
+    count: u64,
+    dir: Option<&std::path::Path>,
+) -> Result<(), AppError> {
+    let managed = dir.is_none();
+    let base = match dir {
+        Some(d) => {
+            std::fs::create_dir_all(d).map_err(|e| {
+                AppError::Usage(format!("cannot use {} for the folder: {e}", d.display()))
             })?;
+            d.to_owned()
         }
-        Ok(())
-    });
+        None => {
+            let d = vox_core::node::pulls::room_dir(paths, &channel_id);
+            vox_core::node::paths::create_private_dir(&d).map_err(|e| {
+                AppError::Usage(format!("cannot use {} for the folder: {e}", d.display()))
+            })?;
+            d
+        }
+    };
+    let (target, prior) = if managed {
+        vox_core::node::pulls::folder_dir(paths, &base, &channel_id, &offer.author, &offer.name)
+    } else {
+        (
+            base.join(safe_file_name(&offer.name)),
+            std::collections::BTreeMap::new(),
+        )
+    };
+    if let Some(why) = vox_core::node::pulls::short_of_space(&base, offer.size) {
+        return Err(AppError::Usage(format!(
+            "refusing to pull {}/ ({}): {why}",
+            safe_file_name(&offer.name),
+            vox_core::node::pulls::bytes(offer.size)
+        )));
+    }
+    std::fs::create_dir_all(&target).map_err(|e| {
+        AppError::Usage(format!(
+            "cannot use {} for the folder: {e}",
+            target.display()
+        ))
+    })?;
+    let (bound, mut events) = open_forward(client, paths, channel_id, offer).await?;
+    let at: std::net::SocketAddr = bound
+        .parse()
+        .map_err(|e| AppError::Usage(format!("the forward's address {bound}: {e}")))?;
+    let listed =
+        vox_core::node::folder::fetch_list(at, &offer.sha256.to_ascii_lowercase(), count).await;
+    let shown = safe_file_name(&offer.name);
+    let mut pull = vox_core::node::pulls::Pulled {
+        room: channel_id,
+        entry: offer.entry,
+        path: target.clone(),
+        created: offer.created,
+        folder: Some((offer.author, shown.clone())),
+        files: Vec::new(),
+    };
+    let pulled = match &listed {
+        Ok(list) => {
+            // **A get cut short is resumed in the same place** (F-8): recorded before it starts,
+            // in the node's files directory; one the person put elsewhere is theirs.
+            pull.files = list
+                .iter()
+                .map(|f| (f.path.clone(), f.sha256.clone()))
+                .collect();
+            let begun = if managed {
+                vox_core::node::pulls::begin(paths, &pull)
+            } else {
+                Ok(())
+            };
+            match begun {
+                Ok(()) => vox_core::node::folder::pull(at, &target, list, &prior).await,
+                Err(e) => Err((e, vox_core::node::folder::Pulled::default())),
+            }
+        }
+        Err(e) => Err((
+            format!("refusing to pull {}/: {e}", offer.name),
+            vox_core::node::folder::Pulled::default(),
+        )),
+    };
     let _ = client
         .request(&Request::StopForward {
             local: bound.clone(),
         })
         .await;
-    match result {
-        // **An offer its sharer no longer serves is gone, and is said to be** (ADR-020 11.8): the
-        // announcement stays on the log, the bytes were live only while it was shared. A transfer
-        // the sharer refused says that, not the socket's error ("Connection reset by peer"). One
-        // that sent the wrong bytes says that, whatever the node said.
-        Err(e) if !e.to_string().contains("announced") => match events.as_mut() {
-            Some(ev) => Err(why_not_collected(ev, offer).await.unwrap_or(e)),
-            None => Err(e),
-        },
-        other => other,
+    let done = match pulled {
+        Ok(done) => done,
+        Err((e, done)) => {
+            let e = AppError::Usage(format!(
+                "{e}; {} fetched before it stopped, and a get of it again keeps them",
+                done.fetched.len()
+            ));
+            return Err(if e.to_string().contains("does not match") {
+                e
+            } else {
+                match events.as_mut() {
+                    Some(ev) => why_not_collected(ev, offer).await.unwrap_or(e),
+                    None => e,
+                }
+            });
+        }
+    };
+    for path in &done.kept {
+        println!("vox: {shown}/{path} was changed here; not replaced");
     }
+    if managed {
+        pull.files = done.placed.clone();
+        vox_core::node::pulls::finish(paths, &pull).map_err(|e| {
+            AppError::Usage(format!("the folder landed, but cannot be recorded: {e}"))
+        })?;
+    }
+    println!(
+        "vox: {}/ ({} files: {} fetched, {} already here) matches its announced SHA-256s",
+        target.display(),
+        count,
+        done.fetched.len(),
+        done.here
+    );
+    Ok(())
 }
 
 /// What the node said about a transfer of `offer` that failed, within a moment of it: the

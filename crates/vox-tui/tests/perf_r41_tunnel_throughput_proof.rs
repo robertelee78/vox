@@ -2,8 +2,8 @@
 //! on 2026-09-25: "we should figure out what the maximum throughput is for a network connection and we
 //! should ensure that our overlay system doesn't completely nuke that").
 //!
-//! Driven entirely through the shipped binary, the way a person sets a tunnel up: `vox node` (an
-//! anchor), `vox serve <port>=<port>` (the host, offering a **sink** that counts bytes and
+//! Driven entirely through the shipped binary, the way a person sets a tunnel up, with no anchor:
+//! `vox serve <port>=<port>` (the host, offering a **sink** that counts bytes and
 //! stamps the last one), `vox connect` (the guest joins; the host trusts it beforehand) and
 //! `vox forward` (the guest's local port into the tunnel).
 //!
@@ -11,8 +11,9 @@
 //! link". This process runs a link emulator: every packet of the tunnel's QUIC connection crosses a UDP
 //! shaper, and the raw transfer crosses a TCP shaper, each holding the same rate and one-way delay
 //! (and, on the lossy link, dropping the same share of the tunnel's packets). The host advertises only
-//! the shaper (`VOX_TEST_ADVERTISE`), and the guest advertises nothing reachable, so the one connection
-//! between them runs through it. The shaper counts what it carries, and the gate refuses to report a
+//! the shaper (`VOX_TEST_ADVERTISE`), and the guest advertises nothing reachable; the host is on IPv4
+//! loopback and the guest on IPv6 loopback, which only the shaper joins, so every packet between them
+//! runs through it, whatever either node dials (#427). The shaper counts what it carries, and the gate refuses to report a
 //! ratio for a tunnel whose bytes did not cross it.
 //!
 //! **What must hold** (PRD-001 R41): at 1 Gbit/s, at LAN and at WAN round-trip time, the tunnel
@@ -327,7 +328,20 @@ fn udp_shaper(
     bottleneck: Arc<Mutex<Pacer>>,
     seed: u64,
 ) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
-    let front = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind the shaper");
+    udp_shaper_at("127.0.0.1:0", upstream, link, bottleneck, seed)
+}
+
+/// [`udp_shaper`] with its client side bound at `front`: the tunnel's shaper takes its client on
+/// IPv6 loopback while its upstream side stays on IPv4, so the link is the one place the two
+/// families meet (see [`stage`]).
+fn udp_shaper_at(
+    front: &str,
+    upstream: SocketAddr,
+    link: Shared,
+    bottleneck: Arc<Mutex<Pacer>>,
+    seed: u64,
+) -> (SocketAddr, Arc<std::sync::atomic::AtomicU64>) {
+    let front = std::net::UdpSocket::bind(front).expect("APPARATUS: bind the shaper");
     let back = std::net::UdpSocket::bind("127.0.0.1:0")
         .expect("APPARATUS: bind the shaper's upstream side");
     big_buffers(&front);
@@ -806,7 +820,6 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
 
     let Staged {
         tmp: _tmp,
-        anchor,
         host,
         forward,
         tunnel,
@@ -951,12 +964,9 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
         shown(&format!("R41: {line}"));
     }
     shown(&format!("uptime at end: {}", uptime()));
-    // No check of the anchor's circuit count here: every link's transfers (`measure`) and every
-    // ADR-024 arm (`crossed_fault`) assert that the tunnel's own bytes crossed its emulated link,
-    // which a relay fallback would fail. The anchor's count also counts a joiner's raced duplicate
-    // connection that lost the tie-break to the direct one and lingers for its 60 s grace, and it
-    // called that a fallback while the tunnel stayed direct (host: "a new connection ... lost the
-    // tie-break to the one held ... Direct against Relayed; retired, closed in 60s").
+    // Every link's transfers (`measure`) and every ADR-024 arm (`crossed_fault`) assert that the
+    // tunnel's own bytes crossed its emulated link; with no anchor and the two nodes on different
+    // address families, no other path exists to take them (#427).
     assert!(
         failed.is_empty(),
         "R41 (PRODUCT): the tunnel throttles the link it runs over: {failed:?}\nand CANNOT MEASURE \
@@ -973,16 +983,14 @@ fn r41_a_tunnel_does_not_throttle_the_link_it_runs_over() {
     );
     drop(forward);
     drop(host);
-    drop(anchor);
 }
 
 /// Everything one R41 run stands on, set up as a person sets a tunnel up (see the module docs):
-/// an anchor, the host serving the sink behind the UDP shaper, the guest joined and forwarding.
+/// the host serving the sink behind the UDP shaper, the guest joined and forwarding, no anchor.
 struct Staged {
     // Field order is drop order: the processes go before the directories they run in.
     forward: Proc,
     host: Proc,
-    anchor: Proc,
     tmp: tempfile::TempDir,
     host_dir: std::path::PathBuf,
     guest_dir: std::path::PathBuf,
@@ -999,28 +1007,13 @@ struct Staged {
 /// starts.
 fn stage(host_env: &[(&str, &str)]) -> Staged {
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
-    let anchor_dir = tmp.path().join("anchor");
     let host_dir = tmp.path().join("host");
     let guest_dir = tmp.path().join("guest");
-    for d in [&anchor_dir, &host_dir, &guest_dir] {
+    for d in [&host_dir, &guest_dir] {
         std::fs::create_dir_all(d.join("cfg")).expect("APPARATUS: create a staging directory");
     }
     let (port, done) = sink();
     let link: Shared = Arc::new(Mutex::new(None));
-
-    let anchor = Proc::spawn(
-        "anchor",
-        &anchor_dir,
-        &["node", "--listen", "127.0.0.1:0"],
-        &[],
-    );
-    let spec = anchor
-        .expect_line("an --anchor spec", |l| {
-            l.trim_start().contains('@')
-                && l.trim_start().starts_with(|c: char| c.is_alphanumeric())
-        })
-        .trim()
-        .to_owned();
 
     let (ok, host_fp, err) = vox_once(&host_dir, &["id"]);
     assert!(ok, "PRODUCT: host id: {err}");
@@ -1032,6 +1025,17 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
     );
     assert!(ok, "PRODUCT (staging): host trusts guest: {err}");
 
+    // **Two address families, and the link the only place they meet** (#427). The host listens on
+    // IPv4 loopback and the guest on IPv6 loopback; the shaper takes the guest on `[::1]` and
+    // reaches the host on `127.0.0.1`. An IPv4 socket cannot send to `[::1]`, nor an IPv6 one bound
+    // to `[::1]` to an IPv4 address, so nothing either node offers the other — a dial-back to the
+    // guest's own socket (V030-22), an address heard on the local network (node/nearby.rs) — can
+    // carry a packet between them except through the shaper; and with no anchor there is no relay
+    // to carry one either. On one loopback both found a path that skipped the link once its own
+    // connection died: the host "dialled it back at 127.0.0.1:<the guest's socket>", and with no
+    // anchor, "heard on this computer or the local network at 192.168.1.135:<port>; dialling it
+    // there", and the tunnel's 128 MB crossed nothing it measured.
+    //
     // The host listens on a known port behind the UDP shaper, and advertises only the shaper.
     let host_port = {
         let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("APPARATUS: bind a socket");
@@ -1043,7 +1047,8 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
     let host_listen = format!("127.0.0.1:{host_port}");
     // The tunnel's queue toward the host: the competing flow of the congested arm shares it.
     let bottleneck = Arc::new(Mutex::new(Pacer::new()));
-    let (shaped, carried) = udp_shaper(
+    let (shaped, carried) = udp_shaper_at(
+        "[::1]:0",
         host_listen
             .parse()
             .expect("APPARATUS: a socket address the proof wrote"),
@@ -1060,8 +1065,6 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
         &[
             "serve",
             &format!("{port_s}={port_s}"),
-            "--anchor",
-            &spec,
             "--listen",
             &host_listen,
         ],
@@ -1084,8 +1087,9 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
         "PRODUCT (staging): the host did not advertise the shaper: {address}"
     );
 
-    // The guest advertises nothing reachable, so the host cannot open a second, unshaped path.
-    let nowhere = [("VOX_TEST_ADVERTISE", "127.0.0.1:9")];
+    // The guest, on IPv6 loopback, advertises nothing reachable, so the host cannot open a second,
+    // unshaped path.
+    let nowhere = [("VOX_TEST_ADVERTISE", "[::1]:9")];
     let (ok, out, err) = vox_once_env(
         &guest_dir,
         &[
@@ -1093,10 +1097,8 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
             &address,
             "--passphrase-file",
             &room_pass_file(&guest_dir, &passphrase),
-            "--anchor",
-            &spec,
             "--listen",
-            "127.0.0.1:0",
+            "[::1]:0",
         ],
         &nowhere,
     );
@@ -1108,10 +1110,8 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
             "forward",
             &format!("{port_s}.{}.{room}.vox", host_fp.trim()),
             "127.0.0.1:0",
-            "--anchor",
-            &spec,
             "--listen",
-            "127.0.0.1:0",
+            "[::1]:0",
         ],
         &nowhere,
     );
@@ -1130,34 +1130,10 @@ fn stage(host_env: &[(&str, &str)]) -> Staged {
         .expect("APPARATUS: a socket address the proof wrote");
     let raw = tcp_shaper(sink_addr, Arc::clone(&link));
 
-    // Direct, asserted: the anchor must carry no circuit for the timed transfers.
-    let carried_line = |l: &str| l.contains("circuit(s) carried") && !l.contains(" 0 circuit(s)");
-    let circuit_lines = |a: &Proc| -> Vec<String> {
-        a.said()
-            .into_iter()
-            .filter(|l| l.contains("circuit(s) carried"))
-            .collect()
-    };
     let _ = transfer(tunnel, &done);
-    let settle = Instant::now();
-    while circuit_lines(&anchor)
-        .last()
-        .is_some_and(|l| carried_line(l))
-        && settle.elapsed() < Duration::from_secs(120)
-    {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        !circuit_lines(&anchor)
-            .last()
-            .is_some_and(|l| carried_line(l)),
-        "PRODUCT (staging): two hosts on one loopback found no direct path; the anchor still \
-         carried their circuit 120 s after the forward came up"
-    );
     Staged {
         forward,
         host,
-        anchor,
         host_dir,
         guest_dir,
         tmp,
