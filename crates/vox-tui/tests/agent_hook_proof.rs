@@ -1152,7 +1152,17 @@ fn a_reply_shows_what_it_answers_and_cannot_forge_it() {
         let (ok, _, err) = hook(
             &data,
             &cfg,
-            &["room", "post", &label, "--re", re, "-"],
+            // A structured post is a session's: this proof names its own, never the runner's.
+            &[
+                "room",
+                "post",
+                &label,
+                "--session",
+                "poster",
+                "--re",
+                re,
+                "-",
+            ],
             body,
         );
         assert!(ok, "PRODUCT (staging): vox room post --re failed: {err}");
@@ -1454,7 +1464,8 @@ fn a_structured_post_reads_alike_for_a_person_and_an_agent() {
         &["--type", "ask", "--work", work, ""],
     ];
     for extra in posts {
-        let mut args = vec!["room", "post", &label];
+        // A structured post is a session's: this proof names its own, never the runner's.
+        let mut args = vec!["room", "post", &label, "--session", "poster"];
         args.extend_from_slice(extra);
         let (ok, _, err) = hook(&data, &cfg, &args, "");
         assert!(
