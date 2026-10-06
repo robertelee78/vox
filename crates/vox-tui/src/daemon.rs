@@ -94,12 +94,15 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     // **A daemon run as root would serve nobody** (ADR-026 C-1): it admits no uid 0, and a client
     // of any other uid is not its user. Said at once, before the lock is taken or anything is read.
     if vox_core::node::paths::my_uid() == 0 {
-        return Err(AppError::Usage(
-            "vox daemon will not run as root (uid 0): it admits no control connection from root, \
-             so a daemon run as root could serve nobody. Run vox as an ordinary user: in a \
-             container, set a non-root USER (for example `podman run --user 1000 …`)"
-                .into(),
-        ));
+        return refused_for_good(
+            args,
+            AppError::Usage(
+                "vox daemon will not run as root (uid 0): it admits no control connection from \
+                 root, so a daemon run as root could serve nobody. Run vox as an ordinary user: \
+                 in a container, set a non-root USER (for example `podman run --user 1000 …`)"
+                    .into(),
+            ),
+        );
     }
     // Refused before anything is read or unlocked: a metrics endpoint the network can
     // reach names every peer and room this node talks to (PRD-001 R38).
@@ -111,11 +114,17 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             )));
         }
     }
-    let account = Account::of(
+    let account = match Account::of(
         args.profile.data_dir.as_deref(),
         args.profile.config_dir.as_deref(),
-    )
-    .map_err(|e| AppError::Usage(e.to_string()))?;
+    ) {
+        Ok(account) => account,
+        // A data root this version does not read stays refused however often it is tried.
+        Err(e) => return refused_for_good(args, AppError::Usage(e.to_string())),
+    };
+    if let Err(e) = vox_core::node::layout::refuse_old_layout(&account) {
+        return refused_for_good(args, AppError::Usage(e.to_string()));
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -251,6 +260,45 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         }
     });
     stop_daemon(rt, &router, &serving.presence, signal)
+}
+
+/// A start that no retry can change. As the login item (`--login-item`), it is written to
+/// [`login_item_log`] and the daemon ends with status 0: launchd restarts the login item only after
+/// a failed exit, so it is not started again every ten seconds, and the app quotes the line.
+/// Otherwise it is the error, as before.
+fn refused_for_good(args: &DaemonArgs, error: AppError) -> Result<(), AppError> {
+    if !args.login_item {
+        return Err(error);
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = format!("{at} vox daemon will not start: {error}\n");
+    eprint!("{line}");
+    if let Some(log) = login_item_log() {
+        let wrote = log
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)?
+                    .write_all(line.as_bytes())
+            });
+        if let Err(e) = wrote {
+            eprintln!("vox daemon: could not write {}: {e}", log.display());
+        }
+    }
+    Ok(())
+}
+
+/// Where the login item says why it did not start: `~/Library/Logs/Vox/login-item.log`, outside
+/// the data root (a data root this version does not read is left byte for byte as it was).
+fn login_item_log() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join("Library/Logs/Vox/login-item.log"))
 }
 
 /// What a daemon that holds its account runs: its router, its account socket and its lock, each
@@ -617,6 +665,14 @@ fn already_running(
             account.data_root.display()
         )
     };
+    if args.login_item {
+        // Not done: launchd starts the login item again after a failed exit, ten seconds on, so
+        // it serves once the daemon running now (started by `vox` or the app) has gone.
+        return Err(AppError::Refused {
+            code: 75,
+            message: running("; the login item tries again in 10 s"),
+        });
+    }
     if args.as_detached || args.no_node {
         eprintln!("vox daemon: {}", running(""));
         return Ok(());

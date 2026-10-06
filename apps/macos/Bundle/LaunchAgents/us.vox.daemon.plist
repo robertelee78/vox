@@ -11,6 +11,7 @@
 		<string>vox</string>
 		<string>daemon</string>
 		<string>--no-node</string>
+		<string>--login-item</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

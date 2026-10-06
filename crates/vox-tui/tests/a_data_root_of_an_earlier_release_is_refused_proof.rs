@@ -23,6 +23,11 @@
 //! **Which side a red is on.** A verb that succeeds, one that refuses for another reason, or a
 //! data root that changed is `PRODUCT:`; the proof's own I/O is `APPARATUS:`.
 //!
+//! The same refusal as the macOS app's login item (`vox daemon --no-node --login-item`, run by
+//! launchd, which starts it again after any failed exit) must end with status 0 and its reason in
+//! `~/Library/Logs/Vox/login-item.log` (`HOME` is the proof's): not a restart every ten seconds.
+//! Mutation: `--login-item` ignored (the refusal an error as before) → red: status 1, no log.
+//!
 //! Mutation: the refusal removed (`refuse_old_layout` answering `Ok`) → red: the verbs run, and
 //! `nodes/` and `.daemon/` appear in the old data root.
 
@@ -215,6 +220,25 @@ fn a_data_root_of_an_earlier_release_is_refused_and_unchanged() {
                 folder.display()
             ));
         }
+    }
+    // **The login item** (the macOS app's launchd agent, `--login-item`): launchd starts it again
+    // after any failed exit, so a refusal no retry can change ends with status 0 and its reason in
+    // ~/Library/Logs/Vox/login-item.log, where the app quotes it; nothing else changes.
+    let log = outside.join("home/Library/Logs/Vox/login-item.log");
+    let (status, said) = run_on(&data, &outside, &["daemon", "--no-node", "--login-item"]);
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    let log_names_it = logged.contains(&format!("{} {REASON}", data.display()));
+    println!(
+        "[proof] vox daemon --no-node --login-item: exit ok = {status:?}; its log says why = \
+         {log_names_it}"
+    );
+    if status != Some(true) || !log_names_it {
+        red.push(format!(
+            "as the login item, a data root this version does not read must end the daemon with \
+             status 0 (launchd then leaves it) and its reason in {}; it ended {status:?}, said \
+             {said:?}, and the log holds {logged:?}",
+            log.display()
+        ));
     }
     let after = snapshot(&data);
     if after != before {

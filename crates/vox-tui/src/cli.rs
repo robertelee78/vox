@@ -616,6 +616,12 @@ pub struct DaemonArgs {
     /// exit once nothing is attached and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
+    /// How the macOS app's login item runs it (launchd, which restarts it after a failed exit):
+    /// a start refused for good (run as root, or a data root this version does not read) is
+    /// written to `~/Library/Logs/Vox/login-item.log` and ends with status 0, so launchd does not
+    /// start it again every ten seconds; the app quotes that line.
+    #[arg(long = "login-item", hide = true)]
+    pub login_item: bool,
     /// Where the `.vox` SOCKS5 proxy listens while a node is attached. Loopback only.
     #[arg(long, env = "VOX_PROXY", default_value = crate::daemon_proxy::DEFAULT_PROXY)]
     pub proxy: SocketAddr,
