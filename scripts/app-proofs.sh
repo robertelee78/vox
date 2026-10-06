@@ -6,11 +6,20 @@
 #   scripts/app-proofs.sh                     # every proof
 #   scripts/app-proofs.sh FirstRunProof       # one class (xcodebuild's -only-testing)
 #   scripts/app-proofs.sh LaunchProof         # scripts/app-launch-proof.py alone: no UI automation
+#   VOX_PROOF_APP=/path/to/Vox.app scripts/app-proofs.sh
+#                                             # against that app: the signed release candidate
 #
 # It builds the macOS slice of VoxFFI.xcframework, the release `vox`, and the app; puts `vox` in
 # the bundle at Contents/Helpers/vox and signs the bundle ad hoc, inside out; then runs the suite.
-# Optional: it blocks nothing, and needs UI automation allowed on this Mac (developer mode, and
-# the approval macOS asks for on the first run).
+# With VOX_PROOF_APP it still builds the proofs, but proves that app, unchanged (ADR-014 M-30: the
+# signed release build).
+# Optional: it blocks nothing. Preconditions, the person's to arrange, never the suite's:
+#   - UI automation allowed on this Mac (developer mode, and the approval macOS asks for once);
+#   - Vox allowed to notify (System Settings, Notifications), and no Focus on, for the
+#     notification step;
+#   - nothing else of the person's listening on what the proofs bind (they bind free ports).
+# The real data root is never touched: every node, daemon and the app run in a scratch data root
+# and config directory, removed at the end.
 #
 # Local macOS hosts with Xcode 27 / sccache: set CARGO_PROFILE_RELEASE_STRIP=none and
 # RUSTC_WRAPPER= (see scripts/build-xcframework.sh).
@@ -29,11 +38,23 @@ xcodebuild -project apps/macos/Vox.xcodeproj -scheme Vox -configuration Release 
     -derivedDataPath "$DERIVED" ARCHS=arm64 CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual \
     build-for-testing
 
-APP="$DERIVED/Build/Products/Release/Vox.app"
-mkdir -p "$APP/Contents/Helpers"
-cp target/release/vox "$APP/Contents/Helpers/vox"
-codesign --force --sign - --options runtime --identifier us.vox.cli "$APP/Contents/Helpers/vox"
-codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
+if [ -n "${VOX_PROOF_APP:-}" ]; then
+    APP="$(cd "$VOX_PROOF_APP" && pwd)"
+    [ -x "$APP/Contents/Helpers/vox" ] || {
+        echo "app-proofs: APPARATUS: $APP holds no Contents/Helpers/vox" >&2
+        exit 2
+    }
+    codesign --verify --strict "$APP" || {
+        echo "app-proofs: APPARATUS: $APP's signature does not check out" >&2
+        exit 2
+    }
+else
+    APP="$DERIVED/Build/Products/Release/Vox.app"
+    mkdir -p "$APP/Contents/Helpers"
+    cp target/release/vox "$APP/Contents/Helpers/vox"
+    codesign --force --sign - --options runtime --identifier us.vox.cli "$APP/Contents/Helpers/vox"
+    codesign --force --sign - --options runtime --preserve-metadata=entitlements "$APP"
+fi
 
 # The launch proof (#438) drives no UI, so it needs no automation approval: it runs first, alone
 # when asked for by name.

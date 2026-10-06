@@ -189,14 +189,17 @@ private struct RoomForm: View {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
             }
             TextField("Your name for it", text: $name)
+                .accessibilityIdentifier("room-form-name")
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
             SecureInput(holder: field) { submit() }.frame(width: 320)
+                .accessibilityIdentifier("room-form-passphrase")
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             HStack {
                 Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
                 Button(joining ? "Join" : "Create") { submit() }.keyboardShortcut(.defaultAction)
                     .disabled(name.isEmpty || (joining && link.isEmpty))
+                    .accessibilityIdentifier("room-form-submit")
             }
         }
         .padding(24)

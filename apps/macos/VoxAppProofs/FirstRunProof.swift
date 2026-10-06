@@ -36,17 +36,28 @@
 //    service card copies the address `vox service list` gives.
 // 10. The decision record (ADR-014 M-18, ADR-028 §7, #445): carol's join with a wrong passphrase,
 //     refused by alice's node, is at the top of the view, above the trust changes of steps 3 and 5.
-// 11. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 11. Untrust cuts a live forward (ADR-014 M-31, ADR-028 K-6, E-5): bob forwards to a service
+//     alice shares and carries bytes through it; alice removes bob in the keyring view, and that
+//     live connection is cut within 30 s.
+// 12. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (11) goes red. A room with a message
+// place of the app's hold), and quitting leaves it attached: (12) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
 // the sidebar's order: (9) goes red. The decision record oldest first: (10) goes red.
+// Untrust that leaves a member's live sessions running: (11) goes red.
 
 import XCTest
+
+/// A red that is the product's, thrown where an assertion cannot be: what `vox` did, quoted.
+struct Product: Error, CustomStringConvertible {
+    let why: String
+    init(_ why: String) { self.why = why }
+    var description: String { "PRODUCT: \(why)" }
+}
 
 /// A red that is the apparatus's, not the product's: staging was not achieved.
 struct Apparatus: Error, CustomStringConvertible {
@@ -74,7 +85,10 @@ final class FirstRunProof: XCTestCase {
         let scratch = URL(fileURLWithPath: scratchPath)
         let data = scratch.appendingPathComponent("data").path
         let config = scratch.appendingPathComponent("config").path
-        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config]
+        // The daemon's .vox proxy on a free port, never another daemon's 1080.
+        let voxEnv = ["VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config, "VOX_PROXY": "127.0.0.1:0"]
+        // `vox room post --to` speaks for an agent session, and refuses without one: bob's, named.
+        let bobSession = voxEnv.merging(["VOX_SESSION": "bob-proof"]) { $1 }
 
         // The account's daemon, from the bundle, before any node exists, so nothing but the app
         // attaches the node.
@@ -139,15 +153,36 @@ final class FirstRunProof: XCTestCase {
         try staged(vox, ["node", "attach", "bob", "--passphrase-file", bobPass], env: voxEnv)
         let aliceFp = try line(staged(vox, ["id", "--node", "alice"], env: voxEnv)) { $0.count == 52 }
         let bobFp = try line(staged(vox, ["id", "--node", "bob"], env: voxEnv)) { $0.count == 52 }
-        try staged(vox, ["room", "create", "--node", "alice", "--passphrase-file", roomPass,
-                         "--name", "mission"], env: voxEnv)
-        let rooms = try staged(vox, ["room", "list", "--node", "alice"], env: voxEnv)
-        guard let room = rooms.split(whereSeparator: \.isWhitespace).first.map(String.init) else {
-            throw Apparatus("`vox room list --node alice` listed no room: \(rooms)")
+        // The app makes the room (⌘N, M-31: create) and copies its link (⌘L).
+        ui.typeKey("n", modifierFlags: .command)
+        let roomName = ui.textFields["room-form-name"]
+        XCTAssertTrue(roomName.waitForExistence(timeout: 10), "PRODUCT: ⌘N opened no New Room form")
+        roomName.click()
+        roomName.typeText("mission")
+        let roomSecret = ui.secureTextFields["room-form-passphrase"]
+        roomSecret.click()
+        roomSecret.typeText("mission room")
+        ui.buttons["room-form-submit"].click()
+        var rooms = ""
+        let madeUntil = Date().addingTimeInterval(60)
+        while Date() < madeUntil && !rooms.contains(" mission") {
+            rooms = run(vox, ["room", "list", "--node", "alice"], env: voxEnv).out
+            if !rooms.contains(" mission") { Thread.sleep(forTimeInterval: 0.5) }
         }
-        let link = try line(staged(vox, ["room", "link", "--node", "alice", room], env: voxEnv)) {
-            $0.hasPrefix("vox://")
+        guard let room = rooms.split(separator: "\n").first(where: { $0.contains(" mission") })?
+            .split(whereSeparator: \.isWhitespace).first.map(String.init) else {
+            throw Product("the app's New Room made no room alice's `vox room list` lists: \(rooms)")
         }
+        NSPasteboard.general.clearContents()
+        ui.typeKey("l", modifierFlags: .command)
+        var link = ""
+        let linkUntil = Date().addingTimeInterval(15)
+        while Date() < linkUntil && !link.hasPrefix("vox://") {
+            link = NSPasteboard.general.string(forType: .string) ?? ""
+            if !link.hasPrefix("vox://") { Thread.sleep(forTimeInterval: 0.25) }
+        }
+        XCTAssertTrue(link.hasPrefix("vox://"),
+                      "PRODUCT: ⌘L in the room must copy its vox:// link; the pasteboard has \(link.debugDescription)")
         try staged(vox, ["room", "join", "--node", "bob", "--passphrase-file", roomPass, link,
                          "--name", "mission"], env: voxEnv)
         try staged(vox, ["trust", "add", "--node", "alice", bobFp, "--name", "bob",
@@ -171,7 +206,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("alice never read a post of bob's in 120 s; `vox room read` said: \(seen)")
         }
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU"],
-                   env: voxEnv)
+                   env: bobSession)
         let needsYou = ui.descendants(matching: .any)["group-needs you"]
         let grouped = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
         let met = XCTWaiter.wait(for: [expectation(for: grouped, evaluatedWith: needsYou)], timeout: 60)
@@ -375,7 +410,7 @@ final class FirstRunProof: XCTestCase {
             throw Apparatus("Vox is not allowed to notify on this Mac: allow it in System Settings, Notifications, Vox, then run again; the app said \(statusNow)")
         }
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "SECRET-TEXT-8"],
-                   env: voxEnv)
+                   env: bobSession)
         let centre = XCUIApplication(bundleIdentifier: "com.apple.notificationcenterui")
         let banner = centre.descendants(matching: .any)
             .matching(NSPredicate(format: "label CONTAINS %@", "bob wrote to you")).firstMatch
@@ -407,7 +442,7 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: room bbb never showed in the sidebar")
         aaa.click()
         try staged(vox, ["room", "post", "--node", "bob", "--to", aliceFp, room, "NEEDS-YOU-9"],
-                   env: voxEnv)
+                   env: bobSession)
         let needs = NSPredicate(format: "exists == true AND label == %@", "needs you (1)")
         XCTAssertEqual(XCTWaiter.wait(for: [expectation(for: needs, evaluatedWith:
             ui.descendants(matching: .any)["group-needs you"])], timeout: 60), .completed,
@@ -418,7 +453,9 @@ final class FirstRunProof: XCTestCase {
         XCTAssertTrue(landed.waitForExistence(timeout: 15),
                       "PRODUCT: ⌘J from room aaa must open mission, the room that needs alice; its message NEEDS-YOU-9 is not on screen")
         // ⌘⇧C: a service bob shares, selected, copies its address.
-        try staged(vox, ["service", "add", "--node", "bob", room, "web", "127.0.0.1:9"], env: voxEnv)
+        let echo = try EchoServer()
+        try staged(vox, ["service", "add", "--node", "bob", room, "web", "127.0.0.1:\(echo.port)"],
+                   env: voxEnv)
         var cliAddress = ""
         let shareUntil = Date().addingTimeInterval(60)
         while Date() < shareUntil && cliAddress.isEmpty {
@@ -442,6 +479,14 @@ final class FirstRunProof: XCTestCase {
         let copied = NSPasteboard.general.string(forType: .string) ?? ""
         XCTAssertEqual(copied, cliAddress,
                        "PRODUCT: ⌘⇧C on the selected service must copy its address as `vox service list` gives it")
+        // ... and used: `vox forward` to what was copied carries bytes to bob's service and back.
+        let forward = try start(vox, ["forward", "--node", "alice", copied, "127.0.0.1:0"],
+                                env: voxEnv, until: "vox: forwarding ", product: true)
+        defer { forward.terminate(); forward.waitUntilExit() }
+        let bound = startedLine.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
+        let through = Line(bound)?.roundTrip("THROUGH-THE-COPY\n") ?? ""
+        XCTAssertEqual(through, "THROUGH-THE-COPY\n",
+                       "PRODUCT: a forward to the copied address \(copied), bound at \(bound), must carry bytes to bob's service and back")
         print("[proof] ⌘J opened mission; ⌘⇧C copied \(copied)")
 
         // (10) A refused join, newest in the decision record.
@@ -469,7 +514,39 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: the decision record must keep the older decisions (the trust changes) below")
         print("[proof] decision record top: \(top.label)")
 
-        // (11) Quitting detaches it.
+        // (11) Untrust cuts a live forward into alice's service.
+        let aliceEcho = try EchoServer()
+        try staged(vox, ["service", "add", "--node", "alice", room, "notes",
+                         "127.0.0.1:\(aliceEcho.port)"], env: voxEnv)
+        var bobsAddress = ""
+        let listUntil = Date().addingTimeInterval(60)
+        while Date() < listUntil && bobsAddress.isEmpty {
+            let listed = run(vox, ["service", "list", "--node", "bob", room], env: voxEnv).out
+            bobsAddress = listed.split(separator: "\n").first { $0.contains("notes.") && $0.contains(" by ") }?
+                .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+            if bobsAddress.isEmpty { Thread.sleep(forTimeInterval: 1) }
+        }
+        guard !bobsAddress.isEmpty else {
+            throw Apparatus("bob's `vox service list` never listed alice's notes share")
+        }
+        let bobForward = try start(vox, ["forward", "--node", "bob", bobsAddress, "127.0.0.1:0"],
+                                   env: voxEnv, until: "vox: forwarding ", product: true)
+        defer { bobForward.terminate(); bobForward.waitUntilExit() }
+        let bobBound = startedLine.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
+        guard let live = Line(bobBound), live.roundTrip("BEFORE-UNTRUST\n") == "BEFORE-UNTRUST\n" else {
+            throw Apparatus("bob's forward at \(bobBound) carried nothing before the untrust")
+        }
+        ui.descendants(matching: .any)["keyring"].click()
+        ui.buttons["keyring-remove-bob"].click()
+        let untrustEffect = ui.descendants(matching: .any)["keyring-remove-effect"]
+        XCTAssertTrue(untrustEffect.waitForExistence(timeout: 10),
+                      "PRODUCT: removing bob must say what untrusting does first")
+        ui.buttons["keyring-untrust-confirm"].click()
+        XCTAssertTrue(live.cut(within: 30),
+                      "PRODUCT: alice untrusted bob in the keyring view; bob's live connection into her service must be cut within 30 s, and it was not")
+        print("[proof] untrust cut bob's live forward into alice's notes service")
+
+        // (12) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
@@ -532,7 +609,14 @@ final class FirstRunProof: XCTestCase {
     }
 
     /// Start `vox` and wait until it prints a line starting with `until`.
-    private func start(_ vox: String, _ args: [String], env: [String: String], until: String) throws -> Process {
+    /// The line `start` waited for, as `vox` printed it.
+    private var startedLine = ""
+
+    /// Start `vox` and wait until it prints a line starting with `until`; that line is kept in
+    /// `startedLine`. A `vox` that never says it is the apparatus's red, unless `product` (it is
+    /// the product's to say, as `vox forward` saying where it forwards).
+    private func start(_ vox: String, _ args: [String], env: [String: String], until: String,
+                       product: Bool = false) throws -> Process {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: vox)
         p.arguments = args
@@ -551,14 +635,17 @@ final class FirstRunProof: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             buffer += chunk
-            if !met, buffer.split(separator: "\n").contains(where: { $0.hasPrefix(until) }) {
+            if !met, let hit = buffer.split(separator: "\n").first(where: { $0.hasPrefix(until) }) {
                 met = true
+                self.startedLine = String(hit)
                 seen.fulfill()
             }
         }
         if XCTWaiter.wait(for: [seen], timeout: 30) != .completed {
             p.terminate()
-            throw Apparatus("the daemon never said \(until.debugDescription); it said: \(buffer)")
+            let why = "`vox \(args.joined(separator: " "))` never said \(until.debugDescription) in 30 s; it said: \(buffer)"
+            if product { throw Product(why) }
+            throw Apparatus(why)
         }
         return p
     }

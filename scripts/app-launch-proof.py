@@ -46,6 +46,21 @@ def fail(side, why):
     sys.exit(1)
 
 
+# What names the agent session running the proof, or an agent's config: never inherited, so the
+# result does not depend on who runs it (as the cargo proofs' children, support/temp_home.rs).
+AGENT_VARS = ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG_DIR", "CLAUDE_CODE_SESSION_ID",
+              "CODEX_THREAD_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN")
+
+
+def clean_env():
+    """The environment a proof's app and `vox` get: no VOX_ variable of the runner's, no agent
+    session, and the daemon's .vox proxy on a free port, never another daemon's 1080."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("VOX_") and k not in AGENT_VARS}
+    env["VOX_PROXY"] = "127.0.0.1:0"
+    return env
+
+
 def daemons(data):
     """PIDs of the `vox daemon` processes naming `data` in their arguments."""
     out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
@@ -111,7 +126,7 @@ def one_daemon(app):
     # The person's first-run answer: Not Now.
     with open(os.path.join(config, "app", "login-item"), "w", encoding="utf-8") as f:
         f.write("no\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("VOX_")}
+    env = clean_env()
     env.update({"VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config})
 
     started = []
@@ -223,7 +238,7 @@ def after_quit(app, answer):
     for name, text in (("login-item", answer), ("node", "carol")):
         with open(os.path.join(config, "app", name), "w", encoding="utf-8") as f:
             f.write(text + "\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("VOX_")}
+    env = clean_env()
     env.update({"VOX_DATA_DIR": data, "VOX_CONFIG_DIR": config})
     vox = os.path.join(app, "Contents", "Helpers", "vox")
     empty = os.path.join(scratch, "empty.pass")
