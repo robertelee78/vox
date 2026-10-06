@@ -4,7 +4,12 @@
 
 import AppKit
 import Foundation
+import os
 import ServiceManagement
+
+/// What the read path does, at debug level (`log stream --level debug --predicate
+/// 'subsystem == "us.vox.app"'`): ids and counts only, never message text.
+let readLog = Logger(subsystem: "us.vox.app", category: "read")
 
 @MainActor
 final class NodeModel: ObservableObject {
@@ -631,7 +636,15 @@ final class NodeModel: ObservableObject {
     /// draws, once each, in batches. This node's own, and those not received yet, are not.
     func drawn(_ message: RoomMessage, in room: String) {
         guard case .room(room) = selection, byID[message.id] != nil, message.author != me,
-              !message.owed, !marked.contains(message.id) else { return }
+              !message.owed, !marked.contains(message.id) else {
+            readLog.debug("""
+                not drawn: \(message.id, privacy: .public) on screen \(self.roomOnScreen ?? "none", privacy: .public) \
+                known \(self.byID[message.id] != nil) mine \(message.author == self.me) owed \(message.owed) \
+                marked \(self.marked.contains(message.id))
+                """)
+            return
+        }
+        readLog.debug("drawn: \(message.id, privacy: .public) in \(room, privacy: .public)")
         marked.insert(message.id)
         unmarked[room, default: []].append(message.id)
         guard flushing == nil else { return }
@@ -645,7 +658,9 @@ final class NodeModel: ObservableObject {
             for (room, ids) in batches {
                 do {
                     try await self.client.markRead(room: room, ids: ids)
+                    readLog.debug("marked read: \(ids.count) in \(room, privacy: .public)")
                 } catch {
+                    readLog.debug("mark read failed in \(room, privacy: .public): \(sentence(error), privacy: .public)")
                     // Not recorded: drawn again, it is told again.
                     ids.forEach { self.marked.remove($0) }
                     self.said = sentence(error)

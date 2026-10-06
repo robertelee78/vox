@@ -312,6 +312,7 @@ private struct RoomView: View {
 
     /// The rows in view are read, only while the window is in front of the person (R-6).
     private func markSeen() {
+        readLog.debug("seen check in \(room, privacy: .public): window seen \(window.seen), \(inView.count) rows in view")
         guard window.seen else { return }
         for id in inView {
             if let message = model.byID[id] { model.drawn(message, in: room) }
