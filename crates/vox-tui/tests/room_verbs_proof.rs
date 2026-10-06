@@ -501,7 +501,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         said(
             &out,
             "vox: about to set how long",
-            &["\"agents\""],
+            &["\"team\""],
             "vox: ",
             "keeps messages for"
         ),
@@ -519,7 +519,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         said(
             &out,
             "vox: about to offer \"echo\"",
-            &["\"agents\""],
+            &["\"team\""],
             "vox: offering \"echo\"",
             ""
         ),
@@ -537,7 +537,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         said(
             &out,
             "vox: about to stop offering \"echo\"",
-            &["\"agents\""],
+            &["\"team\""],
             "vox: no longer offering \"echo\"",
             "live sessions cut: none was open"
         ),
@@ -562,7 +562,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         said(
             &out,
             "vox: about to share shared.txt",
-            &["\"agents\""],
+            &["\"team\""],
             "vox: sharing shared.txt",
             ""
         ),
@@ -580,7 +580,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         said(
             &out,
             "vox: about to stop sharing \"shared.txt\"",
-            &["\"agents\""],
+            &["\"team\""],
             "vox: no longer sharing shared.txt",
             "fetched 0"
         ),
