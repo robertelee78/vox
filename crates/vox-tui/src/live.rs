@@ -1483,7 +1483,8 @@ impl DaemonCore {
                 if cannot.is_empty() {
                     "nobody else is in the room".to_owned()
                 } else {
-                    format!("{} (not trusted)", cannot.join(", "))
+                    // Each named as the keyring has it, which says it is not in it.
+                    cannot.join(", ")
                 }
             ),
         ];

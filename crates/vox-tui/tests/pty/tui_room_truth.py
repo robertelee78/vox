@@ -700,7 +700,8 @@ try:
         return r.returncode == 0 and tag is not None and tag in r.stdout and "bob" in r.stdout
     shared = until(offered, 60, 1)
     listed = run("alice", "service", "list", room).stdout.strip()
-    claim("serve", f":{sport}" in seen and "every interface" in seen and "who can reach it: alice" in seen
+    can = (re.search(r"who can reach it: (.*?) who cannot", seen) or [None, ""])[1]
+    claim("serve", f":{sport}" in seen and "every interface" in seen and "alice" in can
           and tag is not None and shared,
           f"bob's preview: {seen!r}; alice's `vox service list`: {listed!r}")
     if tag:
