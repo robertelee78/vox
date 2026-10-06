@@ -59,6 +59,13 @@ final class NodeModel: ObservableObject {
     @Published private(set) var readBy: [String: [String]] = [:]
     /// The services members share in the room on screen, as cards above its timeline.
     @Published private(set) var roomServices: [SharedService] = []
+    /// What the last keyring change did, or why it failed, in the daemon's words (E-5, M-7).
+    @Published private(set) var keyringDid: String?
+    @Published private(set) var keyringFailed: String?
+    /// The keyring window has closed: the change waiting is made once the passphrase is given.
+    @Published private(set) var keyringNeedsPassphrase = false
+    private var keyringWaiting: ((Passphrase?) async throws -> String)?
+
     /// Follows who has read what while a room is on screen.
     private var watching: Task<Void, Never>?
     @Published private(set) var members: [MemberRow] = []
@@ -157,6 +164,75 @@ final class NodeModel: ObservableObject {
             }
         } catch {
             said = sentence(error)
+        }
+    }
+
+    // ---- the keyring (M-16) ----------------------------------------------------------------
+
+    /// Trust `fingerprint` as `alias`. Whether it was done.
+    func trust(_ fingerprint: String, as alias: String) async -> Bool {
+        let fp = fingerprint.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
+        return await keyringChange { [client] pass in
+            try await client.trustAdd(fingerprint: fp, name: alias, identityPassphrase: pass)
+            return "Trusting \(fp.prefix(12)) as \(alias)."
+        }
+    }
+
+    /// Show `fingerprint` as `alias` from now on.
+    func rename(_ fingerprint: String, to alias: String) async -> Bool {
+        await keyringChange { [client] pass in
+            try await client.trustRename(fingerprint: fingerprint, name: alias,
+                                         identityPassphrase: pass)
+            return "\(fingerprint.prefix(12)) is now \(alias)."
+        }
+    }
+
+    /// Untrust `node`.
+    func untrust(_ node: TrustedNode) async {
+        _ = await keyringChange { [client] pass in
+            try await client.trustRemove(fingerprint: node.fingerprint, identityPassphrase: pass)
+            return "No longer trusting \(node.name). Your sender key is rotated, and everyone you "
+                + "still trust is re-keyed."
+        }
+    }
+
+    /// The change waiting for the passphrase, made with it; its bytes are wiped at once.
+    func retryKeyring(with typed: Data) async {
+        var bytes = typed
+        defer { bytes.resetBytes(in: 0..<bytes.count) }
+        guard let waiting = keyringWaiting else { return }
+        do {
+            let passphrase = try Passphrase(bytes: bytes)
+            defer { passphrase.wipe() }
+            keyringDid = try await waiting(passphrase)
+            keyringFailed = nil
+            keyringNeedsPassphrase = false
+            keyringWaiting = nil
+            await refresh()
+        } catch {
+            keyringFailed = sentence(error)
+        }
+    }
+
+    /// Make a keyring change, asking for the passphrase when the node says the keyring window has
+    /// closed (ADR-026 N-2), and say what it did.
+    private func keyringChange(_ change: @escaping (Passphrase?) async throws -> String) async -> Bool {
+        keyringDid = nil
+        keyringFailed = nil
+        do {
+            keyringDid = try await change(nil)
+            keyringNeedsPassphrase = false
+            await refresh()
+            return true
+        } catch {
+            let why = sentence(error)
+            if why.contains("needs your identity passphrase") {
+                keyringWaiting = change
+                keyringNeedsPassphrase = true
+            } else {
+                keyringFailed = why
+            }
+            return false
         }
     }
 

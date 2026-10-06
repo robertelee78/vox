@@ -18,7 +18,7 @@ struct MainWindow: View {
                 case let .room(id):
                     RoomView(model: model, room: id)
                 case .keyring:
-                    KeyringView(trusted: model.trusted)
+                    KeyringView(model: model)
                 case nil:
                     Text("Pick a room.")
                         .secondaryText()
@@ -283,29 +283,6 @@ private struct FamilyLan: View {
         if let failed = model.lanFailed[room] {
             StateMark(kind: .danger, words: failed).textSelection(.enabled)
         }
-    }
-}
-
-/// The keyring: the nodes this node trusts, by the names they were trusted under.
-private struct KeyringView: View {
-    let trusted: [TrustedNode]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Keyring").font(Theme.heading)
-            if trusted.isEmpty {
-                Text("This node trusts no one yet.").secondaryText()
-            }
-            ForEach(trusted, id: \.fingerprint) { node in
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(node.name).fontWeight(.bold)
-                    Text(node.fingerprint).font(Theme.mono).secondaryText().textSelection(.enabled)
-                }
-            }
-            Spacer()
-        }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 

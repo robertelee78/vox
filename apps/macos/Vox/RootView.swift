@@ -187,7 +187,7 @@ final class SecureFieldHolder {
 
 /// An `NSSecureTextField`: its text is read only by `SecureFieldHolder.take`, never bound to a
 /// Swift `String` that outlives the keystroke.
-private struct SecureInput: NSViewRepresentable {
+struct SecureInput: NSViewRepresentable {
     let holder: SecureFieldHolder
     let onSubmit: () -> Void
 

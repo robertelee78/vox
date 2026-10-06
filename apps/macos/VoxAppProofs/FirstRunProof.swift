@@ -18,12 +18,15 @@
 // 4. Read each way (ADR-028 R-6, ADR-014 M-14, #441): bob's message, drawn in alice's timeline,
 //    is read, and bob's `vox room read --json` says alice read it; a message alice posts, read by
 //    bob's agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
-// 5. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
+// 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
+//    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
+//    removing it says what untrusting does first, and only then removes it.
+// 6. Quitting the app (⌘Q) detaches it: `vox node list` says `detached`.
 //
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
-// place of the app's hold), and quitting leaves it attached: (5) goes red. A room with a message
+// place of the app's hold), and quitting leaves it attached: (6) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
-// the read-by line: (4) goes red.
+// the read-by line: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red.
 
 import XCTest
 
@@ -212,7 +215,46 @@ final class FirstRunProof: XCTestCase {
                       "PRODUCT: alice's message read by bob must show \"read by bob\" under it; the timeline shows \(readLine.exists ? readLine.label : "no read-by line")")
         print("[proof] bob's message read by \(readByAlice); alice's message: \(readLine.exists ? readLine.label : "none")")
 
-        // (5) Quitting detaches it.
+        // (5) The keyring: carol, a node made here, added by her pasted fingerprint, then removed.
+        try staged(vox, ["node", "create", "carol"],
+                   env: voxEnv.merging(["VOX_IDENTITY_PASSPHRASE": "carol identity"]) { $1 })
+        let carolFp = try line(staged(vox, ["id", "--node", "carol"], env: voxEnv)) { $0.count == 52 }
+        ui.descendants(matching: .any)["keyring"].click()
+        let addFp = ui.textFields["keyring-add-fingerprint"]
+        XCTAssertTrue(addFp.waitForExistence(timeout: 10), "PRODUCT: the keyring view offers no add")
+        addFp.click()
+        addFp.typeText(carolFp)
+        let addAlias = ui.textFields["keyring-add-alias"]
+        addAlias.click()
+        addAlias.typeText("carol")
+        let addEffect = ui.descendants(matching: .any)["keyring-add-effect"]
+        XCTAssertTrue(addEffect.waitForExistence(timeout: 10)
+                          && addEffect.label.contains("it may read what you write"),
+                      "PRODUCT: adding must say what trusting does before it is done; it said \(addEffect.exists ? addEffect.label : "nothing")")
+        ui.buttons["keyring-trust"].click()
+        let carolRow = ui.descendants(matching: .any)["keyring-row-carol"]
+        XCTAssertTrue(carolRow.waitForExistence(timeout: 30), "PRODUCT: carol, once trusted, is not listed in the keyring view")
+        let trustList = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
+        XCTAssertTrue(trustList.contains(carolFp),
+                      "PRODUCT: `vox trust list` must list carol once the app trusted her; it said: \(trustList)")
+        ui.buttons["keyring-remove-carol"].click()
+        let removeEffect = ui.descendants(matching: .any)["keyring-remove-effect"]
+        XCTAssertTrue(removeEffect.waitForExistence(timeout: 10)
+                          && removeEffect.label.contains("reads nothing you write from now on"),
+                      "PRODUCT: removing must say what untrusting does before it is done; it said \(removeEffect.exists ? removeEffect.label : "nothing")")
+        ui.buttons["keyring-untrust-confirm"].click()
+        var after5 = ""
+        let goneUntil = Date().addingTimeInterval(30)
+        while Date() < goneUntil {
+            after5 = run(vox, ["trust", "list", "--node", "alice"], env: voxEnv).out
+            if !after5.contains(carolFp) && !carolRow.exists { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertFalse(after5.contains(carolFp) || carolRow.exists,
+                       "PRODUCT: once untrusted, carol must be gone from the keyring view and from `vox trust list`; it said: \(after5)")
+        print("[proof] keyring: added and listed carol, then removed her after saying what untrusting does")
+
+        // (6) Quitting detaches it.
         ui.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(ui.wait(for: .notRunning, timeout: 30), "PRODUCT: ⌘Q did not quit the app")
         var after = ""
