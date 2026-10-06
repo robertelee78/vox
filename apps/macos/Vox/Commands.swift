@@ -55,6 +55,9 @@ extension VoxAction {
                 node?.sheet = .joinRoom
             },
             VoxAction("File", "Attach File…", "o", enabled: inRoom) { node?.attachAsked += 1 },
+            VoxAction("File", "Share Service…", enabled: live) {
+                Task { await node?.show(.services) }
+            },
             VoxAction("Room", "Copy Room Link", "l", enabled: inRoom) {
                 Task { await node?.copyRoomLink() }
             },
@@ -65,7 +68,7 @@ extension VoxAction {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
             VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { node?.urgentAsked += 1 },
-            VoxAction("Room", "Copy Selected Service's Command", "c", [.command, .shift],
+            VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
             VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
                 Task { await node?.nextNeedingYou() }
@@ -85,6 +88,9 @@ extension VoxAction {
             },
             VoxAction("View", "Keyring", "k", [.command, .shift], enabled: live) {
                 Task { await node?.show(.keyring) }
+            },
+            VoxAction("View", "Services", "s", [.command, .shift], enabled: live) {
+                Task { await node?.show(.services) }
             },
             VoxAction("View", "Decision Record", "d", [.command, .shift], enabled: live) {
                 Task { await node?.show(.decisions) }

@@ -37,7 +37,10 @@
 // 9. Keys (ADR-014 M-20, #446): with quiet rooms aaa and bbb and mission needing alice, ⌘J from
 //    aaa goes to mission, not to bbb, the next room in the sidebar's order; To: bob ticked in
 //    mission is not carried into aaa; NEEDS-YOU-9, shown in mission and left at once, is recorded
-//    read in mission; ⌘⇧C on a selected service card copies the address `vox service list` gives.
+//    read in mission; ⌘⇧C on a selected service card copies its canonical address. The services
+//    view (⌘⇧S, M-17, #444) lists bob's share; its forward command, copied (canonical) and run,
+//    reaches bob's service; a service listening here, shared from the view in one step after it
+//    says bob can reach it, is reached by bob through his own `vox service list`.
 // 10. The decision record (ADR-014 M-18, ADR-028 §7, #445): carol's join with a wrong passphrase,
 //     refused by alice's node, is at the top of the view, above the trust changes of steps 3 and 5.
 // 11. Untrust cuts a live forward (ADR-014 M-31, ADR-028 K-6, E-5): bob forwards to a service
@@ -55,7 +58,8 @@
 // that lists the members only when the room is opened: (3) goes red. The timeline drops
 // the read-by line, or marks rows read while the window is hidden: (4) goes red. A read batch sent
 // for the room on screen when it is flushed, not the room it was drawn in; To: kept across rooms;
-// ⌘O on the timeline only: (9), (9) and (7) go red. Remove untrusts at once, saying nothing
+// ⌘O on the timeline only: (9), (9) and (7) go red. A copy of the readable address, by ⌘⇧C or the
+// services view's Copy: (9) goes red. Remove untrusts at once, saying nothing
 // first: (5) goes red. The note is posted as a message
 // of its own: (6) goes red. A lane derived working without a claim: (7) goes red.
 // A notification that carries the message's text: (8) goes red. ⌘J bound to the next room in
@@ -585,16 +589,23 @@ final class FirstRunProof: XCTestCase {
         let echo = try EchoServer(stager)
         try staged(vox, ["service", "add", "--node", "bob", room, "web", "127.0.0.1:\(echo.port)"],
                    env: voxEnv)
+        // Its readable address (shown) and canonical one (copied), as alice's
+        // `vox service list --json` gives them (ADR-028 S-1, S-3).
         var cliAddress = ""
+        var canonical = ""
         let shareUntil = Date().addingTimeInterval(60)
-        while Date() < shareUntil && cliAddress.isEmpty {
-            let listed = run(vox, ["service", "list", "--node", "alice", room], env: voxEnv).out
-            cliAddress = listed.split(separator: "\n").first { $0.contains(" by ") && $0.contains("web.") }?
-                .split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
-            if cliAddress.isEmpty { Thread.sleep(forTimeInterval: 1) }
+        while Date() < shareUntil && canonical.isEmpty {
+            let listed = run(vox, ["service", "list", "--node", "alice", "--json", room], env: voxEnv).out
+            let json = (try? JSONSerialization.jsonObject(with: Data(listed.utf8))) as? [String: Any]
+            let web = (json?["shared"] as? [[String: Any]] ?? []).first {
+                ($0["readable"] as? String)?.hasPrefix("web.") == true
+            }
+            cliAddress = web?["readable"] as? String ?? ""
+            canonical = web?["address"] as? String ?? ""
+            if canonical.isEmpty { Thread.sleep(forTimeInterval: 1) }
         }
-        guard !cliAddress.isEmpty else {
-            throw Apparatus("alice's `vox service list` never listed bob's web share")
+        guard !canonical.isEmpty else {
+            throw Apparatus("alice's `vox service list --json` never listed bob's web share")
         }
         aaa.click()
         ui.descendants(matching: .any)["room-mission"].click()
@@ -606,8 +617,8 @@ final class FirstRunProof: XCTestCase {
         ui.typeKey("c", modifierFlags: [.command, .shift])
         Thread.sleep(forTimeInterval: 1)
         let copied = NSPasteboard.general.string(forType: .string) ?? ""
-        XCTAssertEqual(copied, cliAddress,
-                       "PRODUCT: ⌘⇧C on the selected service must copy its address as `vox service list` gives it")
+        XCTAssertEqual(copied, canonical,
+                       "PRODUCT: ⌘⇧C on the selected service must copy its canonical address, as `vox service list --json` gives it (\(canonical)), not the readable one shown (\(cliAddress))")
         // ... and used: `vox forward` to what was copied carries bytes to bob's service and back.
         let forward = try start(vox, ["forward", "--node", "alice", copied, "127.0.0.1:0"],
                                 env: voxEnv, until: "vox: forwarding ", product: true)
@@ -617,6 +628,65 @@ final class FirstRunProof: XCTestCase {
         XCTAssertEqual(through, "THROUGH-THE-COPY\n",
                        "PRODUCT: a forward to the copied address \(copied), bound at \(bound), must carry bytes to bob's service and back")
         print("[proof] ⌘J opened mission; ⌘⇧C copied \(copied)")
+
+        // The services view (⌘⇧S, ADR-014 M-17, #444): bob's web share with its commands, the
+        // readable address shown and the canonical one copied; the forward command, copied and
+        // run as a person pastes it, reaches bob's service.
+        ui.typeKey("s", modifierFlags: [.command, .shift])
+        let box = ui.descendants(matching: .any)["service-box-\(cliAddress)"]
+        XCTAssertTrue(box.waitForExistence(timeout: 30),
+                      "PRODUCT: the services view does not list bob's web share \(cliAddress)")
+        NSPasteboard.general.clearContents()
+        ui.buttons["copy-forward-\(cliAddress)"].click()
+        Thread.sleep(forTimeInterval: 1)
+        let pasted = NSPasteboard.general.string(forType: .string) ?? ""
+        XCTAssertEqual(pasted, "vox forward \(canonical) 127.0.0.1:0",
+                       "PRODUCT: Copy on the forward command must copy it with the canonical address, as `vox service list` gives it")
+        let pastedArgs = pasted.split(separator: " ").dropFirst().map(String.init)
+        let pastedForward = try start(vox, Array(pastedArgs.prefix(1)) + ["--node", "alice"]
+                                      + Array(pastedArgs.dropFirst()),
+                                      env: voxEnv, until: "vox: forwarding ", product: true)
+        defer { pastedForward.terminate(); pastedForward.waitUntilExit() }
+        let pastedAt = startedLine.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
+        XCTAssertEqual(Line(pastedAt)?.roundTrip("PASTED-COMMAND\n") ?? "", "PASTED-COMMAND\n",
+                       "PRODUCT: the forward command copied from the services view, run, must carry bytes to bob's service and back")
+        // One-step sharing (S-4): a service listening on this Mac, picked from the list, is shared
+        // in mission with the name suggested, and bob reaches it by his own `vox service list`.
+        let mine = try EchoServer(stager)
+        let listedHere = ui.buttons["listening-\(mine.port)"]
+        XCTAssertTrue(listedHere.waitForExistence(timeout: 30),
+                      "PRODUCT: the services view does not list the service listening here on port \(mine.port)")
+        listedHere.click()
+        let shareRoom = ui.popUpButtons["share-room"]
+        XCTAssertTrue(shareRoom.waitForExistence(timeout: 10), "PRODUCT: picking a listening service offers no room to share it in")
+        shareRoom.click()
+        ui.menuItems["mission"].click()
+        let canReach = ui.descendants(matching: .any)["share-can"]
+        XCTAssertTrue(canReach.waitForExistence(timeout: 10) && shown(canReach).contains("bob"),
+                      "PRODUCT: before sharing, the view must say bob, whom alice trusts, can reach it; it said \"\(shown(canReach))\"")
+        ui.buttons["share-submit"].click()
+        let sharedName = ui.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@", "service-mine-")).firstMatch
+        XCTAssertTrue(sharedName.waitForExistence(timeout: 30),
+                      "PRODUCT: the share made in one step is not under YOUR SHARES")
+        var bobSees = ""
+        let bobUntil = Date().addingTimeInterval(60)
+        while Date() < bobUntil && bobSees.isEmpty {
+            let theirs = run(vox, ["service", "list", "--node", "bob", "--json", room], env: voxEnv).out
+            let json = (try? JSONSerialization.jsonObject(with: Data(theirs.utf8))) as? [String: Any]
+            bobSees = (json?["shared"] as? [[String: Any]] ?? []).first {
+                ($0["by"] as? String) != "you" && ($0["readable"] as? String)?.hasPrefix("web.") != true
+            }?["address"] as? String ?? ""
+            if bobSees.isEmpty { Thread.sleep(forTimeInterval: 1) }
+        }
+        XCTAssertFalse(bobSees.isEmpty, "PRODUCT: bob's `vox service list` never listed the service alice shared in one step")
+        let oneStepForward = try start(vox, ["forward", "--node", "bob", bobSees, "127.0.0.1:0"],
+                                   env: voxEnv, until: "vox: forwarding ", product: true)
+        defer { oneStepForward.terminate(); oneStepForward.waitUntilExit() }
+        let bobAt = startedLine.split(separator: " ").dropFirst(2).first.map(String.init) ?? ""
+        XCTAssertEqual(Line(bobAt)?.roundTrip("ONE-STEP\n") ?? "", "ONE-STEP\n",
+                       "PRODUCT: bob must reach the service alice shared in one step, through \(bobSees)")
+        print("[proof] services view: copied \(pasted); shared port \(mine.port) in one step; bob reached it at \(bobSees)")
 
         // (10) A refused join, newest in the decision record.
         let carolPass = scratch.appendingPathComponent("carol.pass").path

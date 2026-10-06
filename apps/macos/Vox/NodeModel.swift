@@ -13,6 +13,7 @@ final class NodeModel: ObservableObject {
         case room(String)
         case keyring
         case decisions
+        case services
     }
 
     /// A room as the sidebar shows it.
@@ -537,13 +538,61 @@ final class NodeModel: ObservableObject {
         }
     }
 
-    /// Copy the selected service's command (⌘⇧C): its address, which `vox forward` and a
-    /// browser through the .vox proxy take.
+    /// Copy the selected service's address (⌘⇧C): its canonical form, which works pasted on any
+    /// member's machine (ADR-028 S-1, S-3), said by its readable one.
     func copyServiceCommand() {
         guard let service = selectedService else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(service.address, forType: .string)
-        did = "Copied \(service.address)."
+        NSPasteboard.general.setString(service.canonical, forType: .string)
+        did = "Copied the address of \(service.address)."
+    }
+
+    /// Copy a service's command, as given: with the canonical address (S-3).
+    func copyCommand(_ command: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        did = "Copied: \(command)"
+    }
+
+    /// A room's services, as the daemon lists them.
+    func services(of room: String) async throws -> RoomServices {
+        try await client.services(room: room)
+    }
+
+    /// A room's members.
+    func rosterOf(_ room: String) async throws -> [Member] {
+        try await client.roster(room: room)
+    }
+
+    /// What listens on this Mac, as one-step sharing lists it (S-4).
+    func listeningHere() async -> ListeningServices {
+        await client.listening()
+    }
+
+    /// What sharing the service on `port` would do, said before it is shared (S-4).
+    func previewShare(port: UInt16, udp: Bool) async throws -> ServicePreview {
+        try await client.servicePreview(port: port, udp: udp)
+    }
+
+    /// Share `local` in `room` as `tag`; nil when shared, else the daemon's sentence.
+    func shareService(room: String, tag: String, local: String) async -> String? {
+        do {
+            try await client.serviceAdd(room: room, tag: tag, local: local)
+            did = "Shared \(tag) (\(local))."
+            return nil
+        } catch {
+            return sentence(error)
+        }
+    }
+
+    /// Stop sharing `tag` in `room`.
+    func stopService(room: String, tag: String) async {
+        do {
+            try await client.serviceRemove(room: room, tag: tag)
+            did = "Stopped sharing \(tag)."
+        } catch {
+            said = sentence(error)
+        }
     }
 
     /// The next room that needs the person, if any (W-2).
@@ -735,7 +784,7 @@ extension NodeModel {
         for room in rooms where room.open {
             if let listed = try? await client.services(room: room.id) {
                 facts.services += listed.shared.filter { $0.by != "you" }
-                    .map { .init(address: $0.address, by: $0.by) }
+                    .map { .init(address: $0.address, canonical: $0.canonical, by: $0.by) }
             }
             if let mine = try? await client.shares(room: room.id) {
                 facts.shares += mine.map {

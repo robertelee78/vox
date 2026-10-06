@@ -22,6 +22,8 @@ struct MainWindow: View {
                     KeyringView(model: model)
                 case .decisions:
                     DecisionsView(model: model)
+                case .services:
+                    ServicesView(model: model)
                 case nil:
                     Text("Pick a room.")
                         .secondaryText()
@@ -75,6 +77,8 @@ private struct Sidebar: View {
                     .accessibilityIdentifier("keyring")
                 Text("Decision record").tag(NodeModel.Selection.decisions)
                     .accessibilityIdentifier("decisions")
+                Text("Services").tag(NodeModel.Selection.services)
+                    .accessibilityIdentifier("services")
             }
             Section {
                 ForEach(model.nodes, id: \.name) { node in

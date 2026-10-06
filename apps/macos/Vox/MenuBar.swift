@@ -32,7 +32,10 @@ enum MenuBarChoice {
 /// What the menu bar extra lists, read when it opens.
 struct MenuBarFacts {
     struct Service: Hashable {
+        /// Shown.
         let address: String
+        /// Copied (ADR-028 S-1).
+        let canonical: String
         let by: String
     }
 
@@ -114,7 +117,7 @@ private struct NodeFacts: View {
                     Spacer()
                     Button("Copy") {
                         NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(service.address, forType: .string)
+                        NSPasteboard.general.setString(service.canonical, forType: .string)
                     }
                     .help("by \(service.by)")
                 }
