@@ -98,6 +98,16 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
         ok,
         "PRODUCT (staging): mallory's `vox connect` failed after {took:?}: {out}{err}"
     );
+    // What `vox connect` says to do next is true of this release: the daemon's proxy carries the
+    // name while a node is attached, so nothing has to be left running.
+    assert!(
+        out.lines().any(|l| l.trim_start().starts_with(
+            "reach a service as <service>.<node>.<room>.vox through the daemon's proxy, running \
+             while a node is attached"
+        )) && !out.contains("with `vox up` running"),
+        "PRODUCT: `vox connect` must say a service is reached through the daemon's proxy while a \
+         node is attached, not that `vox up` must be running; it said:\n{out}"
+    );
 
     let host = w.host.as_mut().expect("APPARATUS: the world's host runs");
     let alone = audience(host, |_, _| true);
@@ -266,7 +276,14 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
         "PRODUCT: before sharing, `vox serve` must show the address members will use and name \
          who can reach it (the guest and mallory); it said:\n{said}"
     );
-    let everywhere = at(&|l: &str| l.starts_with("warning: `db`") && l.contains("every interface"));
+    // Said as a sentence: the program and where it listens, without the list's column padding.
+    let everywhere = at(&|l: &str| {
+        l.starts_with("warning: `db` (")
+            && l.contains(&format!(
+                " on 0.0.0.0:{db_port}, tcp) listens on every interface"
+            ))
+            && !l.contains("  ")
+    });
     let database =
         at(&|l: &str| l.starts_with("warning: `db`") && l.contains(&format!("port {db_port}")));
     let sharing = at(&|l: &str| l.starts_with("sharing ") && l.contains(" as db — "));
@@ -274,7 +291,8 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
         shared.is_some()
             && everywhere.zip(sharing).is_some_and(|(w, s)| w < s)
             && database.zip(sharing).is_some_and(|(d, s)| d < s),
-        "PRODUCT: `vox serve` must warn that `db` listens on every interface and is on a \
+        "PRODUCT: `vox serve` must warn, in a sentence (\"`db` (<program> on 0.0.0.0:{db_port}, \
+         tcp) listens on every interface\"), that `db` listens on every interface and is on a \
          database's port ({db_port}) before it shares it, then share it; it said:\n{said}"
     );
     drop(db);

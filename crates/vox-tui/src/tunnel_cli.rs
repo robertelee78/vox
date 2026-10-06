@@ -1369,6 +1369,22 @@ fn listing_line(l: &vox_core::node::probe::Listening) -> String {
     format!("{program:<20} {}  {proto}{every}", addrs.join(", "))
 }
 
+/// One listening service as a sentence says it, with none of the list's column padding:
+/// "python3.13 on 0.0.0.0:8080, tcp".
+fn said_in_a_sentence(l: &vox_core::node::probe::Listening) -> String {
+    let program = l
+        .command
+        .as_deref()
+        .unwrap_or("a program not visible to you");
+    let addrs: Vec<String> = l
+        .addrs
+        .iter()
+        .map(|a| SocketAddr::new(*a, l.port).to_string())
+        .collect();
+    let proto = if l.udp { "udp" } else { "tcp" };
+    format!("{program} on {}, {proto}", addrs.join(", "))
+}
+
 /// What a person must hear before `services` are shared (ADR-028 S-4): each one this machine
 /// listens for on every interface, which its networks reach with no Vox at all, and each on a
 /// well-known sensitive port.
@@ -1388,7 +1404,7 @@ async fn exposure_warnings(services: &[(u16, String)], at: Option<SocketAddr>) -
             out.push(format!(
                 "`{name}` ({}) listens on every interface of this machine, so its networks \
                  reach it without Vox; sharing it does not change that",
-                listing_line(l).trim()
+                said_in_a_sentence(l)
             ));
         }
         if let Some(what) = vox_core::node::probe::sensitive_port(port) {
@@ -1539,7 +1555,10 @@ pub async fn connect(
         "joined. `vox service list {}` shows what is shared here",
         short(&channel_id)
     );
-    println!("        reach a service as <service>.<node>.<room>.vox, with `vox up` running");
+    println!(
+        "        reach a service as <service>.<node>.<room>.vox through the daemon's proxy, \
+         running while a node is attached (`vox up` says where)"
+    );
     Ok(())
 }
 

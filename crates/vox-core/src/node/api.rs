@@ -1244,7 +1244,7 @@ impl Fault {
             }
             Fault::NoSuchForward => "no forward is listening at that local address",
             Fault::TunnelLimit => {
-                "16 tunnels are already open to this member\n       to free one: `vox tunnel close` it (`vox status` lists every tunnel, its number, and when it last moved), close the program using it, or restart the `vox up` or `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member"
+                "16 tunnels are already open to this member\n       to free one: `vox tunnel close` it (`vox status` lists every tunnel, its number, and when it last moved), or close the program using it, or the `vox forward` carrying it; on the host, `vox service remove` the service, or `vox trust remove` the member"
             }
             Fault::Internal => {
                 "an internal error — a bug in vox, not something you did\n       the node's log has the detail; please report it"
