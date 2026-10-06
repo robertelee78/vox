@@ -435,7 +435,8 @@ try:
     def focus(pane):
         """Tab until `pane`'s title says it has the focus."""
         for _ in range(4):
-            if any(f"{pane} [focus]" in r for r in tui.display()):
+            # The title may say more after the pane's name (the timeline's retention, #483).
+            if any(re.search(rf"\u250c{pane}[^\u2510]*\[focus\]", r) for r in tui.display()):
                 return
             tui.key("\t", 0.3)
         product(f"Tab never gave bob's {pane} the focus; screen:\n" + tui.text())
