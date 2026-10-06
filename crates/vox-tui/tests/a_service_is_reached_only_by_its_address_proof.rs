@@ -900,14 +900,32 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         None,
     );
     assert!(ok, "PRODUCT (staging): alice shares nas-www: {out}{err}");
-    let (_, alice_list) = listed(&alice_dir, &room, &["nas-www.".to_owned()]);
-    let www_canonical = alice_list
-        .lines()
-        .skip_while(|l| !l.trim_start().starts_with("nas-www."))
-        .nth(1)
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
+    // And a UDP service, which carol will ask for over TCP by its canonical address.
+    let dq_at = udp_echo("dq");
+    let (ok, out, err) = vox(
+        &alice_dir,
+        &["service", "add", &room, "udp/nas-dq", &dq_at.to_string()],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice shares nas-dq over UDP: {out}{err}"
+    );
+    let (_, alice_list) = listed(
+        &alice_dir,
+        &room,
+        &["nas-www.".to_owned(), "nas-dq.".to_owned()],
+    );
+    let canonical_of = |name: &str| {
+        alice_list
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with(&format!("{name}.")))
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let (www_canonical, dq_canonical) = (canonical_of("nas-www"), canonical_of("nas-dq"));
     let (alice_pid, bob_pid) = (pid_of(&alice_dir), pid_of(&bob_dir));
     assert!(
         www_canonical.len() == 52 * 3 + 6 && signal("STOP", alice_pid) && signal("STOP", bob_pid),
@@ -931,6 +949,12 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         "carol forward",
         &carol_dir,
         &args(&["forward", &www_canonical, "127.0.0.1:0"]),
+    );
+    // Asked while her copy still lacks nas-dq, so the forward carries only its fingerprint.
+    let mut wrong = VoxProc::spawn(
+        "carol forward nas-dq over tcp",
+        &carol_dir,
+        &args(&["forward", &dq_canonical, "127.0.0.1:0"]),
     );
     std::thread::sleep(Duration::from_secs(2));
     let _ = (signal("CONT", alice_pid), signal("CONT", bob_pid));
@@ -961,13 +985,23 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          of the room lacked the share, must reach alice's nas-www: alice's node holds its own \
          shares"
     );
-    // What the person reads is the share's name, not the fingerprint the address carried.
+    // What the person reads is the share's name, not the fingerprint the address carried: on the
+    // forwarding line, or on the line that follows once her log has it.
+    let www_fp = www_canonical
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let named = stale_fwd.line_within(Duration::from_secs(30), |l| {
+        l.contains(" to nas-www on ") || l.ends_with("forwards to nas-www")
+    });
     assert!(
-        stale_line
-            .as_deref()
-            .is_some_and(|l| l.contains(" to nas-www on ")),
+        named.is_some()
+            && stale_line
+                .as_deref()
+                .is_some_and(|l| !l.contains(&format!(" to {www_fp} "))),
         "PRODUCT: carol's `vox forward` by the canonical address must name the share it reached, \
-         nas-www, not its fingerprint: {stale_line:?}"
+         nas-www, never its fingerprint: {stale_line:?}, then {named:?}"
     );
     assert!(
         stale_answer
@@ -978,6 +1012,36 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         stale_fwd.transcript()
     );
     drop(stale_fwd);
+
+    // The transport is part of what the canonical address names: carol, whose copy of the room
+    // still lacks nas-dq, asks alice for it over TCP by its fingerprint, and alice, who shares it
+    // only over UDP, must refuse rather than serve a UDP service on a TCP tunnel.
+    let wrong_line = wrong.line_within(vox_core::node::up::HOST_PATIENCE, |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let wrong_answer = wrong_line.as_ref().and_then(|l| {
+        let at: SocketAddr = l.split_whitespace().nth(2)?.parse().ok()?;
+        let mut s = TcpStream::connect(at).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+        s.write_all(b"hello\n").ok()?;
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).ok()?;
+        Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+    });
+    let wrong_refused = wrong.line_within(Duration::from_secs(20), |l| {
+        l.contains("refused") || l.contains("shares it over UDP") || l.contains("not TCP")
+    });
+    eprintln!(
+        "carol, nas-dq over TCP by fingerprint: {wrong_line:?}; answered {wrong_answer:?}; said \
+         {wrong_refused:?}"
+    );
+    assert!(
+        wrong_answer.as_deref().unwrap_or_default().is_empty() && wrong_refused.is_some(),
+        "PRODUCT: a TCP forward of {dq_canonical}, alice's UDP-only share, must be refused, not \
+         carried to it: answered {wrong_answer:?}; carol's forward said:\n{}",
+        wrong.transcript()
+    );
+    drop(wrong);
 
     // (13) A readable part that names two things is refused, saying which: bob now calls carol
     // `Nas Box`, which as a label is `nas-box`, his name for alice too.

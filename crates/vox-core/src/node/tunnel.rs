@@ -155,9 +155,12 @@ pub async fn serve(
 
 /// The service a dialer's `label` names in `channel`, as `(the tag it is offered under, where it
 /// listens)`: by its tag, or by its share fingerprint (ADR-028 S-1, the `<service>` of a
-/// canonical address), alone or as `udp/<fingerprint>`. The host resolves the fingerprint itself
-/// because it alone always holds its own shares: a member whose copy of the room's log lacks the
-/// share (it slept while it was made) still reaches it by the canonical address.
+/// canonical address), as `<fingerprint>` for a TCP share or `udp/<fingerprint>` for a UDP one.
+/// The transport must match: a fingerprint names the share's name, which a TCP and a UDP share
+/// would have in common, and a request carried over one transport is never served by the other.
+/// The host resolves the fingerprint itself because it alone always holds its own shares: a
+/// member whose copy of the room's log lacks the share (it slept while it was made) still reaches
+/// it by the canonical address.
 fn offered_as(
     channel: &ChannelServices,
     channel_id: &Digest32,
@@ -167,17 +170,19 @@ fn offered_as(
     if let Some(at) = offered.get(label) {
         return Some((label.to_owned(), *at));
     }
+    let udp = label.starts_with("udp/");
     let fp =
         crate::node::link::b32_decode(label.strip_prefix("udp/").unwrap_or(label), "vox service")
             .ok()?;
     offered
         .iter()
         .find(|(tag, _)| {
-            crate::governance::share::service_fingerprint(
-                channel_id,
-                &channel.me,
-                crate::node::channel::service_name(tag),
-            ) == fp
+            crate::tunnel::udp::is_udp(tag) == udp
+                && crate::governance::share::service_fingerprint(
+                    channel_id,
+                    &channel.me,
+                    crate::node::channel::service_name(tag),
+                ) == fp
         })
         .map(|(tag, at)| (tag.clone(), *at))
 }
