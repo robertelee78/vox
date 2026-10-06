@@ -212,6 +212,19 @@ fn a_client_on_the_anchors_machine_needs_no_anchor_flag() {
         .map(|(fp, _)| fp.trim().to_owned())
         .unwrap_or_default();
 
+    // Listening on loopback only, it says its spec is for this machine, in the words a person
+    // uses: a node, never a "profile" (#428).
+    let here = anchor.expect_line("the anchor's this-machine-only spec", |l| {
+        l.starts_with("vox node: on this machine only")
+    });
+    assert!(
+        here == "vox node: on this machine only, for a node that reads another anchors file:"
+            && !anchor.seen.join("\n").to_lowercase().contains("profile"),
+        "PRODUCT: `vox node` must say its loopback spec is \"on this machine only, for a node that \
+         reads another anchors file:\" and never say \"profile\"; it said {here:?}:\n{}",
+        anchor.seen.join("\n")
+    );
+
     // A host in its own profile, on the same machine, with **no `--anchor`**.
     let mut host = Proc::spawn(
         "host",

@@ -128,7 +128,7 @@ impl Argon2Profile {
     pub fn from_id(id: u8) -> Result<Self> {
         match id {
             Self::PRODUCTION_ID => Ok(Self::PRODUCTION),
-            _ => Err(Error::MalformedAtRest("unknown argon2 profile id")),
+            _ => Err(Error::MalformedAtRest("unknown argon2 parameter set")),
         }
     }
 
@@ -164,7 +164,7 @@ impl Argon2Profile {
             self.p_cost,
             Some(FACTOR_PASS_LEN),
         )
-        .map_err(|_| Error::MalformedAtRest("invalid argon2 profile parameters"))
+        .map_err(|_| Error::MalformedAtRest("invalid argon2 parameters"))
     }
 }
 
@@ -492,7 +492,7 @@ impl SekWrap {
             return Err(Error::MalformedAtRest("sek wrap version"));
         }
         let profile_id = u8::try_from(d.uint().map_err(Error::from)?)
-            .map_err(|_| Error::MalformedAtRest("sek wrap profile id range"))?;
+            .map_err(|_| Error::MalformedAtRest("sek wrap parameter set out of range"))?;
         let salt: [u8; SALT_LEN] = d
             .bytes()
             .map_err(Error::from)?
