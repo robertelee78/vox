@@ -64,7 +64,9 @@
 //! - `trust`: the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
 //!   in the members pane opens the trust prompt showing his fingerprint; Dave's fingerprint pasted
 //!   there adds nothing, says not to trust him and shows both; Frank's own, pasted through the
-//!   `:trust` the hint offers, in groups and upper case, adds him and says so;
+//!   `:trust` the hint offers, in groups and upper case, adds him and says so once the identity
+//!   passphrase is typed into the prompt (`VOX_TEST_KEYRING_WINDOW_SECS` makes Bob's window a
+//!   minute, so it has closed): a wrong passphrase adds nothing and is never shown;
 //! - `unreach`: once every other member's daemon is stopped, it reads "○ offline";
 //! - `fewer`: the status bar then says "connected to 1 peer", the anchor alone (a count that was
 //!   not the node's stayed where it was);
@@ -111,6 +113,9 @@ mod watchdog;
 
 #[path = "support/pty_driver.rs"]
 mod pty_driver;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -172,6 +177,9 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // So the driver's budget is 1750 s, it is stopped from outside at 1780 s, and the watchdog is
     // past both. A release run takes about two minutes.
     watchdog::arm_for(Duration::from_secs(1880));
+    // Bob's keyring window is a minute, so the trust prompt's passphrase field is typed into
+    // (`trust`): the window is closed by then.
+    test_knobs::require(&["VOX_TEST_KEYRING_WINDOW_SECS"]);
     let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pty/tui_room_truth.py");
     let clock = StallClock::start();
     let out = pty_driver::run_within(
