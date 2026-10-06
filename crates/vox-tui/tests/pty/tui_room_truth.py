@@ -81,11 +81,11 @@ and exits 1. An exception in the driver itself prints `APPARATUS: driver crashed
 traceback and exits 2. Every process is recorded and killed by PID. Bounded throughout
 (`vox_pty.py`, V210-54).
 """
-import json, os, re, subprocess, sys, time, traceback
+import json, os, re, signal, subprocess, sys, time, traceback
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
+from vox_pty import Gone, Hung, Tui, arm, disarm, pane, pyte, stage  # noqa: E402
 
 # The colours the TUI is built from (ADR-028 L-1), read as pyte reads a cell: lowercase hex.
 TOKENS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -789,6 +789,17 @@ except Product as e:
 except Hung as h:
     print(f"{TAG} HUNG at {h}")
     code = 1
+except Gone as g:
+    # Nothing in the driver stops the TUI before the end: a signal that ended it came from
+    # outside the product (APPARATUS); a TUI that exited on its own, a panic included, is the
+    # product's red, quoted.
+    if g.signal is not None and g.signal in (signal.SIGTERM, signal.SIGKILL, signal.SIGHUP, signal.SIGINT):
+        print(f"{TAG} APPARATUS: the TUI was stopped from outside the driver: {g}")
+        code = 2
+    else:
+        print(f"{TAG} PRODUCT: bob's `vox tui` ended while in use: {g}")
+        print(f"{TAG} RED")
+        code = 1
 except subprocess.TimeoutExpired as t:
     # A `vox` verb that never returned is a red of its own, named, not a driver with no verdict.
     print(f"{TAG} RED: `vox {' '.join(t.cmd[1:3])}` did not return within {t.timeout:.0f} s")
