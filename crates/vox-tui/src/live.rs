@@ -593,7 +593,7 @@ impl DaemonCore {
                 .rooms
                 .iter()
                 .find(|r| r.channel_id == cid)
-                .and_then(|r| r.local_name.clone())
+                .and_then(|r| r.name.clone())
                 .unwrap_or_else(|| vox_core::node::link::b32_encode(&cid)[..12].to_owned());
             let note = crate::notify::Note {
                 title: format!("Vox: {room}"),
