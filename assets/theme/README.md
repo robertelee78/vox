@@ -8,8 +8,9 @@ L-1, L-2). Schema `vox-tokens/1`:
   "ansi16": <slot> }`, where a slot is `default-fg`, `default-bg`, `black`, `red`, `green`,
   `yellow`, `blue`, `magenta`, `cyan`, `white`, or one of those prefixed `bright-`.
 - `type`: the app's faces, each `{ "family", "weight": 100–900 }` with exactly one of `"system"`
-  (a system font role) or `"bundled"` (a font file the app ships), and optionally `"tracking"`
-  (em), `"uppercase"`, `"size"` (pt).
+  (a system font role: a text style the app follows the system's text size by, `body`, `title`,
+  `caption` and the rest of SwiftUI's `Font.TextStyle` names, or `monospaced`) or `"bundled"` (a
+  font file the app ships), and optionally `"tracking"` (em), `"uppercase"`, `"size"` (pt).
 - `motion`: numbers, by name (frame counts, milliseconds, damping).
 
 Who reads it:
