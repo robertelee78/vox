@@ -234,7 +234,8 @@ same trust model usable as ADR-014 under the same protocol guarantees; only pres
       be parsed so a script using it fails with that message. *Built.*
 16.2. The identity passphrase MUST be taken from `--identity-passphrase-file`, then
       `VOX_IDENTITY_PASSPHRASE` (read directly, not through clap's `env`), then an unechoed prompt.
-      *Built.*
+      *Built.* *Amended by ADR-028 K-13:* the file and the environment variable MAY serve attach
+      only; a keyring change MUST take its passphrase from the unechoed prompt.
 16.3. A tty-less, empty stdin MUST be refused rather than tried as an empty passphrase. *Built.*
 16.4. Every passphrase source (file, environment variable, prompt) MUST be resolved in the client;
       the daemon MUST NOT read a passphrase from its own environment (ADR-026 C-6). *Decided, not

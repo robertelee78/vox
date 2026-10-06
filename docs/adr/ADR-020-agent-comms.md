@@ -263,7 +263,9 @@ they are not a defence against one that lies.
   removes the registration, both through `vox agent hook`, printing nothing; `UserPromptSubmit`
   records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook activity MUST count
   as idle. *Built (ADR-026 L-2, L-3, D-3; #404, #405):* session registration and unregistration
-  move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly. A
+  move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly.
+  *Amended by ADR-028 K-13:* a hook MAY start the daemon but MUST NOT attach its node; it shows the
+  operator the attach command to run outside the session. A
   registered session is a holder of its node; when `SessionEnd` unregisters the last holder of a node
   attached implicitly, the daemon detaches it, atomically with the unregister.
 - **6.11** `agent_wake_hold`, `agent_busy_idle` and `agent_reply_nudges` are settings in the
@@ -414,8 +416,8 @@ they are not a defence against one that lies.
   (M19.5c). It MUST NOT lock on SIGHUP; SIGHUP stops it cleanly (ADR-016 NR-15). It is the node
   `vox room` and `vox agent hook` attach to.
 - **12.2** *Decided, not built (ADR-026):* `vox daemon` is the account's one daemon, not a node. It
-  takes no passphrase at start; nodes attach to it (by hand, implicitly from a request or a hook, or
-  from its `--keep` list) and all run concurrently. `vox room` and `vox agent hook` are its clients
+  takes no passphrase at start; nodes attach to it (by hand, implicitly from a session-holding
+  request or the TUI, or from its `--keep` list; never from a hook, ADR-028 K-13) and all run concurrently. `vox room` and `vox agent hook` are its clients
   and act as the node they name. 12.1 is replaced when this is built.
 
 ### Non-goals

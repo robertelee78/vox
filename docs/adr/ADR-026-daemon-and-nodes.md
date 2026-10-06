@@ -16,9 +16,11 @@ The daemon is the machine's Vox service, distinct from the nodes that use it, as
 multiplexer daemon serves many harnesses. A node is an identity: a person or an agent, never a
 device (ADR-002). Several nodes can live under one OS account: a person's node, and one node for each
 agent working beside them. Which nodes run on a machine changes over the day: an agent's session
-brings its node in and out, and the person can do the same by hand. Every node that is in runs in
+needs its node attached (by the operator, outside the session, ADR-028 K-13) and lets it go when
+it ends, and the person can attach and detach by hand. Every node that is in runs in
 full, side by side; naming a node matters only for an action done as it. Unlocking works as
-gpg-agent does: a node gets its passphrase once, when it attaches. The daemon owns the machine's one
+gpg-agent does: a node gets its passphrase once, when it attaches; a keyring change asks again
+unless one was typed for a keyring change in the last 30 minutes (ADR-028 K-12). The daemon owns the machine's one
 network presence from the start: there is no interim design with one socket per node.
 
 ## Requirements
@@ -63,7 +65,8 @@ network presence from the start: there is no interim design with one socket per 
   reserved and MUST be refused.
 - **N-2. No locked node.** There MUST be no locked state, and no lock or unlock request or event. A
   node MUST receive its passphrase once, when it attaches, and MUST run in full while attached: it
-  dials, accepts, syncs, serves, relays and publishes. Keyring changes (trust add, remove, rename)
+  dials, accepts, syncs, serves, relays and publishes. Keyring changes (trust add, remove, rename, a
+  capability change)
   MUST ask for the passphrase unless one was entered for a keyring change within the keyring window
   (30 minutes, V210-159); the passphrase given at attach MUST NOT open that window (ADR-028 K-12).
   Detaching is the only way a node stops. *Built (#409): there is no `Lock` command and no
@@ -163,8 +166,8 @@ network presence from the start: there is no interim design with one socket per 
 
 - **S-1.** `vox daemon` MUST run in the foreground. SIGHUP, SIGTERM, SIGINT and SIGQUIT MUST each
   detach every node cleanly and then stop the daemon.
-- **S-2. Auto-start.** A client that may attach a node (L-2: a session-holding verb, an agent's hook,
-  the TUI, `vox node attach`) and finds no daemon MUST start
+- **S-2. Auto-start.** A client that may attach a node (L-2: a session-holding verb, the TUI,
+  `vox node attach`), or an agent's hook, that finds no daemon MUST start
   `vox daemon --detach`, writing its stderr to `<data root>/.daemon/log` from its first line, and MUST
   wait up to 15 s for the socket. After that it MUST fail, saying the daemon did not start and naming
   the log's path. Concurrent starts MUST end with exactly one daemon (D-1).
