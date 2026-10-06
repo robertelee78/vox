@@ -632,8 +632,12 @@ try:
             if pred():
                 return True
         return False
-    for keys, secs in (("", 4), ("id pass\r", 4), ("\r", 2), ("room pass\r", 4), ("\r", 2)):
-        if keys: os.write(atui.fd, keys.encode())
+    # As unlock(), each passphrase typed only at its prompt, with both TUIs read meanwhile.
+    asks = lambda: "passphrase" in atui.text().lower()
+    for keys, secs, gated in (("", 4, False), ("id pass\r", 4, True), ("\r", 2, False),
+                              ("room pass\r", 4, True), ("\r", 2, False)):
+        if keys and (not gated or asks()):
+            os.write(atui.fd, keys.encode())
         both_until(lambda: False, secs)
     # The room's newest lines are the `quote` stage's f- lines by now, m- ones before it ran.
     if not both_until(lambda: re.search(r"[mf]-0", "\n".join(pane(atui.display(), "Timeline"))), 30):
