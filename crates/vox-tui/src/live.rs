@@ -116,6 +116,9 @@ pub struct DaemonCore {
     active: Option<Digest32>,
     /// Unread per room off screen, at three levels (ADR-028 R-8, #484).
     unread: BTreeMap<Digest32, RoomUnread>,
+    /// Rooms whose unread was counted, when the TUI first saw them open, from what the node
+    /// recorded as read (`Request::Unread`): before that, only the node's events count.
+    seeded: BTreeSet<Digest32>,
     /// Rooms off screen that rows have arrived in since the last frame, and how many rows: each
     /// is a notification to raise, once per room (ADR-028 R-10).
     arrived: BTreeMap<Digest32, usize>,
@@ -338,6 +341,7 @@ impl DaemonCore {
             asked: None,
             active: None,
             unread: BTreeMap::new(),
+            seeded: BTreeSet::new(),
             arrived: BTreeMap::new(),
             notified: BTreeSet::new(),
             notify_to,
@@ -868,6 +872,41 @@ impl DaemonCore {
         use vox_agentcomms::attention::{unread_level, UnreadLevel};
         let me = self.snapshot.me;
         let me_fp = me.map(|m| vox_core::node::link::b32_encode(&m));
+        // **What was unread before the TUI opened** (ADR-028 R-8): each room, the first time it is
+        // seen open off screen, is counted from the node's own record of what its person read.
+        // Without it, a message that came while the TUI was closed was never counted at all.
+        let unseeded: Vec<Digest32> = self
+            .snapshot
+            .open
+            .iter()
+            .map(|o| o.channel_id)
+            .filter(|cid| !self.seeded.contains(cid) && Some(*cid) != self.active)
+            .collect();
+        for cid in unseeded {
+            let Some(conn) = self.conn.as_mut() else {
+                return;
+            };
+            let asked = until_stopped(
+                &self.rt,
+                &self.stop,
+                conn.client.request(&Request::Unread { channel_id: cid }),
+            );
+            let Some(Ok(Frame::Rows { rows })) = asked else {
+                continue;
+            };
+            self.seeded.insert(cid);
+            let u = self.unread.entry(cid).or_default();
+            for r in &rows {
+                match unread_level(&r.text, me_fp.as_deref()) {
+                    UnreadLevel::ToYou => u.to_you += 1,
+                    UnreadLevel::New => u.new += 1,
+                    UnreadLevel::Coordination => u.coordination += 1,
+                }
+            }
+            if let Some(newest) = rows.last() {
+                u.cursor = Some(newest.entry_hash);
+            }
+        }
         let due: Vec<Digest32> = self
             .unread
             .iter()

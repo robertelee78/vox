@@ -44,9 +44,16 @@
 //! (`--to`). Asserted: mission reads "to you 1", chatty "1 new · 1 coordination" and nothing to
 //! bob, and Ctrl-N opens mission, the room with a message addressed to bob, passing over chatty.
 //!
+//! **What came while the TUI was closed** (ADR-028 R-8): bob's node, attached by hand, takes
+//! alice's next message to bob while no TUI runs; a TUI opened afterwards must read mission "to
+//! you 1" at once, counted from what bob's node recorded as read (`Request::Unread`), with no new
+//! event to count it from.
+//!
 //! Mutations: `--history now` for alice's grant, or the backfill on grant arrival removed —
 //! the row never renders and the badge stays at 0. An addressed message counted as plain new
 //! (`unread_level` never `ToYou`): mission reads "2 new", not "to you 1", and Ctrl-N opens nothing.
+//! A TUI that does not count what came while it was closed (no `Request::Unread` at its start):
+//! mission reads nothing once the TUI is opened again.
 
 #![cfg(unix)]
 
@@ -549,6 +556,59 @@ fn a_message_made_readable_by_its_key_counts_once_on_the_badge() {
          screen:\n{shown}"
     );
     println!("[proof] Ctrl-N opened mission, the room with a message to bob");
+
+    // ---- what came while the TUI was closed is counted when it opens (ADR-028 R-8) ----------
+    // Bob's node is kept attached by hand, so it takes alice's message while no TUI runs; the TUI
+    // is closed; alice writes to bob; once bob's node holds it, a new TUI opens on the list, and
+    // mission must read "to you 1" from what the node recorded as read, before any event.
+    let (ok, _, err) = vox_plain(&bob_dir, &["node", "attach", "default"], None);
+    assert!(ok, "PRODUCT (staging): bob's `vox node attach`: {err}");
+    drop(tui);
+    let (ok, _, err) = vox(
+        &alice_dir,
+        &[
+            "room",
+            "post",
+            &room,
+            "--to",
+            bob_fp.as_str(),
+            "--session",
+            "unread-proof",
+            "WHILE-CLOSED for bob",
+        ],
+        None,
+    );
+    assert!(ok, "PRODUCT (staging): alice posts WHILE-CLOSED: {err}");
+    let t0 = Instant::now();
+    while !vox(&bob_dir, &["room", "read", "--json", &room], None)
+        .1
+        .contains("WHILE-CLOSED")
+    {
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "CANNOT MEASURE: bob's node never held WHILE-CLOSED within 60 s"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let tui = Tui::spawn(&bob_dir);
+    let t0 = Instant::now();
+    let reopened = loop {
+        if let Some(m) = tui.line_for("mission") {
+            if m.contains("to you 1") {
+                break m;
+            }
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "PRODUCT: alice's message to bob came while his TUI was closed; opened again, the \
+             list must count it from what his node recorded as read, mission reading \"to you \
+             1\"; it reads {:?}\nscreen:\n{}",
+            tui.line_for("mission"),
+            tui.text()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    println!("[proof] opened after the TUI was closed: {reopened:?}");
 
     drop(tui);
     drop(alice);
