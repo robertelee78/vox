@@ -41,12 +41,14 @@
 //!   "not in keyring: trust to read each other", Dave, whom he trusts and who trusts nobody,
 //!   "waiting for the other side", and Alice "trusted both ways" (the pane said "consented" for
 //!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
-//!   refuses her key; V210-155);
+//!   refuses her key; V210-155); and no row of the pane names a verified, TOFU or key-changed
+//!   state, a consent or a block: one trust state, in the keyring or not (ADR-028 K-2, K-6, #473);
 //! - `look`: in truecolour, Alice's row reads "⇄ alice" (each trusts the other) and Dave's
 //!   "→ dave" (only Bob trusts him), both in text.primary bold, and Carol's "· <fingerprint>" in
 //!   text.secondary, not bold; the accent is on the focused members pane's border and nowhere
 //!   else (ADR-028 L-3, L-4; colours read from the token file);
-//! - `unknown`: `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command",
+//! - `unknown`: `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant` and
+//!   `:revoke` each answer "unknown command",
 //!   and the help line names none of them (they only said "not available yet"; V210-155);
 //! - `sync`: the status bar says how many peers the node is connected to, the anchor and at least
 //!   one member, so 2 or more (it said "idle" always);
@@ -89,7 +91,8 @@
 //! than "needs you", trust coloured with the accent (`look`, `depths`), or the snapshot's
 //! `consenting` list sent empty, so no member reads `⇄` (`look`, `depths`), a join line naming a
 //! trusted member that has not granted the newcomer (`newcomer`), a quote of the thread's root
-//! rather than `re`, or Enter on a reply not moving the selection. It passes only on the script's
+//! rather than `re`, Enter on a reply not moving the selection, or a trusted member shown as
+//! "verified" (`consent`). It passes only on the script's
 //! PASS with all 26 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,

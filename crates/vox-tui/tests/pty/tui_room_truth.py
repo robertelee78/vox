@@ -35,6 +35,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             whom he did and who trusts him, "trusted both ways" (ADR-028 R-5, #481;
             V210-155: once
             "? unverified" on every row and "← in-only" for Carol, though nothing comes in from her);
+            and no row of the members pane names a verified, TOFU or key-changed state, a consent
+            or a block: one trust state, in the keyring or not (ADR-028 K-2, K-6, #473);
   look      in truecolour, Alice's row is "⇄ alice" (each trusts the other) and Dave's "→ dave" (only
             Bob trusts him), both in text.primary bold, and Carol's "· <her fingerprint>" in
             text.secondary, not bold (ADR-028 L-4); the accent is on the focused
@@ -51,7 +53,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             again;
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
-  unknown   `:show`, `:hide`, `:block`, `:unblock` and `:verify` each answer "unknown command", and
+  unknown   `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant` and `:revoke`
+            each answer "unknown command", and
             the help line names none of them: the TUI offers only what vox supports (V210-155);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
             one member, so 2 or more (it said "idle" always);
@@ -553,9 +556,13 @@ try:
         product(f"bob trusts alice, and his `vox tui` members pane never showed her {ALICE!r} "
                 "within 60 s: " + repr(label_of("alice")[0]))
     carol_label, dave_label = label_of("carol")[0], label_of("dave")[0]
-    claim("consent", bare(carol_label) == CAROL and bare(dave_label) == DAVE,
+    # One trust state (ADR-028 K-2, K-6, #473): in the keyring or not. No row of the pane names a
+    # verified, TOFU or key-changed state, a consent, or a block.
+    STATES = ("verified", "tofu", "key changed", "consent", "block")
+    stated = [r.strip() for r in members_pane() if any(w in r.lower() for w in STATES)]
+    claim("consent", bare(carol_label) == CAROL and bare(dave_label) == DAVE and not stated,
           f"alice: {label_of('alice')[0].strip()!r}; carol: {carol_label.strip()!r}; "
-          f"dave: {(dave_label or '').strip()!r}")
+          f"dave: {(dave_label or '').strip()!r}; rows naming another trust state: {stated!r}")
 
     stage("look")
     # Alice's key reaches Bob once her node has released it: wait for her ⇄ before judging.
@@ -703,7 +710,7 @@ try:
     # an "unknown command" seen is this command's answer and not the one before it.
     def bottom():
         return "\n".join(r.rstrip() for r in tui.display()[-3:])
-    REMOVED = ("show", "hide", "block", "unblock", "verify")
+    REMOVED = ("show", "hide", "block", "unblock", "verify", "consent", "grant", "revoke")
     answers = {}
     for c in REMOVED:
         tui.key(":link\r", 2)
