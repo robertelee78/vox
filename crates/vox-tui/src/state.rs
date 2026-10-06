@@ -466,17 +466,18 @@ impl UiState {
                             return Action::Redraw;
                         }
                     };
-                    let text = if to.is_empty() {
-                        text
-                    } else {
-                        let mut e = vox_agentcomms::envelope::Envelope::say(&text);
-                        e.to = to;
-                        e.to_text()
-                    };
+                    // Whom `@alias` names (K-4) join the To: (W-4): both are addressing.
+                    for fp in to {
+                        if let Ok(id) = vox_core::node::link::b32_decode(&fp, "member") {
+                            if !self.to.contains(&id) {
+                                self.to.push(id);
+                            }
+                        }
+                    }
                     self.composer.clear();
                     let re = self.replying.take();
-                    // With To: or urgent set, the message goes the one way a structured message
-                    // is posted, as `vox room post --to … --urgent` posts it (ADR-028 W-4).
+                    // Addressed or urgent, the message goes the one way a structured message is
+                    // posted, as `vox room post --to … --urgent` posts it (ADR-028 W-4).
                     if !self.to.is_empty() || self.urgent {
                         let to = std::mem::take(&mut self.to);
                         let urgent = std::mem::replace(&mut self.urgent, false);
