@@ -43,9 +43,15 @@
 //! Every red says PRODUCT, with what the product sent or said, or APPARATUS, naming the staging
 //! that was not achieved.
 //!
+//! 7. **an urgent share wakes as an urgent message does** (ADR-028 F-6): alice shares a file
+//!    `--to` bob's node `--urgent -m <note>`; `cc` and `oc` are woken within [`WITHIN`] by a notice
+//!    carrying none of it, and each session's turns give it the note and the local path of the
+//!    copy bob's node pulled by itself, which holds the shared bytes. `oc` takes its turn as soon
+//!    as it is woken, so the copy may not have landed yet, and its next turn says where it did.
+//!
 //! **Mutation**, one per claim: a Codex wake that starts `codex exec` (red at 4); the message put
 //! back in the notice (red at 2); the daemon waking only on its own appends, never on an entry
-//! synced from a peer, as before F15 (red at 1).
+//! synced from a peer, as before F15 (red at 1); the drain omits the copy's path (red at 7).
 
 #![cfg(unix)]
 
@@ -206,6 +212,51 @@ fn opencode_notice(prompt: &str) -> String {
         .ok()
         .and_then(|v| v["text"].as_str().map(str::to_owned))
         .unwrap_or_default()
+}
+
+/// What a turn injected: Claude Code's `additionalContext`, or the plain text another harness gets.
+fn context_of(out: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(out.trim())
+        .ok()
+        .and_then(|v| {
+            v["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| out.to_owned())
+}
+
+/// The local paths a turn gave for pulled copies: after "pulled to " or "is pulled: ".
+fn paths_in(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            l.split_once("pulled to ")
+                .or_else(|| l.split_once("is pulled: "))
+                .map(|(_, p)| p.trim().to_owned())
+        })
+        .collect()
+}
+
+/// When a pulled copy named `name` appeared in the node's files directory, if it did within
+/// `within`.
+fn until_landed(
+    paths: &vox_core::node::paths::Paths,
+    name: &str,
+    within: Duration,
+) -> Option<Duration> {
+    let start = Instant::now();
+    while start.elapsed() < within {
+        let found = std::fs::read_dir(paths.files_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|room| room.path().join(name).exists());
+        if found {
+            return Some(start.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    None
 }
 
 /// Record a failed claim and carry on, so one mutant shows every red.
@@ -497,6 +548,81 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
         spread(&oc_lat),
         WITHIN.as_secs()
     );
+
+    // ---- (7) an urgent share wakes as an urgent message does, and the drain gives the note and
+    // the local path of the copy bob's node pulled (ADR-028 F-6) ----
+    let shared_bytes = "R16-SHARED-BYTES the report bob asked for";
+    let shared = tmp.path().join("report-for-bob.txt");
+    std::fs::write(&shared, shared_bytes).expect("APPARATUS: the file alice shares");
+    let note = "SHARE-NOTE-R16 the numbers you asked for";
+    let shared_at = Instant::now();
+    let o = alice.vox_in(
+        None,
+        &[
+            "share",
+            &room,
+            shared.to_str().expect("APPARATUS: a UTF-8 path"),
+            "--to",
+            &bob_fp,
+            "--urgent",
+            "-m",
+            note,
+        ],
+        None,
+    );
+    assert!(o.ok, "PRODUCT (staging): alice's `vox share`: {o:?}");
+    let cc_got = cc_inbox.recv_timeout(PATIENCE).ok();
+    let oc_got = oc_inbox.recv_timeout(PATIENCE).ok();
+    let cc_at = cc_got.as_ref().map(|(t, _)| (*t - shared_at).as_secs_f64());
+    let oc_at = oc_got
+        .as_ref()
+        .map(|(t, ..)| (*t - shared_at).as_secs_f64());
+    let cc_frame = cc_got.map(|(_, f)| f).unwrap_or_default();
+    let oc_prompt = oc_got.map(|(_, _, p)| p).unwrap_or_default();
+    // oc's turn right after its wake, whether or not the copy has landed; cc's once it has.
+    let oc_first = context_of(&oc_turn());
+    let landed = until_landed(&bob.paths, "report-for-bob.txt", PATIENCE);
+    let cc_after = context_of(&cc_turn(&claude_notice(&cc_frame).unwrap_or_default()));
+    let oc_after = context_of(&oc_turn());
+    println!(
+        "[proof] (7) share: cc woken after {cc_at:?} s, oc after {oc_at:?} s; copy landed at \
+         {landed:?}; oc's first turn: {oc_first:?}; cc's turn after it landed: {cc_after:?}; oc's \
+         next turn: {oc_after:?}"
+    );
+    for (who, at, notice) in [
+        (
+            "cc (Claude Code)",
+            cc_at,
+            claude_notice(&cc_frame).unwrap_or_default(),
+        ),
+        ("oc (OpenCode)", oc_at, opencode_notice(&oc_prompt)),
+    ] {
+        check(
+            &mut failures,
+            at.is_some_and(|s| s <= WITHIN.as_secs_f64())
+                && notice.contains("1 urgent message addressed to you from alice")
+                && !notice.contains("SHARE-NOTE"),
+            format!(
+                "PRODUCT (7): an urgent share must wake {who} within {} s as an urgent message \
+                 does, by a notice carrying none of it; woken after {at:?} s with {notice:?}",
+                WITHIN.as_secs()
+            ),
+        );
+    }
+    let holds_copy = |path: &str| std::fs::read_to_string(path).is_ok_and(|b| b == shared_bytes);
+    let oc_turns = format!("{oc_first}\n{oc_after}");
+    for (who, text) in [("cc", cc_after.as_str()), ("oc", oc_turns.as_str())] {
+        let paths = paths_in(text);
+        check(
+            &mut failures,
+            text.contains(note) && paths.iter().any(|p| holds_copy(p)),
+            format!(
+                "PRODUCT (7): {who}'s turns must give it the share's note and the local path of \
+                 the copy bob's node pulled, holding the shared bytes; it was given the paths \
+                 {paths:?} in: {text:?}"
+            ),
+        );
+    }
 
     // ---- (4) and (5): Codex ----
     let codex_calls = std::fs::read_to_string(&ran).unwrap_or_default();
