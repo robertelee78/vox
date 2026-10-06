@@ -425,7 +425,7 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         l.starts_with("sharing ") && l.contains(&format!(":{} as ", ssh_at.port()))
     });
     let printed_ssh = printed_line
-        .split(" as ")
+        .split(" — ")
         .nth(1)
         .and_then(|a| a.split_whitespace().next())
         .unwrap_or_default()

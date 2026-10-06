@@ -1200,7 +1200,8 @@ pub async fn serve(
                 format!(" ({}{proto})", s.kind)
             })
             .unwrap_or_default();
-        println!("sharing {endpoint} as {address}{said}");
+        // Its name for reading, and the canonical address to copy (ADR-028 S-1).
+        println!("sharing {endpoint} as {name} — {address}{said}");
     }
     // **Who can reach it, by name, and who in the room cannot** (ADR-017 4.2): the reach rule is
     // the host's keyring — a member reaches the service once this node trusts it — so each list
