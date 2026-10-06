@@ -910,6 +910,14 @@ pub fn run(check_only: bool, rollback: bool) -> Result<(), AppError> {
              Silicon Macs on macOS 13 or later)",
         ));
     }
+    // On macOS vox ships inside Vox.app (ADR-014); a standalone install keeps updating as it is,
+    // and is told once per run how to move.
+    if cfg!(target_os = "macos") && matches!(installed, Channel::Standalone { .. }) {
+        println!(
+            "vox: on a Mac, vox now comes with Vox.app; to move to it, run the installer again: \
+             curl -fsSL https://raw.githubusercontent.com/{REPO}/main/install.sh | sh"
+        );
+    }
 
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
         .map_err(|_| usage("this binary's own version is not SemVer"))?;

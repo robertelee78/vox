@@ -743,9 +743,9 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 .args(["node", "--listen", "127.0.0.1:0"])
                 .env("VOX_DATA_DIR", &scratch)
                 .env("VOX_CONFIG_DIR", scratch.join("cfg"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .spawn()
                 .staged();
             std::thread::sleep(std::time::Duration::from_secs(2));

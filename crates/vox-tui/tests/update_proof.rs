@@ -908,6 +908,88 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         ));
     }
 
+    // ---- a bundle a running vox came from is not removed from under it ---------------------
+    // After one update the previous bundle is the one a not-yet-restarted daemon runs from; the
+    // next update replaces that previous bundle, and must keep it until nothing runs from it.
+    {
+        let tmp = tmpdir();
+        let home = tmp.path();
+        let link = bundle_install(home, Some("stable"));
+        let apps = home.join("Apps");
+        let first = vox(&link, home, &["update"], &base);
+        let from = apps.join(".Vox.app.previous/Contents/Helpers/vox");
+        let scratch = home.join("a-node");
+        std::fs::create_dir_all(scratch.join("cfg")).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+        let mut runner = std::process::Command::new(&from)
+            .args(["node", "--listen", "127.0.0.1:0"])
+            .env("VOX_DATA_DIR", &scratch)
+            .env("VOX_CONFIG_DIR", scratch.join("cfg"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| {
+                panic!("APPARATUS: could not run vox from the previous bundle: {e}")
+            });
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let alive = runner.try_wait().ok().flatten().is_none();
+        // The active bundle's helper is the release's version stub; the next update is run by a
+        // vox of the version before it, so this build goes in its place.
+        copy(Path::new(VOX), &apps.join("Vox.app/Contents/Helpers/vox"));
+        let second = vox(&link, home, &["update"], &base);
+        let retired = |apps: &Path| -> Vec<PathBuf> {
+            std::fs::read_dir(apps)
+                .map(|d| {
+                    d.filter_map(Result::ok)
+                        .map(|e| e.path())
+                        .filter(|p| {
+                            p.file_name().is_some_and(|n| {
+                                n.to_string_lossy().starts_with(".Vox.app.retired.")
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let kept = retired(&apps);
+        let kept_whole = kept
+            .iter()
+            .any(|r| r.join("Contents/Helpers/vox").is_file());
+        let still = runner.try_wait().ok().flatten().is_none();
+        let _ = runner.kill();
+        let _ = runner.wait();
+        copy(Path::new(VOX), &apps.join("Vox.app/Contents/Helpers/vox"));
+        let third = vox(&link, home, &["update", "--rollback"], &base);
+        let left = retired(&apps);
+        if first.status.success() && alive {
+            claims.push(claim(
+                "bundle.keeps_a_bundle_a_daemon_runs_from",
+                second.status.success()
+                    && kept_whole
+                    && still
+                    && third.status.success()
+                    && left.is_empty(),
+                format!(
+                    "the second update (exit_ok={}) kept the bundle the running vox came from as \
+                     {kept:?}={kept_whole}, it still running={still}; after it stopped, --rollback \
+                     (exit_ok={}) left {left:?}; the second update said {:?}",
+                    second.status.success(),
+                    third.status.success(),
+                    said(&second)
+                ),
+            ));
+        } else {
+            claims.push(blocked(
+                "bundle.keeps_a_bundle_a_daemon_runs_from",
+                format!(
+                    "staging: the first update exit_ok={}, a vox running from the previous bundle \
+                     alive={alive}",
+                    first.status.success()
+                ),
+            ));
+        }
+    }
+
     // ---- a Vox.app install.sh did not make is not touched (M-29) ---------------------------
     {
         let tmp = tmpdir();

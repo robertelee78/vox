@@ -206,7 +206,79 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
     // The swap left the replaced bundle under the partial name.
     fs::rename(&staged, &previous).map_err(AppError::Io)?;
     sync_dir(apps)?;
+    // The bundle that was previous before this publish goes, unless something still runs from
+    // it: then it is retired, and a later transition removes it (see [`sweep`]).
+    let older = journal.join(BUNDLE);
+    if fs::symlink_metadata(&older).is_ok() {
+        if in_use(&older) {
+            retire(apps, &older)?;
+        } else {
+            clear(&older)?;
+        }
+    }
     clear(&journal)
+}
+
+/// Bundles retired by earlier transitions while code from them was running: `.Vox.app.retired.*`.
+const RETIRED_PREFIX: &str = ".Vox.app.retired.";
+
+/// Rename `bundle` aside as retired: a daemon not restarted since an earlier update runs from it.
+fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = format!("{RETIRED_PREFIX}{secs}.{}", std::process::id());
+    fs::rename(bundle, apps.join(name)).map_err(AppError::Io)
+}
+
+/// Remove the retired bundles nothing runs from any more.
+fn sweep(apps: &Path) -> Result<(), AppError> {
+    let Ok(entries) = fs::read_dir(apps) else {
+        return Ok(());
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let retired = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(RETIRED_PREFIX);
+        if retired && !in_use(&entry.path()) {
+            clear(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether any process runs one of `bundle`'s executables, as `lsof` reports it. When `lsof`
+/// cannot say, the bundle is taken to be in use: kept is the safe side.
+fn in_use(bundle: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut files = Vec::new();
+    let mut dirs = vec![bundle.join("Contents")];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_dir() {
+                dirs.push(entry.path());
+            } else if meta.is_file() && meta.permissions().mode() & 0o100 != 0 {
+                files.push(entry.path());
+            }
+        }
+    }
+    if files.is_empty() {
+        return false;
+    }
+    // The pids, not the status: lsof exits 1 when any one file named is not open.
+    Command::new("/usr/sbin/lsof")
+        .arg("-t")
+        .args(&files)
+        .env_clear()
+        .output()
+        .map_or(true, |out| !out.stdout.is_empty())
 }
 
 /// Finish or undo a publish that was cut short (see [`publish`]); nothing when none was. Run
@@ -218,6 +290,7 @@ fn publish(apps: &Path, version: &str) -> Result<(), AppError> {
 /// the unpublished candidate, and goes. Either way the journal's earlier previous bundle comes
 /// back when nothing has taken its place.
 fn recover(apps: &Path) -> Result<(), AppError> {
+    sweep(apps)?;
     let journal = apps.join(PUBLISHING);
     if fs::symlink_metadata(&journal).is_err() {
         return Ok(());
