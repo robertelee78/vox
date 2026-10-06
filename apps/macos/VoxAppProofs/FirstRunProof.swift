@@ -16,8 +16,9 @@
 //    inspector lists bob with his trust glyph; the status bar says the node, its peers and the
 //    keyring window.
 // 4. Read each way (ADR-028 R-6, ADR-014 M-14, #441): bob's message, drawn in alice's timeline,
-//    is read, and bob's `vox room read --json` says alice read it; a message alice posts, read by
-//    bob's agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
+//    is read, and bob's `vox room read --json` says alice read it; one bob posts while alice's
+//    app is hidden is not read, until she brings it back; a message alice posts, read by bob's
+//    agent drain (`vox agent hook`), shows "read by bob" under it in her timeline.
 // 5. The keyring view (ADR-014 M-16, ADR-028 K-3, E-5, #443): a pasted fingerprint with an alias
 //    says what trusting does before it is done, and is listed, as `vox trust list` lists it;
 //    removing it says what untrusting does first, and only then removes it.
@@ -26,7 +27,7 @@
 // Mutants: the app attaches its node so that it outlives the app (the daemon's explicit attach in
 // place of the app's hold), and quitting leaves it attached: (6) goes red. A room with a message
 // addressed to this node grouped as quiet (`attention::group`): (3) goes red. The timeline drops
-// the read-by line: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red.
+// the read-by line, or marks rows read while the window is hidden: (4) goes red. Remove untrusts at once, saying nothing first: (5) goes red.
 
 import XCTest
 
@@ -193,6 +194,41 @@ final class FirstRunProof: XCTestCase {
         }
         XCTAssertTrue(readByAlice.contains("alice"),
                       "PRODUCT: bob's message drawn in alice's timeline must be read: bob's `vox room read --json` must say alice read it; it says read_by \(readByAlice)")
+        // Hidden (⌘H), alice's app shows nobody bob's next message: it is not read.
+        ui.typeKey("h", modifierFlags: .command)
+        XCTAssertTrue(ui.wait(for: .runningBackground, timeout: 10),
+                      "APPARATUS: ⌘H did not hide the app")
+        try staged(vox, ["room", "post", "--node", "bob", room, "WHILE-HIDDEN"], env: voxEnv)
+        func readBy(_ text: String) -> [String]? {
+            let rows = run(vox, ["room", "read", "--node", "bob", "--json", room], env: voxEnv).out
+            for line in rows.split(separator: "\n") {
+                guard let row = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                      (row["text"] as? String)?.contains(text) == true else { continue }
+                return row["read_by"] as? [String] ?? []
+            }
+            return nil
+        }
+        // Long enough for the message to reach alice's node and her app, and for a read record to
+        // come back, had one been posted.
+        var whileHidden: [String]? = nil
+        let hiddenUntil = Date().addingTimeInterval(15)
+        while Date() < hiddenUntil {
+            whileHidden = readBy("WHILE-HIDDEN")
+            if whileHidden?.contains("alice") == true { break }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        XCTAssertFalse(whileHidden?.contains("alice") ?? false,
+                       "PRODUCT: a message that arrived while alice's app was hidden must not be read; bob's `vox room read --json` says read_by \(whileHidden ?? [])")
+        ui.activate()
+        var shownAgain: [String] = []
+        let backUntil = Date().addingTimeInterval(60)
+        while Date() < backUntil {
+            shownAgain = readBy("WHILE-HIDDEN") ?? []
+            if shownAgain.contains("alice") { break }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        XCTAssertTrue(shownAgain.contains("alice"),
+                      "PRODUCT: once alice's app is in front again, the message on screen must be read; bob's `vox room read --json` says read_by \(shownAgain)")
         // Alice posts; bob's agent reads it in a drain, as a harness does before every prompt.
         let compose = ui.textFields["compose"]
         XCTAssertTrue(compose.waitForExistence(timeout: 10), "PRODUCT: the room has no field to post")

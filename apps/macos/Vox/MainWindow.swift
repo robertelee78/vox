@@ -102,6 +102,9 @@ private struct RoomView: View {
     @ObservedObject var model: NodeModel
     let room: String
     @State private var draft = ""
+    @StateObject private var window = WindowSeen()
+    /// The rows inside the visible part of the timeline, as last measured.
+    @State private var inView: Set<String> = []
 
     var body: some View {
         HStack(spacing: 0) {
@@ -115,16 +118,42 @@ private struct RoomView: View {
                     }
                     Divider()
                 }
-                ScrollViewReader { scroller in
-                    List(model.messages, id: \.id) { message in
-                        MessageRow(message: message, me: model.me,
-                                   readBy: model.readBy[message.id] ?? [])
-                            .onAppear { model.drawn(message) }
-                    }
-                    .onChange(of: model.messages.count) { _ in
-                        if let last = model.messages.last { scroller.scrollTo(last.id, anchor: .bottom) }
+                GeometryReader { viewport in
+                    ScrollViewReader { scroller in
+                        // A scroll view of its own, not a List: a List's rows are cells whose frames
+                        // do not measure in this coordinate space, so what is in view could not be
+                        // told.
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 10) {
+                                ForEach(model.messages, id: \.id) { message in
+                                    MessageRow(message: message, me: model.me,
+                                               readBy: model.readBy[message.id] ?? [])
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .reportsFrame(of: message.id)
+                                        .id(message.id)
+                                }
+                            }
+                            .padding(12)
+                        }
+                        .coordinateSpace(name: "timeline")
+                        .onPreferenceChange(RowFrames.self) { frames in
+                            // Seen: at least half of the row inside the timeline's bounds.
+                            let bounds = CGRect(origin: .zero, size: viewport.size)
+                            inView = Set(frames.compactMap { id, frame in
+                                let shown = frame.intersection(bounds)
+                                return !shown.isNull && shown.height * 2 >= frame.height ? id : nil
+                            })
+                            markSeen()
+                        }
+                        .onChange(of: model.messages.count) { _ in
+                            if let last = model.messages.last {
+                                scroller.scrollTo(last.id, anchor: .bottom)
+                            }
+                        }
                     }
                 }
+                .background(WindowReader(seen: window))
+                .onChange(of: window.seen) { _ in markSeen() }
                 Divider()
                 TextField("Say something to the room", text: $draft)
                     .textFieldStyle(.plain)
@@ -139,6 +168,14 @@ private struct RoomView: View {
             Divider()
             Inspector(model: model, room: room)
                 .frame(width: 240)
+        }
+    }
+
+    /// The rows in view are read, only while the window is in front of the person (R-6).
+    private func markSeen() {
+        guard window.seen else { return }
+        for message in model.messages where inView.contains(message.id) {
+            model.drawn(message)
         }
     }
 }
