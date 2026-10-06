@@ -1787,8 +1787,27 @@ pub async fn forward_named(
         short(&host),
         first_attempt.elapsed().as_millis()
     );
+    // **A name, never a raw fingerprint** (ADR-028 S-1a): a canonical address names its service
+    // by fingerprint, and the host resolved it, but the person reads the share's name. It is on
+    // the room's log, which a node that was behind reads within moments of reaching the host.
+    let mut shown = service.clone();
+    let named_by = Instant::now() + Duration::from_secs(3);
+    while vox_core::node::link::b32_decode(&shown, "vox service").is_ok()
+        && Instant::now() < named_by
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Ok(r) = vox_core::node::nameipc::resolve(&held.at, name).await {
+            shown = r.service;
+        }
+    }
+    let shown = if vox_core::node::link::b32_decode(&shown, "vox service").is_ok() {
+        "the service that address names (its name is not on this node's copy of the room yet)"
+            .to_owned()
+    } else {
+        shown
+    };
     println!(
-        "vox: forwarding {bound} to {service} on {name} ({})",
+        "vox: forwarding {bound} to {shown} on {name} ({})",
         short(&host)
     );
     println!("Ctrl-C to stop");

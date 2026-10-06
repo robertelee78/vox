@@ -960,6 +960,14 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
          of the room lacked the share, must reach alice's nas-www: alice's node holds its own \
          shares"
     );
+    // What the person reads is the share's name, not the fingerprint the address carried.
+    assert!(
+        stale_line
+            .as_deref()
+            .is_some_and(|l| l.contains(" to nas-www on ")),
+        "PRODUCT: carol's `vox forward` by the canonical address must name the share it reached, \
+         nas-www, not its fingerprint: {stale_line:?}"
+    );
     assert!(
         stale_answer
             .as_deref()
