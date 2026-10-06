@@ -1412,6 +1412,11 @@ pub struct SharedService {
     pub udp: bool,
     /// What its sharer's node detected it to be (ADR-028 S-2).
     pub kind: String,
+    /// Whether the sharer trusts this node, as the room's log says (it consents to this node
+    /// reading it): reach is the sharer's decision (ADR-017 decision 3).
+    pub trusts_you: bool,
+    /// Whether this node holds a live connection to the sharer now.
+    pub online: bool,
 }
 
 /// What the node sends.
@@ -1678,12 +1683,14 @@ impl Frame {
                 }
                 e.array(shared.len());
                 for s in shared {
-                    e.array(5)
+                    e.array(7)
                         .text(&s.address)
                         .text(&s.canonical)
                         .text(&s.by)
                         .uint(u64::from(s.udp))
-                        .text(&s.kind);
+                        .text(&s.kind)
+                        .uint(u64::from(s.trusts_you))
+                        .uint(u64::from(s.online));
                 }
             }
             Frame::Shares { shares } => {
@@ -2215,7 +2222,7 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
             for _ in 0..count {
                 if d.array()
                     .map_err(|_| Error::MalformedIpc("ipc shared row"))?
-                    != 5
+                    != 7
                 {
                     return Err(Error::MalformedIpc("ipc shared row arity"));
                 }
@@ -2227,12 +2234,22 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                     .map_err(|_| Error::MalformedIpc("ipc shared udp"))?
                     != 0;
                 let kind = text(d, "ipc shared kind")?;
+                let trusts_you = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc shared trusts you"))?
+                    != 0;
+                let online = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc shared online"))?
+                    != 0;
                 shared.push(SharedService {
                     address,
                     canonical,
                     by,
                     udp,
                     kind,
+                    trusts_you,
+                    online,
                 });
             }
             return Ok(Frame::Services {

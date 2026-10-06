@@ -342,15 +342,125 @@ pub fn named_spec(spec: &str) -> Result<(u16, String), AppError> {
     Ok((port, tag))
 }
 
-/// What `vox service list` prints, from a node this verb opened or from the daemon: the services
-/// shared in the room by every member, each with its address as this node writes it and who
-/// shared it (V030-25), then what this node itself offers there and where.
+/// The ready-to-copy commands for one shared service, by its kind (ADR-028 S-3): each
+/// `(what it is, the command)`, every one carrying the **canonical** address (S-1) so it works
+/// pasted on any member's machine. `ssh` and a URL go through the `.vox` proxy; a forward does not.
+#[must_use]
+pub fn service_commands(s: &vox_core::node::ipc::SharedService) -> Vec<(&'static str, String)> {
+    let c = &s.canonical;
+    match s.kind.as_str() {
+        "ssh" => vec![
+            ("ssh", format!("ssh $USER@{c}")),
+            ("forward", format!("vox forward {c} 127.0.0.1:2222")),
+            ("then", "ssh -p 2222 $USER@127.0.0.1".to_owned()),
+        ],
+        scheme @ ("http" | "https") => {
+            let port = if scheme == "http" { 8080 } else { 8443 };
+            vec![
+                ("open", format!("{scheme}://{c}/")),
+                ("forward", format!("vox forward {c} 127.0.0.1:{port}")),
+                ("then", format!("{scheme}://127.0.0.1:{port}/")),
+            ]
+        }
+        "dns" => vec![("forward", format!("vox forward {c} 127.0.0.1:5353"))],
+        // A forward picks a free port and says which.
+        _ => vec![("forward", format!("vox forward {c} 127.0.0.1:0"))],
+    }
+}
+
+/// What one shared service needs to be reached from here, and whether each holds (ADR-028 S-3):
+/// `(the condition, holds, what to do when it does not)`.
+#[must_use]
+pub fn service_needs(
+    s: &vox_core::node::ipc::SharedService,
+    proxy: &Result<SocketAddr, String>,
+) -> Vec<(String, bool, String)> {
+    let who = if s.by == "you" { "you" } else { s.by.as_str() };
+    let mut needs = vec![
+        (
+            format!("{who} trusts this node"),
+            s.trusts_you,
+            format!("{who} must trust this node: `vox trust add <this node's fingerprint>` there"),
+        ),
+        (
+            "this node is attached".to_owned(),
+            true,
+            "`vox node attach`".to_owned(),
+        ),
+    ];
+    // A forward carries without the proxy; ssh by address and a URL go through it.
+    if matches!(s.kind.as_str(), "ssh" | "http" | "https") {
+        needs.push(match proxy {
+            Ok(at) => (
+                format!("the .vox proxy is running on {at}"),
+                true,
+                String::new(),
+            ),
+            Err(why) => (
+                "the .vox proxy is running".to_owned(),
+                false,
+                format!("not running: {why}"),
+            ),
+        });
+    }
+    needs.push((
+        format!("{who} is online"),
+        s.online,
+        format!("{who} is not reachable now; it is reached when it comes back"),
+    ));
+    needs
+}
+
+/// What `vox service list` prints, from the daemon: the services shared in the room by every
+/// member, each with its readable address and its canonical one beneath it (V030-25, ADR-028
+/// S-1, S-3), who shared it, the commands to reach it and what those need; then what this node
+/// itself offers there and where. With `json`, the same as one JSON object, every address in it
+/// canonical.
 pub fn print_services(
     room: &str,
     channel_id: &Digest32,
     services: &[(String, String)],
     shared: &[vox_core::node::ipc::SharedService],
+    proxy: &Result<SocketAddr, String>,
+    json: bool,
 ) {
+    if json {
+        let rows: Vec<serde_json::Value> = shared
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "address": s.canonical,
+                    "readable": s.address,
+                    "by": s.by,
+                    "kind": s.kind,
+                    "udp": s.udp,
+                    "commands": service_commands(s)
+                        .into_iter()
+                        .map(|(what, command)| serde_json::json!({"what": what, "command": command}))
+                        .collect::<Vec<_>>(),
+                    "needs": service_needs(s, proxy)
+                        .into_iter()
+                        .map(|(need, holds, otherwise)| {
+                            serde_json::json!({"need": need, "holds": holds, "otherwise": otherwise})
+                        })
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let offered: Vec<serde_json::Value> = services
+            .iter()
+            .map(|(tag, local)| serde_json::json!({"tag": tag, "local": local}))
+            .collect();
+        let out = serde_json::json!({
+            "room": room,
+            "room_id": b32_encode(channel_id),
+            "shared": rows,
+            "offered": offered,
+            "ssh_config": proxy.as_ref().ok().map(|at| vox_core::node::up::ssh_config_hint(*at)),
+        });
+        println!("{out}");
+        return;
+    }
     if shared.is_empty() {
         println!("vox: nothing is shared in {room} ({})", short(channel_id));
     } else {
@@ -362,6 +472,30 @@ pub fn print_services(
             let udp = if s.udp && s.kind != "udp" { "/udp" } else { "" };
             println!("  {}  by {}  {}{udp}", s.address, s.by, s.kind);
             println!("    {}", s.canonical);
+            for (what, command) in service_commands(s) {
+                println!("      {what:<8}{command}");
+            }
+            for (need, holds, otherwise) in service_needs(s, proxy) {
+                if holds {
+                    println!("      needs   {need}: yes");
+                } else {
+                    println!("      needs   {need}: NO — {otherwise}");
+                }
+            }
+        }
+        // `ssh <address>` needs ssh pointed at the proxy, once (what `vox up` prints).
+        if shared.iter().any(|s| s.kind == "ssh") {
+            match proxy {
+                Ok(at) => {
+                    println!("  for ssh by address, add this to ~/.ssh/config once:");
+                    for line in vox_core::node::up::ssh_config_hint(*at).lines() {
+                        println!("    {line}");
+                    }
+                }
+                Err(why) => {
+                    println!("  ssh by address needs the .vox proxy, which is not running: {why}")
+                }
+            }
         }
     }
     if services.is_empty() {
