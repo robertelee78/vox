@@ -148,7 +148,7 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
     let said = host.transcript();
     let sharing = |name: &str| {
         said.lines()
-            .find(|l| l.starts_with("sharing ") && l.contains(&format!(" as {name}.")))
+            .find(|l| l.starts_with("sharing ") && l.contains(&format!(" as {name} — ")))
             .map(str::to_owned)
     };
     let (login_said, ssh_said) = (sharing("login"), sharing("ssh"));
@@ -232,7 +232,7 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
         &format!("{db_port}\ndb\ny\n"),
     );
     let shared = pick.line_within(WITHIN, |l| {
-        l.starts_with("sharing ") && l.contains(" as db.")
+        l.starts_with("sharing ") && l.contains(" as db — ")
     });
     let said = pick.transcript();
     eprintln!("[proof] one-step vox serve said:\n{said}");
@@ -269,7 +269,7 @@ fn vox_serve_names_who_can_reach_it_and_who_cannot() {
     let everywhere = at(&|l: &str| l.starts_with("warning: `db`") && l.contains("every interface"));
     let database =
         at(&|l: &str| l.starts_with("warning: `db`") && l.contains(&format!("port {db_port}")));
-    let sharing = at(&|l: &str| l.starts_with("sharing ") && l.contains(" as db."));
+    let sharing = at(&|l: &str| l.starts_with("sharing ") && l.contains(" as db — "));
     assert!(
         shared.is_some()
             && everywhere.zip(sharing).is_some_and(|(w, s)| w < s)

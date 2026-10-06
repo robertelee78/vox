@@ -416,7 +416,7 @@ fn serves_udp(path: PathKind) {
         let said = host.transcript();
         let kind_said = |name: &str| {
             said.lines()
-                .find(|l| l.starts_with("sharing ") && l.contains(&format!(" as {name}.")))
+                .find(|l| l.starts_with("sharing ") && l.contains(&format!(" as {name} — ")))
                 .map(str::to_owned)
         };
         for (name, kind) in [

@@ -3588,14 +3588,14 @@ impl NodeHandle {
         self.view_rx.clone()
     }
 
-    /// The services shared in an open room (V030-25), each as `(address, sharer, udp, kind)`: its
-    /// address and its sharer written as **this** node writes them — its own aliases for the
-    /// node and the room where it has them, the fingerprints where it has not — or `None` if the
-    /// room is not open.
+    /// The services shared in an open room (V030-25): each address readable, as **this** node
+    /// writes it — its own aliases for the node and the room where it has them, the fingerprints
+    /// where it has not — and canonical (ADR-028 S-1), with its sharer as this node names them; or
+    /// `None` if the room is not open.
     pub async fn shared_in(
         &self,
         channel_id: Digest32,
-    ) -> Option<Vec<(String, String, bool, String)>> {
+    ) -> Option<Vec<crate::node::ipc::SharedService>> {
         let detail = self.open_detail(channel_id).await?;
         let (tx, rx) = oneshot::channel();
         self.net_tx.send(NetEvent::Names(tx)).await.ok()?;
@@ -3616,12 +3616,17 @@ impl NodeHandle {
                     } else {
                         names.alias_of(&s.host)
                     };
-                    (
-                        names.address_of(&channel_id, &s.host, &s.name),
-                        who,
-                        s.udp,
-                        s.kind.as_str().to_owned(),
-                    )
+                    crate::node::ipc::SharedService {
+                        address: names.address_of(&channel_id, &s.host, &s.name),
+                        canonical: crate::node::resolver::canonical_address(
+                            &channel_id,
+                            &s.host,
+                            &s.name,
+                        ),
+                        by: who,
+                        udp: s.udp,
+                        kind: s.kind.as_str().to_owned(),
+                    }
                 })
                 .collect(),
         )

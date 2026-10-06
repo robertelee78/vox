@@ -413,13 +413,15 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
     // product's surface on purpose, so changing what a person sees means updating the proof.
     // (It caught me doing exactly that — M17.7 moved the hostname onto the `serving` line and
     // this timed out until it was brought back into step; V030-25 made it the `sharing` line,
-    // `sharing <endpoint> as <service>.<node>.<room>.vox`.)
+    // `sharing <endpoint> as <service>.<node>.<room>.vox`; ADR-028 S-1 made it the name and the
+    // canonical address, `sharing <endpoint> as <name> — <canonical>`.)
     let hostname_line = host.expect_line("the service's .vox address", |l| {
-        l.starts_with("sharing ") && l.contains(" as ") && l.contains(".vox")
+        l.starts_with("sharing ") && l.contains(" — ") && l.contains(".vox")
     });
     let hostname = hostname_line
-        .split_whitespace()
-        .last()
+        .split(" — ")
+        .nth(1)
+        .and_then(|a| a.split_whitespace().next())
         .unwrap_or_else(|| panic!("PRODUCT: no address on the sharing line: {hostname_line:?}"))
         .to_owned();
     // And the line that tells a person who can actually reach it must no longer say
@@ -436,12 +438,12 @@ fn a_room_bound_service_carries_real_bytes_through_the_real_binaries() {
         "PRODUCT: serve printed an address that is not vox://: {address}"
     );
     assert!(
-        hostname.ends_with(".vox")
-            && hostname.starts_with(&format!("{service_port}."))
-            && hostname.contains(&room)
-            && hostname.split('.').count() == 4,
-        "PRODUCT: serve printed an address that is not <service>.<node>.<room>.vox for service \
-         {service_port} in room {room}: {hostname}"
+        hostname_line.contains(&format!(" as {service_port} — "))
+            && hostname.ends_with(&format!(".{room}.vox"))
+            && hostname.split('.').count() == 4
+            && hostname.split('.').all(|l| l == "vox" || l.len() == 52),
+        "PRODUCT: serve printed no canonical <service fp>.<node fp>.<room id>.vox for service \
+         {service_port} in room {room}: {hostname_line}"
     );
     assert!(
         !address.contains(&passphrase),

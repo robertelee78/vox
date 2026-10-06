@@ -28,6 +28,22 @@
 //! 9. The same for UDP: alice also shares `nas-dns` over UDP. `vox forward nas-dns.nas-box.fam.vox`
 //!    carries bob's datagrams to it and back, and an address naming no UDP share (`dns.…`) is
 //!    refused at once, saying so, rather than bound and its datagrams dropped.
+//! 10. The canonical address travels (ADR-028 S-1, #487): `vox serve` prints nas-ssh's as
+//!     `<service fingerprint>.<alice's fingerprint>.<room id>.vox`; bob's `vox service list` shows
+//!     the same beneath his readable one; pasted on carol's machine, where every alias differs, it
+//!     reaches the same service.
+//! 11. A readable address whose room part names no room here is refused, saying so.
+//! 12. The canonical address pasted before the share has reached the machine: dave joins, alice
+//!     then shares `nas-web` and copies its canonical address, every
+//!     member that could sync with him is stopped (SIGSTOP), and his `vox forward` must say it is
+//!     waiting for the room's first sync, then reach nas-web once they resume. A
+//!     forward that never waited is CANNOT MEASURE (the staging did not happen), not a pass.
+//! 13. A readable part that names two things is refused, saying which: bob calls carol `Nas Box`,
+//!     whose label is his name for alice too.
+//!
+//! **Mutation that must turn it red** (#487): the room part resolved by this machine's own name
+//! only, the room id refused. Carol's paste of bob's canonical address then fails at her proxy, and
+//! (10) is red as PRODUCT.
 //!
 //! **A red names its side.** A `vox` command that fails while the scene is set is PRODUCT
 //! (staging); what this proof claims is PRODUCT, quoting what vox said; the proof's own files,
@@ -158,6 +174,24 @@ fn daemon(name: &str, dir: &Path, anchor: &str) -> VoxProc {
         std::thread::sleep(Duration::from_millis(200));
     }
     p
+}
+
+/// Send `sig` to `pid` with `kill`; whether it was delivered.
+fn signal(sig: &str, pid: u32) -> bool {
+    Command::new("kill")
+        .args([&format!("-{sig}"), &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The pid the daemon of `dir` writes in its lock.
+fn daemon_pid(dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(dir.join(".daemon").join("lock"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// A TCP service that answers each line with `<owner>:<line>`.
@@ -386,10 +420,16 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         }),
         "passphrase",
     );
-    let printed_ssh = format!("nas-ssh.{alice_fp}.{room}.vox");
+    // (10) What `vox serve` prints is the canonical address: every part an identifier.
     let printed_line = serve.expect_line("PRODUCT: vox serve prints nas-ssh's address", |l| {
-        l.starts_with("sharing ") && l.contains("as nas-ssh.")
+        l.starts_with("sharing ") && l.contains(&format!(":{} as ", ssh_at.port()))
     });
+    let printed_ssh = printed_line
+        .split(" — ")
+        .nth(1)
+        .and_then(|a| a.split_whitespace().next())
+        .unwrap_or_default()
+        .to_owned();
 
     // bob and carol join, each under their own name for the room.
     let mut bob_daemon = daemon("bob", &bob_dir, &spec);
@@ -427,6 +467,15 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
     ];
     let bob_list = listed(&bob_dir, &room, &bob_wants);
     let carol_list = listed(&carol_dir, &room, &carol_wants);
+    // (10) Beneath each readable address, the canonical one: what bob would copy to another member.
+    let bob_canonical = bob_list
+        .1
+        .lines()
+        .skip_while(|l| !l.contains("nas-ssh.nas-box.fam.vox  by nas-box"))
+        .nth(1)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
 
     let (bob_up, bob_proxy) = up("bob up", &bob_dir);
     let (mut carol_up, carol_proxy) = up("carol up", &carol_dir);
@@ -439,6 +488,8 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         (bob_proxy, format!("nas-nfs.{alice_fp}.{room}.vox")),
         (carol_proxy, "nas-ssh.ally.house.vox".to_owned()),
         (carol_proxy, "nas-nfs.ally.house.vox".to_owned()),
+        // (10) bob's copy, pasted on carol's machine, where every alias differs.
+        (carol_proxy, bob_canonical.clone()),
     ]
     .into_iter()
     .map(|(proxy, n)| {
@@ -486,16 +537,32 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         "PRODUCT: `vox serve <port>` without a name must be refused, saying how to name it: \
          {bare_out}{bare_err}"
     );
+    let labels: Vec<&str> = printed_ssh
+        .strip_suffix(".vox")
+        .unwrap_or_default()
+        .split('.')
+        .collect();
     assert!(
-        printed_line.contains(&printed_ssh),
-        "PRODUCT: vox serve must print nas-ssh's address with its fingerprint and the room id \
-         ({printed_ssh}); it printed {printed_line:?}"
+        labels.len() == 3
+            && labels[0].len() == 52
+            && labels[0] != "nas-ssh"
+            && labels[1] == alice_fp
+            && labels[2] == room,
+        "PRODUCT: vox serve must print nas-ssh's canonical address, <service fingerprint>.<node \
+         fingerprint>.<room id>.vox (ADR-028 S-1); it printed {printed_line:?}"
+    );
+    assert_eq!(
+        bob_canonical, printed_ssh,
+        "PRODUCT: bob's `vox service list` must show nas-ssh's canonical address beneath its \
+         readable one, the address alice's `vox serve` printed: {}",
+        bob_list.1
     );
     for (n, r) in &reached {
-        let want = if n.starts_with("nas-ssh.") {
-            "ssh"
-        } else {
+        // Every nfs address here names it as `nas-nfs`; the rest, canonical ones included, are ssh.
+        let want = if n.starts_with("nas-nfs.") {
             "nfs"
+        } else {
+            "ssh"
         };
         assert_eq!(
             r.as_deref(),
@@ -691,9 +758,137 @@ fn a_shared_service_is_reached_as_service_node_room_and_only_that_way() {
         "PRODUCT: a forward to an address naming no share in a synced room took {absent_took:?} to \
          be refused; R23 bounds a refusal at {IMMEDIATE:?}"
     );
+    // (11) A readable address whose room part names nothing here is refused, saying which.
+    let (unknown_refused, _, unknown_said) = forward_refused(
+        &bob_dir,
+        "bob forward nowhere",
+        "nas-ssh.nas-box.nowhere.vox",
+    );
+    assert!(
+        unknown_refused && unknown_said.contains("no room on this machine is called `nowhere`"),
+        "PRODUCT: an address whose room part names no room here must be refused, saying so: \
+         {unknown_said}"
+    );
+
+    // (12) The canonical address pasted before the share has reached this machine: dave joins
+    // with `vox connect`, which lets his node go; alice then shares nas-web and copies its
+    // canonical address from her `vox service list`; and every member that could sync the room
+    // with dave is stopped. His forward must wait for the room's first sync, then reach nas-web.
+    let (dave_dir, dave_fp) = profile(tmp.path(), "dave");
+    trust(&alice_dir, "alice", &dave_fp, "dave");
+    trust(&dave_dir, "dave", &alice_fp, "nas");
+    let pid_of = |d: &Path| {
+        daemon_pid(d)
+            .unwrap_or_else(|| panic!("APPARATUS: no daemon pid in {}'s lock", d.display()))
+    };
+    // bob and carol first: only alice, whose room address dave holds, may answer his join.
+    let (alice_pid, others) = (pid_of(&alice_dir), [pid_of(&bob_dir), pid_of(&carol_dir)]);
+    for pid in &others {
+        assert!(signal("STOP", *pid), "APPARATUS: SIGSTOP {pid}");
+    }
+    // Plain, as the person types it: no node held for him around it, which would sync the room.
+    let (ok, out, err) = vox_plain(
+        &dave_dir,
+        &[
+            "connect",
+            &address,
+            "--passphrase-file",
+            "-",
+            "--anchor",
+            &spec,
+            "--listen",
+            "127.0.0.1:0",
+        ],
+        Some(&format!("{passphrase}\n")),
+    );
+    assert!(ok, "PRODUCT (staging): dave joins alice's room: {out}{err}");
+    let web_at = echo("web");
+    let (ok, out, err) = vox(
+        &alice_dir,
+        &["service", "add", &room, "nas-web", &web_at.to_string()],
+        None,
+    );
+    assert!(ok, "PRODUCT (staging): alice shares nas-web: {out}{err}");
+    let (_, alice_list) = listed(&alice_dir, &room, &["nas-web.".to_owned()]);
+    let web_canonical = alice_list
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("nas-web."))
+        .nth(1)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    assert!(
+        web_canonical.len() == 52 * 3 + 6 && signal("STOP", alice_pid),
+        "PRODUCT (staging): alice's `vox service list` shows no canonical address for nas-web: \
+         {alice_list}"
+    );
+    let others = [alice_pid, others[0], others[1]];
+    let mut early = VoxProc::spawn(
+        "dave forward",
+        &dave_dir,
+        &args(&[
+            "forward",
+            &web_canonical,
+            "127.0.0.1:0",
+            "--anchor",
+            &spec,
+            "--listen",
+            "127.0.0.1:0",
+        ]),
+    );
+    let waited = early.line_within(Duration::from_secs(20), |l| {
+        l.contains("waiting for this room's first sync")
+    });
+    for pid in &others {
+        let _ = signal("CONT", *pid);
+    }
+    let Some(waited) = waited else {
+        panic!(
+            "CANNOT MEASURE (APPARATUS): dave's room had already synced, or his forward never \
+             asked, before the members were stopped, so the paste did not arrive before the share. \
+             dave's forward said:\n{}",
+            early.transcript()
+        );
+    };
+    let early_line = early.line_within(vox_core::node::up::HOST_PATIENCE, |l| {
+        l.starts_with("vox: forwarding ")
+    });
+    let early_answer = early_line.as_ref().and_then(|l| {
+        let at: SocketAddr = l.split_whitespace().nth(2)?.parse().ok()?;
+        let mut s = TcpStream::connect(at).ok()?;
+        s.set_read_timeout(Some(vox_core::node::up::HOST_PATIENCE))
+            .ok()?;
+        s.write_all(b"hello\n").ok()?;
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(s), &mut line).ok()?;
+        Some(line)
+    });
+    eprintln!("dave's early paste: {waited:?} then {early_line:?} answered {early_answer:?}");
+    assert!(
+        early_answer
+            .as_deref()
+            .is_some_and(|a| a.starts_with("web:")),
+        "PRODUCT: the canonical address {web_canonical}, pasted on dave's machine before the share \
+         reached it, must reach alice's nas-web once the room syncs; dave's forward said:\n{}",
+        early.transcript()
+    );
+    drop(early);
+
+    // (13) A readable part that names two things is refused, saying which: bob now calls carol
+    // `Nas Box`, which as a label is `nas-box`, his name for alice too.
+    trust(&bob_dir, "bob", &carol_fp, "Nas Box");
+    let (amb_refused, _, amb_said) =
+        forward_refused(&bob_dir, "bob forward ambiguous", "nas-ssh.nas-box.fam.vox");
+    assert!(
+        amb_refused && amb_said.contains("`nas-box` names 2 nodes you trust in `fam`"),
+        "PRODUCT: an address whose node part names two trusted nodes must be refused, saying so: \
+         {amb_said}"
+    );
     eprintln!(
-        "[proof] 2 services reached by 6 addresses through 2 members' own words; 4 shorter names \
-         resolved to nothing; a duplicate name and a bare port refused; forward by address only; absent TCP and UDP shares refused at once"
+        "[proof] 2 services reached by 7 addresses through 2 members' own words and one copied \
+         canonical address; 4 shorter names resolved to nothing; a duplicate name and a bare port \
+         refused; forward by address only; absent TCP and UDP shares refused at once; an unknown \
+         and an ambiguous part refused; a canonical paste before the share reached it once synced"
     );
     let _ = (
         bob_daemon.transcript(),
