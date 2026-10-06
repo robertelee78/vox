@@ -67,6 +67,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             joined. alice trusts it.", naming neither Erin, whom Bob trusts and who never granted
             Frank, nor anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is in no keyring of
             Bob's after;
+  trust     the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
+            in Bob's members pane opens the trust prompt, showing his fingerprint; Dave's pasted
+            there adds nothing and shows both fingerprints; Frank's own, pasted through the hint's
+            `:trust`, in groups and upper case, adds him, and the TUI says so;
   unreach   once Alice's, Carol's, Dave's and Frank's daemons are stopped, it reads "○ offline";
   fewer     and the status bar then says "connected to 1 peer": only the anchor is left;
   where     with Alice's, Carol's and Dave's daemons stopped, under a message Bob then posts his TUI says
@@ -784,6 +788,45 @@ try:
     claim("newcomer", said_alone and said_trusted and unadded,
           f"before alice trusted frank, bob's TUI said {before_grant!r} (wanted {alone!r}); after, "
           f"{after_grant!r} (wanted {trusted!r}); frank absent from bob's keyring: {unadded}")
+
+    stage("trust")
+    # ADR-028 K-5 (#475): the join's line offers the one trust action, ":trust <frank's first 8>";
+    # `t` on Frank in the members pane opens the same prompt. A fingerprint pasted that is not
+    # Frank's adds nothing and shows both; Frank's own, pasted in groups and upper case, adds him.
+    flat_ws = lambda: re.sub(r"\s+", " ", flat())
+    hint = f":trust {fp['frank'][:8]}"
+    hinted = hint in flat_ws()
+    grouped = lambda f: " ".join(f[i:i + 4] for i in range(0, len(f), 4))
+    in_ring = lambda: fp["frank"] in run("bob", "trust", "list").stdout
+    tui.key("\r", 2)   # into the room
+    tui.key("\t", 1)   # timeline -> composer
+    tui.key("\t", 1)   # composer -> members
+    for _ in range(8):
+        if label_of("frank")[1]:
+            break
+        tui.key("\x1b[B", 1)  # Down: the next member
+    tui.key("t", 2)
+    prompt_seen = "Trust this node?" in flat() and grouped(fp["frank"])[:24] in flat_ws()
+    tui.key(grouped(fp["dave"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("\r", 3)
+    mismatch_said = (f"given: {grouped(fp['dave'])}" in flat_ws()
+                     and f"this node: {grouped(fp['frank'])}" in flat_ws()
+                     and "do not trust it" in flat_ws())
+    mismatch_added = in_ring()
+    tui.key(":" + hint[1:] + "\r", 2)
+    tui.key(grouped(fp["frank"]).upper() + "\r", 1)
+    tui.key("frank\r", 1)
+    tui.key("\r", 3)
+    matched = tui.until(in_ring, 30, 1)
+    match_said = "you now trust frank" in flat_ws()
+    tui.key("\x1b", 2)  # back to the room list
+    claim("trust", hinted and prompt_seen and mismatch_said and not mismatch_added and matched
+          and match_said,
+          f"the join offered {hint!r}: {hinted}; `t` on frank opened the prompt with his "
+          f"fingerprint: {prompt_seen}; dave's pasted: both shown and told not to trust: "
+          f"{mismatch_said}, frank added anyway: {mismatch_added}; frank's own pasted through "
+          f"{hint!r}: added {matched}, said so {match_said}")
 
     stage("unreach")
     for w in ("alice", "carol", "dave", "frank"):

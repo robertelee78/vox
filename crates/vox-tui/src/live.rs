@@ -802,7 +802,13 @@ impl DaemonCore {
             [one] => format!("{one} trusts it."),
             [rest @ .., last] => format!("{} and {last} trust it.", rest.join(", ")),
         };
-        let line = format!("{} joined. {who}", self.member_name(&peer));
+        // Trust is offered where it matters (ADR-028 K-5), with the one action used everywhere.
+        let offer = if self.snapshot.trusted.iter().any(|(t, _)| *t == peer) {
+            String::new()
+        } else {
+            format!(" · {}", crate::ident::trust_hint(&peer))
+        };
+        let line = format!("{} joined. {who}{offer}", self.member_name(&peer));
         self.notice = Some(line.clone());
         self.joined = Some((room, peer, line));
     }
@@ -1088,7 +1094,16 @@ impl DaemonCore {
         let view_of = |r: &MessageRow| MessageView {
             entry_hash: r.entry_hash,
             author: r.author,
-            author_nick: name_of(&r.author),
+            author_nick: if me == Some(r.author) || trusted.iter().any(|(t, _)| *t == r.author) {
+                name_of(&r.author)
+            } else {
+                // A node not in the keyring is offered the one trust action (ADR-028 K-5).
+                format!(
+                    "{} (not in keyring · {})",
+                    crate::ident::author_id(&r.author),
+                    crate::ident::trust_hint(&r.author)
+                )
+            },
             // The wire names addressees by fingerprint; the timeline by this node's own names.
             addressed: if r.owed {
                 String::new()
@@ -1340,8 +1355,20 @@ impl DaemonCore {
                                 } else {
                                     ""
                                 };
+                                // A sharer not in the keyring cannot be reached until each
+                                // trusts the other: the one trust action is offered (K-5).
+                                let offer = if me != Some(s.host)
+                                    && !snap.trusted.iter().any(|(t, _)| *t == s.host)
+                                {
+                                    format!(
+                                        "  (not in keyring · {})",
+                                        crate::ident::trust_hint(&s.host)
+                                    )
+                                } else {
+                                    String::new()
+                                };
                                 format!(
-                                    "{} by {who}  {kind}{udp}",
+                                    "{} by {who}  {kind}{udp}{offer}",
                                     names.address_of(&d.channel_id, &s.host, &s.name)
                                 )
                             })
@@ -1427,6 +1454,10 @@ fn wipe(request: &mut Request) {
         Request::Create { passphrase, .. }
         | Request::OpenRoom { passphrase, .. }
         | Request::Join { passphrase, .. } => passphrase.zeroize(),
+        Request::Trust {
+            identity_passphrase,
+            ..
+        } => identity_passphrase.zeroize(),
         _ => {}
     }
 }
@@ -1645,6 +1676,21 @@ impl CoreHandle for DaemonCore {
                 name,
                 identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
             }),
+            Command::Trust {
+                target,
+                petname,
+                identity_passphrase,
+            } => match self.send(Request::Trust {
+                target,
+                petname: petname.clone(),
+                identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
+                full_history: false,
+            }) {
+                CommandStatus::Done => CommandStatus::Said(format!(
+                    "you now trust {petname}: it may read what you write in every room you share"
+                )),
+                other => other,
+            },
             Command::OpenChannel {
                 channel_id,
                 passphrase,

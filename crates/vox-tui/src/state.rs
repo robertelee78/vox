@@ -43,6 +43,9 @@ pub enum PromptKind {
     /// End `Prompt::target` for everyone: `[the word "end"]`, typed to confirm what the title says
     /// it does (ADR-028 E-5).
     EndRoom,
+    /// Trust the node `Prompt::target` (ADR-028 K-5): `[its fingerprint as they gave it, a
+    /// name, identity passphrase]`. The fingerprint is compared before anything is added.
+    Trust,
 }
 
 impl PromptKind {
@@ -58,6 +61,11 @@ impl PromptKind {
             PromptKind::RenameRoom => &["new room name", "identity passphrase"],
             PromptKind::LeaveRoom => &["type leave to leave it"],
             PromptKind::EndRoom => &["type end to end it for everyone"],
+            PromptKind::Trust => &[
+                "their fingerprint, as they gave it to you (paste or type it)",
+                "your name for them",
+                "identity passphrase (Enter alone while the keyring is open)",
+            ],
         }
     }
 
@@ -71,6 +79,8 @@ impl PromptKind {
             PromptKind::JoinChannel => i == 1,
             // A confirming word is no secret.
             PromptKind::LeaveRoom | PromptKind::EndRoom => false,
+            // A fingerprint and a name are not; only the passphrase.
+            PromptKind::Trust => i == 2,
             _ => true,
         }
     }
@@ -103,6 +113,9 @@ impl PromptKind {
             PromptKind::EndRoom => {
                 "End this room for everyone? Every member's node is to take no new message in it \
                  and delete it"
+            }
+            PromptKind::Trust => {
+                "Trust this node? Compare its fingerprint with the one they gave you"
             }
         }
     }
@@ -444,6 +457,15 @@ impl UiState {
                 self.settle(vm);
                 Action::Redraw
             }
+            // `t` on a member is the same trust action as `:trust` (ADR-028 K-5).
+            KeyCode::Char('t')
+                if self.screen == Screen::Channel && self.focus == Focus::Members =>
+            {
+                match self.selected_member {
+                    Some(fp) => self.offer_trust(fp, vm),
+                    None => Action::Redraw,
+                }
+            }
             KeyCode::Char('k') if self.screen == Screen::ChannelList => {
                 self.screen = Screen::Keyring;
                 Action::Redraw
@@ -601,6 +623,40 @@ impl UiState {
         };
         let secret = |s: &Zeroizing<String>| SecretString::from(s.as_str().to_owned());
         match p.kind {
+            PromptKind::Trust => {
+                let Some(target) = p.target else {
+                    return Action::Redraw;
+                };
+                let theirs = vox_core::node::link::b32_encode(&target);
+                let given = crate::ident::typed_fingerprint(&p.fields[0]);
+                // **A mismatch is its own outcome** (ADR-028 K-5): nothing is added, and both are
+                // shown, so the person sees that they differ.
+                if given != theirs {
+                    self.status_message = Some(format!(
+                        "not trusted: the fingerprint you were given is not this node's — do not \
+                         trust it; ask them for theirs again another way. given: {} · this node: \
+                         {}",
+                        vox_text::fingerprint::grouped(&given),
+                        vox_text::fingerprint::grouped(&theirs)
+                    ));
+                    return Action::Redraw;
+                }
+                let petname = p.fields[1].trim().to_owned();
+                if petname.is_empty() {
+                    // A node in the keyring always has a name (ADR-028 K-3).
+                    self.status_message = Some("a name is required: what do you call them?".into());
+                    let mut again = Prompt::new(PromptKind::Trust, Some(target));
+                    again.fields[0] = Zeroizing::new(p.fields[0].as_str().to_owned());
+                    again.step = 1;
+                    self.mode = Mode::Prompt(again);
+                    return Action::Redraw;
+                }
+                Action::Dispatch(Command::Trust {
+                    target,
+                    petname,
+                    identity_passphrase: secret(&p.fields[2]),
+                })
+            }
             PromptKind::Attach => Action::Dispatch(Command::Attach {
                 passphrase: secret(&p.fields[0]),
             }),
@@ -695,6 +751,28 @@ impl UiState {
                 }
             }
         }
+    }
+
+    /// Open the trust prompt on `fp`, unless it is this node or already in the keyring.
+    fn offer_trust(&mut self, fp: Digest32, vm: &ViewModel) -> Action {
+        let me = vm
+            .active
+            .as_ref()
+            .and_then(|c| c.members.iter().find(|m| m.id == fp))
+            .is_some_and(|m| m.trust == crate::viewmodel::Trust::You);
+        if me {
+            self.status_message = Some("that is this node".into());
+            return Action::Redraw;
+        }
+        if vm.keyring.iter().any(|(id, _)| *id == fp) {
+            self.status_message = Some(format!(
+                "{} is already in your keyring",
+                crate::ident::name_in(&vm.keyring, &fp)
+            ));
+            return Action::Redraw;
+        }
+        self.mode = Mode::Prompt(Prompt::new(PromptKind::Trust, Some(fp)));
+        Action::Redraw
     }
 
     /// Close the tunnel selected in the tunnel list (V030-11).
@@ -827,6 +905,11 @@ impl UiState {
                         self.mode = Mode::Prompt(Prompt::new(kind, Some(channel_id)));
                         Action::Redraw
                     }
+                    Some(Parsed::Trust(fp)) => self.offer_trust(fp, vm),
+                    Some(Parsed::Refused(why)) => {
+                        self.status_message = Some(why);
+                        Action::Redraw
+                    }
                     Some(Parsed::Nav(nav)) => self.apply_nav(nav, vm),
                     Some(Parsed::Prompt(kind, name)) => {
                         // A rename is of the room on screen.
@@ -926,6 +1009,10 @@ pub enum Parsed {
     CloseTunnel,
     /// Ask the person to confirm a change of access to a room, saying what it does (ADR-028 E-5).
     Confirm(PromptKind, Digest32),
+    /// Open the trust prompt on this node (ADR-028 K-5).
+    Trust(Digest32),
+    /// A command that names nothing it can act on, and why.
+    Refused(String),
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -958,6 +1045,28 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     match verb {
         "quit" | "q" => return Some(Parsed::Quit),
         "attach" => return Some(Parsed::Prompt(PromptKind::Attach, None)),
+        // The one trust action (ADR-028 K-5): a member of the room on screen, by the start of its
+        // fingerprint as the screen offers it, or by name.
+        "trust" => {
+            let Some(room) = vm.active.as_ref() else {
+                return Some(Parsed::Refused(
+                    "open the room the node is in, then :trust it".into(),
+                ));
+            };
+            if rest.is_empty() {
+                return Some(Parsed::Refused(
+                    ":trust takes the start of the node's fingerprint, as the screen shows it"
+                        .into(),
+                ));
+            }
+            let members: Vec<Digest32> = room.members.iter().map(|m| m.id).collect();
+            return Some(
+                match crate::ident::resolve_member(rest, &members, &vm.keyring) {
+                    Ok(fp) => Parsed::Trust(fp),
+                    Err(why) => Parsed::Refused(why),
+                },
+            );
+        }
         "node" if !rest.is_empty() => {
             return Some(Parsed::Core(Command::UseNode {
                 name: rest.to_owned(),
