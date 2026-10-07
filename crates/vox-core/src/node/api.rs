@@ -503,6 +503,9 @@ pub struct ChannelDetail {
     /// What this node's person has not read here, oldest first
     /// ([`crate::node::channel::ChannelState::unread`]): what a client counts at its start.
     pub unread: Vec<Digest32>,
+    /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
+    /// each node whose drive key it holds. What a Session's `can_drive` is said from.
+    pub drive_from: Vec<Digest32>,
 }
 
 /// The node's latest-wins view (published over a `watch`).
@@ -884,6 +887,16 @@ pub enum NodeCommand {
         channel_id: Digest32,
         /// The new name, one DNS label (ADR-028 R-2).
         name: String,
+    },
+    /// Append one entry of a Session (ADR-029 SC-1), sealed under this node's drive key so only
+    /// members it trusts with drive read it (SC-2).
+    AppendSession {
+        /// The channel.
+        channel_id: Digest32,
+        /// The harness's own session id.
+        session_id: String,
+        /// The activity item.
+        body: String,
     },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
@@ -1430,6 +1443,9 @@ pub enum Outcome {
         /// The room's retention, seconds (`0` = forever).
         room: u64,
     },
+    /// A Session entry was appended (ADR-029 SC-1): its entry hash, which a later entry's `re`
+    /// names.
+    Appended(Digest32),
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -1461,7 +1477,7 @@ impl Outcome {
     pub fn is_done(self) -> bool {
         matches!(
             self,
-            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. }
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } | Outcome::Appended(_)
         )
     }
 }
@@ -1471,6 +1487,9 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Done => f.write_str("done"),
             Outcome::Bound(local) => write!(f, "bound at {local}"),
+            Outcome::Appended(entry) => {
+                write!(f, "appended {}", crate::node::link::b32_encode(entry))
+            }
             Outcome::OwnRetention { own, room } => write!(
                 f,
                 "this node keeps the room's messages for {own} s; the room keeps them for {room} s"

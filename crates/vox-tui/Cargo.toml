@@ -63,6 +63,9 @@ zeroize.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+# Codex's app-server, read as a peer client (ADR-029 #541).
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
 thiserror.workspace = true
 # `vox update` verifies the release record's SHA-256 over the downloaded binary before anything
 # is renamed into place (ADR-015 §"Install and update"). Same pin as vox-core, so there is one

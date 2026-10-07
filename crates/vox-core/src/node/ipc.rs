@@ -352,8 +352,17 @@ const T_SHARE_STOP: u64 = 4931;
 const T_SHARE_LIST: u64 = 4932;
 /// [`Frame::Shares`].
 const T_SHARES: u64 = 4933;
+// Session entries, sealed to members with drive (ADR-029 SC-1, SC-2). Additive.
+/// `[5430, channel_id, session_id, body]` — [`Request::AppendSession`].
+const T_SESSION_APPEND: u64 = 5430;
+/// `[5431, channel_id]` — [`Request::SessionEntries`].
+const T_SESSION_ENTRIES: u64 = 5431;
+/// [`Frame::SessionEntries`].
+const T_SESSION_ROWS: u64 = 5432;
 const T_SESSIONS_REQ: u64 = 4940;
 const T_SESSIONS: u64 = 4941;
+/// [`Frame::Appended`].
+const T_APPENDED: u64 = 5433;
 
 /// What a client sends.
 ///
@@ -469,6 +478,23 @@ pub enum Request {
     },
     /// This node's shares in a room, answered with [`Frame::Shares`].
     ShareList {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// Append one entry of a Session (ADR-029 SC-1), sealed under this node's drive key so only
+    /// members it trusts with drive read it (SC-2). The session's hook sends it; it never shows in
+    /// the room's timeline (SC-4).
+    AppendSession {
+        /// The room the session works in.
+        channel_id: Digest32,
+        /// The harness's own session id (SE-2).
+        session_id: String,
+        /// The activity item, in the harnesses' shared format.
+        body: String,
+    },
+    /// The Session entries this node can read in a room (ADR-029 SC-2): its own, and those of
+    /// each node that released it its drive key. Answered with [`Frame::SessionEntries`].
+    SessionEntries {
         /// The room.
         channel_id: Digest32,
     },
@@ -845,6 +871,20 @@ impl Request {
             }
             Request::ShareList { channel_id } => {
                 e.array(2).uint(T_SHARE_LIST).bytes(channel_id);
+            }
+            Request::AppendSession {
+                channel_id,
+                session_id,
+                body,
+            } => {
+                e.array(4)
+                    .uint(T_SESSION_APPEND)
+                    .bytes(channel_id)
+                    .text(session_id)
+                    .text(body);
+            }
+            Request::SessionEntries { channel_id } => {
+                e.array(2).uint(T_SESSION_ENTRIES).bytes(channel_id);
             }
             Request::Rooms { after } => {
                 e.array(2)
@@ -1311,6 +1351,24 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::ShareList { channel_id })
             }
+            (T_SESSION_APPEND, 4) => {
+                let channel_id = digest(&mut d)?;
+                let session_id = text(&mut d, "ipc session id")?;
+                let body = text(&mut d, "ipc session entry")?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::AppendSession {
+                    channel_id,
+                    session_id,
+                    body,
+                })
+            }
+            (T_SESSION_ENTRIES, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SessionEntries { channel_id })
+            }
             (T_SESSIONS_REQ, 2) => {
                 let channel_id = digest(&mut d)?;
                 d.finish()
@@ -1593,6 +1651,17 @@ pub enum Frame {
         /// Each share.
         shares: Vec<crate::node::shares::ShareRow>,
     },
+    /// The Session entry a [`Request::AppendSession`] appended.
+    Appended {
+        /// Its entry hash.
+        entry: Digest32,
+    },
+    /// Session entries, as a [`Request::SessionEntries`] asked for, in the order this node
+    /// opened or wrote them.
+    SessionEntries {
+        /// Each entry.
+        rows: Vec<crate::node::drive::SessionRow>,
+    },
     /// A room's Sessions, oldest opening first, as a [`Request::Sessions`] asked for.
     Sessions {
         /// Each Session.
@@ -1742,6 +1811,20 @@ impl Frame {
                         .text(&r.entry)
                         .uint(r.fetched)
                         .uint(r.files);
+                }
+            }
+            Frame::Appended { entry } => {
+                e.array(2).uint(T_APPENDED).bytes(entry);
+            }
+            Frame::SessionEntries { rows } => {
+                e.array(2).uint(T_SESSION_ROWS).array(rows.len());
+                for r in rows {
+                    e.array(5)
+                        .bytes(&r.entry_hash)
+                        .bytes(&r.author)
+                        .uint(r.created_millis)
+                        .text(&r.session_id)
+                        .text(&r.body);
                 }
             }
             Frame::Sessions { sessions } => {
@@ -2327,6 +2410,39 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::Shares { shares });
+        }
+        (T_APPENDED, 2) => {
+            let entry = digest(d)?;
+            return Ok(Frame::Appended { entry });
+        }
+        (T_SESSION_ROWS, 2) => {
+            let count = d
+                .array()
+                .map_err(|_| Error::MalformedIpc("ipc session entries array"))?;
+            let mut rows = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc session entry row"))?
+                    != 5
+                {
+                    return Err(Error::MalformedIpc("ipc session entry arity"));
+                }
+                let entry_hash = digest(d)?;
+                let author = digest(d)?;
+                let created_millis = d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc session entry time"))?;
+                let session_id = text(d, "ipc session id")?;
+                let body = text(d, "ipc session entry body")?;
+                rows.push(crate::node::drive::SessionRow {
+                    entry_hash,
+                    author,
+                    created_millis,
+                    session_id,
+                    body,
+                });
+            }
+            return Ok(Frame::SessionEntries { rows });
         }
         (T_SESSIONS, 2) => {
             let sessions = crate::node::sessions::read_rows(d)?;
@@ -4054,6 +4170,29 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         },
         Request::ShareList { channel_id } => Frame::Shares {
             shares: handle.shares().list(&channel_id).await,
+        },
+        Request::AppendSession {
+            channel_id,
+            session_id,
+            body,
+        } => match handle
+            .apply(crate::node::api::NodeCommand::AppendSession {
+                channel_id,
+                session_id,
+                body,
+            })
+            .await
+        {
+            crate::node::api::Outcome::Appended(entry) => Frame::Appended { entry },
+            other => Frame::Error {
+                reason: other.to_string(),
+            },
+        },
+        Request::SessionEntries { channel_id } => match handle.session_rows(channel_id).await {
+            Some(rows) => Frame::SessionEntries { rows },
+            None => Frame::Error {
+                reason: "room not open".into(),
+            },
         },
         Request::Sessions { channel_id } => {
             if !handle

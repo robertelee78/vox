@@ -87,7 +87,9 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
                 ended_millis: None,
                 opening: r.entry_hash,
                 ended: None,
-                can_drive: false,
+                // This node reads inside it when it holds the node's drive key, or is the node
+                // (ADR-029 SC-2, #543).
+                can_drive: detail.drive_from.contains(&r.author),
             }),
             (SESSION_END, Some(k)) if rows[k].open => {
                 rows[k].open = false;
