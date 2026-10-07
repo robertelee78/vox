@@ -4,10 +4,11 @@
 //! background and opens the Session once the node is a member
 //! ([`crate::node::sessions::open_when_member`]).
 //!
-//! **Stub (#538)**: the join itself is #550's (uxresearch). Until it lands, nothing is joined and
-//! the status says so.
+//! A join that fails is told to the session on its next turn, with why, and tried again then: the
+//! hook hands the daemon the map's link and passphrase on every turn of a session whose room the
+//! node is not yet a member of. One join per room runs at a time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use zeroize::Zeroizing;
@@ -20,6 +21,8 @@ use crate::node::sessions::Opening;
 #[derive(Debug, Default)]
 pub struct Joins {
     status: Mutex<BTreeMap<String, String>>,
+    /// The rooms a join is running for now.
+    running: Mutex<BTreeSet<String>>,
 }
 
 impl Joins {
@@ -53,7 +56,7 @@ impl Joins {
 
 /// Start joining `room` from `link` with `passphrase`, and open `session`'s Session once the node is
 /// a member. Returns at once: how it goes is told to the session on its next turn
-/// ([`Joins::status`]).
+/// ([`Joins::status`]). A join of `room` already running is left to finish; this one is dropped.
 pub fn join_in_background(
     handle: &NodeHandle,
     joins: &Arc<Joins>,
@@ -62,9 +65,47 @@ pub fn join_in_background(
     passphrase: Zeroizing<String>,
     session: Opening,
 ) {
-    let _ = (handle, link, passphrase, session);
-    joins.set_status(
-        room,
-        Some("joining a room from the room map is not built yet (#550)".into()),
+    if !joins
+        .running
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(room.to_owned())
+    {
+        return;
+    }
+    // The room as a person reads it in a sentence: its id's start, as `vox room list` shows it.
+    let named: String = room.chars().take(12).collect();
+    joins.set_status(room, Some(format!("joining room {named}…")));
+    let (handle, joins, room, link) = (
+        handle.clone(),
+        Arc::clone(joins),
+        room.to_owned(),
+        link.to_owned(),
     );
+    tokio::spawn(async move {
+        let outcome = handle
+            .apply(crate::node::api::NodeCommand::JoinChannel {
+                link,
+                passphrase: crate::node::api::Secret::new(passphrase.as_bytes().to_vec()),
+            })
+            .await;
+        let said = match outcome {
+            crate::node::api::Outcome::Done => match crate::node::link::b32_decode(&room, "room") {
+                Ok(id) => crate::node::sessions::open_when_member(&handle, id, &session)
+                    .await
+                    .err()
+                    .map(|e| {
+                        format!("joined room {named}, and could not open this session there: {e}")
+                    }),
+                Err(e) => Some(format!("joined room {named}, and could not name it: {e}")),
+            },
+            other => Some(format!("could not join room {named}: {other}")),
+        };
+        joins.set_status(&room, said);
+        joins
+            .running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&room);
+    });
 }

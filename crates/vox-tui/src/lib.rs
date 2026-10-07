@@ -38,6 +38,7 @@ pub mod node_tasks;
 pub mod notify;
 pub mod ping;
 pub mod room_cli;
+pub mod room_map;
 pub mod setup;
 pub mod share_cli;
 pub mod shell;
