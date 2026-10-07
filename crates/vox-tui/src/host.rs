@@ -516,6 +516,15 @@ impl Router {
     /// node's stop finished within the patience.
     pub async fn stop_all(&self) -> bool {
         self.inner.stopping.store(true, Ordering::SeqCst);
+        // A proof of a daemon started while this one stops holds that moment open (test builds
+        // only, V210-105).
+        #[cfg(feature = "test-knobs")]
+        if let Some(ms) = std::env::var("VOX_TEST_STOP_HOLD_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
         let names: Vec<NodeName> = lock(&self.inner.slots).keys().cloned().collect();
         let mut all = tokio::task::JoinSet::new();
         for node in names {
