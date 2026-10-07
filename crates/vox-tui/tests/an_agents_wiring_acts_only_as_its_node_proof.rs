@@ -15,7 +15,8 @@
 //! at a real terminal (a pty) as an operator types it: with Claude Code and OpenCode on `PATH` and
 //! Codex not, it says Codex is not found and makes no node for it; it makes `claude-<host>` and
 //! `opencode-<host>` with the passphrases typed; it installs each one's hook where the harness
-//! reads it, which `vox agent doctor` passes, keeping what Claude's settings already held and
+//! reads it, which `vox agent doctor` passes, keeping what Claude's settings already held, in its
+//! order, and
 //! replacing the Vox hook for another node there; on macOS it offers a node for the person, and
 //! skipping it makes none (`vox node list` lists exactly the two); and it prints each node's
 //! fingerprint, grouped with its art, as `vox id` has it, with its alias, harness, host, OS and
@@ -439,9 +440,14 @@ fn setup_makes_a_node_for_each_installed_harness() {
         );
     }
     let kept = std::fs::read_to_string(d.claude_settings()).unwrap_or_default();
+    // In the order the person had it: `theme` was first, then `hooks`.
+    let in_order = matches!(
+        (kept.find("\"theme\""), kept.find("\"hooks\"")),
+        (Some(t), Some(h)) if t < h
+    );
     assert!(
-        kept.contains("echo mine") && kept.contains("\"theme\"") && !kept.contains("someone-else"),
-        "PRODUCT: `vox setup` must keep what Claude's settings held and replace the Vox hook for \
-         another node: {kept}"
+        kept.contains("echo mine") && in_order && !kept.contains("someone-else"),
+        "PRODUCT: `vox setup` must keep what Claude's settings held, in its order, and replace \
+         the Vox hook for another node: {kept}"
     );
 }
