@@ -11,7 +11,7 @@ use secrecy::SecretString;
 use vox_core::hash::Digest32;
 use zeroize::Zeroizing;
 
-use crate::viewmodel::{Command, ViewModel};
+use crate::viewmodel::{Command, SessionView, ViewModel};
 
 /// How many lines PageUp/PageDown scroll the timeline.
 pub const TIMELINE_PAGE: usize = 10;
@@ -208,6 +208,8 @@ pub enum Focus {
     Members,
     /// What is shared in the room (ADR-028 S-3): Up/Down select, `y` copies its command.
     Shared,
+    /// The room's Sessions (ADR-029 CL-2): Up/Down select, Enter shows the one selected.
+    Sessions,
 }
 
 impl Focus {
@@ -218,7 +220,8 @@ impl Focus {
             Focus::Timeline => Focus::Composer,
             Focus::Composer => Focus::Members,
             Focus::Members => Focus::Shared,
-            Focus::Shared => Focus::Timeline,
+            Focus::Shared => Focus::Sessions,
+            Focus::Sessions => Focus::Timeline,
         }
     }
 }
@@ -257,6 +260,58 @@ pub enum Action {
     /// Put this text on the system clipboard (OSC 52) and say it on the status line
     /// (ADR-028 S-3): a shared service's command.
     Copy(String),
+}
+
+/// What a room's timeline shows (ADR-029 CL-2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Showing {
+    /// The room's own conversation: **General**.
+    #[default]
+    General,
+    /// **All**: the room's conversation with each Session's opening and end, in time order.
+    All,
+    /// One Session, by its node and the harness's session id.
+    Session(Digest32, String),
+}
+
+/// One row of a room's Sessions pane, top to bottom (ADR-029 CL-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRow {
+    /// The room's own conversation.
+    General,
+    /// Everything merged.
+    All,
+    /// The Session at this index of the room's `sessions`.
+    Session(usize),
+    /// The ended Sessions, apart (SE-5): this many; Enter shows or hides them.
+    Ended(usize),
+}
+
+/// The Sessions pane's rows: General, All, the open Sessions, then "Ended (N)" when any has
+/// ended, with the ended ones under it while `ended_open`.
+#[must_use]
+pub fn session_rows(sessions: &[SessionView], ended_open: bool) -> Vec<SessionRow> {
+    let mut rows = vec![SessionRow::General, SessionRow::All];
+    rows.extend(
+        sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.ended.is_none())
+            .map(|(i, _)| SessionRow::Session(i)),
+    );
+    let ended: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.ended.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    if !ended.is_empty() {
+        rows.push(SessionRow::Ended(ended.len()));
+        if ended_open {
+            rows.extend(ended.into_iter().map(SessionRow::Session));
+        }
+    }
+    rows
 }
 
 /// The UI navigation state.
@@ -311,6 +366,12 @@ pub struct UiState {
     pub to: Vec<Digest32>,
     /// The composer's next message is urgent (W-4, ADR-020 4.5): `:urgent`.
     pub urgent: bool,
+    /// What the room's timeline shows: General, All or one Session (ADR-029 CL-2).
+    pub showing: Showing,
+    /// The row selected in the Sessions pane, by position.
+    pub selected_session_row: usize,
+    /// The ended Sessions are listed under "Ended (N)" (SE-5).
+    pub ended_open: bool,
     /// The room the To: and urgent belong to: another room starts without them.
     pub compose_room: Option<Digest32>,
 }
@@ -338,6 +399,9 @@ impl Default for UiState {
             serve_room: None,
             to: Vec::new(),
             urgent: false,
+            showing: Showing::General,
+            selected_session_row: 0,
+            ended_open: false,
             compose_room: None,
         }
     }
@@ -354,12 +418,16 @@ impl UiState {
     /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
     /// draws and the member a command acts on are one member, held by identity from then on.
     pub fn settle(&mut self, vm: &ViewModel) {
-        // The To: and urgent are the room's: another room starts without them.
+        // The To:, urgent and what the timeline shows are the room's: another room starts
+        // without them, on General.
         let room = vm.active.as_ref().map(|c| c.channel_id);
         if room != self.compose_room {
             self.compose_room = room;
             self.to.clear();
             self.urgent = false;
+            self.showing = Showing::General;
+            self.selected_session_row = 0;
+            self.ended_open = false;
         }
         match self
             .selected_room
@@ -569,6 +637,25 @@ impl UiState {
                 Action::Redraw
             }
             // Enter on a reply jumps to the message it quotes.
+            KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Sessions => {
+                let rows = vm
+                    .active
+                    .as_ref()
+                    .map(|c| session_rows(&c.sessions, self.ended_open))
+                    .unwrap_or_default();
+                match rows.get(self.selected_session_row) {
+                    Some(SessionRow::General) => self.show(Showing::General),
+                    Some(SessionRow::All) => self.show(Showing::All),
+                    Some(SessionRow::Session(i)) => {
+                        if let Some(x) = vm.active.as_ref().and_then(|c| c.sessions.get(*i)) {
+                            self.show(Showing::Session(x.node, x.id.clone()));
+                        }
+                    }
+                    Some(SessionRow::Ended(_)) => self.ended_open = !self.ended_open,
+                    None => {}
+                }
+                Action::Redraw
+            }
             KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Timeline => {
                 self.jump_to_quote(vm);
                 Action::Redraw
@@ -579,6 +666,10 @@ impl UiState {
                 if self.focus == Focus::Shared
                     && vm.active.as_ref().is_none_or(|c| c.shared.is_empty())
                 {
+                    self.focus = self.focus.next();
+                }
+                // A Session has no composer: typing into one is driving (ADR-029 DR-1).
+                if self.focus == Focus::Composer && matches!(self.showing, Showing::Session(..)) {
                     self.focus = self.focus.next();
                 }
                 Action::Redraw
@@ -956,6 +1047,19 @@ impl UiState {
                     self.selected_share = step(self.selected_share.min(len - 1), len);
                 }
             }
+            Screen::Channel if self.focus == Focus::Sessions => {
+                let len = vm
+                    .active
+                    .as_ref()
+                    .map_or(0, |c| session_rows(&c.sessions, self.ended_open).len());
+                if len > 0 {
+                    self.selected_session_row = step(self.selected_session_row.min(len - 1), len);
+                }
+            }
+            // A Session's activity is not in the room's timeline (ADR-029 SC-4): nothing to select.
+            Screen::Channel
+                if self.focus == Focus::Timeline
+                    && matches!(self.showing, Showing::Session(..)) => {}
             Screen::Channel if self.focus == Focus::Timeline => {
                 // Up selects an older message, Down a newer one; past the newest follows again.
                 let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
@@ -1078,6 +1182,10 @@ impl UiState {
                             urgent,
                         })
                     }
+                    Some(Parsed::Show(showing)) => {
+                        self.show(showing);
+                        Action::Redraw
+                    }
                     Some(Parsed::To(names)) => {
                         self.set_to(&names, vm);
                         Action::Redraw
@@ -1123,6 +1231,17 @@ impl UiState {
             }
             _ => Action::Redraw,
         }
+    }
+
+    /// Show General, All or one Session; the composer is not a Session's (ADR-029 DR-1).
+    fn show(&mut self, showing: Showing) {
+        if matches!(showing, Showing::Session(..)) && self.focus == Focus::Composer {
+            self.focus = Focus::Timeline;
+        }
+        self.showing = showing;
+        self.selected_message = None;
+        self.timeline_scroll = 0;
+        self.replying = None;
     }
 
     /// Set the composer's To: from `names`, this node's names for members of the room or the
@@ -1269,6 +1388,52 @@ pub enum Parsed {
     To(String),
     /// Switch the composer's urgent on or off (W-4).
     Urgent,
+    /// Show General, All or one Session in the room's timeline (ADR-029 CL-2).
+    Show(Showing),
+}
+
+/// The Session the room's timeline shows, while it shows one that the room still lists.
+#[must_use]
+pub fn showing_session<'a>(ui: &UiState, vm: &'a ViewModel) -> Option<&'a SessionView> {
+    let Showing::Session(node, id) = &ui.showing else {
+        return None;
+    };
+    vm.active
+        .as_ref()?
+        .sessions
+        .iter()
+        .find(|x| x.node == *node && x.id == *id)
+}
+
+/// The one Session `name` names: its whole id, the first 8 or more characters of it, or its
+/// name. One that names none, or more than one, is refused, never guessed (ADR-029 DR-5).
+fn find_session<'a>(sessions: &'a [SessionView], name: &str) -> Result<&'a SessionView, String> {
+    if name.is_empty() {
+        return Err("which Session? :session <name or short id>".into());
+    }
+    let by_id: Vec<&SessionView> = sessions
+        .iter()
+        .filter(|x| x.id == name || (name.len() >= 8 && x.id.starts_with(name)))
+        .collect();
+    let found = if by_id.is_empty() {
+        sessions
+            .iter()
+            .filter(|x| x.name.as_deref() == Some(name))
+            .collect()
+    } else {
+        by_id
+    };
+    match found.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!("no Session in this room is named {name}")),
+        many => Err(format!(
+            "more than one Session is named {name}: {}",
+            many.iter()
+                .map(|x| x.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 /// Parse a `:`-command line, resolving selection-relative targets from `ui`/`vm`.
@@ -1358,7 +1523,23 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     }
     // Channel-scoped verbs require an active channel.
     let channel = ui.active_channel_id(vm)?;
+    // In a Session, the composer's verbs would write to the room, not the session: refused.
+    if let (Showing::Session(..), "send" | "share") = (&ui.showing, verb) {
+        let label = showing_session(ui, vm).map_or("this Session", |x| x.label.as_str());
+        return Some(Parsed::Refused(format!(
+            "not sent: this is {label}; :general writes to the room"
+        )));
+    }
     match verb {
+        "general" => return Some(Parsed::Show(Showing::General)),
+        "all" => return Some(Parsed::Show(Showing::All)),
+        "session" => {
+            let sessions = vm.active.as_ref().map_or(&[][..], |c| &c.sessions[..]);
+            return Some(match find_session(sessions, rest) {
+                Ok(x) => Parsed::Show(Showing::Session(x.node, x.id.clone())),
+                Err(why) => Parsed::Refused(why),
+            });
+        }
         "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
         // Share a file or folder here, from the composer (F-1): its words the note. `share`, as
         // `vox share` is; `:attach` is the node's.

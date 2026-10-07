@@ -515,7 +515,7 @@ try:
     selected = lambda: next((r for r in rows() if "▶ " in r), "")
     def focus(pane):
         """Tab until `pane`'s title says it has the focus."""
-        for _ in range(4):
+        for _ in range(6):
             # The title may say more after the pane's name (the timeline's retention, #483).
             if any(re.search(rf"\u250c{pane}[^\u2510]*\[focus\]", r) for r in tui.display()):
                 return
@@ -704,8 +704,9 @@ try:
     claim("copies", copied == SSH_COPY and "copied to the clipboard" in bar and SSH_COPY in printed,
           f"OSC 52 carried {copied!r}, want {SSH_COPY!r}; printed in the Shared pane: "
           f"{SSH_COPY in printed}; status line: {bar.strip()!r}")
-    # Back round to the members pane, where the stages after this one expect focus.
-    for _ in range(3):
+    # Back round to the members pane, where the stages after this one expect focus: Shared,
+    # Sessions, Timeline, Composer, Members.
+    for _ in range(4):
         tui.key("\t", 0.5)
 
     stage("readby")
