@@ -377,6 +377,9 @@ pub enum SessionTo {
     /// Into a Session on this node: the Session's node.
     Node(Digest32),
 }
+const T_OFFERS_REQ: u64 = 4950;
+const T_DISMISS_OFFER: u64 = 4951;
+const T_OFFERS: u64 = 4952;
 
 /// What a client sends.
 ///
@@ -530,6 +533,14 @@ pub enum Request {
     Sessions {
         /// The room.
         channel_id: Digest32,
+    },
+    /// The members offered to this node's keyring (ADR-028 K-15 – K-18), answered with
+    /// [`Frame::Offers`].
+    Offers,
+    /// Dismiss the offer of `member` (ADR-028 K-18): on this node alone, and silently.
+    DismissOffer {
+        /// The member offered.
+        member: Digest32,
     },
     /// Stop offering a service.
     RemoveService {
@@ -896,6 +907,12 @@ impl Request {
             }
             Request::Sessions { channel_id } => {
                 e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
+            }
+            Request::Offers => {
+                e.array(1).uint(T_OFFERS_REQ);
+            }
+            Request::DismissOffer { member } => {
+                e.array(2).uint(T_DISMISS_OFFER).bytes(member);
             }
             Request::ShareList { channel_id } => {
                 e.array(2).uint(T_SHARE_LIST).bytes(channel_id);
@@ -1447,6 +1464,17 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::Sessions { channel_id })
             }
+            (T_OFFERS_REQ, 1) => {
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Offers)
+            }
+            (T_DISMISS_OFFER, 2) => {
+                let member = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::DismissOffer { member })
+            }
             (T_ADD_SERVICE, 5) => {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
@@ -1739,6 +1767,11 @@ pub enum Frame {
         /// Each Session.
         sessions: Vec<crate::node::sessions::SessionRow>,
     },
+    /// The members offered to the keyring, as a [`Request::Offers`] asked for.
+    Offers {
+        /// Each offer, in fingerprint order.
+        offers: Vec<crate::node::api::Offer>,
+    },
 }
 
 impl Frame {
@@ -1902,6 +1935,10 @@ impl Frame {
             Frame::Sessions { sessions } => {
                 e.array(2).uint(T_SESSIONS);
                 crate::node::sessions::put_rows(&mut e, sessions);
+            }
+            Frame::Offers { offers } => {
+                e.array(2).uint(T_OFFERS);
+                crate::node::offers::put_offers(&mut e, offers);
             }
         }
         e.finish()
@@ -2528,6 +2565,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_SESSIONS, 2) => {
             let sessions = crate::node::sessions::read_rows(d)?;
             return Ok(Frame::Sessions { sessions });
+        }
+        (T_OFFERS, 2) => {
+            let offers = crate::node::offers::read_offers(d)?;
+            return Ok(Frame::Offers { offers });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -4325,6 +4366,18 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             Some(rows) => Frame::SessionEntries { rows },
             None => Frame::Error {
                 reason: "room not open".into(),
+            },
+        },
+        Request::Offers => Frame::Offers {
+            offers: handle.view().offers.clone(),
+        },
+        Request::DismissOffer { member } => match handle
+            .apply(crate::node::api::NodeCommand::DismissOffer { member })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
             },
         },
         Request::Sessions { channel_id } => {

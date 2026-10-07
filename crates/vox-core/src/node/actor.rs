@@ -303,6 +303,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         consented: ch.consented().into_iter().collect(),
         admins: ch.admins(),
         consenting: consenting.into_iter().collect(),
+        offer_bases: ch.offer_bases(),
         trusted_by: trusted_by
             .into_iter()
             .map(|(member, by)| (member, by.into_iter().collect()))
@@ -4185,6 +4186,9 @@ pub struct Node {
     /// The ADR-020 §3 trust keyring, loaded on unlock and empty while locked
     /// (it is sealed under the identity, so there is nothing to hold locked).
     trust: crate::node::trust::Keyring,
+    /// The trust offers this node dismissed (ADR-028 K-18), loaded on unlock and empty while
+    /// locked: sealed under the identity like the keyring.
+    dismissed_offers: crate::node::offers::DismissedOffers,
     /// Where each member was last reached directly (`node::peer_book`), so a restart can find
     /// them again with no anchor. Sealed under the identity: empty while locked.
     peer_book: crate::node::peer_book::PeerBook,
@@ -4567,6 +4571,7 @@ impl Node {
             view_tx: watch::Sender::new(NodeView::default()),
             event_tx,
             trust: crate::node::trust::Keyring::new(),
+            dismissed_offers: crate::node::offers::DismissedOffers::default(),
             peer_book: crate::node::peer_book::PeerBook::new(),
             node_retention: crate::node::retention::RetentionConfig::default(),
             retention_read_at: 0,
@@ -5089,6 +5094,26 @@ impl Node {
                 } else {
                     Outcome::Failed(Fault::NotConsented)
                 }
+            }
+            // A dismissal is this node's alone, and changes no keyring: no passphrase (K-11, K-18).
+            NodeCommand::DismissOffer { member } => {
+                let Some(profile) = self.profile.as_ref().filter(|p| p.is_unlocked()) else {
+                    return Outcome::Failed(Fault::Locked);
+                };
+                let rooms = self.view_tx.borrow().open_channels.clone();
+                let mut next = self.dismissed_offers.clone();
+                if !next.dismiss(&member, &rooms) {
+                    return Outcome::Done;
+                }
+                let saved = profile
+                    .signer()
+                    .and_then(|signer| next.save(profile.store(), signer));
+                if let Err(e) = saved {
+                    return Outcome::Failed(crate::node::actor::fault_of(&e));
+                }
+                self.dismissed_offers = next;
+                self.publish().await;
+                Outcome::Done
             }
             NodeCommand::Untrust { fingerprint } => {
                 let alias = self.trust.petname(&fingerprint).map(str::to_owned);
@@ -12646,6 +12671,11 @@ impl Node {
         // (ADR-020 §3). Without this the node would hold an empty keyring and
         // silently trust nobody after every restart.
         self.trust = crate::node::trust::Keyring::load(profile.store(), signer)?;
+        // What was dismissed stays dismissed across a restart (K-18). A set that will not open is
+        // started afresh rather than refusing the unlock: the worst it costs is an offer shown
+        // again.
+        self.dismissed_offers =
+            crate::node::offers::DismissedOffers::load(profile.store(), signer).unwrap_or_default();
         // Where members were last reached. A book that will not open is started afresh rather
         // than refusing the unlock: it is a cache of addresses, and the next connection to
         // each member fills it again.
@@ -12749,6 +12779,7 @@ impl Node {
         // and says who this operator talks to. A locked node holds neither, and it
         // is re-opened on the next unlock (ADR-020 §3).
         self.trust = crate::node::trust::Keyring::new();
+        self.dismissed_offers = crate::node::offers::DismissedOffers::default();
         self.peer_book = crate::node::peer_book::PeerBook::new();
         // The sender keys held for consents not yet delivered are room secrets: dropped, and
         // zeroized as they go (V210-76). They are reloaded, sealed, at the next unlock.
@@ -15011,6 +15042,7 @@ impl Node {
                 .map(|(fp, _)| *fp)
                 .filter(|fp| self.trust.has_drive(fp))
                 .collect(),
+            offers: Vec::new(),
             relayed_peers: Vec::new(),
             connected: 0,
             connected_peers: Vec::new(),
@@ -15150,6 +15182,14 @@ impl Node {
             .collect();
         // What the decision record names members as where the keyring is not at hand.
         self.decisions.set_aliases(&trusted);
+        // Who is offered to the keyring (K-15 – K-18), over every open room.
+        let names_here: Vec<Option<String>> = channels.iter().map(|c| c.name.clone()).collect();
+        let offers = crate::node::offers::offers(
+            &open_channels,
+            &names_here,
+            &trusted,
+            &self.dismissed_offers,
+        );
         let view = NodeView {
             identity,
             locked,
@@ -15158,6 +15198,7 @@ impl Node {
             listening,
             channels,
             open_channels,
+            offers,
             anchoring,
             forwards: self
                 .forwards

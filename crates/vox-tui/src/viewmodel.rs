@@ -355,6 +355,8 @@ pub struct ViewModel {
     pub closed_tunnels: Vec<vox_core::transport::quic::ClosedTunnel>,
     /// The trust keyring, `(fingerprint, alias)`, for the keyring view (ADR-028 W-1, K-1).
     pub keyring: Vec<(vox_core::hash::Digest32, String)>,
+    /// The members offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order.
+    pub offers: Vec<vox_core::node::api::Offer>,
     /// What this node decided, newest first, from its decision record (ADR-028 D-3).
     pub decisions: Vec<vox_core::node::decisions::Event>,
     /// What listens on this machine, for sharing one into a room (ADR-028 S-4), as `vox serve`
@@ -699,6 +701,23 @@ pub enum Command {
         channel_id: Digest32,
         /// The new name, one DNS label. No passphrase is asked for (ADR-028 K-11).
         name: String,
+    },
+    /// Accept the offer of a node (ADR-028 K-16): add it to the keyring under a name, granting
+    /// read, or read + drive, as `vox trust add` does.
+    AcceptOffer {
+        /// The node.
+        target: Digest32,
+        /// The person's name for it.
+        petname: String,
+        /// Whether it may drive this node's sessions too (ADR-028 K-14).
+        drive: bool,
+        /// The identity passphrase, empty while the keyring window is open (redacted/zeroized).
+        identity_passphrase: SecretString,
+    },
+    /// Dismiss the offer of a node (ADR-028 K-18): on this node alone, and silently.
+    DismissOffer {
+        /// The node.
+        member: Digest32,
     },
     /// Add a node to the keyring under a name (ADR-028 K-3, K-5), as `vox trust add` does, once
     /// the person has compared its fingerprint.

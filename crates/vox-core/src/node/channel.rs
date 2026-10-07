@@ -6965,6 +6965,77 @@ impl ChannelState {
             .collect()
     }
 
+    /// Where `author`'s current membership starts, and the time claimed for it: its statement that
+    /// it is back after its last leave, else its admission, which is the start of its feed (`seq`
+    /// 0, whatever this node holds of the feed) with the time of the first entry it holds. An author
+    /// that has written nothing this node holds joined no earlier than this node can tell: its
+    /// time is the latest.
+    fn admission(&self, author: &Digest32) -> (u64, u64) {
+        let back = self
+            .gov_entries
+            .iter()
+            .filter(|g| {
+                g.author_id == *author
+                    && matches!(&g.body, GovBody::Presence(p) if p.body.author_id == *author && p.body.here)
+            })
+            .map(|g| g.seq)
+            .max();
+        let feed = self.dag.feed(author);
+        let ms = |seq: Option<u64>| {
+            seq.and_then(|s| feed.and_then(|f| f.get(s)))
+                .map_or(u64::MAX, |e| e.skeleton.claimed_ms)
+        };
+        match back {
+            Some(seq) => (seq, ms(Some(seq))),
+            None => (0, ms(feed.and_then(crate::log::feed::Feed::min_seq))),
+        }
+    }
+
+    /// What each other member could be offered to this node on here (ADR-028 K-15, K-17), off the
+    /// log: a member that joined after this node did, by its join, and a member that grants this
+    /// node consent (ADR-007 G-9), by its latest grant. Nothing here knows the keyring or what was
+    /// dismissed; [`crate::node::offers::offers`] decides over every room.
+    #[must_use]
+    pub fn offer_bases(&self) -> Vec<crate::node::api::OfferBasis> {
+        use crate::node::api::{OfferBasis, OfferWhy};
+        let me = self.me();
+        let (_, mine) = self.admission(&me);
+        let view = MembershipView::new(&self.evaluator);
+        let mut out = Vec::new();
+        for member in self.members() {
+            if member == me {
+                continue;
+            }
+            let (seq, ms) = self.admission(&member);
+            if ms > mine {
+                out.push(OfferBasis {
+                    member,
+                    why: OfferWhy::Joined,
+                    seq,
+                });
+            }
+            if view.readers_of(&member).contains(&me) {
+                let grant = self
+                    .gov_entries
+                    .iter()
+                    .filter(|g| {
+                        g.author_id == member
+                            && matches!(&g.body, GovBody::ConsentGrant(c) if c.body.target_id == me)
+                    })
+                    .map(|g| g.seq)
+                    .max();
+                if let Some(seq) = grant {
+                    out.push(OfferBasis {
+                        member,
+                        why: OfferWhy::TrustsYou,
+                        seq,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Whether `fingerprint` is a member: an admitted author that has not left.
     #[must_use]
     pub fn is_member(&self, fingerprint: &Digest32) -> bool {
