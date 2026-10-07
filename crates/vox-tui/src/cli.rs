@@ -205,14 +205,14 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
         if pass.is_some() {
             eprintln!(
                 "vox: --identity-passphrase is refused: a keyring change's passphrase is typed at \
-                 a terminal (ADR-028 K-13)"
+                 a terminal"
             );
             return ExitCode::FAILURE;
         }
         if pass_file.is_some() {
             eprintln!(
                 "vox: --identity-passphrase-file is refused: a keyring change's passphrase is \
-                 typed at a terminal, never read from a file (ADR-028 K-13)"
+                 typed at a terminal, never read from a file"
             );
             return ExitCode::FAILURE;
         }
@@ -370,7 +370,7 @@ enum RoomCmd {
     ///
     /// A message carrying a link gets a link card: this node fetches the page of its first
     /// http(s) link once, and its title, description and an image of at most 16 KB travel in the
-    /// message, so no reader's node contacts the site. That fetch tells the linked site this
+    /// message, so no reader's node reaches the site. That fetch tells the linked site this
     /// machine's IP address. Only public addresses are fetched: a link to this machine or a
     /// private network goes without a card. `--no-card` posts without one.
     Post(RoomPostArgs),
@@ -388,11 +388,10 @@ enum RoomCmd {
     Tail(RoomTailArgs),
     /// Print the fingerprints of the room's members.
     Roster(RoomRefArgs),
-    /// The room's Sessions (ADR-029): one per harness session working in the room, each by your
+    /// The room's Sessions: one per harness session working in the room, each by your
     /// name for its node, the session's name and its short id; open ones first, ended ones apart.
     Sessions(RoomSessionsArgs),
-    /// Read one Session of the room: what that harness session did, one line per activity
-    /// (ADR-029 SC-1).
+    /// Read one Session of the room: what that harness session did, one line per activity.
     ///
     /// Tool calls with what they returned, the replies, the end of each turn, what was typed at
     /// the terminal or in Vox, approvals and questions with who answered them, files either way.
@@ -407,9 +406,9 @@ enum RoomCmd {
     /// answer cannot tell an offline node and missing trust in either direction apart, and says
     /// so. Exits 1 when no answer comes within `--wait`.
     ///
-    /// ```text
+    /// For example:
+    ///
     /// vox room ping <room> carol
-    /// ```
     Ping(RoomPingArgs),
     /// List the rooms this node holds.
     List(NodeArgs),
@@ -450,9 +449,9 @@ enum RoomCmd {
     /// The passphrase is asked for at the terminal, or read from `--passphrase-file`
     /// (`-` reads stdin); never argv, which anything that can run `ps` would see:
     ///
-    /// ```text
+    /// For example:
+    ///
     /// echo 'the room passphrase' | vox room join --passphrase-file - vox://…
-    /// ```
     ///
     /// This is what makes agent comms usable on a host with no terminal: `vox
     /// daemon` lets a node hold rooms unattended, and this is how a room gets
@@ -560,7 +559,7 @@ pub struct RenameArgs {
     pub profile: NodeArgs,
     /// The room: its name, or its id or a unique prefix of it.
     pub room: String,
-    /// The new name: one DNS label (a-z, 0-9 and `-`). Asks for no passphrase (ADR-028 K-11).
+    /// The new name: one DNS label (a-z, 0-9 and `-`). Asks for no passphrase.
     pub name: String,
 }
 
@@ -571,8 +570,7 @@ pub struct RetentionArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. Asks for no passphrase
-    /// (ADR-028 K-11).
+    /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. Asks for no passphrase.
     pub duration: String,
 }
 
@@ -735,8 +733,7 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
-/// Session, operation id and output shape, shared by every coordinating verb
-/// (ADR-021 §4, §6).
+/// Session, operation id and output shape, shared by every coordinating verb.
 #[derive(Args, Debug, Clone, Default)]
 pub struct CoordArgs {
     /// The session to act as. Defaults to `VOX_SESSION`, then the harness's own
@@ -874,11 +871,13 @@ enum AgentCmd {
     /// hook entry in their own settings, so they get a JSON snippet; OpenCode has
     /// no hook command and loads JavaScript plugins, so it gets a plugin file.
     ///
-    /// ```text
+    /// For example:
+    ///
     /// vox agent plugin opencode --node opencode-mbp > ~/.config/opencode/plugin/vox.js
+    ///
     /// vox agent plugin claude --node claude-mbp   # merge into ~/.claude/settings.json
+    ///
     /// vox agent plugin codex --node codex-mbp     # merge into Codex's hooks.json
-    /// ```
     ///
     /// The integration goes to stdout so it can be redirected or piped through
     /// `jq`; where to put it goes to stderr, so it does not land in the file.
@@ -895,14 +894,19 @@ enum AgentCmd {
     /// named after the skill. Install it at **user scope**, beside the drain, so a
     /// session opened in any repository has both:
     ///
-    /// ```text
+    /// For example:
+    ///
     /// mkdir -p ~/.claude/skills/vox-agent-comms
+    ///
     /// vox agent skill claude > ~/.claude/skills/vox-agent-comms/SKILL.md
+    ///
     /// mkdir -p ~/.codex/skills/vox-agent-comms           # $CODEX_HOME/skills when set
+    ///
     /// vox agent skill codex > ~/.codex/skills/vox-agent-comms/SKILL.md
+    ///
     /// mkdir -p ~/.config/opencode/skills/vox-agent-comms # $XDG_CONFIG_HOME/opencode/skills when set
+    ///
     /// vox agent skill opencode > ~/.config/opencode/skills/vox-agent-comms/SKILL.md
-    /// ```
     ///
     /// The skill goes to stdout; where it goes, to stderr, so it does not land in the file.
     Skill(AgentSkillArgs),
@@ -914,9 +918,9 @@ enum AgentCmd {
     /// agent hook`. Idempotent; run it again after changing the entry's command.
     /// Honours `CODEX_HOME`.
     ///
-    /// ```text
+    /// For example:
+    ///
     /// vox agent trust codex
-    /// ```
     Trust(AgentTrustArgs),
     /// Check that this node's agent sessions are wired up, and say how to fix what is not.
     ///
@@ -928,24 +932,22 @@ enum AgentCmd {
     /// something not set up, `fail` something set up that will not work. Exits 1 on any `fail`.
     /// It only reads: it starts no harness or model, changes nothing and wakes no one.
     ///
-    /// ```text
+    /// For example:
+    ///
     /// vox agent doctor --room <room>
-    /// ```
     Doctor(AgentDoctorArgs),
-    /// Set the room this harness session works in, or move it to another (ADR-029 RB-5).
+    /// Set the room this harness session works in, or move it to another.
     ///
     /// Run from the session, when its hook says it works in no room, or to move it: its
     /// Session ends in the room it worked in and opens in this one. The room is one the
     /// node holds. A session works in one room at a time.
     Room(AgentRoomArgs),
-    /// Send a file or folder out of this session's Session (ADR-029 DR-1.8).
+    /// Send a file or folder out of this session's Session.
     ///
     /// Run from the session. Only the members this node trusts with drive learn of it and are
     /// served it; their nodes pull it by themselves. Nothing is posted to the room.
     ///
-    /// ```text
-    /// vox agent send ./report.pdf --note "the numbers you asked for"
-    /// ```
+    /// For example: vox agent send ./report.pdf --note "the numbers you asked for"
     Send(AgentSendArgs),
 }
 
@@ -1125,7 +1127,7 @@ pub struct RoomSessionArgs {
     /// Print one JSON object per line instead.
     #[arg(long)]
     pub json: bool,
-    /// Drive the session instead of reading it (ADR-029 §3), as a member its node trusts with
+    /// Drive the session instead of reading it, as a member its node trusts with
     /// drive. Each input reaches that session alone, or is refused with the reason.
     #[command(flatten)]
     pub drive: SessionDriveArgs,
@@ -1160,7 +1162,7 @@ pub struct SessionDriveArgs {
     /// question (a question by its id or its text; several choices joined with ", ").
     #[arg(long, value_name = "REF", num_args = 2..)]
     pub answer: Option<Vec<String>>,
-    /// Send the session a file (ADR-029 DR-1.7): it lands on its node, and the session is told
+    /// Send the session a file: it lands on its node, and the session is told
     /// where. Only its node is served it.
     #[arg(long, value_name = "PATH")]
     pub file: Option<std::path::PathBuf>,
@@ -1674,7 +1676,7 @@ enum TrustCmd {
     /// `<service>.<name>.<room>.vox`; it is local to this machine and never
     /// leaves it. Grants nothing: only an identity already trusted can be renamed.
     Rename(TrustRenameArgs),
-    /// Let a trusted identity drive this node's Sessions as well as read (ADR-028 K-14): its
+    /// Let a trusted identity drive this node's Sessions as well as read: its
     /// keyring entry becomes read + drive. A keyring change, behind the passphrase.
     Drive(TrustCapabilityArgs),
     /// Take drive back from a trusted identity: its keyring entry grants read only.
@@ -1731,7 +1733,7 @@ pub struct TrustAddArgs {
     /// for, so it also reads what you wrote before. Your messages only — nobody else's.
     #[arg(long, value_parser = ["now", "full"], default_value = "now")]
     pub history: String,
-    /// Grant read + drive: it may also drive this node's Sessions (ADR-028 K-14). Without it
+    /// Grant read + drive: it may also drive this node's Sessions. Without it
     /// the entry grants read, the default.
     #[arg(long)]
     pub drive: bool,
@@ -1928,9 +1930,9 @@ enum Cmd {
     /// `VOX_IDENTITY_PASSPHRASE`, else asked for at the terminal without echo, else read from
     /// stdin:
     ///
-    /// ```text
+    /// For example:
+    ///
     /// echo 'my passphrase' | vox daemon --node alice
-    /// ```
     ///
     /// `--keep` attaches that node again whenever the daemon starts. When a daemon already runs
     /// for this data root, a `vox daemon --node <name>` attaches the node to it instead.

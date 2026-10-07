@@ -20,6 +20,8 @@
 //! - no command for contacts, a directory or a one-to-one path (E-3): a direct message is a
 //!   two-member room;
 //! - no reference to a design document (`ADR-…`, `PRD-…`, `V030-…`, `V210-…`, `M17.…`, `(#…)`);
+//! - no Markdown code fence: an example in a doc comment is its own paragraph, never a flattened
+//!   `` ```text … ``` `` line;
 //! - every example `.vox` address has the one form that connects, `<service>.<node>.<room>.vox`:
 //!   four labels.
 
@@ -124,6 +126,10 @@ fn faults(text: &str) -> Vec<String> {
         }
         if low.contains("safety code") {
             out.push(format!("says \"safety code\": {}", line.trim()));
+        }
+        // A code fence in a doc comment reaches the help flattened onto one line, fences and all.
+        if line.contains("```") {
+            out.push(format!("shows a Markdown code fence: {}", line.trim()));
         }
         let refs = ["ADR-", "PRD-", "V030-", "V210-", "V29-", "M17.", "(#"];
         if let Some(r) = refs.iter().find(|r| line.contains(**r)) {
