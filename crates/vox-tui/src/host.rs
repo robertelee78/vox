@@ -1855,7 +1855,10 @@ async fn post_in_order(
                 body: body.clone(),
             })
             .await;
-        if !matches!(outcome, vox_core::node::api::Outcome::Done) {
+        if !matches!(
+            outcome,
+            vox_core::node::api::Outcome::Done | vox_core::node::api::Outcome::Appended(_)
+        ) {
             let kind = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
                 .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
