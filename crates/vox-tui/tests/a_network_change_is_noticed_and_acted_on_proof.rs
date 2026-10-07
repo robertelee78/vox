@@ -439,3 +439,84 @@ fn a_peer_on_loopback_is_not_cut_off_when_the_default_route_moves() {
         late.said()
     );
 }
+
+/// **A failed read of a node's socket does not leave it deaf.** quinn ends its endpoint on any
+/// read error but a reset, and says so only on output nothing reads; the node went on running,
+/// unreachable by anyone, in silence (once after a real change of the machine's network: a joiner
+/// on loopback was told "no board could be read" on every try). The node's socket now says the
+/// failure and reads again.
+///
+/// Staged with `VOX_TEST_RECV_FAIL_FILE`: while the file exists, alice's next read of her socket
+/// fails (the network down) and removes it. The agent's join is what she reads next; it must get in,
+/// and the file must be gone (else the failure was never injected: APPARATUS).
+///
+/// **Mutant**: `MuxSocket::poll_recv` handing the failure up to quinn as before. alice's endpoint
+/// ends, she says she stopped taking connections, and the join is not answered.
+#[test]
+#[ignore = "real daemons and an injected socket read failure; run in release with test-knobs"]
+fn a_failed_socket_read_does_not_leave_a_node_deaf() {
+    watchdog::arm();
+    test_knobs::require(&["VOX_TEST_RECV_FAIL_FILE"]);
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temporary directory");
+    let route = tmp.path().join("route");
+    std::fs::write(&route, "192.168.1.1").expect("APPARATUS: the staged route");
+    let fail = tmp.path().join("fail-next-read");
+    let fail_env = fail.to_str().expect("APPARATUS: a UTF-8 path").to_owned();
+    let alice = Loopback::start(
+        &tmp.path().join("alice"),
+        &route,
+        &[("VOX_TEST_RECV_FAIL_FILE", fail_env.as_str())],
+    );
+    let agent = Loopback::start(&tmp.path().join("agent"), &route, &[]);
+    let (ok, said) = alice.vox(
+        &[
+            "room",
+            "create",
+            "--passphrase-file",
+            "-",
+            "--name",
+            "agents",
+        ],
+        "channel passphrase",
+    );
+    assert!(ok, "PRODUCT (staging): vox room create: {said}");
+    let (_, list) = alice.vox(&["room", "list"], "");
+    let room = list
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` named no room: {list}"))
+        .to_owned();
+    let (ok, link) = alice.vox(&["room", "link", &room], "");
+    let link = link
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room link` printed no link: {link}"))
+        .to_owned();
+    assert!(ok, "PRODUCT (staging): vox room link: {link}");
+
+    // alice's next read fails; the join is what she reads next.
+    std::fs::write(&fail, "").expect("APPARATUS: arm the read failure");
+    let started = Instant::now();
+    let (ok, said) = agent.vox(
+        &["room", "join", &link, "--passphrase-file", "-"],
+        "channel passphrase",
+    );
+    let took = started.elapsed();
+    println!(
+        "[proof] the join, {took:?} after alice's read failed, said: {:?}\n[proof] alice said \
+         (the failure, and the read that worked after it):\n{}",
+        said.lines().next(),
+        alice.said()
+    );
+    assert!(
+        !fail.exists(),
+        "APPARATUS: staging not achieved: alice never read her socket with the failure armed \
+         (the file is still there); the join said:\n{said}"
+    );
+    assert!(
+        ok && said.contains("joined agents"),
+        "PRODUCT: a node whose socket failed one read must keep taking connections: the join to \
+         alice on loopback said:\n{said}\nalice's daemon said:\n{}",
+        alice.said()
+    );
+}
