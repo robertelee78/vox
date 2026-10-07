@@ -38,7 +38,7 @@
 //!   it knows no address of its own, and it stops with a failure.
 //!
 //! - **F, a board that holds the room but not the host's address** (C7). The host's records are
-//!   given a short life (`VOX_TEST_RECORD_TTL_SECS`, 8 s) and the host is frozen (SIGSTOP) until
+//!   given a short life (`VOX_TEST_RECORD_TTL_MS`, 8 000 ms) and the host is frozen (SIGSTOP) until
 //!   its address record on the anchor lapses, as a host that slept would leave it; the anchor still
 //!   holds the room's genesis and the host's bundle. The guest joins, and the host is resumed
 //!   (SIGCONT) a moment later. Asserted: the join gets in, and its steps say it dialled the host at
@@ -773,7 +773,7 @@ fn signal(pid: u32, signal: &str) {
 #[test]
 #[ignore = "a real anchor, host and guest, production Argon2id and a real PoW; CI runs it in release"]
 fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
-    test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
+    test_knobs::require(&["VOX_TEST_RECORD_TTL_MS"]);
     watchdog::arm_for(BUDGET);
     let tmp = tempfile::tempdir()
         .unwrap_or_else(|e| panic!("APPARATUS: could not make a temporary directory: {e}"));
@@ -795,7 +795,7 @@ fn f_a_join_dials_the_host_at_the_links_address_when_the_board_has_none() {
             "--listen",
             "127.0.0.1:0",
         ]),
-        &[("VOX_TEST_RECORD_TTL_SECS", "8")],
+        &[("VOX_TEST_RECORD_TTL_MS", "8000")],
     );
     let address = line_within(&mut host, ROOM_WITHIN, |l| l.starts_with("address "));
     let address = after_label(

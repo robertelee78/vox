@@ -110,7 +110,7 @@ fn flood_batch(
                 SoftwareRootSigner::from_component_seeds(&seed, &other)
                     .expect("APPARATUS: build the stand-in peer's signer"),
             );
-            let t = hostile::now();
+            let t = hostile::now_ms();
             let ring = PrekeyRing::generate(&s, &seed, t)
                 .expect("APPARATUS: generate the stand-in peer's prekeys");
             let bundle = ring
@@ -219,10 +219,10 @@ fn a_flood_of_strangers_does_not_stop_a_real_join_through_a_node() {
             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
             let policy = ChannelPolicy {
                 history_mode: vox_core::governance::genesis::HistoryMode::ForwardOnly,
-                ttl: 0,
+                ttl_ms: 0,
                 min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
             };
-            Genesis::create_with_nonce(&inventor, hostile::now(), policy, nonce)
+            Genesis::create_with_nonce(&inventor, hostile::now_ms(), policy, nonce)
                 .expect("APPARATUS: build the stand-in peer's records")
                 .to_wire()
         })

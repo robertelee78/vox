@@ -189,7 +189,7 @@ relay circuit.
 
 - **N-25. Record kinds.** A board MUST accept four kinds (ADR-008 tags):
   - **member address record**, `RendezvousRecord`, `0x0007`: `[author_id, channelID, epoch,
-    endpoints, seq, timestamp, ttl_secs, sign_algo]`, composite-signed, carrying the author's
+    endpoints, seq, timestamp_ms, ttl_ms, sign_algo]`, composite-signed, carrying the author's
     fingerprint only;
   - **pre-join record**, `PreJoinRecord`, `0x0008`: self-signed, embedding the asserted composite key
     and prekey bundle, with `prekey_bundle.root_pub == asserted_id`;

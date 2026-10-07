@@ -1,4 +1,4 @@
-//! The **board withdraw** (tag `0x001A`, domain `vox/board-withdraw/v1`) and the **admin roster**
+//! The **board withdraw** (tag `0x001A`, domain `vox/board-withdraw/v2`) and the **admin roster**
 //! (tag `0x001B`, domain `vox/admin-roster/v1`), V030-14: signed statements, put on a rendezvous
 //! board, that take records off it at once and say who may.
 //!
@@ -84,8 +84,8 @@ pub struct BoardWithdraw {
     pub author_id: Digest32,
     /// What it takes off.
     pub scope: WithdrawScope,
-    /// When it was said, unix seconds.
-    pub timestamp: u64,
+    /// When it was said, milliseconds since the Unix epoch.
+    pub timestamp_ms: u64,
     /// The signer's composite root signature.
     pub signature: CompositeSignature,
 }
@@ -95,7 +95,7 @@ fn withdraw_body(
     epoch: u64,
     author_id: &Digest32,
     scope: WithdrawScope,
-    timestamp: u64,
+    timestamp_ms: u64,
 ) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(5)
@@ -103,7 +103,7 @@ fn withdraw_body(
         .uint(epoch)
         .bytes(author_id)
         .uint(scope.code())
-        .uint(timestamp);
+        .uint(timestamp_ms);
     e.finish()
 }
 
@@ -114,12 +114,12 @@ impl BoardWithdraw {
         channel_id: &Digest32,
         epoch: u64,
         scope: WithdrawScope,
-        timestamp: u64,
+        timestamp_ms: u64,
     ) -> Result<Self> {
         let author_id = signer.fingerprint();
         let input = signing_input(
             StructTag::BoardWithdraw,
-            &withdraw_body(channel_id, epoch, &author_id, scope, timestamp),
+            &withdraw_body(channel_id, epoch, &author_id, scope, timestamp_ms),
         );
         let signature = signer.sign(&input)?;
         Ok(Self {
@@ -127,7 +127,7 @@ impl BoardWithdraw {
             epoch,
             author_id,
             scope,
-            timestamp,
+            timestamp_ms,
             signature,
         })
     }
@@ -141,7 +141,7 @@ impl BoardWithdraw {
             .uint(self.epoch)
             .bytes(&self.author_id)
             .uint(self.scope.code())
-            .uint(self.timestamp)
+            .uint(self.timestamp_ms)
             .bytes(&self.signature.to_bytes());
         frame(StructTag::BoardWithdraw, &e.finish())
     }
@@ -162,7 +162,7 @@ impl BoardWithdraw {
         let epoch = d.uint()?;
         let author_id = take_digest(&mut d, "board withdraw digest length")?;
         let scope = WithdrawScope::from_code(d.uint()?)?;
-        let timestamp = d.uint()?;
+        let timestamp_ms = d.uint()?;
         let signature = take_sig(&mut d, "board withdraw sig length")?;
         d.finish()?;
         Ok(Self {
@@ -170,7 +170,7 @@ impl BoardWithdraw {
             epoch,
             author_id,
             scope,
-            timestamp,
+            timestamp_ms,
             signature,
         })
     }
@@ -189,7 +189,7 @@ impl BoardWithdraw {
                 self.epoch,
                 &self.author_id,
                 self.scope,
-                self.timestamp,
+                self.timestamp_ms,
             ),
         );
         signer_key.verify(&input, &self.signature)

@@ -342,7 +342,9 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             .expect("PRODUCT (staging): step 1 — a valid identity must be admitted");
 
         // ---- step 3, the assertion this proof stands on ---------------------------------
-        let ring = PrekeyRing::generate(&stranger, &[0x3B; 32], t)
+        // The board's records and the prekeys are stamped in milliseconds; the transport in seconds.
+        let t_ms = t.saturating_mul(1_000);
+        let ring = PrekeyRing::generate(&stranger, &[0x3B; 32], t_ms)
             .expect("APPARATUS: the stranger's prekeys");
         let bundle = ring
             .bundle(&stranger.public_key())
@@ -353,7 +355,7 @@ fn a_stranger_with_only_the_rooms_name_does_not_stop_the_node() {
             bundle,
             EndpointList::new(Vec::new()).expect("APPARATUS: build the stand-in peer's records"),
             1,
-            t,
+            t_ms,
         )
         .expect("APPARATUS: the stranger's pre-join record");
         let mut rendezvous = RendezvousClient::open(&conn)

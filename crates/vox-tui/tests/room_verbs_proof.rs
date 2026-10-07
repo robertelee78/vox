@@ -53,6 +53,16 @@
 //! (`test-knobs`). `--no-card` posts the link and fetches nothing. Mutant: fetch the card on the
 //! reader (red: the server counts bob's requests).
 //!
+//! **A room made before Vox's times were milliseconds still opens, reads and takes a post**
+//! ([`a_room_made_when_times_were_seconds_still_opens_reads_and_takes_a_post`], #562). The
+//! fixture `fixtures/seconds-format-room.tar.gz` is a node's data directory made by `vox` at
+//! integrate 48b1c743, the last build that wrote a room's genesis, its idle end and its retention
+//! change in seconds (format 1): room `before`, idle end one month, retention one week, and one
+//! post. The shipped `vox` opens it: the room keeps its id (its genesis hash, so the genesis is
+//! encoded exactly as it was written), its post reads, its retention is still one week, and a new
+//! post is taken. Mutants: read a format-1 time as milliseconds (red: the room's id, or the room
+//! does not open); refuse format 1 (red: the room does not open).
+//!
 //! Production Argon2id once at setup; `#[ignore]`d in the debug suite.
 //!
 //! **A room is made and posted to in a debug build too**
@@ -95,7 +105,9 @@ impl Drop for Daemon {
 
 /// Start `vox daemon` on the profile and wait until its control socket answers.
 fn daemon(data: &Path, cfg: &Path, pass: &Path, err: &Path) -> Daemon {
-    let child = Command::new(VOX)
+    let mut cmd = Command::new(VOX);
+    support::strip_harness_env(&mut cmd);
+    let child = cmd
         .args(["daemon", "--listen", "127.0.0.1:0", "--passphrase-file"])
         .arg(pass)
         .env("VOX_DATA_DIR", data)
@@ -140,6 +152,7 @@ fn vox(
     stdin: Option<&str>,
 ) -> (bool, String, String) {
     let mut cmd = Command::new(VOX);
+    support::strip_harness_env(&mut cmd);
     cmd.args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
@@ -1057,5 +1070,86 @@ fn a_link_card_is_fetched_by_the_senders_node_alone() {
         card3.is_null(),
         "PRODUCT: `--no-card` must post the link with no card, fetching nothing; the card read \
          {card3}"
+    );
+}
+
+/// The room the fixture holds, as `vox` at integrate 48b1c743 made it: its id is its genesis hash.
+const SECONDS_ROOM: &str = "oku2e2lomuokl6rfrzsifpq72o5i2n3ejc4kdm3bu73khltiinga";
+
+#[test]
+#[ignore = "production Argon2id to unlock the fixture's identity; CI runs it in release"]
+fn a_room_made_when_times_were_seconds_still_opens_reads_and_takes_a_post() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/seconds-format-room.tar.gz"
+    );
+    let unpacked = Command::new("tar")
+        .args(["-xzf", fixture, "-C"])
+        .arg(tmp.path())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run tar: {e}"));
+    assert!(
+        unpacked.success(),
+        "APPARATUS: tar could not unpack {fixture}"
+    );
+    let data = tmp.path().join("data");
+    let cfg = data.join("cfg");
+    let pass = tmp.path().join("identity.pass");
+    std::fs::write(&pass, "identity passphrase\n")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the passphrase file: {e}"));
+    let _d = daemon(&data, &cfg, &pass, &tmp.path().join("daemon.err"));
+
+    let (ok, list, err) = vox(&data, &cfg, &["room", "list"], None);
+    println!("[proof] the seconds-era node's rooms:\n{list}");
+    assert!(
+        ok && list.contains(&SECONDS_ROOM[..12]) && list.contains("before"),
+        "PRODUCT: a room made when times were seconds must still be held and listed; `vox room \
+         list` said: {list}{err}"
+    );
+    let (ok, link, err) = vox(&data, &cfg, &["room", "link", &SECONDS_ROOM[..12]], None);
+    assert!(
+        ok && link.trim().starts_with(&format!("vox://{SECONDS_ROOM}?")),
+        "PRODUCT: the room must keep its id ({SECONDS_ROOM}), the hash of its genesis as it was \
+         written; `vox room link` said: {link}{err}"
+    );
+    let (ok, read, err) = vox(&data, &cfg, &["room", "read", SECONDS_ROOM], None);
+    println!("[proof] its messages:\n{read}");
+    assert!(
+        ok && read.contains("said while times were seconds"),
+        "PRODUCT: the room's post from before must still read; `vox room read` said: {read}{err}"
+    );
+    let (ok, status, err) = vox(&data, &cfg, &["status", "--json"], None);
+    let retention = serde_json::from_str::<serde_json::Value>(&status)
+        .ok()
+        .and_then(|v| {
+            v["rooms"]
+                .as_array()?
+                .iter()
+                .find(|r| r["id"] == SECONDS_ROOM)
+                .and_then(|r| r["retention"].as_u64())
+        });
+    println!("[proof] its retention, as `vox status --json` says: {retention:?}");
+    assert!(
+        ok && retention == Some(7 * 24 * 60 * 60),
+        "PRODUCT: the room's retention, changed to one week when times were seconds, must still be \
+         one week (604800 s); `vox status --json` said {retention:?}{err}"
+    );
+    let (ok, out, err) = vox(
+        &data,
+        &cfg,
+        &["room", "post", SECONDS_ROOM, "said after milliseconds"],
+        None,
+    );
+    assert!(
+        ok,
+        "PRODUCT: the room must take a new post; `vox room post` said: {out}{err}"
+    );
+    let (ok, read, err) = vox(&data, &cfg, &["room", "read", SECONDS_ROOM], None);
+    println!("[proof] after a new post:\n{read}");
+    assert!(
+        ok && read.contains("said while times were seconds") && read.contains("said after milliseconds"),
+        "PRODUCT: the room must read its old post and the new one; `vox room read` said: {read}{err}"
     );
 }

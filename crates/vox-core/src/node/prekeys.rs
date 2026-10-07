@@ -54,7 +54,7 @@
 //!   consume the same one-time prekey, and that the second session must still
 //!   establish while being **treated as last-resort-grade**. That is only possible
 //!   if the responder can still complete the handshake, which needs the consumed
-//!   secret — so it is retained for [`ONE_TIME_CONSUMED_RETAIN_SECS`] (and at most
+//!   secret — so it is retained for [`ONE_TIME_CONSUMED_RETAIN_MS`] (and at most
 //!   [`ONE_TIME_CONSUMED_MAX`] entries) and served from the consumed set, flagged.
 //!   The ring is the **persistent** record of consumption;
 //!   [`crate::pairwise::OtpReuseTracker`] is the per-process one that
@@ -97,11 +97,14 @@ pub const PREKEY_RING_SEK_INFO: &[u8] = b"vox/prekey-ring-sek/v2";
 /// The ring's segment id within its pseudo-channel (one segment, latest-wins).
 pub const SEG_PREKEY_RING: u64 = 1;
 
-/// At-rest encoding version of the ring.
-const RING_VERSION: u64 = 1;
+/// At-rest encoding version of the ring: 2, every time in it in milliseconds.
+const RING_VERSION: u64 = 2;
+
+/// The ring's version 1, its times in seconds: still read (see [`PrekeyRing::decode`]).
+const RING_VERSION_SECONDS: u64 = 1;
 
 /// Signed-prekey rotation cadence (ADR-002 §2: "every 7 days").
-pub const SIGNED_PREKEY_CADENCE_SECS: u64 = 7 * 24 * 60 * 60;
+pub const SIGNED_PREKEY_CADENCE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// One-time prekey pool target size (refilled up to this).
 pub const ONE_TIME_PREKEY_TARGET: usize = 64;
@@ -144,7 +147,7 @@ const fn one_time_pool() -> (usize, usize) {
 /// How long a **consumed** one-time prekey is retained so a concurrent duplicate
 /// use can still establish (ADR-004 §"Serverless consume semantics"). One hour
 /// covers a genuine race; see the module docs for why it is not the bundle TTL.
-pub const ONE_TIME_CONSUMED_RETAIN_SECS: u64 = 60 * 60;
+pub const ONE_TIME_CONSUMED_RETAIN_MS: u64 = 60 * 60 * 1_000;
 
 /// Hard cap on retained consumed one-time prekeys (oldest dropped first), so a
 /// drain attack cannot grow the ring without bound.
@@ -214,6 +217,10 @@ pub struct PrekeyRing {
     /// Initial messages this process answered with the **previous** signed prekey: sessions
     /// started just before a rotation. Not persisted; `vox status --json` reports it.
     previous_used: std::sync::atomic::AtomicU64,
+    /// The current signed prekey was read from a version-1 ring, its creation time in seconds
+    /// under its signature: it is rotated at the next [`PrekeyRing::maintain`] rather than read in
+    /// the wrong unit.
+    rotate_now: bool,
 }
 
 impl std::fmt::Debug for PrekeyRing {
@@ -243,9 +250,9 @@ impl PrekeyRing {
     pub fn generate(
         signer: &dyn RootSigner,
         identity_dh_secret: &[u8; 32],
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<Self> {
-        Self::generate_sized(signer, identity_dh_secret, now_secs, one_time_pool().1)
+        Self::generate_sized(signer, identity_dh_secret, now_ms, one_time_pool().1)
     }
 
     /// [`PrekeyRing::generate`] with an explicit initial pool size. Private: the
@@ -255,16 +262,16 @@ impl PrekeyRing {
     fn generate_sized(
         signer: &dyn RootSigner,
         identity_dh_secret: &[u8; 32],
-        now_secs: u64,
+        now_ms: u64,
         one_time: usize,
     ) -> Result<Self> {
         let identity_dh = SignedIdentityDhKey::from_key(
             signer,
             X25519IdentityKey::from_secret_bytes(*identity_dh_secret),
-            now_secs,
+            now_ms,
         )?;
-        let current = SignedPrekey::generate(signer, 1, now_secs)?;
-        let pool = OneTimePrekeyPool::generate(signer, one_time, 1, now_secs)?;
+        let current = SignedPrekey::generate(signer, 1, now_ms)?;
+        let pool = OneTimePrekeyPool::generate(signer, one_time, 1, now_ms)?;
         Ok(Self {
             identity_dh,
             current,
@@ -273,6 +280,7 @@ impl PrekeyRing {
             pool,
             consumed: Vec::new(),
             previous_used: std::sync::atomic::AtomicU64::new(0),
+            rotate_now: false,
         })
     }
 
@@ -334,11 +342,11 @@ impl PrekeyRing {
     /// docs for the three outcomes). On [`OneTimeUse::Fresh`] or
     /// [`OneTimeUse::Reused`] the material is available from
     /// [`PrekeyRing::consumed_one_time`]; the caller must [`save`] the ring.
-    pub fn use_one_time(&mut self, prekey_id: u64, now_secs: u64) -> OneTimeUse {
+    pub fn use_one_time(&mut self, prekey_id: u64, now_ms: u64) -> OneTimeUse {
         if let Some(prekey) = self.pool.take_by_id(prekey_id) {
             self.consumed.push(ConsumedOneTime {
                 prekey,
-                consumed_at: now_secs,
+                consumed_at: now_ms,
             });
             self.enforce_consumed_cap();
             return OneTimeUse::Fresh;
@@ -384,31 +392,32 @@ impl PrekeyRing {
     /// Rotate the signed prekey if the cadence has elapsed and refill the one-time
     /// pool if it is at or below the low-water mark (ADR-002 §2). Call on start and
     /// periodically; [`save`] afterwards iff [`Maintenance::changed`].
-    pub fn maintain(&mut self, signer: &dyn RootSigner, now_secs: u64) -> Result<Maintenance> {
+    pub fn maintain(&mut self, signer: &dyn RootSigner, now_ms: u64) -> Result<Maintenance> {
         let mut out = Maintenance::default();
         let due = self
             .current
             .public()
             .created
-            .saturating_add(SIGNED_PREKEY_CADENCE_SECS);
-        if now_secs >= due {
+            .saturating_add(SIGNED_PREKEY_CADENCE_MS);
+        if self.rotate_now || now_ms >= due {
             let id = self.next_signed_prekey_id;
-            let fresh = SignedPrekey::generate(signer, id, now_secs)?;
+            let fresh = SignedPrekey::generate(signer, id, now_ms)?;
             self.next_signed_prekey_id = id
                 .checked_add(1)
                 .ok_or(Error::MalformedAtRest("signed prekey id overflow"))?;
             // The outgoing current becomes `previous`; the older `previous` is
             // dropped — it has now been retained one full cadence (ADR-002).
             self.previous = Some(std::mem::replace(&mut self.current, fresh));
+            self.rotate_now = false;
             out.rotated = true;
         }
         out.one_time_added =
             self.pool
-                .refill_to(signer, one_time_pool().0, one_time_pool().1, now_secs)?;
+                .refill_to(signer, one_time_pool().0, one_time_pool().1, now_ms)?;
         // Retention elapsed: drop the consumed secrets (forward secrecy restored).
         let before = self.consumed.len();
         self.consumed
-            .retain(|c| now_secs < c.consumed_at.saturating_add(ONE_TIME_CONSUMED_RETAIN_SECS));
+            .retain(|c| now_ms < c.consumed_at.saturating_add(ONE_TIME_CONSUMED_RETAIN_MS));
         out.consumed_pruned = before - self.consumed.len() + self.enforce_consumed_cap();
         Ok(out)
     }
@@ -462,9 +471,14 @@ impl PrekeyRing {
         if d.array()? != 8 {
             return Err(Error::MalformedAtRest("prekey ring arity"));
         }
-        if d.uint()? != RING_VERSION {
-            return Err(Error::MalformedAtRest("prekey ring version"));
-        }
+        // A version-1 ring's times are seconds. Its consume times convert; a prekey's creation
+        // time is under its root signature, and only the current signed prekey's is ever read,
+        // so that one is rotated at once instead (the others' are never compared with anything).
+        let seconds = match d.uint()? {
+            RING_VERSION => false,
+            RING_VERSION_SECONDS => true,
+            _ => return Err(Error::MalformedAtRest("prekey ring version")),
+        };
         if d.array()? != 3 {
             return Err(Error::MalformedAtRest("prekey ring identity dh arity"));
         }
@@ -507,6 +521,11 @@ impl PrekeyRing {
             }
             let prekey = decode_one_time(root, &mut d)?;
             let consumed_at = d.uint()?;
+            let consumed_at = if seconds {
+                consumed_at.saturating_mul(1_000)
+            } else {
+                consumed_at
+            };
             consumed.push(ConsumedOneTime {
                 prekey,
                 consumed_at,
@@ -535,6 +554,7 @@ impl PrekeyRing {
             pool,
             consumed,
             previous_used: std::sync::atomic::AtomicU64::new(0),
+            rotate_now: seconds,
         })
     }
 }
@@ -643,17 +663,17 @@ pub fn load_or_create(
     store: &Store,
     signer: &dyn RootSigner,
     identity_dh_secret: &[u8; 32],
-    now_secs: u64,
+    now_ms: u64,
 ) -> Result<(PrekeyRing, bool)> {
     match load(store, signer)? {
         Some(mut ring) => {
-            if ring.maintain(signer, now_secs)?.changed() {
+            if ring.maintain(signer, now_ms)?.changed() {
                 save(store, signer, &ring)?;
             }
             Ok((ring, false))
         }
         None => {
-            let ring = PrekeyRing::generate(signer, identity_dh_secret, now_secs)?;
+            let ring = PrekeyRing::generate(signer, identity_dh_secret, now_ms)?;
             save(store, signer, &ring)?;
             Ok((ring, true))
         }

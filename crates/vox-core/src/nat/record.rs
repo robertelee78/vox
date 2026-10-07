@@ -87,41 +87,41 @@ pub struct RendezvousRecord {
     /// A per-`(author, channel, epoch)` monotonic sequence number — the primary
     /// anti-replay handle (readers reject a non-increasing `seq`).
     pub seq: u64,
-    /// Wall-clock publication time (epoch-seconds). Bounds TTL and rate, and
+    /// Wall-clock publication time (milliseconds since the Unix epoch). Bounds TTL and rate, and
     /// breaks ties when `seq` is equal.
-    pub timestamp: u64,
-    /// Requested time-to-live in seconds; the store caps it at
-    /// [`crate::nat::store::MAX_TTL_SECS`]. After `timestamp + ttl_secs` the record
+    pub timestamp_ms: u64,
+    /// Requested time-to-live in milliseconds; the store caps it at
+    /// [`crate::nat::store::MAX_TTL_MS`]. After `timestamp_ms + ttl_ms` the record
     /// is expired and pruned.
-    pub ttl_secs: u64,
+    pub ttl_ms: u64,
     /// The author's composite signature over [`RendezvousRecord::signing_input`].
     pub signature: CompositeSignature,
 }
 
 impl RendezvousRecord {
     /// The canonical signed body (arity 8): `[author_id, channelID, epoch,
-    /// endpoints, seq, timestamp, ttl_secs, [sign_algo]]`.
+    /// endpoints, seq, timestamp_ms, ttl_ms, [sign_algo]]`.
     fn canonical_body(
         author_id: &Digest32,
         channel_id: &Digest32,
         epoch: u64,
         endpoints: &EndpointList,
         seq: u64,
-        timestamp: u64,
-        ttl_secs: u64,
+        timestamp_ms: u64,
+        ttl_ms: u64,
     ) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(8).bytes(author_id).bytes(channel_id).uint(epoch);
         endpoints.encode_into(&mut e);
         e.uint(seq)
-            .uint(timestamp)
-            .uint(ttl_secs)
+            .uint(timestamp_ms)
+            .uint(ttl_ms)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
         e.finish()
     }
 
-    /// The signing input: `vox/rendezvous-record/v1 ‖ canonical_body` (ADR-008).
+    /// The signing input: `vox/rendezvous-record/v2 ‖ canonical_body` (ADR-008).
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
         signing_input(
@@ -132,8 +132,8 @@ impl RendezvousRecord {
                 self.epoch,
                 &self.endpoints,
                 self.seq,
-                self.timestamp,
-                self.ttl_secs,
+                self.timestamp_ms,
+                self.ttl_ms,
             ),
         )
     }
@@ -147,12 +147,18 @@ impl RendezvousRecord {
         epoch: u64,
         endpoints: EndpointList,
         seq: u64,
-        timestamp: u64,
-        ttl_secs: u64,
+        timestamp_ms: u64,
+        ttl_ms: u64,
     ) -> Result<Self> {
         let author_id = signer.fingerprint();
         let body = Self::canonical_body(
-            &author_id, channel_id, epoch, &endpoints, seq, timestamp, ttl_secs,
+            &author_id,
+            channel_id,
+            epoch,
+            &endpoints,
+            seq,
+            timestamp_ms,
+            ttl_ms,
         );
         let signature = signer.sign(&signing_input(StructTag::RendezvousRecord, &body))?;
         Ok(Self {
@@ -161,8 +167,8 @@ impl RendezvousRecord {
             epoch,
             endpoints,
             seq,
-            timestamp,
-            ttl_secs,
+            timestamp_ms,
+            ttl_ms,
             signature,
         })
     }
@@ -179,8 +185,8 @@ impl RendezvousRecord {
             .uint(self.epoch);
         self.endpoints.encode_into(&mut e);
         e.uint(self.seq)
-            .uint(self.timestamp)
-            .uint(self.ttl_secs)
+            .uint(self.timestamp_ms)
+            .uint(self.ttl_ms)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65))
             .bytes(&self.signature.to_bytes());
@@ -203,8 +209,8 @@ impl RendezvousRecord {
         let epoch = d.uint()?;
         let endpoints = EndpointList::decode_from(&mut d)?;
         let seq = d.uint()?;
-        let timestamp = d.uint()?;
-        let ttl_secs = d.uint()?;
+        let timestamp_ms = d.uint()?;
+        let ttl_ms = d.uint()?;
         take_and_check_algo(&mut d, "rendezvous algo arity")?;
         let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
             .bytes()?
@@ -218,8 +224,8 @@ impl RendezvousRecord {
             epoch,
             endpoints,
             seq,
-            timestamp,
-            ttl_secs,
+            timestamp_ms,
+            ttl_ms,
             signature,
         })
     }
@@ -264,8 +270,8 @@ pub struct PreJoinRecord {
     pub endpoints: EndpointList,
     /// Monotonic per-`(asserted_id, channel)` sequence number (anti-replay).
     pub seq: u64,
-    /// Wall-clock publication time (epoch-seconds).
-    pub timestamp: u64,
+    /// Wall-clock publication time (milliseconds since the Unix epoch).
+    pub timestamp_ms: u64,
     /// The self-signature over [`PreJoinRecord::signing_input`].
     pub signature: CompositeSignature,
 }
@@ -278,14 +284,14 @@ impl PreJoinRecord {
     }
 
     /// The canonical signed body (arity 7): `[asserted_pubkey, channelID,
-    /// prekey_bundle, endpoints, seq, timestamp, [sign_algo]]`.
+    /// prekey_bundle, endpoints, seq, timestamp_ms, [sign_algo]]`.
     fn canonical_body(
         asserted_pubkey: &CompositePublicKey,
         channel_id: &Digest32,
         prekey_bundle_bytes: &[u8],
         endpoints: &EndpointList,
         seq: u64,
-        timestamp: u64,
+        timestamp_ms: u64,
     ) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(7)
@@ -294,13 +300,13 @@ impl PreJoinRecord {
             .bytes(prekey_bundle_bytes);
         endpoints.encode_into(&mut e);
         e.uint(seq)
-            .uint(timestamp)
+            .uint(timestamp_ms)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
         e.finish()
     }
 
-    /// The signing input: `vox/pre-join-record/v1 ‖ canonical_body` (ADR-008).
+    /// The signing input: `vox/pre-join-record/v2 ‖ canonical_body` (ADR-008).
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
         signing_input(
@@ -311,7 +317,7 @@ impl PreJoinRecord {
                 &self.prekey_bundle.encode_canonical(),
                 &self.endpoints,
                 self.seq,
-                self.timestamp,
+                self.timestamp_ms,
             ),
         )
     }
@@ -324,7 +330,7 @@ impl PreJoinRecord {
         prekey_bundle: PrekeyBundlePublic,
         endpoints: EndpointList,
         seq: u64,
-        timestamp: u64,
+        timestamp_ms: u64,
     ) -> Result<Self> {
         let asserted_pubkey = signer.public_key();
         let bundle_bytes = prekey_bundle.encode_canonical();
@@ -334,7 +340,7 @@ impl PreJoinRecord {
             &bundle_bytes,
             &endpoints,
             seq,
-            timestamp,
+            timestamp_ms,
         );
         let signature = signer.sign(&signing_input(StructTag::PreJoinRecord, &body))?;
         Ok(Self {
@@ -343,7 +349,7 @@ impl PreJoinRecord {
             prekey_bundle,
             endpoints,
             seq,
-            timestamp,
+            timestamp_ms,
             signature,
         })
     }
@@ -359,7 +365,7 @@ impl PreJoinRecord {
             .bytes(&self.prekey_bundle.encode_canonical());
         self.endpoints.encode_into(&mut e);
         e.uint(self.seq)
-            .uint(self.timestamp)
+            .uint(self.timestamp_ms)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65))
             .bytes(&self.signature.to_bytes());
@@ -389,7 +395,7 @@ impl PreJoinRecord {
         let prekey_bundle = PrekeyBundlePublic::decode_canonical(bundle_bytes)?;
         let endpoints = EndpointList::decode_from(&mut d)?;
         let seq = d.uint()?;
-        let timestamp = d.uint()?;
+        let timestamp_ms = d.uint()?;
         take_and_check_algo(&mut d, "pre-join algo arity")?;
         let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
             .bytes()?
@@ -404,7 +410,7 @@ impl PreJoinRecord {
             prekey_bundle,
             endpoints,
             seq,
-            timestamp,
+            timestamp_ms,
             signature,
         })
     }
@@ -546,21 +552,21 @@ pub struct JoinWitness {
     pub joiner_id: Digest32,
     /// The member that verified it and is signing this statement.
     pub witness_id: Digest32,
-    /// Wall-clock time of the join (epoch-seconds).
-    pub timestamp: u64,
+    /// Wall-clock time of the join (milliseconds since the Unix epoch).
+    pub timestamp_ms: u64,
     /// The witness's composite signature over [`JoinWitness::signing_input`].
     pub signature: CompositeSignature,
 }
 
 impl JoinWitness {
     /// The canonical signed body (arity 6): `[channel_id, epoch, joiner_id, witness_id,
-    /// timestamp, [sign_algo]]`.
+    /// timestamp_ms, [sign_algo]]`.
     fn canonical_body(
         channel_id: &Digest32,
         epoch: u64,
         joiner_id: &Digest32,
         witness_id: &Digest32,
-        timestamp: u64,
+        timestamp_ms: u64,
     ) -> Vec<u8> {
         let mut e = Encoder::new();
         e.array(6)
@@ -568,13 +574,13 @@ impl JoinWitness {
             .uint(epoch)
             .bytes(joiner_id)
             .bytes(witness_id)
-            .uint(timestamp)
+            .uint(timestamp_ms)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
         e.finish()
     }
 
-    /// The signing input: `vox/join-witness/v1 ‖ canonical_body`.
+    /// The signing input: `vox/join-witness/v2 ‖ canonical_body`.
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
         signing_input(
@@ -584,7 +590,7 @@ impl JoinWitness {
                 self.epoch,
                 &self.joiner_id,
                 &self.witness_id,
-                self.timestamp,
+                self.timestamp_ms,
             ),
         )
     }
@@ -600,7 +606,7 @@ impl JoinWitness {
         channel_id: &Digest32,
         epoch: u64,
         joiner_id: &Digest32,
-        timestamp: u64,
+        timestamp_ms: u64,
     ) -> Result<Self> {
         let witness_id = signer.fingerprint();
         if witness_id == *joiner_id {
@@ -608,14 +614,14 @@ impl JoinWitness {
                 "join-witness cannot witness itself",
             ));
         }
-        let body = Self::canonical_body(channel_id, epoch, joiner_id, &witness_id, timestamp);
+        let body = Self::canonical_body(channel_id, epoch, joiner_id, &witness_id, timestamp_ms);
         let signature = signer.sign(&signing_input(StructTag::JoinWitness, &body))?;
         Ok(Self {
             channel_id: *channel_id,
             epoch,
             joiner_id: *joiner_id,
             witness_id,
-            timestamp,
+            timestamp_ms,
             signature,
         })
     }
@@ -636,7 +642,7 @@ impl JoinWitness {
             .uint(self.epoch)
             .bytes(&self.joiner_id)
             .bytes(&self.witness_id)
-            .uint(self.timestamp)
+            .uint(self.timestamp_ms)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65))
             .bytes(&self.signature.to_bytes());
@@ -653,7 +659,7 @@ impl JoinWitness {
         let epoch = d.uint()?;
         let joiner_id = take_digest(&mut d, "join-witness joiner_id length")?;
         let witness_id = take_digest(&mut d, "join-witness witness_id length")?;
-        let timestamp = d.uint()?;
+        let timestamp_ms = d.uint()?;
         take_and_check_algo(&mut d, "join-witness algo arity")?;
         let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
             .bytes()?
@@ -665,7 +671,7 @@ impl JoinWitness {
             epoch,
             joiner_id,
             witness_id,
-            timestamp,
+            timestamp_ms,
             signature: CompositeSignature::from_bytes(&sig_bytes)?,
         })
     }
@@ -728,7 +734,7 @@ impl JoinWitness {
 /// the newcomer's pre-join bundle; the newcomer seals *its* SKDM to each member
 /// using that member's bundle record — this one. Like the member address record
 /// it is member-only (the store resolves the author's key from the authenticated
-/// membership), `(channelID, epoch)`-scoped, `seq`/`timestamp` anti-replayed and
+/// membership), `(channelID, epoch)`-scoped, `seq`/`timestamp_ms` anti-replayed and
 /// TTL'd — but its TTL is the ADR-002 signed-prekey cadence (7 days) rather than
 /// the address record's 2 hours, and it is refreshed on rotation and when the
 /// one-time pool crosses its low-water mark. It is a separate kind because the
@@ -747,11 +753,11 @@ pub struct MemberBundleRecord {
     pub prekey_bundle: PrekeyBundlePublic,
     /// Monotonic per-`(author, channel, epoch)` sequence (anti-replay).
     pub seq: u64,
-    /// Wall-clock publication time (epoch-seconds).
-    pub timestamp: u64,
-    /// Requested time-to-live in seconds; the store caps it at
-    /// [`crate::nat::store::BUNDLE_MAX_TTL_SECS`].
-    pub ttl_secs: u64,
+    /// Wall-clock publication time (milliseconds since the Unix epoch).
+    pub timestamp_ms: u64,
+    /// Requested time-to-live in milliseconds; the store caps it at
+    /// [`crate::nat::store::BUNDLE_MAX_TTL_MS`].
+    pub ttl_ms: u64,
     /// How this key earned its place on the board: it created the channel, or a member
     /// verified its ADR-005 passphrase proof and signed that it did (ADR-016 M17.6).
     ///
@@ -764,7 +770,7 @@ pub struct MemberBundleRecord {
 
 impl MemberBundleRecord {
     /// The canonical signed body (arity 9): `[author_id, channelID, epoch,
-    /// prekey_bundle, seq, timestamp, ttl_secs, admission, [sign_algo]]`.
+    /// prekey_bundle, seq, timestamp_ms, ttl_ms, admission, [sign_algo]]`.
     ///
     /// The admission is **inside** the signed body so the publisher cannot be given one
     /// witness and publish under another, and so a witness cannot be lifted off one
@@ -779,8 +785,8 @@ impl MemberBundleRecord {
         epoch: u64,
         prekey_bundle_bytes: &[u8],
         seq: u64,
-        timestamp: u64,
-        ttl_secs: u64,
+        timestamp_ms: u64,
+        ttl_ms: u64,
         admission_bytes: &[u8],
     ) -> Vec<u8> {
         let mut e = Encoder::new();
@@ -790,15 +796,15 @@ impl MemberBundleRecord {
             .uint(epoch)
             .bytes(prekey_bundle_bytes)
             .uint(seq)
-            .uint(timestamp)
-            .uint(ttl_secs)
+            .uint(timestamp_ms)
+            .uint(ttl_ms)
             .bytes(admission_bytes)
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
         e.finish()
     }
 
-    /// The signing input: `vox/member-bundle-record/v1 ‖ canonical_body`.
+    /// The signing input: `vox/member-bundle-record/v2 ‖ canonical_body`.
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
         signing_input(
@@ -809,8 +815,8 @@ impl MemberBundleRecord {
                 self.epoch,
                 &self.prekey_bundle.encode_canonical(),
                 self.seq,
-                self.timestamp,
-                self.ttl_secs,
+                self.timestamp_ms,
+                self.ttl_ms,
                 &self.admission.body_bytes(),
             ),
         )
@@ -830,8 +836,8 @@ impl MemberBundleRecord {
         epoch: u64,
         prekey_bundle: PrekeyBundlePublic,
         seq: u64,
-        timestamp: u64,
-        ttl_secs: u64,
+        timestamp_ms: u64,
+        ttl_ms: u64,
         admission: Admission,
     ) -> Result<Self> {
         if prekey_bundle.root_pub != signer.public_key().to_bytes() {
@@ -861,8 +867,8 @@ impl MemberBundleRecord {
             epoch,
             &bundle_bytes,
             seq,
-            timestamp,
-            ttl_secs,
+            timestamp_ms,
+            ttl_ms,
             &admission.body_bytes(),
         );
         let signature = signer.sign(&signing_input(StructTag::MemberBundleRecord, &body))?;
@@ -872,8 +878,8 @@ impl MemberBundleRecord {
             epoch,
             prekey_bundle,
             seq,
-            timestamp,
-            ttl_secs,
+            timestamp_ms,
+            ttl_ms,
             admission,
             signature,
         })
@@ -890,8 +896,8 @@ impl MemberBundleRecord {
             .uint(self.epoch)
             .bytes(&self.prekey_bundle.encode_canonical())
             .uint(self.seq)
-            .uint(self.timestamp)
-            .uint(self.ttl_secs)
+            .uint(self.timestamp_ms)
+            .uint(self.ttl_ms)
             .bytes(&self.admission.body_bytes())
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65))
@@ -919,8 +925,8 @@ impl MemberBundleRecord {
         }
         let prekey_bundle = PrekeyBundlePublic::decode_canonical(bundle_bytes)?;
         let seq = d.uint()?;
-        let timestamp = d.uint()?;
-        let ttl_secs = d.uint()?;
+        let timestamp_ms = d.uint()?;
+        let ttl_ms = d.uint()?;
         let admission = Admission::from_body(d.bytes()?)?;
         take_and_check_algo(&mut d, "member-bundle algo arity")?;
         let sig_bytes: [u8; COMPOSITE_SIG_LEN] = d
@@ -935,8 +941,8 @@ impl MemberBundleRecord {
             epoch,
             prekey_bundle,
             seq,
-            timestamp,
-            ttl_secs,
+            timestamp_ms,
+            ttl_ms,
             admission,
             signature,
         })

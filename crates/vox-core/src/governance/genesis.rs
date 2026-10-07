@@ -1,5 +1,11 @@
 //! The channel genesis record — the trust anchor (ADR-007 §"Trust anchor",
-//! tag `0x000D`, domain `vox/genesis/v1`).
+//! tag `0x000D`, domain `vox/genesis/v2`).
+//!
+//! ## Its times are milliseconds (format 2)
+//! `created` and the policy's `ttl` are milliseconds since the Unix epoch and milliseconds. A
+//! genesis written before (format 1, domain `vox/genesis/v1`) carried both in seconds: it is still
+//! read, its seconds held as milliseconds, and it is encoded, hashed and verified exactly as it was
+//! written, so every room made before keeps its id ([`GenesisBody::format`]).
 //!
 //! A channel *begins* with a genesis record: its own canonical struct (not a
 //! generic governance cert), self-signed by the creator's composite identity key
@@ -11,7 +17,7 @@
 //! admin (ADR-007).
 //!
 //! ## Pinned field list (ADR-007, exact order)
-//! `{ nonce(16 B random), created(uint epoch-seconds),
+//! `{ nonce(16 B random), created(uint milliseconds since the Unix epoch),
 //!    policy{ history_mode(enum), retired_deniability(uint, always 0), ttl(uint, 0=never) },
 //!    creator_pubkey(composite, ADR-002), algo_ids }`
 //!
@@ -22,7 +28,7 @@
 //! genesis record commits to (there is no AEAD or KEM at the genesis layer).
 //!
 //! ## Self-signature and the cold-join check
-//! The creator signs `vox/genesis/v1 ‖ canonical_body`
+//! The creator signs `vox/genesis/v2 ‖ canonical_body`
 //! ([`crate::wire::signing_input`]) with its composite root. A cold-joining node
 //! fetches genesis from the rendezvous (ADR-012) and accepts it **only if**
 //! `SHA-256(canonical bytes) == the channelID it joined with`
@@ -37,7 +43,7 @@ use crate::hash::{sha256, Digest32, COMPOSITE_PUB_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::identity::rng::fill_random;
 use crate::suite::{algo, suite_by_id, validate_algo, SuiteFloor};
-use crate::wire::{frame, parse_frame, signing_input, StructTag};
+use crate::wire::{frame_at, parse_frame, signing_input_at, time_decoded, time_encoded, StructTag};
 
 /// Length of the genesis nonce in bytes (128-bit, ADR-007).
 pub const GENESIS_NONCE_LEN: usize = 16;
@@ -117,9 +123,9 @@ fn attributable_slot(v: u64) -> Result<()> {
 pub struct ChannelPolicy {
     /// History retention/release mode (mutable).
     pub history_mode: HistoryMode,
-    /// Payload time-to-live in seconds; `0` means never expire (mutable). The
+    /// Payload time-to-live in milliseconds; `0` means never expire (mutable). The
     /// actual erasure is M8 (ADR-010); this is the policy value.
-    pub ttl: u64,
+    pub ttl_ms: u64,
     /// The channel's **minimum ciphersuite** id (ADR-003 §"Floor relation";
     /// raise-only via policy update). Every handshake on the channel rejects a
     /// proposal ranked below it. Must name a registered suite.
@@ -142,12 +148,16 @@ impl ChannelPolicy {
 pub struct GenesisBody {
     /// 128-bit random nonce — the entropy that makes each channelID unique.
     pub nonce: [u8; GENESIS_NONCE_LEN],
-    /// Channel creation time (epoch seconds).
-    pub created: u64,
+    /// Channel creation time, milliseconds since the Unix epoch.
+    pub created_ms: u64,
     /// The channel policy (history / ttl / floor).
     pub policy: ChannelPolicy,
     /// The creator's composite root public key — the root admin (ADR-007).
     pub creator_pubkey: CompositePublicKey,
+    /// The format it was written in: [`StructTag::format_version`] for one this build makes,
+    /// [`crate::wire::FORMAT_VERSION`] (1) for one written when its times were seconds. It is encoded in its own
+    /// format, so its bytes, its signature and its hash (the room's id) are what its creator made.
+    pub format: u8,
 }
 
 impl GenesisBody {
@@ -161,11 +171,11 @@ impl GenesisBody {
         let mut e = Encoder::new();
         e.array(6)
             .bytes(&self.nonce)
-            .uint(self.created)
+            .uint(time_encoded(self.created_ms, self.format))
             .array(4)
             .uint(self.policy.history_mode.as_u64())
             .uint(ATTRIBUTABLE_SLOT)
-            .uint(self.policy.ttl)
+            .uint(time_encoded(self.policy.ttl_ms, self.format))
             .uint(u64::from(self.policy.min_suite))
             .array(0)
             .bytes(&self.creator_pubkey.to_bytes())
@@ -174,10 +184,15 @@ impl GenesisBody {
         e.finish()
     }
 
-    /// The signing input: `vox/genesis/v1 ‖ canonical_body` (ADR-008).
+    /// The signing input: `vox/genesis/v2 ‖ canonical_body` (ADR-008), or `vox/genesis/v1 ‖ …`
+    /// for a format-1 genesis.
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
-        signing_input(StructTag::GenesisRecord, &self.canonical_body())
+        signing_input_at(
+            StructTag::GenesisRecord,
+            self.format,
+            &self.canonical_body(),
+        )
     }
 
     /// The channelID: `SHA-256(canonical genesis body)` (ADR-007/ADR-005). This
@@ -191,7 +206,7 @@ impl GenesisBody {
     /// Decode a genesis body from its canonical bytes, validating arity, the
     /// policy enums' domains, the composite key encoding, and the algo-id (must be
     /// the composite signature class).
-    fn from_canonical_body(body: &[u8]) -> Result<Self> {
+    fn from_canonical_body(body: &[u8], format: u8) -> Result<Self> {
         let mut d = Decoder::new(body);
         if d.array()? != 6 {
             return Err(Error::MalformedGovernance("genesis arity"));
@@ -232,13 +247,14 @@ impl GenesisBody {
         let creator_pubkey = CompositePublicKey::from_bytes(&pk_bytes)?;
         Ok(Self {
             nonce,
-            created,
+            created_ms: time_decoded(created, format),
             policy: ChannelPolicy {
                 history_mode,
-                ttl,
+                ttl_ms: time_decoded(ttl, format),
                 min_suite,
             },
             creator_pubkey,
+            format,
         })
     }
 }
@@ -260,19 +276,19 @@ impl Genesis {
     /// admin). Returns [`Error::Rng`] if the OS CSPRNG is unavailable.
     pub fn create(
         creator_root: &dyn RootSigner,
-        created: u64,
+        created_ms: u64,
         policy: ChannelPolicy,
     ) -> Result<Self> {
         let mut nonce = [0u8; GENESIS_NONCE_LEN];
         fill_random(&mut nonce)?;
-        Self::create_with_nonce(creator_root, created, policy, nonce)
+        Self::create_with_nonce(creator_root, created_ms, policy, nonce)
     }
 
     /// Build and self-sign a genesis record with an explicit nonce (deterministic
     /// — used by golden vectors and tests; production uses [`Genesis::create`]).
     pub fn create_with_nonce(
         creator_root: &dyn RootSigner,
-        created: u64,
+        created_ms: u64,
         policy: ChannelPolicy,
         nonce: [u8; GENESIS_NONCE_LEN],
     ) -> Result<Self> {
@@ -280,9 +296,10 @@ impl Genesis {
         suite_by_id(policy.min_suite)?;
         let body = GenesisBody {
             nonce,
-            created,
+            created_ms,
             policy,
             creator_pubkey: creator_root.public_key(),
+            format: StructTag::GenesisRecord.format_version(),
         };
         let signature = creator_root.sign(&body.signing_input())?;
         Ok(Self { body, signature })
@@ -309,11 +326,11 @@ impl Genesis {
         let mut e = Encoder::new();
         e.array(7)
             .bytes(&b.nonce)
-            .uint(b.created)
+            .uint(time_encoded(b.created_ms, b.format))
             .array(4)
             .uint(b.policy.history_mode.as_u64())
             .uint(ATTRIBUTABLE_SLOT)
-            .uint(b.policy.ttl)
+            .uint(time_encoded(b.policy.ttl_ms, b.format))
             .uint(u64::from(b.policy.min_suite))
             .array(0)
             .bytes(&b.creator_pubkey.to_bytes())
@@ -325,11 +342,15 @@ impl Genesis {
 
     /// Frame for the wire/storage per ADR-008: `tag(2 BE) ‖ version(1) ‖
     /// canonical_cbor_6field_body` (tag [`StructTag::GenesisRecord`] = `0x000D`).
-    /// The `vox/genesis/v1` domain label is the *signing* prefix, **not** the wire
+    /// The `vox/genesis/v2` domain label is the *signing* prefix, **not** the wire
     /// frame (ADR-008 §Struct framing).
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
-        frame(StructTag::GenesisRecord, &self.wire_body())
+        frame_at(
+            StructTag::GenesisRecord,
+            self.body.format,
+            &self.wire_body(),
+        )
     }
 
     /// Parse a framed genesis record, rejecting a wrong/unknown struct tag,
@@ -378,7 +399,7 @@ impl Genesis {
             .bytes(&creator_pubkey)
             .array(1)
             .uint(sign_algo);
-        let body = GenesisBody::from_canonical_body(&be.finish())?;
+        let body = GenesisBody::from_canonical_body(&be.finish(), parsed.version)?;
 
         let sig_arr: [u8; crate::hash::COMPOSITE_SIG_LEN] = sig_bytes
             .as_slice()

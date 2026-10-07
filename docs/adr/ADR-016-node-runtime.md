@@ -87,10 +87,10 @@ The persistence engine is **redb**; member prekey bundles are a **new rendezvous
 - **NR-22 (M14.1).** The record kinds MUST include:
   - the member address record (`0x0007`);
   - the pre-join record (`0x0008`);
-  - the member bundle record (`0x0012`, `vox/member-bundle-record/v1`):
+  - the member bundle record (`0x0012`, `vox/member-bundle-record/v2`):
     - a member's root-signed `PrekeyBundlePublic`;
-    - body `[author_id, channelID, epoch, prekey_bundle, seq, timestamp, ttl_secs, [sign_algo]]`;
-    - default and maximum TTL 7 days (`BUNDLE_MAX_TTL_SECS`);
+    - body `[author_id, channelID, epoch, prekey_bundle, seq, timestamp_ms, ttl_ms, [sign_algo]]`;
+    - default and maximum TTL 7 days (`BUNDLE_MAX_TTL_MS`);
     - refreshed on rotation and at the one-time pool's low-water mark;
     - `verify` MUST bind `prekey_bundle.root_pub` to the resolved member key and check the bundle's own signatures, and `build` MUST refuse to sign a foreign bundle;
   - the room genesis (M14.7b).

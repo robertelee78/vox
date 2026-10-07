@@ -1,7 +1,8 @@
 //! Admin-delegation certificates and their revocations (ADR-007
 //! §"Per-type body schemas").
 //!
-//! - **Admin-delegation cert** (tag `0x0003`, domain `vox/admin-cert/v1`): an
+//! - **Admin-delegation cert** (tag `0x0003`, domain `vox/admin-cert/v2`, `v1` for a
+//!   format-1 cert, whose expiry was in seconds): an
 //!   admin names a *delegate* identity key and a granted capability set,
 //!   optionally attenuated and optionally with an expiry. Delegations chain to
 //!   genesis, forming an SPKI/SDSI/UCAN-style capability tree the client verifies
@@ -20,7 +21,7 @@
 //! ## The cert body (signing input, ADR-007)
 //! `[channelID, epoch, issuer_id, delegate_pubkey, capability_set[], expiry,
 //!   [sign_algo]]` where `expiry == 0` means *no expiry* and a non-zero value is
-//! the epoch-seconds deadline. `capability_set` is the canonical (sorted) token
+//! the deadline in milliseconds since the Unix epoch. `capability_set` is the canonical (sorted) token
 //! array from [`crate::governance::capability`]. The wire body appends the
 //! composite signature as a final element.
 
@@ -30,7 +31,10 @@ use crate::governance::capability::CapabilitySet;
 use crate::hash::{Digest32, COMPOSITE_PUB_LEN, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
 use crate::suite::{algo, validate_algo};
-use crate::wire::{frame, parse_frame, signing_input, StructTag};
+use crate::wire::{
+    frame, frame_at, parse_frame, signing_input, signing_input_at, time_decoded, time_encoded,
+    StructTag,
+};
 
 /// Hard cap on the number of capabilities in one delegation cert, enforced
 /// before interning the token array (anti-abuse, ADR-008): a cert grants a small
@@ -86,8 +90,11 @@ pub struct AdminCertBody {
     pub delegate_pubkey: CompositePublicKey,
     /// The granted capability set (attenuated; never exceeding the issuer's).
     pub capability_set: CapabilitySet,
-    /// Expiry in epoch-seconds; `0` means no expiry (ADR-007 `expiry?`).
-    pub expiry: u64,
+    /// Expiry, milliseconds since the Unix epoch; `0` means no expiry (ADR-007 `expiry?`).
+    pub expiry_ms: u64,
+    /// The format it was written in: a format-1 cert carried its expiry in seconds, and is encoded
+    /// and verified as it was written (see [`crate::governance::genesis`]).
+    pub format: u8,
 }
 
 impl AdminCertBody {
@@ -107,16 +114,17 @@ impl AdminCertBody {
         for t in &tokens {
             e.text(t);
         }
-        e.uint(self.expiry)
+        e.uint(time_encoded(self.expiry_ms, self.format))
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
         e.finish()
     }
 
-    /// The signing input: `vox/admin-cert/v1 ‖ canonical_body` (ADR-008).
+    /// The signing input: `vox/admin-cert/v2 ‖ canonical_body` (ADR-008), or the `v1` label for a
+    /// format-1 cert.
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
-        signing_input(StructTag::AdminCert, &self.canonical_body())
+        signing_input_at(StructTag::AdminCert, self.format, &self.canonical_body())
     }
 
     /// The delegate's identity fingerprint (the key the grant authorizes).
@@ -125,7 +133,7 @@ impl AdminCertBody {
         self.delegate_pubkey.fingerprint()
     }
 
-    fn from_canonical_body(body: &[u8]) -> Result<Self> {
+    fn from_canonical_body(body: &[u8], format: u8) -> Result<Self> {
         let mut d = Decoder::new(body);
         if d.array()? != 7 {
             return Err(Error::MalformedGovernance("admin-cert arity"));
@@ -167,7 +175,8 @@ impl AdminCertBody {
             issuer_id,
             delegate_pubkey,
             capability_set,
-            expiry,
+            expiry_ms: time_decoded(expiry, format),
+            format,
         })
     }
 }
@@ -191,7 +200,7 @@ impl AdminCert {
         epoch: u64,
         delegate_pubkey: CompositePublicKey,
         capability_set: CapabilitySet,
-        expiry: u64,
+        expiry_ms: u64,
     ) -> Result<Self> {
         let body = AdminCertBody {
             channel_id: *channel_id,
@@ -199,7 +208,8 @@ impl AdminCert {
             issuer_id: issuer_root.fingerprint(),
             delegate_pubkey,
             capability_set,
-            expiry,
+            expiry_ms,
+            format: StructTag::AdminCert.format_version(),
         };
         let signature = issuer_root.sign(&body.signing_input())?;
         Ok(Self { body, signature })
@@ -223,11 +233,11 @@ impl AdminCert {
         for t in &tokens {
             e.text(t);
         }
-        e.uint(self.body.expiry)
+        e.uint(time_encoded(self.body.expiry_ms, self.body.format))
             .array(1)
             .uint(u64::from(algo::COMPOSITE_ED25519_ML_DSA_65));
         e.bytes(&self.signature.to_bytes());
-        frame(StructTag::AdminCert, &e.finish())
+        frame_at(StructTag::AdminCert, self.body.format, &e.finish())
     }
 
     /// Parse a framed admin-delegation cert (does NOT verify — call
@@ -273,7 +283,7 @@ impl AdminCert {
             be.text(t);
         }
         be.uint(expiry).array(1).uint(sign_algo);
-        let body = AdminCertBody::from_canonical_body(&be.finish())?;
+        let body = AdminCertBody::from_canonical_body(&be.finish(), parsed.version)?;
 
         let signature = parse_sig(&sig_bytes)?;
         Ok(Self { body, signature })
