@@ -349,7 +349,32 @@ Every control has a VoiceOver label in words: a room says its group and unread, 
 trust, a service card its address, who shares it and its kind, and the status bar reads as one
 sentence. The app is dark only.
 
-## Not in the app yet
+## Sessions
 
-Sessions are to come to the app, and this chapter is to describe them when they land. Until
-then, follow and drive Sessions from the CLI or the TUI (see [Sessions](sessions.md)).
+Beside a room's timeline, above its members, **SESSIONS** lists the room's Sessions as the TUI
+does: **General** (the room's own conversation), **All** (the conversation with each Session's
+opening and end among it), each open Session (`● LABEL`, or `! LABEL · waiting on you` when it is
+waiting for you), and **Ended (N)**, folded until you open it. See [Sessions](sessions.md) for what
+a Session is.
+
+Choose a Session to show it in the timeline. Its title says which: `Timeline — LABEL · open ·
+⏱ 1 week`. To a member its node trusts with **read + drive**, a Session shows each entry as one
+line, word for word as `vox room session` prints it, with **Details** for its full input and
+output, and a file the session sent offers **Quick Look** and **Show in Finder** once your node
+has a checked copy. The header says that the Session's name and id are its node's claim:
+`LABEL — name and id as NODE says`. To anyone else it shows only that it opened (and ended), and
+`Only members NODE trusts with drive see inside this Session.`
+
+With drive, an open Session has its own composer, `Composer — to LABEL`, in place of the room's:
+
+- What you type goes to the session as its operator's input; a line starting with `/` is sent as
+  a slash command.
+- **Interrupt** stops the turn it is running, as Esc does; **Stop** stops it, as Ctrl-C does.
+- The paper clip sends the session a file.
+- An approval it asks for shows **Approve** and **Reject** (with an optional reason, told to the
+  model); a question shows each part's options, and **Send answers** once each part has one. Once
+  it is settled, the entry says what became of it.
+
+Under the composer the app says what came of the last thing you sent, as the CLI and the TUI say
+it: the session's node's answer, `not sent to LABEL: …`, or `no answer from LABEL: it may or may
+not have been delivered`.
