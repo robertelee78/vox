@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks forty-four claims, each
+//! 160x50. It checks forty-five claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -97,6 +97,9 @@
 //!   the room's messages; `:session <short id>`, without drive, shows only that it exists and
 //!   "Only members alice trusts with drive see inside this Session.", with no composer, and
 //!   `:send` there is refused and reaches nobody (ADR-029 CL-2, CL-3, #553);
+//! - `session-order`: Alice posts, then her hook opens a new Session, within one wall-clock second:
+//!   in Bob's All the post reads first and "<label> opened" under it (#562: a Session's opened line
+//!   follows no message, so it is placed by its time, kept in milliseconds);
 //! - `drive`: once Alice gives Bob drive (`vox trust drive`, typed at a terminal) and her open
 //!   Session runs a turn through Claude Code's hook (a tool call, its result, the reply), Bob's
 //!   `:session` shows each line his `vox room session` prints, and not "Only members …"; `d` on the
@@ -168,9 +171,9 @@
 //! offering a composer (`sessions`), a member with drive shown only that the Session exists
 //! (`drive`), `a` sending a rejection (`approve`),
 //! `:interrupt` sent as a stop (`steer`),
-//! a Session's `:share` sending the path as text (`share`), or a time rounded to the second
-//! (`order`). It passes only on the script's PASS with
-//! all 44 claims ok.
+//! a Session's `:share` sending the path as text (`share`), notices placed by time again
+//! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
+//! all 45 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -266,7 +269,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (44 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (45 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -280,8 +283,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (44, 44),
-                "APPARATUS: the driver said PASS without all 44 claims ok: {said}"
+                (45, 45),
+                "APPARATUS: the driver said PASS without all 45 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

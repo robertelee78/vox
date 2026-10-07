@@ -103,6 +103,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             among the room's messages; `:session <short id>`, without drive, shows only that it
             exists and "Only members alice trusts with drive see inside this Session.", with no
             composer, and `:send` there is refused, reaching nobody (ADR-029 CL-2, CL-3, #553);
+  session-order  Alice posts, then her hook opens a new Session, within one second: in Bob's All the
+            post reads first and "<label> opened" under it (#562: times in milliseconds);
   drive     once Alice gives Bob drive (`vox trust drive`, at a terminal) and her open Session
             runs a turn through Claude Code's hook, Bob's `:session` shows each line his `vox room
             session` prints, not "Only members …"; `d` on the tool call's line shows its output
@@ -1224,6 +1226,42 @@ try:
           f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
           f"{leaked}; `:share` there said {share_refused!r}" + ("" if merged else f"; All showed: {all_rows!r}")
           + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))
+
+    stage("session-order")
+    # A Session that opens just after a post, within the same second, reads after it in All (#562,
+    # the lead's ruling: times stay in milliseconds; a Session's opened line has no message to
+    # follow, so it is placed by its time). Alice posts, then her node's hook opens a new Session;
+    # the two are staged within one wall-clock second (else again with another session, then
+    # APPARATUS). In Bob's All the post comes first, then "<label> opened".
+    order_staged = None
+    for attempt in range(3):
+        sid = f"0dde{attempt:04d}-aaaa-4bbb-8ccc-dddddddddddd"
+        t0 = time.time()
+        p = run("alice", "room", "post", room, f"SESSION-ORDER-{attempt}")
+        hook("alice", claude(sid, "UserPromptSubmit", prompt="order"))
+        t1 = time.time()
+        if p.returncode != 0:
+            product(f"alice's post failed: {p.stderr.strip()}")
+        if int(t0) == int(t1):
+            order_staged = (attempt, sid, t0, t1)
+            break
+    if order_staged is None:
+        apparatus("CANNOT MEASURE: a post and a Session's opening were never staged within one second")
+    attempt, sid, t0, t1 = order_staged
+    if not until(lambda: sid in cli_labels(), 60):
+        product(f"bob's `vox room sessions` never listed the Session {sid} within 60 s")
+    opened_mark = f"{cli_labels()[sid]['label']} opened".replace(" ", "")
+    post_mark = f"SESSION-ORDER-{attempt}"
+    tui.key(":all\r", 2)
+    all_text = lambda: "".join(bare(r) for r in pane(tui.display(), "Timeline")).replace(" ", "")
+    tui.until(lambda: post_mark in all_text() and opened_mark in all_text(), 60, 1)
+    text = all_text()
+    in_order = post_mark in text and opened_mark in text and text.find(post_mark) < text.find(opened_mark)
+    tail_rows = [bare(r) for r in pane(tui.display(), "Timeline")][-6:]
+    tui.key(":general\r", 2)
+    claim("session-order", in_order,
+          f"post at {t0:.3f}, the Session opened by {t1:.3f}; in bob's All the post "
+          f"{'precedes' if in_order else 'does not precede'} the opened line: {tail_rows!r}")
 
     stage("drive")
     # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gives Bob drive, as a person
