@@ -372,6 +372,10 @@ pub struct UiState {
     pub selected_session_row: usize,
     /// The ended Sessions are listed under "Ended (N)" (SE-5).
     pub ended_open: bool,
+    /// The line selected in the Session on screen, by position; `None` follows the newest.
+    pub selected_session_line: Option<usize>,
+    /// The selected line's Details are shown under it (SC-1).
+    pub details_open: bool,
     /// The room the To: and urgent belong to: another room starts without them.
     pub compose_room: Option<Digest32>,
 }
@@ -402,6 +406,8 @@ impl Default for UiState {
             showing: Showing::General,
             selected_session_row: 0,
             ended_open: false,
+            selected_session_line: None,
+            details_open: false,
             compose_room: None,
         }
     }
@@ -428,6 +434,8 @@ impl UiState {
             self.showing = Showing::General;
             self.selected_session_row = 0;
             self.ended_open = false;
+            self.selected_session_line = None;
+            self.details_open = false;
         }
         match self
             .selected_room
@@ -636,7 +644,6 @@ impl UiState {
                 }
                 Action::Redraw
             }
-            // Enter on a reply jumps to the message it quotes.
             KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Sessions => {
                 let rows = vm
                     .active
@@ -644,18 +651,33 @@ impl UiState {
                     .map(|c| session_rows(&c.sessions, self.ended_open))
                     .unwrap_or_default();
                 match rows.get(self.selected_session_row) {
-                    Some(SessionRow::General) => self.show(Showing::General),
-                    Some(SessionRow::All) => self.show(Showing::All),
+                    Some(SessionRow::General) => self.show(Showing::General, vm),
+                    Some(SessionRow::All) => self.show(Showing::All, vm),
                     Some(SessionRow::Session(i)) => {
-                        if let Some(x) = vm.active.as_ref().and_then(|c| c.sessions.get(*i)) {
-                            self.show(Showing::Session(x.node, x.id.clone()));
+                        match vm.active.as_ref().and_then(|c| c.sessions.get(*i)) {
+                            Some(x) => self.show(Showing::Session(x.node, x.id.clone()), vm),
+                            None => Action::Redraw,
                         }
                     }
-                    Some(SessionRow::Ended(_)) => self.ended_open = !self.ended_open,
-                    None => {}
+                    Some(SessionRow::Ended(_)) => {
+                        self.ended_open = !self.ended_open;
+                        Action::Redraw
+                    }
+                    None => Action::Redraw,
+                }
+            }
+            // In a Session, Enter or `d` on a line shows its Details, or hides them (ADR-029 SC-1).
+            KeyCode::Enter | KeyCode::Char('d')
+                if self.screen == Screen::Channel
+                    && self.focus == Focus::Timeline
+                    && matches!(self.showing, Showing::Session(..)) =>
+            {
+                if self.selected_session_line.is_some() {
+                    self.details_open = !self.details_open;
                 }
                 Action::Redraw
             }
+            // Enter on a reply jumps to the message it quotes.
             KeyCode::Enter if self.screen == Screen::Channel && self.focus == Focus::Timeline => {
                 self.jump_to_quote(vm);
                 Action::Redraw
@@ -1056,10 +1078,22 @@ impl UiState {
                     self.selected_session_row = step(self.selected_session_row.min(len - 1), len);
                 }
             }
-            // A Session's activity is not in the room's timeline (ADR-029 SC-4): nothing to select.
+            // In a Session, Up selects an older line and Down a newer one; past the newest follows
+            // again (ADR-029 SC-1).
             Screen::Channel
                 if self.focus == Focus::Timeline
-                    && matches!(self.showing, Showing::Session(..)) => {}
+                    && matches!(self.showing, Showing::Session(..)) =>
+            {
+                let len = vm.active.as_ref().map_or(0, |c| c.session_lines.len());
+                self.details_open = false;
+                self.selected_session_line = match (self.selected_session_line, delta < 0) {
+                    (_, _) if len == 0 => None,
+                    (None, true) => Some(len - 1),
+                    (None, false) => None,
+                    (Some(i), true) => Some(i.min(len - 1).saturating_sub(1)),
+                    (Some(i), false) => Some(i + 1).filter(|n| *n < len),
+                };
+            }
             Screen::Channel if self.focus == Focus::Timeline => {
                 // Up selects an older message, Down a newer one; past the newest follows again.
                 let Some(timeline) = vm.active.as_ref().map(|c| &c.timeline) else {
@@ -1182,10 +1216,7 @@ impl UiState {
                             urgent,
                         })
                     }
-                    Some(Parsed::Show(showing)) => {
-                        self.show(showing);
-                        Action::Redraw
-                    }
+                    Some(Parsed::Show(showing)) => self.show(showing, vm),
                     Some(Parsed::To(names)) => {
                         self.set_to(&names, vm);
                         Action::Redraw
@@ -1234,14 +1265,28 @@ impl UiState {
     }
 
     /// Show General, All or one Session; the composer is not a Session's (ADR-029 DR-1).
-    fn show(&mut self, showing: Showing) {
+    fn show(&mut self, showing: Showing, vm: &ViewModel) -> Action {
         if matches!(showing, Showing::Session(..)) && self.focus == Focus::Composer {
             self.focus = Focus::Timeline;
         }
-        self.showing = showing;
         self.selected_message = None;
+        self.selected_session_line = None;
+        self.details_open = false;
         self.timeline_scroll = 0;
         self.replying = None;
+        let session = match &showing {
+            Showing::Session(node, id) => Some((*node, id.clone())),
+            Showing::General | Showing::All => None,
+        };
+        self.showing = showing;
+        // The core reads the Session's entries while it is shown (SC-1).
+        match self.active_channel_id(vm) {
+            Some(channel_id) => Action::Dispatch(Command::ShowSession {
+                channel_id,
+                session,
+            }),
+            None => Action::Redraw,
+        }
     }
 
     /// Set the composer's To: from `names`, this node's names for members of the room or the
