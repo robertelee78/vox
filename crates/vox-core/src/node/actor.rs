@@ -1192,6 +1192,9 @@ enum NetEvent {
         channel_id: Digest32,
         /// The joiner's proven identity.
         identity: Box<crate::identity::composite::CompositePublicKey>,
+        /// The witness this node signed for it (ADR-016 M17.6): kept, as an admission notice, so
+        /// every member learns of the joiner while it is offline (#520).
+        witness: Box<crate::nat::record::JoinWitness>,
         /// Answered with whether the admission was applied: `Ok` releases the acceptance frame, an
         /// error refuses the joiner instead (a full room says so). A dropped sender answers too —
         /// the slot must never wait on an actor that has moved on — and is a refusal: nothing
@@ -6525,6 +6528,12 @@ impl Node {
             }
             let _ = net.publish_local(&bundle.to_wire());
         }
+        // The room's admission notices and members' withdraws this node keeps (#520): a board
+        // starts empty, and these are what tell every member of a newcomer that is offline, and of
+        // none that left.
+        for wire in channel.board_kept() {
+            let _ = net.publish_local(&wire);
+        }
     }
 
     /// Republish the membership snapshot and peer policy the served board and the
@@ -6790,6 +6799,7 @@ impl Node {
             NetEvent::JoinAdmit {
                 channel_id,
                 identity,
+                witness,
                 ack,
             } => {
                 // The join proved this identity; admit it as an author so its entries — and its
@@ -6802,6 +6812,7 @@ impl Node {
                 let fails = std::env::var_os(TEST_ADMISSION_FAILS_ENV).is_some();
                 #[cfg(not(feature = "test-knobs"))]
                 let fails = false;
+                let mut notice = None;
                 let admitted = match (
                     self.profile.as_ref().filter(|_| !fails),
                     self.channels.get(&channel_id).map(Arc::clone),
@@ -6815,6 +6826,16 @@ impl Node {
                         // until its own return reaches the others through this node (V030-08).
                         if admitted.is_ok() {
                             ch.readmit(identity.fingerprint());
+                            // Its admission, as this node witnessed it, kept and put on this
+                            // node's board, so every member learns of the joiner while it is
+                            // offline (#520).
+                            if let Ok(n) = crate::nat::notice::AdmissionNotice::new(
+                                (*identity).clone(),
+                                (*witness).clone(),
+                            ) {
+                                let _ = ch.keep_notice(profile.store(), &n);
+                                notice = Some(n.to_wire());
+                            }
                         }
                         admitted
                     }
@@ -6833,6 +6854,9 @@ impl Node {
                     // board stops counting it as pending (V210-102).
                     if let Some(net) = self.net.as_ref() {
                         net.forget_prejoin(&channel_id, &identity.fingerprint());
+                        if let Some(wire) = &notice {
+                            let _ = net.publish_local(wire);
+                        }
                     }
                 }
                 let _ = ack.send(admitted);
@@ -8157,7 +8181,7 @@ impl Node {
                     // **The admission lands before the joiner is told it is in.** Awaited here, on
                     // this task, so the actor is never the thing waiting — which is the whole point
                     // of the slot. See `NetEvent::JoinAdmit`.
-                    |identity| async move {
+                    |identity, witness| async move {
                         #[cfg(feature = "test-knobs")]
                         test_admission_gate().await;
                         // **Every online member agrees first** (V030-30, #366): the place is held
@@ -8170,6 +8194,7 @@ impl Node {
                             .send(NetEvent::JoinAdmit {
                                 channel_id,
                                 identity: Box::new(identity),
+                                witness: Box::new(witness),
                                 ack,
                             })
                             .await
@@ -10247,11 +10272,11 @@ impl Node {
         let bundles = net.board_bundles(channel_id, epoch);
         let known = self.board_authors.entry(*channel_id).or_default();
         let fresh = bundles.iter().filter(|b| known.insert(b.author_id)).count();
-        if fresh == 0 {
+        let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             return;
-        }
-        if let Some(store) = self.profile.as_ref().map(Profile::store_handle) {
-            let now_ms = self.now_ms();
+        };
+        let now_ms = self.now_ms();
+        if fresh > 0 {
             let _ = admit_board_records(
                 &shared,
                 &store,
@@ -10261,6 +10286,19 @@ impl Node {
                 self.net.as_deref(),
             )
             .await;
+        }
+        // A newcomer learned of from its admission notice is news as its bundle is (#520).
+        let from_notices = admit_board_notices(
+            &shared,
+            &store,
+            &net,
+            channel_id,
+            ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+            now_ms,
+        )
+        .await;
+        if fresh == 0 && from_notices == 0 {
+            return;
         }
         self.refresh_network_view().await;
         // New board members raise a request on the room's ports (ADR-025 D2): the outbound setup
@@ -15581,9 +15619,31 @@ async fn exchange_boards(
         .iter()
         .map(MemberBundleRecord::to_wire)
         .chain(set.members.iter().map(RendezvousRecord::to_wire))
+        // The members' withdraws, then the admission notices (#520): a withdraw first, so this
+        // node's board refuses a notice of a member that left.
+        .chain(
+            set.withdraws
+                .iter()
+                .map(crate::nat::withdraw::BoardWithdraw::to_wire),
+        )
+        .chain(
+            set.notices
+                .iter()
+                .map(crate::nat::notice::AdmissionNotice::to_wire),
+        )
     {
         let _ = net.publish_local(&wire);
     }
+    let admitted_authors = admitted_authors
+        + admit_board_notices(
+            shared,
+            pstore,
+            net,
+            &cid,
+            ChannelState::MAX_ADMISSIONS_PER_SWEEP,
+            now,
+        )
+        .await;
     // **And the other way: what this node's board holds that the peer's lacks.** A member who
     // joined through this node is on this node's board and no other, and the peer learned of it
     // only when *it* next read this board, on its own periodic sync: 24–28 s for a third member to
@@ -15604,6 +15664,75 @@ async fn exchange_boards(
         }
     }
     admitted_authors
+}
+
+/// **Admit the newcomers this node's board holds notices of** (#520), to a fixpoint, as
+/// [`admit_board_records`] does records: the board's members' withdraws are kept first, so no
+/// notice of a member that left is taken, then each notice whose witness's signer is an author
+/// here admits its joiner, past the room's cap only as another member decided. The notices of
+/// authors already held are kept too, to pass on. `quota` bounds the call. Returns the authors
+/// admitted.
+async fn admit_board_notices(
+    shared: &tokio::sync::Mutex<ChannelState>,
+    store: &crate::node::store::Store,
+    net: &NodeNet,
+    channel_id: &Digest32,
+    quota: usize,
+    now_ms: crate::time::Ms,
+) -> usize {
+    let withdraws = net.board_member_withdraws(channel_id);
+    let notices = net.board_notices(channel_id);
+    if withdraws.is_empty() && notices.is_empty() {
+        return 0;
+    }
+    let mut channel = shared.lock().await;
+    for w in &withdraws {
+        let _ = channel.keep_withdraw(store, w);
+    }
+    let mut pending: Vec<crate::nat::notice::AdmissionNotice> = Vec::new();
+    for n in notices {
+        if channel.is_author(&n.joiner()) {
+            let _ = channel.keep_notice(store, &n);
+        } else {
+            pending.push(n);
+        }
+    }
+    // Witnessed before witnessing: a member admitted early in the batch can be the witness of one
+    // later in it.
+    pending.sort_by_key(|n| n.witness.timestamp_ms);
+    let mut admitted = 0usize;
+    while admitted < quota {
+        let before = admitted;
+        pending.retain(|n| {
+            if admitted >= quota {
+                return true;
+            }
+            match channel.admit_from_notice(store, n, now_ms) {
+                Ok(true) => {
+                    admitted += 1;
+                    let (members, cap) =
+                        (channel.author_count(), crate::node::channel::max_authors());
+                    if members > cap {
+                        net.manager().note(
+                            n.joiner(),
+                            format!(
+                                "admitted to room {} past its cap of {cap}, now {members} \
+                                 members: another member admitted it",
+                                crate::node::network::short_id(channel.channel_id())
+                            ),
+                        );
+                    }
+                    false
+                }
+                Ok(false) => false,
+                Err(_) => true,
+            }
+        });
+        if admitted == before {
+            break;
+        }
+    }
+    admitted
 }
 
 /// Admit as many board records as their M17.6 evidence allows, to a fixpoint.

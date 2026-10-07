@@ -117,11 +117,15 @@ pub enum StructTag {
     /// `0x001F` — room name (ADR-028 R-1): the room's one shared name, stated by its creator or
     /// an admin. The causally last statement by an admin wins, as retention does.
     RoomName = 0x001F,
+    /// `0x0020` — admission notice (#520): a newcomer's composite key with the join witness its
+    /// admitting member signed, so every member learns of the newcomer while it is offline. It
+    /// carries no signature of its own: the witness is the evidence.
+    AdmissionNotice = 0x0020,
 }
 
 impl StructTag {
     /// All registered tags, in ascending order.
-    pub const ALL: [StructTag; 27] = [
+    pub const ALL: [StructTag; 28] = [
         StructTag::LogEntry,
         StructTag::Skdm,
         StructTag::AdminCert,
@@ -149,6 +153,7 @@ impl StructTag {
         StructTag::IdentityProve,
         StructTag::IdentityClaim,
         StructTag::RoomName,
+        StructTag::AdmissionNotice,
     ];
 
     /// The 2-byte tag value.
@@ -159,7 +164,7 @@ impl StructTag {
 
     /// Resolve a tag from its 2-byte value, or [`Error::UnknownStructTag`].
     pub fn from_u16(v: u16) -> Result<Self> {
-        // Linear scan over a 27-element table: trivial and avoids an
+        // Linear scan over a 28-element table: trivial and avoids an
         // unsafe transmute or a brittle hand-maintained match-on-int.
         Self::ALL
             .into_iter()
@@ -282,6 +287,7 @@ impl StructTag {
             StructTag::IdentityProve => "vox-id/v2/resp",
             StructTag::IdentityClaim => "vox-id/v2/init",
             StructTag::RoomName => "vox/room-name/v1",
+            StructTag::AdmissionNotice => "vox/admission-notice/v1",
         }
     }
 }

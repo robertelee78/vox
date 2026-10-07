@@ -2025,6 +2025,30 @@ impl NodeNet {
     /// records. Local, so cheap: it is what lets the sync gate learn a member that
     /// joined through somebody else before refusing it (`run_sync_session`).
     #[must_use]
+    pub fn board_notices(&self, channel_id: &Digest32) -> Vec<crate::nat::notice::AdmissionNotice> {
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.notices(channel_id).into_iter().cloned().collect()
+    }
+
+    /// The members' own withdraws this node's board holds for `channel_id`, each checked against
+    /// the member's key when it was taken (#520).
+    #[must_use]
+    pub fn board_member_withdraws(
+        &self,
+        channel_id: &Digest32,
+    ) -> Vec<crate::nat::withdraw::BoardWithdraw> {
+        let store = self.service.store();
+        let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .member_withdraws(channel_id)
+            .into_iter()
+            .filter_map(|w| crate::nat::withdraw::BoardWithdraw::from_wire(w).ok())
+            .collect()
+    }
+
+    /// The live member bundle records this node's board holds for `(channel, epoch)`.
+    #[must_use]
     pub fn board_bundles(&self, channel_id: &Digest32, epoch: u64) -> Vec<MemberBundleRecord> {
         let now = self.now_ms();
         let store = self.service.store();
@@ -2135,6 +2159,37 @@ impl NodeNet {
                 .into_iter()
                 .filter(|r| !has_address.contains(&r.author_id))
                 .map(RendezvousRecord::to_wire),
+        );
+        // And the room's admission notices and members' withdraws the peer lacks (#520): the
+        // withdraws first, so the peer refuses a notice of a member that left before it could
+        // take it.
+        let has_withdraw: std::collections::BTreeSet<(Digest32, u64)> = peer
+            .withdraws
+            .iter()
+            .map(|w| (w.author_id, w.timestamp_ms))
+            .collect();
+        let has_notice: std::collections::BTreeSet<(Digest32, u64)> = peer
+            .notices
+            .iter()
+            .map(|n| (n.joiner(), n.witness.timestamp_ms))
+            .collect();
+        out.extend(
+            guard
+                .member_withdraws(channel_id)
+                .into_iter()
+                .filter_map(|w| {
+                    let parsed = crate::nat::withdraw::BoardWithdraw::from_wire(w).ok()?;
+                    (!has_withdraw.contains(&(parsed.author_id, parsed.timestamp_ms)))
+                        .then(|| w.to_vec())
+                }),
+        );
+        let mut notices = guard.notices(channel_id);
+        notices.sort_by_key(|n| n.witness.timestamp_ms);
+        out.extend(
+            notices
+                .into_iter()
+                .filter(|n| !has_notice.contains(&(n.joiner(), n.witness.timestamp_ms)))
+                .map(crate::nat::notice::AdmissionNotice::to_wire),
         );
         out
     }
@@ -2310,7 +2365,10 @@ impl NodeNet {
         admit_before_accepting: F,
     ) -> Result<JoinOutcome>
     where
-        F: FnOnce(crate::identity::composite::CompositePublicKey) -> Fut,
+        F: FnOnce(
+            crate::identity::composite::CompositePublicKey,
+            crate::nat::record::JoinWitness,
+        ) -> Fut,
         Fut: std::future::Future<Output = Result<Option<String>>>,
     {
         let cfg = ResponderConfig {
