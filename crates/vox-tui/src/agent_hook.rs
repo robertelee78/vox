@@ -1984,7 +1984,10 @@ async fn read_room(
             };
             extra.extend(more.into_iter().filter(|r| {
                 vox_agentcomms::envelope::Envelope::parse(&r.text).is_ok_and(|e| {
-                    e.re.is_some() || me_fp.as_deref().is_some_and(|fp| e.may_interrupt(fp))
+                    e.re.is_some()
+                        || me_fp
+                            .as_deref()
+                            .is_some_and(|fp| crate::wake::wakes(&e, fp, &input.session_id))
                 })
             }));
         }
@@ -2048,7 +2051,10 @@ async fn read_room(
     let asked = crate::wake::asked(targets.iter().chain(rows.iter()), me, &input.session_id);
     let owed = |r: &vox_core::node::api::MessageRow| {
         vox_agentcomms::envelope::Envelope::parse(&r.text).is_ok_and(|e| {
-            me_fp.as_deref().is_some_and(|fp| e.may_interrupt(fp))
+            // Owed first: what this session's wake announced (ADR-029 TA-3, #548).
+            me_fp
+                .as_deref()
+                .is_some_and(|fp| crate::wake::wakes(&e, fp, &input.session_id))
                 || crate::wake::is_reply(&e, &asked)
         })
     };

@@ -813,9 +813,19 @@ fn an_urgent_message_to_one_session_wakes_that_session_alone() {
             two.map(|(_, f)| f)
         ),
     );
-    // Each session reads what it is owed, so the next wake is not held back (V030-15).
-    let _ = turn(0, "s-one", "UserPromptSubmit");
+    // Each session reads what it is owed, so the next wake is not held back (V030-15): s-one's
+    // turn shows the message its wake announced.
+    let shown = context_of(&turn(0, "s-one", "UserPromptSubmit"));
     let _ = turn(1, "s-two", "UserPromptSubmit");
+    println!(
+        "[proof] (1) s-one's next turn shows the message: {}",
+        shown.contains("CANARY-ONE")
+    );
+    check(
+        &mut failures,
+        shown.contains("CANARY-ONE"),
+        format!("PRODUCT (1): s-one's next turn must show the message its wake announced; it showed:\n{shown}"),
+    );
 
     // ---- (2) to the node ----
     let _ = post(
