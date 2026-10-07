@@ -16,7 +16,7 @@
 //!   record making the same claim as the held one inside the refresh floor, which is already held.
 //! - **Rate floor.** A *refresh* — the same claim re-announced — inside [`MIN_REFRESH_MS`] is a
 //!   no-op: the held record stands and nothing is reported. A *changed* claim (new endpoints, new
-//!   prekeys) is accepted as soon as it is strictly newer, by its millisecond timestamp.
+//!   prekeys) is accepted once it is at least [`MIN_CHANGE_MS`] newer: one change a second per author.
 //! - **TTL.** Member records carry a `ttl_ms` capped at [`MAX_TTL_MS`]; pre-join
 //!   records (no TTL field, ADR-012) get [`DEFAULT_TTL_MS`]. Expired records are
 //!   never served and are pruned.
@@ -47,6 +47,11 @@ use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
 /// Minimum milliseconds between successive accepted records for one
 /// `(author, channel, epoch)` — the ADR-012 refresh cap (≥ 60 s).
 pub const MIN_REFRESH_MS: u64 = 60_000;
+
+/// The least a replacement's timestamp must be past the held record's: an author changes its claim
+/// at most once a second. When timestamps were whole seconds a change in the same second was refused
+/// as not newer; in milliseconds the bound is kept by this, so the unit change loosens no flood bound.
+pub const MIN_CHANGE_MS: u64 = 1_000;
 
 /// The environment variable [`test_record_ttl`] reads. **Test-only.**
 #[cfg(feature = "test-knobs")]
@@ -179,7 +184,8 @@ fn bundle_expiry(rec: &MemberBundleRecord) -> u64 {
 }
 
 /// Shared freshness checks for a replacement against the current record's
-/// `(seq, timestamp_ms)`: strict monotonicity, so a record is never replaced by an older one.
+/// `(seq, timestamp_ms)`: strict monotonicity, so a record is never replaced by an older one, and
+/// its timestamp at least [`MIN_CHANGE_MS`] past the held one's.
 ///
 /// **The refresh floor governs refreshes, not changes.** [`MIN_REFRESH_MS`] is ADR-012's cap
 /// on how often a member re-announces; the callers apply it to a record whose claim is the same
@@ -190,8 +196,8 @@ fn bundle_expiry(rec: &MemberBundleRecord) -> u64 {
 /// times in one measured session, the node unreachable from any other machine meanwhile. Its
 /// updated prekey bundle was refused the same way, 131 times. ADR-012 called that refusal benign
 /// because "the previous announcement is still live"; the previous announcement was the wrong one.
-/// A changed claim must still be strictly newer, and the board keeps one current record per author,
-/// so the anti-spam bound stands.
+/// A changed claim must be at least [`MIN_CHANGE_MS`] newer, and the board keeps one current record
+/// per author, so the anti-spam bound stands.
 ///
 /// **Not reached for a record identical to the one held**: the callers accept that as a no-op
 /// first. A board is re-offered records it already has all the time — a member vouching for
@@ -237,7 +243,7 @@ fn check_replacement(new_seq: u64, new_ts: u64, cur_seq: u64, cur_ts: u64) -> Re
     if new_seq <= cur_seq {
         return Err(Error::RendezvousRejected("non-increasing seq (replay)"));
     }
-    if new_ts <= cur_ts {
+    if new_ts < cur_ts.saturating_add(MIN_CHANGE_MS) {
         return Err(Error::RendezvousRejected(
             "non-increasing timestamp (replay)",
         ));

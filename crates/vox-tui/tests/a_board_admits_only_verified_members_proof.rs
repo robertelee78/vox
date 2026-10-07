@@ -699,6 +699,47 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
          said {past:?}"
     );
 
+    // ---- 3e. an author changes its claim at most once a second (#562) ----------------------
+    // R3 puts a pre-join, then a changed one (new prekeys) stamped 500 ms later, then another
+    // stamped a whole second after its first. Times are milliseconds now; the board still bounds a
+    // changed claim to one a second, as it did when a change in the same second was not newer.
+    let r3 = stranger(0x85);
+    let (_r3c, r3_v) = rt.block_on(connect(&r3, victim_addr, victim_id));
+    let t = hostile::now_ms();
+    let changed = |seed: u8, seq: u64, stamp: u64| {
+        let ring = PrekeyRing::generate(&*r3, &[seed; 32], stamp)
+            .expect("APPARATUS (harness error): a prekey ring");
+        PreJoinRecord::build(
+            &*r3,
+            &room,
+            ring.bundle(&r3.public_key())
+                .expect("APPARATUS (harness error): a prekey bundle"),
+            EndpointList::new(Vec::new())
+                .expect("APPARATUS (harness error): an empty endpoint list"),
+            seq,
+            stamp,
+        )
+        .expect("APPARATUS (harness error): a pre-join")
+        .to_wire()
+    };
+    let first = rt.block_on(put(&r3_v, &changed(0x45, 1, t)));
+    let too_soon = rt.block_on(put(&r3_v, &changed(0x46, 2, t + 500)));
+    let a_second_on = rt.block_on(put(&r3_v, &changed(0x47, 3, t + 1_000)));
+    println!(
+        "[proof] step: one author's pre-join → {first:?}; changed 500 ms later → {too_soon:?}; \
+         changed 1 s after the first → {a_second_on:?}"
+    );
+    assert!(
+        first.is_ok() && a_second_on.is_ok(),
+        "PRODUCT (staging): the board must take an author's pre-join, and a change of it a second \
+         later ({first:?}, then {a_second_on:?})"
+    );
+    assert!(
+        too_soon.as_ref().is_err_and(|e| e.contains("newer record")),
+        "PRODUCT: an author's changed claim 500 ms after its last must be refused as not newer \
+         (one change a second, as when times were seconds); the victim said {too_soon:?}"
+    );
+
     // ---- 4. the stranger's own room, on the anchor ----------------------------------------
     let (_s2, s_a) = rt.block_on(connect(&s, anchor_addr, anchor_id));
     let anchored = rt.block_on(put(&s_a, &minted));
