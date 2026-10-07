@@ -151,6 +151,17 @@ fn vox(
         .env("VOX_LISTEN", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ROOM_PASSPHRASE");
+    // Nothing of a terminal or a harness session this proof did not make: a `vox` run from inside
+    // the operator's own Claude Code session would otherwise inherit its tmux pane and sockets.
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE", "VOX_SESSION"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            cmd.env_remove(&k);
+        }
+    }
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
     if typed::is_keyring_change(args) {
         let (ok, shown) = typed::keyring(&cmd);
