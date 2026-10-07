@@ -40,6 +40,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -137,11 +140,18 @@ impl Agent {
     }
 
     fn vox(&self, args: &[&str]) -> (bool, String, String) {
-        let out = Command::new(VOX)
-            .args(args)
+        let mut cmd = Command::new(VOX);
+        cmd.args(args)
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", &self.cfg)
-            .env_remove("VOX_ROOM")
+            .env_remove("VOX_ROOM");
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            return (ok, shown.clone(), shown);
+        }
+        let out = cmd
             .stdin(Stdio::null())
             .output()
             .expect("APPARATUS: spawn vox");

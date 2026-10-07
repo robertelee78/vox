@@ -29,6 +29,9 @@ mod layout;
 
 #[path = "attach.rs"]
 mod attach;
+
+#[path = "typed.rs"]
+mod typed;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
 
@@ -255,8 +258,8 @@ impl Member {
 
     /// Run a one-shot `vox` verb as this member.
     pub fn vox(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
-        let mut child = Command::new(VOX)
-            .args(args)
+        let mut cmd = Command::new(VOX);
+        cmd.args(args)
             .env("VOX_DATA_DIR", &self.dir)
             .env("VOX_CONFIG_DIR", self.dir.join("cfg"))
             .env("VOX_IDENTITY_PASSPHRASE", ID_PASS)
@@ -264,7 +267,14 @@ impl Member {
             .env_remove("VOX_ROOM_PASSPHRASE")
             .env_remove("VOX_SESSION")
             .env_remove("CLAUDE_CODE_SESSION_ID")
-            .env_remove("CODEX_THREAD_ID")
+            .env_remove("CODEX_THREAD_ID");
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            return (ok, shown.clone(), shown);
+        }
+        let mut child = cmd
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {

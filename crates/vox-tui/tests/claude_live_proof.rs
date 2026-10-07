@@ -75,6 +75,9 @@ mod watchdog;
 #[path = "support/oc_sandbox.rs"]
 mod oc_sandbox;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -137,8 +140,8 @@ fn vox(
     args: &[&str],
     input: Option<&str>,
 ) -> (bool, String, String) {
-    let mut child = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         // Every node has a passphrase (ADR-028 K-11); each is attached before Claude Code starts,
@@ -147,7 +150,13 @@ fn vox(
         .env("VOX_NODE", node)
         .env("VOX_LISTEN", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
-        .env_remove("VOX_ROOM_PASSPHRASE")
+        .env_remove("VOX_ROOM_PASSPHRASE");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let mut child = cmd
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {

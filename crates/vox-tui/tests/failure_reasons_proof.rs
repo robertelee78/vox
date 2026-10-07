@@ -44,6 +44,9 @@ mod watchdog;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
 optional_proof::not_run!(a_full_keyring_names_its_cause);
@@ -215,12 +218,23 @@ fn vox(
     within: Duration,
 ) -> (bool, String, Duration) {
     let started = Instant::now();
-    let mut child = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
-        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        assert!(
+            started.elapsed() <= within,
+            "PRODUCT: `vox {}` took longer than {within:?} to report its failure; it had said:\n{shown}",
+            args.join(" ")
+        );
+        return (ok, shown, started.elapsed());
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -1269,16 +1269,16 @@ pub struct Daemon {
     pub node: vox_core::node::paths::NodeName,
     /// Where a daemon this hook starts listens.
     pub listen: std::net::SocketAddr,
-    /// The anchors a daemon this hook starts, or the node it attaches, is given.
+    /// The anchors a daemon this hook starts is given.
     pub anchors: Vec<String>,
 }
 
 impl Daemon {
     /// Register this turn's session in the daemon, starting the daemon if none runs: the session
-    /// then holds the hook's node, which the daemon attaches if it is not attached, with the
-    /// identity passphrase from `VOX_IDENTITY_PASSPHRASE` (resolved here, never by the daemon,
-    /// ADR-026 C-6). How the harness can wake the session is read from this process's
-    /// environment, which is the harness's, and stored by the daemon.
+    /// then holds the hook's node. **A hook never attaches its node, and takes no passphrase**
+    /// (ADR-028 K-13): a node not attached is said to the agent with the command its operator
+    /// runs in a terminal outside the session. How the harness can wake the session is read from
+    /// this process's environment, which is the harness's, and stored by the daemon.
     async fn register(
         &self,
         input: &HookInput,
@@ -1301,9 +1301,6 @@ impl Daemon {
         let mut d = DaemonClient::open(&self.account.socket())
             .await
             .map_err(|e| AppError::Usage(e.to_string()))?;
-        let passphrase = std::env::var("VOX_IDENTITY_PASSPHRASE")
-            .ok()
-            .map(zeroize::Zeroizing::new);
         // **Never without a bound** (#408): the hook runs inside a model's turn, and a wait with
         // no end hangs the harness. The daemon refuses a node still detaching after
         // DETACHING_PATIENCE; this bounds everything else the registration can wait on.
@@ -1313,8 +1310,6 @@ impl Daemon {
                 node: self.node.clone(),
                 session: input.session_id.clone(),
                 record,
-                passphrase,
-                anchors: self.anchors.clone(),
                 join,
             }),
         )
@@ -1333,6 +1328,12 @@ impl Daemon {
             DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::StillDetaching { node }) => {
                 Err(AppError::Usage(format!(
                     "node {node} is still detaching; this turn reads nothing"
+                )))
+            }
+            DaemonFrame::Refused(vox_core::node::daemonipc::Refusal::NotAttached { node }) => {
+                Err(AppError::Usage(format!(
+                    "node {node} is not attached, and a hook never attaches it. Ask the operator \
+                     to run, in a terminal outside this session: vox node attach {node}"
                 )))
             }
             DaemonFrame::Refused(r) => Err(AppError::Usage(r.to_string())),

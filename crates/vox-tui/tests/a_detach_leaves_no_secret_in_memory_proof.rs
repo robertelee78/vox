@@ -26,7 +26,8 @@
 //! scan sees it at all), detach bob's node, and scan again once the detach is done.
 //!
 //! - **seal:** `vox room create`, the room passphrase; detached with `vox node detach bob`;
-//! - **check:** `vox trust add`, which sends the identity passphrase for the node to check;
+//! - **check:** `vox trust add`, the identity passphrase typed at its prompt over a pty (a keyring
+//!   change takes it from nothing else, ADR-028 K-13), which it sends for the node to check;
 //! - **reopen:** bob's TUI attaches a node with a remembered room, and is stopped with SIGHUP while
 //!   that room reopens: the TUI was the node's last holder, so the node detaches once its attach is
 //!   done (L-3); the room passphrase;
@@ -76,6 +77,9 @@ mod syscalls;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -713,24 +717,16 @@ fn a_detach_waits_for_a_passphrase_check_and_leaves_no_passphrase() {
     let mut tui = Tui::start(&account, tmp.path().join("cues"), "bob", &[]);
     tui.attached();
     let before = scanner.scan();
-    let pass_file = tmp.path().join("idp");
-    std::fs::write(&pass_file, format!("{identity}\n")).staged();
     // A keyring change sends the identity passphrase for the node to check (V210-159); a read
-    // sends none (V210-165).
-    let mut check = start(
-        &account.dir,
-        "bob",
-        &[
-            "trust",
-            "add",
-            &account.keeper,
-            "--name",
-            "keeper",
-            "--identity-passphrase-file",
-            pass_file.to_str().staged(),
-        ],
-        None,
-    );
+    // sends none (V210-165). It is typed at the terminal, as a person types it (ADR-028 K-13).
+    let mut check = Proc(typed::spawn(
+        &command(
+            &account.dir,
+            "bob",
+            &["trust", "add", &account.keeper, "--name", "keeper"],
+        ),
+        &identity,
+    ));
     let during = scanner.until_more("identity", before.of("identity"));
     still_running(&mut check, "vox trust add");
     let asked = Instant::now();

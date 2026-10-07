@@ -379,8 +379,38 @@ for m in alice bob carol; do
         || { fail "$m's daemon never attached $m: $(cat "$WORK/nodes-$m.txt") $(tail -3 "$WORK/daemon_$m.log")"; exit 1; }
     echo "$m's daemon: $(tr '\n' ' ' <"$WORK/nodes-$m.txt")"
 done
+# A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13): the
+# command runs on a pty, and the passphrase from the file is typed at its prompt.
+TYPED_PY='
+import os, select, sys, time
+secret = open(sys.argv[1]).readline().rstrip("\n").encode()
+argv = sys.argv[2:]
+pid, fd = os.forkpty()
+if pid == 0:
+    os.execvp(argv[0], argv)
+out, sent, deadline = b"", False, time.time() + 120
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.2)
+    if not r:
+        continue
+    try:
+        d = os.read(fd, 4096)
+    except OSError:
+        break
+    if not d:
+        break
+    out += d
+    if not sent and out.rstrip().endswith(b"passphrase:"):
+        time.sleep(0.5)  # as a person reads the prompt: never before its terminal is raw
+        os.write(fd, secret + b"\r")
+        sent = True
+_, st = os.waitpid(pid, 0)
+sys.stdout.write(out.decode("utf-8", "replace"))
+sys.exit(os.waitstatus_to_exitcode(st))
+'
 trust() { # member fingerprint name
-    vox_as "$1" trust add "$2" --name "$3" --identity-passphrase-file "$WORK/$1/identity.pass" \
+    voxcmd "$1"
+    python3 -c "$TYPED_PY" "$WORK/$1/identity.pass" "${VOXCMD[@]}" trust add "$2" --name "$3" \
         >>"$WORK/trust-$1.log" 2>&1 || { fail "vox trust add ($1 trusts $3): $(tail -3 "$WORK/trust-$1.log")"; exit 1; }
 }
 trust alice "$FP_bob" bob

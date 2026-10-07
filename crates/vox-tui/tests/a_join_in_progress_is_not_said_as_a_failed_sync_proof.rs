@@ -27,6 +27,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -108,8 +111,14 @@ impl Root {
 
     /// Run `vox args` that must succeed; its stdout. `side` labels a failure.
     fn ok(&self, side: &str, args: &[&str]) -> String {
-        let out = self
-            .cmd(args)
+        let mut cmd = self.cmd(args);
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            assert!(ok, "{side} `vox {}` failed:\n{shown}", args.join(" "));
+            return shown;
+        }
+        let out = cmd
             .stdin(Stdio::null())
             .output()
             .expect("APPARATUS: run vox");

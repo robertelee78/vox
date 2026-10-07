@@ -29,6 +29,9 @@ mod ports;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -64,6 +67,11 @@ fn vox(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String)
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
     let mut child = cmd.spawn().expect("spawn vox");
     if let Some(text) = stdin {
         child

@@ -35,6 +35,11 @@
 //! 6. **every failure still exits 0**: no node running, an unknown room, no room
 //!    given. A hook that breaks the turn it rides on is worse than one that does
 //!    nothing.
+//! 7. **a hook never attaches its node** (ADR-028 K-13): with the node detached, and its
+//!    passphrase in `VOX_IDENTITY_PASSPHRASE` and a file beside it, the hook tells the agent the
+//!    node is not attached and the command for the operator to run outside the session, `vox
+//!    node attach default`, and the node stays detached; once the operator runs it, the hook reads
+//!    the room. Mutant: the hook attaches the node with the variable — red, PRODUCT.
 //!
 //! **Which side a red is on.** A red that quotes what `vox` printed is `PRODUCT:`; a fixture that
 //! could not be made (a directory, a spawn, a pipe) is `APPARATUS:`; setup that the product
@@ -80,6 +85,9 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -252,8 +260,14 @@ fn hook(
     args: &[&str],
     stdin: &str,
 ) -> (bool, String, String) {
-    let mut child = vox(data, cfg)
-        .args(args)
+    let mut cmd = vox(data, cfg);
+    cmd.args(args);
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -273,6 +287,80 @@ fn hook(
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// (7) ADR-028 K-13: a hook never attaches its node, and takes no passphrase from anywhere; it
+/// says the command the operator runs outside the session.
+#[test]
+#[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
+fn a_hook_never_attaches_its_node_and_says_how_to() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let (data, cfg) = (tmp.path().join("data"), tmp.path().join("cfg"));
+    std::fs::create_dir_all(&cfg).expect("APPARATUS: cannot make the profile directory");
+    let pass = tmp.path().join("identity.pass");
+    std::fs::write(&pass, "identity passphrase\n")
+        .expect("APPARATUS: cannot write the passphrase file");
+    let pass = pass.to_str().expect("APPARATUS: a UTF-8 path");
+    let (ok, _, err) = hook(
+        &data,
+        &cfg,
+        &["node", "create", "default", "--passphrase-file", pass],
+        "",
+    );
+    assert!(ok, "PRODUCT (staging): vox node create failed: {err}");
+    let node_list = || hook(&data, &cfg, &["node", "list"], "").1;
+    let turn = |session: &str| {
+        let mut c = vox(&data, &cfg);
+        // Everything a hook could take a passphrase from, there to be taken: it must take none.
+        c.args(["agent", "hook", "--node", "default", "--format", "text"])
+            .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
+            .env("VOX_IDENTITY_PASSPHRASE_FILE", pass)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().expect("APPARATUS: cannot start vox agent hook");
+        child
+            .stdin
+            .as_mut()
+            .expect("APPARATUS: vox has no stdin")
+            .write_all(claude_input(session).as_bytes())
+            .expect("APPARATUS: cannot write the hook's stdin");
+        let out = child.wait_with_output().expect("APPARATUS: the hook");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let (ok, told) = turn("k13-1");
+    let listed = node_list();
+    println!("[proof] (7) the hook told the agent: {told:?}; `vox node list`: {listed:?}");
+    assert!(
+        ok && told.contains("node default is not attached")
+            && told.contains("in a terminal outside this session: vox node attach default")
+            && listed.lines().any(|l| l.starts_with("default detached")),
+        "PRODUCT: with node default detached, the hook must leave it detached and tell the agent \
+         the command for the operator, `vox node attach default` (ADR-028 K-13); it exited ok \
+         {ok}, told the agent {told:?}, and `vox node list` says {listed:?}"
+    );
+    // The operator attaches it, outside the session: the next turn reads.
+    let (ok, _, err) = hook(
+        &data,
+        &cfg,
+        &["node", "attach", "default", "--passphrase-file", pass],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): vox node attach default failed: {err}"
+    );
+    let (ok, told) = turn("k13-2");
+    let (_, _, _) = hook(&data, &cfg, &["node", "detach", "default"], "");
+    assert!(
+        ok && !told.contains("not attached") && !told.contains("could not read"),
+        "PRODUCT: once the operator attached node default, the hook must read its rooms; it told \
+         the agent {told:?}"
+    );
 }
 
 #[test]

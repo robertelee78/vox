@@ -150,6 +150,11 @@ fn vox(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if support::typed::is_keyring_change(args) {
+        let (ok, shown) = support::typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox {args:?}: {e}"));

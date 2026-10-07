@@ -83,6 +83,9 @@ mod attach;
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -696,12 +699,18 @@ fn vox_once_env_plain(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> (bool, String, String) {
-    let out = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .envs(env.iter().copied())
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase")
+        .env("VOX_IDENTITY_PASSPHRASE", "identity passphrase");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let out = cmd
         .stdin(Stdio::null())
         .output()
         .expect("APPARATUS: run vox");

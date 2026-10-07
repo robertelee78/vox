@@ -8,14 +8,16 @@
 //! 1. right after the attach, a `vox trust add` with no passphrase and no terminal is refused at
 //!    once saying the passphrase is needed, nothing changes, and `vox status` says the keyring asks
 //!    for the passphrase (K-12: the attach's passphrase opens no window);
-//! 2. a `vox trust add --identity-passphrase-file` is made; then `vox status` says `keyring open
-//!    Nm` (K-9), and a second trust add with no passphrase is made;
+//! 2. **the passphrase is typed, and taken from nothing else** (K-13): a `vox trust add` with
+//!    `VOX_IDENTITY_PASSPHRASE` set, and one with `--identity-passphrase-file`, are refused and
+//!    change nothing; the same add typed at a terminal (a pty) is made; then `vox status` says
+//!    `keyring open Nm` (K-9), and a second trust add with no passphrase is made;
 //! 3. past the window, `vox trust remove` with no passphrase is refused at once and nothing
 //!    changes, and `vox status` says the keyring asks for the passphrase;
 //! 4. past the window, a raw control-socket `Trust` with no passphrase is refused the same way; one
 //!    with a wrong passphrase is refused; one with the right passphrase succeeds;
-//! 5. past the window again, a `vox trust add` with none is refused, and `vox trust remove
-//!    --identity-passphrase-file` succeeds.
+//! 5. past the window again, a `vox trust add` with none is refused, and a `vox trust remove`
+//!    typed at a terminal succeeds.
 //!
 //! **A change given the right passphrase is always made.** Every change whose passphrase was just
 //! checked waits [`PROVED_DELAY`], longer than [`WINDOW`], between the check and the change
@@ -25,13 +27,14 @@
 //! **What an entry grants is part of it** (ADR-028 K-14, #525): in 2 bob is trusted with `--drive`
 //! and `vox trust list` says `read + drive`; in 3, past the window, `vox trust read` with no
 //! passphrase is refused for it and bob still has drive; in 4 carol is trusted with drive over the
-//! raw socket; in 5, given the passphrase, `vox trust read` makes bob `read`; and 6, carol still
+//! raw socket; in 5, typed at a terminal, `vox trust read` makes bob `read`; and 6, carol still
 //! has drive after the daemon restarts, when the keyring is read back from the disk.
 //!
 //! Mutations: the window opened at the attach — red, PRODUCT (1: the change with no passphrase is
-//! made). No window check in the node — red, PRODUCT (the change past the window is made). A
-//! change given the right passphrase put through the window like one given none — red, PRODUCT (it
-//! is refused as needing the passphrase it was given). The window reported open after it closed —
+//! made). `VOX_IDENTITY_PASSPHRASE` read for a keyring change again — red, PRODUCT (2: the change
+//! given the variable is made). No window check in the node — red, PRODUCT (the change past the
+//! window is made). A change given the right passphrase put through the window like one given none
+//! — red, PRODUCT (it is refused as needing the passphrase it was given). The window reported open after it closed —
 //! red, PRODUCT. The capability dropped when the keyring is saved — red, PRODUCT (6: carol reads
 //! `read` after the restart).
 
@@ -45,6 +48,9 @@ mod attach;
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::io::BufRead as _;
 use std::path::Path;
@@ -276,24 +282,39 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         );
     }
 
-    // 2. A change given the passphrase opens the window: the next change needs none.
-    let (ok, said) = run(&mut vox_cmd(
+    // 2. K-13: the passphrase is typed, never taken from the environment or a file.
+    let add_bob = ["trust", "add", bob.as_str(), "--name", "bob", "--drive"];
+    let (by_variable, variable_said) =
+        run(vox_cmd(&alice, &add_bob).env("VOX_IDENTITY_PASSPHRASE", IDPASS));
+    let (by_file, file_said) = run(&mut vox_cmd(
         &alice,
         &[
-            "trust",
-            "add",
-            &bob,
-            "--name",
-            "bob",
-            "--drive",
-            "--identity-passphrase-file",
-            pass_file.to_str().expect("APPARATUS: path"),
-        ],
+            &add_bob[..],
+            &[
+                "--identity-passphrase-file",
+                pass_file.to_str().expect("APPARATUS: path"),
+            ],
+        ]
+        .concat(),
     ));
+    let list = trusted(&alice);
+    if by_variable || by_file || list.contains(&bob) {
+        kill(daemon);
+        panic!(
+            "PRODUCT: a keyring change must take its passphrase only as typed at a terminal \
+             (ADR-028 K-13): with VOX_IDENTITY_PASSPHRASE set it succeeded {by_variable}, \
+             saying:\n{variable_said}\nwith --identity-passphrase-file it succeeded {by_file}, \
+             saying:\n{file_said}\nthe keyring now:\n{list}"
+        );
+    }
+    // Typed at a terminal: made, and the window opens.
+    let (ok, said) = typed::typed(&vox_cmd(&alice, &add_bob), IDPASS);
     let entered = Instant::now();
     if !ok {
         kill(daemon);
-        panic!("PRODUCT: `vox trust add --identity-passphrase-file` was refused: {said}");
+        panic!(
+            "PRODUCT: `vox trust add` with the passphrase typed at a terminal was refused: {said}"
+        );
     }
     // K-14: bob was trusted with drive, and the list says so.
     let drive_list = trusted(&alice);
@@ -394,39 +415,21 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         );
     }
 
-    // 5. Past the window again: the CLI given the passphrase in a file.
+    // 5. Past the window again: the CLI given the passphrase typed at a terminal.
     std::thread::sleep(WINDOW + Duration::from_secs(2));
     let (refused_ok, refused_said) = run(&mut vox_cmd(
         &alice,
         &["trust", "add", &dave, "--name", "d"],
     ));
-    // K-14: given the passphrase, `vox trust read` makes bob read only.
-    let (to_read, to_read_said) = run(&mut vox_cmd(
-        &alice,
-        &[
-            "trust",
-            "read",
-            &bob,
-            "--identity-passphrase-file",
-            pass_file.to_str().expect("APPARATUS: path"),
-        ],
-    ));
+    // K-14: typed at a terminal, `vox trust read` makes bob read only.
+    let (to_read, to_read_said) = typed::typed(&vox_cmd(&alice, &["trust", "read", &bob]), IDPASS);
     let read_list = trusted(&alice);
-    let given = run(&mut vox_cmd(
-        &alice,
-        &[
-            "trust",
-            "remove",
-            &bob,
-            "--identity-passphrase-file",
-            pass_file.to_str().expect("APPARATUS: path"),
-        ],
-    ));
+    let given = typed::typed(&vox_cmd(&alice, &["trust", "remove", &bob]), IDPASS);
     let list = trusted(&alice);
     kill(daemon);
     assert!(
         to_read && entry(&read_list, &bob).ends_with("bob  read"),
-        "PRODUCT: `vox trust read --identity-passphrase-file` must make bob `read`: \
+        "PRODUCT: `vox trust read` typed at a terminal must make bob `read`: \
          {to_read_said}\nthe keyring:\n{read_list}"
     );
     assert!(
@@ -436,7 +439,7 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     );
     assert!(
         given.0 && !list.contains(&bob),
-        "PRODUCT: past the window, `vox trust remove --identity-passphrase-file` did not make the \
+        "PRODUCT: past the window, `vox trust remove` typed at a terminal did not make the \
          change: {}\nthe keyring:\n{list}",
         given.1
     );

@@ -53,12 +53,18 @@ const FREEZE: Duration = Duration::from_secs(4);
 const LONG_FREEZE: Duration = Duration::from_secs(30);
 
 fn vox(dir: &std::path::Path, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
-    let mut child = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
-        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if world::typed::is_keyring_change(args) {
+        let (ok, shown) = world::typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let mut child = cmd
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {

@@ -2,14 +2,16 @@
 //! a person and an agent's hook run it, every participant the shipped `vox` binary.
 //!
 //! 1. **Panic isolation (proof 5, L-6).** A daemon holding two nodes, one in the foreground and
-//!    one attached by an agent's hook. A post through node `a` that hits the test-only panic
+//!    one attached by its operator (`vox node attach`), with an agent's session on it. A post through node `a` that hits the test-only panic
 //!    marker kills `a`'s actor; the daemon says `a` detached because its actor panicked, and
 //!    node `b` still answers.
-//! 2. **Lifecycle races (proof 6, L-2, L-3).** Two hooks of two sessions of one node, with no
-//!    daemon running, start at once: both succeed, one daemon starts, and the node attaches once.
-//!    Then one session's `SessionEnd` races the other's next turn: the node is attached while a
-//!    session is registered. The last `SessionEnd` detaches it, and the daemon the hooks started
-//!    exits (L-8).
+//! 2. **Lifecycle races (proof 6, L-3; ADR-028 K-13).** Two hooks of two sessions of one detached
+//!    node, with no daemon running, start at once: both exit 0, telling the agent the node is not
+//!    attached and the command for the operator, `vox node attach agent`; one daemon starts, and
+//!    the node stays detached (a hook never attaches it). The operator attaches it; then one
+//!    session's `SessionEnd` races the other's next turn, and the node stays attached throughout;
+//!    the last `SessionEnd` leaves it attached too, since the operator attached it. Detached by
+//!    hand, the daemon the hooks started exits (L-8).
 //! 3. **Keep (proof 7, L-4).** `vox daemon --keep` records its node; after the daemon stops, a
 //!    daemon started in the background attaches it again with its room open.
 //! 4. **Two clients, one daemon (proof 8, D-1, S-2).** Two `vox daemon --detach` at once end with
@@ -262,12 +264,27 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
         l.starts_with("vox daemon: identity")
     });
     let room = make_room(&a, "a");
-    // Node b, attached by its agent's hook.
-    let (ok, _, err) = a.hook("b", "s-b", "UserPromptSubmit");
-    assert!(ok, "PRODUCT: b's hook failed: {err}");
+    // Node b, attached by its operator (a hook never attaches it, ADR-028 K-13), with its agent's
+    // session on it.
+    let (ok, out, err) = a.run(
+        &[
+            "node",
+            "attach",
+            "b",
+            "--passphrase-file",
+            pass.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): vox node attach b failed: {out}{err}"
+    );
     d.expect("node b attached", Duration::from_secs(30), |l| {
         l.starts_with("vox daemon: node b attached")
     });
+    let (ok, _, err) = a.hook("b", "s-b", "UserPromptSubmit");
+    assert!(ok, "PRODUCT: b's hook failed: {err}");
     let (posted, _, _) = a.run(
         &[
             "room",
@@ -303,7 +320,7 @@ fn one_nodes_panic_detaches_it_and_the_other_node_goes_on() {
 
 #[test]
 #[ignore = "real binaries with production Argon2id; run in release"]
-fn two_hooks_start_one_daemon_attach_once_and_the_last_end_detaches() {
+fn two_hooks_start_one_daemon_and_never_attach_its_node() {
     watchdog::arm();
     let a = Account::new();
     a.make_node("agent");
@@ -314,8 +331,10 @@ fn two_hooks_start_one_daemon_attach_once_and_the_last_end_detaches() {
     });
     for (n, (ok, out, err)) in [(1, &h1), (2, &h2)] {
         assert!(
-            *ok && !out.contains("could not read your rooms"),
-            "PRODUCT: hook {n} did not get its node: {out}{err}\nlog:\n{}",
+            *ok && out.contains("node agent is not attached")
+                && out.contains("vox node attach agent"),
+            "PRODUCT: hook {n} must exit 0 telling the agent its node is not attached and the \
+             command for the operator (ADR-028 K-13): {out}{err}\nlog:\n{}",
             a.log()
         );
     }
@@ -329,19 +348,20 @@ fn two_hooks_start_one_daemon_attach_once_and_the_last_end_detaches() {
         "PRODUCT: two hooks with no daemon must end with exactly one daemon\nlog:\n{}",
         a.log()
     );
-    let attaches = a
-        .log()
-        .lines()
-        .filter(|l| l.starts_with("vox daemon: node agent attached"))
-        .count();
-    assert_eq!(
-        attaches,
-        1,
-        "PRODUCT: two hooks at once must attach the node once\nlog:\n{}",
+    assert!(
+        !a.log()
+            .lines()
+            .any(|l| l.starts_with("vox daemon: node agent attached")),
+        "PRODUCT: a hook attached its node (ADR-028 K-13)\nlog:\n{}",
         a.log()
     );
-    // A session's end racing the other's next turn, a few times: the node stays attached while
-    // a session is registered.
+    // The operator attaches it, outside the sessions.
+    let (ok, out, err) = a.run(&["node", "attach", "agent"], "");
+    assert!(
+        ok,
+        "PRODUCT (staging): vox node attach agent failed: {out}{err}"
+    );
+    // A session's end racing the other's next turn, a few times: the node stays attached.
     for round in 0..3 {
         let (end, next) = std::thread::scope(|s| {
             let end = s.spawn(|| a.hook("agent", "s-1", "SessionEnd"));
@@ -367,16 +387,21 @@ fn two_hooks_start_one_daemon_attach_once_and_the_last_end_detaches() {
     for s in ["s-1", "s-2"] {
         let _ = a.hook("agent", s, "SessionEnd");
     }
+    let (ok, _, err) = a.run(&["room", "list", "--node", "agent"], "");
     assert!(
-        wait_until(Duration::from_secs(10), || !alive(pid)),
-        "PRODUCT: the daemon the hooks started did not exit once its last session ended\nlog:\n{}",
+        ok,
+        "PRODUCT: the node its operator attached detached when its last session ended: \
+         {err}\nlog:\n{}",
         a.log()
     );
+    let (ok, out, err) = a.run(&["node", "detach", "agent"], "");
     assert!(
-        a.log()
-            .lines()
-            .any(|l| l.starts_with("vox daemon: node agent detached (its last holder went)")),
-        "PRODUCT: the node's detach was not said\nlog:\n{}",
+        ok,
+        "PRODUCT (staging): vox node detach agent failed: {out}{err}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || !alive(pid)),
+        "PRODUCT: the daemon the hooks started did not exit once its node was detached\nlog:\n{}",
         a.log()
     );
 }
@@ -609,8 +634,8 @@ fn a_daemon_started_while_another_stops_takes_over() {
 }
 
 /// ADR-026 L-3: a detach is done only when the node's keys are wiped and its directory let go.
-/// A room seal still working (staged to take 12 s) holds the node's stop; the last session's
-/// `SessionEnd`, which detaches the node, answers only after the seal ends, never at the daemon's
+/// A room seal still working (staged to take 12 s) holds the node's stop; `vox node detach`
+/// answers only after the seal ends, never at the daemon's
 /// 5 s stop patience, and the daemon answers other clients meanwhile.
 #[cfg(feature = "test-knobs")]
 #[test]
@@ -644,11 +669,18 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
             &format!(r#"{{"hook_event_name":"{event}","session_id":"s-1"}}"#),
         )
     };
-    // The session attaches the node (its unlock is held by the knob too).
+    // The operator attaches the node (a hook never does, ADR-028 K-13); its daemon, started by the
+    // attach, holds secret work by the knob.
+    let (ok, out, err) = run(&["node", "attach", "agent"], "");
+    assert!(
+        ok,
+        "PRODUCT (staging): vox node attach agent failed: {out}{err}\nlog:\n{}",
+        a.log()
+    );
     let (ok, out, err) = hook("UserPromptSubmit");
     assert!(
         ok && !out.contains("could not read your rooms"),
-        "PRODUCT (staging): the hook did not attach its node: {out}{err}\nlog:\n{}",
+        "PRODUCT (staging): the hook did not read with its node attached: {out}{err}\nlog:\n{}",
         a.log()
     );
     let pid = a
@@ -680,13 +712,13 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
             let r = a.run(&["daemon", "--detach"], "");
             (r, t.elapsed())
         });
-        let end = hook("SessionEnd");
+        let end = run(&["node", "detach", "agent"], "");
         let ended_at = Instant::now();
         let took = t0.elapsed();
         let ((created, made_at), (probe_r, probe_took)) =
             (seal.join().unwrap(), probe.join().unwrap());
         eprintln!(
-            "[proof] SessionEnd (the detach) answered after {:.2} s; the seal's room create ok={}; \
+            "[proof] the detach answered after {:.2} s; the seal's room create ok={}; \
              a client probe answered in {:.3} s; the create said {:?}",
             took.as_secs_f64(),
             created.0,
@@ -695,7 +727,7 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
         );
         assert!(
             end.0,
-            "PRODUCT (staging): the SessionEnd hook failed: {end:?}"
+            "PRODUCT (staging): vox node detach agent failed: {end:?}"
         );
         assert!(
             took >= Duration::from_millis(SEAL_MS - 3_000) && made_at <= ended_at,
@@ -718,11 +750,11 @@ fn a_detach_answers_only_after_the_seal_in_flight_ends() {
     assert!(
         a.log()
             .lines()
-            .any(|l| l.starts_with("vox daemon: node agent detached (its last holder went)")),
+            .any(|l| l.starts_with("vox daemon: node agent detached (asked to)")),
         "PRODUCT: the detach was not said\nlog:\n{}",
         a.log()
     );
-    // Idle now: the daemon the hook started leaves.
+    // Idle now: the daemon the attach started leaves.
     assert!(
         wait_until(Duration::from_secs(10), || !alive(pid)),
         "PRODUCT: the daemon did not leave once idle\nlog:\n{}",
@@ -905,8 +937,10 @@ fn a_hooks_output_closes_while_the_daemon_it_started_runs() {
             match got {
                 Some(out) => {
                     let _ = child.wait();
+                    // Its node is not attached, and a hook never attaches it (ADR-028 K-13): the
+                    // hook answers with the command for the operator, and ends.
                     assert!(
-                        !out.contains("could not read your rooms"),
+                        out.contains("vox node attach agent"),
                         "PRODUCT (staging): round {round}, hook {}: {out}",
                         i + 1
                     );

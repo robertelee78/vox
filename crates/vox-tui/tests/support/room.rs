@@ -31,6 +31,9 @@ mod layout;
 
 #[path = "attach.rs"]
 mod attach;
+
+#[path = "typed.rs"]
+pub mod typed;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{node_dir, reap_daemon, DEFAULT_NODE};
 
@@ -252,6 +255,18 @@ impl Worker {
         }
         for (k, v) in env {
             cmd.env(k, v);
+        }
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            return Out {
+                ok,
+                code: Some(i32::from(!ok)),
+                stdout: shown.clone(),
+                stderr: shown,
+                argv: format!("{bin} {}", args.join(" ")),
+            };
         }
         let mut child = cmd
             .spawn()
