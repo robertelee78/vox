@@ -16,14 +16,21 @@
 //!    answered once the node has it.
 //! 2. A message the peer posts reaches the Swift program **through its listener**.
 //! 3. A service the peer shares (`vox service add`) is listed by `services` at the address the
-//!    app's own `vox service list` prints; `forward` to that address carries bytes to the peer's
+//!    app's own `vox service list` prints, with the commands (each with the canonical address)
+//!    and needs `vox service list --json` gives (ADR-028 S-3, #444); `forward` to that address
+//!    carries bytes to the peer's
 //!    service and back; `stopForward` ends it; `status` is the report `vox status --json` gives
 //!    for the same node (ADR-014 #436).
 //! 4. A file the app shares to the peer (`share`, with a note) is served: the peer's node pulls
 //!    it by itself into its files directory, byte for byte, and `shares` lists it as the app's own
 //!    `vox share list` does. A file the peer shares to the app (`vox share --to`) is pulled by the
 //!    app's node by itself, and `pulled` gives where, byte for byte (ADR-028 F-1–F-4, #436).
-//! 5. When the client closes, the daemon detaches the node it attached (`vox node list` says
+//! 5. `lanUp` brings the app's node onto the room's family LAN through the root helper, here a
+//!    stand-in answering the helper's protocol (apparatus, no root: `support/lan_standin.rs`):
+//!    the helper is asked for the node's LAN addresses, the answer names the interface it handed
+//!    over, the LAN says the port it was told to allow, and `lanDown` takes it down (ADR-013,
+//!    ADR-014 M-10, #439). The real helper and `utun` are `scripts/family-lan-proof.sh`.
+//! 6. When the client closes, the daemon detaches the node it attached (`vox node list` says
 //!    `detached`): the app's hold ends with it (M-6).
 //!
 //! 6. **One-step sharing** (ADR-028 S-4, #444): with a stand-in listening on every interface,
@@ -35,7 +42,9 @@
 //! 7. **What a message carries for showing, and a room's name**: a message the peer posts with
 //!    a link carries the card the peer's node fetched (ADR-028 F-10), and `read` gives its title,
 //!    description and image; the image the peer's file share announced (F-9) comes with its
-//!    dimensions, a JPEG thumbnail and a BlurHash. `renameRoom` on the peer's room is refused
+//!    dimensions, a JPEG thumbnail and a BlurHash. Once the peer has pulled the app's file share
+//!    whole, `pulledBy` names it, by the app's name for it, against that share's announcement
+//!    (F-7). `renameRoom` on the peer's room is refused
 //!    with the node's own sentence; on a room the app created and the peer joined, it renames
 //!    the room for both, and the peer's own `vox room list` shows the new name (R-1). The card
 //!    is fetched from a local server, so this test needs `--features vox-tui/test-knobs`
@@ -50,9 +59,11 @@
 //!    room's Sessions changing.
 //!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
+//! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
 //! Mutants for (7), one per claim, each red PRODUCT: `RoomMessage.card` always nil;
-//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node.
+//! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
+//! always empty.
 //! Mutant for (8): `sessionRead` gives each entry's kind for its line: red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
@@ -74,6 +85,9 @@ mod test_knobs;
 mod typed;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/lan_standin.rs"]
+mod lan_standin;
 
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -609,6 +623,8 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     peer.run(&["service", "add", &room, "echo", &echo_at], "");
     writeln!(to_app).unwrap();
     let shared = expect(&from_app, &seen, "SHARED ");
+    let commands = expect(&from_app, &seen, "COMMANDS ")[9..].to_owned();
+    let needs = expect(&from_app, &seen, "NEEDS ")[6..].to_owned();
     let address = shared
         .split_whitespace()
         .nth(1)
@@ -631,6 +647,63 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         address, cli_address,
         "PRODUCT: `services` must list the peer's share at the address `vox service list` \
          prints; it said {shared:?}"
+    );
+    // Its commands and needs, word for word as `vox service list --json` gives them (ADR-028
+    // S-3): every command carrying the canonical address.
+    let cli_json: serde_json::Value =
+        serde_json::from_str(&mine.run(&["service", "list", "--json", &joined[7..]], ""))
+            .unwrap_or_default();
+    let cli_share = cli_json["shared"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["by"] != "you"))
+        .cloned()
+        .unwrap_or_default();
+    let cli_commands = cli_share["commands"]
+        .as_array()
+        .map(|cs| {
+            cs.iter()
+                .map(|c| {
+                    format!(
+                        "{}={}",
+                        c["what"].as_str().unwrap_or(""),
+                        c["command"].as_str().unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+    let cli_needs = cli_share["needs"]
+        .as_array()
+        .map(|ns| {
+            ns.iter()
+                .map(|n| {
+                    let holds = if n["holds"].as_bool() == Some(true) {
+                        "yes"
+                    } else {
+                        "no"
+                    };
+                    format!("{}={holds}", n["need"].as_str().unwrap_or(""))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .unwrap_or_default();
+    let canonical = cli_share["address"].as_str().unwrap_or_default().to_owned();
+    eprintln!("the app's commands: {commands}\nits needs: {needs}");
+    assert!(
+        !cli_commands.is_empty() && !canonical.is_empty(),
+        "APPARATUS: `vox service list --json` gave no share of the peer's to compare with: \
+         {cli_json}"
+    );
+    assert!(
+        commands == cli_commands && commands.contains(&canonical),
+        "PRODUCT: the app's commands for the share must be `vox service list --json`'s, each with \
+         the canonical address {canonical}: the app said {commands:?}, the CLI {cli_commands:?}"
+    );
+    assert_eq!(
+        needs, cli_needs,
+        "PRODUCT: the app's needs for the share must be `vox service list --json`'s"
     );
     writeln!(to_app).unwrap();
     let bound = expect(&from_app, &seen, "BOUND ")[6..].to_owned();
@@ -698,6 +771,16 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     writeln!(to_app).unwrap();
     let pulled = expect(&from_app, &seen, "PULLED ")[7..].to_owned();
     let at_app = std::fs::read(&pulled).ok();
+
+    // (5) The family LAN, through a stand-in helper.
+    let helper = tmp.path().join("helper.sock");
+    let os = lan_standin::Os::default();
+    os.serve(&helper);
+    writeln!(to_app, "{}", helper.display()).unwrap();
+    let lan_up = expect(&from_app, &seen, "LAN_UP ");
+    let lan_said = expect(&from_app, &seen, "LAN_SAID ");
+    expect(&from_app, &seen, "LAN_DOWN");
+    let asked = os.asked.lock().unwrap().clone();
 
     // (6) One-step sharing (ADR-028 S-4, #444): a stand-in listens on every interface here; the
     // app lists it, previews it (the warning said first), shares it, and the peer reaches it.
@@ -806,6 +889,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
     writeln!(to_app).unwrap();
     let card = expect(&from_app, &seen, "CARD ");
     let image = expect(&from_app, &seen, "IMAGE ");
+    let pulled_by = expect(&from_app, &seen, "PULLED_BY ");
     let refused = expect(&from_app, &seen, "REFUSED ");
     let created = expect(&from_app, &seen, "CREATED ");
     let (made, made_link) = {
@@ -835,7 +919,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    eprintln!("{card}\n{image}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room list`: {peer_rooms}");
+    eprintln!("{card}\n{image}\n{pulled_by}\n{refused}\n{created}\n{renamed}\nthe peer's `vox room list`: {peer_rooms}");
     assert_eq!(
         card,
         format!(
@@ -849,6 +933,11 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         image.starts_with("IMAGE 48x32 JPEG true BLURHASH ") && image.len() > 31,
         "PRODUCT: `read` must give the image the peer's share announced: 48x32, a JPEG thumbnail \
          and a BlurHash: {image}"
+    );
+    assert_eq!(
+        pulled_by, "PULLED_BY peer SAME true",
+        "PRODUCT: `pulledBy` must say the peer pulled the app's file share whole, by the name the \
+         app trusts it under, against the share's own announcement"
     );
     assert!(
         refused.contains("this identity is not its admin"),
@@ -1014,7 +1103,7 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
          changing: {heard}"
     );
 
-    // (5) The app closes; the daemon lets the node go.
+    // (9) The app closes; the daemon lets the node go.
     writeln!(to_app).unwrap();
     expect(&from_app, &seen, "CLOSED");
     let until = Instant::now() + TIMEOUT;
@@ -1034,8 +1123,9 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
         "{joined}\nwhile attached, `vox node list` said: {listed}{posted}\npeer's read shows the \
          app's post: {}\n{got}\n{shared}\n`vox service list` said: {cli_list}BOUND {bound}, \
          echoed {through:?}, refused once stopped: {refused_after}\nstatus identity {} (vox \
-         status: {})\n{shared_file}; {listed_files}; the peer has it: {}; PULLED {pulled}, matches: {}\nafter \
-         close, `vox node list` said: {after}all the Swift program said: {:?}",
+         status: {})\n{shared_file}; {listed_files}; the peer has it: {}; PULLED {pulled}, matches: {}\n\
+         helper asked {asked:?}; {lan_up}; {lan_said}\nafter close, `vox node list` said: {after}all \
+         the Swift program said: {:?}",
         read.contains("hello from swift"),
         status["identity"],
         cli_status["identity"],
@@ -1090,6 +1180,26 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
          {} against {}",
         status["identity"],
         cli_status["identity"]
+    );
+    assert!(
+        asked.len() == 1
+            && asked[0].starts_with("up 100.")
+            && asked[0]
+                .split_whitespace()
+                .nth(2)
+                .is_some_and(|v6| v6.starts_with("fd")),
+        "PRODUCT: `lanUp` must ask the helper once for the node's LAN addresses (100.64.0.0/10, \
+         fd00::/8); it asked {asked:?}"
+    );
+    assert!(
+        lan_up.starts_with("LAN_UP vox lan up on utun-standin"),
+        "PRODUCT: `lanUp` must answer once the LAN is up on the interface the helper handed over; \
+         it said {lan_up:?}"
+    );
+    assert!(
+        lan_said.contains("reachable over the LAN: ports 5000"),
+        "PRODUCT: the LAN must carry the port `lanUp` was told to allow, as `vox lan up --allow` \
+         says it; it said {lan_said:?}"
     );
     assert!(
         after

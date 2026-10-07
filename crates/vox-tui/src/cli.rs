@@ -279,7 +279,8 @@ enum ServiceCmd {
 #[derive(Subcommand, Debug, Clone)]
 enum LanCmd {
     /// Create LAN interfaces for `vox lan up`, as root. Run it with `sudo`: it serves only
-    /// the person who ran `sudo`, accepts only LAN addresses (`100.64.0.0/10`,
+    /// the person who ran `sudo` (or, run by Vox.app's login-time helper, the person who owns
+    /// Vox.app), accepts only LAN addresses (`100.64.0.0/10`,
     /// `fd00::/8`), opens no node and touches no network. Runs until interrupted;
     /// interfaces it made live exactly as long as the `vox lan up` holding them.
     Helper(LanHelperArgs),
@@ -294,6 +295,12 @@ pub struct LanHelperArgs {
     /// Where to listen.
     #[arg(long, default_value = crate::lan_cli::DEFAULT_HELPER_SOCKET)]
     pub socket: PathBuf,
+    /// Serve the person who owns the Vox.app this `vox` is inside, as the app's login-time
+    /// helper does (ADR-014 M-10), instead of the person who ran `sudo`. Refused for a Vox.app
+    /// owned by root, one with a directory or file down to this `vox` that others may write,
+    /// or one not signed by the same Developer ID team as this `vox`.
+    #[arg(long)]
+    pub serve_bundle_owner: bool,
 }
 
 /// `vox lan up`
@@ -620,10 +627,21 @@ pub struct DaemonArgs {
     /// Its passphrase comes from `--passphrase-file` then, or it has none.
     #[arg(long)]
     pub keep: bool,
+    /// For a service manager, such as the macOS login item: no foreground node and nothing
+    /// asked for, running until stopped; kept nodes attach as always. With a daemon already
+    /// running for this data root it says so and waits, serving once that one stops.
+    #[arg(long, conflicts_with_all = ["node", "keep", "passphrase_file", "detach"])]
+    pub no_node: bool,
     /// How a client starts the daemon: its own session, no foreground node, and an
     /// exit once nothing is attached and no client is connected.
     #[arg(long = "as-detached", hide = true)]
     pub as_detached: bool,
+    /// How the macOS app's login item runs it (launchd, which restarts it after a failed exit):
+    /// a start refused for good (run as root, or a data root this version does not read) is
+    /// written to `~/Library/Logs/Vox/login-item.log` and ends with status 0, so launchd does not
+    /// start it again every ten seconds; the app quotes that line.
+    #[arg(long = "login-item", hide = true)]
+    pub login_item: bool,
     /// Where the `.vox` SOCKS5 proxy listens while a node is attached. Loopback only.
     #[arg(long, env = "VOX_PROXY", default_value = crate::daemon_proxy::DEFAULT_PROXY)]
     pub proxy: SocketAddr,
@@ -1297,6 +1315,12 @@ pub struct RoomReadArgs {
     /// One `vox.room.row/1` JSON object per line.
     #[arg(long)]
     pub json: bool,
+    /// With `--json`, also what was done to the room (its retention set, its name changed), each
+    /// as a `vox.room.notice/1` object right after the row it follows in the room's order, its
+    /// time in milliseconds. Off by default: a program that reads rows takes only
+    /// `vox.room.row/1` (ADR-021 7.6).
+    #[arg(long, requires = "json", conflicts_with = "late")]
+    pub notices: bool,
     /// Print every entry this node holds for the room in the room's order, one per
     /// line as `<entry-hash> <clock-ms>` — readable or not. The sequence every member's view is a part of,
     /// and the one that must be identical on every node.
@@ -2316,6 +2340,7 @@ pub fn run() -> ExitCode {
                                 a.limit,
                                 a.json,
                                 a.late,
+                                a.notices,
                             )
                             .await
                         }
@@ -3076,13 +3101,15 @@ pub fn run() -> ExitCode {
                 .await
             })
         }
-        Cmd::Lan(LanCmd::Helper(a)) => match crate::lan_cli::run_helper(&a.socket) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("vox lan helper: {e}");
-                ExitCode::FAILURE
+        Cmd::Lan(LanCmd::Helper(a)) => {
+            match crate::lan_cli::run_helper(&a.socket, a.serve_bundle_owner) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox lan helper: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Cmd::Lan(LanCmd::Up(a)) => {
             if let Err(e) =
                 crate::tunnel_cli::refuse_disclosed_room_passphrase(a.room.passphrase.as_ref())

@@ -13,6 +13,8 @@
 //   GOT <text>              a message arrived through the event listener
 //   (waits for a line on stdin: the peer now shares a service in the room)
 //   SHARED <address> <by> <kind>
+//   COMMANDS <what>=<command> | …   the share's ready-to-copy commands (ADR-028 S-3)
+//   NEEDS <need>=<yes|no> | …        what reaching it needs, and whether each holds
 //                           one per service the peer shares, as `services` lists it, once the
 //                           room's log has brought the peer's share (up to 120 s)
 //   (waits for a line on stdin: the proof has compared the list with `vox service list`)
@@ -26,6 +28,10 @@
 //   LISTED_FILES <n> <name> `shares`: this node's shares in the room
 //   (waits for a line on stdin: the peer has shared a file to this node)
 //   PULLED <path>           `pulled`: the file this node pulled by itself (up to 90 s)
+//   (waits for a line on stdin: a stand-in LAN helper's socket)
+//   LAN_UP <line>           `lanUp`, allowing port 5000, answered with the daemon's first line
+//   LAN_SAID <lines>        `lanSaid`: what the LAN has said, joined with " | "
+//   LAN_DOWN                `lanDown` took it down
 //   (waits for a line on stdin: the port a stand-in listens on, on every interface)
 //   LISTENING <line> EVERY <true|false>
 //                           `listening`: the stand-in, as one-step sharing lists it
@@ -40,6 +46,9 @@
 //   IMAGE <w>x<h> JPEG <true|false> BLURHASH <hash>
 //                           the image the peer's file share announced: dimensions, whether the
 //                           thumbnail is a JPEG, its BlurHash
+//   PULLED_BY <names> SAME <true|false>
+//                           `pulledBy`: who pulled this node's file share whole (up to 90 s), and
+//                           whether it names the share's own announcement
 //   REFUSED <error>         `renameRoom` on the peer's room, which this node may not rename
 //   CREATED <room> <link>   `createRoom` named "mine", and its link
 //   (waits for a line on stdin: the peer has joined it)
@@ -145,6 +154,8 @@ do {
     }
     for s in shared {
         say("SHARED \(s.address) \(s.by) \(s.kind)")
+        say("COMMANDS " + s.commands.map { "\($0.what)=\($0.command)" }.joined(separator: " | "))
+        say("NEEDS " + s.needs.map { "\($0.need)=\($0.holds ? "yes" : "no")" }.joined(separator: " | "))
     }
     guard let first = shared.first else {
         say("ERROR the peer's share was never listed")
@@ -175,6 +186,19 @@ do {
         if pulled.isEmpty { try await Task.sleep(nanoseconds: 250_000_000) }
     }
     say("PULLED \(pulled.first?.path ?? "")")
+    // The family LAN, through the helper the proof stands in for.
+    let helper = readLine() ?? ""
+    say("LAN_UP \(try await client.lanUp(room: room, allow: [5000], helperSocket: helper))")
+    // The lines after the first arrive as the LAN says them: up to 10 s for the next two.
+    var lanLines = try await client.lanSaid(room: room)
+    let saidUntil = Date().addingTimeInterval(10)
+    while lanLines.count < 3 && Date() < saidUntil {
+        try await Task.sleep(nanoseconds: 100_000_000)
+        lanLines = try await client.lanSaid(room: room)
+    }
+    say("LAN_SAID \(lanLines.joined(separator: " | "))")
+    try await client.lanDown(room: room)
+    say("LAN_DOWN")
 
     // One-step sharing (ADR-028 S-4, #444): what listens here, what sharing it says, then share.
     let port = UInt16(readLine() ?? "") ?? 0
@@ -201,6 +225,14 @@ do {
         .compactMap { $0.image }.first
     let jpeg = image.map { $0.thumb.starts(with: [0xFF, 0xD8]) } ?? false
     say("IMAGE \(image?.width ?? 0)x\(image?.height ?? 0) JPEG \(jpeg) BLURHASH \(image?.blurhash ?? "")")
+    var pulledBy: [PulledBy] = []
+    let pulledByUntil = Date().addingTimeInterval(90)
+    while pulledBy.isEmpty && Date() < pulledByUntil {
+        pulledBy = try await client.pulledBy(room: room)
+        if pulledBy.isEmpty { try await Task.sleep(nanoseconds: 250_000_000) }
+    }
+    let byNames = pulledBy.first?.names.joined(separator: ",") ?? ""
+    say("PULLED_BY \(byNames) SAME \(pulledBy.first?.id == fileShare.entry)")
     // A rename asks for no passphrase (ADR-028 K-11).
     do {
         try await client.renameRoom(room: room, name: "taken")

@@ -90,6 +90,9 @@ getrandom.workspace = true
 # nix's safe wrappers so `#![forbid(unsafe_code)]` holds.
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["socket", "net", "ioctl", "user", "fs"] }
+# A kept node's identity passphrase in the login keychain, stored and read by the daemon only
+# (ADR-028 K-10, ADR-014 M-6): the crate's safe password calls.
+security-framework = "3"
 # A session's process, its parent, start time and executable, read from the kernel (`proc_pidinfo`,
 # `proc_pidpath`) through libproc's safe API: never by running `ps` or `lsof`, which a sandbox may
 # refuse to start (ADR-029 DR-5, the pane binding).

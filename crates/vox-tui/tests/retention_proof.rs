@@ -37,7 +37,13 @@
 //! alice's minute her copy of bob's share is deleted, and her own share is no longer served, so
 //! bob, who keeps its announcement a week, is told the offer is gone; his copy stays.
 //!
-//! Mutations (each run, each red): the sweep disabled; a reload that refuses a pruned entry; the
+//! **In proof 3, the same second (#441):** alice posts and, in the same second, changes the room's
+//! retention; `vox room read --json --notices` gives the change after the post, its time in
+//! milliseconds and no earlier than the post's.
+//!
+//! Mutations (each run, each red): a governance entry claiming its whole second (red: the change's
+//! time is before the post's); a notice placed before the row it follows (red: the change read
+//! before the post); the sweep disabled; a reload that refuses a pruned entry; the
 //! node's own retention ignored; the node's retention winning whenever it is set (so a node
 //! keeping more than its room keeps more); the arrival check removed; a payload-less entry set
 //! aside as v0.2.10 did (Withheld, still owed), which turns proof 5 red; a pulled copy kept past
@@ -202,6 +208,22 @@ fn read(dir: &Path, room: &str) -> Vec<String> {
     out.lines()
         .filter_map(|l| l.splitn(3, ' ').nth(2).map(str::to_owned))
         .collect()
+}
+
+/// `vox room read --json --notices`: each row and each notice, in the order printed.
+fn read_with_notices(dir: &Path, room: &str) -> Vec<serde_json::Value> {
+    let (ok, out, err) = vox(dir, &["room", "read", room, "--json", "--notices"], None);
+    assert!(ok, "PRODUCT: vox room read --json --notices: {err}");
+    out.lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// The wall clock, milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn count(texts: &[String], prefix: &str) -> usize {
@@ -435,6 +457,61 @@ fn shortening_a_rooms_retention_removes_older_messages_on_every_member() {
         "PRODUCT: bob, not an admin, asking with no passphrase source must be told only the \
          creator or an admin changes the room's retention (ADR-028 K-11: no passphrase is \
          asked for); succeeded {ok}, said:\n{out}{err}"
+    );
+    // **A retention change made just after a post, in the same second, is shown after it, with a
+    // time in milliseconds** (the decider, 2026-10-07: all time in milliseconds; #441). Each try
+    // starts just after a second turns, so the post and the change land in one second; a try
+    // that straddles a second is retried, and three that all do are APPARATUS.
+    let mut same = None;
+    for (i, ttl) in ["32", "31", "33"].into_iter().enumerate() {
+        let into = now_ms() % 1_000;
+        std::thread::sleep(Duration::from_millis(1_000 - into + 20));
+        let text = format!("same-second {i}");
+        post(&alice, &room, &text);
+        let (ok, out, err) = vox_with(&alice, &["room", "retention", &room, ttl], None, None);
+        assert!(
+            ok,
+            "PRODUCT (staging): alice's `vox room retention {ttl}`: {out}{err}"
+        );
+        let rows = read_with_notices(&alice, &room);
+        let at = |pick: &dyn Fn(&serde_json::Value) -> bool| {
+            rows.iter().enumerate().filter(|(_, r)| pick(r)).last().map(|(i, r)| {
+                (i, r["created_millis"].as_u64().unwrap_or(0))
+            })
+        };
+        let posted = at(&|r| r["text"].as_str() == Some(text.as_str()));
+        let changed = at(&|r| {
+            r["schema"] == "vox.room.notice/1"
+                && r["notice"].as_str().is_some_and(|n| n.contains("set the room's retention"))
+        });
+        let (Some(posted), Some(changed)) = (posted, changed) else {
+            panic!(
+                "PRODUCT: `vox room read --json --notices` must give alice's post {text:?} and                  her retention change; it gave:\n{rows:#?}"
+            );
+        };
+        if posted.1 / 1_000 == changed.1 / 1_000 {
+            same = Some((rows, text, posted, changed));
+            break;
+        }
+    }
+    let Some((rows, text, posted, changed)) = same else {
+        panic!(
+            "APPARATUS (precondition unmet): in three tries alice's post and her retention change              never landed in the same second"
+        );
+    };
+    println!(
+        "same second: {text:?} at {} ms (row {}), the retention change at {} ms (row {})",
+        posted.1, posted.0, changed.1, changed.0
+    );
+    assert!(
+        changed.0 > posted.0 && changed.1 >= posted.1,
+        "PRODUCT: a retention change made just after a post, in the same second, must be read \
+         after it, with a time in milliseconds no earlier than the post's: the post {text:?} is \
+         row {} at {} ms, the change row {} at {} ms:\n{rows:#?}",
+        posted.0,
+        posted.1,
+        changed.0,
+        changed.1
     );
     let (ok, out, err) = vox_with(&alice, &["room", "retention", &room, "30"], None, None);
     assert!(

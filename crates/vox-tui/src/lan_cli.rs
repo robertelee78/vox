@@ -39,7 +39,7 @@ use crate::app::AppError;
 
 /// Where the helper listens unless told otherwise: in a root-owned directory, so nobody
 /// else can put a socket there first.
-pub const DEFAULT_HELPER_SOCKET: &str = "/var/run/vox-lan.sock";
+pub const DEFAULT_HELPER_SOCKET: &str = vox_core::node::lan_request::DEFAULT_HELPER_SOCKET;
 
 /// What `vox lan up` asks the helper for: an interface holding these addresses, with the
 /// room's /24 and /64 routed to it.
@@ -232,7 +232,7 @@ pub use mac::{run_helper, up};
 ///
 /// # Errors
 /// Always, on this platform.
-pub fn run_helper(_socket: &Path) -> Result<(), AppError> {
+pub fn run_helper(_socket: &Path, _serve_bundle_owner: bool) -> Result<(), AppError> {
     Err(AppError::Usage(NOT_HERE.into()))
 }
 
@@ -455,7 +455,7 @@ mod mac {
         let (uid, _) = nix::unistd::getpeereid(stream).map_err(|e| format!("getpeereid: {e}"))?;
         if uid != owner {
             return Err(format!(
-                "uid {uid} asked, and this helper serves only uid {owner}, who started it"
+                "uid {uid} asked, and this helper serves only uid {owner}"
             ));
         }
         match stream.set_read_timeout(Some(Duration::from_secs(5))) {
@@ -509,25 +509,38 @@ mod mac {
         Ok(Some(format!("{name} for uid {uid}: {}", done.join("; "))))
     }
 
-    /// `sudo vox lan helper`: serve interface requests from the person who ran `sudo`
+    /// `sudo vox lan helper`: serve interface requests from the person who ran `sudo`, or with
+    /// `serve_bundle_owner` from the person who owns the Vox.app it is inside (ADR-014 M-10),
     /// until interrupted.
     ///
     /// # Errors
-    /// If it is not root, cannot tell who ran `sudo`, or cannot listen.
-    pub fn run_helper(socket: &Path) -> Result<(), AppError> {
-        if !nix::unistd::geteuid().is_root() {
-            return Err(AppError::Usage(
-                "the helper creates network interfaces, which needs root: `sudo vox lan helper`"
-                    .into(),
-            ));
-        }
-        let id = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
-        let (Some(uid), Some(gid)) = (id("SUDO_UID"), id("SUDO_GID")) else {
-            return Err(AppError::Usage(
-                "start the helper with sudo, so it knows whom to serve: `sudo vox lan helper`"
-                    .into(),
-            ));
+    /// If it is not root, cannot tell whom to serve, or cannot listen.
+    pub fn run_helper(socket: &Path, serve_bundle_owner: bool) -> Result<(), AppError> {
+        // Whom it serves is worked out first, so a refusal to run says it either way.
+        let whom = if serve_bundle_owner {
+            bundle_owner().map_err(AppError::Usage)?
+        } else {
+            let id = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+            let (Some(uid), Some(gid)) = (id("SUDO_UID"), id("SUDO_GID")) else {
+                return Err(AppError::Usage(
+                    "start the helper with sudo, so it knows whom to serve: `sudo vox lan helper`"
+                        .into(),
+                ));
+            };
+            Owner {
+                uid,
+                gid,
+                why: "who ran sudo".into(),
+            }
         };
+        if !nix::unistd::geteuid().is_root() {
+            return Err(AppError::Usage(format!(
+                "the helper creates network interfaces, which needs root: `sudo vox lan helper` \
+                 (it would serve uid {}, {})",
+                whom.uid, whom.why
+            )));
+        }
+        let Owner { uid, gid, .. } = whom;
         let (owner, group) = (
             nix::unistd::Uid::from_raw(uid),
             nix::unistd::Gid::from_raw(gid),
@@ -591,6 +604,122 @@ mod mac {
         let _ = std::fs::remove_file(&path);
         println!("vox lan helper: stopped");
         result.map_err(AppError::Io)
+    }
+
+    /// Whom the helper serves, and why that person.
+    struct Owner {
+        uid: u32,
+        gid: u32,
+        why: String,
+    }
+
+    /// The person who owns the Vox.app this `vox` is inside (ADR-014 M-10): only they, or root,
+    /// can change what this root helper runs. Refused, with why, for a Vox.app owned by root, a
+    /// directory or file from the bundle down to this `vox` that is not theirs or that others
+    /// may write, or a bundle whose signature is not valid or not by this `vox`'s Developer ID
+    /// team.
+    fn bundle_owner() -> Result<Owner, String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let exe = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map_err(|e| format!("cannot find this vox: {e}"))?;
+        let bundle = exe
+            .ancestors()
+            .find(|p| p.extension().is_some_and(|x| x == "app"))
+            .ok_or_else(|| {
+                format!(
+                    "{} is not inside a Vox.app, so there is no owner to serve",
+                    exe.display()
+                )
+            })?
+            .to_path_buf();
+        let meta = std::fs::metadata(&bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+        let (uid, gid) = (meta.uid(), meta.gid());
+        if uid == 0 {
+            return Err(format!(
+                "{} is owned by root, so it has no person to serve; the helper serves the person \
+                 who owns Vox.app",
+                bundle.display()
+            ));
+        }
+        // Everything from the bundle down to this `vox`: its owner's alone, written by no one else.
+        let mut path = bundle.clone();
+        let mut walk = vec![bundle.clone()];
+        for part in exe
+            .strip_prefix(&bundle)
+            .map_err(|e| e.to_string())?
+            .components()
+        {
+            path.push(part);
+            walk.push(path.clone());
+        }
+        for p in &walk {
+            let m = std::fs::symlink_metadata(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            if m.uid() != uid && m.uid() != 0 {
+                return Err(format!(
+                    "{} belongs to uid {}, not to Vox.app's owner uid {uid}; not serving",
+                    p.display(),
+                    m.uid()
+                ));
+            }
+            if m.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "{} can be written by others (mode {:o}), so what this helper runs could be \
+                     changed by them; not serving",
+                    p.display(),
+                    m.mode() & 0o7777
+                ));
+            }
+        }
+        let bundle_team = signing_team(&bundle)?;
+        let own_team = signing_team(&exe)?;
+        if bundle_team != own_team {
+            return Err(format!(
+                "{} is signed by team {bundle_team}, and this vox by team {own_team}; not serving",
+                bundle.display()
+            ));
+        }
+        Ok(Owner {
+            uid,
+            gid,
+            why: format!("who owns {}", bundle.display()),
+        })
+    }
+
+    /// The Developer ID team that signed `path`, once its signature checks out
+    /// (`codesign --verify --strict`). Refused for an ad hoc signature, which names no team.
+    fn signing_team(path: &Path) -> Result<String, String> {
+        let codesign = "/usr/bin/codesign";
+        let verify = Command::new(codesign)
+            .args(["--verify", "--strict"])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("cannot run {codesign}: {e}"))?;
+        if !verify.status.success() {
+            return Err(format!(
+                "{}'s signature does not check out: {}",
+                path.display(),
+                String::from_utf8_lossy(&verify.stderr).trim()
+            ));
+        }
+        let shown = Command::new(codesign)
+            .args(["--display", "--verbose=2"])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("cannot run {codesign}: {e}"))?;
+        // codesign says what it shows on stderr.
+        let said = String::from_utf8_lossy(&shown.stderr);
+        match said
+            .lines()
+            .find_map(|l| l.strip_prefix("TeamIdentifier="))
+            .map(str::trim)
+        {
+            Some(team) if !team.is_empty() && team != "not set" => Ok(team.to_owned()),
+            _ => Err(format!(
+                "{} is not signed with a Developer ID (no team), so the helper will not serve it",
+                path.display()
+            )),
+        }
     }
 
     fn request_device(socket: &Path, req: &DeviceRequest) -> Result<(OwnedFd, String), String> {
@@ -823,79 +952,7 @@ mod mac {
 
 // ---- `vox lan up` through the daemon (ADR-026 S-5) ------------------------------------------
 
-/// A node's connection asks its daemon to run the LAN: `[T_LAN_UP, room, helper socket, stats
-/// file or "", allowed ports as "p,p"]`. Tags away from every IPC range.
-const T_LAN_UP: u64 = 4600;
-/// The daemon's line for the person: `[T_LAN_SAID, text]`.
-const T_LAN_SAID: u64 = 4601;
-/// The LAN could not start, and why: `[T_LAN_FAILED, text]`; the connection then closes.
-const T_LAN_FAILED: u64 = 4602;
-
-/// What `vox lan up` asks of the daemon.
-struct LanRequest {
-    channel_id: vox_core::hash::Digest32,
-    helper: std::path::PathBuf,
-    stats_file: Option<std::path::PathBuf>,
-    allow: std::collections::BTreeSet<u16>,
-}
-
-impl LanRequest {
-    fn to_bytes(&self) -> Vec<u8> {
-        let allow: Vec<String> = self.allow.iter().map(u16::to_string).collect();
-        let mut e = vox_core::cbor::Encoder::new();
-        e.array(5)
-            .uint(T_LAN_UP)
-            .bytes(&self.channel_id)
-            .text(&self.helper.to_string_lossy())
-            .text(
-                &self
-                    .stats_file
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            )
-            .text(&allow.join(","));
-        e.finish()
-    }
-
-    fn parse(body: &[u8]) -> Option<Self> {
-        let mut d = vox_core::cbor::Decoder::new(body);
-        let (Ok(5), Ok(T_LAN_UP)) = (d.array(), d.uint()) else {
-            return None;
-        };
-        let channel_id = vox_core::hash::Digest32::try_from(d.bytes().ok()?).ok()?;
-        let helper = std::path::PathBuf::from(d.text().ok()?);
-        let stats = d.text().ok()?;
-        let allow = d
-            .text()
-            .ok()?
-            .split(',')
-            .filter(|p| !p.is_empty())
-            .map(str::parse)
-            .collect::<Result<_, _>>()
-            .ok()?;
-        d.finish().ok()?;
-        Some(Self {
-            channel_id,
-            helper,
-            stats_file: (!stats.is_empty()).then(|| std::path::PathBuf::from(stats)),
-            allow,
-        })
-    }
-}
-
-/// One `[tag, text]` frame, length-prefixed as every control-socket frame is.
-fn line_frame(tag: u64, text: &str) -> Vec<u8> {
-    let mut e = vox_core::cbor::Encoder::new();
-    e.array(2).uint(tag).text(text);
-    let body = e.finish();
-    let mut framed = u32::try_from(body.len())
-        .unwrap_or(0)
-        .to_be_bytes()
-        .to_vec();
-    framed.extend_from_slice(&body);
-    framed
-}
+use vox_core::node::lan_request::{LanRequest, LanSaid};
 
 /// The daemon's side of `vox lan up` (ADR-026 S-5): it asks the root helper for the device as
 /// this user, and runs the LAN as the node until the client's connection closes. The helper is
@@ -904,8 +961,7 @@ pub struct LanUp;
 
 impl vox_core::node::ipc::Extension for LanUp {
     fn claims(&self, body: &[u8]) -> bool {
-        let mut d = vox_core::cbor::Decoder::new(body);
-        matches!((d.array(), d.uint()), (Ok(5), Ok(T_LAN_UP)))
+        LanRequest::claims(body)
     }
 
     fn serve(
@@ -926,7 +982,7 @@ impl vox_core::node::ipc::Extension for LanUp {
                 }
             });
             let Some(req) = LanRequest::parse(&body) else {
-                let _ = tx.send(line_frame(T_LAN_FAILED, "that is not a LAN request"));
+                let _ = tx.send(LanSaid::Failed("that is not a LAN request".into()).framed());
                 drop(tx);
                 let _ = writer.await;
                 return;
@@ -943,7 +999,7 @@ impl vox_core::node::ipc::Extension for LanUp {
             let tag = who.clone();
             let say = move |line: String| {
                 eprintln!("vox daemon: {tag}: {line}");
-                let _ = said.send(line_frame(T_LAN_SAID, &line));
+                let _ = said.send(LanSaid::Said(line).framed());
             };
             // The LAN lives exactly as long as the client's connection.
             let stop = async move {
@@ -966,7 +1022,7 @@ impl vox_core::node::ipc::Extension for LanUp {
                 ),
                 Err(e) => {
                     eprintln!("vox daemon: {who}: a LAN could not run: {e}");
-                    let _ = tx.send(line_frame(T_LAN_FAILED, &e.to_string()));
+                    let _ = tx.send(LanSaid::Failed(e.to_string()).framed());
                 }
             }
             drop(say);
@@ -1044,13 +1100,10 @@ pub async fn up_held(
                 let Ok(Some(body)) = frame else {
                     return Err((&mut closed).await);
                 };
-                let mut d = vox_core::cbor::Decoder::new(&body);
-                match (d.array(), d.uint(), d.text()) {
-                    (Ok(2), Ok(T_LAN_SAID), Ok(line)) => println!("{line}"),
-                    (Ok(2), Ok(T_LAN_FAILED), Ok(why)) => {
-                        return Err(AppError::Usage(why.to_owned()))
-                    }
-                    _ => match vox_core::node::ipc::Frame::from_bytes(&body) {
+                match LanSaid::parse(&body) {
+                    Some(LanSaid::Said(line)) => println!("{line}"),
+                    Some(LanSaid::Failed(why)) => return Err(AppError::Usage(why)),
+                    None => match vox_core::node::ipc::Frame::from_bytes(&body) {
                         Ok(vox_core::node::ipc::Frame::Error { reason }) => {
                             return Err(AppError::Usage(reason))
                         }

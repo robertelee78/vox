@@ -28,6 +28,18 @@
 #
 # or `sudo scripts/family-lan-proof.sh /path/to/vox` for another binary.
 #
+# **With Vox.app's registered helper** (ADR-014 M-10, #439), after approving the LAN helper in
+# System Settings (the manual check `manual.lan_helper`):
+#
+#     sudo scripts/family-lan-proof.sh --registered-helper /Applications/Vox.app
+#
+# It then starts no helper of its own: every `vox` is the bundle's, and every `vox lan up` uses
+# the helper launchd runs on /var/run/vox-lan.sock, as the app does. One more check comes first:
+#
+#   0. owner     the registered helper serves only the person who owns Vox.app: a request from
+#                another uid (root, this script) is refused with "serves only uid <yours>", and
+#                no interface is made. Mutant: the helper skips its uid check; 0 goes red.
+#
 # What runs as root, and why: `vox lan helper` (it creates the utun interfaces — that is
 # its whole job) and this script's own bookkeeping (killing what it started, `ifconfig`
 # and `netstat` snapshots). Every `vox` — each member's daemon and every client verb — and
@@ -69,7 +81,15 @@ if [[ $(uname) != Darwin ]]; then
 fi
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-VOX=${1:-$REPO/target/release/vox}
+REGISTERED=0
+if [[ ${1:-} == --registered-helper ]]; then
+    REGISTERED=1
+    APP=${2:?--registered-helper needs the registered Vox.app, e.g. /Applications/Vox.app}
+    VOX=$APP/Contents/Helpers/vox
+else
+    VOX=${1:-$REPO/target/release/vox}
+fi
+HELPER_SOCK=/var/run/vox-lan.sock
 PY=/usr/bin/python3
 [[ -x $VOX ]] || { echo "no vox binary at $VOX — cargo build --release -p vox-tui" >&2; exit 2; }
 [[ -x $PY ]] || { echo "no $PY (install the Xcode command line tools)" >&2; exit 2; }
@@ -443,16 +463,44 @@ stop_pid "$PID_serve"
 # The decider's rule: nothing is reachable over the LAN unless its port is listed. The
 # checks' own ports are listed; 47040 and 47041 are the unlisted ones check 6 knocks on.
 ALLOW=47010,47011,47030
-say "vox lan helper (root) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
-bg helper "$VOX" lan helper --socket "$WORK/helper.sock"
-wait_line "$WORK/helper.log" 'serving uid' 30 "$PID_helper" || exit 1
+if [[ $REGISTERED == 1 ]]; then
+    # ---- 0. the registered helper serves only Vox.app's owner ----
+    say "0. owner: the registered helper on $HELPER_SOCK, asked by root (another uid)"
+    if [[ ! -S $HELPER_SOCK ]]; then
+        echo "APPARATUS: no helper listens on $HELPER_SOCK: approve Vox's LAN helper in System" \
+            "Settings (manual.lan_helper) and run this again" >&2
+        exit 1
+    fi
+    OWNER=$(stat -f %u "$HELPER_SOCK")
+    ASKED=$("$PY" -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect(sys.argv[1])
+s.sendall(b"hello\n")
+print(s.recv(4096).decode(errors="replace").strip())
+' "$HELPER_SOCK" 2>&1)
+    echo "socket owner uid $OWNER ($SUDO_USER is $(id -u "$SUDO_USER")); root was answered: $ASKED"
+    if [[ $OWNER == "$(id -u "$SUDO_USER")" && $ASKED == *"uid 0 asked, and this helper serves only uid $OWNER"* ]]; then
+        pass "owner: the registered helper serves only uid $OWNER, who owns Vox.app; root was refused"
+    else
+        fail "owner: socket owned by uid $OWNER, and root was answered: $ASKED"
+    fi
+    HELPER_AT=$HELPER_SOCK
+    say "the registered helper (launchd) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
+else
+    HELPER_AT=$WORK/helper.sock
+    say "vox lan helper (root) and three vox lan up (as $SUDO_USER), each --allow $ALLOW"
+    bg helper "$VOX" lan helper --socket "$HELPER_AT"
+    wait_line "$WORK/helper.log" 'serving uid' 30 "$PID_helper" || exit 1
+fi
 # Each `vox lan up` is a client holding its member's node: its daemon, as $SUDO_USER, asks
 # the helper on helper.sock for the utun and runs the LAN, writing the stats file.
 for m in alice bob carol; do
     voxcmd "$m"
     bg "lan_$m" "${VOXCMD[@]}" lan up "$ROOM" --passphrase-file "$WORK/$m/room.pass" \
         --identity-passphrase-file "$WORK/$m/identity.pass" \
-        --helper-socket "$WORK/helper.sock" --stats-file "$WORK/$m.json" \
+        --helper-socket "$HELPER_AT" --stats-file "$WORK/$m.json" \
         --allow "$ALLOW"
 done
 for m in alice bob carol; do
@@ -478,8 +526,10 @@ SUBNET4=$(jget "$WORK/alice.json" 'd["subnet_v4"]')
 PREFIX6=$(jget "$WORK/alice.json" 'd["prefix_v6"]')
 BCAST=${SUBNET4%.0/24}.255
 echo "LAN $SUBNET4 $PREFIX6 — alice $V4_alice on $IF_alice, bob $V4_bob on $IF_bob, carol $V4_carol on $IF_carol"
-say "helper said"
-sed 's/^/    /' "$WORK/helper.log"
+if [[ $REGISTERED == 0 ]]; then
+    say "helper said"
+    sed 's/^/    /' "$WORK/helper.log"
+fi
 say "the interfaces"
 for i in "${IFACES[@]}"; do ifconfig "$i" | sed 's/^/    /'; done
 netstat -rn | grep -E "$(IFS='|'; echo "${IFACES[*]}")" | sed 's/^/    /'

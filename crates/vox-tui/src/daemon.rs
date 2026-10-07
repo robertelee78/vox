@@ -33,6 +33,10 @@ use crate::host::{Defaults, Router};
 /// How long an auto-started daemon lingers with no node and no client before it exits (L-8).
 const IDLE_LINGER: Duration = Duration::from_secs(1);
 
+/// How long an auto-started daemon serves before an idle exit may end it (L-8): the client that
+/// started it, slow to connect on a loaded machine, still finds it there.
+const START_GRACE: Duration = Duration::from_secs(10);
+
 /// Run this profile's node **without a terminal**, so agent sessions can attach
 /// (ADR-020 §12).
 ///
@@ -90,12 +94,15 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     // **A daemon run as root would serve nobody** (ADR-026 C-1): it admits no uid 0, and a client
     // of any other uid is not its user. Said at once, before the lock is taken or anything is read.
     if vox_core::node::paths::my_uid() == 0 {
-        return Err(AppError::Usage(
-            "vox daemon will not run as root (uid 0): it admits no control connection from root, \
-             so a daemon run as root could serve nobody. Run vox as an ordinary user: in a \
-             container, set a non-root USER (for example `podman run --user 1000 …`)"
-                .into(),
-        ));
+        return refused_for_good(
+            args,
+            AppError::Usage(
+                "vox daemon will not run as root (uid 0): it admits no control connection from \
+                 root, so a daemon run as root could serve nobody. Run vox as an ordinary user: \
+                 in a container, set a non-root USER (for example `podman run --user 1000 …`)"
+                    .into(),
+            ),
+        );
     }
     // Refused before anything is read or unlocked: a metrics endpoint the network can
     // reach names every peer and room this node talks to (PRD-001 R38).
@@ -107,11 +114,17 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             )));
         }
     }
-    let account = Account::of(
+    let account = match Account::of(
         args.profile.data_dir.as_deref(),
         args.profile.config_dir.as_deref(),
-    )
-    .map_err(|e| AppError::Usage(e.to_string()))?;
+    ) {
+        Ok(account) => account,
+        // A data root this version does not read stays refused however often it is tried.
+        Err(e) => return refused_for_good(args, AppError::Usage(e.to_string())),
+    };
+    if let Err(e) = vox_core::node::layout::refuse_old_layout(&account) {
+        return refused_for_good(args, AppError::Usage(e.to_string()));
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -157,6 +170,37 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     let mut given = None;
     let (rt, serving) = match take(&rt)? {
         Some(serving) => (rt, serving),
+        None if args.no_node => {
+            // **A service manager's daemon waits its turn** (ADR-014 M-9): the login item's
+            // launch agent restarts it only after a crash, so one that exited 0 because a daemon
+            // a client started was running left nothing behind once that daemon went, and Vox.app,
+            // waiting for the login item's daemon, found none until the next login. It waits for
+            // the account instead, and serves once the running daemon stops.
+            eprintln!(
+                "vox daemon: a daemon is already running for {}; this one serves once it stops",
+                account.data_root.display()
+            );
+            let serving = loop {
+                let signal = rt.block_on(async {
+                    tokio::select! {
+                        signal = &mut stop => Some(signal),
+                        () = tokio::time::sleep(Duration::from_millis(250)) => None,
+                    }
+                });
+                if let Some(signal) = signal {
+                    say(format_args!(
+                        "vox daemon: stopped by {} while it waited",
+                        signal.name()
+                    ));
+                    return Ok(());
+                }
+                if let Some(serving) = take(&rt)? {
+                    eprintln!("vox daemon: the daemon that was running stopped; this one serves");
+                    break serving;
+                }
+            };
+            (rt, serving)
+        }
         None => match already_running(args, &account, rt, &mut stop, named.clone())? {
             Handed::Done => return Ok(()),
             // **A daemon that was stopping is waited for, and then this one serves** (ADR-026
@@ -209,7 +253,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     }
 
     // The foreground node.
-    let foreground = if args.as_detached {
+    let foreground = if args.as_detached || args.no_node {
         None
     } else {
         resolve(&account, named)
@@ -230,14 +274,14 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 return Ok(());
             }
         }
-        None if !args.as_detached && account.nodes_on_disk().is_empty() => {
+        None if !args.as_detached && !args.no_node && account.nodes_on_disk().is_empty() => {
             eprintln!(
                 "vox daemon: no node here yet, so it runs with none; nodes attach to it as they \
                  are made and used"
             );
             println!("vox daemon: control socket {}", account.socket().display());
         }
-        None if !args.as_detached => {
+        None if !args.as_detached && !args.no_node => {
             let nodes = account.nodes_on_disk();
             eprintln!(
                 "vox daemon: {} node(s) here and none named, so none is attached: name one with \
@@ -259,6 +303,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
             if !args.as_detached {
                 return std::future::pending::<()>().await;
             }
+            let served = Instant::now();
             let mut since: Option<Instant> = None;
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -268,7 +313,7 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
                 }
                 if router.idle() {
                     let t = *since.get_or_insert_with(Instant::now);
-                    if t.elapsed() >= IDLE_LINGER {
+                    if t.elapsed() >= IDLE_LINGER && served.elapsed() >= START_GRACE {
                         return;
                     }
                 } else {
@@ -283,6 +328,45 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         }
     });
     stop_daemon(rt, &router, &serving.presence, signal)
+}
+
+/// A start that no retry can change. As the login item (`--login-item`), it is written to
+/// [`login_item_log`] and the daemon ends with status 0: launchd restarts the login item only after
+/// a failed exit, so it is not started again every ten seconds, and the app quotes the line.
+/// Otherwise it is the error, as before.
+fn refused_for_good(args: &DaemonArgs, error: AppError) -> Result<(), AppError> {
+    if !args.login_item {
+        return Err(error);
+    }
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let line = format!("{at} vox daemon will not start: {error}\n");
+    eprint!("{line}");
+    if let Some(log) = login_item_log() {
+        let wrote = log
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log)?
+                    .write_all(line.as_bytes())
+            });
+        if let Err(e) = wrote {
+            eprintln!("vox daemon: could not write {}: {e}", log.display());
+        }
+    }
+    Ok(())
+}
+
+/// Where the login item says why it did not start: `~/Library/Logs/Vox/login-item.log`, outside
+/// the data root (a data root this version does not read is left byte for byte as it was).
+fn login_item_log() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join("Library/Logs/Vox/login-item.log"))
 }
 
 /// What a daemon that holds its account runs: its router, its account socket and its lock, each

@@ -362,7 +362,9 @@ structure for both clients; the TUI renders the same regions in text.
 - **A-3.** A menu bar extra, opt-in, MUST show the node's state and keyring window, rooms with
   messages addressed to it, services shared to it with copy buttons, its own shares with stop, and
   live tunnels.
-- **A-4.** Quitting the app MUST detach its node, as quitting the TUI does (ADR-026 S-4).
+- **A-4.** Quitting the app MUST detach its node, as quitting the TUI does (ADR-026 S-4), except
+  when the person chose Keep Running and stored the node's passphrase in the Keychain (K-10), or
+  the node needs none: then the node stays attached (ADR-014 M-6, M-8).
 - **A-5.** On macOS the user-level `vox daemon` MUST be registered as a login item with
   `SMAppService`, so it runs before the app opens.
 

@@ -196,11 +196,12 @@ impl NodeSnapshot {
             }
             e.array(o.notices.len());
             for n in &o.notices {
-                e.array(4)
+                e.array(5)
                     .bytes(&n.entry_hash)
                     .bytes(&n.author)
                     .uint(n.created_millis)
-                    .text(&n.what);
+                    .text(&n.what)
+                    .bytes(n.after.as_ref().map_or(&[][..], |d| &d[..]));
             }
             e.array(o.trusted_by.len());
             for (member, by) in &o.trusted_by {
@@ -330,12 +331,22 @@ impl NodeSnapshot {
             }
             let mut notices = Vec::new();
             for _ in 0..d.array().map_err(bad("ipc snapshot notices"))? {
-                want(&mut d, 4, "ipc snapshot notice")?;
+                want(&mut d, 5, "ipc snapshot notice")?;
+                let entry_hash = digest(&mut d)?;
+                let author = digest(&mut d)?;
+                let created_millis = d.uint().map_err(bad("ipc snapshot notice time"))?;
+                let what = d.text().map_err(bad("ipc snapshot notice"))?.to_owned();
+                let after = d.bytes().map_err(bad("ipc snapshot notice after"))?;
                 notices.push(crate::node::channel::RoomNotice {
-                    entry_hash: digest(&mut d)?,
-                    author: digest(&mut d)?,
-                    created_millis: d.uint().map_err(bad("ipc snapshot notice time"))?,
-                    what: d.text().map_err(bad("ipc snapshot notice"))?.to_owned(),
+                    entry_hash,
+                    author,
+                    created_millis,
+                    what,
+                    after: if after.is_empty() {
+                        None
+                    } else {
+                        Some(digest_of(after)?)
+                    },
                 });
             }
             let mut trusted_by = Vec::new();
@@ -496,6 +507,17 @@ fn read_digests(d: &mut Decoder<'_>) -> Result<Vec<Digest32>> {
         .array()
         .map_err(|_| Error::MalformedIpc("ipc snapshot digests"))?;
     (0..n).map(|_| digest(d)).collect()
+}
+
+/// The keyring window as every client says it (ADR-028 K-9): `keyring open 23m` while a keyring
+/// change goes without the passphrase, rounded up so an open window never reads `0m`; `keyring asks
+/// for the passphrase` once it will ask.
+#[must_use]
+pub fn keyring_label(open_secs: Option<u64>) -> String {
+    match open_secs {
+        Some(left) => format!("keyring open {}m", left.div_ceil(60).max(1)),
+        None => "keyring asks for the passphrase".to_owned(),
+    }
 }
 
 #[cfg(test)]

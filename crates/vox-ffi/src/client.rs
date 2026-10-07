@@ -22,7 +22,7 @@ use vox_core::error::{Error, IpcHandshake};
 use vox_core::hash::Digest32;
 use vox_core::node::api::{MessageRow, NodeEvent};
 use vox_core::node::daemonipc::{
-    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, NodeName, NodeState, UseNode,
+    AttachMode, DaemonClient, DaemonFrame, DaemonRequest, KeepSource, NodeName, NodeState, UseNode,
 };
 use vox_core::node::ipc::{Frame, IpcClient, NodeSocket, Request};
 use vox_core::node::link::b32_encode;
@@ -129,6 +129,11 @@ pub struct RoomMessage {
     pub late: bool,
     /// Its body has not been received yet.
     pub owed: bool,
+    /// What it is to this node while unread (ADR-028 R-8), by the rule the TUI counts by.
+    pub level: UnreadLevel,
+    /// The file or folder it shares, when it is a share's announcement (ADR-028 F-1): the message
+    /// is its card, its text the note.
+    pub file: Option<FileOffer>,
     /// The image a file share announces (ADR-028 F-9), or none: not a share, or not an image.
     pub image: Option<ImagePreview>,
     /// The link card its sender's node fetched for its first link (ADR-028 F-10), or none.
@@ -202,6 +207,124 @@ fn card_of(env: &vox_agentcomms::envelope::Envelope) -> Option<LinkCard> {
     })
 }
 
+/// What a share's announcement offers, as its signed envelope states it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FileOffer {
+    /// The name it is offered under.
+    pub name: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its SHA-256, hex.
+    pub sha256: String,
+    /// A folder, served as one archive.
+    pub folder: bool,
+    /// The sharer's note, or empty.
+    pub note: String,
+}
+
+/// One event of this node's decision record (ADR-028 §7): what it decided, about whom, and why,
+/// in its own words; never message text, a file name, a passphrase or a key.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DecisionEvent {
+    /// When, milliseconds since the Unix epoch.
+    pub at_millis: u64,
+    /// What was asked: "to join a room", "a tunnel to a service", …
+    pub asked: String,
+    /// Who asked, or whom it was about: a fingerprint, base32.
+    pub by: String,
+    /// This node's name for them when it was decided; empty when it had none.
+    pub alias: String,
+    /// `refused`, `trusted`, `untrusted`, `cut` or `stopped`.
+    pub decided: String,
+    /// Why, in this node's words.
+    pub why: String,
+    /// The room it concerns, by its ID; empty for a decision about no room.
+    pub room: String,
+}
+
+/// Who has read one of this node's own messages (ADR-028 R-6).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReadBy {
+    /// The message's id.
+    pub id: String,
+    /// This node's names for the members who read it, sorted; a fingerprint's first 12
+    /// characters for one it has no name for.
+    pub names: Vec<String>,
+}
+
+/// Who has pulled one of this node's own shares whole and verified it (ADR-028 F-7).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PulledBy {
+    /// The share's announcement: its message id.
+    pub id: String,
+    /// This node's names for the members who pulled it, sorted; a fingerprint's first 12
+    /// characters for one it has no name for.
+    pub names: Vec<String>,
+}
+
+/// **The three unread levels** (ADR-028 R-8): what one unread message is to this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum UnreadLevel {
+    /// Addressed to this node.
+    ToYou,
+    /// New, to the room.
+    New,
+    /// Coordination traffic, counted only (ADR-020 6.6).
+    Coordination,
+}
+
+/// **What a room needs from the person** (ADR-028 W-2): the sidebar's groups, in the order it
+/// lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RoomGroup {
+    /// A message addressed to this node is unread.
+    NeedsYou,
+    /// New messages are unread.
+    Active,
+    /// Nothing is unread.
+    Quiet,
+}
+
+/// The account's config directory for the data root `data_root` (empty: the default one), as
+/// `vox` finds it: what a client keeps its own choices in, readable before any daemon answers.
+///
+/// # Errors
+/// The data root cannot be found.
+#[uniffi::export]
+pub fn config_dir(data_root: String) -> Result<String, VoxError> {
+    let root = (!data_root.is_empty()).then(|| PathBuf::from(&data_root));
+    Account::of(root.as_deref(), None)
+        .map(|a| a.config_dir.display().to_string())
+        .map_err(|e| failed(format!("data root: {e}")))
+}
+
+/// The group a room's unread counts, by [`UnreadLevel`], put it in: the TUI's rule
+/// (`vox_agentcomms::attention::group`).
+#[uniffi::export]
+#[must_use]
+pub fn room_group(to_you: u32, new: u32, coordination: u32) -> RoomGroup {
+    use vox_agentcomms::attention::{group, RoomGroup as G};
+    match group(to_you as usize, new as usize, coordination as usize) {
+        G::NeedsYou => RoomGroup::NeedsYou,
+        G::Active => RoomGroup::Active,
+        G::Quiet => RoomGroup::Quiet,
+    }
+}
+
+/// The group, as the sidebar heads it: the TUI's words.
+#[uniffi::export]
+#[must_use]
+pub fn room_group_words(group: RoomGroup) -> String {
+    use vox_agentcomms::attention::RoomGroup as G;
+    match group {
+        RoomGroup::NeedsYou => G::NeedsYou,
+        RoomGroup::Active => G::Active,
+        RoomGroup::Quiet => G::Quiet,
+    }
+    .label()
+    .to_owned()
+}
+
 /// A member of a room.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Member {
@@ -255,6 +378,30 @@ pub struct SharedService {
     pub udp: bool,
     /// What its sharer's node detected it to be (ADR-028 S-2).
     pub kind: String,
+    /// The ready-to-copy commands for its kind, each with the canonical address (ADR-028 S-3).
+    pub commands: Vec<ServiceCommand>,
+    /// What reaching it from here needs, and whether each holds (S-3).
+    pub needs: Vec<ServiceNeed>,
+}
+
+/// One ready-to-copy command for a shared service (ADR-028 S-3), as `vox service list` gives it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServiceCommand {
+    /// What it is: `ssh`, `forward`, `then` (what to run after the forward), `open`.
+    pub what: String,
+    /// The command, carrying the canonical address: it works pasted on any member's machine.
+    pub command: String,
+}
+
+/// One thing reaching a shared service needs (ADR-028 S-3), as `vox service list` says it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ServiceNeed {
+    /// The condition, in words.
+    pub need: String,
+    /// Whether it holds now.
+    pub holds: bool,
+    /// What to do when it does not; empty when it holds.
+    pub otherwise: String,
 }
 
 /// A service this node offers in a room.
@@ -627,6 +774,25 @@ pub struct DriveAnswer {
     pub delivery: DriveDelivery,
 }
 
+/// Something done to a room, said among its messages (ADR-028 R-1, R-7): its retention set, its
+/// name changed. The client names who: "you", the alias, or the fingerprint marked not in keyring.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomNoticeRow {
+    /// Its log entry's id.
+    pub id: String,
+    /// Who did it, base32.
+    pub author: String,
+    /// Their name in this node's keyring; empty when they are not in it.
+    pub author_name: String,
+    /// When, as its author's entry claims, milliseconds since the Unix epoch.
+    pub created_millis: u64,
+    /// What they did, without who, as the TUI says it: `set messages here to be kept for 1 week`.
+    pub what: String,
+    /// The id of the message it follows in the room's order, where it is drawn; empty before
+    /// every message.
+    pub after: String,
+}
+
 /// A share this node pulled by itself and verified (ADR-028 F-3, F-4).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PulledFile {
@@ -647,6 +813,26 @@ fn file_share(row: vox_core::node::shares::ShareRow) -> FileShare {
         entry: row.entry,
         fetched: row.fetched,
     }
+}
+
+/// Who reads whom in a room: both directions of trust, off the room's log.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomConsents {
+    /// The members this node consents to reading it, as fingerprints.
+    pub outbound: Vec<String>,
+    /// The members that consent to this node reading them, as fingerprints.
+    pub inbound: Vec<String>,
+}
+
+/// The node at a glance, as a client draws it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NodeView {
+    /// Its fingerprint, base32.
+    pub me: String,
+    /// How many peers it holds a connection to now.
+    pub peers: u32,
+    /// The keyring window, as the TUI's status bar says it (ADR-028 K-9).
+    pub keyring: String,
 }
 
 /// What the app hears from the node it acts as.
@@ -721,6 +907,16 @@ struct Held {
     /// The forwards this app made, by the address each is bound at: each on a connection of its
     /// own, which carries it until it is stopped or the node is let go of.
     forwards: HashMap<String, IpcClient>,
+    /// The family LANs this app runs, by room: each on a connection of its own, which runs it
+    /// until it is stopped or the node is let go of.
+    lans: HashMap<Digest32, Lan>,
+}
+
+/// A family LAN the app runs: dropping `stop` closes its connection, and the daemon takes the LAN
+/// down.
+struct Lan {
+    stop: tokio::sync::oneshot::Sender<()>,
+    said: Arc<Mutex<Vec<String>>>,
 }
 
 type Slot = Arc<tokio::sync::Mutex<Option<Held>>>;
@@ -736,6 +932,10 @@ pub struct VoxClient {
     data_root: PathBuf,
     config_dir: PathBuf,
     held: Slot,
+    /// A connection to the daemon, kept while the client lives: a daemon a client started exits
+    /// once no node is attached and no client is connected (ADR-026 L-8), and the app is its
+    /// client from the moment it opens, before any node is attached.
+    daemon_hold: Mutex<Option<DaemonClient>>,
 }
 
 /// A failure to reach the daemon, said for a person.
@@ -832,9 +1032,10 @@ fn shown_name(s: &str) -> String {
     vox_agentcomms::envelope::reveal_keeping(s, |_| false)
 }
 
-fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>) -> RoomMessage {
+fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>, me: Option<&str>) -> RoomMessage {
+    use vox_agentcomms::attention::{unread_level, UnreadLevel as L};
     let reveal = |s: &str| vox_agentcomms::envelope::reveal_keeping(s, |c| c == '\n' || c == '\t');
-    let (kind, text, to, re, urgent, image, card) =
+    let (kind, text, to, re, urgent, file, image, card) =
         match vox_agentcomms::envelope::Envelope::parse(&row.text) {
             Ok(env) => (
                 shown_name(&env.kind),
@@ -842,6 +1043,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>) -> RoomMessage 
                 env.to.iter().map(|t| shown_name(t)).collect(),
                 env.re.as_deref().map(shown_name).unwrap_or_default(),
                 env.urgent,
+                file_offer(&env),
                 image_of(&env),
                 card_of(&env),
             ),
@@ -851,6 +1053,7 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>) -> RoomMessage 
                 Vec::new(),
                 String::new(),
                 false,
+                None,
                 None,
                 None,
             ),
@@ -867,9 +1070,31 @@ fn rendered(row: &MessageRow, names: &HashMap<Digest32, String>) -> RoomMessage 
         urgent,
         late: row.late,
         owed: row.owed,
+        level: match unread_level(&row.text, me) {
+            L::ToYou => UnreadLevel::ToYou,
+            L::New => UnreadLevel::New,
+            L::Coordination => UnreadLevel::Coordination,
+        },
+        file,
         image,
         card,
     }
+}
+
+/// The file a `file` envelope offers, from the fields its sharer's daemon filled in.
+fn file_offer(env: &vox_agentcomms::envelope::Envelope) -> Option<FileOffer> {
+    if env.kind != vox_core::node::shares::FILE {
+        return None;
+    }
+    let d = &env.data;
+    let text = |k: &str| d.get(k).and_then(|v| v.as_str()).map(shown_name);
+    Some(FileOffer {
+        name: text("name")?,
+        size: d.get("size").and_then(|v| v.as_u64())?,
+        sha256: text("sha256")?,
+        folder: text("kind").as_deref() == Some("folder"),
+        note: text("note").unwrap_or_default(),
+    })
 }
 
 /// The keyring's names, by fingerprint. A read: the node checks no passphrase.
@@ -1010,6 +1235,66 @@ impl VoxClient {
             .map(|r| r.0)
             .collect())
     }
+
+    /// `room` as the node's snapshot holds it, and the names it knows: `None` when the room is
+    /// not open.
+    async fn open_snap(
+        &self,
+        room: &str,
+    ) -> Result<
+        (
+            Option<vox_core::node::snapshot::OpenRoomSnap>,
+            HashMap<Digest32, String>,
+        ),
+        VoxError,
+    > {
+        let channel_id = digest(room, "room id")?;
+        let body = vox_core::node::snapshot::request_body();
+        let (reply, names) = on_held!(self, |c| {
+            let names = names(c).await?;
+            let reply = c
+                .exchange(&body)
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            Ok((reply, names))
+        })?;
+        let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
+            return Err(failed(
+                "the vox daemon did not answer with the node's state",
+            ));
+        };
+        Ok((
+            snap.open.into_iter().find(|o| o.channel_id == channel_id),
+            names,
+        ))
+    }
+
+    /// One of the node's marks on its own entries in `room`, from one snapshot: each entry's id
+    /// and the sorted names of the members `pick` lists for it, entries with none left out.
+    async fn own_marks(
+        &self,
+        room: String,
+        pick: fn(vox_core::node::snapshot::OpenRoomSnap) -> Vec<(Digest32, Vec<Digest32>)>,
+    ) -> Result<Vec<(String, Vec<String>)>, VoxError> {
+        let (open, names) = self.open_snap(&room).await?;
+        let name = |fp: &Digest32| {
+            names
+                .get(fp)
+                .cloned()
+                .unwrap_or_else(|| b32_encode(fp).chars().take(12).collect())
+        };
+        Ok(open
+            .map(pick)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, who)| !who.is_empty())
+            .map(|(entry, who)| {
+                let mut names: Vec<String> = who.iter().map(name).collect();
+                names.sort();
+                (b32_encode(&entry), names)
+            })
+            .collect())
+    }
 }
 
 #[uniffi::export]
@@ -1033,14 +1318,14 @@ impl VoxClient {
             Account::of(root.as_deref(), None).map_err(|e| failed(format!("data root: {e}")))?;
         let socket = account.socket();
         let probe = socket.clone();
-        rt.spawn(async move {
-            DaemonClient::open(&probe)
-                .await
-                .map(drop)
-                .map_err(|e| said(&probe, e))
-        })
-        .await
-        .map_err(|_| failed("the app's vox runtime stopped"))??;
+        let hold = rt
+            .spawn(async move {
+                DaemonClient::open(&probe)
+                    .await
+                    .map_err(|e| said(&probe, e))
+            })
+            .await
+            .map_err(|_| failed("the app's vox runtime stopped"))??;
         Ok(Arc::new(Self {
             runtime: Mutex::new(Some(runtime)),
             rt,
@@ -1048,7 +1333,15 @@ impl VoxClient {
             data_root: account.data_root.clone(),
             config_dir: account.config_dir.clone(),
             held: Arc::new(tokio::sync::Mutex::new(None)),
+            daemon_hold: Mutex::new(Some(hold)),
         }))
+    }
+
+    /// The account's config directory, where an app keeps its own settings beside vox's
+    /// (`VOX_CONFIG_DIR` when set).
+    #[must_use]
+    pub fn config_dir(&self) -> String {
+        self.config_dir.to_string_lossy().into_owned()
     }
 
     /// The nodes on this machine, as the daemon lists them.
@@ -1116,10 +1409,47 @@ impl VoxClient {
                 client,
                 at: at.attached_only(),
                 forwards: HashMap::new(),
+                lans: HashMap::new(),
             });
             Ok(me)
         })
         .await
+    }
+
+    /// Attach `node` so that it stays attached when the app quits, and again whenever the daemon
+    /// starts (ADR-014 M-6, ADR-028 K-10): with `passphrase`, the daemon stores it in the login
+    /// keychain and reads it from there at its next start; with none, for a node that needs none,
+    /// nothing is stored. The node must not be attached already, so a passphrase is stored only
+    /// once it has attached the node. Then [`VoxClient::attach`] acts as it.
+    ///
+    /// # Errors
+    /// The daemon's refusal (a wrong passphrase, the node already attached), or the node attached
+    /// but not kept, with why.
+    pub async fn keep(
+        &self,
+        node: String,
+        passphrase: Option<Arc<Passphrase>>,
+    ) -> Result<(), VoxError> {
+        let name = NodeName::parse(&node).map_err(|e| failed(e.to_string()))?;
+        let keep = if passphrase.is_some() {
+            KeepSource::Keychain(String::new())
+        } else {
+            KeepSource::None
+        };
+        let req = DaemonRequest::Attach {
+            node: name,
+            passphrase: passphrase.as_ref().map(|p| p.copy()),
+            keep: Some(keep),
+            rooms: Vec::new(),
+            anchors: Vec::new(),
+        };
+        match self.daemon(req).await? {
+            DaemonFrame::Attached(info, _) if info.keep => Ok(()),
+            DaemonFrame::Attached(_, notes) => Err(failed(notes.join("; "))),
+            _ => Err(failed(format!(
+                "the vox daemon did not say node {node} is kept"
+            ))),
+        }
     }
 
     /// Stop holding the node: the daemon detaches it unless it is kept or held by another client.
@@ -1163,6 +1493,18 @@ impl VoxClient {
     /// Stop: release the node and end the client's work. The object is unusable afterwards.
     pub async fn close(&self) {
         self.release().await;
+        let hold = self
+            .daemon_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        // Dropped on the runtime its connection belongs to.
+        let _ = self
+            .on_rt(async move {
+                drop(hold);
+                Ok(())
+            })
+            .await;
         if let Some(rt) = self
             .runtime
             .lock()
@@ -1229,6 +1571,7 @@ impl VoxClient {
         };
         on_held!(self, |c| {
             let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
             match ask(
                 c,
                 &Request::Read {
@@ -1240,7 +1583,10 @@ impl VoxClient {
             )
             .await?
             {
-                Frame::Rows { rows } => Ok(rows.iter().map(|r| rendered(r, &names)).collect()),
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .map(|r| rendered(r, &names, me.as_deref()))
+                    .collect()),
                 other => Err(unexpected(&other)),
             }
         })
@@ -1418,6 +1764,53 @@ impl VoxClient {
         on_held!(self, |c| done(c, &Request::End { channel_id }).await)
     }
 
+    /// Keep `room`'s message bodies for `ttl_secs` seconds (0: forever), as
+    /// `vox room retention` does (ADR-023 decision 2); its creator or an admin only. No
+    /// passphrase (ADR-028 K-11): the room's governance says who may.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (not the creator or an admin).
+    pub async fn set_retention(&self, room: String, ttl_secs: u64) -> Result<(), VoxError> {
+        let req = Request::SetRetention {
+            channel_id: digest(&room, "room id")?,
+            ttl: ttl_secs,
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// `room`'s admins, its creator first, as fingerprints.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (the room not open).
+    pub async fn admins(&self, room: String) -> Result<Vec<String>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::Admins { channel_id }).await? {
+                Frame::Members { members } => Ok(members.iter().map(b32_encode).collect()),
+                other => Err(unexpected(&other)),
+            }
+        )
+    }
+
+    /// Make `member` an admin of `room`, or (`admin` false) take it back; its creator only.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal.
+    pub async fn set_admin(
+        &self,
+        room: String,
+        member: String,
+        admin: bool,
+    ) -> Result<(), VoxError> {
+        let req = Request::SetAdmin {
+            channel_id: digest(&room, "room id")?,
+            member: digest(&member, "member's fingerprint")?,
+            admin,
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
     /// Trust `fingerprint` under `name`. The identity passphrase is needed unless one was given
     /// for a keyring change within the keyring window; attaching opens no window (ADR-028 K-12).
     ///
@@ -1569,6 +1962,25 @@ impl VoxClient {
     /// A malformed id, or the node's refusal.
     pub async fn services(&self, room: String) -> Result<RoomServices, VoxError> {
         let channel_id = digest(&room, "room id")?;
+        // Whether the `.vox` proxy runs, for the needs of ssh by address and of a URL, asked as
+        // `vox service list` asks it.
+        let held = Arc::clone(&self.held);
+        let proxy = self
+            .on_rt(async move {
+                let at = held
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|h| h.at.clone())
+                    .ok_or_else(not_attached)?;
+                Ok(vox_core::node::nameipc::proxy(&at)
+                    .await
+                    .map_err(|e| match e {
+                        Error::AppRefused(reason) => reason,
+                        other => other.to_string(),
+                    }))
+            })
+            .await?;
         on_held!(
             self,
             |c| match ask(c, &Request::Services { channel_id }).await? {
@@ -1580,12 +1992,30 @@ impl VoxClient {
                     room: shown_name(&room),
                     shared: shared
                         .into_iter()
-                        .map(|s| SharedService {
-                            address: shown_name(&s.address),
-                            canonical: s.canonical,
-                            by: shown_name(&s.by),
-                            udp: s.udp,
-                            kind: shown_name(&s.kind),
+                        .map(|s| {
+                            use vox_core::node::service_reach::{commands, needs};
+                            SharedService {
+                                commands: commands(&s)
+                                    .into_iter()
+                                    .map(|(what, command)| ServiceCommand {
+                                        what: what.to_owned(),
+                                        command,
+                                    })
+                                    .collect(),
+                                needs: needs(&s, Some(&proxy))
+                                    .into_iter()
+                                    .map(|(need, holds, otherwise)| ServiceNeed {
+                                        need: shown_name(&need),
+                                        holds,
+                                        otherwise: shown_name(&otherwise),
+                                    })
+                                    .collect(),
+                                address: shown_name(&s.address),
+                                canonical: s.canonical,
+                                by: shown_name(&s.by),
+                                udp: s.udp,
+                                kind: shown_name(&s.kind),
+                            }
                         })
                         .collect(),
                     offered: services
@@ -2068,6 +2498,64 @@ impl VoxClient {
         })
     }
 
+    /// This node's decision record, newest first (ADR-028 §7, D-1, D-2): every day's file it
+    /// keeps (14 days), read from `nodes/<node>/decisions/`, as the TUI's Decisions screen reads
+    /// it. A line that does not parse is left out.
+    ///
+    /// # Errors
+    /// No node attached, or the data root cannot be found.
+    pub async fn decisions(&self) -> Result<Vec<DecisionEvent>, VoxError> {
+        let held = Arc::clone(&self.held);
+        let (data_root, config_dir) = (self.data_root.clone(), self.config_dir.clone());
+        self.on_rt(async move {
+            let node = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.node.clone())
+                .ok_or_else(not_attached)?;
+            let account = Account::of(Some(&data_root), Some(&config_dir))
+                .map_err(|e| failed(format!("data root: {e}")))?;
+            let dir = account
+                .node_dir(&node)
+                .join(vox_core::node::decisions::DECISIONS_DIR);
+            let Ok(days) = std::fs::read_dir(&dir) else {
+                return Ok(Vec::new());
+            };
+            let text = |v: &serde_json::Value, k: &str| {
+                v.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .map(shown_name)
+                    .unwrap_or_default()
+            };
+            let mut events: Vec<DecisionEvent> = days
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+                .filter_map(|p| std::fs::read_to_string(p).ok())
+                .flat_map(|day| {
+                    day.lines()
+                        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|v| {
+                    Some(DecisionEvent {
+                        at_millis: v.get("at_ms")?.as_u64()?,
+                        asked: text(&v, "asked"),
+                        by: text(&v, "by"),
+                        alias: text(&v, "alias"),
+                        decided: text(&v, "decided"),
+                        why: text(&v, "why"),
+                        room: text(&v, "room"),
+                    })
+                })
+                .collect();
+            events.sort_by(|a, b| b.at_millis.cmp(&a.at_millis));
+            Ok(events)
+        })
+        .await
+    }
+
     /// What this node pulled by itself in `room` and verified, oldest first, each where `vox room
     /// get` puts it: `<data root>/nodes/<node>/files/<room>/`.
     ///
@@ -2122,6 +2610,306 @@ impl VoxClient {
                 .map_err(|e| failed(format!("the node did not report: {e}")))
         })
         .await
+    }
+
+    /// The node at a glance: who it is and how many peers it is connected to.
+    ///
+    /// # Errors
+    /// No node attached, or the daemon's refusal.
+    pub async fn view(&self) -> Result<NodeView, VoxError> {
+        let body = vox_core::node::snapshot::request_body();
+        let reply = on_held!(self, |c| c
+            .exchange(&body)
+            .await
+            .map_err(|e| failed(format!("the vox daemon stopped answering: {e}"))))?;
+        match vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) {
+            Ok(Some(s)) => Ok(NodeView {
+                me: s.me.map(|m| b32_encode(&m)).unwrap_or_default(),
+                peers: u32::try_from(s.connected_peers.len()).unwrap_or(u32::MAX),
+                keyring: vox_core::node::snapshot::keyring_label(s.keyring_open_secs),
+            }),
+            Ok(None) => match Frame::from_bytes(&reply) {
+                Ok(frame) => Err(answered(frame).err().unwrap_or_else(|| {
+                    failed("the vox daemon did not answer with the node's state")
+                })),
+                Err(e) => Err(failed(format!("the vox daemon's answer did not read: {e}"))),
+            },
+            Err(e) => Err(failed(format!("the vox daemon's answer did not read: {e}"))),
+        }
+    }
+
+    /// Who reads whom in a room (ADR-028 L-4: a member in the keyring that consents back is
+    /// shown ⇄).
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal.
+    pub async fn consents(&self, room: String) -> Result<RoomConsents, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(
+            self,
+            |c| match ask(c, &Request::Consents { channel_id }).await? {
+                Frame::Consents { outbound, inbound } => Ok(RoomConsents {
+                    outbound: outbound.iter().map(b32_encode).collect(),
+                    inbound: inbound.iter().map(b32_encode).collect(),
+                }),
+                other => Err(unexpected(&other)),
+            }
+        )
+    }
+
+    /// Bring this Mac onto `room`'s family LAN (ADR-013), as `vox lan up` does: the daemon asks the
+    /// root helper for the interface and runs the LAN until [`Self::lan_down`] or the node is let
+    /// go of. `allow` are the local ports members may reach over it; none by default. The root
+    /// helper is asked on `helper_socket` (empty: where Vox.app's helper listens). Answers the
+    /// daemon's first line, once the LAN is up: the interface and this node's LAN addresses.
+    ///
+    /// # Errors
+    /// A malformed id, the room not open, the helper not running or refusing, or the LAN not
+    /// started, with why.
+    pub async fn lan_up(
+        &self,
+        room: String,
+        allow: Vec<u16>,
+        helper_socket: String,
+    ) -> Result<String, VoxError> {
+        use vox_core::node::lan_request::{LanRequest, LanSaid, DEFAULT_HELPER_SOCKET};
+        let channel_id = digest(&room, "room id")?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let at = held
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.at.clone())
+                .ok_or_else(not_attached)?;
+            let (mut stream, _) = vox_core::node::ipc::open_as(&at)
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            let req = LanRequest {
+                channel_id,
+                helper: PathBuf::from(if helper_socket.is_empty() {
+                    DEFAULT_HELPER_SOCKET
+                } else {
+                    &helper_socket
+                }),
+                stats_file: None,
+                allow: allow.into_iter().collect(),
+            };
+            vox_core::node::ipc::write_frame(&mut stream, &req.to_bytes())
+                .await
+                .map_err(|e| failed(format!("the vox daemon stopped answering: {e}")))?;
+            let first = match vox_core::node::ipc::read_frame(&mut stream).await {
+                Ok(Some(body)) => match LanSaid::parse(&body) {
+                    Some(LanSaid::Said(line)) => line,
+                    Some(LanSaid::Failed(why)) => return Err(failed(why)),
+                    None => match Frame::from_bytes(&body) {
+                        Ok(Frame::Error { reason }) => return Err(failed(reason)),
+                        _ => {
+                            return Err(failed(
+                                "the vox daemon answered the LAN with something else",
+                            ))
+                        }
+                    },
+                },
+                _ => return Err(failed("the vox daemon closed the LAN before it was up")),
+            };
+            let said = Arc::new(Mutex::new(vec![first.clone()]));
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            // The LAN's lines, kept for `lan_said`, until it is stopped or the daemon ends it.
+            let lines = Arc::clone(&said);
+            tokio::spawn(async move {
+                tokio::pin!(stopped);
+                loop {
+                    tokio::select! {
+                        _ = &mut stopped => break,
+                        frame = vox_core::node::ipc::read_frame(&mut stream) => {
+                            let line = match frame {
+                                Ok(Some(body)) => match LanSaid::parse(&body) {
+                                    Some(LanSaid::Said(l)) => l,
+                                    Some(LanSaid::Failed(why)) => format!("the LAN stopped: {why}"),
+                                    None => continue,
+                                },
+                                _ => "the LAN stopped: the vox daemon closed it".to_owned(),
+                            };
+                            let end = line.starts_with("the LAN stopped");
+                            lines.lock().unwrap_or_else(PoisonError::into_inner).push(line);
+                            if end {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Closing the connection takes the LAN down.
+                drop(stream);
+            });
+            match held.lock().await.as_mut() {
+                Some(h) => {
+                    h.lans.insert(channel_id, Lan { stop, said });
+                    Ok(first)
+                }
+                None => Err(not_attached()),
+            }
+        })
+        .await
+    }
+
+    /// Take `room`'s family LAN down: its interface goes with it.
+    ///
+    /// # Errors
+    /// A malformed id, or no LAN of this app's runs for that room.
+    pub async fn lan_down(&self, room: String) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            let lan = held
+                .lock()
+                .await
+                .as_mut()
+                .ok_or_else(not_attached)?
+                .lans
+                .remove(&channel_id);
+            match lan {
+                Some(lan) => {
+                    let _ = lan.stop.send(());
+                    Ok(())
+                }
+                None => Err(failed("this app runs no LAN for that room")),
+            }
+        })
+        .await
+    }
+
+    /// What `room`'s family LAN has said, oldest first, as `vox lan up` prints it; empty when
+    /// this app runs none there.
+    ///
+    /// # Errors
+    /// A malformed id.
+    pub async fn lan_said(&self, room: String) -> Result<Vec<String>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let held = Arc::clone(&self.held);
+        self.on_rt(async move {
+            Ok(held
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|h| h.lans.get(&channel_id))
+                .map(|l| {
+                    l.said
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone()
+                })
+                .unwrap_or_default())
+        })
+        .await
+    }
+
+    /// Who has read this node's own recent messages in `room` (ADR-028 R-6), from the read
+    /// records the node can open, as `vox room read --json` says it: a member whose records it
+    /// cannot open is in none.
+    ///
+    /// # Errors
+    /// A malformed id, or the daemon's refusal.
+    pub async fn read_by(&self, room: String) -> Result<Vec<ReadBy>, VoxError> {
+        Ok(self
+            .own_marks(room, |o| o.read_by)
+            .await?
+            .into_iter()
+            .map(|(id, names)| ReadBy { id, names })
+            .collect())
+    }
+
+    /// What was done to `room`, in the room's order, as the TUI says it among the messages
+    /// (ADR-028 R-1, R-7): who set its retention, who renamed it, and the message each follows.
+    ///
+    /// # Errors
+    /// A malformed id, the room not open, or the daemon's refusal.
+    pub async fn notices(&self, room: String) -> Result<Vec<RoomNoticeRow>, VoxError> {
+        let (open, names) = self.open_snap(&room).await?;
+        let Some(open) = open else {
+            return Err(failed("the room is not open on this node"));
+        };
+        Ok(open
+            .notices
+            .into_iter()
+            .map(|n| RoomNoticeRow {
+                id: b32_encode(&n.entry_hash),
+                author: b32_encode(&n.author),
+                author_name: names.get(&n.author).cloned().unwrap_or_default(),
+                created_millis: n.created_millis,
+                what: n.what,
+                after: n.after.map(|a| b32_encode(&a)).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// How long `room` keeps messages here, as a person reads it ("1 week", "forever"), as the
+    /// TUI's timeline title says it (ADR-028 R-7).
+    ///
+    /// # Errors
+    /// A malformed id, the room not open, or the daemon's refusal.
+    pub async fn retention(&self, room: String) -> Result<String, VoxError> {
+        match self.open_snap(&room).await?.0 {
+            Some(open) => Ok(vox_core::node::retention::describe(open.retention)),
+            None => Err(failed("the room is not open on this node")),
+        }
+    }
+
+    /// Who has pulled this node's own shares in `room` whole and verified them (ADR-028 F-7), from
+    /// the daemon's record of completed fetches, as `vox room read` says "pulled by": a fetch cut
+    /// short is in none.
+    ///
+    /// # Errors
+    /// A malformed id, or the daemon's refusal.
+    pub async fn pulled_by(&self, room: String) -> Result<Vec<PulledBy>, VoxError> {
+        Ok(self
+            .own_marks(room, |o| o.pulled_by)
+            .await?
+            .into_iter()
+            .map(|(id, names)| PulledBy { id, names })
+            .collect())
+    }
+
+    /// What this node's person has not read in `room`, oldest first (ADR-028 R-8): the messages
+    /// after the newest one the node recorded as read, by someone else. A client counts its unread
+    /// from these when it starts, then from the node's events.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (the room not open).
+    pub async fn unread(&self, room: String) -> Result<Vec<RoomMessage>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            let me = c.me().map(|f| b32_encode(&f));
+            match ask(c, &Request::Unread { channel_id }).await? {
+                Frame::Rows { rows } => Ok(rows
+                    .iter()
+                    .map(|r| rendered(r, &names, me.as_deref()))
+                    .collect()),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// The messages `ids` in `room` were shown to the person: the node records them read, and
+    /// its read records tell the room's members (ADR-028 R-6), as the TUI does for what it draws.
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (a room left or ended).
+    pub async fn mark_read(&self, room: String, ids: Vec<String>) -> Result<(), VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in &ids {
+            entries.push(digest(id, "message id")?);
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let req = Request::MarkRead {
+            channel_id,
+            entries,
+        };
+        on_held!(self, |c| done(c, &req).await)
     }
 
     /// Deliver the held node's events to `listener` until it is detached or the daemon stops.
@@ -2272,8 +3060,9 @@ async fn follow(
                     }
                 };
                 let names = names(&mut h.client).await.unwrap_or_default();
+                let me = h.client.me().map(|f| b32_encode(&f));
                 rows.iter()
-                    .map(|r| (r.clone(), rendered(r, &names)))
+                    .map(|r| (r.clone(), rendered(r, &names, me.as_deref())))
                     .collect::<Vec<_>>()
             };
             if let Some(newest) = rows
