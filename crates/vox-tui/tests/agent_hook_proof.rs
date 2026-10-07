@@ -1792,7 +1792,9 @@ fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accep
     };
     println!("[proof] (1) alice's agent's turn {turn}: {shown:?}");
     assert!(
-        shown.contains(&accept) && shown.contains("typing the passphrase in a terminal"),
+        shown.contains("Vox offers your node these nodes to trust (")
+            && shown.contains(&accept)
+            && shown.contains("typing the passphrase in a terminal"),
         "PRODUCT: bob joined alice's room and is offered to her keyring, so her agent's turn must \
          show the offer with the command her operator types outside the session ({accept:?}) \
          (ADR-028 K-19); within 90 s it showed:\n{shown}"
