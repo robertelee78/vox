@@ -93,6 +93,8 @@ struct Inner {
     connections: Arc<std::sync::atomic::AtomicUsize>,
     /// The daemon's `.vox` proxy, run while any node is attached (ADR-028 S-5).
     proxy: Option<Arc<crate::daemon_proxy::DaemonProxy>>,
+    /// Each node's joins of its sessions' rooms under way (ADR-029 RB-3).
+    joins: Mutex<BTreeMap<NodeName, Arc<vox_core::node::room_join::Joins>>>,
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -241,6 +243,7 @@ impl Router {
                 unfinished_stop: AtomicBool::new(false),
                 connections: Arc::default(),
                 proxy,
+                joins: Mutex::default(),
             }),
         };
         router.follow_attached_with_the_proxy();
@@ -402,7 +405,16 @@ impl Router {
         session: crate::wake::Session,
         passphrase: Option<Zeroizing<String>>,
         anchors: Vec<String>,
-    ) -> Result<NodeInfo, Refusal> {
+        join: Option<(String, Zeroizing<String>)>,
+    ) -> Result<DaemonFrame, Refusal> {
+        // Whether this node knew the session before this turn: its registration on disk.
+        let known = self
+            .inner
+            .account
+            .node_paths(node)
+            .is_ok_and(|p| p.session_file(&session.session).is_file());
+        let id = session.session.clone();
+        let asked = session.room.clone();
         let g = self
             .want(
                 node,
@@ -412,7 +424,143 @@ impl Router {
                 anchors,
             )
             .await?;
-        Ok(g.info)
+        let handle = self.handle_of(node);
+        // A room the hook named by a prefix of its id is resolved against the node's rooms, now
+        // that the node is attached, and kept by its whole id.
+        if let (Some(h), Ok(paths)) = (handle.as_ref(), self.inner.account.node_paths(node)) {
+            let named = crate::wake::registration(&paths, &id).and_then(|r| r.room);
+            if let Some(prefix) =
+                named.filter(|r| vox_core::node::link::b32_decode(r, "room").is_err())
+            {
+                let whole: Vec<String> = h
+                    .view()
+                    .channels
+                    .iter()
+                    .map(|c| vox_core::node::link::b32_encode(&c.channel_id))
+                    .filter(|c| c.starts_with(prefix.trim()))
+                    .collect();
+                if let [one] = whole.as_slice() {
+                    crate::wake::store_room(&paths, &id, one);
+                }
+            }
+        }
+        // The record as stored: the room a session works in is kept for its life (RB-4).
+        let stored = self
+            .inner
+            .account
+            .node_paths(node)
+            .ok()
+            .and_then(|p| crate::wake::registration(&p, &id));
+        let room = stored.as_ref().and_then(|r| r.room.clone());
+        let mut joining = None;
+        // A join is for the room this turn named, and only when that is the session's room: a
+        // session keeps the room it started with (RB-4), so a later lookup joins nothing.
+        let join = join.filter(|_| asked.is_some() && asked == room);
+        if let (Some(handle), Some(reg)) = (handle.as_ref(), stored.as_ref()) {
+            joining = self.open_session(node, handle, reg, join).await;
+        }
+        // **New** is new to this node: no registration before, and no Session of it in any room
+        // its log holds, so a daemon restarted mid-session still knows it (ADR-029 RB-5).
+        let seen = handle.as_ref().is_some_and(|h| {
+            let me = h.view().identity.as_ref().map(|i| i.fingerprint);
+            h.view().open_channels.iter().any(|d| {
+                vox_core::node::sessions::fold(d)
+                    .iter()
+                    .any(|s| Some(s.node) == me && s.id == id)
+            })
+        });
+        Ok(DaemonFrame::SessionRegistered {
+            info: g.info,
+            room,
+            new: !known && !seen,
+            joining,
+        })
+    }
+
+    /// Open `reg`'s Session in its room (ADR-029 SE-1): at once when the node is a member, or once
+    /// a join from the room map (`join`) makes it one. A headless session gets none. What a join
+    /// under way says, for the session.
+    async fn open_session(
+        &self,
+        node: &NodeName,
+        handle: &vox_core::node::actor::NodeHandle,
+        reg: &crate::wake::Session,
+        join: Option<(String, Zeroizing<String>)>,
+    ) -> Option<String> {
+        let room_b32 = reg.room.as_ref()?;
+        if !reg.interactive {
+            return None;
+        }
+        let room = vox_core::node::link::b32_decode(room_b32, "room").ok()?;
+        let opening = vox_core::node::sessions::Opening {
+            id: reg.session.clone(),
+            harness: reg.harness.clone(),
+            name: reg.name.clone(),
+        };
+        let member = handle.view().channels.iter().any(|c| c.channel_id == room);
+        let joins = Arc::clone(lock(&self.inner.joins).entry(node.clone()).or_default());
+        if member {
+            joins.set_status(room_b32, None);
+            if let Err(e) = vox_core::node::sessions::open_when_member(handle, room, &opening).await
+            {
+                return Some(format!(
+                    "could not open this session's Session in its room: {e}"
+                ));
+            }
+            return None;
+        }
+        if let Some((link, passphrase)) = join {
+            vox_core::node::room_join::join_in_background(
+                handle, &joins, room_b32, &link, passphrase, opening,
+            );
+        }
+        joins.status(room_b32)
+    }
+
+    /// Move `session` of `node` to `room` (ADR-029 RB-5): its Session ends in the room it worked in,
+    /// and one opens in `room`.
+    ///
+    /// # Errors
+    /// The [`Refusal`] the caller is told.
+    pub async fn session_room(
+        &self,
+        node: &NodeName,
+        session: &str,
+        room: &str,
+    ) -> Result<DaemonFrame, Refusal> {
+        let failed = |why: String| Refusal::Failed {
+            node: node.clone(),
+            why,
+        };
+        let paths = self
+            .inner
+            .account
+            .node_paths(node)
+            .map_err(|e| failed(e.to_string()))?;
+        let handle = self
+            .handle_of(node)
+            .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?;
+        vox_core::node::link::b32_decode(room, "room").map_err(|e| failed(e.to_string()))?;
+        let before = crate::wake::store_room(&paths, session, room)
+            .ok_or_else(|| failed(format!("no session {session} is registered")))?;
+        if let Some(old) = before.filter(|old| old != room) {
+            if let Ok(old) = vox_core::node::link::b32_decode(&old, "room") {
+                let _ = vox_core::node::sessions::end(&handle, old, session, "moved").await;
+            }
+        }
+        let reg = crate::wake::registration(&paths, session)
+            .ok_or_else(|| failed(format!("no session {session} is registered")))?;
+        let joining = self.open_session(node, &handle, &reg, None).await;
+        Ok(DaemonFrame::SessionRegistered {
+            info: self
+                .nodes()
+                .into_iter()
+                .find(|n| n.name == *node)
+                .ok_or_else(|| Refusal::NotAttached { node: node.clone() })?,
+            room: Some(room.to_owned()),
+            new: false,
+            joining,
+        })
     }
 
     /// Unregister an agent session of `node`, and detach the node if it was attached implicitly
@@ -421,7 +569,22 @@ impl Router {
     /// moment either comes first (and the node stays) or finds the node detaching and waits.
     ///
     /// Returns whether the session was registered, and whether the node detached.
-    pub async fn session_end(&self, node: &NodeName, session: &str) -> (bool, bool) {
+    pub async fn session_end(&self, node: &NodeName, session: &str, reason: &str) -> (bool, bool) {
+        // **A resume is not an end** (ADR-029 SE-4): the session goes on, registered, its Session
+        // open.
+        if vox_core::node::sessions::keeps_open(reason) {
+            return (true, false);
+        }
+        // Its Session ends first, while the node is still attached to say so.
+        if let (Some(handle), Ok(paths)) =
+            (self.handle_of(node), self.inner.account.node_paths(node))
+        {
+            let room = crate::wake::registration(&paths, session).and_then(|r| r.room);
+            if let Some(room) = room.and_then(|r| vox_core::node::link::b32_decode(&r, "room").ok())
+            {
+                let _ = vox_core::node::sessions::end(&handle, room, session, reason).await;
+            }
+        }
         let going = {
             let mut slots = lock(&self.inner.slots);
             match slots.get_mut(node) {
@@ -1174,6 +1337,7 @@ impl Dispatch for Router {
                 record,
                 passphrase,
                 anchors,
+                join,
             } => {
                 let record = match serde_json::from_str::<crate::wake::Session>(&record) {
                     Ok(r) if r.session == session => r,
@@ -1186,15 +1350,27 @@ impl Dispatch for Router {
                     }
                 };
                 match self
-                    .session_register(&node, record, passphrase, anchors)
+                    .session_register(&node, record, passphrase, anchors, join)
                     .await
                 {
-                    Ok(info) => DaemonFrame::Attached(info, Vec::new()),
+                    Ok(frame) => frame,
                     Err(r) => refused(r),
                 }
             }
-            DaemonRequest::SessionEnd { node, session } => {
-                let (was_registered, detached) = self.session_end(&node, &session).await;
+            DaemonRequest::SessionRoom {
+                node,
+                session,
+                room,
+            } => match self.session_room(&node, &session, &room).await {
+                Ok(frame) => frame,
+                Err(r) => refused(r),
+            },
+            DaemonRequest::SessionEnd {
+                node,
+                session,
+                reason,
+            } => {
+                let (was_registered, detached) = self.session_end(&node, &session, &reason).await;
                 DaemonFrame::SessionEnded {
                     was_registered,
                     detached,
@@ -1449,7 +1625,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let r = router(account(dir.path(), &["agent", "person"]).await);
             let s = crate::wake::Session::from_env("s-1", true);
-            r.session_register(&n("agent"), s, pass(), Vec::new())
+            r.session_register(&n("agent"), s, pass(), Vec::new(), None)
                 .await
                 .expect("PRODUCT: register");
             let lease = r.use_node(hold("agent")).await.unwrap();
@@ -1460,7 +1636,7 @@ mod tests {
                 NodeState::Attached,
                 "PRODUCT: a registered session did not hold its node"
             );
-            let (was, detached) = r.session_end(&n("agent"), "s-1").await;
+            let (was, detached) = r.session_end(&n("agent"), "s-1", "").await;
             assert!(was && detached, "PRODUCT: end said {was} {detached}");
             assert_eq!(state(&r, "agent"), NodeState::Detached);
 
@@ -1468,10 +1644,10 @@ mod tests {
                 .await
                 .unwrap();
             let s = crate::wake::Session::from_env("s-2", true);
-            r.session_register(&n("person"), s, None, Vec::new())
+            r.session_register(&n("person"), s, None, Vec::new(), None)
                 .await
                 .unwrap();
-            let (_, detached) = r.session_end(&n("person"), "s-2").await;
+            let (_, detached) = r.session_end(&n("person"), "s-2", "").await;
             assert!(
                 !detached,
                 "PRODUCT: a node attached by hand detached with a session"

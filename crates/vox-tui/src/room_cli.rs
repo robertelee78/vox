@@ -1431,6 +1431,67 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
     }
 }
 
+/// `vox room sessions` — the room's Sessions (ADR-029 SE-3, SE-5): open ones first, then the
+/// ended ones apart, each labelled as every client labels it
+/// ([`vox_agentcomms::envelope::session_label`]): this node's name for the session's node, the
+/// session's name and its short id. With `--json`, one object per Session.
+///
+/// # Errors
+/// If the node cannot be reached, or the room is unknown or not open.
+pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    crate::ident::load_names(&mut client).await;
+    let rows = match client.request(&Request::Sessions { channel_id }).await {
+        Ok(Frame::Sessions { sessions }) => sessions,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let label = |s: &vox_core::node::sessions::SessionRow| {
+        vox_agentcomms::envelope::session_label(
+            &crate::ident::name_of(&s.node),
+            s.name.as_deref(),
+            &s.id,
+        )
+    };
+    if json {
+        for s in &rows {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "node": id(&s.node),
+                    "id": s.id,
+                    "name": s.name,
+                    "harness": s.harness,
+                    "label": label(s),
+                    "open": s.open,
+                    "opened_millis": s.opened_millis,
+                    "ended_millis": s.ended_millis,
+                    "can_drive": s.can_drive,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("(no Sessions in this room)");
+        return Ok(());
+    }
+    for s in rows.iter().filter(|s| s.open) {
+        println!("open   {}", label(s));
+    }
+    // **An ended Session is set apart** (SE-5), kept as long as the room keeps messages.
+    let ended: Vec<_> = rows.iter().filter(|s| !s.open).collect();
+    if !ended.is_empty() {
+        println!("ended:");
+        for s in ended {
+            println!("ended  {}", label(s));
+        }
+    }
+    Ok(())
+}
+
 /// `vox room tail` — every row after a cursor, then every row as it lands, **with no
 /// gap across a lag or a restart** (ADR-021 §7).
 ///

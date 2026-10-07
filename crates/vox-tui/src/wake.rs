@@ -92,6 +92,38 @@ pub struct Session {
     /// When its drain last ran, in Unix milliseconds: the last time it read its rooms.
     #[serde(default)]
     pub last_drained_ms: u64,
+    /// The room this session works in (ADR-029 §6), its id in base32; `None` for none. Kept for
+    /// the session's life once set (RB-4): a later registration without one never clears it, and
+    /// only `vox agent room` moves it (RB-5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
+    /// The session's current name, as its harness gives it (ADR-029 MD-1); `None` when it gives
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Whether a person is at the session (ADR-029 SE-1): a headless run (`claude -p`, an SDK,
+    /// `codex exec`) gets no Session.
+    #[serde(default = "interactive_by_default")]
+    pub interactive: bool,
+}
+
+/// A record written before Sessions said nothing of it: it was registered by a hook a person ran.
+fn interactive_by_default() -> bool {
+    true
+}
+
+/// Whether the harness this hook runs inside has a person at it (ADR-029 SE-1).
+///
+/// **Claude Code** sets `CLAUDE_CODE_ENTRYPOINT` for its hooks: `sdk-cli` for a non-interactive
+/// run (`claude -p`), `sdk-ts` / `sdk-py` for the Agent SDK, `cli` for a person at the terminal
+/// (read from Claude Code 2.1.292: `set("CLAUDE_CODE_ENTRYPOINT", e ? "sdk-cli" : "cli")`).
+/// Codex and OpenCode are taken as interactive until their own signals are measured.
+#[must_use]
+pub fn interactive_now() -> bool {
+    !matches!(
+        std::env::var("CLAUDE_CODE_ENTRYPOINT").as_deref(),
+        Ok("sdk-cli" | "sdk-ts" | "sdk-py")
+    )
 }
 
 /// How a registered session can be reached now (V030-16), as `vox agent doctor` and a pong
@@ -226,10 +258,22 @@ pub fn store(paths: &Paths, reg: &Session) {
     let session = session.as_str();
     // When the session was first seen outlives this turn's rewrite (V030-16).
     let now = now_millis();
-    reg.first_seen_ms = load(paths, session)
+    let earlier = load(paths, session);
+    reg.first_seen_ms = earlier
+        .as_ref()
         .map(|b| b.first_seen_ms)
         .filter(|&t| t != 0)
         .unwrap_or(now);
+    // **A session's room is the one it started with, for its life** (ADR-029 RB-4, RB-5): a
+    // session that started in no room stays in none, however it moves about later; only
+    // [`store_room`] (`vox agent room`) changes it. A record from before Sessions had no room to
+    // keep.
+    if let Some(b) = earlier
+        .as_ref()
+        .filter(|b| b.room.is_some() || b.first_seen_ms != 0)
+    {
+        reg.room.clone_from(&b.room);
+    }
     reg.last_drained_ms = now;
     let dir = paths.session_dir();
     if std::fs::create_dir_all(&dir).is_err() {
@@ -239,6 +283,19 @@ pub fn store(paths: &Paths, reg: &Session) {
         let _ =
             vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
     }
+}
+
+/// Move `session`'s registration to `room` (ADR-029 RB-5, `vox agent room`): the one way a
+/// session's room changes. `None` when the session is not registered; else the room it worked in
+/// before, if any.
+pub fn store_room(paths: &Paths, session: &str, room: &str) -> Option<Option<String>> {
+    let mut reg = load(paths, session)?;
+    let before = reg.room.replace(room.to_owned());
+    if let Ok(body) = serde_json::to_vec(&reg) {
+        let _ =
+            vox_core::node::paths::write_private_file_unique(&paths.session_file(session), &body);
+    }
+    Some(before)
 }
 
 impl Session {
@@ -257,6 +314,9 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                name: None,
+                interactive: interactive_now(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -271,6 +331,9 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                name: None,
+                interactive: interactive_now(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -285,6 +348,9 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                name: None,
+                interactive: interactive_now(),
             }
         } else {
             Session {
@@ -296,6 +362,9 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                room: None,
+                name: None,
+                interactive: interactive_now(),
             }
         }
     }
@@ -375,6 +444,12 @@ pub fn forget(paths: &Paths, session: &Session) -> bool {
 }
 
 /// `session`'s registration, if it has one.
+/// `session`'s registration as stored, if it is registered.
+#[must_use]
+pub fn registration(paths: &Paths, session: &str) -> Option<Session> {
+    load(paths, session)
+}
+
 fn load(paths: &Paths, session: &str) -> Option<Session> {
     let body = std::fs::read(paths.session_file(session)).ok()?;
     serde_json::from_slice(&body).ok()
