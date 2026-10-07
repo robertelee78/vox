@@ -1209,6 +1209,7 @@ impl NodeNet {
         let candidates_none = candidates.is_empty();
         let has_direct = !candidates_none;
         let (direct_failed, failed) = tokio::sync::watch::channel(candidates_none);
+        let (direct_won, won) = tokio::sync::watch::channel(false);
         if has_direct {
             let endpoint = Arc::clone(self.manager.endpoint());
             let now = self.now_ms();
@@ -1220,6 +1221,8 @@ impl NodeNet {
                 let result = connect_direct(endpoint, &candidates, peer, now).await;
                 if result.is_err() {
                     let _ = direct_failed.send(true);
+                } else {
+                    let _ = direct_won.send(true);
                 }
                 (label, result)
             });
@@ -1230,10 +1233,17 @@ impl NodeNet {
         // its anchor connection existed: no candidate, no helper, "no peer is connected to carry a
         // circuit" — and the forward's next attempt came 500 ms later (restarts of 556 and 617 ms
         // against V210-57's 150 ms). While a direct dial is under way anywhere in this node, a reach
-        // with no candidate and no helper waits for it, for at most [`DIRECT_HEAD_START`].
+        // with no helper waits for it, for at most [`DIRECT_HEAD_START`].
+        //
+        // **With a candidate too.** Its own direct rung may be to an address it can send to and
+        // never reach (behind a NAT), and only a helper can then carry the punch or the circuit: a
+        // `vox up` that reached its host before its anchor connection was up (65 ms in) had no
+        // helper, no dial-back and no circuit, and waited out its direct dial's 10 s, and every
+        // other reach to the host waited on it (6 of 10 cold first connections at 10.1 s, R42). Its
+        // direct rung runs meanwhile, and a win there ends the wait.
         let mut helpers = self.helpers(peer);
-        if candidates_none && helpers.is_empty() {
-            self.wait_for_a_helper(peer, started + DIRECT_HEAD_START)
+        if helpers.is_empty() {
+            self.wait_for_a_helper(peer, started + DIRECT_HEAD_START, &|| *won.borrow())
                 .await;
             if let Some(conn) = self.manager.existing(&peer) {
                 return Ok(conn);
@@ -1706,11 +1716,18 @@ impl NodeNet {
 
     /// **Nobody connected to help reach `peer` yet, but somebody being dialled** (V210-57): wait,
     /// until `until` at most, while a direct dial is under way anywhere in this node (an anchor's,
-    /// say) and neither a helper nor `peer` itself is connected. Says how long it waited.
-    async fn wait_for_a_helper(&self, peer: Digest32, until: tokio::time::Instant) {
+    /// say) and neither a helper nor `peer` itself is connected, nor `done` true. Says how long it
+    /// waited.
+    async fn wait_for_a_helper(
+        &self,
+        peer: Digest32,
+        until: tokio::time::Instant,
+        done: &(dyn Fn() -> bool + Sync),
+    ) {
         let began = tokio::time::Instant::now();
         while self.helpers(peer).is_empty()
             && self.manager.existing(&peer).is_none()
+            && !done()
             && self.manager.any_direct_dial_under_way()
             && tokio::time::Instant::now() < until
         {
@@ -1912,7 +1929,7 @@ impl NodeNet {
         let until = began + DIRECT_HEAD_START;
         let mut boards = self.helpers(member);
         if boards.is_empty() {
-            self.wait_for_a_helper(member, until).await;
+            self.wait_for_a_helper(member, until, &|| false).await;
             boards = self.helpers(member);
         }
         if boards.is_empty() || self.manager.existing(&member).is_some() {
