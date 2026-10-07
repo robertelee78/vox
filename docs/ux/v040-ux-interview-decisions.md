@@ -72,3 +72,40 @@ From an outside review, noting a pattern; whether Vox keeps such a record is the
 - **Addresses are communicated as fingerprints, every part.** The canonical address is `<service id>.<node fingerprint>.<room id>.vox`: the service part is a stable ID of the share (from its share statement), the node part the node's fingerprint, the room part the room's ID. Copy actions, pasted text, messages and agent hooks carry this form, so it resolves the same on every member's machine. Each client renders it human-readable by each part's own rule (service name; the viewer's alias for the node; the room's shared name) and accepts the readable form typed locally, translating it back.
 - **A rename that clashes on one node.** On that node only, the rooms involved lose the readable name and are shown by their room IDs until the clash is gone.
 - **Read records** are visible only to members the reader trusts (sealed like messages).
+
+## Passphrases and trust offers (2026-10-06)
+
+Input to ADR-028 §2a.
+
+- **Every node has a passphrase**, an agent's node as well as a person's. It is used only to start a session as the node (attach) and to change its keyring. This replaces the 2026-10-02 rulings that agent nodes have no passphrase or take one from an environment variable, and that passphrases are optional.
+- **The same rules for every node.** "We have no typed entity of agent/human -- same rules apply to both."
+- **Attaching does not open the keyring window.** Only a passphrase typed for a keyring change opens it; the 30-minute window applies to every node.
+- **Typed outside the agent's session.** The Claude, Codex or OpenCode session gives the operator a command to run from a command line outside that session, where the passphrase is typed.
+- **No trust file.** Trust is offered when a node joins a room: its fingerprint is offered to the members already there, each may trust it, and accepting offers that member's fingerprint back. One symmetric pair at a time.
+- **Accepting asks "read, or read + drive?"**, with read the default.
+- **An unanswered offer waits** under needs you until accepted, dismissed (silently) or the joiner leaves.
+- **No forced fingerprint comparison.** "It's expected that the user who is accepting the fingerprint knows how to do validation that they required for their threat model."
+
+## Sessions (2026-10-05 and 2026-10-06)
+
+Input to ADR-029. Sessions are in v0.4.0.
+
+- **Two jobs, kept apart.** ctm mirrors one session to a place the person can drive 1:1 from anywhere; agent comms is n sessions, on any harness and computer, collaborating on one repository. "I kind of want both ... session level, and repo level groupings."
+- **One room per repository** is the central place where every node with a session on it talks. Inside it, a **Session** per harness session, like a Telegram forum topic: a sidebar of Sessions beside the room's own conversation ("General") and everything merged ("All").
+- **A Session appears automatically** for every interactive harness session; headless runs get none; `resume` keeps it.
+- **Retention.** A Session's content follows the room's retention and is never deleted because the session ended; an ended Session is only moved out of the way.
+- **Drive is a capability on trust**, not a separate trust: one keyring entry per node, with "may read me" and "may drive my sessions". Capabilities apply in every room shared, limited by room membership: "she might not be in all the rooms."
+- **Only nodes with drive see inside a Session.** Others see only that it exists.
+- **First version of driving:** see activity with Details, see replies and turn ends, type in, interrupt or stop, approve or reject tool calls, answer its questions, send slash commands, send files or images, receive files. Not mute.
+- **Talking is not driving.** Another session may ask one specific session something ("the project 4 session should have a way to ask a question of the project 5 agent separately from the project 6 agent, even though it's the same node"). Waking a session is talking: "it's not driving ... it's 'yo, let's chat'."
+- **Every agent message carries its session id and session name** (the harness's /rename), filled in automatically.
+- **The room a session works in** comes from a per-machine file like `~/.ssh/config`: `/path/to/repo` → room link + passphrase, readable by every node on the machine. Only the exact start path matters ("I never start a new session directly from a work tree"); the room stays the same for the session's life, whatever branch, worktree or other repository's files it touches. With no entry, the operator tells it which room. A manual change moves the session; "I don't plan to do that."
+- **Setup** detects the installed harnesses and creates one node per harness, plus an optional node for the person on macOS or iOS, and prints each node's fingerprint with facts about the node.
+- **Clients:** the TUI and the macOS app, kept in sync; the iOS app is not designed yet.
+
+## Lanes removed; ctm rules confirmed (2026-10-06)
+
+- **No lanes.** "I don't know what a lane is. I want to kill the lane. I want rooms, nodes, sessions. Lanes was never asked for." ADR-028 W-3 is removed, with the built TUI lanes view and the app's planned one.
+- **A sub-agent's activity belongs to its parent's Session**, as in ctm.
+- **A message to a session that has ended is refused**, and the sender told.
+- **No self-contradicting documents.** Every issue bound to an amended ADR is to point at the current text.

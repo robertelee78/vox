@@ -16,9 +16,11 @@ The daemon is the machine's Vox service, distinct from the nodes that use it, as
 multiplexer daemon serves many harnesses. A node is an identity: a person or an agent, never a
 device (ADR-002). Several nodes can live under one OS account: a person's node, and one node for each
 agent working beside them. Which nodes run on a machine changes over the day: an agent's session
-brings its node in and out, and the person can do the same by hand. Every node that is in runs in
+needs its node attached (by the operator, outside the session, ADR-028 K-13) and lets it go when
+it ends, and the person can attach and detach by hand. Every node that is in runs in
 full, side by side; naming a node matters only for an action done as it. Unlocking works as
-gpg-agent does: a node gets its passphrase once, when it attaches. The daemon owns the machine's one
+gpg-agent does: a node gets its passphrase once, when it attaches; a keyring change asks again
+unless one was typed for a keyring change in the last 30 minutes (ADR-028 K-12). The daemon owns the machine's one
 network presence from the start: there is no interim design with one socket per node.
 
 ## Requirements
@@ -63,8 +65,10 @@ network presence from the start: there is no interim design with one socket per 
   reserved and MUST be refused.
 - **N-2. No locked node.** There MUST be no locked state, and no lock or unlock request or event. A
   node MUST receive its passphrase once, when it attaches, and MUST run in full while attached: it
-  dials, accepts, syncs, serves, relays and publishes. After the keyring window (30 minutes,
-  V210-159), only keyring changes (trust add, remove, rename) MUST ask for the passphrase again.
+  dials, accepts, syncs, serves, relays and publishes. Keyring changes (trust add, remove, rename, a
+  capability change)
+  MUST ask for the passphrase unless one was entered for a keyring change within the keyring window
+  (30 minutes, V210-159); the passphrase given at attach MUST NOT open that window (ADR-028 K-12).
   Detaching is the only way a node stops. *Built (#409): there is no `Lock` command and no
   `Locked` or `Unlocked` event; the vault is opened once, by the daemon's attach, and a detach wipes
   the node's secrets once work holding one has finished
@@ -77,8 +81,8 @@ network presence from the start: there is no interim design with one socket per 
   (ADR-016). `vox node` MUST start a daemon with that node; it MUST NOT be a separate process type.
 - **N-6. Agents.** Each agent MUST be its own node, one per (host, harness). An agent MUST NOT use a
   person's node, and a person MUST NOT share a node with an agent. The agent's node is created by its
-  skill pack's setup (`vox node create <harness>-<host>`, with no passphrase or one from an
-  environment variable the hook client resolves at harness start). Its hooks MUST be installed as
+  skill pack's setup (`vox node create <harness>-<host>`, with a passphrase the operator types, as
+  for every node, ADR-028 K-11). Its hooks MUST be installed as
   `vox agent hook --node <name>` and MUST act only as that node. A hook invoked without `--node` MUST
   refuse; it MUST NOT fall back to any other node (ADR-020).
 
@@ -88,9 +92,10 @@ network presence from the start: there is no interim design with one socket per 
   detached`, and MUST serialise every transition of one node through it.
 - **L-2. Attach.** A node MUST be attached:
   - by hand: `vox node attach <name> [--keep]`;
-  - implicitly, only by a verb that holds a session (`serve`, `connect`, `up`, `forward`, `lan up`),
-    by an agent's hook, or by the TUI, for a node that needs no passphrase or whose passphrase the
-    client supplies;
+  - implicitly, only by a verb that holds a session (`serve`, `connect`, `up`, `forward`, `lan up`)
+    or by the TUI, when the client supplies the node's passphrase. An agent's hook MUST NOT attach
+    a node: when its node is not attached, it MUST show the operator the attach command to run
+    outside the session (ADR-028 K-13);
   - at daemon start: every node in the `--keep` list (`<data root>/.daemon/attach`).
 
   One-shot verbs (`room`, `status`, `share`, `app` and the like) MUST NOT attach: they MUST refuse
@@ -110,8 +115,9 @@ network presence from the start: there is no interim design with one socket per 
   (which MUST NOT trigger an implicit re-attach), stop its tasks, close its connections (D-5),
   unregister its signer from the identity exchange (ADR-011) before its keys are wiped, wipe its keys,
   close its store and release its directory lock.
-- **L-4. Keep.** `--keep` MUST record the node in `.daemon/attach` with its passphrase source: none,
-  or a file path. On daemon start each kept node MUST re-attach, and its rooms and services MUST come
+- **L-4. Keep.** `--keep` MUST record the node in `.daemon/attach` with its passphrase source: none
+  (an anchor's headless key, N-1), or a file path. A file source serves attach only, never a keyring
+  change (ADR-028 K-13; the decider, 2026-10-06). On daemon start each kept node MUST re-attach, and its rooms and services MUST come
   back. *Deferred (additive):* an environment-variable passphrase source in the attach file.
 - **L-5. Silent harness death.** *Deferred (additive):* a sweep that unregisters the sessions of a
   harness that died without ending them. Until it exists, such a session MUST keep holding its node.
@@ -152,6 +158,8 @@ network presence from the start: there is no interim design with one socket per 
   an environment variable MUST be resolved in the client, never by the daemon. A foreground
   `vox daemon` attaching its own foreground node is that node's client: it MAY read
   `VOX_IDENTITY_PASSPHRASE` for that node only, never for a node another client asks it to attach.
+  A keyring change MUST NOT take its passphrase from an environment variable or a file; it is typed
+  (ADR-028 K-13).
 - **C-7.** The socket MUST offer what the TUI needs as a client: open and close of a closed room,
   per-node status, attach and detach. *Built (#409): `OpenRoom`/`CloseRoom`, the node snapshot
   (`node::snapshot`), status and tunnel close on the node's connection, and the daemon's attach,
@@ -161,8 +169,8 @@ network presence from the start: there is no interim design with one socket per 
 
 - **S-1.** `vox daemon` MUST run in the foreground. SIGHUP, SIGTERM, SIGINT and SIGQUIT MUST each
   detach every node cleanly and then stop the daemon.
-- **S-2. Auto-start.** A client that may attach a node (L-2: a session-holding verb, an agent's hook,
-  the TUI, `vox node attach`) and finds no daemon MUST start
+- **S-2. Auto-start.** A client that may attach a node (L-2: a session-holding verb, the TUI,
+  `vox node attach`), or an agent's hook, that finds no daemon MUST start
   `vox daemon --detach`, writing its stderr to `<data root>/.daemon/log` from its first line, and MUST
   wait up to 15 s for the socket. After that it MUST fail, saying the daemon did not start and naming
   the log's path. Concurrent starts MUST end with exactly one daemon (D-1).

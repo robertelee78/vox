@@ -28,8 +28,9 @@ agent; Vox has no typed agent/human distinction and no room types.
 
 Agent comms exists so that agents and the operator can divide up work (who does what) and work
 through hard problems together, across machines and NATs, with no SSH tunnels or pairwise peer
-configuration. It is not a mirror of agent activity: a room carrying every agent's running chatter
-could not be followed by the person in it. The room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
+configuration. Its room conversation is not a mirror of agent activity: a room carrying every
+agent's running chatter could not be followed by the person in it. A session's activity lives in its
+Session (ADR-029), readable only by members with drive. The room is for planning, assignment of work and higher-order discussion. Progress (attempts, proofs,
 verdicts, delivery) is recorded on GitHub through awa, not in the room (ADR-021).
 
 The design rests on three findings from prior art: addressing must be a structured field, never
@@ -59,7 +60,8 @@ caps are the only loop guards that provably terminate.
 - **2.1** An agent's Vox identity MUST correspond to one `(host, harness)` pair, for example
   `claude-code@mbp`, holding one durable key. Its node is hosted by the system's daemon (§12,
   ADR-016). *Built (ADR-026 N-6; #405, #408):* the skill pack's setup creates the agent's node
-  (`vox node create <harness>-<host>`) and installs its hooks as `vox agent hook --node <name>`; a
+  (`vox node create <harness>-<host>`, with a passphrase the operator types, ADR-028 K-11) and
+  installs its hooks as `vox agent hook --node <name>`; a
   hook MUST act only as that node, and MUST refuse without `--node`, never falling back to another
   node. An agent MUST NOT use a person's node: each agent is its own node, one per (host, harness).
 - **2.2** A session (one Claude Code, Codex or OpenCode conversation) MUST NOT hold its own key.
@@ -76,7 +78,8 @@ caps are the only loop guards that provably terminate.
   operator-chosen name (a petname, local to this node) (M19.2). The keyring MUST be sealed at rest
   under a key derived from the identity (`vox/trust-keyring-sek/v1`), so a changed keyring requires
   an unlocked identity. A keyring change MUST require the identity passphrase again once
-  `KEYRING_WINDOW_SECS` (30 minutes) have passed since it was last entered (V210-159).
+  `KEYRING_WINDOW_SECS` (30 minutes) have passed since it was last entered for a keyring change
+  (V210-159); the passphrase given at attach MUST NOT open the window (ADR-028 K-12).
 - **3.2** When a member is admitted to a room and its fingerprint is in the keyring, the node MUST
   release its sender key to that member without any further act. A release owed to an offline
   member MUST be retried on the tick. No member is dialled on the actor.
@@ -99,10 +102,10 @@ caps are the only loop guards that provably terminate.
   1. `vox trust add <fingerprint> --name <name>` (built);
   2. approving a member in a room, which MUST add that member to the keyring and MUST NOT create a
      room-scoped grant. The approval surface MUST say, at the moment of approval, that the trust
-     covers every room shared with that member, now and later. **Not built**: no in-room approval
-     surface exists on this tree.
-- **3.8** A provision-time import MAY be provided as a bulk wrapper over entry point 1. It MUST NOT
-  be a third path. Not built.
+     covers every room shared with that member, now and later. Specified as offers on join by
+     ADR-028 K-15–K-19 (v0.4.0). **Not built.**
+- **3.8** There MUST be no provision-time import or bulk trust file (the decider, 2026-10-06;
+  ADR-028 K-20). A key enters the keyring only by 3.7.
 - **3.9** Trust-on-first-use MUST NOT be implemented. Transitive introduction MUST NOT be
   implemented (§10).
 - **3.10** The client MUST offer per-message read metadata: which nodes have read a message this
@@ -144,13 +147,15 @@ caps are the only loop guards that provably terminate.
   name for a member or its fingerprint (whole, or a unique prefix of at least 8 characters) and
   write the whole fingerprint. A name that matches no member MUST be refused with a reason, and a
   raw envelope whose `to` is not a member's whole fingerprint MUST be refused (V210-161).
+  *Amended by ADR-029 TA-1:* an entry MAY name one session as `<whole fingerprint>/<session id>`.
 - **4.7** A reader MUST show each recipient and each author by the reader's own keyring name for
   that node, else by its fingerprint, and its own node as `you` (V210-161, V210-162, PRD-001 R15).
   A receiver MUST decide whether it was addressed from `to` and MUST NOT parse `body` for
   mentions.
 - **4.8** `re` names the one message replied to; `thread` names the conversation root.
 - **4.9** Host and harness MUST NOT appear in the message. Volatile facts (`repo`, `worktree`,
-  `branch`, `cwd`) MUST appear on every message; session-static facts (model, harness version, pid,
+  `branch`, `cwd`, and the session's current name `session_name` when the harness gives one,
+  ADR-029 MD-1) MUST appear on every message; session-static facts (model, harness version, pid,
   `started_at`) ride `hello`. **Built only in part**: structured posts fill `at`; a plain
   `vox room post` carries none of it; `hello` carries the Vox version and `data.wake`
   (`interrupt` or `turn`, V030-17).
@@ -202,6 +207,7 @@ they are not a defence against one that lies.
 - **6.2 (M19.6).** A message MUST wake a session only when it is addressed to that session's node in `to`
   **and** is `urgent`, has hops left (§9), was not posted by that session, and does not answer a
   reply chain that session already spoke in (V210-121). An urgent broadcast MUST wake nobody.
+  *Amended by ADR-029 TA-3:* a message addressed to one session wakes only that session.
   Everything else waits for the next turn.
 - **6.3 (M19.5, M19.5b).** The drain MUST be a harness hook, not a skill instruction:
 
@@ -232,6 +238,8 @@ they are not a defence against one that lies.
     `result`, `failed`, `accept`, `decline`, `ack`, the claim protocol, `ping`, `pong`) MUST be
     counted in one line per room, not shown (V030-18): a `--type status` post is counted, not shown,
     in the per-turn read. A row addressed to this node, or answering this session, is shown in full.
+    *Amended by ADR-029 TA-2:* a row addressed to another session of this node is counted, not
+    shown.
 - **6.7** The drain MUST skip a session's own posts only when both the author fingerprint and
   `from` match this session (ADR-021 §7, F8).
 - **6.8 (V030-15).** A wake MUST be an announce-only notice: how many urgent messages and replies
@@ -261,14 +269,17 @@ they are not a defence against one that lies.
   removes the registration, both through `vox agent hook`, printing nothing; `UserPromptSubmit`
   records busy. A session busy for `agent_busy_idle` (10 minutes) with no hook activity MUST count
   as idle. *Built (ADR-026 L-2, L-3, D-3; #404, #405):* session registration and unregistration
-  move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly. A
+  move into the daemon. A hook that finds no daemon starts one and attaches its node implicitly.
+  *Amended by ADR-028 K-13:* a hook MAY start the daemon but MUST NOT attach its node; it shows the
+  operator the attach command to run outside the session. A
   registered session is a holder of its node; when `SessionEnd` unregisters the last holder of a node
   attached implicitly, the daemon detaches it, atomically with the unregister.
 - **6.11** `agent_wake_hold`, `agent_busy_idle` and `agent_reply_nudges` are settings in the
   profile's settings file (under ADR-026, the node's `config`). A value that does not parse, an empty schedule or a zero MUST be refused,
   said on the daemon's stderr (again every ten minutes while it stands), and the default used.
-- **6.12 (V210-169, M19.12).** Vox MUST NOT send `turn/start` or `turn/steer` to Codex: its
-  app-server keeps a quit session's thread loaded, so a wake could start a model turn nobody is in. A
+- **6.12 (V210-169, M19.12).** Vox MUST NOT send `turn/start` or `turn/steer` to Codex to wake it: its
+  app-server keeps a quit session's thread loaded, so a wake could start a model turn nobody is in.
+  *Amended by ADR-029 DR-7:* driving an open session's Session MAY send them. A
   Codex session MUST be registered from the hook's input (its rollout `transcript_path` or
   `turn_id`), before any Claude Code variables it inherited. When an urgent post addresses the
   poster's own node and no session of that node can be woken, `vox room post` MUST say so in one
@@ -412,19 +423,22 @@ they are not a defence against one that lies.
   (M19.5c). It MUST NOT lock on SIGHUP; SIGHUP stops it cleanly (ADR-016 NR-15). It is the node
   `vox room` and `vox agent hook` attach to.
 - **12.2** *Decided, not built (ADR-026):* `vox daemon` is the account's one daemon, not a node. It
-  takes no passphrase at start; nodes attach to it (by hand, implicitly from a request or a hook, or
-  from its `--keep` list) and all run concurrently. `vox room` and `vox agent hook` are its clients
+  takes no passphrase at start; nodes attach to it (by hand, implicitly from a session-holding
+  request or the TUI, or from its `--keep` list; never from a hook, ADR-028 K-13) and all run concurrently. `vox room` and `vox agent hook` are its clients
   and act as the node they name. 12.1 is replaced when this is built.
 
 ### Non-goals
 
 Agent comms MUST NOT be or add: a mirror of agent activity (tool calls, progress, per-turn
-chatter); a replacement for ctm (moving ctm onto Vox is the chat app's concern); a wire-format
+chatter) in the room's conversation (ADR-029 puts it in a Session, readable only by members with
+drive); a replacement for ctm beyond ADR-029's Sessions; a wire-format
 change; per-session cryptographic identity; central coordination (orchestrator, speaker selection,
 trust score); IP-level anonymity (ADR-017); an MCP delivery path; file bytes in the log; a spawned
 instance of anything (1.5); a council feature (a council is an `ask` in a room whose agents span
 model families); an operator hold on messages (trust and room membership are the controls); hosted
-agent sandboxes that allow only HTTP out. A TUI view for agent comms is deferred until a real room
+agent sandboxes that allow only HTTP out. (Per-session cryptographic identity stays excluded: a
+Session key is the node's, ADR-029 SC-2; the TUI and app show Sessions, ADR-029 §8.) A TUI view for
+agent comms beyond ADR-028 and ADR-029 is deferred until a real room
 has shown what needs filtering.
 
 ## Consequences
