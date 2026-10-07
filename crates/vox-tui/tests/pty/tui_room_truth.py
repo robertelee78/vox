@@ -95,6 +95,20 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
   to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
+  sessions  Alice's node, through Claude Code's hook in a session a person is at, opens two
+            Sessions and ends one: Bob's Sessions pane lists the open one by `vox room sessions`'s
+            label and the ended one apart under "Ended (1)"; `:all` shows each opening and end
+            among the room's messages; `:session <short id>`, without drive, shows only that it
+            exists and "Only members alice trusts with drive see inside this Session.", with no
+            composer, and `:send` there is refused, reaching nobody (ADR-029 CL-2, CL-3, #553);
+  drive     once Alice gives Bob drive (`vox trust drive`, at a terminal) and her open Session
+            runs a turn through Claude Code's hook, Bob's `:session` shows each line his `vox room
+            session` prints, not "Only members …"; `d` on the tool call's line shows its output
+            (ADR-029 SC-1, CL-1, #553);
+  approve   Alice's session asks to run a command through Claude Code's PermissionRequest hook:
+            Bob's TUI lists the room with "waiting 1" and the Session "· waiting on you"; `a` on
+            the request's line approves it, the waiting hook gives Claude Code "allow", and the line
+            then reads "approved here" (ADR-029 DR-1.4, CL-2, #553);
   attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
             message: a `file` announcement carrying the note in it and `to` naming her, no second
             message for the note (ADR-028 F-1, #493);
@@ -238,11 +252,13 @@ def span(t, y, text):
     x = line.find(text)
     return None if x < 0 else cs[x:x + len(text)]
 
-def stray(t, colours, live=(), cols=(0, 160)):
+def stray(t, colours, live=(), cols=(0, 160), top=None):
     """Every cell drawn in one of `colours` (fg or bg) that is not the focused pane's frame (a
-    border character within `cols`, or its top row there, which holds the pane's title) nor inside
-    one of the `live` texts: where the accent must not be (ADR-028 L-3)."""
-    top = next((y for y in range(t.screen.lines) if cells_of(t, y)[1][cols[0]] in "┌╭"), None)
+    border character within `cols`, or its top row `top` there, which holds the pane's title; by
+    default the first row with a corner in its first column) nor inside one of the `live` texts:
+    where the accent must not be (ADR-028 L-3)."""
+    if top is None:
+        top = next((y for y in range(t.screen.lines) if cells_of(t, y)[1][cols[0]] in "┌╭"), None)
     out = []
     for y in range(t.screen.lines):
         cs, line = cells_of(t, y)
@@ -515,7 +531,7 @@ try:
     selected = lambda: next((r for r in rows() if "▶ " in r), "")
     def focus(pane):
         """Tab until `pane`'s title says it has the focus."""
-        for _ in range(4):
+        for _ in range(6):
             # The title may say more after the pane's name (the timeline's retention, #483).
             if any(re.search(rf"\u250c{pane}[^\u2510]*\[focus\]", r) for r in tui.display()):
                 return
@@ -641,7 +657,9 @@ try:
             said.append(f"{who} {glyph}name bold {name_cells[0].bold} fg {name_cells[0].fg!r} "
                         f"(want bold {strong}, {colour!r})")
         # The sidebar beside the room shows its live "● online", which the accent marks (L-3).
-        off = stray(t, accent, live=("● online",), cols=members_box(t)[1:])
+        # The members pane is under the Sessions pane: its own top row holds its title.
+        box = members_box(t)
+        off = stray(t, accent, live=("● online",), cols=box[1:], top=box[0])
         said.append(f"accent cells off the focused border: {off[:6]!r}")
         return ok and not off, "; ".join(said)
 
@@ -704,8 +722,9 @@ try:
     claim("copies", copied == SSH_COPY and "copied to the clipboard" in bar and SSH_COPY in printed,
           f"OSC 52 carried {copied!r}, want {SSH_COPY!r}; printed in the Shared pane: "
           f"{SSH_COPY in printed}; status line: {bar.strip()!r}")
-    # Back round to the members pane, where the stages after this one expect focus.
-    for _ in range(3):
+    # Back round to the members pane, where the stages after this one expect focus: Shared,
+    # Sessions, Timeline, Composer, Members.
+    for _ in range(4):
         tui.key("\t", 0.5)
 
     stage("readby")
@@ -821,7 +840,12 @@ try:
                and "⏱ 1 week" in header(atui) and "⏱ 1 week" in header(tui), 60)
     after = (header(atui), header(tui))
     # A focused pane names itself once on its border: "Members [focus]", never "MembersMembers".
-    once = all(h.count("Timeline") == 1 and h.count("Members") == 1 for h in after) \
+    # The members pane sits under the Sessions pane (ADR-029 CL-2), so its title is on a row of
+    # its own: read there.
+    def members_title(t):
+        return [bare(r) for r in t.display() if "\u250cMembers" in r]
+    once = all(h.count("Timeline") == 1 for h in after) \
+        and all(len(m) == 1 and m[0].count("Members") == 1 for m in map(members_title, (atui, tui))) \
         and any("[focus]" in h for h in after)
     claim("retention", all("⏱ forever" in h for h in before) and all("⏱ 1 week" in h for h in after)
           and says(atui, f"you {LINE}") and says(tui, f"alice {LINE}") and once,
@@ -1085,6 +1109,183 @@ try:
           and "at" not in env_,
           f"bob's composer: {composer.strip()!r}; alice reads the message as {row!r}; `:to zz-nobody` "
           f"said {refused!r}, To: left unset: {unset}")
+
+    stage("sessions")
+    # A room's Sessions (ADR-029 CL-2, CL-3, #553): Alice's node, as Claude Code's hook runs it in a
+    # session a person is at, opens two Sessions in the room and ends one with a real `SessionEnd`.
+    # Bob's TUI lists the open one by the label `vox room sessions` gives it, the ended one apart
+    # under "Ended (1)"; All merges each Session's opening and end among the room's messages; a
+    # Session opened without drive (Alice gives Bob none) shows only that it exists and why
+    # nothing more, and offers no composer: `:send` there is refused.
+    def hook(w, payload):
+        e = env(w)
+        e["CLAUDE_CODE_ENTRYPOINT"] = "cli"  # a session a person is at, not a headless run
+        r = subprocess.run([VOX, "agent", "hook", "--node", "default", "--room", room], env=e,
+                           input=json.dumps(payload), capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            product(f"{w}'s `vox agent hook` failed: {r.stdout.strip()} {r.stderr.strip()}")
+    def claude(session, event, **extra):
+        return {"session_id": session, "hook_event_name": event, "cwd": "/tmp",
+                "transcript_path": "/tmp/t.jsonl", **extra}
+    OPEN_ID, ENDED_ID = "3f0c25bf-aaaa-4bbb-8ccc-dddddddddddd", "9a1b22c0-aaaa-4bbb-8ccc-eeeeeeeeeeee"
+    hook("alice", claude(OPEN_ID, "UserPromptSubmit", prompt="port the codec"))
+    hook("alice", claude(ENDED_ID, "UserPromptSubmit", prompt="look at the tests"))
+    hook("alice", claude(ENDED_ID, "SessionEnd", reason="prompt_input_exit"))
+    def cli_labels():
+        r = run("bob", "room", "sessions", room, "--json")
+        rows = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
+        return {x["id"]: x for x in rows}
+    if not until(lambda: {OPEN_ID, ENDED_ID} <= set(cli_labels()) and not cli_labels()[ENDED_ID]["open"], 60):
+        product(f"bob's `vox room sessions --json` never listed alice's two Sessions, one ended, within 60 s: "
+                f"{cli_labels()!r}")
+    labels = cli_labels()
+    open_label, ended_label = labels[OPEN_ID]["label"], labels[ENDED_ID]["label"]
+    sessions_pane = lambda: [r.strip().strip("│").strip() for r in pane(tui.display(), "Sessions")]
+    listed = tui.until(lambda: any(r.endswith("● " + open_label) for r in sessions_pane())
+                       and "Ended (1)" in " ".join(sessions_pane()), 60, 1)
+    listed_rows = sessions_pane()
+    apart = not any(ended_label in r for r in listed_rows)
+    tui.key(":all\r", 2)
+    all_rows = pane(tui.display(), "Timeline")
+    all_text = " ".join(" ".join(r.split()) for r in all_rows)
+    merged = (f"{open_label} opened" in all_text and f"{ended_label} opened" in all_text
+              and f"{ended_label} ended" in all_text and "TO-ALICE-513" in all_text
+              and any("Timeline — All" in r for r in tui.display()))
+    tui.key(f":session {OPEN_ID[:8]}\r", 2)
+    screen = tui.display()
+    inside = " ".join(" ".join(r.split()) for r in pane(screen, "Timeline"))
+    titled = any(f"Timeline — {open_label} · open" in r for r in screen)
+    # The pane wraps its lines: read it as one text without the spaces a wrap took.
+    nodrive = ("Only members alice trusts with drive see inside this Session.".replace(" ", "")
+               in inside.replace(" ", ""))
+    no_composer = not any("Composer" in r for r in screen)
+    tui.key(":send DRIVE-WITHOUT-DRIVE\r", 1)
+    refused = " ".join(r.strip() for r in tui.display()[-3:])
+    told = f"not sent: this is {open_label}; :general writes to the room" in refused
+    tui.key(":general\r", 2)
+    leaked = "DRIVE-WITHOUT-DRIVE" in run("alice", "room", "read", room).stdout
+    claim("sessions", listed and apart and merged and titled and nodrive and no_composer and told
+          and not leaked,
+          f"Sessions pane: {listed_rows!r} (open listed: {listed}, ended apart: {apart}); All merged the "
+          f"openings and end among the messages: {merged}; `:session` titled {titled}, said no drive "
+          f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
+          f"{leaked}" + ("" if merged else f"; All showed: {all_rows!r}")
+          + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))
+
+    stage("drive")
+    # A Session read from inside (ADR-029 SC-1, CL-1, #553): Alice gives Bob drive, as a person
+    # does at a terminal, and her open Session runs one turn through Claude Code's hook: a tool
+    # call, its result in the transcript, the reply. Bob's `:session` then shows the turn, line for
+    # line as his `vox room session` prints it, and no "Only members …" sentence; the tool call's
+    # Details (`d` on its line) hold its whole output.
+    t = Tui([VOX, "trust", "drive", fp["bob"]], env("alice"))
+    t.until(lambda: t.closed or "passphrase" in t.text().lower(), 20, 0.5)
+    if not t.closed and "passphrase" in t.text().lower():
+        t.key("id pass\r", 0.5)
+    t.until(lambda: t.closed, 60, 0.5)
+    granted = t.text()
+    t.stop()
+    work = f"{S}/alice-work"
+    os.makedirs(work, exist_ok=True)
+    transcript = f"{work}/{OPEN_ID}.jsonl"
+    open(transcript, "w").close()
+    def turn(event, **extra):
+        hook("alice", {"session_id": OPEN_ID, "transcript_path": transcript, "cwd": work,
+                       "permission_mode": "default", "hook_event_name": event, **extra})
+    call = {"command": "echo DETAILS-OUTPUT-LINE", "description": "Say it"}
+    turn("PreToolUse", tool_name="Bash", tool_input=call, tool_use_id="toolu_D")
+    with open(transcript, "a") as f:
+        f.write(json.dumps({"type": "user", "sessionId": OPEN_ID, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_D", "content": "DETAILS-OUTPUT-LINE\n",
+             "is_error": False}]}}) + "\n")
+    turn("PostToolUse", tool_name="Bash", tool_input=call, tool_use_id="toolu_D",
+         tool_response={"stdout": "DETAILS-OUTPUT-LINE\n", "stderr": "", "interrupted": False},
+         duration_ms=3)
+    turn("Stop", stop_hook_active=False, last_assistant_message="DRIVE-REPLY the codec is ported")
+    def cli_session():
+        r = run("bob", "room", "session", room, OPEN_ID)
+        return r.stdout if r.returncode == 0 else ""
+    if not until(lambda: "— turn ended —" in cli_session(), 120):
+        product(f"bob, given drive, never read alice's Session to its turn's end with `vox room "
+                f"session` within 120 s; alice's `vox trust drive` said {granted!r}; it said "
+                f"{run('bob', 'room', 'session', room, OPEN_ID).stdout!r}")
+    cli = [l for l in cli_session().splitlines()[1:] if l.strip()]
+    tui.key(f":session {OPEN_ID[:8]}\r", 2)
+    flat = lambda: " ".join(" ".join(bare(r).split()) for r in pane(tui.display(), "Timeline"))
+    tui.until(lambda: "— turn ended —" in flat(), 30, 1)
+    # Each line `vox room session` printed is a line of the TUI's (the pane wraps; read it whole).
+    same = all(" ".join(l.split()).replace(" ", "") in flat().replace(" ", "") for l in cli)
+    sealed_off = "Onlymembers" in flat().replace(" ", "")
+    hint = tui.display()[-1]
+    focus("Timeline")
+    for _ in range(len(cli) + 2):
+        tui.key("\x1b[A", 0.3)  # Up: an older line
+        if any(bare(r).startswith("▶ Bash:") for r in pane(tui.display(), "Timeline")):
+            break
+    tui.key("d", 1)
+    details = flat()
+    opened = "DETAILS-OUTPUT-LINE" in details.split("▶ Bash:", 1)[-1].split("reply:", 1)[0]
+    tui.key(":general\r", 2)
+    # The help line is reported, not judged: a node notice ("alice trusts you") holds that row
+    # until another replaces it.
+    claim("drive", same and not sealed_off and opened,
+          f"`vox room session` printed {cli!r}; the TUI showed each of them: {same}; said the "
+          f"Session is sealed off: {sealed_off}; `d` on the tool call showed its output: {opened}; "
+          f"help line: {hint.strip()!r}" + ("" if same and opened else f"; the pane: {details!r}"))
+
+    stage("approve")
+    # A request waiting on a driver (ADR-029 DR-1.4, CL-2, #553): Alice's session asks to run a
+    # command, through Claude Code's PermissionRequest hook, which waits for an answer. Bob's TUI
+    # puts the room under needs you ("waiting 1") and the Session's row says "waiting on you"; `a`
+    # on the request's line in the Session approves it: the hook gives Claude Code "allow", and once
+    # the call has run the line reads "approved here".
+    touch = {"command": "touch e2", "description": "Make e2"}
+    turn("PreToolUse", tool_name="Bash", tool_input=touch, tool_use_id="toolu_2")
+    e = env("alice")
+    e["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+    asking = subprocess.Popen([VOX, "agent", "hook", "--node", "default", "--room", room], env=e,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+    PROCS.append(asking)
+    asking.stdin.write(json.dumps({"session_id": OPEN_ID, "transcript_path": transcript, "cwd": work,
+                                   "permission_mode": "default", "hook_event_name": "PermissionRequest",
+                                   "tool_name": "Bash", "tool_input": touch, "permission_suggestions": []}))
+    asking.stdin.close()
+    side_rows = lambda: [bare(r) for r in pane(tui.display(), "Rooms")]
+    flagged = tui.until(lambda: any(r.startswith(f"! {open_label} · waiting on you") or
+                                    f"! {open_label} · waiting on you" in r for r in sessions_pane())
+                        and any("waiting 1" in r for r in side_rows()), 60, 1)
+    flags = (sessions_pane(), side_rows())
+    tui.key(f":session {OPEN_ID[:8]}\r", 2)
+    focus("Timeline")
+    tui.until(lambda: "approve or reject?" in flat(), 30, 1)
+    for _ in range(12):
+        if any(bare(r).startswith("▶ ") and "approve or reject?" in r for r in pane(tui.display(), "Timeline")):
+            break
+        tui.key("\x1b[A", 0.3)  # Up: an older line
+    tui.key("a", 2)
+    said_a = " ".join(r.strip() for r in tui.display()[-2:])
+    try:
+        out, err = asking.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        asking.kill()
+        out, err = asking.communicate()
+    try:
+        decision = json.loads(out)["hookSpecificOutput"]["decision"]
+    except (ValueError, KeyError, TypeError):
+        decision = None
+    # The harness takes the answer: the call runs, and its result is in the transcript.
+    with open(transcript, "a") as f:
+        f.write(json.dumps({"type": "user", "sessionId": OPEN_ID, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_2", "content": "", "is_error": False}]}}) + "\n")
+    turn("PostToolUse", tool_name="Bash", tool_input=touch, tool_use_id="toolu_2",
+         tool_response={"stdout": "", "stderr": "", "interrupted": False})
+    approved = tui.until(lambda: "Bash: touch e2 — approved here" in flat(), 60, 1)
+    tui.key(":general\r", 2)
+    claim("approve", flagged and (decision or {}).get("behavior") == "allow" and approved,
+          f"needs you: Sessions pane {flags[0]!r}, rooms {flags[1]!r} (flagged: {flagged}); `a` "
+          f"said {said_a!r}; the hook gave Claude Code {decision!r} (stdout {out!r}, stderr "
+          f"{err.strip()[:200]!r}); the line then read \"approved here\": {approved}")
 
     stage("attach")
     # A file shared from the composer is one message, addressed like one (ADR-028 F-1, #493): its

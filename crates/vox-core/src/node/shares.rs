@@ -61,6 +61,56 @@ pub struct ShareRequest {
     pub count: u64,
     /// Stop after this many seconds; `0` for no such stop.
     pub for_secs: u64,
+    /// A file through a Session (ADR-029 DR-1), or `None` for a room share.
+    pub session: Option<SessionShare>,
+}
+
+/// A file through a Session (ADR-029 DR-1.7, DR-1.8; #546): neither is a message of the room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionShare {
+    /// Out of a Session: announced as that Session's `file` entry, sealed under this node's drive
+    /// key, and served to the members this node trusts with drive.
+    Out {
+        /// The harness's session id.
+        session_id: String,
+    },
+    /// Into a Session on another node: announced to that node alone, on the drive request, and
+    /// served to it alone.
+    In {
+        /// The Session's node.
+        node: Digest32,
+    },
+}
+
+/// Who a share is served to, besides the tunnel's own gate (this node's keyring and the room's
+/// members).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Only {
+    /// Any member that gate lets in: a room share, which any member may pull (ADR-028 F-3).
+    Anyone,
+    /// A file out of a Session: a member this node trusts with drive **when it fetches**
+    /// (ADR-029 SC-2), so losing drive cuts a fetch under way.
+    Drive,
+    /// A file into a Session: that Session's node, alone.
+    Node(Digest32),
+}
+
+impl Only {
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Only::Anyone => "anyone".into(),
+            Only::Drive => "drive".into(),
+            Only::Node(n) => b32_encode(n).into(),
+        }
+    }
+
+    fn from_json(v: Option<&serde_json::Value>) -> Option<Self> {
+        match v.and_then(serde_json::Value::as_str) {
+            None | Some("anyone") => Some(Only::Anyone),
+            Some("drive") => Some(Only::Drive),
+            Some(n) => b32_decode(n, "share record node").ok().map(Only::Node),
+        }
+    }
 }
 
 /// One share, as `vox share` and `vox share list` show it.
@@ -99,6 +149,8 @@ struct Record {
     created: u64,
     count: u64,
     until: u64,
+    /// Who it is served to.
+    only: Only,
 }
 
 impl Record {
@@ -124,6 +176,7 @@ impl Record {
             "created": self.created,
             "count": self.count,
             "until": self.until,
+            "only": self.only.to_json(),
         })
     }
 
@@ -164,6 +217,7 @@ impl Record {
             created: n("created")?,
             count: n("count")?,
             until: n("until")?,
+            only: Only::from_json(v.get("only"))?,
         })
     }
 
@@ -402,8 +456,9 @@ impl Shares {
             .collect()
     }
 
-    /// What `serve` needs to record who pulled the share `tag` in `room`.
-    fn witness(&self, tag: &str, room: Digest32) -> Witness {
+    /// What `serve` needs to record who pulled the share `tag` in `room`, and to tell whom it
+    /// may serve (`only`).
+    fn witness(&self, tag: &str, room: Digest32, only: Only) -> Witness {
         Witness {
             book: Arc::clone(&self.pulled),
             tag: tag.to_owned(),
@@ -411,6 +466,8 @@ impl Shares {
             owner: self.view.borrow().identity.as_ref().map(|i| i.fingerprint),
             events: self.events.clone(),
             said: Arc::default(),
+            only,
+            view: self.view.clone(),
         }
     }
 
@@ -511,6 +568,11 @@ impl Shares {
         }
         // The sharing session's name, as on every message from it (ADR-029 MD-2).
         let text = crate::node::sessions::fill_name(&self.paths, &envelope.to_string());
+        let only = match &req.session {
+            None => Only::Anyone,
+            Some(SessionShare::Out { .. }) => Only::Drive,
+            Some(SessionShare::In { node }) => Only::Node(*node),
+        };
         let fail = |e: String| e;
         let (stop, stopping) = watch::channel(false);
         let fetched = Arc::new(AtomicU64::new(0));
@@ -534,7 +596,7 @@ impl Shares {
         let (server, local) = serve(
             what,
             Arc::clone(&fetched),
-            self.witness(&tag, req.channel_id),
+            self.witness(&tag, req.channel_id, only.clone()),
             stopping,
         )
         .await
@@ -557,47 +619,28 @@ impl Shares {
                 return Err(fail(format!("cannot offer {tag}: {other}")));
             }
         }
-        let me = self.view.borrow().identity.as_ref().map(|i| i.fingerprint);
-        let mut events = self.events.subscribe();
-        let deadline = tokio::time::Instant::now() + POST_PATIENCE;
-        let posted = loop {
-            match self
-                .apply(NodeCommand::SendText {
-                    channel_id: req.channel_id,
-                    text: text.clone(),
-                })
-                .await
-            {
-                Outcome::Done => break Ok(()),
-                Outcome::Failed(Fault::RoomNotSynced) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                other => break Err(other.to_string()),
+        let announced = match &req.session {
+            None => self.announce(req.channel_id, &text).await,
+            Some(SessionShare::Out { session_id }) => {
+                self.announce_in_session(req.channel_id, session_id, &envelope)
+                    .await
+            }
+            // Into a Session: its node hears of it on the drive request, and nothing is posted.
+            Some(SessionShare::In { .. }) => Ok((String::new(), now_secs())),
+        };
+        let (entry, created) = match announced {
+            Ok(found) => found,
+            Err(e) => {
+                let _ = self
+                    .apply(NodeCommand::RemoveService {
+                        channel_id: req.channel_id,
+                        service_tag: tag.clone(),
+                    })
+                    .await;
+                drop(active_parts);
+                return Err(fail(format!("cannot announce the share: {e}")));
             }
         };
-        if let Err(e) = posted {
-            let _ = self
-                .apply(NodeCommand::RemoveService {
-                    channel_id: req.channel_id,
-                    service_tag: tag.clone(),
-                })
-                .await;
-            drop(active_parts);
-            return Err(fail(format!("cannot announce the share: {e}")));
-        }
-        // The announcement's entry and time, from the node's own word that it landed.
-        let mut entry = String::new();
-        let mut created = now_secs();
-        let until = tokio::time::Instant::now() + ENTRY_PATIENCE;
-        while let Ok(Ok(ev)) = tokio::time::timeout_at(until, events.recv()).await {
-            if let NodeEvent::NewEntry { channel_id, row } = ev {
-                if channel_id == req.channel_id && Some(row.author) == me && row.text == text {
-                    entry = b32_encode(&row.entry_hash);
-                    created = row.created_millis / 1000;
-                    break;
-                }
-            }
-        }
         if !entry.is_empty() {
             self.pulled
                 .lock()
@@ -620,6 +663,7 @@ impl Shares {
             } else {
                 now_secs().saturating_add(req.for_secs)
             },
+            only,
         };
         let written =
             crate::node::paths::create_private_dir(&self.paths.shares_dir()).and_then(|()| {
@@ -648,6 +692,90 @@ impl Shares {
             },
         );
         Ok(row)
+    }
+
+    /// Post a room share's announcement (F-1), and the entry and time it landed at, from the
+    /// node's own word that it did; an empty entry if that word did not come.
+    async fn announce(&self, channel_id: Digest32, text: &str) -> Result<(String, u64), String> {
+        let me = self.view.borrow().identity.as_ref().map(|i| i.fingerprint);
+        let mut events = self.events.subscribe();
+        let deadline = tokio::time::Instant::now() + POST_PATIENCE;
+        loop {
+            match self
+                .apply(NodeCommand::SendText {
+                    channel_id,
+                    text: text.to_owned(),
+                })
+                .await
+            {
+                Outcome::Done => break,
+                Outcome::Failed(Fault::RoomNotSynced) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                other => return Err(other.to_string()),
+            }
+        }
+        let mut entry = String::new();
+        let mut created = now_secs();
+        let until = tokio::time::Instant::now() + ENTRY_PATIENCE;
+        while let Ok(Ok(ev)) = tokio::time::timeout_at(until, events.recv()).await {
+            if let NodeEvent::NewEntry { channel_id: c, row } = ev {
+                if c == channel_id && Some(row.author) == me && row.text == text {
+                    entry = b32_encode(&row.entry_hash);
+                    created = row.created_millis / 1000;
+                    break;
+                }
+            }
+        }
+        Ok((entry, created))
+    }
+
+    /// Announce a file out of Session `session_id` as that Session's `file` entry (ADR-029 SC-1,
+    /// #546), sealed under this node's drive key: only members it trusts with drive learn its
+    /// name, size and tag. Its entry is the share's, as a room share's message is.
+    async fn announce_in_session(
+        &self,
+        channel_id: Digest32,
+        session_id: &str,
+        envelope: &serde_json::Value,
+    ) -> Result<(String, u64), String> {
+        let data = &envelope["data"];
+        let mut body = serde_json::json!({
+            "v": vox_agentcomms::activity::VERSION,
+            "session": session_id,
+            "kind": "file",
+            "dir": "out",
+            "ts": now_secs() * 1000,
+        });
+        if let Some(obj) = body.as_object_mut() {
+            for k in [
+                "name", "size", "sha256", "tag", "http", "kind", "files", "image", "note",
+            ] {
+                if let Some(v) = data.get(k) {
+                    // The data's `kind` (file or folder) is the entry's `type`: its `kind` is the
+                    // activity's.
+                    let key = if k == "kind" { "type" } else { k };
+                    obj.insert(key.into(), v.clone());
+                }
+            }
+        }
+        let deadline = tokio::time::Instant::now() + POST_PATIENCE;
+        loop {
+            match self
+                .apply(NodeCommand::AppendSession {
+                    channel_id,
+                    session_id: session_id.to_owned(),
+                    body: body.to_string(),
+                })
+                .await
+            {
+                Outcome::Appended(entry) => return Ok((b32_encode(&entry), now_secs())),
+                Outcome::Failed(Fault::RoomNotSynced) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                other => return Err(other.to_string()),
+            }
+        }
     }
 
     /// This node's shares in `room`, in tag order.
@@ -761,7 +889,7 @@ impl Shares {
             let Ok((server, local)) = serve(
                 Served::of(&record),
                 Arc::clone(&fetched),
-                self.witness(&record.tag, record.room),
+                self.witness(&record.tag, record.room, record.only.clone()),
                 stopping,
             )
             .await
@@ -869,12 +997,26 @@ struct Witness {
     events: broadcast::Sender<NodeEvent>,
     /// The listed files already said to have changed, said once each.
     said: Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    /// Who it may serve.
+    only: Only,
+    /// The node's view: its keyring's drive entries, read at each fetch.
+    view: watch::Receiver<NodeView>,
 }
 
 impl Witness {
     /// The member a connection from `from` came through a tunnel for.
     fn member(&self, from: Option<SocketAddr>) -> Option<Digest32> {
         crate::transport::quic::tunnel_peer_at(&self.owner?, from?)
+    }
+
+    /// Whether `member` may fetch this share now (ADR-029 SC-2, DR-1): any member for a room
+    /// share; for a Session's, one this node trusts with drive, or the Session's node.
+    fn allowed(&self, member: Option<Digest32>) -> bool {
+        match &self.only {
+            Only::Anyone => true,
+            Only::Drive => member.is_some_and(|m| self.view.borrow().drive.contains(&m)),
+            Only::Node(n) => member == Some(*n),
+        }
     }
 
     /// A listed file changed since it was listed, and was refused: said to the sharer once.
@@ -1090,6 +1232,16 @@ async fn serve_one(
             }
         }
         member = identify();
+        // **A Session's file goes only to whom the Session is for** (ADR-029 SC-2, DR-1): any
+        // other member, though the tunnel let it in and it knows the tag, is refused.
+        if !witness.allowed(member) {
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            return Some(false);
+        }
         let is_head = head.starts_with(b"HEAD ");
         let target = String::from_utf8_lossy(&head)
             .lines()
@@ -1142,6 +1294,10 @@ async fn serve_one(
         let mut buf = vec![0u8; 64 * 1024];
         let mut sent = 0u64;
         loop {
+            // Losing drive cuts a fetch under way: reset, never a clean end.
+            if !witness.allowed(member) {
+                return None;
+            }
             match f.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {

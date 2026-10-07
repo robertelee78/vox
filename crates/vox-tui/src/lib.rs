@@ -19,6 +19,7 @@
 
 pub mod agent_hook;
 pub mod agent_room;
+pub mod agent_send;
 pub mod app;
 pub mod app_cli;
 pub mod claude_injector;
@@ -46,6 +47,7 @@ pub mod ping;
 pub mod room_cli;
 pub mod room_map;
 pub mod session_cli;
+pub mod session_drive_ui;
 pub mod session_mirror;
 pub mod session_sink;
 pub mod setup;

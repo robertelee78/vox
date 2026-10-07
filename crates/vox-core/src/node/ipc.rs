@@ -363,6 +363,18 @@ const T_SESSIONS_REQ: u64 = 4940;
 const T_SESSIONS: u64 = 4941;
 /// [`Frame::Appended`].
 const T_APPENDED: u64 = 5433;
+/// `[5434, channel_id, path, envelope, to]` — [`Request::SessionShare`]; `to` is `[0, session
+/// id]` out of a Session, `[1, node]` into one (ADR-029 DR-1, #546).
+const T_SESSION_SHARE: u64 = 5434;
+
+/// Which way a file goes through a Session (ADR-029 DR-1; #546).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionTo {
+    /// Out of this node's Session with this harness session id, to its members with drive.
+    Session(String),
+    /// Into a Session on this node: the Session's node.
+    Node(Digest32),
+}
 
 /// What a client sends.
 ///
@@ -491,6 +503,20 @@ pub enum Request {
         session_id: String,
         /// The activity item, in the harnesses' shared format.
         body: String,
+    },
+    /// Share a file through a Session (ADR-029 DR-1.7, DR-1.8; #546), answered as
+    /// [`Request::Share`] is. Out of a Session: announced as its drive-sealed `file` entry and
+    /// served to members with drive. Into a Session on another node: announced to nobody (the
+    /// driver's drive request says it to that node) and served to that node once.
+    SessionShare {
+        /// The room.
+        channel_id: Digest32,
+        /// The file or folder, absolute.
+        path: String,
+        /// A file envelope carrying the note, as [`Request::Share`]'s.
+        envelope: String,
+        /// Which way it goes.
+        to: SessionTo,
     },
     /// The Session entries this node can read in a room (ADR-029 SC-2): its own, and those of
     /// each node that released it its drive key. Answered with [`Frame::SessionEntries`].
@@ -885,6 +911,23 @@ impl Request {
             }
             Request::SessionEntries { channel_id } => {
                 e.array(2).uint(T_SESSION_ENTRIES).bytes(channel_id);
+            }
+            Request::SessionShare {
+                channel_id,
+                path,
+                envelope,
+                to,
+            } => {
+                e.array(5)
+                    .uint(T_SESSION_SHARE)
+                    .bytes(channel_id)
+                    .text(path)
+                    .text(envelope)
+                    .array(2);
+                match to {
+                    SessionTo::Session(id) => e.uint(0).text(id),
+                    SessionTo::Node(n) => e.uint(1).bytes(n),
+                };
             }
             Request::Rooms { after } => {
                 e.array(2)
@@ -1361,6 +1404,33 @@ impl Request {
                     channel_id,
                     session_id,
                     body,
+                })
+            }
+            (T_SESSION_SHARE, 5) => {
+                let channel_id = digest(&mut d)?;
+                let path = text(&mut d, "ipc share path")?;
+                let envelope = text(&mut d, "ipc share envelope")?;
+                if d.array()
+                    .map_err(|_| Error::MalformedIpc("ipc session share to"))?
+                    != 2
+                {
+                    return Err(Error::MalformedIpc("ipc session share to arity"));
+                }
+                let to = match d
+                    .uint()
+                    .map_err(|_| Error::MalformedIpc("ipc session share way"))?
+                {
+                    0 => SessionTo::Session(text(&mut d, "ipc session id")?),
+                    1 => SessionTo::Node(digest(&mut d)?),
+                    _ => return Err(Error::MalformedIpc("ipc session share way")),
+                };
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::SessionShare {
+                    channel_id,
+                    path,
+                    envelope,
+                    to,
                 })
             }
             (T_SESSION_ENTRIES, 2) => {
@@ -3857,6 +3927,27 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             // **The session's name, filled by its node** (ADR-029 MD-2): whatever verb or client
             // posted, a message from a registered session carries the name its harness gives.
             let text = crate::node::sessions::fill_name(handle.paths(), &text);
+            // **A post too long says how long, against what, and why** (#549): a post from a
+            // session carries the session's id and name around its words, so words that fit
+            // alone may not fit with them. "That is longer than this field allows" named no field.
+            let max = crate::node::content::MAX_TEXT_LEN;
+            if text.len() > max {
+                let from_session = vox_agentcomms::envelope::Envelope::parse(&text)
+                    .is_ok_and(|e| !e.from.trim().is_empty());
+                return Frame::Error {
+                    reason: format!(
+                        "this post is {} bytes as the room keeps it{}; a post holds at most {max} \
+                         bytes (64 KiB), so it must be {} bytes shorter",
+                        text.len(),
+                        if from_session {
+                            ", with the id and name of the session posting it"
+                        } else {
+                            ""
+                        },
+                        text.len() - max
+                    ),
+                };
+            }
             // A room just joined is written to once its first sync with another member has ended
             // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
             // that rather than failing.
@@ -4156,6 +4247,33 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 envelope,
                 count,
                 for_secs,
+                session: None,
+            })
+            .await
+        {
+            Ok(row) => Frame::Shares { shares: vec![row] },
+            Err(reason) => Frame::Error { reason },
+        },
+        Request::SessionShare {
+            channel_id,
+            path,
+            envelope,
+            to,
+        } => match handle
+            .shares()
+            .start(crate::node::shares::ShareRequest {
+                channel_id,
+                path: PathBuf::from(path),
+                envelope,
+                // Into a Session: one fetch, by its node.
+                count: u64::from(matches!(to, SessionTo::Node(_))),
+                for_secs: 0,
+                session: Some(match to {
+                    SessionTo::Session(session_id) => {
+                        crate::node::shares::SessionShare::Out { session_id }
+                    }
+                    SessionTo::Node(node) => crate::node::shares::SessionShare::In { node },
+                }),
             })
             .await
         {

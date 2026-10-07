@@ -186,6 +186,9 @@ pub struct ChannelSummary {
     pub unread: usize,
     /// Unread coordination traffic (presence, progress, claims), counted only: the third level.
     pub coordination: usize,
+    /// Approvals and questions waiting on this node in Sessions it may drive here (ADR-029
+    /// CL-2).
+    pub waiting: usize,
     /// What the room needs from the person, which group the sidebar lists it under (ADR-028 W-2,
     /// #511).
     pub group: vox_agentcomms::attention::RoomGroup,
@@ -217,6 +220,11 @@ pub struct ChannelView {
     pub held_back: Vec<String>,
     /// The services shared in the room (V030-25, ADR-028 S-3).
     pub shared: Vec<SharedView>,
+    /// The room's Sessions, open and ended, newest opening first (ADR-029 CL-2).
+    pub sessions: Vec<SessionView>,
+    /// The lines of the Session on screen, for a member with drive (ADR-029 SC-1): one per
+    /// activity, in the words `vox room session` prints. Empty while none is shown.
+    pub session_lines: Vec<SessionLineView>,
     /// This channel's reachability.
     pub reachability: Reachability,
 }
@@ -232,6 +240,66 @@ pub struct SharedView {
     pub copy: String,
     /// What it needs that does not hold, each in words; empty when nothing is missing.
     pub missing: Vec<String>,
+}
+
+/// One Session in a room, as the TUI lists it (ADR-029 SE-3, CL-2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionView {
+    /// The node whose harness session it is.
+    pub node: Digest32,
+    /// The harness's own session id, as its node claims it (SE-2, MD-3).
+    pub id: String,
+    /// The session's current name, as its node claims it (MD-1); `None` when the harness gives
+    /// none.
+    pub name: Option<String>,
+    /// `codex@device-2 · gso-cap · 3f0c25bf`: this node's alias for the session's node, the
+    /// session's name, and its short id (SE-3).
+    pub label: String,
+    /// This node's alias for the session's node, as the label begins.
+    pub node_alias: String,
+    /// When it opened, seconds since the Unix epoch.
+    pub opened: u64,
+    /// When it ended, seconds since the Unix epoch; `None` while it is open (SE-5).
+    pub ended: Option<u64>,
+    /// Whether the session's node trusts this node with drive (SC-2, CL-3).
+    pub can_drive: bool,
+    /// An approval or a question in it waits on this node (CL-2).
+    pub waiting: bool,
+}
+
+/// What a driver sends a Session (ADR-029 DR-1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriveAct {
+    /// Text typed into the session as its operator.
+    Say(String),
+    /// A slash command: `/compact`, `/clear`, `/rename <name>`.
+    Slash(String),
+    /// Interrupt it (its Esc).
+    Interrupt,
+    /// Stop it (its Ctrl-C).
+    Stop,
+    /// Approve the approval request with this ref (DR-1.4).
+    Approve(String),
+    /// Reject the approval request with this ref, with the reason the model is given, if any.
+    Reject(String, Option<String>),
+    /// Answer the question request with this ref: for each question, an option's number as shown
+    /// or text typed as the answer (DR-1.5).
+    Answer(String, Vec<(crate::session_drive_ui::Question, String)>),
+}
+
+/// One activity of a Session, as the reader sees it (ADR-029 SC-1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionLineView {
+    /// The one line.
+    pub text: String,
+    /// Its full input and output, labelled, in order: Details.
+    pub details: Vec<(String, String)>,
+    /// The harness's id for the request it is about (`ref`), empty for none.
+    pub reference: String,
+    /// What it waits for from a driver: an open approval or question, or `None` (DR-1.4, DR-1.5).
+    pub waiting: Option<crate::session_cli::Waiting>,
+    /// A waiting question's questions and their options, for an answer.
+    pub questions: Vec<crate::session_drive_ui::Question>,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many
@@ -590,6 +658,23 @@ pub enum Command {
     SelectChannel {
         /// The channel now on screen, if any.
         channel_id: Option<Digest32>,
+    },
+    /// Drive the Session on screen (ADR-029 DR-1): what it is sent, said back in words.
+    Drive {
+        /// The room.
+        channel_id: Digest32,
+        /// The Session's node and the harness's session id.
+        session: (Digest32, String),
+        /// What it is sent.
+        act: DriveAct,
+    },
+    /// The Session the room's timeline now shows, by its node and session id; `None` for General
+    /// or All (ADR-029 CL-2).
+    ShowSession {
+        /// The room.
+        channel_id: Digest32,
+        /// The Session's node and the harness's session id.
+        session: Option<(Digest32, String)>,
     },
     /// Create a room under its shared name (ADR-028 R-1) with an out-of-band passphrase.
     CreateChannel {

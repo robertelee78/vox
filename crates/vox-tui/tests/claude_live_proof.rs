@@ -67,7 +67,10 @@
 
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
-optional_proof::not_run!(a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts);
+optional_proof::not_run!(
+    a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts,
+    a_live_claude_session_is_followed_answered_and_interrupted_from_vox
+);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -82,6 +85,13 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// A short root for the run's directories: a Unix socket's path must fit the platform's bound
+/// (104 bytes on macOS), which the system's temporary directory does not leave room for.
+#[cfg(target_os = "macos")]
+const SHORT_ROOT: &str = "/private/tmp/vc";
+#[cfg(not(target_os = "macos"))]
+const SHORT_ROOT: &str = "/tmp/vc";
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// The person whose room it is.
@@ -151,6 +161,17 @@ fn vox(
         .env("VOX_LISTEN", "127.0.0.1:0")
         .env_remove("VOX_ROOM")
         .env_remove("VOX_ROOM_PASSPHRASE");
+    // Nothing of a terminal or a harness session this proof did not make: a `vox` run from inside
+    // the operator's own Claude Code session would otherwise inherit its tmux pane and sockets.
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE", "VOX_SESSION"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            cmd.env_remove(&k);
+        }
+    }
     // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
     if typed::is_keyring_change(args) {
         let (ok, shown) = typed::keyring(&cmd);
@@ -413,11 +434,11 @@ fn a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts() {
         .unwrap_or_else(|| panic!("APPARATUS: HOME is unset, so the operator's files are unknown"));
 
     // ---- the run's root: short, so the daemon's socket path fits ----
-    std::fs::create_dir_all("/private/tmp/vc")
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+    std::fs::create_dir_all(SHORT_ROOT)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {SHORT_ROOT}: {e}"));
     let tmp = tempfile::Builder::new()
         .prefix("cll-")
-        .tempdir_in("/private/tmp/vc")
+        .tempdir_in(SHORT_ROOT)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let root = oc_sandbox::real(tmp.path());
     let data = root.join("vd");
@@ -785,4 +806,502 @@ fn a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts() {
         t.answer.trim()
     );
     println!("[proof] trusted turn: the model answered with the codeword {codeword}");
+}
+
+/// ADR-029 SC-1, DR-1, DR-3, DR-4 (#540, #545, #544) — **a live, interactive Claude Code session
+/// is followed, answered and interrupted from Vox**, as the person with drive does it, on the
+/// decider's request (2026-10-06: strong live signal from every harness).
+///
+/// One data root and its daemon hold `person` and the agent node `claude-a` in one room; `claude-a`
+/// trusts `person` with drive (typed at a terminal, ADR-028 K-13). The room map maps the run's work
+/// directory to the room (ADR-029 RB-1), so a session started there works in it. Claude Code runs
+/// **interactively** in a pane of a scratch tmux server (its socket under the run's root, never the
+/// operator's), the server and the pane both confined by the live-proof sandbox (`oc_sandbox`, with
+/// tmux's own install read-only), with `vox agent plugin claude --node claude-a`'s settings and the
+/// operator's access token alone (the route `a_live_claude_turn_reads_…` documents).
+///
+/// 1. **Followed**: the person's `vox room session` shows the prompt typed at the terminal and the
+///    call it makes;
+/// 2. **Answered from the Session**: the call asks permission; the person approves it with
+///    `vox room session … --approve <ref>`; Claude Code runs it (the file exists) and the Session
+///    reads "approved here";
+/// 3. **Interrupted from the Session**: during a long reply, `vox room session … --interrupt`
+///    stops it, as Esc at the terminal does: the pane shows Claude Code's interruption.
+///
+/// **Never a sign-in or trust screen**: one appears, and the run stops there as `APPARATUS`,
+/// typing nothing. **Which side a red is on**: what `vox` printed or did is `PRODUCT:`; the
+/// sandbox, tmux, the pane, or the model's own choices are `APPARATUS:` / `CANNOT MEASURE`.
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "drives a real interactive Claude Code session; optional, on the decider's request, in release"]
+fn a_live_claude_session_is_followed_answered_and_interrupted_from_vox() {
+    const AGENT: &str = "claude-a";
+    const ROOM_PASS: &str = "channel passphrase";
+    const MODEL: &str = "claude-haiku-4-5-20251001";
+    watchdog::arm_for(Duration::from_secs(1200));
+    if !oc_sandbox::live_model_allowed(
+        "claude_live_proof::a_live_claude_session_is_followed_answered_and_interrupted_from_vox",
+    ) {
+        return;
+    }
+    let (claude, claude_dir) = claude_install();
+    let real_home = watchdog::temp_home::real_home()
+        .unwrap_or_else(|| panic!("APPARATUS: HOME is unset, so the operator's files are unknown"));
+    let tmux = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("APPARATUS, CANNOT MEASURE: no tmux on this machine"));
+    // tmux's own install, read-only inside the sandbox, so the server itself runs confined.
+    let tmux_real = oc_sandbox::real(&tmux);
+    let mut tmux_dirs: Vec<PathBuf> = vec![tmux_real
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| panic!("APPARATUS: tmux's install has no directory"))];
+    for lib in ["utf8proc", "ncurses", "libevent"] {
+        let p = PathBuf::from(format!("/opt/homebrew/opt/{lib}"));
+        if p.exists() {
+            tmux_dirs.push(oc_sandbox::real(&p));
+        }
+    }
+
+    // ---- the run's root: short, so every socket path fits ----
+    std::fs::create_dir_all("/private/tmp/vc")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+    let tmp = tempfile::Builder::new()
+        .prefix("cls-")
+        .tempdir_in("/private/tmp/vc")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
+    let root = oc_sandbox::real(tmp.path());
+    let data = root.join("vd");
+    let cfg = root.join("vc");
+    let bin = root.join("bin");
+    let work = root.join("work");
+    for d in [&bin, &work] {
+        std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("APPARATUS: cannot make {d:?}: {e}"));
+    }
+    std::fs::copy(VOX, bin.join("vox"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot copy vox into the run: {e}"));
+    let tmux_bin_dir = tmux
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    // The hook finds `vox` and `tmux` (its pane claim names the tmux it runs under) on its PATH.
+    let path = format!(
+        "{}:{tmux_bin_dir}:{}",
+        bin.display(),
+        oc_sandbox::SANDBOX_PATH
+    );
+
+    // ---- two nodes, one room, drive ----
+    for node in [PERSON, AGENT] {
+        staged(&data, &cfg, node, &["node", "create", node], None);
+    }
+    let (ok, out, err) = vox(&data, &cfg, PERSON, &["node", "attach", PERSON], None);
+    let _daemon = Daemon(data.clone());
+    assert!(
+        ok,
+        "APPARATUS (staging): `vox node attach {PERSON}` (which starts the daemon) failed: {out}{err}"
+    );
+    staged(&data, &cfg, AGENT, &["node", "attach", AGENT], None);
+    let fp = |node: &str| staged(&data, &cfg, node, &["id"], None).trim().to_owned();
+    let (person_fp, agent_fp) = (fp(PERSON), fp(AGENT));
+    staged(
+        &data,
+        &cfg,
+        PERSON,
+        &["room", "create", "--passphrase-file", "-", "--name", "work"],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    let list = staged(&data, &cfg, PERSON, &["room", "list"], None);
+    let room = list
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room list` shows no room: {list:?}"))
+        .to_owned();
+    let link = staged(&data, &cfg, PERSON, &["room", "link", &room], None)
+        .trim()
+        .to_owned();
+    staged(
+        &data,
+        &cfg,
+        PERSON,
+        &["trust", "add", &agent_fp, "--name", AGENT],
+        None,
+    );
+    staged(
+        &data,
+        &cfg,
+        AGENT,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some(&format!("{ROOM_PASS}\n")),
+    );
+    staged(
+        &data,
+        &cfg,
+        AGENT,
+        &["trust", "add", &person_fp, "--name", PERSON, "--drive"],
+        None,
+    );
+    // The room map (ADR-029 RB-1): a session started in the work directory works in the room.
+    let map = data.join("rooms");
+    std::fs::write(
+        &map,
+        format!(
+            "repo {}\n    room       {link}\n    passphrase {ROOM_PASS}\n",
+            work.display()
+        ),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the room map: {e}"));
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make the room map private: {e}"));
+    }
+
+    // ---- Claude Code's config: the plugin's settings, onboarding done, the work dir trusted ----
+    let plugin = Command::new(VOX)
+        .args(["agent", "plugin", "claude", "--node", AGENT])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin claude: {e}"));
+    assert!(
+        plugin.status.success(),
+        "PRODUCT: `vox agent plugin claude --node {AGENT}` failed"
+    );
+    let h = ClaudeHome::new(&root, AGENT);
+    std::fs::write(h.config.join("settings.json"), &plugin.stdout)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write settings.json: {e}"));
+    std::fs::write(
+        h.config.join(".claude.json"),
+        serde_json::json!({
+            "hasCompletedOnboarding": true, "theme": "dark", "numStartups": 5,
+            "projects": { work.display().to_string():
+                { "hasTrustDialogAccepted": true, "hasCompletedProjectOnboarding": true } },
+        })
+        .to_string(),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write .claude.json: {e}"));
+
+    // ---- the sandbox, probed before anything runs under it ----
+    let canary = oc_sandbox::Canary::plant();
+    let profile = root.join("claude.sb");
+    let mut readable: Vec<&Path> = vec![&claude_dir];
+    readable.extend(tmux_dirs.iter().map(PathBuf::as_path));
+    std::fs::write(&profile, oc_sandbox::sandbox_profile(&[&root], &readable))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox profile: {e}"));
+    oc_sandbox::probe_profile(&profile, &canary, "claude in tmux");
+
+    if dry_run() {
+        println!(
+            "[proof] STOPPED BEFORE CLAUDE: nodes, daemon, room {room}, drive, room map, config and \
+             the sandbox probes are ready; no sign-in was read and no Claude Code was started"
+        );
+        return;
+    }
+    let token = access_token(real_home);
+
+    // ---- the scratch tmux server, confined, its pane a shell in the work directory ----
+    let socket = root.join("t.sock");
+    let env: Vec<(String, String)> = vec![
+        ("PATH".into(), path.clone()),
+        ("HOME".into(), h.home.display().to_string()),
+        ("TMPDIR".into(), h.tmp.display().to_string()),
+        ("CLAUDE_CODE_TMPDIR".into(), h.tmp.display().to_string()),
+        ("CLAUDE_CONFIG_DIR".into(), h.config.display().to_string()),
+        ("VOX_DATA_DIR".into(), data.display().to_string()),
+        ("VOX_CONFIG_DIR".into(), cfg.display().to_string()),
+        ("VOX_PROXY".into(), "127.0.0.1:0".into()),
+        ("LANG".into(), "en_US.UTF-8".into()),
+        ("TERM".into(), "xterm-256color".into()),
+        ("CLAUDE_CODE_OAUTH_TOKEN".into(), token.clone()),
+    ];
+    let tm = |args: &[&str]| -> Command {
+        let mut c = Command::new(&tmux);
+        c.env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .arg("-S")
+            .arg(&socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .args(args);
+        c
+    };
+    let started = Command::new("/usr/bin/sandbox-exec")
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .arg("-f")
+        .arg(&profile)
+        .arg(&tmux)
+        .arg("-S")
+        .arg(&socket)
+        .args([
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "160",
+            "-y",
+            "50",
+            "-c",
+        ])
+        .arg(&work)
+        .arg("/bin/sh")
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start the confined tmux server: {e}"));
+    assert!(
+        started.status.success(),
+        "APPARATUS: the confined tmux server did not start: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    struct Server(Command);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.output();
+        }
+    }
+    let _server = Server(tm(&["kill-server"]));
+    let pane = String::from_utf8_lossy(
+        &tm(&["display-message", "-p", "-t", ":0.0", "#{pane_id}"])
+            .output()
+            .unwrap_or_else(|e| panic!("APPARATUS: tmux: {e}"))
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+    let screen = || {
+        String::from_utf8_lossy(
+            &tm(&["capture-pane", "-p", "-t", &pane])
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default(),
+        )
+        .into_owned()
+    };
+    // Typed as a person types, and submitted only once it has left Claude Code's input box (the
+    // box between its last two rules): an Enter that lands while the TUI is busy is swallowed.
+    let in_box = |s: &str, text: &str| {
+        let lines: Vec<&str> = s.lines().collect();
+        let rules: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.matches('─').count() >= 20)
+            .map(|(i, _)| i)
+            .collect();
+        let tail: String = text
+            .chars()
+            .skip(text.chars().count().saturating_sub(20))
+            .collect();
+        match rules[..] {
+            [.., top, bottom] => lines[top + 1..bottom].join("").contains(tail.trim()),
+            _ => false,
+        }
+    };
+    let type_line = |text: &str| {
+        let _ = tm(&["send-keys", "-t", &pane, "-l", text]).output();
+        std::thread::sleep(Duration::from_millis(600));
+        for _ in 0..5 {
+            let _ = tm(&["send-keys", "-t", &pane, "Enter"]).output();
+            std::thread::sleep(Duration::from_millis(1500));
+            if !in_box(&screen(), text) {
+                return;
+            }
+        }
+        panic!(
+            "APPARATUS: {text:?} stayed in Claude Code's input box after five Enters:\n{}",
+            screen()
+        );
+    };
+    // Never a sign-in or trust screen: one appearing stops the run, nothing typed into it.
+    let guard = |s: &str| {
+        for bad in [
+            "Select login method",
+            "API key",
+            "Paste code",
+            "Log in to",
+            "trust this folder",
+        ] {
+            assert!(
+                !s.contains(bad),
+                "APPARATUS: Claude Code showed a sign-in or trust screen ({bad:?}); stopped \
+                 without typing into it. The pane:\n{s}"
+            );
+        }
+    };
+    let wait_screen = |what: &str, within: Duration, pred: &dyn Fn(&str) -> bool| -> String {
+        let t0 = Instant::now();
+        loop {
+            let s = screen();
+            guard(&s);
+            if pred(&s) {
+                return s;
+            }
+            assert!(
+                t0.elapsed() < within,
+                "APPARATUS: Claude Code's pane never showed {what} within {within:?}:\n{s}"
+            );
+            std::thread::sleep(Duration::from_millis(400));
+        }
+    };
+
+    // ---- Claude Code, interactive, in the pane ----
+    type_line(&format!("{} --model {MODEL}", claude.display()));
+    wait_screen("its prompt", Duration::from_secs(90), &|s| {
+        s.contains("Claude Code v")
+            && s.lines().filter(|l| l.matches('─').count() >= 20).count() >= 2
+    });
+    println!("[proof] Claude Code is up in pane {pane} of the scratch server");
+
+    let session_read = |args: &[&str]| -> (bool, String, String) {
+        let mut a = vec!["room", "session", room.as_str()];
+        a.extend_from_slice(args);
+        vox(&data, &cfg, PERSON, &a, None)
+    };
+    // ---- 1. followed ----
+    let prompt = "Run exactly this bash command and nothing else: touch approved.txt";
+    type_line(prompt);
+    let t0 = Instant::now();
+    let session = loop {
+        let (_, o, _) = vox(
+            &data,
+            &cfg,
+            PERSON,
+            &["room", "sessions", &room, "--json"],
+            None,
+        );
+        let id = o
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["harness"] == "claude" && v["open"] == true)
+            .and_then(|v| v["id"].as_str().map(str::to_owned));
+        if let Some(id) = id {
+            break id;
+        }
+        guard(&screen());
+        assert!(
+            t0.elapsed() < Duration::from_secs(90),
+            "PRODUCT: within 90 s of the prompt, {PERSON} never saw a Claude Code Session listed in \
+             the room: {o}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!("[proof] 1. the Session: {session}");
+    let t0 = Instant::now();
+    let (approval_ref, followed) = loop {
+        let (_, o, e) = session_read(&[&session, "--json"]);
+        let lines: Vec<serde_json::Value> = o
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let pending = lines.iter().find(|v| {
+            v["kind"] == "approval"
+                && v["line"].as_str().is_some_and(|l| {
+                    l.contains("touch approved.txt") && l.ends_with("approve or reject?")
+                })
+        });
+        if let Some(p) = pending {
+            break (p["ref"].as_str().unwrap_or_default().to_owned(), o);
+        }
+        guard(&screen());
+        assert!(
+            t0.elapsed() < Duration::from_secs(120),
+            "PRODUCT: within 120 s, {PERSON}'s Session never showed the approval Claude Code asked \
+             for (`touch approved.txt — approve or reject?`); it showed:\n{o}{e}\nthe pane:\n{}",
+            screen()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!("[proof] 1. the Session followed the turn:\n{followed}");
+    assert!(
+        followed.contains(&format!("typed at the terminal: {prompt}")),
+        "PRODUCT: 1. the Session must show the prompt typed at the terminal; it showed:\n{followed}"
+    );
+    let on_screen = screen();
+    println!(
+        "[proof] 2. Claude Code's own permission prompt is on its screen too: {}",
+        on_screen.contains("Do you want")
+    );
+
+    // ---- 2. answered from the Session ----
+    let (ok, said, err) = session_read(&[&session, "--approve", &approval_ref]);
+    println!(
+        "[proof] 2. --approve {approval_ref}: {}{}",
+        said.trim(),
+        err.trim()
+    );
+    assert!(
+        ok,
+        "PRODUCT: 2. the approval from the Session must be handed to Claude Code; vox said: {said}{err}"
+    );
+    let t0 = Instant::now();
+    loop {
+        let (_, plain, _) = session_read(&[&session]);
+        if work.join("approved.txt").exists() && plain.contains("approved here") {
+            println!("[proof] 2. approved.txt exists; the Session:\n{plain}");
+            break;
+        }
+        guard(&screen());
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "PRODUCT: 2. within 60 s of the approval from the Session, Claude Code must run the call \
+             (approved.txt exists: {}) and the Session read \"approved here\"; it read:\n{plain}\nthe \
+             pane:\n{}",
+            work.join("approved.txt").exists(),
+            screen()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // ---- 3. interrupted from the Session ----
+    let story = "Write a 600-word story about a lighthouse keeper. Do not use any tools.";
+    type_line(story);
+    // The reply is under way once the Session shows the prompt (its hook ran) and a moment passed.
+    let t0 = Instant::now();
+    loop {
+        let (_, plain, _) = session_read(&[&session]);
+        if plain.contains("typed at the terminal: Write a 600-word story") {
+            break;
+        }
+        guard(&screen());
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "PRODUCT: 3. the Session never showed the second prompt typed at the terminal:\n{plain}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let (ok, said, err) = session_read(&[&session, "--interrupt"]);
+    println!("[proof] 3. --interrupt: {}{}", said.trim(), err.trim());
+    assert!(
+        ok,
+        "PRODUCT: 3. the interrupt from the Session must be delivered to its terminal; vox said: \
+         {said}{err}"
+    );
+    let stopped = wait_screen("the interruption", Duration::from_secs(20), &|s| {
+        s.contains("Interrupted")
+    });
+    println!(
+        "[proof] 3. the pane after the interrupt says: {}",
+        stopped
+            .lines()
+            .find(|l| l.contains("Interrupted"))
+            .unwrap_or_default()
+            .trim()
+    );
+
+    // ---- leave: Claude Code's own exit, then the server ----
+    type_line("/exit");
+    std::thread::sleep(Duration::from_secs(3));
+    let (files, holding) = files_holding(&root, &[&token, &canary.text]);
+    drop(token);
+    println!(
+        "[proof] every file the run left under its root ({files} files) searched for the token and \
+         the canary: {} hold either",
+        holding.len()
+    );
+    assert!(
+        holding.is_empty(),
+        "APPARATUS: the sign-in token or the canary was written to {holding:?} under the run's root"
+    );
 }

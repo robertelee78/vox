@@ -40,7 +40,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use support::{post_raw, resource, until, Out, Worker, HARNESS_SESSION_VARS, VOX};
+use support::{post_raw, resource, until, Out, Worker, VOX};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -84,9 +84,7 @@ impl Consumer {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        for v in HARNESS_SESSION_VARS {
-            cmd.env_remove(v);
-        }
+        support::strip_harness_env(&mut cmd);
         let mut child = cmd
             .spawn()
             .unwrap_or_else(|e| panic!("APPARATUS: could not spawn `vox room tail`: {e}"));
@@ -383,9 +381,7 @@ fn a_retry_is_one_operation_and_a_conflict_is_explicit() {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-            for v in HARNESS_SESSION_VARS {
-                cmd.env_remove(v);
-            }
+            support::strip_harness_env(&mut cmd);
             cmd.env("VOX_SESSION", "a1");
             cmd.spawn()
                 .unwrap_or_else(|e| panic!("APPARATUS: could not spawn racer {n}: {e}"))
@@ -477,9 +473,7 @@ fn a_conflict_that_lands_after_the_lookup_is_found_by_the_read_back() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for v in HARNESS_SESSION_VARS {
-        cmd.env_remove(v);
-    }
+    support::strip_harness_env(&mut cmd);
     cmd.env("VOX_SESSION", "a1");
     let mut held = cmd
         .spawn()

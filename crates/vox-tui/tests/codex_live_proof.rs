@@ -73,7 +73,10 @@
 
 #[path = "support/optional_proof.rs"]
 mod optional_proof;
-optional_proof::not_run!(a_live_codex_turn_reads_the_room_only_through_a_trusted_hook);
+optional_proof::not_run!(
+    a_live_codex_turn_reads_the_room_only_through_a_trusted_hook,
+    a_live_codex_session_is_mirrored_and_driven
+);
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
@@ -81,10 +84,20 @@ mod watchdog;
 #[path = "support/oc_sandbox.rs"]
 mod oc_sandbox;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// A short root for the run's directories: a Unix socket's path must fit the platform's bound
+/// (104 bytes on macOS), which the system's temporary directory does not leave room for.
+#[cfg(target_os = "macos")]
+const SHORT_ROOT: &str = "/private/tmp/vc";
+#[cfg(not(target_os = "macos"))]
+const SHORT_ROOT: &str = "/tmp/vc";
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// The agent's own node (ADR-026 N-6): `<harness>-<host>`, as the skill names it.
@@ -128,7 +141,15 @@ fn dry_run() -> bool {
 }
 
 fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, String, String) {
+    // A cleared environment: nothing of a real harness's terminal (`TMUX*`, `CLAUDE*`, `CODEX*`,
+    // `OPENCODE*`) reaches a `vox` here, or the daemon it starts.
+    let home = data.with_file_name("home");
+    let _ = std::fs::create_dir_all(&home);
     let mut child = Command::new(VOX)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("VOX_PROXY", "127.0.0.1:0")
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
@@ -445,11 +466,11 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         .unwrap_or_else(|_| panic!("APPARATUS: ~/.codex/auth.json is not JSON"));
 
     // ---- the run's root: short, so the node's socket sits in its profile ----
-    std::fs::create_dir_all("/private/tmp/vc")
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+    std::fs::create_dir_all(SHORT_ROOT)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {SHORT_ROOT}: {e}"));
     let tmp = tempfile::Builder::new()
         .prefix("cxl-")
-        .tempdir_in("/private/tmp/vc")
+        .tempdir_in(SHORT_ROOT)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let root = oc_sandbox::real(tmp.path());
     let data = root.join("vd");
@@ -525,6 +546,8 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
 
     // ---- two isolated Codex homes, each with exactly what `vox agent plugin codex` prints ----
     let plugin = Command::new(VOX)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
         .args(["agent", "plugin", "codex", "--node", NODE])
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin codex: {e}"));
@@ -745,4 +768,651 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         t.answer.trim()
     );
     println!("[proof] trusted turn: the model answered with the codeword {codeword}");
+}
+
+// ---- ADR-029 #541, #544: a live Codex session's Session, read and driven -----------------------
+
+/// The person whose room it is, with drive on the agent's node.
+const PERSON: &str = "person";
+
+/// What the live session is asked first: one shell command the read-only sandbox refuses, so
+/// Codex asks approval for it, and a one-word reply.
+const SESSION_PROMPT: &str = "Use one shell command to create the file e1 containing vox-live \
+                              (ask for approval if the sandbox blocks it), then reply with only \
+                              the word done.";
+
+/// What the person types into the session from Vox: a turn long enough to interrupt.
+const LONG_TURN: &str =
+    "Run the shell command `sleep 120` and then reply with only the word slept.";
+
+/// `vox` as `node` in the run's data root. A keyring change is typed at a terminal, as a person
+/// types it (ADR-028 K-13).
+fn vox_as(
+    data: &Path,
+    cfg: &Path,
+    node: &str,
+    args: &[&str],
+    input: Option<&str>,
+) -> (bool, String) {
+    // **A cleared environment** (the lead, 2026-10-07): this process may run beneath a real
+    // harness's terminal, so nothing of its `TMUX*`, `CLAUDE*`, `CODEX*` or `OPENCODE*` (nor a
+    // messaging socket or an app-server it names) may reach a `vox` here, the daemon it starts
+    // above all: a session registered from them could be driven into a real one.
+    let home = data.with_file_name("home");
+    let _ = std::fs::create_dir_all(&home);
+    let mut cmd = Command::new(VOX);
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("LANG", "en_US.UTF-8")
+        .args(args)
+        .env("VOX_DATA_DIR", data)
+        .env("VOX_CONFIG_DIR", cfg)
+        .env(
+            "VOX_IDENTITY_PASSPHRASE",
+            format!("the {node} node's identity passphrase"),
+        )
+        .env("VOX_NODE", node)
+        .env("VOX_LISTEN", "127.0.0.1:0")
+        .env("VOX_PROXY", "127.0.0.1:0")
+        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM_PASSPHRASE");
+    if typed::is_keyring_change(args) {
+        return typed::keyring(&cmd);
+    }
+    let mut child = cmd
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start `vox {}`: {e}", args.join(" ")));
+    if let (Some(text), Some(mut pipe)) = (input, child.stdin.take()) {
+        let _ = pipe.write_all(text.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("APPARATUS: `vox {}`: {e}", args.join(" ")));
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+fn staged_as(data: &Path, cfg: &Path, node: &str, args: &[&str], input: Option<&str>) -> String {
+    let (ok, said) = vox_as(data, cfg, node, args, input);
+    assert!(
+        ok,
+        "APPARATUS (staging): `vox {}` as {node} failed: {said}",
+        args.join(" ")
+    );
+    said
+}
+
+/// Where Codex's app-server for `codex_home` puts its socket: `<CODEX_HOME>/app-server-control/
+/// app-server-control.sock` is a link to `/private/tmp/codex-daemon-<uid>/<sha256 of that path>`
+/// (read from Codex 0.160.1's behaviour, 2026-10-06). The sandbox lets the run write that one
+/// socket and its lock, and nothing else there.
+fn codex_daemon_socket(codex_home: &Path) -> PathBuf {
+    use sha2::Digest as _;
+    let link = codex_home.join("app-server-control/app-server-control.sock");
+    let hash = sha2::Sha256::digest(link.display().to_string().as_bytes());
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    let uid = Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot read this user's id: {e}"));
+    PathBuf::from(format!("/private/tmp/codex-daemon-{uid}/{hex}"))
+}
+
+/// Codex's interactive TUI under a pty (`tests/pty/live_tui.py`), one JSON line per command.
+struct Tui {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<String>,
+    /// What the terminal drew, and where a copy is kept once the run's directory is gone.
+    screen: PathBuf,
+    keep: PathBuf,
+}
+
+impl Tui {
+    fn ask(&mut self, command: &str, within: Duration) -> serde_json::Value {
+        writeln!(self.stdin, "{command}")
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot drive Codex's terminal: {e}"));
+        let line = self.lines.recv_timeout(within).unwrap_or_else(|e| {
+            panic!(
+                "APPARATUS: Codex's terminal driver did not answer {command:?} in {within:?}: {e}"
+            )
+        });
+        let v: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("APPARATUS: the terminal driver said {line:?}: {e}"));
+        if let Some(what) = v.get("login") {
+            panic!(
+                "APPARATUS, CANNOT MEASURE: Codex showed a sign-in or trust screen ({what}); \
+                 nothing was typed into it, and the run stops here"
+            );
+        }
+        v
+    }
+
+    fn type_line(&mut self, text: &str) {
+        self.ask(&format!("type {text}"), Duration::from_secs(60));
+        self.ask("key enter", Duration::from_secs(10));
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        self.keep();
+        let _ = writeln!(self.stdin, "quit");
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(10) {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Tui {
+    /// Keep what the terminal drew outside the run's directory, and say where.
+    fn keep(&self) {
+        if std::fs::copy(&self.screen, &self.keep).is_ok() {
+            println!(
+                "[proof] what the terminal drew is kept at {}",
+                self.keep.display()
+            );
+        }
+    }
+}
+
+/// The person's view of Session `id`: its plain lines, and its JSON lines.
+fn session_view(data: &Path, cfg: &Path, room: &str, id: &str) -> (String, Vec<serde_json::Value>) {
+    let (_, plain) = vox_as(data, cfg, PERSON, &["room", "session", room, id], None);
+    let (_, json) = vox_as(
+        data,
+        cfg,
+        PERSON,
+        &["room", "session", room, id, "--json"],
+        None,
+    );
+    let json = json
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    (plain, json)
+}
+
+/// Wait until Session `id` shows a line `pred` takes, within `within`: the plain view then.
+fn session_until(
+    data: &Path,
+    cfg: &Path,
+    room: &str,
+    id: &str,
+    within: Duration,
+    what: &str,
+    pred: impl Fn(&str, &[serde_json::Value]) -> bool,
+) -> (String, Vec<serde_json::Value>) {
+    let deadline = Instant::now() + within;
+    loop {
+        let (plain, json) = session_view(data, cfg, room, id);
+        if pred(&plain, &json) {
+            return (plain, json);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: within {within:?}, {PERSON} (with drive) never read {what} in the live Codex \
+             session's Session; `vox room session` said:\n{plain}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(feature = "optional-proofs")]
+#[test]
+#[ignore = "drives a live Codex session's model turns; optional, on the decider's request, in release"]
+fn a_live_codex_session_is_mirrored_and_driven() {
+    watchdog::arm_for(Duration::from_secs(1200));
+    if !oc_sandbox::live_model_allowed(
+        "codex_live_proof::a_live_codex_session_is_mirrored_and_driven",
+    ) {
+        return;
+    }
+    let (codex, codex_release) = codex_install();
+    let real_home = watchdog::temp_home::real_home()
+        .unwrap_or_else(|| panic!("APPARATUS: HOME is unset, so Codex's sign-in cannot be found"));
+    let auth_src = real_home.join(".codex/auth.json");
+    let auth_bytes = std::fs::read(&auth_src).unwrap_or_else(|_| {
+        panic!("CANNOT MEASURE: no ~/.codex/auth.json, so no Codex turn can run; sign in to Codex")
+    });
+
+    // ---- the run's root: short, for the sockets under it ----
+    std::fs::create_dir_all("/private/tmp/vc")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+    let tmp = tempfile::Builder::new()
+        .prefix("cxs-")
+        .tempdir_in("/private/tmp/vc")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
+    let root = oc_sandbox::real(tmp.path());
+    let (data, cfg, bin, work) = (
+        root.join("vd"),
+        root.join("vc"),
+        root.join("bin"),
+        root.join("work"),
+    );
+    for d in [&bin, &work] {
+        std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("APPARATUS: cannot make {d:?}: {e}"));
+    }
+    std::fs::copy(VOX, bin.join("vox"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot copy vox into the run: {e}"));
+    let path = format!("{}:{}", bin.display(), oc_sandbox::SANDBOX_PATH);
+
+    // ---- (1) the person and the agent's node, one room, the agent trusting the person with drive
+    for node in [PERSON, NODE] {
+        staged_as(&data, &cfg, node, &["node", "create", node], None);
+    }
+    let (ok, said) = vox_as(&data, &cfg, PERSON, &["node", "attach", PERSON], None);
+    let _daemon = Daemon(data.clone());
+    assert!(
+        ok,
+        "APPARATUS (staging): `vox node attach {PERSON}` failed: {said}"
+    );
+    staged_as(&data, &cfg, NODE, &["node", "attach", NODE], None);
+    staged_as(
+        &data,
+        &cfg,
+        PERSON,
+        &["room", "create", "--passphrase-file", "-", "--name", "work"],
+        Some("room passphrase\n"),
+    );
+    let list = staged_as(&data, &cfg, PERSON, &["room", "list"], None);
+    let room = list
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room list` shows no room: {list:?}"))
+        .to_owned();
+    let said = staged_as(&data, &cfg, PERSON, &["room", "link", &room], None);
+    let link = said
+        .split_whitespace()
+        .find(|w| w.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room link` printed no link: {said}"))
+        .to_owned();
+    let person_fp = staged_as(&data, &cfg, PERSON, &["id"], None)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let agent_fp = staged_as(&data, &cfg, NODE, &["id"], None)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    staged_as(
+        &data,
+        &cfg,
+        PERSON,
+        &["trust", "add", &agent_fp, "--name", NODE],
+        None,
+    );
+    staged_as(
+        &data,
+        &cfg,
+        NODE,
+        &["room", "join", "--passphrase-file", "-", &link],
+        Some("room passphrase\n"),
+    );
+    staged_as(
+        &data,
+        &cfg,
+        NODE,
+        &["trust", "add", &person_fp, "--name", PERSON, "--drive"],
+        None,
+    );
+    println!("[proof] (1) room {room}: {NODE} trusts {PERSON} with drive");
+
+    // ---- (2) Codex's home: Vox's hooks, trusted through Codex's own RPCs; its app-server ----
+    let h = CodexHome::new(&root, "s");
+    let plugin = Command::new(VOX)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .args(["agent", "plugin", "codex", "--node", NODE])
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin codex: {e}"));
+    assert!(
+        plugin.status.success(),
+        "PRODUCT: `vox agent plugin codex --node {NODE}` failed"
+    );
+    std::fs::write(h.codex_home.join("hooks.json"), &plugin.stdout)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write hooks.json: {e}"));
+    std::fs::write(
+        h.codex_home.join("config.toml"),
+        format!(
+            "approval_policy = \"on-request\"\nsandbox_mode = \"read-only\"\n\
+             cli_auth_credentials_store = \"file\"\nmodel_reasoning_effort = \"low\"\n\
+             [projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            work.display()
+        ),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write config.toml: {e}"));
+    let out = h
+        .command(Path::new(VOX), &path, &data, &cfg)
+        .args(["agent", "trust", "codex", "--codex"])
+        .arg(&codex)
+        .output()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent trust codex: {e}"));
+    assert!(
+        out.status.success(),
+        "PRODUCT (staging): `vox agent trust codex` failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let socket = codex_daemon_socket(&h.codex_home);
+    let lock = PathBuf::from(format!("{}.lock", socket.display()));
+    let canary = oc_sandbox::Canary::plant();
+    let profile = root.join("codex.sb");
+    std::fs::write(
+        &profile,
+        // The run's own app-server socket and its lock, which Codex keeps outside CODEX_HOME:
+        // these two paths alone, by name (they do not exist yet, so they cannot be resolved).
+        format!(
+            "{}(allow file-read-data file-write* (literal {:?}) (literal {:?}))\n\
+             (allow network-outbound (remote unix-socket (path-literal {:?})))\n",
+            oc_sandbox::sandbox_profile(&[&root], &[&codex_release]),
+            socket.display().to_string(),
+            lock.display().to_string(),
+            socket.display().to_string(),
+        ),
+    )
+    .unwrap_or_else(|e| panic!("APPARATUS: cannot write the sandbox profile: {e}"));
+    oc_sandbox::probe_profile(&profile, &canary, "codex session");
+
+    let auth = h.codex_home.join("auth.json");
+    let credential = CodexSignIn::copy(&auth_src, &auth, &auth_bytes);
+    let signin = std::rc::Rc::clone(&credential.outcome);
+    let server_log = root.join("app-server.log");
+    let mut server = h.command(Path::new("/usr/bin/sandbox-exec"), &path, &data, &cfg);
+    server
+        .arg("-f")
+        .arg(&profile)
+        .arg(&codex)
+        .args(["app-server", "--listen", "unix://"])
+        // Codex runs the hooks here: they register the session in this room (ADR-029 RB-2).
+        .env("VOX_ROOM", &room)
+        .current_dir(&work)
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&server_log).unwrap_or_else(|e| panic!("APPARATUS: {e}")))
+        .stderr(Stdio::from(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&server_log)
+                .unwrap_or_else(|e| panic!("APPARATUS: {e}")),
+        ));
+    let server = server
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start codex app-server: {e}"));
+    // Stopped by its own PID however the proof ends.
+    struct Stopped(std::process::Child);
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let server = Stopped(server);
+    let control = h
+        .codex_home
+        .join("app-server-control/app-server-control.sock");
+    let t0 = Instant::now();
+    while std::os::unix::net::UnixStream::connect(&control).is_err() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "APPARATUS: Codex's app-server never listened at {control:?}; its log:\n{}",
+            std::fs::read_to_string(&server_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!("[proof] (2) Codex's app-server listens; Vox's hooks are trusted");
+
+    // ---- (3) the operator's session: a plain `codex` in a terminal, which joins it ----
+    let screen = root.join("tui.screen");
+    let driver = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty/live_tui.py");
+    let mut tui_cmd = h.command(
+        Path::new("python3"),
+        &format!("{path}:/usr/bin"),
+        &data,
+        &cfg,
+    );
+    tui_cmd
+        .arg(&driver)
+        .arg(&screen)
+        .args(["/usr/bin/sandbox-exec", "-f"])
+        .arg(&profile)
+        .arg(&codex)
+        .args(["--no-alt-screen", "-C"])
+        .arg(&work)
+        .env("TERM", "xterm-256color")
+        .env("VOX_ROOM", &room)
+        .current_dir(&work)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = tui_cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot start Codex's terminal: {e}"));
+    let stdin = child
+        .stdin
+        .take()
+        .expect("APPARATUS: the terminal driver's stdin");
+    let out = child
+        .stdout
+        .take()
+        .expect("APPARATUS: the terminal driver's stdout");
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let keep = PathBuf::from(format!(
+        "/private/tmp/vc/kept-{}-tui.screen",
+        std::process::id()
+    ));
+    let mut tui = Tui {
+        child,
+        stdin,
+        lines,
+        screen: screen.clone(),
+        keep,
+    };
+    tui.ask("wait 30 (?i)(context|codex)", Duration::from_secs(60));
+    std::thread::sleep(Duration::from_secs(3));
+    tui.type_line(SESSION_PROMPT);
+    println!("[proof] (3) the operator typed the first prompt at Codex's terminal");
+
+    // The session's id, as its Session names it.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let id = loop {
+        let (_, json) = vox_as(
+            &data,
+            &cfg,
+            PERSON,
+            &["room", "sessions", &room, "--json"],
+            None,
+        );
+        let found = json
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|s| s["harness"] == "codex" && s["open"] == true)
+            .and_then(|s| s["id"].as_str().map(str::to_owned));
+        if let Some(id) = found {
+            break id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: within 120 s of the operator's first prompt, no open Codex Session appeared \
+             in room {room}; `vox room sessions` said:\n{json}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    println!("[proof] (3) Session {id} is open");
+
+    // ---- (4) the approval waits in the Session; the person approves it from Vox ----
+    let (plain, json) = session_until(
+        &data,
+        &cfg,
+        &room,
+        &id,
+        Duration::from_secs(240),
+        "an approval waiting",
+        |p, _| p.contains("approve or reject?"),
+    );
+    println!("[proof] (4) Session {id} while the approval waits:\n{plain}");
+    let reference = json
+        .iter()
+        .find(|l| l["kind"] == "approval" && l["waiting"] == true)
+        .and_then(|l| l["ref"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: the waiting approval's line in `vox room session --json` names no ref, \
+                 so a person cannot answer it from Vox: {json:?}"
+            )
+        });
+    let (ok, said) = vox_as(
+        &data,
+        &cfg,
+        PERSON,
+        &["room", "session", &room, &id, "--approve", &reference],
+        None,
+    );
+    println!("[proof] (4) {PERSON} --approve {reference}: {said}");
+    assert!(
+        ok,
+        "PRODUCT: approving from the Session must be handed to the session; it said: {said}"
+    );
+    let (plain, _) = session_until(
+        &data,
+        &cfg,
+        &room,
+        &id,
+        Duration::from_secs(240),
+        "the turn's end",
+        |p, _| p.contains("approved here") && p.contains("— turn ended —"),
+    );
+    println!("[proof] (4) Session {id} after the turn:\n{plain}");
+    assert!(
+        work.join("e1").is_file(),
+        "PRODUCT: Codex reads the approval as given in Vox, yet the command it approved did not \
+         run: no {:?}",
+        work.join("e1")
+    );
+
+    // ---- (5) the person types a long turn into the session from Vox, then interrupts it ----
+    let (ok, said) = vox_as(
+        &data,
+        &cfg,
+        PERSON,
+        &["room", "session", &room, &id, "--say", LONG_TURN],
+        None,
+    );
+    println!("[proof] (5) {PERSON} --say: {said}");
+    assert!(
+        ok,
+        "PRODUCT: typed text from Vox must reach the idle session; it said: {said}"
+    );
+    session_until(
+        &data,
+        &cfg,
+        &room,
+        &id,
+        Duration::from_secs(240),
+        "the typed turn running its command",
+        // The command itself running, not only the prompt that asks for it: an interrupt is
+        // for a turn at work.
+        |p, _| {
+            p.contains("typed in Vox by")
+                && p.lines()
+                    .any(|l| l.starts_with("command:") && l.contains("sleep 120"))
+        },
+    );
+    let tui_saw = tui.ask(r"wait 60 sleep\s*120", Duration::from_secs(90));
+    println!("[proof] (5) Codex's own terminal shows the typed turn: {tui_saw}");
+    let (ok, said) = vox_as(
+        &data,
+        &cfg,
+        PERSON,
+        &["room", "session", &room, &id, "--interrupt"],
+        None,
+    );
+    println!("[proof] (5) {PERSON} --interrupt: {said}");
+    assert!(
+        ok,
+        "PRODUCT: an interrupt from Vox must reach the running turn; it said: {said}"
+    );
+    let started = Instant::now();
+    let (plain, _) = session_until(
+        &data,
+        &cfg,
+        &room,
+        &id,
+        Duration::from_secs(60),
+        "the interrupted turn's end, its command stopped",
+        |p, _| interrupted_turn_ended(p),
+    );
+    println!(
+        "[proof] (5) the interrupted turn ended {:.1}s after the interrupt (its command sleeps \
+         120 s):\n{plain}",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        tui_saw["found"] == true,
+        "PRODUCT: both surfaces stay live (DR-3): the operator's own terminal never showed the \
+         turn typed in Vox"
+    );
+
+    // ---- the end: the operator quits; the sign-in copy goes; nothing leaked ----
+    tui.type_line("/quit");
+    drop(tui);
+    drop(server);
+    drop(credential);
+    let signin = signin.borrow().clone().unwrap_or_default();
+    println!("[proof] the sign-in: {signin}; copy removed");
+    for (what, text) in [
+        (
+            "terminal",
+            std::fs::read_to_string(&screen).unwrap_or_default(),
+        ),
+        (
+            "app-server log",
+            std::fs::read_to_string(&server_log).unwrap_or_default(),
+        ),
+        ("session logs", session_logs(&h.codex_home.join("sessions"))),
+        ("Session", plain),
+    ] {
+        canary.check(&text, &format!("the live Codex session's {what}"));
+    }
+    assert!(
+        signin == "unchanged" || signin.ends_with("the operator's file was updated"),
+        "APPARATUS: {signin}"
+    );
+}
+
+/// Whether the Session shows the turn's end after the interrupt that caused it: the interrupt's
+/// line, then "— turn ended —".
+fn interrupted_turn_ended(plain: &str) -> bool {
+    plain
+        .split_once("interrupt sent by")
+        .is_some_and(|(_, after)| after.contains("— turn ended —"))
 }

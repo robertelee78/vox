@@ -14,6 +14,15 @@
 //! 2. `tail --since <before the first> --json` every one of them;
 //! 3. answer `board --json`, which folds the whole room.
 //!
+//! alice posts as a person does, with no session: such a post is kept as its words alone. A
+//! post from a session carries the session's id and name around its words (ADR-029 MD-1), so
+//! the largest words alone do not fit with them:
+//!
+//! 4. the same 64 KiB posted as a session is refused, saying how long it is as the room keeps it,
+//!    that the session's id and name are in that, the most a post holds, and by how much to
+//!    shorten it. It said "that is longer than this field allows" (#549). Mutant: those words
+//!    back: red PRODUCT.
+//!
 //! The maximum row is the bound a page relies on: a reply always carries at least
 //! one row, so the largest row must fit a frame by itself.
 //!
@@ -32,7 +41,7 @@ use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use support::{until, Out, HARNESS_SESSION_VARS, VOX};
+use support::{until, Out, VOX};
 
 /// Rows of this many bytes of body, and how many: 5 MiB, twenty frames' worth.
 const ROW: usize = 32 * 1024;
@@ -82,13 +91,37 @@ fn a_room_past_one_frame_of_history_reads_whole() {
     }
     sent.push(body(ROWS, MAX_TEXT));
     for b in &sent {
-        let o = alice.vox_in(Some("a1"), &["room", "post", r, "-"], Some(b));
+        let o = alice.vox_in(None, &["room", "post", r, "-"], Some(b));
         assert!(
             o.ok,
             "PRODUCT (staging): alice's `vox room post` of {} bytes was refused: {o:?}",
             b.len()
         );
     }
+    // 4. The largest words, posted as a session.
+    let as_session = alice.vox_in(
+        Some("a1"),
+        &["room", "post", r, "-"],
+        Some(&body(0, MAX_TEXT)),
+    );
+    let over = as_session
+        .stderr
+        .split("this post is ")
+        .nth(1)
+        .and_then(|t| t.split(' ').next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(0);
+    let told = &as_session.stderr;
+    assert!(
+        !as_session.ok
+            && over > MAX_TEXT
+            && told.contains("with the id and name of the session posting it")
+            && told.contains(&format!("a post holds at most {MAX_TEXT} bytes"))
+            && told.contains(&format!("{} bytes shorter", over - MAX_TEXT)),
+        "PRODUCT: words that fill a post refused as a session's must be told how long the post is \
+         with the session's id and name, the most a post holds, and by how much to shorten it; \
+         vox said: {as_session:?}"
+    );
     let total: usize = sent.iter().map(String::len).sum();
     assert!(
         total >= 1024 * 1024,
@@ -139,9 +172,7 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for v in HARNESS_SESSION_VARS {
-        cmd.env_remove(v);
-    }
+    support::strip_harness_env(&mut cmd);
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} room tail: {e}"));

@@ -339,14 +339,16 @@ fn judge(
         return;
     }
     // **A message wakes the agents of the nodes it addresses** (V210-161): `to` names nodes by
-    // fingerprint, and every session of this node hears every room it holds.
+    // fingerprint, and every session of this node hears every room it holds; an entry
+    // `<fingerprint>/<session id>` wakes that one session alone (ADR-029 TA-3).
     let Some(me) = view.identity.as_ref().map(|i| i.fingerprint) else {
         return;
     };
-    if !envelope.may_interrupt(&vox_core::node::link::b32_encode(&me)) {
-        return;
-    }
+    let me_fp = vox_core::node::link::b32_encode(&me);
     for session in crate::wake::registered(paths) {
+        if !crate::wake::wakes(&envelope, &me_fp, &session.session) {
+            continue;
+        }
         if row.author == me && envelope.from == session.session {
             continue;
         }

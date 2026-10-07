@@ -99,6 +99,7 @@ impl OpenCodeMirror {
             finished: BTreeSet::new(),
             asks: BTreeMap::new(),
             model: None,
+            ended: false,
             next_id: 1,
             calls: BTreeMap::new(),
             answers: tx,
@@ -157,6 +158,9 @@ struct Follow {
     asks: BTreeMap<String, Ask>,
     /// The provider and model of the session's last assistant message, which /compact needs.
     model: Option<(String, String)>,
+    /// Whether the last thing posted was a turn's end: OpenCode reports a session idle more than
+    /// once around an abort, and one turn ends once.
+    ended: bool,
     next_id: u64,
     calls: BTreeMap<u64, (oneshot::Sender<Result<String, String>>, String)>,
     /// Where a member's first answer comes back to this loop.
@@ -399,8 +403,9 @@ impl Follow {
         m
     }
 
-    fn post(&self, bodies: Vec<String>) {
+    fn post(&mut self, bodies: Vec<String>) {
         if !bodies.is_empty() {
+            self.ended = false;
             self.sink.activity(&self.node, &self.session, bodies, None);
         }
     }
@@ -459,13 +464,22 @@ impl Follow {
                     }
                 }
             }
-            "message.part.updated" => self.part(&sid, &p["part"]),
+            "message.part.updated" => {
+                self.part(&sid, &p["part"]);
+            }
             "session.idle" if sid == self.session => {
                 self.flush_replies();
-                self.post(split(self.envelope(&sid, "turn-end", None), ""));
+                if !self.ended {
+                    self.post(split(self.envelope(&sid, "turn-end", None), ""));
+                    self.ended = true;
+                }
             }
-            "permission.asked" => self.permission(&sid, p),
-            "question.asked" => self.question(&sid, p),
+            "permission.asked" => {
+                self.permission(&sid, p);
+            }
+            "question.asked" => {
+                self.question(&sid, p);
+            }
             "permission.replied" => {
                 let Some(r) = p.get("requestID").and_then(Value::as_str) else {
                     return;

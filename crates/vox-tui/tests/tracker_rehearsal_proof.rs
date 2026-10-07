@@ -76,7 +76,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use support::{Out, Worker, HARNESS_SESSION_VARS, VOX};
+use support::{Out, Worker, VOX};
 
 fn which(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -301,9 +301,7 @@ impl Adapter {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        for v in HARNESS_SESSION_VARS {
-            cmd.env_remove(v);
-        }
+        support::strip_harness_env(&mut cmd);
         let mut child = cmd.spawn().expect("APPARATUS: tail");
         let out = child
             .stdout

@@ -956,6 +956,15 @@ enum AgentCmd {
     /// Session ends in the room it worked in and opens in this one. The room is one the
     /// node holds. A session works in one room at a time.
     Room(AgentRoomArgs),
+    /// Send a file or folder out of this session's Session (ADR-029 DR-1.8).
+    ///
+    /// Run from the session. Only the members this node trusts with drive learn of it and are
+    /// served it; their nodes pull it by themselves. Nothing is posted to the room.
+    ///
+    /// ```text
+    /// vox agent send ./report.pdf --note "the numbers you asked for"
+    /// ```
+    Send(AgentSendArgs),
 }
 
 /// `vox agent doctor`
@@ -1041,6 +1050,25 @@ pub struct AgentPluginArgs {
     pub node: String,
 }
 
+/// `vox agent send`
+#[derive(Args, Debug, Clone)]
+pub struct AgentSendArgs {
+    #[command(flatten)]
+    pub profile: AccountArgs,
+    /// The file or folder to send.
+    pub path: std::path::PathBuf,
+    /// A note sent with it.
+    #[arg(long)]
+    pub note: Option<String>,
+    /// The agent's own node, as its hook names it; `VOX_NODE` in the session's environment.
+    #[arg(long, env = "VOX_NODE", required = true)]
+    pub node: String,
+    /// The harness session whose Session it goes out of; else `VOX_SESSION`, or the harness's own
+    /// id.
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
 /// `vox agent room`
 #[derive(Args, Debug, Clone)]
 pub struct AgentRoomArgs {
@@ -1119,6 +1147,9 @@ pub struct RoomSessionArgs {
     /// drive. Each input reaches that session alone, or is refused with the reason.
     #[command(flatten)]
     pub drive: SessionDriveArgs,
+    /// A note the session is told with the file `--file` sends it.
+    #[arg(long, value_name = "TEXT", requires = "file")]
+    pub note: Option<String>,
 }
 
 /// What `vox room session` sends to the session, when it drives it: at most one of these.
@@ -1147,6 +1178,10 @@ pub struct SessionDriveArgs {
     /// question (a question by its id or its text; several choices joined with ", ").
     #[arg(long, value_name = "REF", num_args = 2..)]
     pub answer: Option<Vec<String>>,
+    /// Send the session a file (ADR-029 DR-1.7): it lands on its node, and the session is told
+    /// where. Only its node is served it.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<std::path::PathBuf>,
 }
 
 impl SessionDriveArgs {
@@ -2294,6 +2329,16 @@ pub fn run() -> ExitCode {
                             crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
                         }
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::Session(a) if a.drive.file.is_some() => {
+                            crate::drive::run_file(
+                                &paths,
+                                &a.room,
+                                &a.session,
+                                a.drive.file.as_deref().unwrap_or(std::path::Path::new("")),
+                                a.note.as_deref(),
+                            )
+                            .await
+                        }
                         RoomCmd::Session(a) => match a.drive.action() {
                             Err(e) => Err(crate::app::AppError::Usage(e)),
                             Ok(Some(action)) => {
@@ -2601,6 +2646,34 @@ pub fn run() -> ExitCode {
             // Not `rt` dropping: stdin's reader thread may still be blocked in a read, and
             // the runtime would wait for it.
             rt.shutdown_background();
+            match outcome {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Agent(AgentCmd::Send(args)) => {
+            let outcome = vox_core::node::paths::NodeName::parse(&args.node)
+                .map_err(AppError::from)
+                .and_then(|node| {
+                    let account = vox_core::node::paths::Account::of(
+                        args.profile.data_dir.as_deref(),
+                        args.profile.config_dir.as_deref(),
+                    )?;
+                    vox_core::node::layout::refuse_old_layout(&account)?;
+                    block_on_client(async move {
+                        crate::agent_send::run(
+                            &account,
+                            &node,
+                            args.session.as_deref(),
+                            &args.path,
+                            args.note.as_deref(),
+                        )
+                        .await
+                    })
+                });
             match outcome {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

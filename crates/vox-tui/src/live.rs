@@ -121,6 +121,19 @@ pub struct DaemonCore {
     asked: Option<Instant>,
     /// The room on screen (drives `ViewModel::active` and unread resets).
     active: Option<Digest32>,
+    /// The Session the room's timeline shows: its room, node and session id (ADR-029 CL-2).
+    shown_session: Option<(Digest32, Digest32, String)>,
+    /// Its lines, as last read, for a member with drive (SC-1).
+    session_lines: Vec<crate::viewmodel::SessionLineView>,
+    /// When its entries were last read; `None` reads them on the next frame.
+    session_read: Option<Instant>,
+    /// Per room, the approvals and questions waiting on this node in Sessions it may drive there
+    /// (ADR-029 CL-2): what puts a room under needs you.
+    waiting: BTreeMap<Digest32, usize>,
+    /// The Sessions with one waiting: room, node and session id.
+    waiting_sessions: BTreeSet<(Digest32, Digest32, String)>,
+    /// When they were last counted.
+    waiting_read: Option<Instant>,
     /// Unread per room off screen, at three levels (ADR-028 R-8, #484).
     unread: BTreeMap<Digest32, RoomUnread>,
     /// Rooms whose unread was counted, when the TUI first saw them open, from what the node
@@ -363,6 +376,12 @@ impl DaemonCore {
             active: None,
             unread: BTreeMap::new(),
             seeded: BTreeSet::new(),
+            shown_session: None,
+            session_lines: Vec::new(),
+            session_read: None,
+            waiting: BTreeMap::new(),
+            waiting_sessions: BTreeSet::new(),
+            waiting_read: None,
             arrived: BTreeMap::new(),
             notified: BTreeSet::new(),
             notify_to,
@@ -1057,6 +1076,191 @@ impl DaemonCore {
 
     /// Read the room on screen: whole when it first comes on screen, or when a late row or an
     /// unknown cursor says the order changed above what is shown; else only what arrived since.
+    /// Send `act` to the Session `id` of `node` in `room`, through the one sender `vox room
+    /// session` uses, and say what came of it in its words (ADR-029 DR-1, DR-6, CL-1).
+    fn drive(
+        &mut self,
+        room: Digest32,
+        node: Digest32,
+        id: &str,
+        act: crate::viewmodel::DriveAct,
+    ) -> CommandStatus {
+        use crate::session_drive_ui as d;
+        use crate::viewmodel::DriveAct;
+        let names = SessionNames {
+            trusted: &self.snapshot.trusted,
+            me: self.snapshot.me,
+        };
+        let alias = names.alias_of(&node);
+        let row = self
+            .snapshot
+            .open
+            .iter()
+            .find(|o| o.channel_id == room)
+            .and_then(|o| o.sessions.iter().find(|x| x.node == node && x.id == id));
+        let Some(row) = row else {
+            return CommandStatus::Said(format!("no Session in this room is named {id}"));
+        };
+        let t = d::Target {
+            room,
+            node,
+            session: id.to_owned(),
+            label: vox_agentcomms::envelope::session_label(&alias, row.name.as_deref(), id),
+            node_alias: alias.clone(),
+            can_drive: row.can_drive,
+        };
+        let paths = match self.account.node_paths(&self.node) {
+            Ok(p) => p,
+            Err(e) => return CommandStatus::Said(format!("not sent to {}: {e}", t.label)),
+        };
+        let said = until_stopped(&self.rt, &self.stop, async {
+            match &act {
+                DriveAct::Say(text) => d::say(&paths, &t, text).await,
+                DriveAct::Slash(text) => d::slash(&paths, &t, text).await,
+                DriveAct::Interrupt => d::interrupt(&paths, &t).await,
+                DriveAct::Stop => d::stop(&paths, &t).await,
+                DriveAct::Approve(r) => d::approve(&paths, &t, r).await,
+                DriveAct::Reject(r, why) => d::reject(&paths, &t, r, why.as_deref()).await,
+                DriveAct::Answer(r, answers) => d::answer(&paths, &t, r, answers).await,
+            }
+        });
+        // What the Session says of it is read again at once.
+        self.session_read = None;
+        self.waiting_read = None;
+        match said {
+            Some(Ok(s) | Err(s)) => CommandStatus::Said(s),
+            None => CommandStatus::Said(format!("not sent to {}: the TUI is stopping", t.label)),
+        }
+    }
+
+    /// Count, once a second, the approvals and questions waiting on this node in each open room's
+    /// Sessions it may drive, by the rule that words them (`Line::waiting`, ADR-029 CL-2).
+    fn count_waiting(&mut self) {
+        if self
+            .waiting_read
+            .is_some_and(|at| at.elapsed() < SNAPSHOT_EVERY)
+        {
+            return;
+        }
+        self.waiting_read = Some(Instant::now());
+        let rooms: Vec<(Digest32, Vec<(Digest32, String)>)> = self
+            .snapshot
+            .open
+            .iter()
+            .map(|o| {
+                (
+                    o.channel_id,
+                    o.sessions
+                        .iter()
+                        .filter(|x| x.open && x.can_drive)
+                        .map(|x| (x.node, x.id.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let mut waiting = BTreeMap::new();
+        let mut sessions = BTreeSet::new();
+        for (room, drivable) in rooms {
+            if drivable.is_empty() {
+                continue;
+            }
+            let Ok(Frame::SessionEntries { rows }) =
+                self.request(&Request::SessionEntries { channel_id: room })
+            else {
+                continue;
+            };
+            let names = SessionNames {
+                trusted: &self.snapshot.trusted,
+                me: self.snapshot.me,
+            };
+            let mut n = 0;
+            for (node, id) in &drivable {
+                let mine = crate::session_cli::of_session(rows.clone(), id, node);
+                let here = crate::session_cli::lines(&mine, "", &names)
+                    .iter()
+                    .filter(|l| l.waiting.is_some())
+                    .count();
+                if here > 0 {
+                    sessions.insert((room, *node, id.clone()));
+                }
+                n += here;
+            }
+            waiting.insert(room, n);
+        }
+        self.waiting = waiting;
+        self.waiting_sessions = sessions;
+    }
+
+    /// Read the shown Session's entries, at most once a second, and draw them as `vox room
+    /// session` does (ADR-029 SC-1, CL-1). Entries this node cannot open are not among them: a
+    /// member without drive reads none (SC-2).
+    fn read_session(&mut self) {
+        let Some((room, node, id)) = self.shown_session.clone() else {
+            return;
+        };
+        if Some(room) != self.active {
+            return;
+        }
+        if self
+            .session_read
+            .is_some_and(|at| at.elapsed() < SNAPSHOT_EVERY)
+        {
+            return;
+        }
+        self.session_read = Some(Instant::now());
+        let Ok(Frame::SessionEntries { rows }) =
+            self.request(&Request::SessionEntries { channel_id: room })
+        else {
+            return;
+        };
+        // The Session's own entries and the drive entries naming it, in written order: as
+        // `vox room session` takes them.
+        let mine = crate::session_cli::of_session(rows, &id, &node);
+        let me = self.snapshot.me;
+        let names = SessionNames {
+            trusted: &self.snapshot.trusted,
+            me,
+        };
+        let label = self
+            .snapshot
+            .open
+            .iter()
+            .find(|o| o.channel_id == room)
+            .and_then(|o| o.sessions.iter().find(|x| x.node == node && x.id == id))
+            .map_or_else(
+                || vox_agentcomms::envelope::session_label(&names.alias_of(&node), None, &id),
+                |x| {
+                    vox_agentcomms::envelope::session_label(
+                        &names.alias_of(&node),
+                        x.name.as_deref(),
+                        &x.id,
+                    )
+                },
+            );
+        // A waiting question's questions, from its entry, for an answer (DR-1.5).
+        let questions = |reference: &str| {
+            mine.iter()
+                .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+                .find(|v| v["kind"] == "question" && v["ref"] == reference)
+                .map(|v| crate::session_drive_ui::questions(&v))
+                .unwrap_or_default()
+        };
+        self.session_lines = crate::session_cli::lines(&mine, &label, &names)
+            .into_iter()
+            .map(|l| crate::viewmodel::SessionLineView {
+                questions: if l.waiting == Some(crate::session_cli::Waiting::Question) {
+                    questions(&l.reference)
+                } else {
+                    Vec::new()
+                },
+                text: l.text,
+                details: l.details,
+                reference: l.reference,
+                waiting: l.waiting,
+            })
+            .collect();
+    }
+
     fn read_timeline(&mut self) {
         let Some(cid) = self.active else {
             self.timeline = None;
@@ -1405,12 +1609,18 @@ impl DaemonCore {
                     (None, false) => format!("(closed {})", short_id(&c.channel_id)),
                 },
                 to_you: self.unread.get(&c.channel_id).map_or(0, |u| u.to_you),
+                waiting: self.waiting.get(&c.channel_id).copied().unwrap_or(0),
                 unread: self.unread.get(&c.channel_id).map_or(0, |u| u.new),
                 coordination: self.unread.get(&c.channel_id).map_or(0, |u| u.coordination),
-                group: self
-                    .unread
-                    .get(&c.channel_id)
-                    .map_or(RoomGroup::Quiet, |u| group(u.to_you, u.new, u.coordination)),
+                // A Session waiting on this node, for a member with drive, needs the person
+                // (ADR-028 W-2 as amended, ADR-029 CL-2).
+                group: if self.waiting.get(&c.channel_id).is_some_and(|n| *n > 0) {
+                    RoomGroup::NeedsYou
+                } else {
+                    self.unread
+                        .get(&c.channel_id)
+                        .map_or(RoomGroup::Quiet, |u| group(u.to_you, u.new, u.coordination))
+                },
                 reachability: reachability(&c.channel_id),
             })
             .collect();
@@ -1574,6 +1784,46 @@ impl DaemonCore {
                             })
                             .collect()
                     },
+                    session_lines: if self
+                        .shown_session
+                        .as_ref()
+                        .is_some_and(|(room, _, _)| *room == d.channel_id)
+                    {
+                        self.session_lines.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    // The room's Sessions (ADR-029 CL-2), newest opening first, each labelled as
+                    // `vox room sessions` labels it (SE-3).
+                    sessions: d
+                        .sessions
+                        .iter()
+                        .rev()
+                        .map(|x| {
+                            let node_alias =
+                                crate::ident::author_for(&snap.trusted, me.as_ref(), &x.node);
+                            crate::viewmodel::SessionView {
+                                node: x.node,
+                                id: x.id.clone(),
+                                name: x.name.clone(),
+                                label: vox_agentcomms::envelope::session_label(
+                                    &node_alias,
+                                    x.name.as_deref(),
+                                    &x.id,
+                                ),
+                                node_alias,
+                                opened: x.opened_millis / 1_000,
+                                ended: (!x.open)
+                                    .then(|| x.ended_millis.unwrap_or(x.opened_millis) / 1_000),
+                                can_drive: x.can_drive,
+                                waiting: self.waiting_sessions.contains(&(
+                                    d.channel_id,
+                                    x.node,
+                                    x.id.clone(),
+                                )),
+                            }
+                        })
+                        .collect(),
                     // **Every member held back, each on its own line** (V210-66).
                     held_back: d
                         .equivocations
@@ -1911,6 +2161,8 @@ impl CoreHandle for DaemonCore {
             }
         }
         self.read_timeline();
+        self.read_session();
+        self.count_waiting();
         self.count_unread();
         self.project()
     }
@@ -2090,6 +2342,20 @@ impl CoreHandle for DaemonCore {
                 ),
                 other => other,
             },
+            Command::Drive {
+                channel_id,
+                session: (node, id),
+                act,
+            } => self.drive(channel_id, node, &id, act),
+            Command::ShowSession {
+                channel_id,
+                session,
+            } => {
+                self.shown_session = session.map(|(node, id)| (channel_id, node, id));
+                self.session_lines.clear();
+                self.session_read = None;
+                CommandStatus::Done
+            }
             Command::SelectChannel { channel_id } => {
                 // The room left counts from the newest row it showed: nothing seen is unread.
                 if let Some(t) = self
@@ -2257,5 +2523,33 @@ impl CoreHandle for DaemonCore {
 
     fn ended(&self) -> Option<String> {
         self.ended.clone()
+    }
+}
+
+/// How the TUI names a node in a Session's lines, as `vox room session` does: "you", this node's
+/// name for it, or its fingerprint marked not in the keyring (ADR-029 CL-1).
+struct SessionNames<'a> {
+    trusted: &'a [(Digest32, String)],
+    me: Option<Digest32>,
+}
+
+impl SessionNames<'_> {
+    fn alias_of(&self, fp: &Digest32) -> String {
+        crate::ident::author_for(self.trusted, self.me.as_ref(), fp)
+    }
+}
+
+impl crate::session_cli::Names for SessionNames<'_> {
+    fn alias(&self, fp: &Digest32) -> String {
+        self.alias_of(fp)
+    }
+    fn is_me(&self, by: &str) -> bool {
+        vox_core::node::link::b32_decode(by, "fingerprint").is_ok_and(|fp| self.me == Some(fp))
+    }
+    fn alias_b32(&self, by: &str) -> String {
+        match vox_core::node::link::b32_decode(by, "fingerprint") {
+            Ok(fp) => self.alias_of(&fp),
+            Err(_) => by.chars().take(12).collect(),
+        }
     }
 }

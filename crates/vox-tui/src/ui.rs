@@ -19,10 +19,14 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use vox_core::hash::Digest32;
 
-use crate::state::{Focus, Mode, Prompt, PromptKind, Screen, UiState};
+use crate::state::{
+    session_rows, showing_session, Focus, Mode, Prompt, PromptKind, Screen, SessionRow, Showing,
+    UiState,
+};
 use crate::theme;
 use crate::viewmodel::{
-    ImageState, MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust, ViewModel,
+    ChannelView, ImageState, MemberView, MessageView, NoticeView, Reachability, SyncStatus, Trust,
+    ViewModel,
 };
 
 /// The honest non-leaking marker for an entry not decryptable to you (ADR-015).
@@ -278,6 +282,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         // The three unread levels (ADR-028 R-8, #484): to this node first.
         let levels: Vec<String> = [
             (c.to_you > 0).then(|| format!("to you {}", c.to_you)),
+            (c.waiting > 0).then(|| format!("waiting {}", c.waiting)),
             (c.unread > 0).then(|| format!("{} new", c.unread)),
             (c.coordination > 0).then(|| format!("{} coordination", c.coordination)),
         ]
@@ -493,25 +498,119 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         ])
         .split(area);
 
+    // A Session has a composer only for a driver: typing into one is driving (ADR-029 DR-1,
+    // CL-3).
+    let session = showing_session(ui, vm);
+    let in_session = matches!(ui.showing, Showing::Session(..));
+    let composing = !in_session || session.is_some_and(|x| x.can_drive);
     let body = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(if composing { 3 } else { 0 }),
+        ])
         .split(cols[0]);
 
-    (ui.timeline_scroll, ui.on_screen) = render_timeline(
-        frame,
-        body[0],
-        &channel.held_back,
-        channel.timeline.as_slice(),
-        (&channel.notices, &channel.retention),
-        Selection {
-            scroll: ui.timeline_scroll,
-            selected: ui.selected_message,
-            reveal: std::mem::take(&mut ui.reveal_selected),
-            focus: focused(ui, Focus::Timeline),
-        },
-        &mut ui.images.borrow_mut(),
-    );
+    // What the timeline shows (ADR-029 CL-2): the room's conversation (General); that and each
+    // Session's opening and end (All); or one Session, whose activity is never the room's (SC-4).
+    let (timeline, notices, shown) = match &ui.showing {
+        Showing::General => (
+            channel.timeline.as_slice(),
+            channel.notices.clone(),
+            String::new(),
+        ),
+        Showing::All => {
+            let mut notices = channel.notices.clone();
+            for x in &channel.sessions {
+                notices.push(NoticeView {
+                    timestamp: x.opened,
+                    text: format!("{} opened", x.label),
+                });
+                if let Some(at) = x.ended {
+                    notices.push(NoticeView {
+                        timestamp: at,
+                        text: format!("{} ended", x.label),
+                    });
+                }
+            }
+            notices.sort_by_key(|n| n.timestamp);
+            (channel.timeline.as_slice(), notices, " — All".to_owned())
+        }
+        Showing::Session(..) => {
+            let mut notices = Vec::new();
+            if let Some(x) = session {
+                notices.push(NoticeView {
+                    timestamp: x.opened,
+                    text: format!("{} opened", x.label),
+                });
+                if let Some(at) = x.ended {
+                    notices.push(NoticeView {
+                        timestamp: at,
+                        text: format!("{} ended", x.label),
+                    });
+                }
+                if !x.can_drive {
+                    notices.push(NoticeView {
+                        timestamp: u64::MAX,
+                        text: format!(
+                            "Only members {} trusts with drive see inside this Session.",
+                            x.node_alias
+                        ),
+                    });
+                }
+            }
+            let shown = session.map_or_else(
+                || " — a Session this room no longer lists".to_owned(),
+                |x| {
+                    format!(
+                        " — {}{}",
+                        x.label,
+                        if x.ended.is_some() {
+                            " · ended"
+                        } else {
+                            " · open"
+                        }
+                    )
+                },
+            );
+            (&[][..], notices, shown)
+        }
+    };
+    // Inside a Session, for a member with drive: its activity, a line each (SC-1).
+    let inside = session.filter(|x| x.can_drive || !channel.session_lines.is_empty());
+    if let Some(x) = inside {
+        render_session(
+            frame,
+            body[0],
+            &channel.session_lines,
+            (ui.selected_session_line, ui.details_open),
+            &format!(
+                "Timeline — {}{}",
+                x.label,
+                if x.ended.is_some() {
+                    " · ended"
+                } else {
+                    " · open"
+                }
+            ),
+            focused(ui, Focus::Timeline),
+        );
+    } else {
+        (ui.timeline_scroll, ui.on_screen) = render_timeline(
+            frame,
+            body[0],
+            &channel.held_back,
+            timeline,
+            (&notices, &channel.retention, &shown),
+            Selection {
+                scroll: ui.timeline_scroll,
+                selected: ui.selected_message,
+                reveal: std::mem::take(&mut ui.reveal_selected),
+                focus: focused(ui, Focus::Timeline),
+            },
+            &mut ui.images.borrow_mut(),
+        );
+    }
     // Whom the next message is to, and whether it is urgent (ADR-028 W-4), by this node's names.
     let mut about = Vec::new();
     if !ui.to.is_empty() {
@@ -551,22 +650,38 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                 },
             )
     });
-    render_composer(
-        frame,
-        body[1],
-        &ui.composer,
-        replying.as_deref(),
-        &about.join(" · "),
-        focused(ui, Focus::Composer),
-    );
+    // In a Session, the composer is to the session (DR-1.2).
+    if let Some(x) = session.filter(|_| in_session) {
+        about = vec![format!("to {}", x.label)];
+    }
+    if composing {
+        render_composer(
+            frame,
+            body[1],
+            &ui.composer,
+            replying.as_deref(),
+            &about.join(" · "),
+            focused(ui, Focus::Composer),
+        );
+    }
     // Members above, and under them what is shared in the room (V030-25), when anything is.
     let shared_focus = focused(ui, Focus::Shared);
     // The pane's inner width: the command under the selected service is printed in full there,
     // wrapped, since it is longer than a line (ADR-028 S-3).
     let inner = usize::from(cols[1].width.saturating_sub(2)).max(20);
     let shared_lines = shared_lines(&channel.shared, ui.selected_share, shared_focus, inner);
+    // The room's Sessions on top (ADR-029 CL-2), at most a third of the column.
+    let rows = session_rows(&channel.sessions, ui.ended_open);
+    let tall = u16::try_from(rows.len().saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .min(cols[1].height / 3);
+    let column = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(tall), Constraint::Min(3)])
+        .split(cols[1]);
+    render_sessions(frame, column[0], channel, &rows, ui);
     let side = if channel.shared.is_empty() {
-        vec![cols[1]]
+        vec![column[1]]
     } else {
         Layout::default()
             .direction(Direction::Vertical)
@@ -576,7 +691,7 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                     u16::try_from(shared_lines.len().saturating_add(2)).unwrap_or(u16::MAX),
                 ),
             ])
-            .split(cols[1])
+            .split(column[1])
             .to_vec()
     };
     render_members(
@@ -593,6 +708,103 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             *area,
         );
     }
+}
+
+/// **A Session, read from inside** (ADR-029 SC-1): a line per activity, the newest at the bottom;
+/// the selected line marked `▶`, and under it, while open, its Details: each part labelled, its
+/// text indented. The window keeps the selected line in view.
+fn render_session(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[crate::viewmodel::SessionLineView],
+    (selected, details): (Option<usize>, bool),
+    title: &str,
+    focus: bool,
+) {
+    let width = usize::from(area.width.saturating_sub(2)).max(1);
+    let height = usize::from(area.height.saturating_sub(2));
+    let mut rows: Vec<Line> = Vec::new();
+    let mut at = None;
+    for (i, l) in lines.iter().enumerate() {
+        let chosen = selected == Some(i);
+        if chosen {
+            at = Some(rows.len());
+        }
+        let mark = if chosen { "▶ " } else { "  " };
+        rows.extend(wrap(Line::from(format!("{mark}{}", l.text)), width));
+        if chosen && details {
+            for (label, body) in &l.details {
+                rows.extend(wrap(
+                    Line::from(Span::styled(
+                        format!("    {label}:"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )),
+                    width,
+                ));
+                for part in body.lines() {
+                    rows.extend(wrap(Line::from(format!("      {part}")), width));
+                }
+            }
+        }
+    }
+    if lines.is_empty() {
+        rows.push(Line::from(Span::styled(
+            "· nothing from this Session yet",
+            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        )));
+    }
+    // The newest at the bottom, unless that would hide the selected line.
+    let mut end = rows.len();
+    if let Some(top) = at {
+        if top + height < end {
+            end = (top + height).max(height.min(rows.len()));
+        }
+    }
+    let start = end.saturating_sub(height);
+    let shown: Vec<Line> = rows[start..end].to_vec();
+    frame.render_widget(Paragraph::new(shown).block(pane_block(title, focus)), area);
+}
+
+/// **The Sessions pane** (ADR-029 CL-2): General, All, each open Session by its label, and the
+/// ended ones apart under "Ended (N)" (SE-5). What the timeline shows is marked `▸`.
+fn render_sessions(
+    frame: &mut Frame,
+    area: Rect,
+    channel: &ChannelView,
+    rows: &[SessionRow],
+    ui: &UiState,
+) {
+    let focus = focused(ui, Focus::Sessions);
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let (text, on) = match row {
+                SessionRow::General => ("General".to_owned(), ui.showing == Showing::General),
+                SessionRow::All => ("All".to_owned(), ui.showing == Showing::All),
+                SessionRow::Session(at) => {
+                    let x = &channel.sessions[*at];
+                    let on = ui.showing == Showing::Session(x.node, x.id.clone());
+                    if x.ended.is_some() {
+                        (format!("  {} · ended", x.label), on)
+                    } else if x.waiting {
+                        (format!("! {} · waiting on you", x.label), on)
+                    } else {
+                        (format!("● {}", x.label), on)
+                    }
+                }
+                SessionRow::Ended(n) => (format!("Ended ({n})"), false),
+            };
+            let mark = if on { "▸ " } else { "  " };
+            let style = if focus && i == ui.selected_session_row {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(format!("{mark}{text}"), style)))
+        })
+        .collect();
+    frame.render_widget(List::new(items).block(pane_block("Sessions", focus)), area);
 }
 
 /// The Shared pane's lines (ADR-028 S-3): each service, and under the one selected while the pane
@@ -646,8 +858,9 @@ fn render_timeline(
     area: Rect,
     held_back: &[String],
     timeline: &[MessageView],
-    // What happened to the room, and its retention, for the header.
-    (room_notices, retention): (&[NoticeView], &str),
+    // What happened to the room, its retention, and what is shown beyond the room's own
+    // conversation (" — All", " — <a Session's label>"), for the header.
+    (room_notices, retention, showing): (&[NoticeView], &str, &str),
     at: Selection,
     images: &mut crate::images::Images,
 ) -> (usize, Vec<Digest32>) {
@@ -813,9 +1026,9 @@ fn render_timeline(
     on_screen.dedup();
     // The room's header always says its retention (ADR-028 R-7).
     let title = if scroll > 0 {
-        format!("Timeline · {RETENTION} {retention} (scrolled — End: newest)")
+        format!("Timeline{showing} · {RETENTION} {retention} (scrolled — End: newest)")
     } else {
-        format!("Timeline · {RETENTION} {retention}")
+        format!("Timeline{showing} · {RETENTION} {retention}")
     };
     let p = Paragraph::new(shown).block(pane_block(&title, focus));
     frame.render_widget(p, area);
@@ -1098,8 +1311,16 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         Screen::ChannelList => {
             " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :attach · Ctrl-C quit"
         }
+        // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
+        // for a member with drive only (CL-3).
+        Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {
+            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :interrupt · :stop · :general · : command · Esc back"
+        }
+        Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
+            " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
+        }
         Screen::Channel => {
-            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · : command · Esc back"
+            " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · : command · Esc back"
         }
         Screen::Tunnels => " ↑/↓ select · x close the selected tunnel · : command · Esc back",
         Screen::Serve if vm.serve_preview.is_some() => " Enter share it · Esc back to the list",

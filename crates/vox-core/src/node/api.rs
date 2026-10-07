@@ -506,6 +506,9 @@ pub struct ChannelDetail {
     /// The nodes whose Sessions this node can read inside here (ADR-029 SC-2), sorted: itself, and
     /// each node whose drive key it holds. What a Session's `can_drive` is said from.
     pub drive_from: Vec<Digest32>,
+    /// The files other members' Sessions sent out here that this node can open (ADR-029
+    /// DR-1.8): what it pulls by itself, as a room share addressed to it.
+    pub session_files: Vec<crate::node::drive::SessionRow>,
 }
 
 /// The node's latest-wins view (published over a `watch`).

@@ -93,6 +93,10 @@ nix = { version = "0.31", default-features = false, features = ["socket", "net",
 # A kept node's identity passphrase in the login keychain, stored and read by the daemon only
 # (ADR-028 K-10, ADR-014 M-6): the crate's safe password calls.
 security-framework = "3"
+# A session's process, its parent, start time and executable, read from the kernel (`proc_pidinfo`,
+# `proc_pidpath`) through libproc's safe API: never by running `ps` or `lsof`, which a sandbox may
+# refuse to start (ADR-029 DR-5, the pane binding).
+libproc = "0.14"
 
 # A daemon a client starts closes every descriptor it inherited past stdio (ADR-026 S-2), with
 # nix's safe `close`, so `#![forbid(unsafe_code)]` holds on Linux too.

@@ -72,6 +72,27 @@ pub const HARNESS_SESSION_VARS: [&str; 11] = [
     "VOX_HARNESS",
 ];
 
+/// Take out of `cmd`'s environment everything that names a harness session or a terminal this
+/// proof did not make: [`HARNESS_SESSION_VARS`], and every inherited variable whose name starts
+/// with `TMUX`, `CLAUDE`, `CODEX` or `OPENCODE` (walked from this process's environment, not a
+/// fixed list). A proof run from inside a real session inherits that session's tmux pane and
+/// sockets; a `vox` given them could bind a test session to the real pane (2026-10-07: a proof's
+/// line was typed into the operator's Claude Code session).
+pub fn strip_harness_env(cmd: &mut Command) {
+    for v in HARNESS_SESSION_VARS {
+        cmd.env_remove(v);
+    }
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            cmd.env_remove(&k);
+        }
+    }
+}
+
 /// A child process killed and reaped when dropped, by its own handle — never by a name
 /// pattern (a path-pattern `pkill` once missed every node and leaked hundreds).
 pub struct Proc(Child);
@@ -247,9 +268,7 @@ impl Worker {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for v in HARNESS_SESSION_VARS {
-            cmd.env_remove(v);
-        }
+        strip_harness_env(&mut cmd);
         if let Some(s) = session {
             cmd.env("VOX_SESSION", s);
         }
