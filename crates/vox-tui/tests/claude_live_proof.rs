@@ -83,6 +83,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A short root for the run's directories: a Unix socket's path must fit the platform's bound
+/// (104 bytes on macOS), which the system's temporary directory does not leave room for.
+#[cfg(target_os = "macos")]
+const SHORT_ROOT: &str = "/private/tmp/vc";
+#[cfg(not(target_os = "macos"))]
+const SHORT_ROOT: &str = "/tmp/vc";
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// The person whose room it is.
 const PERSON: &str = "person";
@@ -424,11 +431,11 @@ fn a_live_claude_turn_reads_the_room_only_through_what_its_node_trusts() {
         .unwrap_or_else(|| panic!("APPARATUS: HOME is unset, so the operator's files are unknown"));
 
     // ---- the run's root: short, so the daemon's socket path fits ----
-    std::fs::create_dir_all("/private/tmp/vc")
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+    std::fs::create_dir_all(SHORT_ROOT)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {SHORT_ROOT}: {e}"));
     let tmp = tempfile::Builder::new()
         .prefix("cll-")
-        .tempdir_in("/private/tmp/vc")
+        .tempdir_in(SHORT_ROOT)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let root = oc_sandbox::real(tmp.path());
     let data = root.join("vd");
