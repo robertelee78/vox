@@ -105,13 +105,19 @@ pub struct Session {
     /// `codex exec`) gets no Session.
     #[serde(default = "interactive_by_default")]
     pub interactive: bool,
-    /// The tmux pane the session runs in, when it runs in one (ADR-029 DR-1, DR-5): how a driver's
-    /// input reaches a Claude Code session, as ctm's injector does. `None` outside tmux.
+    /// The tmux pane the session runs in, proven, when it runs in one (ADR-029 DR-1, DR-5): how a
+    /// driver's input reaches a Claude Code session, as ctm's injector does. Refreshed by every
+    /// hook. `None` outside tmux, or when the pane could not be proven ([`Session::tmux_why`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux: Option<TmuxPane>,
+    /// Why the session's pane could not be proven, when it runs in tmux but could not be bound:
+    /// what a driver is told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_why: Option<String>,
 }
 
-/// Where a session's terminal is, in tmux: read from the harness's environment by its hook.
+/// Where a session's terminal is, in tmux, and the process that ties the session to it: found by
+/// the session's own hook ([`crate::claude_injector::bind_here`]) and checked again at every send.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TmuxPane {
     /// The tmux server's socket: the first field of `$TMUX`.
@@ -121,28 +127,15 @@ pub struct TmuxPane {
     /// The `tmux` the hook's `PATH` finds, so the daemon, whose environment is not the
     /// harness's, runs the same one.
     pub bin: String,
-}
-
-impl TmuxPane {
-    /// The pane this process runs in, if tmux says: `$TMUX` and `$TMUX_PANE` both set, and a
-    /// `tmux` on `PATH`. Never a guess: without `$TMUX_PANE` there is no pane (ctm's positional
-    /// fallback could name another session's pane).
-    #[must_use]
-    pub fn from_env() -> Option<Self> {
-        let socket = std::env::var("TMUX").ok()?;
-        let socket = socket.split(',').next()?.trim().to_owned();
-        let pane = std::env::var("TMUX_PANE").ok()?.trim().to_owned();
-        let bin = std::env::var_os("PATH").and_then(|p| {
-            std::env::split_paths(&p)
-                .map(|d| d.join("tmux"))
-                .find(|t| t.is_file())
-        })?;
-        (!socket.is_empty() && !pane.is_empty()).then(|| Self {
-            socket,
-            pane,
-            bin: bin.display().to_string(),
-        })
-    }
+    /// The pane's own process (`#{pane_pid}`), as tmux said when the hook bound it.
+    pub pane_pid: u32,
+    /// The session's process: the hook's ancestor that is the pane's process or its child (a
+    /// wrapper such as `npx` or a version shim is that child, and lives as long as the session).
+    pub process: u32,
+    /// When that process started, as the process table says: a reused pid is not the session.
+    pub process_start: String,
+    /// What that process is called, as the process table says (for the driver's words).
+    pub process_name: String,
 }
 
 /// A record written before Sessions said nothing of it: it was registered by a hook a person ran.
@@ -313,6 +306,12 @@ pub fn store(paths: &Paths, reg: &Session) {
         reg.room.clone_from(&b.room);
     }
     reg.last_drained_ms = now;
+    // **One session per pane** (ADR-029 DR-5): the newest hook in a pane claims it, and every other
+    // session of this node bound there loses its binding. Case: a new session (or `/clear`) in the
+    // pane of one that ended without a SessionEnd while its process lives on.
+    if let Some(mine) = reg.tmux.as_ref() {
+        unbind_pane(paths, session, &mine.socket, &mine.pane);
+    }
     let dir = paths.session_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
@@ -343,7 +342,10 @@ impl Session {
     #[must_use]
     pub fn from_env(session: &str, codex: bool) -> Self {
         let mut s = Self::from_env_untmuxed(session, codex);
-        s.tmux = TmuxPane::from_env();
+        match crate::claude_injector::bind_here() {
+            Ok(pane) => s.tmux = pane,
+            Err(why) => s.tmux_why = Some(why),
+        }
         // Claude Code sets `CLAUDE_CODE_ENTRYPOINT` for its hooks even when its messaging socket
         // is off.
         if s.harness == "unknown" && std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some() {
@@ -367,6 +369,7 @@ impl Session {
                 name: None,
                 interactive: interactive_now(),
                 tmux: None,
+                tmux_why: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -385,6 +388,7 @@ impl Session {
                 name: None,
                 interactive: interactive_now(),
                 tmux: None,
+                tmux_why: None,
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -403,6 +407,7 @@ impl Session {
                 name: None,
                 interactive: interactive_now(),
                 tmux: None,
+                tmux_why: None,
             }
         } else {
             Session {
@@ -418,7 +423,39 @@ impl Session {
                 name: None,
                 interactive: interactive_now(),
                 tmux: None,
+                tmux_why: None,
             }
+        }
+    }
+}
+
+/// Drop the tmux binding of every session of this node but `keep` bound to `pane` on `socket`.
+fn unbind_pane(paths: &Paths, keep: &str, socket: &str, pane: &str) {
+    let Ok(dir) = std::fs::read_dir(paths.session_dir()) else {
+        return;
+    };
+    for f in dir.flatten() {
+        let Ok(body) = std::fs::read(f.path()) else {
+            continue;
+        };
+        let Ok(mut other) = serde_json::from_slice::<Session>(&body) else {
+            continue;
+        };
+        if other.session == keep
+            || !other
+                .tmux
+                .as_ref()
+                .is_some_and(|t| t.socket == socket && t.pane == pane)
+        {
+            continue;
+        }
+        other.tmux = None;
+        other.tmux_why = Some(format!(
+            "tmux pane {pane} now runs another session, so this one cannot be typed into until \
+             its next turn"
+        ));
+        if let Ok(body) = serde_json::to_vec(&other) {
+            let _ = vox_core::node::paths::write_private_file_unique(&f.path(), &body);
         }
     }
 }

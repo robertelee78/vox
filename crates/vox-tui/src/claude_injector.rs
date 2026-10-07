@@ -9,10 +9,13 @@
 //! guessed** (DR-5). ctm falls back to a positional target when `$TMUX_PANE` is unset, which its
 //! own log says "may misroute"; here no recorded pane is a refusal that says why.
 //!
-//! - **The pane** is the one the session's own hook recorded at registration
-//!   ([`crate::wake::TmuxPane`]: `$TMUX`'s socket, `$TMUX_PANE`, and the `tmux` its `PATH` finds).
-//! - **Before every send** the pane must exist and must not be back at a shell: a pane whose Claude
-//!   Code exited would take the text as a shell command.
+//! - **The pane** is the one the session's own hook proved ([`bind_here`]), refreshed by every hook,
+//!   keyed by session id: `$TMUX`'s socket, `$TMUX_PANE` (`%N`, stable for the pane's life, which
+//!   tmux always sets inside a pane: dropping ctm's positional fallback loses nothing real), the
+//!   pane's process, and the session's process, found by walking the hook's own ancestry up to the
+//!   pane's process, with its start time from the process table (never from the hook's input).
+//! - **Before every send** ([`check`]) all of it is checked again; each case it settles is named
+//!   beside its check.
 //! - **Text** is typed literally (`send-keys -l`), and submitted only once it is seen in Claude's
 //!   input box; the box must then empty, with Enter tried up to three times, or the driver is told
 //!   the text would not submit (DR-6). Reading the box is what ctm learned after a long message's
@@ -41,6 +44,9 @@ const SUBMIT_RETRIES: u32 = 2;
 /// tolerates a label on the rule (Claude Code writes the session's name there).
 const RULE_MIN_DASHES: usize = 20;
 
+/// Held while a send types into a pane.
+static SENDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What a driver asks of the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Act {
@@ -54,20 +60,25 @@ pub enum Act {
     Slash(String),
 }
 
-/// Do `act` in the session whose registration recorded `pane`. `Err` says, in words, why it was
-/// not done or did not take: every time (DR-6).
+/// Do `act` in the session `reg` registers. `Err` says, in words, why it was not done or did not
+/// take: every time (DR-6).
 ///
 /// # Errors
-/// No pane recorded, the pane gone or back at a shell, tmux failing, text over
+/// No pane proven, the pane gone or no longer the session's, tmux failing, text over
 /// [`MAX_TEXT_CHARS`] or that would not submit, a slash command with other characters.
-pub fn drive(pane: Option<&TmuxPane>, act: &Act) -> Result<(), String> {
-    let Some(p) = pane else {
-        return Err(
+pub fn drive(reg: &crate::wake::Session, act: &Act) -> Result<(), String> {
+    let Some(p) = reg.tmux.as_ref() else {
+        // Case: a drive before any hook bound the session, or a session outside tmux.
+        return Err(reg.tmux_why.clone().unwrap_or_else(|| {
             "this Claude Code session is not running in tmux, so Vox cannot type into it; start \
              Claude Code inside tmux"
-                .into(),
-        );
+                .into()
+        }));
     };
+    // One send at a time, to any pane (ctm's lock): two drives never interleave their keys.
+    let _one = SENDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     check(p)?;
     match act {
         Act::Interrupt => key(p, "Escape"),
@@ -122,48 +133,179 @@ fn tmux(p: &TmuxPane, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// The recorded pane is usable: its socket and pane well-formed, the pane alive, and not back at
-/// a shell.
-fn check(p: &TmuxPane) -> Result<(), String> {
+/// One process, as the process table says.
+#[derive(Debug, Clone)]
+struct Proc {
+    ppid: u32,
+    start: String,
+    name: String,
+}
+
+/// The process table: pid → parent, start time (`lstart`) and name. One `ps` for the whole walk.
+fn processes() -> Result<std::collections::HashMap<u32, Proc>, String> {
+    let out = Command::new("/bin/ps")
+        .args(["-ax", "-o", "pid=,ppid=,lstart=,comm="])
+        .output()
+        .map_err(|e| format!("the process table could not be read: {e}"))?;
+    let mut table = std::collections::HashMap::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // `lstart` is five words: "Tue Oct  6 18:04:12 2026".
+        let w: Vec<&str> = line.split_whitespace().collect();
+        if w.len() < 8 {
+            continue;
+        }
+        let (Ok(pid), Ok(ppid)) = (w[0].parse::<u32>(), w[1].parse::<u32>()) else {
+            continue;
+        };
+        let name = w[7..].join(" ");
+        let name = name.rsplit('/').next().unwrap_or(&name).to_owned();
+        table.insert(
+            pid,
+            Proc {
+                ppid,
+                start: w[2..7].join(" "),
+                name,
+            },
+        );
+    }
+    Ok(table)
+}
+
+/// The chain from `pid` up through its parents, `pid` first, ending at init or a loop.
+fn ancestry(table: &std::collections::HashMap<u32, Proc>, pid: u32) -> Vec<u32> {
+    let mut chain = vec![pid];
+    let mut at = pid;
+    while let Some(p) = table.get(&at) {
+        if p.ppid <= 1 || chain.contains(&p.ppid) || chain.len() > 64 {
+            break;
+        }
+        chain.push(p.ppid);
+        at = p.ppid;
+    }
+    chain
+}
+
+/// The pane this process runs in, proven: `Ok(None)` outside tmux (no `$TMUX`), `Err` why when
+/// tmux is named but the pane cannot be proven. Called by the session's hook, so its ancestry is
+/// the session's.
+///
+/// # Errors
+/// `$TMUX_PANE` unset, no `tmux` on `PATH`, tmux not answering for the pane, or this process not
+/// running under the pane's process (a `$TMUX`/`$TMUX_PANE` inherited by a process outside the
+/// pane: over ssh with the variables forwarded, or a process started elsewhere).
+pub fn bind_here() -> Result<Option<TmuxPane>, String> {
+    let Ok(server) = std::env::var("TMUX") else {
+        return Ok(None);
+    };
+    let socket = server.split(',').next().unwrap_or_default().trim().to_owned();
+    // Case: `$TMUX` without `$TMUX_PANE` (tmux always sets both inside a pane): not a pane this
+    // process is in. ctm fell back to a positional target here, the active pane; never.
+    let pane = std::env::var("TMUX_PANE")
+        .map(|p| p.trim().to_owned())
+        .ok()
+        .filter(|p| !p.is_empty())
+        .ok_or("$TMUX is set but $TMUX_PANE is not, so Vox cannot tell which pane it runs in")?;
+    let bin = std::env::var_os("PATH")
+        .and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("tmux"))
+                .find(|t| t.is_file())
+        })
+        .ok_or("no tmux on the session's PATH")?
+        .display()
+        .to_string();
+    let mut found = TmuxPane {
+        socket,
+        pane,
+        bin,
+        pane_pid: 0,
+        process: 0,
+        process_start: String::new(),
+        process_name: String::new(),
+    };
+    shape(&found)?;
+    let pane_pid: u32 = tmux(
+        &found,
+        &["display-message", "-p", "-t", &found.pane, "#{pane_pid}"],
+    )
+    .map_err(|e| format!("tmux did not answer for pane {} ({e})", found.pane))?
+    .trim()
+    .parse()
+    .map_err(|_| format!("tmux gave no process for pane {}", found.pane))?;
+    let table = processes()?;
+    let chain = ancestry(&table, std::process::id());
+    // The session's process: the pane's own process when the session is the pane's command, else
+    // the pane's child on this chain (Claude Code itself, or the wrapper that started it).
+    let Some(at) = chain.iter().position(|&p| p == pane_pid) else {
+        // Case: nested tmux is fine (the innermost server's variables are the hook's, and its
+        // chain reaches that pane); ssh, or variables inherited by a process outside the pane,
+        // is not: the chain never reaches the pane's process.
+        return Err(format!(
+            "this session does not run under tmux pane {}'s process, though $TMUX_PANE names it",
+            found.pane
+        ));
+    };
+    let process = if at == 0 { pane_pid } else { chain[at - 1] };
+    let p = table
+        .get(&process)
+        .ok_or("the session's process left the process table")?;
+    found.pane_pid = pane_pid;
+    found.process = process;
+    found.process_start.clone_from(&p.start);
+    found.process_name.clone_from(&p.name);
+    Ok(Some(found))
+}
+
+/// The recorded socket and pane are well-formed.
+fn shape(p: &TmuxPane) -> Result<(), String> {
     let pane_ok = p.pane.len() > 1
         && p.pane.starts_with('%')
         && p.pane[1..].chars().all(|c| c.is_ascii_digit());
     if !pane_ok || !p.socket.starts_with('/') || p.socket.contains("..") || p.socket.len() > 256 {
         return Err(format!(
-            "the session's recorded tmux pane ({} on {}) is not one Vox can address",
+            "the session's tmux pane ({} on {}) is not one Vox can address",
             p.pane, p.socket
         ));
     }
-    let state = tmux(
-        p,
-        &[
-            "display-message",
-            "-p",
-            "-t",
-            &p.pane,
-            "#{pane_title}\u{1f}#{pane_current_command}",
-        ],
-    )
-    .map_err(|e| {
+    Ok(())
+}
+
+/// The recorded pane is still the session's, now: each check names the case it settles.
+fn check(p: &TmuxPane) -> Result<(), String> {
+    shape(p)?;
+    // Case: the tmux server restarted, or the pane closed. The key is (socket, %N): a pane of
+    // another server with the same %N is never this one, and a restarted server's %N is a new pane
+    // with a new process.
+    let now = tmux(p, &["display-message", "-p", "-t", &p.pane, "#{pane_pid}"]).map_err(|e| {
         format!(
             "the session's tmux pane {} is gone ({e}): its terminal closed, or tmux restarted",
             p.pane
         )
     })?;
-    let line = state.trim_end_matches(['\n', '\r']);
-    let (title, command) = line.split_once('\u{1f}').unwrap_or(("", line));
-    let shell = matches!(
-        command
-            .trim()
-            .trim_start_matches('-')
-            .to_ascii_lowercase()
-            .as_str(),
-        "zsh" | "bash" | "sh" | "fish" | "dash" | "ksh" | "tcsh" | "csh" | "ash" | "login"
-    );
-    if shell && !title.contains("Claude Code") {
+    if now.trim().parse::<u32>().ok() != Some(p.pane_pid) {
         return Err(format!(
-            "the session's tmux pane {} is back at a shell prompt: Claude Code is no longer \
-             running there, so nothing was typed",
+            "tmux pane {} is not the pane the session ran in (its process changed): tmux              restarted, or the pane was reused; the session is known again after its next turn",
+            p.pane
+        ));
+    }
+    // Case: Claude Code exited (the pane back at a shell), or a new session took the pane after
+    // one that ended without a SessionEnd: the session's process is gone, or is another process
+    // under the same pid.
+    let table = processes()?;
+    let alive = table
+        .get(&p.process)
+        .is_some_and(|q| q.start == p.process_start);
+    if !alive {
+        return Err(format!(
+            "the session is no longer running in tmux pane {}: its process ({} {}) has ended,              so nothing was typed",
+            p.pane, p.process_name, p.process
+        ));
+    }
+    // Case: the process still lives but left the pane (moved by a wrapper, the pane respawned).
+    // A pane moved, split, swapped or renumbered keeps its %N and its process: input follows it.
+    if p.process != p.pane_pid && !ancestry(&table, p.process).contains(&p.pane_pid) {
+        return Err(format!(
+            "the session's process no longer runs under tmux pane {}",
             p.pane
         ));
     }

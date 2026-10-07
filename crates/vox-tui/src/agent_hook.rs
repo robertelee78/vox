@@ -1201,6 +1201,12 @@ pub async fn run(
         .filter(|ev| crate::session_mirror::mirrors(&ev.name));
     if let Some(ev) = &mirrored {
         if ev.name != "UserPromptSubmit" {
+            // **Every hook binds the session** (ADR-029 DR-5): its registration, with the tmux pane
+            // it proves, is refreshed on each event, so a session first seen by a tool call is
+            // known, and a session resumed in another pane is rebound at once.
+            if let Err(e) = daemon.register(&input, room_arg).await {
+                eprintln!("vox agent hook: {e}");
+            }
             if ev.name == "Stop" {
                 crate::wake::record_idle(paths, &input.session_id);
             }
