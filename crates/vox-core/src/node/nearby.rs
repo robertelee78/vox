@@ -44,8 +44,9 @@ const TAG_LEN: usize = 16;
 pub const ENTRY_LEN: usize = TAG_LEN + 2;
 /// The most entries one datagram carries (it stays under 1,200 bytes).
 const ENTRIES_PER_DATAGRAM: usize = 64;
-/// How long a tag stays the same.
-pub const WINDOW_SECS: u64 = 600;
+/// How long a tag stays the same, in milliseconds: ten minutes. The window number is the same as
+/// when it was counted in seconds, so nodes still match.
+pub const WINDOW_MS: u64 = 600_000;
 
 /// A member of a room listening on a port, as a datagram names it.
 pub type Entry = [u8; ENTRY_LEN];
@@ -59,16 +60,16 @@ fn key(room: &Digest32, member: &Digest32, window: u64) -> Digest32 {
     crate::hash::domain_hash("vox/nearby/v2", &data)
 }
 
-/// The window `now` (Unix seconds) falls in.
+/// The window `now_ms` (milliseconds since the Unix epoch) falls in.
 #[must_use]
-pub fn window(now: u64) -> u64 {
-    now / WINDOW_SECS
+pub fn window(now_ms: u64) -> u64 {
+    now_ms / WINDOW_MS
 }
 
-/// How `member` of `room`, listening on `port`, is named in a datagram sent at `now`.
+/// How `member` of `room`, listening on `port`, is named in a datagram sent at `now_ms`.
 #[must_use]
-pub fn entry(room: &Digest32, member: &Digest32, port: u16, now: u64) -> Entry {
-    let h = key(room, member, window(now));
+pub fn entry(room: &Digest32, member: &Digest32, port: u16, now_ms: u64) -> Entry {
+    let h = key(room, member, window(now_ms));
     let mut e = [0u8; ENTRY_LEN];
     e[..TAG_LEN].copy_from_slice(&h[..TAG_LEN]);
     let masked = port ^ u16::from_be_bytes([h[TAG_LEN], h[TAG_LEN + 1]]);
@@ -76,11 +77,11 @@ pub fn entry(room: &Digest32, member: &Digest32, port: u16, now: u64) -> Entry {
     e
 }
 
-/// The port of whichever of `entries` names `member` of `room`, heard at `now`: its window, or
+/// The port of whichever of `entries` names `member` of `room`, heard at `now_ms`: its window, or
 /// the one either side.
 #[must_use]
-pub fn port_of(entries: &[Entry], room: &Digest32, member: &Digest32, now: u64) -> Option<u16> {
-    let w = window(now);
+pub fn port_of(entries: &[Entry], room: &Digest32, member: &Digest32, now_ms: u64) -> Option<u16> {
+    let w = window(now_ms);
     for w in [w, w.saturating_sub(1), w + 1] {
         let h = key(room, member, w);
         if let Some(e) = entries.iter().find(|e| e[..TAG_LEN] == h[..TAG_LEN]) {

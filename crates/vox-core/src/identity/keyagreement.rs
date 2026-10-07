@@ -195,7 +195,7 @@ impl X25519IdentityKey {
 /// sub-keys) and ADR-004 (authenticated IK_B) both require it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X25519IdentityKeyPublic {
-    /// Unix-seconds creation time, covered by the root signature.
+    /// Creation time, milliseconds since the Unix epoch, covered by the root signature.
     pub created: u64,
     /// X25519 identity DH public key bytes (algorithm `0x0101`).
     pub x25519_pub: [u8; X25519_PUB_LEN],
@@ -343,7 +343,7 @@ impl SignedIdentityDhKey {
 pub struct SignedPrekeyPublic {
     /// Monotonic prekey id (for rotation/retention bookkeeping by higher layers).
     pub prekey_id: u64,
-    /// Unix-seconds creation time (ADR-002 §2 "creation metadata").
+    /// Creation time, milliseconds since the Unix epoch (ADR-002 §2 "creation metadata").
     pub created: u64,
     /// X25519 public key bytes (algorithm `0x0101`).
     pub x25519_pub: [u8; X25519_PUB_LEN],
@@ -507,7 +507,7 @@ impl SignedPrekey {
 pub struct OneTimePrekeyPublic {
     /// One-time prekey id (unique within the pool).
     pub prekey_id: u64,
-    /// Unix-seconds creation time (ADR-002 §2 "creation metadata"); covered by
+    /// Creation time, milliseconds since the Unix epoch (ADR-002 §2 "creation metadata"); covered by
     /// the root signature so a stale prekey cannot be silently re-dated.
     pub created: u64,
     /// X25519 public key bytes (algorithm `0x0101`).
@@ -657,7 +657,7 @@ impl OneTimePrekeyPool {
     }
 
     /// Generate a pool of `count` root-signed one-time prekeys, each stamped with
-    /// `created` (Unix seconds), covered by the root signature.
+    /// `created` (milliseconds since the Unix epoch), covered by the root signature.
     pub fn generate(
         root: &dyn RootSigner,
         count: usize,
@@ -682,7 +682,7 @@ impl OneTimePrekeyPool {
     }
 
     /// Append `count` freshly generated, root-signed one-time prekeys, each
-    /// stamped with `created` (Unix seconds), covered by the root signature.
+    /// stamped with `created` (milliseconds since the Unix epoch), covered by the root signature.
     pub fn add(&mut self, root: &dyn RootSigner, count: usize, created: u64) -> Result<()> {
         self.prekeys.reserve(count);
         for _ in 0..count {
@@ -712,7 +712,7 @@ impl OneTimePrekeyPool {
 
     /// Refill the pool up to `target` if it has dropped to or below
     /// `low_water`. No-op when above the low-water mark. New prekeys are stamped
-    /// with `created` (Unix seconds). Returns the number of prekeys added.
+    /// with `created` (milliseconds since the Unix epoch). Returns the number of prekeys added.
     pub fn refill_to(
         &mut self,
         root: &dyn RootSigner,

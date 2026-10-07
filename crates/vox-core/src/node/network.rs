@@ -531,7 +531,7 @@ impl NodeNet {
     /// pruning when one fills, but a board nobody publishes to again kept every record it
     /// ever took, served nothing from them and freed nothing (V210-70); the tick calls this.
     pub fn prune_board(&self) -> usize {
-        let now = self.now();
+        let now = self.now_ms();
         lock(self.service.store()).prune_expired(now)
     }
 
@@ -608,7 +608,14 @@ impl NodeNet {
         &self.presence
     }
 
-    fn now(&self) -> u64 {
+    /// The clock in whole seconds, for the transport's session records, which are specified in
+    /// seconds.
+    fn now_secs(&self) -> u64 {
+        (self.clock)() / 1_000
+    }
+
+    /// The clock in milliseconds: what the board's records are stamped with and judged by.
+    fn now_ms(&self) -> u64 {
         (self.clock)()
     }
 
@@ -673,7 +680,7 @@ impl NodeNet {
             if let Some(log) = lock(&self.decisions).as_ref() {
                 let why = format!("it may not open a {kind:?} stream here, as {class:?}");
                 log.record_folded(
-                    (self.clock)().saturating_mul(1_000),
+                    (self.clock)(),
                     &format!("stream {} {why}", crate::node::link::b32_encode(&peer)),
                     &crate::node::decisions::Decision {
                         asked: "to open a stream",
@@ -724,7 +731,7 @@ impl NodeNet {
     /// node holds or anchors.
     #[must_use]
     pub fn peer_has_prejoin(&self, peer: &Digest32) -> bool {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard.channels_with_genesis().iter().any(|cid| {
@@ -750,7 +757,7 @@ impl NodeNet {
     /// (which the board only admitted from an authenticated member).
     #[must_use]
     pub fn peer_is_member_on_board(&self, peer: &Digest32) -> bool {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard.channels_with_genesis().iter().any(|cid| {
@@ -794,7 +801,7 @@ impl NodeNet {
             .filter(|(cid, epoch)| self.membership.member_key(cid, *epoch, peer).is_some())
             .map(|(cid, _)| cid)
             .collect();
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         for cid in guard.channels_with_genesis() {
@@ -941,7 +948,7 @@ impl NodeNet {
                 };
                 if let (Some(why), Some(log)) = (refused, lock(&self.decisions).as_ref()) {
                     log.record(
-                        (self.clock)().saturating_mul(1_000),
+                        (self.clock)(),
                         &crate::node::decisions::Decision {
                             asked: "a relay circuit",
                             by: peer,
@@ -1164,7 +1171,7 @@ impl NodeNet {
         let (direct_failed, failed) = tokio::sync::watch::channel(candidates_none);
         if has_direct {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now();
+            let now = self.now_secs();
             // The addresses go into the label: "all direct candidates failed" is not a
             // diagnosis on its own, and which addresses this node believed in is exactly
             // what distinguishes a stale board record from a blocked path.
@@ -1215,7 +1222,7 @@ impl NodeNet {
             let me = self.local_id();
             let coordinator = Arc::clone(coordinator);
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now();
+            let now = self.now_secs();
             let label = format!("dial-back via {}", short_id(coordinator.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
@@ -1342,7 +1349,7 @@ impl NodeNet {
         }
         for relay in helpers {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now();
+            let now = self.now_secs();
             let label = format!("circuit via {}", short_id(relay.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
@@ -1513,7 +1520,7 @@ impl NodeNet {
         let candidates = direct_candidates(endpoints);
         if !candidates.is_empty() {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now();
+            let now = self.now_secs();
             set.spawn(async move {
                 crate::nat::reachability::connect_direct_within(
                     endpoint,
@@ -1534,7 +1541,7 @@ impl NodeNet {
             };
             let local = coordstream::punch_endpoints(observed, &local_eps);
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now();
+            let now = self.now_secs();
             set.spawn(async move {
                 let (mut send, mut recv) =
                     coordstream::open_punch_session(&coordinator, peer).await?;
@@ -1614,9 +1621,13 @@ impl NodeNet {
         let observed = self.observed_or_ask(coordinator.peer_id()).await;
         let local = coordstream::punch_endpoints(observed, &self.local_endpoints()?);
         let plan = coordstream::run_punch_initiator(&mut send, &mut recv, local).await?;
-        let conn =
-            coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
-                .await?;
+        let conn = coordstream::execute_punch(
+            Arc::clone(self.manager.endpoint()),
+            plan,
+            peer,
+            self.now_secs(),
+        )
+        .await?;
         Ok(self.manager.adopt(conn).await)
     }
 
@@ -1628,8 +1639,9 @@ impl NodeNet {
         relay: &Arc<VoxConnection>,
         peer: Digest32,
     ) -> Result<Arc<VoxConnection>> {
-        let conn = circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now())
-            .await?;
+        let conn =
+            circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now_secs())
+                .await?;
         Ok(self.manager.adopt(conn).await)
     }
 
@@ -1649,9 +1661,13 @@ impl NodeNet {
         let plan = coordstream::run_punch_responder(&mut send, &mut recv, local).await?;
         let planned_ms = t0.elapsed().as_millis();
         let targets = join_addrs(&plan.targets);
-        let dialled =
-            coordstream::execute_punch(Arc::clone(self.manager.endpoint()), plan, peer, self.now())
-                .await;
+        let dialled = coordstream::execute_punch(
+            Arc::clone(self.manager.endpoint()),
+            plan,
+            peer,
+            self.now_secs(),
+        )
+        .await;
         // **Said, either way** (V030-22): this is the dial a peer that cannot reach this node asked
         // for, and when it fails that peer bridges through its coordinator; without this, nothing
         // on either side said why.
@@ -1678,7 +1694,7 @@ impl NodeNet {
     /// how many members and pending joiners it knows of each (ADR-016 M15.2a).
     #[must_use]
     pub fn anchored_channels(&self) -> Vec<crate::node::api::AnchoredChannel> {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         let mut channels = guard.channels_with_genesis();
@@ -1725,7 +1741,7 @@ impl NodeNet {
     /// room, PRD-001 R20).
     #[must_use]
     pub fn board_endpoints_any(&self, member: &Digest32) -> EndpointList {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard
@@ -1746,7 +1762,7 @@ impl NodeNet {
     /// fails).
     #[must_use]
     pub fn board_endpoints(&self, channel_id: &Digest32, member: &Digest32) -> EndpointList {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard
@@ -1847,7 +1863,7 @@ impl NodeNet {
     /// `channel_id` — somebody is in the room.
     #[must_use]
     pub fn board_has_members(&self, channel_id: &Digest32) -> bool {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         !guard.current_members(channel_id, 0, now).is_empty()
@@ -1867,7 +1883,7 @@ impl NodeNet {
     /// carries its key, and was admitted only through a member).
     #[must_use]
     pub fn board_member_keys(&self, channel_id: &Digest32, epoch: u64) -> Vec<CompositePublicKey> {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         let mut out: Vec<CompositePublicKey> = Vec::new();
@@ -1889,7 +1905,7 @@ impl NodeNet {
     /// joined through somebody else before refusing it (`run_sync_session`).
     #[must_use]
     pub fn board_bundles(&self, channel_id: &Digest32, epoch: u64) -> Vec<MemberBundleRecord> {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard
@@ -1915,7 +1931,7 @@ impl NodeNet {
         epoch: u64,
         member: &Digest32,
     ) -> Option<MemberBundleRecord> {
-        let now = self.now();
+        let now = self.now_ms();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
         guard.bundle(channel_id, epoch, member, now).cloned()
@@ -1943,7 +1959,7 @@ impl NodeNet {
     /// intermittent unreachable peer and attributes to nothing. Nothing outside this
     /// comment enforces the order today.
     pub fn board_records(&self, channel_id: &Digest32, epoch: u64) -> Vec<Vec<u8>> {
-        let now = self.now();
+        let now = self.now_ms();
         let me = self.local_id();
         let store = self.service.store();
         let guard = store.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1978,7 +1994,7 @@ impl NodeNet {
         epoch: u64,
         peer: &crate::nat::service::RecordSet,
     ) -> Vec<Vec<u8>> {
-        let now = self.now();
+        let now = self.now_ms();
         let has_bundle: std::collections::BTreeSet<Digest32> =
             peer.bundles.iter().map(|b| b.author_id).collect();
         let has_address: std::collections::BTreeSet<Digest32> =
@@ -2079,7 +2095,7 @@ impl NodeNet {
             endpoints,
             seq,
             now,
-            crate::nat::store::own_record_ttl_secs(),
+            crate::nat::store::own_record_ttl_ms(),
         )?;
         let bundle = MemberBundleRecord::build(
             signer,
@@ -2088,7 +2104,7 @@ impl NodeNet {
             ring.bundle(&signer.public_key())?,
             seq,
             now,
-            crate::nat::store::BUNDLE_MAX_TTL_SECS,
+            crate::nat::store::BUNDLE_MAX_TTL_MS,
             admission,
         )?;
         Ok((address, bundle))
@@ -2122,8 +2138,15 @@ impl NodeNet {
         seq: u64,
         admission: Admission,
     ) -> Result<()> {
-        let (address, bundle) =
-            self.own_records(signer, channel_id, epoch, ring, seq, self.now(), admission)?;
+        let (address, bundle) = self.own_records(
+            signer,
+            channel_id,
+            epoch,
+            ring,
+            seq,
+            self.now_ms(),
+            admission,
+        )?;
         let mut client = RendezvousClient::open(conn).await?;
         let res = async {
             client.put(&address.to_wire()).await?;
@@ -2175,7 +2198,8 @@ impl NodeNet {
             root: signer,
             base_difficulty: Difficulty::DEFAULT_INVITE,
             pending_joins,
-            now_secs: self.now(),
+            now_secs: self.now_secs(),
+            now_ms: self.now_ms(),
             worked: slot
                 .as_ref()
                 .map(|(worked, _)| std::sync::Arc::clone(worked)),
@@ -2236,7 +2260,7 @@ impl NodeNet {
 fn chain_order(record: &MemberBundleRecord) -> (u8, u64) {
     match record.admission.witness() {
         None => (0, 0),
-        Some(w) => (1, w.timestamp),
+        Some(w) => (1, w.timestamp_ms),
     }
 }
 

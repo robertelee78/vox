@@ -3141,8 +3141,8 @@ fn hex(bytes: &[u8]) -> String {
 struct Offer {
     /// The announcement's entry.
     entry: Digest32,
-    /// When it was announced, seconds, never later than now.
-    created: u64,
+    /// When it was announced, milliseconds.
+    created_ms: u64,
     author: Digest32,
     name: String,
     size: u64,
@@ -3242,10 +3242,10 @@ pub async fn get_file(
         };
         let offer = Offer {
             entry: r.entry_hash,
-            created: (r.created_millis / 1000).min(
+            created_ms: r.created_millis.min(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs()),
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             ),
             author: r.author,
             name,
@@ -3304,10 +3304,10 @@ pub async fn get_file(
                 }
                 offers.push(Offer {
                     entry: r.entry_hash,
-                    created: (r.created_millis / 1000).min(
+                    created_ms: r.created_millis.min(
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs()),
+                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                     ),
                     author: r.author,
                     name,
@@ -3519,7 +3519,7 @@ async fn collect_offer(
                     room: channel_id,
                     entry: offer.entry,
                     path: placed,
-                    created: offer.created,
+                    created_ms: offer.created_ms,
                     folder: None,
                     files: Vec::new(),
                 },
@@ -3658,7 +3658,7 @@ async fn collect_folder(
         room: channel_id,
         entry: offer.entry,
         path: target.clone(),
-        created: offer.created,
+        created_ms: offer.created_ms,
         folder: Some((offer.author, shown.clone())),
         files: Vec::new(),
     };

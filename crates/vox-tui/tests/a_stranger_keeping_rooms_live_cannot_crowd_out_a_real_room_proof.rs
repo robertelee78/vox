@@ -104,7 +104,7 @@ const BUDGET: Duration = if cfg!(debug_assertions) {
 fn policy() -> ChannelPolicy {
     ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        ttl: 0,
+        ttl_ms: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     }
 }
@@ -291,7 +291,7 @@ fn await_published(rt: &Rt, anchor: SocketAddr, id: Digest32, room: Digest32) {
 
 /// Publish `ROOMS` geneses the stranger mints, each followed by a live member record for it,
 /// from `[::1]`. Returns how many geneses and records the anchor took.
-fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_secs: u64) -> (usize, usize) {
+fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_ms: u64) -> (usize, usize) {
     let inventor = stranger(0x63);
     rt.block_on(async {
         let (_ep, conn) = hostile::connect(&inventor, anchor, id).await;
@@ -302,13 +302,13 @@ fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_secs: u64) -> (usi
         for i in 0..ROOMS {
             let mut nonce = [0u8; 16];
             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            let g = Genesis::create_with_nonce(&inventor, hostile::now(), policy(), nonce)
+            let g = Genesis::create_with_nonce(&inventor, hostile::now_ms(), policy(), nonce)
                 .expect("APPARATUS: build the stand-in peer's records");
             if client.put(&g.to_wire()).await.is_ok() {
                 geneses += 1;
             }
             // Timestamped by the anchor's clock, so it is live there however that clock runs.
-            let t = hostile::now() + skew_secs;
+            let t = hostile::now_ms() + skew_ms;
             let rec = RendezvousRecord::build(
                 &inventor,
                 &g.channel_id(),
@@ -317,7 +317,7 @@ fn live_flood(rt: &Rt, anchor: SocketAddr, id: Digest32, skew_secs: u64) -> (usi
                     .expect("APPARATUS: build the stand-in peer's records"),
                 1,
                 t,
-                2 * 60 * 60,
+                2 * 60 * 60 * 1_000,
             )
             .expect("APPARATUS: build the stand-in peer's records");
             if client.put(&rec.to_wire()).await.is_ok() {
@@ -354,7 +354,7 @@ fn flood(
     let inventor = stranger(0x73);
     // A second identity for the second network: the anchor keeps one connection per peer.
     let carrier = stranger(0x75);
-    let t = hostile::now();
+    let t = hostile::now_ms();
     let ring = PrekeyRing::generate(&carrier, &[0x3E; 32], t)
         .expect("APPARATUS: generate the stand-in peer's prekeys");
     let carrier_bundle = ring
@@ -374,7 +374,7 @@ fn flood(
                             let mut nonce = [0u8; 16];
                             nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
                             nonce[8] = 0x5c;
-                            let now = hostile::now();
+                            let now = hostile::now_ms();
                             let g = Genesis::create_with_nonce(inventor, now, policy(), nonce)
                                 .expect("APPARATUS: build the stand-in peer's records");
                             let cid = g.channel_id();
@@ -388,7 +388,7 @@ fn flood(
                                 bundle.clone(),
                                 1,
                                 now,
-                                2 * 60 * 60,
+                                2 * 60 * 60 * 1_000,
                                 Admission::Witnessed(Box::new(witness)),
                             )
                             .expect("APPARATUS: build the stand-in peer's records");
@@ -580,8 +580,8 @@ fn a_room_whose_members_are_away_is_not_crowded_out() {
          (it holds {held:?})"
     );
 
-    let skew_secs = (AWAY_MS / 1000) as u64;
-    let (geneses, records) = live_flood(&rt, anchor6, anchor_id, skew_secs);
+    let skew_ms = AWAY_MS as u64;
+    let (geneses, records) = live_flood(&rt, anchor6, anchor_id, skew_ms);
     println!(
         "[proof] live flood from [::1]: the anchor took {geneses}/{ROOMS} geneses and \
          {records}/{ROOMS} live member records"

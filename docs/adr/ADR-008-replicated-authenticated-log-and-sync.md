@@ -129,35 +129,39 @@ consent grants (ADR-007), rendezvous records (ADR-012), the transport identity e
   |---|---|---|---|
   | `0x0001` | log-entry | `vox/log-entry/v1` | ADR-008 |
   | `0x0002` | SKDM | `vox/skdm/v1` | ADR-006 |
-  | `0x0003` | admin/governance cert | `vox/admin-cert/v1` | ADR-007 |
+  | `0x0003` | admin/governance cert | `vox/admin-cert/v2` | ADR-007 |
   | `0x0004` | consent-grant | `vox/consent-grant/v1` | ADR-007 |
   | `0x0005` | consent-revocation | `vox/consent-revocation/v1` | ADR-007 |
-  | `0x0006` | policy/passphrase-rotation | `vox/policy-rotation/v1` | ADR-007 |
-  | `0x0007` | rendezvous-record | `vox/rendezvous-record/v1` | ADR-012 |
-  | `0x0008` | pre-join-record | `vox/pre-join-record/v1` | ADR-012 |
+  | `0x0006` | policy/passphrase-rotation | `vox/policy-rotation/v2` | ADR-007 |
+  | `0x0007` | rendezvous-record | `vox/rendezvous-record/v2` | ADR-012 |
+  | `0x0008` | pre-join-record | `vox/pre-join-record/v2` | ADR-012 |
   | `0x0009` | tls-identity-extension | `vox/tls-identity-extension/v1` | ADR-011 |
   | `0x000A` | chunk-manifest | `vox/chunk-manifest/v1` | ADR-020 §11.1 (reserved, not implemented) |
   | `0x000B` | dgka-setup (removed) | `vox/dgka-setup/v1` | ADR-009 |
   | `0x000C` | self-channel-entry | `vox/self-channel-entry/v1` | ADR-008 |
-  | `0x000D` | genesis-record | `vox/genesis/v1` | ADR-007 |
+  | `0x000D` | genesis-record | `vox/genesis/v2` | ADR-007 |
   | `0x000E` | admin-delegation-revocation | `vox/admin-delegation-revocation/v1` | ADR-007 |
   | `0x000F` | service-advertisement | `vox/service-advertisement/v1` | ADR-013 |
   | `0x0010` | esk-publication (removed) | `vox/esk-publication/v1` | ADR-009 |
   | `0x0011` | session-establishment | `vox/session-establishment/v1` | ADR-011 |
-  | `0x0012` | member-bundle-record | `vox/member-bundle-record/v1` | ADR-016 |
+  | `0x0012` | member-bundle-record | `vox/member-bundle-record/v2` | ADR-016 |
   | `0x0013` | service-grant-exclusion | `vox/service-grant-exclusion/v1` | ADR-007, ADR-017 |
-  | `0x0014` | join-witness | `vox/join-witness/v1` | ADR-016 M17.6 |
+  | `0x0014` | join-witness | `vox/join-witness/v2` | ADR-016 M17.6 |
   | `0x0015` | presence | `vox/presence/v1` | V210-164 (`governance/presence.rs`) |
   | `0x0016` | checkpoint | `vox/checkpoint/v1` | ADR-023 decision 3 (`log/checkpoint.rs`) |
   | `0x0017` | key-package | `vox/key-package/v1` | ADR-023 decision 4 (`node/keypackage.rs`) |
   | `0x0018` | service-share | `vox/service-share/v1` | ADR-017 decision 12 (`governance/share.rs`) |
-  | `0x0019` | room-lifecycle | `vox/room-lifecycle/v1` | ADR-023 RL-8 (`governance/lifecycle.rs`) |
-  | `0x001A` | board-withdraw | `vox/board-withdraw/v1` | ADR-023 RL-8 (`nat/withdraw.rs`) |
+  | `0x0019` | room-lifecycle | `vox/room-lifecycle/v2` | ADR-023 RL-8 (`governance/lifecycle.rs`) |
+  | `0x001A` | board-withdraw | `vox/board-withdraw/v2` | ADR-023 RL-8 (`nat/withdraw.rs`) |
   | `0x001B` | admin-roster | `vox/admin-roster/v1` | ADR-023 RL-8 (`nat/withdraw.rs`) |
   | `0x001C` | identity ask | — (never signed) | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
   | `0x001D` | identity prove | `vox-id/v2/resp` | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
   | `0x001E` | identity claim | `vox-id/v2/init` | ADR-011 req 28 (ADR-026; decided, not built on this tree) |
 
+- **LS-21a.** A struct that carries a time MUST carry it in milliseconds, at format version 2 (the
+  frame's version byte) under its `/v2` label (#562). A board record, pre-join, join witness or board
+  withdraw at format 1 MUST be refused with the reason that it is from a Vox whose times were seconds; a
+  logged struct at format 1 is read as ADR-007 G-1a says.
 - **LS-22.** New struct types MUST be appended, versioned, and a tag MUST NOT be reused. `0x000B`
   and `0x0010` belong to removed deniable mode: they stay registered and MUST NOT be produced.
   `0x0006` carries only a room's retention; policy updates beyond retention and passphrase rotation

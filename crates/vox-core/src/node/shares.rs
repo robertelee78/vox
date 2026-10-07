@@ -145,10 +145,11 @@ struct Record {
     /// A folder's files as they were listed (ADR-028 F-8); empty for a file.
     files: Vec<crate::node::folder::Found>,
     entry: String,
-    /// When the announcement was made, seconds: the message's age runs from here.
-    created: u64,
+    /// When the announcement was made, milliseconds: the message's age runs from here.
+    created_ms: u64,
     count: u64,
-    until: u64,
+    /// When its `--for` is up, milliseconds; 0 for never.
+    until_ms: u64,
     /// Who it is served to.
     only: Only,
 }
@@ -173,9 +174,9 @@ impl Record {
                 ]))
                 .collect::<Vec<_>>(),
             "entry": self.entry,
-            "created": self.created,
+            "created_ms": self.created_ms,
             "count": self.count,
-            "until": self.until,
+            "until_ms": self.until_ms,
             "only": self.only.to_json(),
         })
     }
@@ -187,6 +188,9 @@ impl Record {
                 .map(str::to_owned)
         };
         let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+        // Milliseconds; a record written before held whole seconds under the old name.
+        let ms =
+            |k: &str| n(&format!("{k}_ms")).or_else(|| n(k).map(|secs| secs.saturating_mul(1_000)));
         Some(Self {
             tag: s("tag")?,
             room: b32_decode(&s("room")?, "share record room").ok()?,
@@ -214,9 +218,9 @@ impl Record {
                 })
                 .unwrap_or_default(),
             entry: s("entry")?,
-            created: n("created")?,
+            created_ms: ms("created")?,
             count: n("count")?,
-            until: n("until")?,
+            until_ms: ms("until")?,
             only: Only::from_json(v.get("only"))?,
         })
     }
@@ -378,10 +382,9 @@ impl std::fmt::Debug for Shares {
     }
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// The node's clock in milliseconds, a test step included, as the node's own clock has it.
+fn now_ms() -> u64 {
+    (crate::time::clock_with_test_skew())()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -626,7 +629,7 @@ impl Shares {
                     .await
             }
             // Into a Session: its node hears of it on the drive request, and nothing is posted.
-            Some(SessionShare::In { .. }) => Ok((String::new(), now_secs())),
+            Some(SessionShare::In { .. }) => Ok((String::new(), now_ms())),
         };
         let (entry, created) = match announced {
             Ok(found) => found,
@@ -656,12 +659,12 @@ impl Shares {
             served,
             files,
             entry,
-            created,
+            created_ms: created,
             count: req.count,
-            until: if req.for_secs == 0 {
+            until_ms: if req.for_secs == 0 {
                 0
             } else {
-                now_secs().saturating_add(req.for_secs)
+                now_ms().saturating_add(req.for_secs.saturating_mul(1_000))
             },
             only,
         };
@@ -716,13 +719,13 @@ impl Shares {
             }
         }
         let mut entry = String::new();
-        let mut created = now_secs();
+        let mut created = now_ms();
         let until = tokio::time::Instant::now() + ENTRY_PATIENCE;
         while let Ok(Ok(ev)) = tokio::time::timeout_at(until, events.recv()).await {
             if let NodeEvent::NewEntry { channel_id: c, row } = ev {
                 if c == channel_id && Some(row.author) == me && row.text == text {
                     entry = b32_encode(&row.entry_hash);
-                    created = row.created_millis / 1000;
+                    created = row.created_millis;
                     break;
                 }
             }
@@ -745,7 +748,7 @@ impl Shares {
             "session": session_id,
             "kind": "file",
             "dir": "out",
-            "ts": now_secs() * 1000,
+            "ts": now_ms(),
         });
         if let Some(obj) = body.as_object_mut() {
             for k in [
@@ -769,7 +772,7 @@ impl Shares {
                 })
                 .await
             {
-                Outcome::Appended(entry) => return Ok((b32_encode(&entry), now_secs())),
+                Outcome::Appended(entry) => return Ok((b32_encode(&entry), now_ms())),
                 Outcome::Failed(Fault::RoomNotSynced) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
@@ -915,7 +918,7 @@ impl Shares {
         if active.is_empty() {
             return;
         }
-        let now = now_secs();
+        let now = now_ms();
         let verdicts: Vec<(String, Verdict)> = {
             let view = self.view.borrow();
             // A locked node knows too little to end anything: it is kept for when it unlocks.
@@ -934,14 +937,17 @@ impl Shares {
                         Some(_) if r.count > 0 && a.fetched.load(Ordering::SeqCst) >= r.count => {
                             Verdict::Stop(format!("it was fetched {} time(s)", r.count))
                         }
-                        Some(_) if r.until > 0 && now >= r.until => {
+                        Some(_) if r.until_ms > 0 && now >= r.until_ms => {
                             Verdict::Stop("its --for is up".into())
                         }
                         Some(_) => {
                             match view.open_channels.iter().find(|d| d.channel_id == r.room) {
                                 Some(d)
                                     if d.retention > 0
-                                        && now >= r.created.saturating_add(d.retention) =>
+                                        && now
+                                            >= r.created_ms.saturating_add(
+                                                d.retention.saturating_mul(1_000),
+                                            ) =>
                                 {
                                     Verdict::Stop("its message expired".into())
                                 }

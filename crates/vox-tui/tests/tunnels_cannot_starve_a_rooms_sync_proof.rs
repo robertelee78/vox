@@ -536,8 +536,8 @@ fn two_frozen_tunnels_do_not_stop_the_room() {
                     .filter(|t| {
                         t["service"].as_str() == Some(tag.as_str())
                             && t["direction"].as_str() == Some(way)
-                            && t["opened"].as_u64().is_some_and(|s| s > 0)
-                            && t["last_moved"].as_u64().is_some_and(|s| s > 0)
+                            && t["opened_ms"].as_u64().is_some_and(|s| s > 0)
+                            && t["last_moved_ms"].as_u64().is_some_and(|s| s > 0)
                     })
                     .count()
             })

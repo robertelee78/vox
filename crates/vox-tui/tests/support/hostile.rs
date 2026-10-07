@@ -21,12 +21,17 @@ use vox_core::transport::framing::{read_frame, write_frame};
 use vox_core::transport::quic::{VoxConnection, VoxEndpoint};
 use vox_core::transport::streams::{accept_typed, open_typed, StreamKind};
 
-/// The unix time now, in seconds.
+/// The unix time now, in seconds: for the transport, whose session records are in seconds.
 pub fn now() -> u64 {
-    std::time::SystemTime::now()
+    now_ms() / 1_000
+}
+
+/// The unix time now, in milliseconds: what board records and a genesis are stamped with.
+pub fn now_ms() -> u64 {
+    let d = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("APPARATUS: the clock went backwards")
-        .as_secs()
+        .expect("APPARATUS: the clock went backwards");
+    u64::try_from(d.as_millis()).expect("APPARATUS: the clock is past u64 milliseconds")
 }
 
 /// A runtime shut down **without waiting** when dropped: a task blocked on a victim that
