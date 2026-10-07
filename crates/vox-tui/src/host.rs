@@ -861,7 +861,9 @@ impl Router {
             let (session, note) = (req.session.clone(), note.clone());
             tokio::spawn(async move {
                 router
-                    .land_driven(&node, &handle, &paths, &reg, &session, &by, &alias, driven, note)
+                    .land_driven(
+                        &node, &handle, &paths, &reg, &session, &by, &alias, driven, note,
+                    )
                     .await;
             });
         }
