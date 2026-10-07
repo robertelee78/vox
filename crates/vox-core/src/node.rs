@@ -43,7 +43,6 @@ pub mod joinslots;
 pub mod joinstream;
 pub mod keypackage;
 pub mod lan_request;
-pub mod lanes;
 pub mod layout;
 pub mod link;
 pub mod nameipc;

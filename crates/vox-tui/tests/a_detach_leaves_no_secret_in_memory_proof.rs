@@ -16,8 +16,8 @@
 //!
 //! **Staging.** A `vox daemon` started by hand (so it does not exit when bob's node goes, L-8) runs
 //! with `crates/vox-test-interpose` loaded, whose scan (`VOX_INTERPOSE_SCAN`) reports every copy
-//! of a byte string in the process's written memory on cue. It holds a node `keeper` with no
-//! passphrase, so it is a daemon with something attached; bob's node is attached by bob's real
+//! of a byte string in the process's written memory on cue. It holds a node `keeper`, with a
+//! passphrase of its own that no scan looks for, so it is a daemon with something attached; bob's node is attached by bob's real
 //! `vox tui`, given his identity passphrase at its "Attach node" prompt
 //! (`tests/pty/tui_attach_for_scan.py`). `VOX_TEST_SECRET_WORK_DELAY_MS` makes each blocking thread
 //! holding a secret wait, holding its inputs, before it works, so the detach lands while one runs.
@@ -86,6 +86,9 @@ use std::time::{Duration, Instant};
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// How long each blocking thread holding a secret waits before its work, holding it.
 const DELAY_MS: &str = "15000";
+
+/// `keeper`'s identity passphrase: every node has one (ADR-028 K-11); no scan looks for it.
+const KEEPER: &str = "keeper's identity passphrase";
 /// The same for the reopen case, where the attach's own passphrase check is held first and a scan
 /// of the daemon takes a second or so: long enough that the reopen is still held when it is seen.
 const REOPEN_DELAY_MS: &str = "45000";
@@ -346,7 +349,7 @@ impl Scanner {
     }
 }
 
-/// An account: its data root, with node `keeper` (no passphrase) and node `bob` (`identity`).
+/// An account: its data root, with node `keeper` ([`KEEPER`]) and node `bob` (`identity`).
 struct Account {
     dir: PathBuf,
     identity: String,
@@ -358,7 +361,7 @@ impl Account {
     fn new(dir: PathBuf, identity: &str) -> Self {
         std::fs::create_dir_all(dir.join("cfg")).staged();
         let mut keeper = String::new();
-        for (node, pass) in [("keeper", ""), ("bob", identity)] {
+        for (node, pass) in [("keeper", KEEPER), ("bob", identity)] {
             let file = dir.join(format!("{node}.pass"));
             std::fs::write(&file, format!("{pass}\n")).staged();
             let (ok, said) = run(
@@ -407,8 +410,7 @@ impl Account {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        // `keeper` has no passphrase: an empty line gives none.
-        let daemon = start_with(cmd, Some("\n"));
+        let daemon = start_with(cmd, Some(&format!("{KEEPER}\n")));
         let t0 = Instant::now();
         loop {
             let (ok, said) = run(&self.dir, "keeper", &["node", "list"]);

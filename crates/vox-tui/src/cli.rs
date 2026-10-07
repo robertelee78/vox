@@ -533,14 +533,8 @@ pub struct RenameArgs {
     pub profile: NodeArgs,
     /// The room: its name, or its id or a unique prefix of it.
     pub room: String,
-    /// The new name: one DNS label (a-z, 0-9 and `-`).
+    /// The new name: one DNS label (a-z, 0-9 and `-`). Asks for no passphrase (ADR-028 K-11).
     pub name: String,
-    /// **Refused**, as on `vox trust add`: a command line is world-readable.
-    #[arg(long)]
-    pub identity_passphrase: Option<String>,
-    /// Read the identity passphrase from this file (first line).
-    #[arg(long)]
-    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox room retention`
@@ -1859,6 +1853,14 @@ enum Cmd {
     /// Close the live tunnels `vox status` lists.
     #[command(subcommand)]
     Tunnel(TunnelCmd),
+    /// Set up this machine: a node for each harness installed here, and one for you.
+    ///
+    /// Looks for Claude Code, Codex and OpenCode (their programs on `PATH`) and offers each
+    /// a node of its own, `<harness>-<host>`, with a passphrase you type, its hook installed
+    /// in the harness's settings and the agent skill beside it. On macOS it also offers a
+    /// node for you, which you may skip. It ends by printing every node it made: its
+    /// fingerprint, with its art, and its alias, harness, host, OS and Vox version.
+    Setup(AccountArgs),
     /// Put `vox` on PATH and install tab completion for your shell.
     ///
     /// `install.sh` and `vox update` run this for you. It writes the completion script into
@@ -2196,12 +2198,7 @@ pub fn run() -> ExitCode {
                                 .await
                         }
                         RoomCmd::Rename(a) => {
-                            let identity = crate::tunnel_cli::identity_passphrase_for(
-                                &paths,
-                                a.identity_passphrase.clone(),
-                                a.identity_passphrase_file.clone(),
-                            )?;
-                            crate::room_cli::rename(&paths, &a.room, &a.name, &identity).await
+                            crate::room_cli::rename(&paths, &a.room, &a.name).await
                         }
                         RoomCmd::Retention(a) => {
                             crate::room_cli::retention(&paths, &a.room, &a.duration).await
@@ -2828,6 +2825,13 @@ pub fn run() -> ExitCode {
                 crate::lan_cli::up_held(&paths, &a, &steps).await
             })
         }
+        Cmd::Setup(account) => match crate::setup::run(&account.as_node_args()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("vox: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::ShellSetup { remove } => crate::shell::run(remove),
         Cmd::Update { check, rollback } => match crate::update::run(check, rollback) {
             Ok(()) => ExitCode::SUCCESS,

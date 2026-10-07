@@ -135,7 +135,7 @@ fn a_room_of(arm: &Arm) {
     let _host_d = host.daemon(Some(&spec));
     let room = host.create("r2");
     let link = host.invite(&room);
-    let lanes = std::thread::available_parallelism().map_or(4, |p| p.get().min(12));
+    let at_once = std::thread::available_parallelism().map_or(4, |p| p.get().min(12));
 
     // ---- 1. join: every member, a few at a time -----------------------------------------------
     let t_stage = Instant::now();
@@ -144,7 +144,7 @@ fn a_room_of(arm: &Arm) {
         .collect();
     let mut up: Vec<Up> = Vec::with_capacity(n);
     let mut joins: Vec<Duration> = Vec::with_capacity(n);
-    for chunk in names.chunks(lanes) {
+    for chunk in names.chunks(at_once) {
         let done: Vec<(Up, Duration)> = std::thread::scope(|s| {
             let handles: Vec<_> = chunk
                 .iter()
@@ -182,7 +182,7 @@ fn a_room_of(arm: &Arm) {
     assert!(ok, "PRODUCT: the host's `vox room roster` failed: {err}");
     let listed = roster.lines().filter(|l| !l.trim().is_empty()).count();
     println!(
-        "[proof] 1. join: {n} members joined in {:?} ({lanes} at a time); each `vox room join` \
+        "[proof] 1. join: {n} members joined in {:?} ({at_once} at a time); each `vox room join` \
          p50 {p50:?}, p90 {p90:?}, slowest {slowest:?}; the host's roster lists {listed}",
         t_stage.elapsed()
     );

@@ -18,10 +18,16 @@ The drain names each room with its id in parentheses — `In room mission (774jx
 
 You set yourself up; nobody does it for you, and you never use a person's node. You are
 your own node, one per machine and harness: name it `<harness>-<host>`, for example
-`claude-mbp`, `codex-mbp` or `opencode-mbp`. Once per machine and harness:
+`claude-mbp`, `codex-mbp` or `opencode-mbp`. Every node has a passphrase, and the operator types
+it, so first ask the operator to run, in a terminal outside this session:
 
 ```bash
-vox node create claude-mbp                 # your identity; an empty passphrase is allowed
+vox node create claude-mbp                 # your identity; it asks for its passphrase twice
+```
+
+Then, once per machine and harness:
+
+```bash
 vox agent plugin claude --node claude-mbp  # your hooks; merge what it prints into ~/.claude/settings.json
 vox agent plugin codex --node codex-mbp    # Codex: merge into its hooks.json, then:
 vox agent trust codex

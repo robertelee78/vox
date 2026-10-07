@@ -60,6 +60,9 @@ impl std::fmt::Debug for Profile {
     }
 }
 
+/// Why an identity was not made with an empty passphrase (ADR-028 K-11).
+pub const EMPTY_PASSPHRASE: &str = "every node has an identity passphrase; an empty one is refused";
+
 impl Profile {
     /// Whether `paths` already holds an identity (a vault file).
     #[must_use]
@@ -96,6 +99,11 @@ impl Profile {
         argon2: Argon2Profile,
         waiting: LockWaitNotice<'_>,
     ) -> Result<Self> {
+        // **Every node has a passphrase** (ADR-028 K-11): refused before anything is written, by
+        // whichever client asks.
+        if passphrase.is_empty() {
+            return Err(Error::Profile(EMPTY_PASSPHRASE));
+        }
         // **One creation at a time per profile** (V210-91). Two `vox id`s started together
         // both saw no vault, and the second moved the first's store aside and renamed its own
         // vault over the first's: both printed a fingerprint, and one of them was gone. The

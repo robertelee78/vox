@@ -36,7 +36,7 @@ use crate::{digest, failed, VoxError};
 ///
 /// Swift makes one from the bytes it has (a secure field's, or the Keychain's `Data`) and passes the
 /// handle; it never gets the text back. One handle may be passed more than once, for an attach and
-/// then a keyring change within the window.
+/// then a keyring change.
 #[derive(uniffi::Object)]
 pub struct Passphrase(Mutex<Zeroizing<String>>);
 
@@ -1291,21 +1291,15 @@ impl VoxClient {
     }
 
     /// Give a room a new name, for every member (ADR-028 R-1), as `vox room rename`: only its
-    /// creator or an admin may, and the identity passphrase is asked for that reason.
+    /// creator or an admin may. No passphrase is asked for (ADR-028 K-11).
     ///
     /// # Errors
-    /// A malformed id, a wrong passphrase, or the node's refusal in its own words (this node may
-    /// not rename the room; the name is not one DNS label).
-    pub async fn rename_room(
-        &self,
-        room: String,
-        name: String,
-        identity_passphrase: Arc<Passphrase>,
-    ) -> Result<(), VoxError> {
+    /// A malformed id, or the node's refusal in its own words (this node may not rename the
+    /// room; the name is not one DNS label).
+    pub async fn rename_room(&self, room: String, name: String) -> Result<(), VoxError> {
         let req = Request::RenameRoom {
             channel_id: digest(&room, "room id")?,
             name,
-            identity_passphrase: identity_passphrase.copy(),
         };
         on_held!(self, |c| done(c, &req).await)
     }
@@ -1390,8 +1384,8 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
-    /// Trust `fingerprint` under `name`. The identity passphrase is needed once the keyring
-    /// window has passed; within it, pass none.
+    /// Trust `fingerprint` under `name`. The identity passphrase is needed unless one was given
+    /// for a keyring change within the keyring window; attaching opens no window (ADR-028 K-12).
     ///
     /// # Errors
     /// A malformed fingerprint, the passphrase needed or wrong, or the node's refusal.

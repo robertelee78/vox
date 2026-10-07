@@ -98,8 +98,10 @@ do {
     let room = try await client.joinRoom(
         link: link, passphrase: try Passphrase(bytes: Data(args[5].utf8)))
     say("JOINED \(room)")
-    // Within the keyring window the attach opened: no passphrase is asked for.
-    try await client.trustAdd(fingerprint: peer, name: "peer", identityPassphrase: nil)
+    // A keyring change takes the identity passphrase: attaching opened no window (ADR-028 K-12).
+    let again = try Passphrase(bytes: Data(args[3].utf8))
+    try await client.trustAdd(fingerprint: peer, name: "peer", identityPassphrase: again)
+    again.wipe()
     try await client.post(room: room, text: "hello from swift", to: [], re: "", urgent: false)
     // A post is answered once the node has it: the room read back at once holds it.
     let mine = try await client.read(room: room, after: "", limit: 0)
@@ -198,9 +200,9 @@ do {
     }
     let byNames = pulledBy.first?.names.joined(separator: ",") ?? ""
     say("PULLED_BY \(byNames) SAME \(pulledBy.first?.id == fileShare.entry)")
-    let operator_ = try Passphrase(bytes: Data(args[3].utf8))
+    // A rename asks for no passphrase (ADR-028 K-11).
     do {
-        try await client.renameRoom(room: room, name: "taken", identityPassphrase: operator_)
+        try await client.renameRoom(room: room, name: "taken")
         say("REFUSED nothing: the rename was answered")
     } catch {
         say("REFUSED \(error)")
@@ -209,8 +211,7 @@ do {
         name: "mine", passphrase: try Passphrase(bytes: Data("mine passphrase".utf8)))
     say("CREATED \(made) \(try await client.link(room: made).url)")
     _ = readLine()
-    try await client.renameRoom(room: made, name: "renamed", identityPassphrase: operator_)
-    operator_.wipe()
+    try await client.renameRoom(room: made, name: "renamed")
     say("RENAMED")
     _ = readLine()
     await client.close()

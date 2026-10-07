@@ -243,10 +243,14 @@ async fn detaching_one_node_leaves_the_others_tunnel_and_sync_moving() {
     let b_room = room(&b, "b-room");
     invite_and_join(&b, b_room, &c, &pass_b).await;
     for (h, other, name) in [(&b, fc, "c"), (&c, fb, "b")] {
+        // A keyring change made as its passphrase proved, as the daemon makes one given it:
+        // creating the identity opened no keyring window (ADR-028 K-12).
         let t = h
-            .apply(NodeCommand::Trust {
-                fingerprint: other,
-                petname: name.into(),
+            .apply(NodeCommand::Proved {
+                change: Box::new(NodeCommand::Trust {
+                    fingerprint: other,
+                    petname: name.into(),
+                }),
             })
             .await;
         assert!(t.is_done(), "PRODUCT (staging): trust: {t}");

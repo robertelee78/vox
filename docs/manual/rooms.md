@@ -52,7 +52,7 @@ vox room rename family home
 ```
 
 Only the room's creator, or an admin it named, may rename it; anyone else is refused, saying so.
-It asks for the identity passphrase. The new name reaches every
+It asks for no passphrase. The new name reaches every
 member as the room syncs, and each member's timeline in `vox tui` says who renamed it and to what:
 `bob renamed the room to home`. Service addresses follow the name: `ssh.nas.home.vox`, and the old
 `ssh.nas.family.vox` then leads nowhere. In `vox tui`, `:rename home` does the same.

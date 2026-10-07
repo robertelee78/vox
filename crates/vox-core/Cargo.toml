@@ -15,7 +15,7 @@ vox-text = { path = "../vox-text" }
 # A UDP socket's own drop count, for the receiver-overflow report (#218, ADR-024 RO-1): the one
 # getsockopt the safe dependencies do not offer, in the one crate that allows `unsafe`.
 vox-sockdrops = { path = "../vox-sockdrops" }
-# Each member's lane state (ADR-028 W-3), derived where the room's posts are: the app tier's
+# The envelope a message's link card goes into (ADR-028 F-10, `node::card`): the app tier's
 # vocabulary, which depends on nothing of the core's.
 vox-agentcomms = { path = "../vox-agentcomms" }
 # The structured-post index (V210-120) reads a body's `type`: generic JSON, no app vocabulary.

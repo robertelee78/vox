@@ -4913,14 +4913,10 @@ impl Node {
             }
             NodeCommand::VerifyPassphrase { passphrase } => match self.profile.as_ref() {
                 None => Outcome::Failed(Fault::NoIdentity),
+                // A check opens no window (ADR-028 K-12): only the keyring change it proves does,
+                // as `Proved`.
                 Some(profile) => match profile.verify_passphrase(&passphrase) {
-                    Ok(()) => {
-                        // An entry of it on a locked node starts no window: the unlock does.
-                        if profile.is_unlocked() {
-                            self.note_passphrase_entered();
-                        }
-                        Outcome::Done
-                    }
+                    Ok(()) => Outcome::Done,
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 },
             },
@@ -4960,10 +4956,9 @@ impl Node {
                 debug_assert!(false, "JoinChannel is answered by begin_join_channel");
                 Outcome::Failed(Fault::Internal)
             }
-            // A change whose passphrase was just checked: made, and the window starts again. Not
-            // through the window: with the window restarted by the check, a change could still
-            // find it passed — another check's restart having won, or the clock having moved on
-            // between the check and the change — and refuse the passphrase it had just been given.
+            // A change whose passphrase was just checked: made, and the window starts again (the
+            // only thing that starts it, ADR-028 K-12). Not through the window: the change must
+            // never refuse the passphrase it had just been given.
             NodeCommand::Proved { change } => {
                 if !matches!(
                     *change,
@@ -5142,8 +5137,9 @@ impl Node {
         (self.clock)()
     }
 
-    /// The identity passphrase was just entered, and proved: a keyring change is allowed for
-    /// [`keyring_window`] from now (V210-159).
+    /// The identity passphrase was just entered for a keyring change, and proved: further keyring
+    /// changes are allowed without it for [`keyring_window`] from now (V210-159). Only a keyring
+    /// change opens the window; attaching never does (ADR-028 K-12).
     fn note_passphrase_entered(&self) {
         self.passphrase_entered_at
             .store(self.now().max(1), std::sync::atomic::Ordering::Relaxed);
@@ -5170,8 +5166,8 @@ impl Node {
         };
         match Profile::create_noting(self.paths.clone(), passphrase, now, self.argon2, &waiting) {
             Ok(p) => {
+                // Made, not entered for a keyring change: no window opens (ADR-028 K-12).
                 self.profile = Some(p);
-                self.note_passphrase_entered();
                 // A fresh identity gets its prekey ring immediately: without it the
                 // node has nothing to publish and cannot answer PQXDH.
                 if let Err(e) = self.load_prekeys(now) {
@@ -5208,7 +5204,8 @@ impl Node {
                     drop(self.lock_all().await);
                     return Outcome::Failed(fault_of(&e));
                 }
-                self.note_passphrase_entered();
+                // **Attaching opens no keyring window** (ADR-028 K-12): only a passphrase
+                // entered for a keyring change does.
                 self.reopen_remembered().await;
                 Outcome::Done
             }
@@ -12789,15 +12786,6 @@ impl Node {
             return;
         };
         let verifier = profile.passphrase_verifier();
-        // What the window stood at when the check began. A right passphrase restarts it only if
-        // nothing changed it meanwhile: a lock sets it to zero, and a check passing after that
-        // must not start a window on a locked node. While locked it is already zero, so nothing
-        // is recorded then either.
-        let (entered_at, clock) = (
-            Arc::clone(&self.passphrase_entered_at),
-            Arc::clone(&self.clock),
-        );
-        let entered_before = entered_at.load(std::sync::atomic::Ordering::Relaxed);
         let slots = Arc::clone(&self.verify_slots);
         let secret_work = Arc::clone(&self.secret_work);
         // Waiting for a slot happens here, off the actor; the check itself on a blocking
@@ -12815,22 +12803,10 @@ impl Node {
             };
             let outcome = secret_blocking(&secret_work, move || {
                 let _slot = slot;
+                // A check opens no window (ADR-028 K-12): only the keyring change it proves does,
+                // as `NodeCommand::Proved`.
                 match verifier.verify(&passphrase) {
-                    Ok(()) => {
-                        // Restarted unless a lock zeroed it meanwhile, and never moved back: of
-                        // several checks passing at once, each leaves it at least at its own
-                        // time, whichever wrote first (a compare-exchange against the value at
-                        // the start lost to the first, and left the window where it was).
-                        if entered_before != 0 {
-                            let now = clock().max(1);
-                            let _ = entered_at.fetch_update(
-                                std::sync::atomic::Ordering::Relaxed,
-                                std::sync::atomic::Ordering::Relaxed,
-                                |at| (at != 0).then_some(at.max(now)),
-                            );
-                        }
-                        Outcome::Done
-                    }
+                    Ok(()) => Outcome::Done,
                     Err(_) => Outcome::Failed(Fault::WrongPassphrase),
                 }
             })
@@ -15618,6 +15594,7 @@ pub fn fault_of(e: &Error) -> Fault {
         Error::RoomNotSynced => Fault::RoomNotSynced,
         Error::Profile("no identity on this node") => Fault::NoIdentity,
         Error::Profile("identity already exists on this node") => Fault::IdentityExists,
+        Error::Profile(crate::node::profile::EMPTY_PASSPHRASE) => Fault::PassphraseEmpty,
         Error::Profile("locked") => Fault::Locked,
         Error::Profile("no such room on this node") => Fault::UnknownChannel,
         Error::AtRestUnlockFailed => Fault::WrongPassphrase,

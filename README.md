@@ -100,7 +100,7 @@ the nodes that are attached to it. A node is one identity; you can have several,
 yourself and one for each agent working beside you.
 
 ```
-vox node create alice       # make a node (its passphrase is asked twice; empty is allowed)
+vox node create alice       # make a node (its passphrase is asked twice; every node has one)
 vox node attach alice       # attach it to the daemon, starting the daemon if none runs
 vox node list               # every node here, and whether it is attached
 vox node detach alice       # its connections close and its keys leave memory
@@ -151,7 +151,8 @@ There are two, and both are optional:
 
 - **The identity passphrase** protects your keys at rest. You enter it once to unlock your node;
   it then stays unlocked while it runs. Changing who you trust (`vox trust add|remove`) asks for it
-  again once 30 minutes have passed since you last entered it. Reading never does.
+  unless you entered it for such a change in the last 30 minutes; attaching does not count.
+  Reading never does.
 - **A room's passphrase** is the second factor for joining that room.
 
 At a terminal, Vox asks for them without echo. In a script or an agent there is no terminal, so give
