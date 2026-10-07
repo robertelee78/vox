@@ -100,7 +100,7 @@ the nodes that are attached to it. A node is one identity; you can have several,
 yourself and one for each agent working beside you.
 
 ```
-vox node create alice       # make a node (its passphrase is asked twice; empty is allowed)
+vox node create alice       # make a node (its passphrase is asked twice; every node has one)
 vox node attach alice       # attach it to the daemon, starting the daemon if none runs
 vox node list               # every node here, and whether it is attached
 vox node detach alice       # its connections close and its keys leave memory

@@ -1947,6 +1947,7 @@ pub fn ui_error(f: Fault) -> UiError {
         Fault::ProfileBusy => UiError::ProfileBusy,
         Fault::Locked => UiError::NotAttached,
         Fault::WrongPassphrase => UiError::WrongPassphrase,
+        Fault::PassphraseEmpty => UiError::PassphraseEmpty,
         Fault::UnknownChannel | Fault::ChannelNotOpen => UiError::ChannelNotOpen,
         Fault::TooLong => UiError::TooLong,
         Fault::KeyringFull => UiError::KeyringFull,

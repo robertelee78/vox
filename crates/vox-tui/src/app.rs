@@ -963,8 +963,7 @@ pub(crate) enum Asked<T> {
 }
 
 /// `VOX_IDENTITY_PASSPHRASE`, when set: how an agent's harness gives a daemon its identity
-/// passphrase (V210-159, decider 2026-10-02, option A). Set to nothing, it gives none on purpose
-/// (V030-36).
+/// passphrase (V210-159, decider 2026-10-02, option A).
 pub(crate) fn daemon_env_passphrase() -> Option<zeroize::Zeroizing<String>> {
     std::env::var("VOX_IDENTITY_PASSPHRASE")
         .ok()
@@ -983,13 +982,11 @@ pub(crate) fn daemon_passphrases(
     let raw = if let Some(path) = &passphrase_file {
         crate::tunnel_cli::passphrase_file_text(path)?
     } else if let Some(identity) = daemon_env_passphrase() {
-        // Said whichever way the passphrase came: an empty one set in the environment goes on
-        // without one, and the person is told so here as on every other path (V030-36).
-        return Ok(Asked::Got((encouraged(identity), Vec::new())));
+        return Ok(Asked::Got((identity, Vec::new())));
     } else if io::IsTerminal::is_terminal(&io::stdin()) {
         return Ok(match ask_without_echo(rt, stop, "identity passphrase") {
             Asked::Got(identity) => match identity? {
-                Some(identity) => Asked::Got((encouraged(identity), Vec::new())),
+                Some(identity) => Asked::Got((identity, Vec::new())),
                 None => {
                     return Err(AppError::Usage(format!(
                         "{NO_IDENTITY_PASSPHRASE} The terminal's input ended before one was \
@@ -1036,28 +1033,17 @@ pub(crate) fn daemon_passphrases(
         .map(|l| l.trim_end_matches('\r').to_owned())
         .filter(|l| !l.is_empty())
         .collect();
-    Ok(Asked::Got((encouraged(identity), rooms)))
-}
-
-/// `identity`, after one line encouraging a passphrase when it is empty.
-///
-/// **An empty identity passphrase is accepted** (V030-36, decider 2026-10-02: "passphrase is a
-/// good idea, but is technically optional"). It was refused here, so an identity made with none
-/// could never be served by a daemon.
-fn encouraged(identity: zeroize::Zeroizing<String>) -> zeroize::Zeroizing<String> {
-    crate::tunnel_cli::encouraged(identity.as_str(), "identity");
-    identity
+    Ok(Asked::Got((identity, rooms)))
 }
 
 /// What to say when nothing at all was given for the identity passphrase.
 const NO_IDENTITY_PASSPHRASE: &str =
-    "no identity passphrase. Type it at the terminal (Enter alone \
-     gives none), pipe it in (`echo … | vox daemon`; an empty line gives none), set \
+    "no identity passphrase. Type it at the terminal, pipe it in (`echo … | vox daemon`), set \
      VOX_IDENTITY_PASSPHRASE, or pass --passphrase-file.";
 
 /// Stdin that is not a terminal, read to its end: refused when it held nothing at all. A harness
 /// that closes stdin without writing has given nothing, and an identity whose passphrase that is
-/// not would only fail later as a wrong one; an empty line is how to give none.
+/// not would only fail later as a wrong one.
 fn given_on_stdin(raw: zeroize::Zeroizing<String>) -> Result<zeroize::Zeroizing<String>, AppError> {
     if raw.is_empty() {
         return Err(AppError::Usage(format!(

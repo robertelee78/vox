@@ -919,6 +919,8 @@ pub enum Fault {
     /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) ago (V210-159). Not
     /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
     PassphraseNeeded,
+    /// An identity was to be made with an empty passphrase: every node has one (ADR-028 K-11).
+    PassphraseEmpty,
     /// The trust keyring already holds its maximum number of identities
     /// (`trust::MAX_TRUSTED`). Not [`Fault::TooLong`]: nothing the person typed was too
     /// long, and "longer than this field allows" sent them looking at the petname.
@@ -1111,6 +1113,9 @@ impl Fault {
             Fault::WrongPassphrase => "the passphrase is wrong",
             Fault::PassphraseNeeded => {
                 "changing who you trust needs your identity passphrase again: it was last entered more than 30 minutes ago\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
+            }
+            Fault::PassphraseEmpty => {
+                "every node has an identity passphrase, and an empty one is refused; nothing was created"
             }
             Fault::UnknownChannel => {
                 "no such room on this node\n       `vox room list` shows the rooms it holds"
@@ -1334,6 +1339,7 @@ fault_names!(
     Locked,
     WrongPassphrase,
     PassphraseNeeded,
+    PassphraseEmpty,
     UnknownChannel,
     ChannelNotOpen,
     TooLong,
