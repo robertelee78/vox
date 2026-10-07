@@ -68,6 +68,31 @@ restarts, attach it with `--keep` (see [passphrase input](reference.md#passphras
 **Verify:** `vox room list` returns the rooms or `no rooms`, not the attach message. If the
 same message remains, report the selected roots and the exact message.
 
+## A keyring change asks for the passphrase, or is refused
+
+**Exact symptoms:**
+
+- `vox: changing who you trust needs your identity passphrase: it was not entered for a keyring
+  change in the last 30 minutes`, then `identity passphrase:` at a terminal;
+- the same line, then `it is typed at a terminal, and taken from nothing else (not
+  VOX_IDENTITY_PASSPHRASE, not a file). Run it in a terminal: vox trust add …`, and the command
+  exits 1;
+- `vox: --identity-passphrase-file is refused: a keyring change's passphrase is typed at a
+  terminal, never read from a file`.
+
+**Meaning:** a keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) needs the
+identity passphrase unless one was typed for a keyring change in the last 30 minutes. Attaching
+the node does not count. The passphrase is typed at a terminal; a file, `VOX_IDENTITY_PASSPHRASE`
+and an agent's session are never asked for it. Nothing is changed when the command is refused.
+
+**Check:** `vox status` says `keyring asks for the passphrase` or `keyring open Nm` on its second
+line.
+
+**Fix:** run the command the message names in a terminal of your own, outside any agent's session,
+and type the passphrase at the prompt. For an agent's node, you, its operator, run it.
+
+**Verify:** `vox trust list` shows the change, and `vox status` says `keyring open 30m`.
+
 ## A daemon is already running
 
 **Exact symptom:** `a daemon is already running for …`.
