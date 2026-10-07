@@ -1682,16 +1682,13 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
                         x.label
                     )));
                 };
-                // One answer per question, in order, separated by `;`: an option's number or
-                // the answer's text.
-                let given: Vec<&str> = if l.questions.len() > 1 {
-                    rest.split(';').map(str::trim).collect()
-                } else {
-                    vec![rest]
-                };
+                // One answer per question, in order, separated by `;`: an option's number or the
+                // answer's text. A `;` always separates, so one question given two answers is
+                // refused, never sent as the text "1; 2".
+                let given: Vec<&str> = rest.split(';').map(str::trim).collect();
                 if given.len() != l.questions.len() || given.iter().any(|g| g.is_empty()) {
                     return Some(Parsed::Refused(format!(
-                        "not sent to {}: the question asks {} thing(s); answer each, separated                          by ;",
+                        "not sent to {}: the question asks {} thing(s); answer each, separated by ;",
                         x.label,
                         l.questions.len()
                     )));
