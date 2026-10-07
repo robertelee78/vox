@@ -72,7 +72,9 @@ pub struct ShareOpts {
     pub for_: Option<Duration>,
 }
 
-fn shares_of(frame: Result<Frame, vox_core::error::Error>) -> Result<Vec<ShareRow>, AppError> {
+pub(crate) fn shares_of(
+    frame: Result<Frame, vox_core::error::Error>,
+) -> Result<Vec<ShareRow>, AppError> {
     match frame {
         Ok(Frame::Shares { shares }) => Ok(shares),
         Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
