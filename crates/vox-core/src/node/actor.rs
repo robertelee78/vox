@@ -6271,7 +6271,12 @@ impl Node {
                     let _ = own.add(n.clone());
                 }
             }
-            (channel.anchors().clone(), own, members, channel.is_settled())
+            (
+                channel.anchors().clone(),
+                own,
+                members,
+                channel.is_settled(),
+            )
         };
         self.room_anchors.insert(*channel_id, own);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
