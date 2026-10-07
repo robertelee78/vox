@@ -363,6 +363,11 @@ async fn members_of(
 /// `--to`, as the envelope carries it (V210-161): each word resolved by the poster, once, to a
 /// member's whole fingerprint, so every reader resolves it to the same node. A word that names
 /// no member is refused, saying why.
+///
+/// **`<member>/<session>` addresses one session of that member** (ADR-029 TA-1): the session is
+/// one of the member's Sessions in this room, named as `vox room sessions` names it (its id, 8 or
+/// more characters of it, or its name), and is carried as `<whole fingerprint>/<session id>`.
+/// One that has ended is refused, and nothing is posted (TA-5).
 pub(crate) async fn addressees(
     client: &mut IpcClient,
     channel_id: Digest32,
@@ -372,16 +377,66 @@ pub(crate) async fn addressees(
         return Ok(Vec::new());
     }
     let members = members_of(client, channel_id).await?;
+    let member = |w: &str| crate::ident::resolve_member(w, &members, crate::ident::names());
+    let mut sessions: Option<Vec<vox_core::node::sessions::SessionRow>> = None;
     let mut to: Vec<String> = Vec::new();
     for w in words {
-        let fp = crate::ident::resolve_member(w, &members, crate::ident::names())
-            .map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?;
-        let fp = b32_encode(&fp);
-        if !to.contains(&fp) {
-            to.push(fp);
+        let entry = match w
+            .rsplit_once('/')
+            .and_then(|(m, s)| Some((member(m).ok()?, s)))
+        {
+            Some((fp, typed)) => {
+                if sessions.is_none() {
+                    sessions = Some(sessions_of(client, channel_id).await?);
+                }
+                let session = session_of(sessions.as_deref().unwrap_or_default(), &fp, typed)
+                    .map_err(|e| AppError::Usage(format!("refusing --to {w}: {e}")))?;
+                format!("{}/{session}", b32_encode(&fp))
+            }
+            None => {
+                b32_encode(&member(w).map_err(|e| AppError::Usage(format!("refusing --to: {e}")))?)
+            }
+        };
+        if !to.contains(&entry) {
+            to.push(entry);
         }
     }
     Ok(to)
+}
+
+/// The room's Sessions, as its log says.
+async fn sessions_of(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+) -> Result<Vec<vox_core::node::sessions::SessionRow>, AppError> {
+    match client.request(&Request::Sessions { channel_id }).await {
+        Ok(Frame::Sessions { sessions }) => Ok(sessions),
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(AppError::Usage(e.to_string())),
+    }
+}
+
+/// The id of the one Session of the node `fp` that `typed` names, open (ADR-029 TA-1, TA-5): its
+/// newest opening for each id, so a session that ended and came back is the one that is open.
+fn session_of(
+    rows: &[vox_core::node::sessions::SessionRow],
+    fp: &Digest32,
+    typed: &str,
+) -> Result<String, String> {
+    let mut mine: Vec<vox_core::node::sessions::SessionRow> = Vec::new();
+    for r in rows.iter().filter(|r| r.node == *fp) {
+        mine.retain(|m| m.id != r.id);
+        mine.push(r.clone());
+    }
+    vox_core::node::sessions::resolve(&mine, typed, false, |s| {
+        vox_agentcomms::envelope::session_label(
+            &crate::ident::name_of(&s.node),
+            s.name.as_deref(),
+            &s.id,
+        )
+    })
+    .map(|s| s.id.clone())
 }
 
 /// What a structured post did, for its caller to say (`vox room post`, the TUI's composer).
@@ -694,17 +749,42 @@ pub async fn post_cmd(
             if !env.to.is_empty() {
                 let (mut client, cid, _) = open_room(paths, room).await?;
                 let members = members_of(&mut client, cid).await?;
-                if let Some(bad) = env
-                    .to
-                    .iter()
-                    .find(|t| !crate::ident::recipient(t).is_some_and(|fp| members.contains(&fp)))
-                {
+                let node_of = |t: &str| {
+                    crate::ident::recipient(vox_agentcomms::envelope::addressee(t).0)
+                        .filter(|fp| members.contains(fp))
+                };
+                if let Some(bad) = env.to.iter().find(|t| node_of(t).is_none()) {
                     return Err(AppError::Usage(format!(
                         "refusing to post it: `to` names {:?}, which is not a member's whole \
                          fingerprint as `vox room roster` prints it. Use --to, which takes your \
                          name for a member or its fingerprint",
                         vox_agentcomms::envelope::shown(bad, vox_agentcomms::envelope::SHOWN_NAME)
                     )));
+                }
+                // One session addressed is one of the member's open Sessions here (TA-1, TA-5).
+                let mut sessions = None;
+                for t in &env.to {
+                    let (Some(fp), (_, Some(id))) =
+                        (node_of(t), vox_agentcomms::envelope::addressee(t))
+                    else {
+                        continue;
+                    };
+                    if sessions.is_none() {
+                        sessions = Some(sessions_of(&mut client, cid).await?);
+                    }
+                    match session_of(sessions.as_deref().unwrap_or_default(), &fp, id) {
+                        Ok(found) if found == id => {}
+                        Ok(_) => {
+                            return Err(AppError::Usage(format!(
+                                "refusing to post it: no Session in this room is named {}",
+                                vox_agentcomms::envelope::shown(
+                                    id,
+                                    vox_agentcomms::envelope::SHOWN_NAME
+                                )
+                            )))
+                        }
+                        Err(e) => return Err(AppError::Usage(format!("refusing to post it: {e}"))),
+                    }
                 }
             }
             if claim::is_claim_protocol(&env) {
@@ -943,7 +1023,7 @@ fn unread_addressed(
         .filter_map(|r| {
             let env = Envelope::parse(&r.text).ok()?;
             let own = r.author == snap.me && env.from == session;
-            (!own && env.is_addressed_to(&me)).then(|| {
+            (!own && env.is_addressed_to_session(&me, session)).then(|| {
                 // Every field is the author's, and this lands on the reporting agent's stderr: each
                 // is shown on one line and cut (V210-123). The body's first line ends at any
                 // character a reader breaks a line at, not only `\n`.

@@ -45,6 +45,16 @@ pub fn session_label(node_alias: &str, name: Option<&str>, id: &str) -> String {
     }
 }
 
+/// A `to` entry split into the node it names and, for one addressed to a single session of that
+/// node, the session (ADR-029 TA-1): `<whole fingerprint>/<session id>`.
+#[must_use]
+pub fn addressee(entry: &str) -> (&str, Option<&str>) {
+    match entry.split_once('/') {
+        Some((node, session)) => (node, Some(session)),
+        None => (entry, None),
+    }
+}
+
 /// Default hop budget, decremented on every relay and dropped at zero.
 ///
 /// 8, following ruflo's ADR-097, whose own note is the argument: the default
@@ -351,7 +361,10 @@ impl Envelope {
                 "the type is empty, too long, or not on one line",
             ));
         }
-        if self.to.iter().any(|n| !is_valid_name(n, MAX_NAME)) {
+        if self.to.iter().any(|n| {
+            let (node, session) = addressee(n);
+            !is_valid_name(node, MAX_NAME) || session.is_some_and(|s| !is_valid_name(s, MAX_NAME))
+        }) {
             return Err(ParseError::Malformed(
                 "an addressee name is empty, too long, or not on one line",
             ));
@@ -395,6 +408,26 @@ impl Envelope {
     #[must_use]
     pub fn is_addressed_to(&self, me: &str) -> bool {
         self.to.iter().any(|n| n == me)
+    }
+
+    /// Whether this message is for `session` of the node `me` (ADR-029 TA-1, TA-4): it names the
+    /// node, which reaches every session of it, or that one session.
+    #[must_use]
+    pub fn is_addressed_to_session(&self, me: &str, session: &str) -> bool {
+        self.to
+            .iter()
+            .any(|n| n == me || addressee(n) == (me, Some(session)))
+    }
+
+    /// Whether this message is for another session of the node `me` and not for `session` (ADR-029
+    /// TA-2): that session's siblings count it rather than show it.
+    #[must_use]
+    pub fn is_for_a_sibling_of(&self, me: &str, session: &str) -> bool {
+        !self.is_addressed_to_session(me, session)
+            && self
+                .to
+                .iter()
+                .any(|n| addressee(n).0 == me && addressee(n).1.is_some())
     }
 
     /// Whether this message is to the room rather than to anyone in particular.

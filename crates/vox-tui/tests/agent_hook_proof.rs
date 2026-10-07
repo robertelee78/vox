@@ -1895,6 +1895,15 @@ fn restart(d: &mut Daemon, root: &Path) {
     }
 }
 
+/// Whether `d`'s `vox room sessions` lists the Session `id` as open; `None` when it lists none.
+fn bob_label_open(d: &Daemon, room: &str, id: &str) -> Option<bool> {
+    let (_, out, _) = hook(&d.data, &d.cfg, &["room", "sessions", room, "--json"], "");
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|r| r["id"] == id)
+        .and_then(|r| r["open"].as_bool())
+}
+
 #[test]
 #[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
 fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
@@ -2091,6 +2100,68 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     );
     post_as(at, "AFTER-RENAME the cap holds");
     let bob_renamed = bob_label("AFTER-RENAME");
+    // (10) bob addresses one session of the node (ADR-029 TA-1), then the node itself (TA-4). Each
+    // session's next turn: the one addressed shows it in full, its sibling counts it.
+    let bob_post = |args: &[&str]| {
+        let mut all = vec!["room", "post", room.as_str()];
+        all.extend_from_slice(args);
+        hook(&bob.data, &bob.cfg, &all, "")
+    };
+    let (ok, _, err) = bob_post(&["--to", "codex@device-2/gso-cap-2", "TO-ONE-SESSION hello"]);
+    assert!(
+        ok,
+        "PRODUCT: bob's `vox room post --to codex@device-2/gso-cap-2` failed: {err}"
+    );
+    let (ok, _, err) = bob_post(&["--to", "codex@device-2", "TO-THE-NODE hello all"]);
+    assert!(
+        ok,
+        "PRODUCT (staging): bob's `vox room post --to codex@device-2` failed: {err}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while !["TO-ONE-SESSION", "TO-THE-NODE"]
+        .iter()
+        .all(|m| shown_rows(&daemon).iter().any(|(_, t)| t.contains(m)))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: staging not achieved: bob's two posts did not reach the session's node in \
+             90 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let turn = |payload: String| {
+        let (ok, out, err) = hook_env(&data, &cfg, &hook_args, &payload, &person);
+        assert!(ok, "PRODUCT: the hook must exit 0; it said {out}{err}");
+        out
+    };
+    let addressed_turn = turn(claude_event_at(
+        at,
+        "UserPromptSubmit",
+        r#","prompt":"anything for me""#,
+        &transcript,
+    ));
+    let sibling_turn = turn(claude_event(
+        "0a1b2c3d-nameless",
+        "UserPromptSubmit",
+        r#","prompt":"anything for me""#,
+    ));
+    eprintln!(
+        "[proof] the addressed session's turn: {addressed_turn}\n[proof] its sibling's turn: \
+         {sibling_turn}"
+    );
+    assert!(
+        addressed_turn.contains("TO-ONE-SESSION hello") && addressed_turn.contains("TO-THE-NODE"),
+        "PRODUCT: a message addressed to one session must be shown in full in its turn, and one \
+         to its node too; its turn said:\n{addressed_turn}"
+    );
+    assert!(
+        !sibling_turn.contains("TO-ONE-SESSION")
+            && sibling_turn.contains("1 message(s) to another session of this node")
+            && sibling_turn.contains("TO-THE-NODE hello all"),
+        "PRODUCT: another session of the node must count a message addressed to its sibling, not \
+         show it, and still be shown one addressed to the node (ADR-029 TA-2, TA-4); its turn \
+         said:\n{sibling_turn}"
+    );
     // (8) The daemon restarts mid-session; the session's next turn opens no second Session.
     restart(&mut daemon, tmp.path());
     run(
@@ -2119,6 +2190,29 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         &person,
     );
     let after_end = sessions();
+    // (11) bob addresses the session that has ended (TA-5): refused, and nothing posted.
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while bob_label_open(&bob, &room, at) != Some(false) {
+        assert!(
+            Instant::now() < deadline,
+            "APPARATUS: staging not achieved: the session's end did not reach bob in 90 s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (posted, said, refused) = bob_post(&[
+        "--to",
+        "codex@device-2/3f0c25bf",
+        "TO-AN-ENDED-SESSION hello",
+    ]);
+    let reached = shown_rows(&bob)
+        .iter()
+        .any(|(_, t)| t.contains("TO-AN-ENDED-SESSION"));
+    assert!(
+        !posted && refused.contains("has ended") && !reached,
+        "PRODUCT: a message to a session that has ended must be refused, saying it ended, and \
+         posted nowhere (ADR-029 TA-5); vox exited ok={posted}, said {said}{refused}, and the \
+         room holds it: {reached}"
+    );
     let (_, listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
     let (_, read, _) = hook(&data, &cfg, &["room", "read", &room], "");
     eprintln!(
