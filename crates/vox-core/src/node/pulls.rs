@@ -470,7 +470,9 @@ pub async fn pull_driven(
     let name = safe_file_name(&offer.name);
     let part = dir.join(format!(".{name}.{}.part", hex(&offer.entry[..8])));
     let received = receive(bound, &part, &offer).await;
-    let _ = handle.apply(NodeCommand::StopForward { local: bound }).await;
+    let _ = handle
+        .apply(NodeCommand::StopForward { local: bound })
+        .await;
     if let Err(e) = received {
         let _ = std::fs::remove_file(&part);
         return Err(e);
