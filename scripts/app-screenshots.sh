@@ -35,12 +35,16 @@ case "$VOX_DATA_DIR$VOX_CONFIG_DIR" in
 esac
 
 XCFRAMEWORK_SLICES=macos OUT="$BUILD/xcf" scripts/build-xcframework.sh >/dev/null
-cargo build -q --release --bin vox
+# The demo's own `vox`, built for proofs only (test-knobs: it may fetch a link card from the
+# demo's local page, VOX_TEST_CARD_ALLOW), into the demo's directory; never the one shipped.
+cargo build -q --release --bin vox --features vox-tui/test-knobs --target-dir "$BUILD/target"
 cargo run -q -p vox-theme -- swift assets/theme/vox-tokens.json "$BUILD/theme"
-VOX="$ROOT/target/release/vox"
+VOX="$BUILD/target/release/vox"
 
 DAEMON=""
+PAGE=""
 cleanup() {
+    [ -n "$PAGE" ] && kill "$PAGE" 2>/dev/null && { wait "$PAGE" 2>/dev/null || true; }
     [ -n "$DAEMON" ] && kill "$DAEMON" 2>/dev/null && wait "$DAEMON" 2>/dev/null
     echo "app-screenshots: the demo data root was $DEMO (scratch; remove it when done)"
 }
@@ -50,7 +54,30 @@ trap cleanup EXIT
 : >"$DEMO/empty"
 printf 'family room\n' >"$DEMO/room"
 printf 'not it\n' >"$DEMO/wrong"
-"$VOX" daemon --listen 127.0.0.1:0 >"$DEMO/daemon.log" 2>&1 &
+# A page on this machine for a link card (title, description, image), so the demo contacts no
+# site; and a photo to share, so its card carries a preview.
+python3 - "$DEMO" <<'PY'
+import struct, sys, zlib
+demo = sys.argv[1]
+def png(w, h, px):
+    rows = b"".join(b"\0" + bytes(c for x in range(w) for c in px(x, y)) for y in range(h))
+    chunk = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+open(f"{demo}/hike.png", "wb").write(png(240, 160, lambda x, y: (40 + y // 2, 120 + x // 4, 200 - y // 2)))
+open(f"{demo}/soup.png", "wb").write(png(64, 64, lambda x, y: (200, 140 + x, 60 + y)))
+open(f"{demo}/recipe.html", "w").write(
+    '<html><head><title>Leek and potato soup</title>'
+    '<meta property="og:title" content="Leek and potato soup">'
+    '<meta property="og:description" content="Forty minutes, one pot, serves six.">'
+    '<meta property="og:image" content="/soup.png"></head><body>soup</body></html>')
+PY
+python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$DEMO" >"$DEMO/page.log" 2>&1 &
+PAGE=$!
+for _ in $(seq 1 50); do grep -q "Serving HTTP" "$DEMO/page.log" && break; sleep 0.1; done
+PAGE_AT=$(sed -n 's/.*port \([0-9]*\).*/127.0.0.1:\1/p' "$DEMO/page.log" | head -1)
+[ -n "$PAGE_AT" ] || { echo "app-screenshots: the demo's page server did not start" >&2; exit 2; }
+VOX_TEST_CARD_ALLOW="$PAGE_AT" "$VOX" daemon --listen 127.0.0.1:0 >"$DEMO/daemon.log" 2>&1 &
 DAEMON=$!
 for _ in $(seq 1 100); do grep -q "control socket" "$DEMO/daemon.log" && break; sleep 0.1; done
 for n in ann ben builder stranger; do
@@ -63,7 +90,7 @@ ANN=$(fp ann) BEN=$(fp ben) BUILDER=$(fp builder)
 ROOM=$("$VOX" room list --node ann | awk 'NR==1{print $1}')
 LINK=$("$VOX" room link --node ann "$ROOM" | grep '^vox://')
 for n in ben builder; do
-    "$VOX" room join --node "$n" --passphrase-file "$DEMO/room" "$LINK" --name family >/dev/null 2>&1
+    "$VOX" room join --node "$n" --passphrase-file "$DEMO/room" "$LINK" >/dev/null
 done
 trust() { "$VOX" trust add --node "$1" "$2" --name "$3" --identity-passphrase-file "$DEMO/empty" >/dev/null; }
 trust ann "$BEN" ben; trust ann "$BUILDER" builder
@@ -76,6 +103,8 @@ done
 "$VOX" room post --node ann "$ROOM" "Seven works. I'll make the soup." >/dev/null
 printf 'Shopping: leeks, potatoes, cream, bread.\n' >"$DEMO/shopping-list.txt"
 "$VOX" share --node ben "$ROOM" "$DEMO/shopping-list.txt" --to "$ANN" -m "the list for Saturday" >/dev/null
+"$VOX" share --node ben "$ROOM" "$DEMO/hike.png" -m "the view from Sunday's hike" >/dev/null
+"$VOX" room post --node ann "$ROOM" "The soup: http://$PAGE_AT/recipe.html" >/dev/null
 # The agent's own session, named here: a claim is owned per session.
 VOX_SESSION=builder-demo "$VOX" room claim --node builder "$ROOM" photo-album >/dev/null
 VOX_SESSION=builder-demo "$VOX" room post --node builder --type working "$ROOM" \
@@ -84,7 +113,7 @@ VOX_SESSION=builder-demo "$VOX" room post --node builder --type working "$ROOM" 
 # `vox room post --to` speaks for a session, and refuses without one: ben's, named.
 VOX_SESSION=ben-demo "$VOX" room post --node ben --to "$ANN" "$ROOM" \
     "Can you check the photo album when it's done?" >/dev/null
-"$VOX" room join --node stranger --passphrase-file "$DEMO/wrong" "$LINK" --name family >/dev/null 2>&1 || true
+"$VOX" room join --node stranger --passphrase-file "$DEMO/wrong" "$LINK" >/dev/null 2>&1 || true
 sleep 3
 
 # ---- the renderer: the app's views, offscreen ------------------------------------------------

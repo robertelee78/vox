@@ -6,7 +6,7 @@ import SwiftUI
 
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
-    case palette, newRoom, joinRoom, fingerprint, retention, admins, leave, end
+    case palette, newRoom, joinRoom, fingerprint, rename, retention, admins, leave, end
     var id: String { rawValue }
 }
 
@@ -61,6 +61,7 @@ extension VoxAction {
             VoxAction("Room", "Copy Room Link", "l", enabled: inRoom) {
                 Task { await node?.copyRoomLink() }
             },
+            VoxAction("Room", "Rename…", enabled: inRoom) { node?.sheet = .rename },
             VoxAction("Room", "Retention…", enabled: inRoom) { node?.sheet = .retention },
             VoxAction("Room", "Admins…", enabled: inRoom) { node?.sheet = .admins },
             VoxAction("Room", "Reply to Selected Message", "r",
@@ -201,6 +202,7 @@ struct NodeSheets: View {
         case .newRoom: RoomForm(model: model, joining: false)
         case .joinRoom: RoomForm(model: model, joining: true)
         case .fingerprint: FingerprintSheet(model: model)
+        case .rename: RenameSheet(model: model)
         case .retention: RetentionSheet(model: model)
         case .admins: AdminsSheet(model: model)
         case .leave: LeaveSheet(model: model, ending: false)
@@ -326,6 +328,46 @@ private struct RetentionSheet: View {
         guard let secret = field.take() else { return }
         let s = seconds
         Task { if await model.setRetention(s, passphrase: secret) { model.sheet = nil } }
+    }
+}
+
+/// Rename the room: its one name, as every member sees it, said before it is set (E-5); the
+/// identity passphrase always, as `vox room rename` asks it.
+private struct RenameSheet: View {
+    @ObservedObject var model: NodeModel
+    @State private var name = ""
+    @State private var field = SecureFieldHolder()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Rename the room").font(Theme.heading)
+            TextField("Its new name", text: $name).accessibilityIdentifier("rename-name")
+            Text("Every member sees the new name, in their sidebar and in every address of the "
+                + "room's services. Only the room's creator or an admin may rename it.")
+                .secondaryText()
+                .accessibilityIdentifier("rename-effect")
+            Text("Your identity passphrase:").secondaryText()
+            SecureInput(holder: field) { submit() }.frame(width: 320)
+                .accessibilityIdentifier("rename-passphrase")
+            if let said = model.said {
+                StateMark(kind: .danger, words: said).textSelection(.enabled)
+                    .accessibilityIdentifier("rename-said")
+            }
+            HStack {
+                Button("Cancel") { model.sheet = nil }.keyboardShortcut(.cancelAction)
+                Button("Rename") { submit() }.keyboardShortcut(.defaultAction)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .accessibilityIdentifier("rename-submit")
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+    }
+
+    private func submit() {
+        guard let secret = field.take() else { return }
+        let n = name.trimmingCharacters(in: .whitespaces)
+        Task { if await model.renameRoom(to: n, passphrase: secret) { model.sheet = nil } }
     }
 }
 
