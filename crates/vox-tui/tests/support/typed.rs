@@ -135,6 +135,16 @@ fn driver(cmd: &Command) -> Command {
         .arg(BOUND.as_secs().to_string())
         .arg(cmd.get_program())
         .args(cmd.get_args());
+    // **A cleared environment** (every child of a proof is): what the proof's own process holds —
+    // a harness's session, a terminal multiplexer's pane — never reaches the typed `vox`. A
+    // caller's `env_clear` is not visible here, so only `PATH`, `HOME` and `TMPDIR` are carried,
+    // and then what the caller set on its command.
+    py.env_clear();
+    for key in ["PATH", "HOME", "TMPDIR"] {
+        if let Some(v) = std::env::var_os(key) {
+            py.env(key, v);
+        }
+    }
     for (k, v) in cmd.get_envs() {
         match v {
             Some(v) => py.env(k, v),
