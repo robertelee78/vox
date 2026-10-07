@@ -27,6 +27,18 @@ pub struct Line {
     /// The harness's id for the call or request it is about (`ref`): what `--approve`,
     /// `--reject` and `--answer` name. Empty for an entry about none.
     pub reference: String,
+    /// What it waits for from a member with drive: an approval or a question still open and
+    /// answerable from Vox, or `None`.
+    pub waiting: Option<Waiting>,
+}
+
+/// What an open request waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Waiting {
+    /// Approve or reject.
+    Approval,
+    /// An answer.
+    Question,
 }
 
 /// How the reader names a node: by its alias, or as itself.
@@ -161,6 +173,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             t => format!("[{t}] "),
         };
         let mut details: Vec<(String, String)> = Vec::new();
+        let mut waiting = None;
         let text = match b.kind() {
             "user" => {
                 details.push(("typed".into(), b.str("text").to_owned()));
@@ -203,7 +216,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     format!("{head} — not answerable from Vox: {}", b.str("why"))
                 } else {
                     match resolved.get(b.reference()).map(|&i| &bodies[i]) {
-                        None => format!("{head} — approve or reject?"),
+                        None => {
+                            waiting = Some(Waiting::Approval);
+                            format!("{head} — approve or reject?")
+                        }
                         Some(r) => format!("{head} — {}", outcome_words(r, names)),
                     }
                 }
@@ -254,7 +270,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     format!("{head} — not answerable from Vox: {}", b.str("why"))
                 } else {
                     match resolved.get(b.reference()).map(|&i| &bodies[i]) {
-                        None => head,
+                        None => {
+                            waiting = Some(Waiting::Question);
+                            head
+                        }
                         Some(r) => format!("{head} — {}", outcome_words(r, names)),
                     }
                 }
@@ -306,6 +325,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             text: format!("{prefix}{text}"),
             details,
             reference: b.reference().to_owned(),
+            waiting,
         });
     }
     out
@@ -319,6 +339,17 @@ pub fn render(lines: &[Line], details: bool) -> String {
     for l in lines {
         s.push_str(&l.text);
         s.push('\n');
+        // **A request waiting for an answer names how to give it** (DR-1.4, DR-1.5): the ref
+        // `--approve`, `--reject` and `--answer` take, whole, so a person can copy it.
+        match (l.waiting, l.reference.as_str()) {
+            (_, "") | (None, _) => {}
+            (Some(Waiting::Approval), r) => s.push_str(&format!(
+                "    waiting: approve with --approve {r}, or reject with --reject {r}\n"
+            )),
+            (Some(Waiting::Question), r) => s.push_str(&format!(
+                "    waiting: answer with --answer {r} \"<question>=<answer>\"\n"
+            )),
+        }
         if details {
             for (label, body) in &l.details {
                 s.push_str(&format!("    {label}:\n"));
@@ -510,6 +541,7 @@ pub async fn show(
                 "{}",
                 serde_json::json!({
                     "seq": l.seq, "kind": l.kind, "line": l.text, "ref": l.reference,
+                    "waiting": l.waiting.is_some(),
                     "details": if details { Value::Object(d) } else { Value::Null },
                 })
             );
