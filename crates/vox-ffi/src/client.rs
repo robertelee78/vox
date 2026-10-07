@@ -36,7 +36,7 @@ use crate::{digest, failed, VoxError};
 ///
 /// Swift makes one from the bytes it has (a secure field's, or the Keychain's `Data`) and passes the
 /// handle; it never gets the text back. One handle may be passed more than once, for an attach and
-/// then a keyring change within the window.
+/// then a keyring change.
 #[derive(uniffi::Object)]
 pub struct Passphrase(Mutex<Zeroizing<String>>);
 
@@ -1032,8 +1032,8 @@ impl VoxClient {
         on_held!(self, |c| done(c, &Request::End { channel_id }).await)
     }
 
-    /// Trust `fingerprint` under `name`. The identity passphrase is needed once the keyring
-    /// window has passed; within it, pass none.
+    /// Trust `fingerprint` under `name`. The identity passphrase is needed unless one was given
+    /// for a keyring change within the keyring window; attaching opens no window (ADR-028 K-12).
     ///
     /// # Errors
     /// A malformed fingerprint, the passphrase needed or wrong, or the node's refusal.

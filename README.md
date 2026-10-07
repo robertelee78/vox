@@ -151,7 +151,8 @@ There are two, and both are optional:
 
 - **The identity passphrase** protects your keys at rest. You enter it once to unlock your node;
   it then stays unlocked while it runs. Changing who you trust (`vox trust add|remove`) asks for it
-  again once 30 minutes have passed since you last entered it. Reading never does.
+  unless you entered it for such a change in the last 30 minutes; attaching does not count.
+  Reading never does.
 - **A room's passphrase** is the second factor for joining that room.
 
 At a terminal, Vox asks for them without echo. In a script or an agent there is no terminal, so give

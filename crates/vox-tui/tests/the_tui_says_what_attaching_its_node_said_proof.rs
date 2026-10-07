@@ -22,9 +22,9 @@
 //! and the focused room list's border is drawn in its `accent`, both read from
 //! `assets/theme/vox-tokens.json` by this proof, so a change to a token is what the TUI draws.
 //!
-//! **The keyring window is on the status bar (ADR-028 K-9, #478).** The passphrase was just typed
-//! to attach the node, so a keyring change goes without it for the next 30 minutes: the status bar
-//! says `keyring open 30m`.
+//! **The keyring window is on the status bar (ADR-028 K-9, #478), and attaching does not open it
+//! (K-12).** The passphrase was just typed to attach the node, which opens no window: the status
+//! bar says `keyring asks for the passphrase`, never `keyring open`.
 //!
 //! **The mutations that must turn it red:** the keyring window left off the status bar — red as
 //! PRODUCT, quoting the bottom rows; `DaemonCore::attach` not putting the attach's notes in
@@ -129,15 +129,14 @@ fn the_tui_says_what_attaching_its_node_said() {
         out.stdout
     );
 
-    // K-9: the passphrase was just typed, so the whole window is ahead.
-    println!(
-        "[proof] the status bar says the keyring is open: {}",
-        said.contains("keyring open 30m")
-    );
+    // K-9, K-12: the passphrase was just typed to attach, which opens no keyring window.
+    let asks = said.contains("keyring asks for the passphrase") && !said.contains("keyring open");
+    println!("[proof] the status bar says the keyring asks for the passphrase: {asks}");
     assert!(
-        said.contains("keyring open 30m"),
-        "PRODUCT: the TUI's node was just attached with its passphrase, and its status bar does \
-         not say `keyring open 30m`: it said {said:?}"
+        asks,
+        "PRODUCT: the TUI's node was just attached with its passphrase, which opens no keyring \
+         window (ADR-028 K-12), and its status bar does not say `keyring asks for the passphrase`: \
+         it said {said:?}"
     );
 
     let colours = out
