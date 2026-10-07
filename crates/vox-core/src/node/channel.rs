@@ -703,6 +703,23 @@ pub const MAX_OWED_ASKED: usize = 256;
 /// held without one (V030-10).
 type Arrived = (Digest32, Digest32, Option<Vec<u8>>, Option<u64>);
 
+/// The milliseconds an entry authored at `now_secs` claims: the wall clock's, while it is within
+/// that second (or the next, just past it: that second's last millisecond), so governance and
+/// control entries order and show in milliseconds like messages, and a retention change made just
+/// after a post is never drawn before it (the decider, 2026-10-07: all time in milliseconds). A
+/// caller acting at another time (a test's clock) claims its second.
+fn claim_ms(now_secs: u64) -> u64 {
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let second = now_secs.saturating_mul(1_000);
+    match wall / 1_000 {
+        s if s == now_secs => wall,
+        s if s == now_secs.saturating_add(1) => second.saturating_add(999),
+        _ => second,
+    }
+}
+
 /// Whether an entry claimed at `claimed_ms` is past `ttl` seconds of retention at `now_secs`
 /// (`ttl == 0` keeps everything).
 fn expired_at(claimed_ms: u64, now_secs: u64, ttl: u64) -> bool {
@@ -4411,7 +4428,7 @@ impl ChannelState {
         }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
-        let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
+        let skeleton = self.next_skeleton(&me, payload, claim_ms(now_secs));
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let id = self.next_log_id;
@@ -4624,9 +4641,7 @@ impl ChannelState {
         if !self.authors.contains_key(&me) {
             return Err(Error::Profile("this identity is not an author of the room"));
         }
-        // Governance is authored on the seconds clock; its place in the order is whole
-        // seconds, which only matters against entries it did not see.
-        let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
+        let skeleton = self.next_skeleton(&me, payload, claim_ms(now_secs));
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let wire = entry.to_wire();
