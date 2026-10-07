@@ -107,43 +107,75 @@ pub async fn run_file(
     note: Option<&str>,
 ) -> Result<(), crate::app::AppError> {
     use crate::app::AppError;
-    use vox_core::node::ipc::{Request as Ipc, SessionTo};
     let (channel_id, node, id, label) = target(paths, room, session).await?;
+    match send_file(paths, channel_id, node, id, path, note).await {
+        Ok(said) => {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stdout().lock(), "{label}: {said}");
+            Ok(())
+        }
+        Err(not) => Err(AppError::Usage(not.sentence(&label))),
+    }
+}
+
+/// Send Session `session_id` of `node` in room `channel_id` a file (ADR-029 DR-1.7, #546), as
+/// `vox room session --file` and the TUI's `:share` do: serve `path` as a share only `node` may
+/// fetch, once, then say so on the drive request. What the session's node answered ("accepted,
+/// pulling n bytes"); or why not, in the words every drive uses (CL-1). A file not taken is not
+/// served on.
+///
+/// # Errors
+/// [`NotDelivered`]: the file could not be read or served (not sent), the session's node refused
+/// it, or no answer came.
+pub async fn send_file(
+    paths: &vox_core::node::paths::Paths,
+    channel_id: vox_core::hash::Digest32,
+    node: vox_core::hash::Digest32,
+    session_id: String,
+    path: &std::path::Path,
+    note: Option<&str>,
+) -> Result<String, NotDelivered> {
+    use vox_core::node::ipc::{Request as Ipc, SessionTo};
     let path = std::fs::canonicalize(path)
-        .map_err(|e| AppError::Usage(format!("not sent to {label}: {}: {e}", path.display())))?;
+        .map_err(|e| NotDelivered::NotSent(format!("{}: {e}", path.display())))?;
     let note = note.map(str::trim).filter(|n| !n.is_empty());
     let mut env =
         vox_agentcomms::envelope::Envelope::new(crate::room_cli::FILE, note.unwrap_or(""));
     if let Some(n) = note {
         env.data = serde_json::json!({ "note": n });
     }
-    let mut client = crate::room_cli::attach(paths).await?;
+    let mut client = crate::room_cli::attach(paths)
+        .await
+        .map_err(|e| NotDelivered::NotSent(e.to_string()))?;
     let row = crate::share_cli::shares_of(
         client
             .request(&Ipc::SessionShare {
                 channel_id,
                 path: path.to_string_lossy().into_owned(),
-                envelope: serde_json::to_string(&env)
-                    .map_err(|e| AppError::Usage(format!("not sent to {label}: {e}")))?,
+                envelope: env.to_text(),
                 to: SessionTo::Node(node),
             })
             .await,
     )
-    .map_err(|e| AppError::Usage(format!("not sent to {label}: {e}")))?
+    .map_err(|e| NotDelivered::NotSent(e.to_string()))?
     .into_iter()
     .next()
-    .ok_or_else(|| AppError::Usage(format!("not sent to {label}: the daemon did not serve it")))?;
+    .ok_or_else(|| NotDelivered::NotSent("the daemon did not serve it".into()))?;
     let tag = row.tag.clone();
-    let action = Action::File {
-        name: row.name,
-        size: row.size,
-        sha256: row.sha256,
-        tag: row.tag,
-        note: note.map(str::to_owned),
+    let request = Request {
+        v: 1,
+        session: session_id,
+        action: Action::File {
+            name: row.name,
+            size: row.size,
+            sha256: row.sha256,
+            tag: row.tag,
+            note: note.map(str::to_owned),
+        },
     };
-    let delivered = deliver(paths, channel_id, node, id, &label, action).await;
+    let sent = send(paths, channel_id, node, &request).await;
     // Not taken: served to no one, so not served at all.
-    if delivered.is_err() {
+    if sent.is_err() {
         let _ = client
             .request(&Ipc::ShareStop {
                 channel_id,
@@ -151,7 +183,7 @@ pub async fn run_file(
             })
             .await;
     }
-    delivered
+    sent
 }
 
 /// The one open Session `session` names in `room`: its room, its node, its id and its label;
