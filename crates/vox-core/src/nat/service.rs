@@ -506,7 +506,7 @@ impl RendezvousService {
         request: &RendezvousRequest,
         local: bool,
     ) -> Vec<RendezvousResponse> {
-        let now = (self.clock)();
+        let now = (self.clock)() / 1_000;
         match request {
             RendezvousRequest::Put { record } => {
                 vec![match self.put(publisher, source, record, now, local) {

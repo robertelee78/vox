@@ -1482,13 +1482,13 @@ impl ChannelState {
         profile: &Profile,
         name: &str,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
         Self::create_with_profile(
             profile,
             name,
             channel_passphrase,
-            now_secs,
+            now,
             Argon2Profile::default(),
         )
     }
@@ -1498,22 +1498,14 @@ impl ChannelState {
         profile: &Profile,
         name: &str,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
         argon2: Argon2Profile,
     ) -> Result<Self> {
-        let (genesis, sek) = Self::create_genesis(profile, name, now_secs)?;
+        let (genesis, sek) = Self::create_genesis(profile, name, now)?;
         let signer = profile.signer()?;
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
-        Self::create_from_sealed(
-            profile,
-            name,
-            channel_passphrase,
-            genesis,
-            sek,
-            &wrap,
-            now_secs,
-        )
+        Self::create_from_sealed(profile, name, channel_passphrase, genesis, sek, &wrap, now)
     }
 
     /// The fast first step of creating a room: its genesis and a fresh room key.
@@ -1526,7 +1518,12 @@ impl ChannelState {
     /// # Errors
     /// A name that is not a room name ([`crate::governance::name::room_name`]), no unlocked
     /// signer, or a genesis or key that cannot be made.
-    pub fn create_genesis(profile: &Profile, name: &str, now_secs: u64) -> Result<(Genesis, Sek)> {
+    pub fn create_genesis(
+        profile: &Profile,
+        name: &str,
+        now: crate::time::Ms,
+    ) -> Result<(Genesis, Sek)> {
+        let now_secs = now.secs();
         if crate::governance::name::room_name(name).as_deref() != Ok(name) {
             return Err(Error::MalformedGovernance("room name is not a DNS label"));
         }
@@ -1552,8 +1549,9 @@ impl ChannelState {
         genesis: Genesis,
         sek: Sek,
         wrap: &crate::atrest::SekWrap,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
+        let now_secs = now.secs();
         let signer = profile.signer()?;
         let channel_id = genesis.channel_id();
         let epoch = 0u64;
@@ -1699,7 +1697,7 @@ impl ChannelState {
         profile: &Profile,
         channel_id: &Digest32,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
         let signer = profile.signer()?;
         let store = profile.store();
@@ -1709,7 +1707,7 @@ impl ChannelState {
         let factor = SignatureIdentityFactor::new(signer);
         let sek = wrap.unwrap_sek(&factor, channel_id, channel_passphrase)?;
         let me = signer.fingerprint();
-        Self::open_with_sek(store, channel_id, sek, channel_passphrase, me, now_secs)
+        Self::open_with_sek(store, channel_id, sek, channel_passphrase, me, now)
     }
 
     /// Open a channel from the store with its SEK already in hand: the half of [`Self::open`]
@@ -1725,8 +1723,9 @@ impl ChannelState {
         sek: Sek,
         channel_passphrase: &[u8],
         me: Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
+        let now_secs = now.secs();
         let manifest_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_MANIFEST)?
             .ok_or(Error::MalformedAtRest("room manifest missing"))?;
@@ -2238,10 +2237,11 @@ impl ChannelState {
         channel_id: &Digest32,
         name_hint: Option<&str>,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
         sealed: (Sek, crate::atrest::SekWrap),
         own_admission: Admission,
     ) -> Result<Self> {
+        let now_secs = now.secs();
         Self::join_checks(profile, genesis, channel_id)?;
         let name_hint = name_hint.unwrap_or_default();
         let (sek, wrap) = sealed;
@@ -2443,8 +2443,9 @@ impl ChannelState {
         store: &Store,
         key: &CompositePublicKey,
         admission: &Admission,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<bool> {
+        let now_secs = now.secs();
         let fingerprint = key.fingerprint();
         match admission {
             Admission::Creator => {
@@ -2501,8 +2502,9 @@ impl ChannelState {
         &mut self,
         store: &Store,
         key: &CompositePublicKey,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<bool> {
+        let now_secs = now.secs();
         self.admit_within(store, key, now_secs, max_authors())
     }
 
@@ -2687,8 +2689,9 @@ impl ChannelState {
         profile: &Profile,
         service_tag: &str,
         shared: bool,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<()> {
+        let now_secs = now.secs();
         let statement = crate::governance::share::ServiceShare::build(
             profile.signer()?,
             &self.channel_id,
@@ -2705,7 +2708,7 @@ impl ChannelState {
     /// State every share this node offers here that the log does not yet say it shares, and
     /// return whether anything was written. A share made in a room joined and not yet synced is
     /// offered at once but can be said only once the room settles (V210-164); this says it then.
-    pub fn say_unsaid_shares(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+    pub fn say_unsaid_shares(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
         let me = profile.signer()?.fingerprint();
         let said: BTreeSet<String> = self
             .shares()
@@ -2720,7 +2723,7 @@ impl ChannelState {
             .cloned()
             .collect();
         for tag in &unsaid {
-            self.say_share(profile, tag, true, now_secs)?;
+            self.say_share(profile, tag, true, now)?;
         }
         Ok(!unsaid.is_empty())
     }
@@ -3069,8 +3072,9 @@ impl ChannelState {
     pub fn oldest_generation_needed(
         &self,
         trusted: &BTreeSet<Digest32>,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Option<u64> {
+        let now_secs = now.secs();
         let me = self.me();
         let unjoined = |id: &Digest32| *id != me && !self.entitled.contains_key(id);
         // A trusted identity with **no mark here** was trusted before this room existed, so every
@@ -3169,8 +3173,9 @@ impl ChannelState {
         delivered_skdm: &Skdm,
         full_history: bool,
         entitled_from: (u64, u64),
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<(ConsentGrant, bool)> {
+        let now_secs = now.secs();
         let signer = profile.signer()?;
         // The grant records what this approval actually released (PRD-001 R12): the
         // approver's per-grant choice, not a room-wide default.
@@ -3244,7 +3249,8 @@ impl ChannelState {
     /// [`ChannelState::rotate_sender`] and re-keys whoever is
     /// [`owed`](ChannelState::owed_rekeys).
     #[must_use]
-    pub fn should_rotate_sender(&self, now_secs: u64) -> bool {
+    pub fn should_rotate_sender(&self, now: crate::time::Ms) -> bool {
+        let now_secs = now.secs();
         self.sender.should_rotate(now_secs)
     }
 
@@ -3269,7 +3275,8 @@ impl ChannelState {
     /// rotation that persisted the chain but lost the origin would leave the members
     /// who kept consent permanently unable to read the messages sent before their
     /// re-key.
-    pub fn rotate_sender(&mut self, profile: &Profile, now_secs: u64) -> Result<u64> {
+    pub fn rotate_sender(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<u64> {
+        let now_secs = now.secs();
         let next = self.sender.rotated(now_secs)?;
         self.rotate_sender_to(profile, next, now_secs)
     }
@@ -3282,7 +3289,8 @@ impl ChannelState {
     /// that number. They refuse a second key for a generation they hold, so nothing it sent would
     /// ever read. Its feed, once synced, says what it used: each message's header names its
     /// generation, a revocation the one it moved to, and a presence statement the one it was on.
-    pub fn catch_up_generation(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+    pub fn catch_up_generation(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
+        let now_secs = now.secs();
         let me = self.me();
         let Some(feed) = self.dag.feed(&me).filter(|f| !f.is_empty()) else {
             return Ok(false);
@@ -3591,8 +3599,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         target: Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<ConsentRevocation> {
+        let now_secs = now.secs();
         let me = self.me();
         if target == me {
             return Err(Error::MalformedGovernance(
@@ -3607,7 +3616,7 @@ impl ChannelState {
         }
         // Rotate first: the entry names the generation that excludes `target`, so
         // that generation has to exist before the fact is signed.
-        let new_chain_id = self.rotate_sender(profile, now_secs)?;
+        let new_chain_id = self.rotate_sender(profile, now)?;
         let signer = profile.signer()?;
         let revocation =
             issue_consent_revocation(signer, &self.channel_id, self.epoch, target, new_chain_id)?;
@@ -4132,7 +4141,8 @@ impl ChannelState {
     /// effective retention (the room's, or its own shorter one). **The receiver's own reckoning**
     /// (V030-10): from the author's signed claim, never from what a peer did or did not send.
     #[must_use]
-    pub fn body_expired(&self, claimed_ms: u64, now_secs: u64) -> bool {
+    pub fn body_expired(&self, claimed_ms: u64, now: crate::time::Ms) -> bool {
+        let now_secs = now.secs();
         expired_at(claimed_ms, now_secs, self.effective_retention())
     }
 
@@ -4262,7 +4272,13 @@ impl ChannelState {
     /// `ttl` seconds (`0` = forever). Only a holder of the `policy` capability may — the
     /// room's admin; anyone else is refused here rather than writing an entry every other
     /// node would ignore. It applies to what is already stored, at the next sweep (R8).
-    pub fn set_retention(&mut self, profile: &Profile, ttl: u64, now_secs: u64) -> Result<()> {
+    pub fn set_retention(
+        &mut self,
+        profile: &Profile,
+        ttl: u64,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        let now_secs = now.secs();
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self
@@ -4290,7 +4306,8 @@ impl ChannelState {
     /// against the policy in force now. Returns how many entries were pruned.
     ///
     /// Costs what it prunes, not what the room holds: the index is ordered by age.
-    pub fn sweep_retention(&mut self, store: &Store, now_secs: u64) -> Result<usize> {
+    pub fn sweep_retention(&mut self, store: &Store, now: crate::time::Ms) -> Result<usize> {
+        let now_secs = now.secs();
         self.now_hint = self.now_hint.max(now_secs);
         self.forget_settled_owed();
         let ttl = self.effective_retention();
@@ -4327,7 +4344,8 @@ impl ChannelState {
     /// restart, or pruned while the room kept everything) without waiting for another prune. The position named is the highest one below which every content entry of
     /// this author has had its body pruned on this node; governance and earlier checkpoints
     /// keep their bodies and never hold it back.
-    pub fn checkpoint_if_due(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+    pub fn checkpoint_if_due(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
+        let now_secs = now.secs();
         if self.poisoned || self.room_retention() == 0 {
             return Ok(false);
         }
@@ -4754,8 +4772,9 @@ impl ChannelState {
         &mut self,
         store: &Store,
         transport: &mut T,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<SyncOutcome> {
+        let now_secs = now.secs();
         if self.poisoned {
             return Err(Error::Profile(
                 "room is poisoned after a failed persist; reopen it",
@@ -4980,7 +4999,9 @@ impl ChannelState {
                     let Some(payload) = payload else {
                         // A skeleton: stored, never rendered. Its body is owed unless it has
                         // expired here (V030-10).
-                        if !self.body_expired(claimed, now_secs) {
+                        if !self
+                            .body_expired(claimed, crate::time::Ms(now_secs.saturating_mul(1_000)))
+                        {
                             self.owed.insert((author, seq));
                         }
                         return Ok(Ok(Vec::new()));
@@ -5117,10 +5138,11 @@ impl ChannelState {
         shared: &tokio::sync::Mutex<Self>,
         store: &Store,
         transport: &mut T,
-        now_secs: u64,
+        now: crate::time::Ms,
         fence: &crate::transport::stream_transport::Fence,
         on_stored: &dyn Fn(),
     ) -> SessionReport {
+        let now_secs = now.secs();
         let epoch = {
             let ch = shared.blocking_lock();
             if ch.poisoned {
@@ -5164,7 +5186,13 @@ impl ChannelState {
     /// as ciphertext before consent renders as soon as the key arrives — the
     /// monotone per-sender fill-in ADR-007 describes. Returns how many entries that
     /// backfill rendered.
-    pub fn accept_skdm(&mut self, store: &Store, skdm: &Skdm, now_secs: u64) -> Result<usize> {
+    pub fn accept_skdm(
+        &mut self,
+        store: &Store,
+        skdm: &Skdm,
+        now: crate::time::Ms,
+    ) -> Result<usize> {
+        let now_secs = now.secs();
         if self.poisoned {
             return Err(Error::Profile(
                 "room is poisoned after a failed persist; reopen it",
@@ -5483,8 +5511,9 @@ impl ChannelState {
         &mut self,
         store: &Store,
         holders: &BTreeSet<Digest32>,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Vec<Digest32>> {
+        let now_secs = now.secs();
         let lost = self.drive.lost(holders);
         if lost.is_empty() || self.drive.chain.is_none() {
             return Ok(lost);
@@ -5721,7 +5750,10 @@ impl ChannelState {
                 let Some(payload) = entry.payload.as_deref() else {
                     // Expired: its key is needed by nothing. Not expired: a body still to come,
                     // under a generation not known yet — every generation from here on stays.
-                    if self.body_expired(entry.skeleton.claimed_ms, self.now_hint) {
+                    if self.body_expired(
+                        entry.skeleton.claimed_ms,
+                        crate::time::Ms(self.now_hint.saturating_mul(1_000)),
+                    ) {
                         continue;
                     }
                     break;
@@ -6206,7 +6238,13 @@ impl ChannelState {
     /// rendering needs that author's sender key, which only arrives with its SKDM,
     /// and this node's consent view (ADR-007 — the newcomer sees ciphertext until a
     /// member consents).
-    pub fn accept_entry(&mut self, store: &Store, entry: Entry, now_secs: u64) -> Result<Accepted> {
+    pub fn accept_entry(
+        &mut self,
+        store: &Store,
+        entry: Entry,
+        now: crate::time::Ms,
+    ) -> Result<Accepted> {
+        let now_secs = now.secs();
         if self.poisoned {
             return Err(Error::Profile(
                 "room is poisoned after a failed persist; reopen it",
@@ -6884,7 +6922,8 @@ impl ChannelState {
     ///
     /// # Errors
     /// Not an admin, not a room name, or an append that fails.
-    pub fn set_name(&mut self, profile: &Profile, name: &str, now_secs: u64) -> Result<()> {
+    pub fn set_name(&mut self, profile: &Profile, name: &str, now: crate::time::Ms) -> Result<()> {
+        let now_secs = now.secs();
         let signer = profile.signer()?;
         if !self.may_rename(&signer.fingerprint()) {
             return Err(Error::MalformedGovernance(
@@ -6996,7 +7035,13 @@ impl ChannelState {
 
     /// Write that this identity has left the room (`here` = false) or is back in it, unless its
     /// feed already says so (V210-164). Returns whether an entry was written.
-    pub fn say_presence(&mut self, profile: &Profile, here: bool, now_secs: u64) -> Result<bool> {
+    pub fn say_presence(
+        &mut self,
+        profile: &Profile,
+        here: bool,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        let now_secs = now.secs();
         let me = profile.signer()?.fingerprint();
         if self.said_left(&me) != here {
             return Ok(false);
@@ -7059,7 +7104,8 @@ impl ChannelState {
     /// End the room for everyone (V030-08). Only its creator, or an admin the creator delegated,
     /// may: anyone else is refused here rather than writing an entry every other node would
     /// ignore.
-    pub fn end(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
+    pub fn end(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<Digest32> {
+        let now_secs = now.secs();
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if me != self.evaluator.root_admin() && !self.evaluator.admins().contains(&me) {
@@ -7084,8 +7130,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         member: &Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Digest32> {
+        let now_secs = now.secs();
         let signer = profile.signer()?;
         // The client's own check. The room's is the certificate: it carries no `delegate`, so an
         // admin's certificate for anyone else verifies nowhere (#319).
@@ -7138,8 +7185,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         member: &Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<usize> {
+        let now_secs = now.secs();
         use crate::governance::entry::GovBody;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
@@ -7209,8 +7257,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         idle_secs: u64,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Digest32> {
+        let now_secs = now.secs();
         let signer = profile.signer()?;
         if signer.fingerprint() != self.evaluator.root_admin() {
             return Err(Error::Profile(

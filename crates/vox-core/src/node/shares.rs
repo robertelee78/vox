@@ -378,10 +378,9 @@ impl std::fmt::Debug for Shares {
     }
 }
 
+/// The node's clock in whole seconds, a test step included, as the node's own clock has it.
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    (crate::time::clock_with_test_skew())() / 1_000
 }
 
 fn hex(bytes: &[u8]) -> String {

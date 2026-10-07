@@ -588,7 +588,7 @@ impl std::fmt::Debug for Bind {
 /// constructors are shorthands for common shapes of it.
 #[derive(Clone)]
 pub struct NodeConfig {
-    /// The wall clock (tests inject a fixed one).
+    /// The wall clock, in milliseconds (tests inject a fixed one).
     pub clock: Clock,
     /// Milliseconds since the epoch, from one read. Defaults to
     /// [`crate::time::system_millis_clock`]; pin it in a test that pins [`NodeConfig::clock`].
@@ -849,7 +849,7 @@ async fn run_session_worker(
     target: SessionTarget,
     store: Arc<crate::node::store::Store>,
     transport: crate::transport::quic::QuicStreamTransport,
-    now: u64,
+    now_ms: crate::time::Ms,
     fence: Arc<crate::transport::stream_transport::Fence>,
     tx: mpsc::Sender<NetEvent>,
     channel_id: Digest32,
@@ -865,7 +865,7 @@ async fn run_session_worker(
         // (`sync_over_room`).
         match target {
             SessionTarget::Channel(shared) => crate::node::channel::ChannelState::sync_over_room(
-                &shared, &store, &mut t, now, &fence, &on_stored,
+                &shared, &store, &mut t, now_ms, &fence, &on_stored,
             ),
         }
     })
@@ -3525,7 +3525,10 @@ impl NodeHandle {
     #[must_use]
     pub fn keyring_open_secs(&self) -> Option<u64> {
         let KeyringWindow { entered, clock } = &self.keyring;
-        keyring_left(entered.load(std::sync::atomic::Ordering::Relaxed), clock())
+        keyring_left(
+            entered.load(std::sync::atomic::Ordering::Relaxed),
+            clock() / 1_000,
+        )
     }
 
     /// The sync counters `vox status --json` reports (ADR-025 S0b).
@@ -4582,7 +4585,7 @@ impl Node {
             sync_book: crate::node::status::SyncBook::shared(),
         };
         let mut node = node;
-        node.status.started = (node.clock)();
+        node.status.started = (node.clock)() / 1_000;
         // The app layer asks the actor for connections through its own queue, forwarded
         // onto the network queue so they are served in order with everything else.
         {
@@ -5202,8 +5205,15 @@ impl Node {
         });
     }
 
+    /// Whole seconds since the Unix epoch, from [`Self::now_ms`]: for what is still kept in
+    /// seconds.
     fn now(&self) -> u64 {
-        (self.clock)()
+        self.now_ms().secs()
+    }
+
+    /// The node's clock (ADR: every time is milliseconds).
+    fn now_ms(&self) -> crate::time::Ms {
+        crate::time::Ms((self.clock)())
     }
 
     /// The identity passphrase was just entered for a keyring change, and proved: further keyring
@@ -6722,7 +6732,7 @@ impl Node {
             } => {
                 // The join proved this identity; admit it as an author so its entries — and its
                 // records on this node's board — are accepted. Reading still needs consent.
-                let now = self.now();
+                let now_ms = self.now_ms();
                 // **Test-only** (`test-knobs`): this node fails every joiner's admission as a node
                 // locked mid-join does — admitting nothing — so a proof can see what the joiner is
                 // told.
@@ -6737,7 +6747,7 @@ impl Node {
                     (Some(profile), Some(shared)) => {
                         let mut ch = shared.lock().await;
                         let admitted = ch
-                            .admit_author(profile.store(), &identity, now)
+                            .admit_author(profile.store(), &identity, now_ms)
                             .map(|_| ch.name().map(str::to_owned));
                         // A member that left and proved the passphrase again is in again here,
                         // until its own return reaches the others through this node (V030-08).
@@ -6842,8 +6852,14 @@ impl Node {
                             step: "making the room here and publishing this member on its boards"
                                 .to_owned(),
                         });
-                        self.finish_join_channel(*parsed, passphrase, now, me, won)
-                            .await
+                        self.finish_join_channel(
+                            *parsed,
+                            passphrase,
+                            crate::time::Ms(now.saturating_mul(1_000)),
+                            me,
+                            won,
+                        )
+                        .await
                     }
                     Err(lost) => {
                         let _ = self.event_tx.send(NodeEvent::JoinSteps {
@@ -6910,7 +6926,7 @@ impl Node {
                             *genesis,
                             sek,
                             &wrap,
-                            now,
+                            crate::time::Ms(now.saturating_mul(1_000)),
                         ) {
                             Ok(ch) => match service {
                                 None => self.finish_create_channel(ch).await,
@@ -9029,7 +9045,7 @@ impl Node {
         &mut self,
         parsed: crate::node::link::InviteLink,
         passphrase: Secret,
-        now: u64,
+        now_ms: crate::time::Ms,
         me: Digest32,
         won: JoinerWon,
     ) -> Outcome {
@@ -9072,7 +9088,7 @@ impl Node {
                 &parsed.channel_id,
                 joined.room_name.as_deref(),
                 &passphrase,
-                now,
+                now_ms,
                 sealed,
                 // Keep the responder's witness to this join (M17.6). It is republished with
                 // every bundle record this node ever puts on a board for this room, so it is
@@ -9112,7 +9128,7 @@ impl Node {
                 profile.store(),
                 &set.bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                now,
+                now_ms,
                 self.net.as_deref(),
             )
             .await;
@@ -9221,7 +9237,7 @@ impl Node {
         if self.net.is_none() {
             return Outcome::Failed(Fault::NotNetworked);
         }
-        let now = self.now();
+        let now_ms = self.now_ms();
         let decision = self.trust_decision(&target);
         let plan: Option<Vec<(u64, u64)>>;
         let skdm = {
@@ -9308,7 +9324,7 @@ impl Node {
                 .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
             // The generations before the live one that the decision — or a full-history grant —
             // covers (V210-45, PRD-001 R12) are owed in the grant's own transaction (V210-88).
-            match channel.issue_consent(profile, target, &skdm, full, entitled_from, now) {
+            match channel.issue_consent(profile, target, &skdm, full, entitled_from, now_ms) {
                 Ok((_, history_owed)) => history_owed,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
@@ -9826,7 +9842,7 @@ impl Node {
                 continue;
             }
             let keep_from = channel
-                .oldest_generation_needed(&trusted, now_secs)
+                .oldest_generation_needed(&trusted, crate::time::Ms(now_secs.saturating_mul(1_000)))
                 .unwrap_or(u64::MAX);
             pruned |= channel
                 .prune_superseded_origins(&store, keep_from)
@@ -9915,7 +9931,7 @@ impl Node {
 
     /// [`Self::revoke`], unboxed: see [`Boxed`].
     async fn revoke_unboxed(&mut self, channel_id: &Digest32, target: Digest32) -> Outcome {
-        let now = self.now();
+        let now_ms = self.now_ms();
         let (Some(profile), Some(shared)) = (
             self.profile.as_ref(),
             self.channels.get(channel_id).map(Arc::clone),
@@ -9924,7 +9940,7 @@ impl Node {
         };
         let generation = {
             let mut channel = shared.lock().await;
-            match channel.revoke_consent(profile, target, now) {
+            match channel.revoke_consent(profile, target, now_ms) {
                 Ok(r) => r.body.new_chain_id,
                 Err(e) => return Outcome::Failed(fault_of(&e)),
             }
@@ -10154,13 +10170,13 @@ impl Node {
             return;
         }
         if let Some(store) = self.profile.as_ref().map(Profile::store_handle) {
-            let now = self.now();
+            let now_ms = self.now_ms();
             let _ = admit_board_records(
                 &shared,
                 &store,
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                now,
+                now_ms,
                 self.net.as_deref(),
             )
             .await;
@@ -10575,7 +10591,7 @@ impl Node {
         ) else {
             return;
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
         for (cid, shared) in &self.channels {
             let (anchors, known) = {
                 let ch = shared.lock().await;
@@ -10607,7 +10623,7 @@ impl Node {
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(
                         SETUP_PATIENCE,
-                        exchange_boards(&net, &conn, &shared, &store, cid, known, now),
+                        exchange_boards(&net, &conn, &shared, &store, cid, known, now_ms),
                     )
                     .await;
                 });
@@ -10721,7 +10737,7 @@ impl Node {
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| c.opened += 1);
         let admit_store = self.profile.as_ref().map(Profile::store_handle);
         let cid = channel_id;
-        let now = self.now();
+        let now_ms = self.now_ms();
         let tx = self.net_tx.clone();
         let task = tokio::spawn(async move {
             // 1. Learn who else has joined, or the first entry from a newer member is refused
@@ -10738,7 +10754,7 @@ impl Node {
                     let setup = async {
                         if let Some(pstore) = admit_store {
                             admitted_authors =
-                                exchange_boards(&net, &conn, shared, &pstore, cid, known, now)
+                                exchange_boards(&net, &conn, shared, &pstore, cid, known, now_ms)
                                     .await;
                         }
                     };
@@ -10775,7 +10791,7 @@ impl Node {
                 target,
                 store,
                 transport,
-                now,
+                now_ms,
                 fence,
                 tx.clone(),
                 cid,
@@ -10849,7 +10865,7 @@ impl Node {
         crate::node::status::SyncBook::with(&self.sync_book, channel_id, peer, |c| {
             c.admitted += 1;
         });
-        let now = self.now();
+        let now_ms = self.now_ms();
         let tx = self.net_tx.clone();
         let transport = transport.fenced(Arc::clone(&fence));
         let task = tokio::spawn(async move {
@@ -10857,7 +10873,7 @@ impl Node {
                 target,
                 store,
                 transport,
-                now,
+                now_ms,
                 fence,
                 tx.clone(),
                 channel_id,
@@ -11462,13 +11478,13 @@ impl Node {
             if !bundles.iter().any(|b| b.author_id == *peer) {
                 return false;
             }
-            let now = self.now();
+            let now_ms = self.now_ms();
             let _ = admit_board_records(
                 &shared,
                 &store,
                 &bundles,
                 ChannelState::MAX_ADMISSIONS_PER_SWEEP,
-                now,
+                now_ms,
                 self.net.as_deref(),
             )
             .await;
@@ -11529,7 +11545,7 @@ impl Node {
                 if !self.post_key_package(&channel_id, peer, &skdm).await {
                     continue;
                 }
-                let now = self.now();
+                let now_ms = self.now_ms();
                 let issued = {
                     let Some(profile) = self.profile.as_ref() else {
                         return;
@@ -11549,7 +11565,7 @@ impl Node {
                         .unwrap_or((skdm.body.chain_id, skdm.body.iteration));
                     let mut channel = shared.lock().await;
                     channel
-                        .issue_consent(profile, peer, &skdm, full, entitled_from, now)
+                        .issue_consent(profile, peer, &skdm, full, entitled_from, now_ms)
                         .is_ok()
                         && (entitled_from.0 >= skdm.body.chain_id
                             || channel
@@ -11689,7 +11705,8 @@ impl Node {
             };
             (packages, ctx)
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
+        let now = now_ms.secs();
         for package in packages {
             let Ok(init) = package.initial_message() else {
                 continue;
@@ -11714,7 +11731,10 @@ impl Node {
                 let Some(profile) = self.profile.as_ref() else {
                     return;
                 };
-                shared.lock().await.accept_skdm(profile.store(), &skdm, now)
+                shared
+                    .lock()
+                    .await
+                    .accept_skdm(profile.store(), &skdm, now_ms)
             };
             if let Ok(backfilled) = installed {
                 let _ = self.event_tx.send(NodeEvent::SenderKeyReceived {
@@ -12577,7 +12597,8 @@ impl Node {
                 }
             }
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
+        let now = now_ms.secs();
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
             // No session with this peer for that channel: nothing can open it. Said, so the
             // sender sends it again once a join or key exchange establishes one.
@@ -12607,7 +12628,7 @@ impl Node {
             (Some(profile), Some(shared)) => {
                 let mut channel = shared.lock().await;
                 fresh = !channel.holds_generation(&author, skdm.body.chain_id);
-                channel.accept_skdm(profile.store(), &skdm, now).ok()
+                channel.accept_skdm(profile.store(), &skdm, now_ms).ok()
             }
             _ => None,
         };
@@ -12844,11 +12865,12 @@ impl Node {
         if self.room_named(room_name).is_some() {
             return Outcome::Failed(Fault::RoomNameTaken);
         }
-        let now = self.now();
+        let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
-        match ChannelState::create_with_profile(profile, room_name, passphrase, now, self.argon2) {
+        match ChannelState::create_with_profile(profile, room_name, passphrase, now_ms, self.argon2)
+        {
             Ok(ch) => self.finish_create_channel(ch).await,
             Err(e) => Outcome::Failed(fault_of(&e)),
         }
@@ -12932,14 +12954,15 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::RoomNameTaken));
             return;
         }
-        let now = self.now();
+        let now_ms = self.now_ms();
+        let now = now_ms.secs();
         let Some(profile) = self.profile.as_ref() else {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
         };
         // A service room's genesis is like any other room's: it carries no grant (PRD-001 R44).
         // The service is the host's to offer, and its gate decides who reaches it.
-        let (genesis, sek) = match ChannelState::create_genesis(profile, &room_name, now) {
+        let (genesis, sek) = match ChannelState::create_genesis(profile, &room_name, now_ms) {
             Ok(g) => g,
             Err(e) => {
                 let _ = reply.send(Outcome::Failed(fault_of(&e)));
@@ -13029,12 +13052,12 @@ impl Node {
             return Outcome::Failed(Fault::NoIdentity);
         };
         let id = channel.channel_id();
-        let now = self.now();
+        let now_ms = self.now_ms();
         // Offered and said to the room (V030-25) together: a share its members cannot list is
         // half a share.
         if let Err(e) = channel
             .add_service(profile.store(), profile, tag, endpoint, kind, true)
-            .and_then(|_| channel.say_share(profile, tag, true, now))
+            .and_then(|_| channel.say_share(profile, tag, true, now_ms))
         {
             // Drop the room rather than keep a half-made one. Nothing outside this
             // function has seen it: it is not in `self.channels` and has not been
@@ -13112,7 +13135,7 @@ impl Node {
     /// the daemon reports ("N room(s) open, M still closed") — it is not a reason to refuse the
     /// identity and every other room with it.
     async fn reopen_remembered(&mut self) {
-        let now = self.now();
+        let now_ms = self.now_ms();
         // Only the sealed set is read here — one small decrypt. Opening each room reads and
         // re-verifies its whole log, and that runs **off the actor**, one room at a time, each
         // held as soon as it is open: with many rooms, a reopen on the actor answered nobody until
@@ -13158,7 +13181,7 @@ impl Node {
                     if let Ok(why) = std::env::var(TEST_REOPEN_FAILS_ENV) {
                         return Err(Some(why));
                     }
-                    ChannelState::open_with_sek(&store, &id, sek, &passphrase, me, now)
+                    ChannelState::open_with_sek(&store, &id, sek, &passphrase, me, now_ms)
                         .map_err(|e| Some(e.to_string()))
                 })
                 .await;
@@ -13203,7 +13226,7 @@ impl Node {
             let _ = reply.send(Outcome::Done);
             return;
         }
-        let now = self.now();
+        let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             let _ = reply.send(Outcome::Failed(Fault::NoIdentity));
             return;
@@ -13225,7 +13248,7 @@ impl Node {
                     .ok_or(Error::Profile("no such room on this node"))?;
                 let factor = crate::atrest::idfactor::SignatureIdentityFactor::new(&*signer);
                 let sek = wrap.unwrap_sek(&factor, &channel_id, &passphrase)?;
-                ChannelState::open_with_sek(&store, &channel_id, sek, &passphrase, me, now)
+                ChannelState::open_with_sek(&store, &channel_id, sek, &passphrase, me, now_ms)
             })
             .await
             .unwrap_or(Err(Error::Argon2Failed));
@@ -13335,14 +13358,14 @@ impl Node {
             let _ = reply.send(Outcome::Failed(Fault::NotNetworked));
             return;
         }
-        let now = self.now();
+        let now_ms = self.now_ms();
         let written = {
             let Some(profile) = self.profile.as_ref() else {
                 let _ = reply.send(Outcome::Failed(Fault::Locked));
                 return;
             };
             let mut ch = shared.lock().await;
-            let written = ch.say_presence(profile, false, now).map(|_| {
+            let written = ch.say_presence(profile, false, now_ms).map(|_| {
                 (
                     ch.generation().load(std::sync::atomic::Ordering::Relaxed),
                     ch.members().into_iter().all(|m| m == ch.me()),
@@ -13573,7 +13596,7 @@ impl Node {
 
     /// End a room for everyone (V030-08): its creator's signed end, passed on like a leave.
     async fn end_room(&mut self, channel_id: &Digest32) -> Outcome {
-        let now = self.now();
+        let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -13585,7 +13608,7 @@ impl Node {
             if ch.ended((self.millis_clock)()).is_some() {
                 return Outcome::Failed(Fault::RoomEnded);
             }
-            if let Err(e) = ch.end(profile, now) {
+            if let Err(e) = ch.end(profile, now_ms) {
                 // The faulty peer a board must not obey (V030-14's proof): it takes the room off
                 // boards though it may not end it.
                 #[cfg(feature = "mutant-sender")]
@@ -13621,7 +13644,7 @@ impl Node {
         member: &Digest32,
         admin: bool,
     ) -> Outcome {
-        let now = self.now();
+        let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -13631,9 +13654,9 @@ impl Node {
         {
             let mut ch = shared.lock().await;
             let done = if admin {
-                ch.add_admin(profile, member, now).map(|_| ())
+                ch.add_admin(profile, member, now_ms).map(|_| ())
             } else {
-                ch.remove_admin(profile, member, now).map(|_| ())
+                ch.remove_admin(profile, member, now_ms).map(|_| ())
             };
             if let Err(e) = done {
                 return Outcome::Failed(fault_of(&e));
@@ -13649,7 +13672,7 @@ impl Node {
 
     /// Choose a room's idle end (V030-08).
     async fn choose_idle_end(&mut self, channel_id: &Digest32, idle_secs: u64) -> Outcome {
-        let now = self.now();
+        let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -13658,7 +13681,7 @@ impl Node {
         };
         {
             let mut ch = shared.lock().await;
-            if let Err(e) = ch.choose_idle_end(profile, idle_secs, now) {
+            if let Err(e) = ch.choose_idle_end(profile, idle_secs, now_ms) {
                 return Outcome::Failed(fault_of(&e));
             }
             self.fresh_details
@@ -13872,7 +13895,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
         let back = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
@@ -13881,12 +13904,12 @@ impl Node {
             if !matches!(ch.settle(profile.store()), Ok(true)) {
                 return;
             }
-            ch.catch_up_generation(profile, now)
-                .and_then(|_| ch.say_presence(profile, true, now))
+            ch.catch_up_generation(profile, now_ms)
+                .and_then(|_| ch.say_presence(profile, true, now_ms))
                 .map(|back| {
                     // Shares made while the room was unsettled are said now (V030-25). A share
                     // left unsaid is offered but unlisted, which is not worth failing the room.
-                    let said = ch.say_unsaid_shares(profile, now).unwrap_or(false);
+                    let said = ch.say_unsaid_shares(profile, now_ms).unwrap_or(false);
                     back || said
                 })
         };
@@ -13920,7 +13943,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
         let outcome = {
             let mut channel = shared.lock().await;
             channel
@@ -13934,7 +13957,7 @@ impl Node {
                     }
                     // A room joined and not yet synced cannot be written to (V210-164): the share
                     // is offered now and said when the room settles (`say_unsaid_shares`).
-                    match channel.say_share(profile, service_tag, true, now) {
+                    match channel.say_share(profile, service_tag, true, now_ms) {
                         Err(crate::error::Error::RoomNotSynced) => Ok(()),
                         Err(e) => {
                             let _ = channel.remove_service(profile.store(), service_tag);
@@ -13970,7 +13993,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
         let outcome = {
             let mut channel = shared.lock().await;
             let was_shared = channel.is_shared(service_tag);
@@ -13979,7 +14002,7 @@ impl Node {
             // where nothing answers — a wrong listing, not a failed removal: the service is gone
             // either way.
             if matches!(removed, Ok(true)) && was_shared {
-                let _ = channel.say_share(profile, service_tag, false, now);
+                let _ = channel.say_share(profile, service_tag, false, now_ms);
             }
             removed
         };
@@ -14549,14 +14572,14 @@ impl Node {
         if crate::governance::name::room_name(name).as_deref() != Ok(name) {
             return Outcome::Failed(Fault::NotARoomName);
         }
-        let now = self.now();
+        let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return Outcome::Failed(Fault::ChannelNotOpen);
         };
-        if let Err(e) = shared.lock().await.set_name(profile, name, now) {
+        if let Err(e) = shared.lock().await.set_name(profile, name, now_ms) {
             return Outcome::Failed(fault_of(&e));
         }
         self.note_local_append(channel_id);
@@ -14564,7 +14587,8 @@ impl Node {
     }
 
     async fn set_retention(&mut self, channel_id: &Digest32, ttl: u64) -> Outcome {
-        let now = self.now();
+        let now_ms = self.now_ms();
+        let now = now_ms.secs();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -14603,7 +14627,7 @@ impl Node {
             self.sweep_retention().await;
             return Outcome::OwnRetention { own: ttl, room };
         }
-        if let Err(e) = shared.lock().await.set_retention(profile, ttl, now) {
+        if let Err(e) = shared.lock().await.set_retention(profile, ttl, now_ms) {
             return Outcome::Failed(fault_of(&e));
         }
         self.note_local_append(channel_id);
@@ -14650,7 +14674,8 @@ impl Node {
     /// this node's own (ADR-023 decision 2). `true` when anything was pruned, so the view is
     /// republished and `vox room read` stops showing it.
     async fn sweep_retention(&mut self) -> bool {
-        let now = self.now();
+        let now_ms = self.now_ms();
+        let now = now_ms.secs();
         self.refresh_node_retention(now);
         let Some(store) = self.profile.as_ref().map(Profile::store_handle) else {
             return false;
@@ -14684,7 +14709,7 @@ impl Node {
                     room,
                 });
             }
-            let here = ch.sweep_retention(&store, now).unwrap_or(0);
+            let here = ch.sweep_retention(&store, now_ms).unwrap_or(0);
             pruned += here;
             // Asked every tick, not only after a prune: a room opened with an expired backlog
             // (after a restart) or one idle with a backlog under the batch size is checkpointed
@@ -14694,7 +14719,7 @@ impl Node {
             let _ = here;
             ch.set_checkpoint_idle(self.checkpoint_idle_secs);
             if let Some(profile) = self.profile.as_ref() {
-                if ch.checkpoint_if_due(profile, now).unwrap_or(false) {
+                if ch.checkpoint_if_due(profile, now_ms).unwrap_or(false) {
                     checkpointed.push(*cid);
                 }
             }
@@ -14822,7 +14847,7 @@ impl Node {
             let mut ch = shared.lock().await;
             // **Never sealed under a key a member that lost drive still holds** (SC-2b): the key
             // changes here, before the entry, whatever the tick has not got to yet.
-            match ch.rotate_drive_if_lost(profile.store(), &holders, now_millis / 1_000) {
+            match ch.rotate_drive_if_lost(profile.store(), &holders, crate::time::Ms(now_millis)) {
                 Ok(_) => ch.append_session(profile, session_id, body, &holders, now_millis),
                 Err(e) => Err(e),
             }
@@ -14871,14 +14896,14 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let now = self.now();
+        let now_ms = self.now_ms();
         let releases = {
             let Some(profile) = self.profile.as_ref() else {
                 return;
             };
             let mut ch = shared.lock().await;
             if ch
-                .rotate_drive_if_lost(profile.store(), holders, now)
+                .rotate_drive_if_lost(profile.store(), holders, now_ms)
                 .is_err()
             {
                 return;
@@ -14909,7 +14934,7 @@ impl Node {
     }
 
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {
-        let now = self.now();
+        let now_ms = self.now_ms();
         let Some(profile) = self.profile.as_ref() else {
             return Outcome::Failed(Fault::NoIdentity);
         };
@@ -14933,7 +14958,7 @@ impl Node {
         // A rotation that cannot persist poisons the channel, which the *next*
         // command reports; it does not un-send the message that just went out, so the
         // append is still reported as the success it was.
-        let rotated = ch.should_rotate_sender(now) && ch.rotate_sender(profile, now).is_ok();
+        let rotated = ch.should_rotate_sender(now_ms) && ch.rotate_sender(profile, now_ms).is_ok();
         let detail = {
             let published = self.view_tx.borrow();
             detail_of(
@@ -15454,7 +15479,7 @@ async fn exchange_boards(
     pstore: &crate::node::store::Store,
     cid: Digest32,
     known: u64,
-    now: u64,
+    now: crate::time::Ms,
 ) -> usize {
     let Ok(set) = net.fetch_channel(conn, &cid, known).await else {
         return 0;
@@ -15519,7 +15544,7 @@ async fn admit_board_records(
     store: &crate::node::store::Store,
     records: &[crate::nat::record::MemberBundleRecord],
     quota: usize,
-    now: u64,
+    now_ms: crate::time::Ms,
     net: Option<&NodeNet>,
 ) -> usize {
     // **Only records for keys not yet admitted are verified, and outside the room's lock**
@@ -15565,7 +15590,7 @@ async fn admit_board_records(
             if admitted >= quota {
                 return true;
             }
-            match channel.admit_from_board(store, key, &record.admission, now) {
+            match channel.admit_from_board(store, key, &record.admission, now_ms) {
                 Ok(true) => {
                     admitted += 1;
                     // **Past the cap only when another member admitted it on its own view**
