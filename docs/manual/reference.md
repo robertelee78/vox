@@ -52,6 +52,10 @@ start the daemon in the background when none runs and attach their node. One-sho
 (`room`, `status`, `trust`, `share`, `service`) only ask an attached node, and say so when it is
 not: `vox node attach NAME` first.
 
+A `vox daemon` started while the daemon holding the data root is stopping says so, waits until it
+has stopped, and then serves its node itself. `vox tui` exits when its terminal goes away, and
+SIGHUP or SIGTERM stop it cleanly.
+
 Data/config selection follows explicit flags, then `VOX_DATA_DIR` / `VOX_CONFIG_DIR`, then
 XDG/platform defaults. Each data root has its own daemon and nodes, so two shells with different
 roots see different nodes even when both say `--node robertgpt`. A command may create
