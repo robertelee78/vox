@@ -63,7 +63,7 @@ do {
 
     let room = try await node.joinRoom(link: link, passphrase: roomPassphrase)
     say("JOINED \(room)")
-    try await node.trust(fingerprint: daemon, name: "daemon")
+    try await node.trust(fingerprint: daemon, name: "daemon", passphrase: "harness identity")
     // A room just joined is written to only once it has synced with a member (V210-164): the
     // node says RoomNotSynced until then, and asks to be tried again. So the app tries again,
     // for up to a minute, as an app would.

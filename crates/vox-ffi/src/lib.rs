@@ -172,6 +172,33 @@ impl VoxNode {
         self.on_node(async move { outcome(what, node.apply(cmd).await) })
             .await
     }
+
+    /// A keyring change: given the identity passphrase, checked first and made as proved, which
+    /// opens the keyring window; given none, made only while the window is open (ADR-028 K-12).
+    async fn keyring_change(
+        &self,
+        what: &'static str,
+        change: NodeCommand,
+        passphrase: Option<String>,
+    ) -> Result<(), VoxError> {
+        let Some(passphrase) = passphrase else {
+            return self.apply(what, change).await;
+        };
+        self.apply(
+            "checking the identity passphrase",
+            NodeCommand::VerifyPassphrase {
+                passphrase: Secret::new(passphrase.into_bytes()),
+            },
+        )
+        .await?;
+        self.apply(
+            what,
+            NodeCommand::Proved {
+                change: Box::new(change),
+            },
+        )
+        .await
+    }
 }
 
 #[uniffi::export]
@@ -447,30 +474,47 @@ impl VoxNode {
     }
 
     /// Trust an identity, node-wide, under `name` (ADR-020 §3): it may read what this
-    /// node writes, and open app streams to it.
+    /// node writes, and open app streams to it. A keyring change: `passphrase`, the identity's,
+    /// is checked and opens the keyring window; with none, the change is made only while that
+    /// window is open (ADR-028 K-12).
     ///
     /// # Errors
-    /// A malformed fingerprint, or the keyring could not be saved.
-    pub async fn trust(&self, fingerprint: String, name: String) -> Result<(), VoxError> {
+    /// A malformed fingerprint, the passphrase needed or wrong, or the keyring could not be saved.
+    pub async fn trust(
+        &self,
+        fingerprint: String,
+        name: String,
+        passphrase: Option<String>,
+    ) -> Result<(), VoxError> {
         let fingerprint = digest(&fingerprint, "fingerprint")?;
-        self.apply(
+        self.keyring_change(
             "trusting",
             NodeCommand::Trust {
                 fingerprint,
                 petname: name,
             },
+            passphrase,
         )
         .await
     }
 
-    /// Stop trusting an identity, and change the lock (ADR-017 M17.14).
+    /// Stop trusting an identity, and change the lock (ADR-017 M17.14). A keyring change, as
+    /// [`Self::trust`].
     ///
     /// # Errors
-    /// A malformed fingerprint, or one that was not trusted.
-    pub async fn untrust(&self, fingerprint: String) -> Result<(), VoxError> {
+    /// A malformed fingerprint, one that was not trusted, or the passphrase needed or wrong.
+    pub async fn untrust(
+        &self,
+        fingerprint: String,
+        passphrase: Option<String>,
+    ) -> Result<(), VoxError> {
         let fingerprint = digest(&fingerprint, "fingerprint")?;
-        self.apply("untrusting", NodeCommand::Untrust { fingerprint })
-            .await
+        self.keyring_change(
+            "untrusting",
+            NodeCommand::Untrust { fingerprint },
+            passphrase,
+        )
+        .await
     }
 
     /// Listen for app streams speaking `label`, in `room` or (empty) any room.

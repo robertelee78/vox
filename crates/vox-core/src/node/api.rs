@@ -915,8 +915,9 @@ pub enum Fault {
     ChannelNotOpen,
     /// An input exceeded its bound (name or text length).
     TooLong,
-    /// A trust add or remove needs the identity passphrase again: it was last entered more than
-    /// [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) ago (V210-159). Not
+    /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
+    /// change within [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) (V210-159,
+    /// ADR-028 K-12). Not
     /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
     PassphraseNeeded,
     /// The trust keyring already holds its maximum number of identities
@@ -1110,7 +1111,7 @@ impl Fault {
             }
             Fault::WrongPassphrase => "the passphrase is wrong",
             Fault::PassphraseNeeded => {
-                "changing who you trust needs your identity passphrase again: it was last entered more than 30 minutes ago\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
+                "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
             }
             Fault::UnknownChannel => {
                 "no such room on this node\n       `vox room list` shows the rooms it holds"
