@@ -352,9 +352,7 @@ pub fn named_spec(spec: &str) -> Result<(u16, String), AppError> {
 
 // The commands and the needs of a shared service (ADR-028 S-3) are said from one place for the
 // CLI, the TUI and the app (`vox_core::node::service_reach`).
-pub use vox_core::node::service_reach::{
-    commands as service_commands, needs as service_needs,
-};
+pub use vox_core::node::service_reach::{commands as service_commands, needs as service_needs};
 
 /// What `vox service list` prints, from the daemon: the services shared in the room by every
 /// member, each with its readable address and its canonical one beneath it (V030-25, ADR-028
