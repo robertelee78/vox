@@ -112,6 +112,19 @@ fn vox_cmd() -> Command {
     for v in HARNESS_VARS {
         cmd.env_remove(v);
     }
+    // **Checked, not trusted**: every such variable in this process's environment is removed from
+    // the child's, or nothing runs. A staged hook given a pane would bind a real terminal.
+    let removed: std::collections::BTreeSet<_> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_owned())
+        .collect();
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if (name.starts_with("TMUX") || name.starts_with("CLAUDE")) && !removed.contains(&k) {
+            panic!("APPARATUS: {name} would reach a vox this proof starts; nothing is run");
+        }
+    }
     cmd
 }
 
