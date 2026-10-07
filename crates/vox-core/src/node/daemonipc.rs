@@ -44,6 +44,7 @@ const T_DAEMON_EVENT: u64 = 4007;
 const T_METRICS: u64 = 4008;
 const T_DAEMON_STATUS: u64 = 4009;
 const T_SESSION_ENDED: u64 = 4010;
+const T_SESSION_REGISTERED: u64 = 4011;
 
 // Client → daemon: the opening frame.
 const T_USE: u64 = 4100;
@@ -56,6 +57,7 @@ const T_REQ_METRICS: u64 = 4106;
 const T_REQ_SUBSCRIBE: u64 = 4107;
 const T_REQ_STOP: u64 = 4108;
 const T_REQ_SESSION_REGISTER: u64 = 4109;
+const T_REQ_SESSION_ROOM: u64 = 4110;
 
 // Events.
 const T_EV_ATTACHED: u64 = 4200;
@@ -187,6 +189,9 @@ pub enum DaemonRequest {
         node: NodeName,
         /// The harness's session id.
         session: String,
+        /// The harness's own reason (Claude Code's `SessionEnd` `reason`): `resume` keeps the
+        /// session's Session open (ADR-029 SE-4); empty when the harness gave none.
+        reason: String,
     },
     /// Register (or refresh) an agent session of `node` (ADR-020 6.10, ADR-026 D-3): the session
     /// becomes a holder of its node, which is attached implicitly first if it is not attached
@@ -204,6 +209,21 @@ pub enum DaemonRequest {
         passphrase: Option<Zeroizing<String>>,
         /// Anchor specs the node is attached with, if this attaches it.
         anchors: Vec<String>,
+        /// When the session's room is one the node is not a member of (ADR-029 RB-3): the room's
+        /// link and passphrase, for the daemon to join in the background. Never stored, never
+        /// logged.
+        join: Option<(String, Zeroizing<String>)>,
+    },
+    /// Move an agent session of `node` to the room `room` (ADR-029 RB-5, `vox agent room`): its
+    /// Session ends in the room it worked in, and one opens in `room`. Answered
+    /// [`DaemonFrame::SessionRegistered`] or [`DaemonFrame::Refused`].
+    SessionRoom {
+        /// The node.
+        node: NodeName,
+        /// The harness's session id.
+        session: String,
+        /// The room, its id in base32.
+        room: String,
     },
     /// The daemon's own status: answered [`DaemonFrame::Status`].
     Status,
@@ -395,6 +415,19 @@ pub enum DaemonFrame {
     Attached(NodeInfo, Vec<String>),
     /// A daemon request succeeded and carries nothing further.
     Ok,
+    /// What a [`DaemonRequest::SessionRegister`] or [`DaemonRequest::SessionRoom`] did (ADR-029 §6):
+    /// the node, the room the session works in now, whether the session is new to this node, and
+    /// what a join of its room under way, or the last one that failed, says.
+    SessionRegistered {
+        /// The node, as [`DaemonFrame::Attached`] carries it.
+        info: NodeInfo,
+        /// The room the session works in, its id in base32; `None` for none.
+        room: Option<String>,
+        /// The session is new: no registration and no Session of it before this one.
+        new: bool,
+        /// `joining <room>…`, or why the join could not; `None` when no join is under way.
+        joining: Option<String>,
+    },
     /// What a [`DaemonRequest::SessionEnd`] did: whether the session was registered, and whether
     /// the node detached because it was the last holder.
     SessionEnded {
@@ -680,11 +713,27 @@ impl Opening {
                 DaemonRequest::Detach { node } => {
                     e.array(2).uint(T_REQ_DETACH).text(node.as_str());
                 }
-                DaemonRequest::SessionEnd { node, session } => {
-                    e.array(3)
+                DaemonRequest::SessionEnd {
+                    node,
+                    session,
+                    reason,
+                } => {
+                    e.array(4)
                         .uint(T_REQ_SESSION_END)
                         .text(node.as_str())
-                        .text(session);
+                        .text(session)
+                        .text(reason);
+                }
+                DaemonRequest::SessionRoom {
+                    node,
+                    session,
+                    room,
+                } => {
+                    e.array(4)
+                        .uint(T_REQ_SESSION_ROOM)
+                        .text(node.as_str())
+                        .text(session)
+                        .text(room);
                 }
                 DaemonRequest::SessionRegister {
                     node,
@@ -692,14 +741,18 @@ impl Opening {
                     record,
                     passphrase,
                     anchors,
+                    join,
                 } => {
-                    e.array(6)
+                    e.array(8)
                         .uint(T_REQ_SESSION_REGISTER)
                         .text(node.as_str())
                         .text(session)
                         .text(record);
                     put_secret(&mut e, passphrase.as_ref());
                     put_texts(&mut e, anchors);
+                    // The join's link, empty for none, then its passphrase.
+                    e.text(join.as_ref().map_or("", |(link, _)| link.as_str()));
+                    put_secret(&mut e, join.as_ref().map(|(_, p)| p));
                 }
                 DaemonRequest::Status => {
                     e.array(1).uint(T_REQ_STATUS);
@@ -776,17 +829,33 @@ impl Opening {
             (T_REQ_DETACH, 2) => Opening::Daemon(DaemonRequest::Detach {
                 node: name(&mut d, "ipc detach node")?,
             }),
-            (T_REQ_SESSION_END, 3) => Opening::Daemon(DaemonRequest::SessionEnd {
+            (T_REQ_SESSION_END, 4) => Opening::Daemon(DaemonRequest::SessionEnd {
                 node: name(&mut d, "ipc session end node")?,
                 session: text(&mut d, "ipc session end session")?,
+                reason: text(&mut d, "ipc session end reason")?,
             }),
-            (T_REQ_SESSION_REGISTER, 6) => Opening::Daemon(DaemonRequest::SessionRegister {
-                node: name(&mut d, "ipc session register node")?,
-                session: text(&mut d, "ipc session register session")?,
-                record: text(&mut d, "ipc session register record")?,
-                passphrase: secret(&mut d, "ipc session register passphrase")?,
-                anchors: texts(&mut d, "ipc session register anchors")?,
+            (T_REQ_SESSION_ROOM, 4) => Opening::Daemon(DaemonRequest::SessionRoom {
+                node: name(&mut d, "ipc session room node")?,
+                session: text(&mut d, "ipc session room session")?,
+                room: text(&mut d, "ipc session room room")?,
             }),
+            (T_REQ_SESSION_REGISTER, 8) => {
+                let node = name(&mut d, "ipc session register node")?;
+                let session = text(&mut d, "ipc session register session")?;
+                let record = text(&mut d, "ipc session register record")?;
+                let passphrase = secret(&mut d, "ipc session register passphrase")?;
+                let anchors = texts(&mut d, "ipc session register anchors")?;
+                let link = text(&mut d, "ipc session register join link")?;
+                let pass = secret(&mut d, "ipc session register join passphrase")?;
+                Opening::Daemon(DaemonRequest::SessionRegister {
+                    node,
+                    session,
+                    record,
+                    passphrase,
+                    anchors,
+                    join: (!link.is_empty()).then(|| (link, pass.unwrap_or_default())),
+                })
+            }
             (T_REQ_STATUS, 1) => Opening::Daemon(DaemonRequest::Status),
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
@@ -837,6 +906,18 @@ impl DaemonFrame {
             }
             DaemonFrame::Ok => {
                 e.array(1).uint(T_DAEMON_OK);
+            }
+            DaemonFrame::SessionRegistered {
+                info,
+                room,
+                new,
+                joining,
+            } => {
+                e.array(5).uint(T_SESSION_REGISTERED);
+                put_info(&mut e, info);
+                e.text(room.as_deref().unwrap_or_default())
+                    .uint(u64::from(*new))
+                    .text(joining.as_deref().unwrap_or_default());
             }
             DaemonFrame::SessionEnded {
                 was_registered,
@@ -910,6 +991,18 @@ impl DaemonFrame {
                 DaemonFrame::Attached(info(&mut d)?, texts(&mut d, "ipc attached notes")?)
             }
             (T_DAEMON_OK, 1) => DaemonFrame::Ok,
+            (T_SESSION_REGISTERED, 5) => {
+                let info = info(&mut d)?;
+                let room = text(&mut d, "ipc session registered room")?;
+                let new = flag(&mut d, "ipc session registered new")?;
+                let joining = text(&mut d, "ipc session registered joining")?;
+                DaemonFrame::SessionRegistered {
+                    info,
+                    room: (!room.is_empty()).then_some(room),
+                    new,
+                    joining: (!joining.is_empty()).then_some(joining),
+                }
+            }
             (T_SESSION_ENDED, 3) => DaemonFrame::SessionEnded {
                 was_registered: flag(&mut d, "ipc session ended registered")?,
                 detached: flag(&mut d, "ipc session ended detached")?,
@@ -1188,6 +1281,7 @@ mod tests {
             Opening::Daemon(DaemonRequest::SessionEnd {
                 node: n("alice"),
                 session: "s-1".into(),
+                reason: String::new(),
             }),
             Opening::Daemon(DaemonRequest::SessionRegister {
                 node: n("alice"),
@@ -1195,6 +1289,7 @@ mod tests {
                 record: "{}".into(),
                 passphrase: Some(Zeroizing::new("pw".into())),
                 anchors: vec!["a".into()],
+                join: None,
             }),
             Opening::Daemon(DaemonRequest::Status),
             Opening::Daemon(DaemonRequest::Metrics),

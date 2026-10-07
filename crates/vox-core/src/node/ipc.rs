@@ -348,6 +348,8 @@ const T_SHARE_STOP: u64 = 4931;
 const T_SHARE_LIST: u64 = 4932;
 /// [`Frame::Shares`].
 const T_SHARES: u64 = 4933;
+const T_SESSIONS_REQ: u64 = 4940;
+const T_SESSIONS: u64 = 4941;
 
 /// What a client sends.
 ///
@@ -463,6 +465,11 @@ pub enum Request {
     },
     /// This node's shares in a room, answered with [`Frame::Shares`].
     ShareList {
+        /// The room.
+        channel_id: Digest32,
+    },
+    /// A room's Sessions (ADR-029), as its log says, answered with [`Frame::Sessions`].
+    Sessions {
         /// The room.
         channel_id: Digest32,
     },
@@ -819,6 +826,9 @@ impl Request {
                     .uint(T_SHARE_STOP)
                     .bytes(channel_id)
                     .text(selector);
+            }
+            Request::Sessions { channel_id } => {
+                e.array(2).uint(T_SESSIONS_REQ).bytes(channel_id);
             }
             Request::ShareList { channel_id } => {
                 e.array(2).uint(T_SHARE_LIST).bytes(channel_id);
@@ -1292,6 +1302,12 @@ impl Request {
                     .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
                 Ok(Request::ShareList { channel_id })
             }
+            (T_SESSIONS_REQ, 2) => {
+                let channel_id = digest(&mut d)?;
+                d.finish()
+                    .map_err(|_| Error::MalformedIpc("ipc request trailing"))?;
+                Ok(Request::Sessions { channel_id })
+            }
             (T_ADD_SERVICE, 5) => {
                 let channel_id = digest(&mut d)?;
                 let service_tag = text(&mut d, "ipc service tag")?;
@@ -1568,6 +1584,11 @@ pub enum Frame {
         /// Each share.
         shares: Vec<crate::node::shares::ShareRow>,
     },
+    /// A room's Sessions, oldest opening first, as a [`Request::Sessions`] asked for.
+    Sessions {
+        /// Each Session.
+        sessions: Vec<crate::node::sessions::SessionRow>,
+    },
 }
 
 impl Frame {
@@ -1710,6 +1731,10 @@ impl Frame {
                         .uint(r.fetched)
                         .uint(r.files);
                 }
+            }
+            Frame::Sessions { sessions } => {
+                e.array(2).uint(T_SESSIONS);
+                crate::node::sessions::put_rows(&mut e, sessions);
             }
         }
         e.finish()
@@ -2284,6 +2309,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::Shares { shares });
+        }
+        (T_SESSIONS, 2) => {
+            let sessions = crate::node::sessions::read_rows(d)?;
+            return Ok(Frame::Sessions { sessions });
         }
         (T_TRUSTED, 2) => {
             let count = d
@@ -3959,6 +3988,21 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
         Request::ShareList { channel_id } => Frame::Shares {
             shares: handle.shares().list(&channel_id).await,
         },
+        Request::Sessions { channel_id } => {
+            if !handle
+                .view()
+                .open_channels
+                .iter()
+                .any(|d| d.channel_id == channel_id)
+            {
+                return Frame::Error {
+                    reason: "room not open".into(),
+                };
+            }
+            Frame::Sessions {
+                sessions: crate::node::sessions::of_room(handle, &channel_id),
+            }
+        }
         Request::Services { channel_id } => match handle.open_detail(channel_id).await {
             Some(detail) => Frame::Services {
                 room: crate::node::resolver::room_shown_here(

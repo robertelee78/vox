@@ -67,6 +67,9 @@ pub struct OpenRoomSnap {
     /// ([`crate::node::api::ChannelDetail::retention`]): what the room's header always shows
     /// (ADR-028 R-7).
     pub retention: u64,
+    /// The room's Sessions, oldest opening first (ADR-029;
+    /// [`crate::node::sessions::fold`]).
+    pub sessions: Vec<crate::node::sessions::SessionRow>,
 }
 
 /// One node as a client draws it.
@@ -129,6 +132,7 @@ impl NodeSnapshot {
                     trusted_by: d.trusted_by.clone(),
                     pulled_by: handle.shares().pulled_by(&d.channel_id),
                     retention: d.retention,
+                    sessions: crate::node::sessions::fold(d),
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
@@ -160,7 +164,7 @@ impl NodeSnapshot {
         }
         e.array(self.open.len());
         for o in &self.open {
-            e.array(13)
+            e.array(14)
                 .bytes(&o.channel_id)
                 .text(o.name.as_deref().unwrap_or_default());
             digests(&mut e, &o.members);
@@ -206,6 +210,7 @@ impl NodeSnapshot {
                 digests(&mut e, who);
             }
             e.uint(o.retention);
+            crate::node::sessions::put_rows(&mut e, &o.sessions);
         }
         e.array(self.trusted.len());
         for (fp, name) in &self.trusted {
@@ -276,7 +281,7 @@ impl NodeSnapshot {
         }
         let mut open = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot open rooms"))? {
-            want(&mut d, 13, "ipc snapshot open room")?;
+            want(&mut d, 14, "ipc snapshot open room")?;
             let channel_id = digest(&mut d)?;
             let name = Some(d.text().map_err(bad("ipc snapshot open name"))?.to_owned())
                 .filter(|n| !n.is_empty());
@@ -342,6 +347,7 @@ impl NodeSnapshot {
                 pulled_by.push((entry, read_digests(&mut d)?));
             }
             let retention = d.uint().map_err(bad("ipc snapshot retention"))?;
+            let sessions = crate::node::sessions::read_rows(&mut d)?;
             open.push(OpenRoomSnap {
                 channel_id,
                 name,
@@ -356,6 +362,7 @@ impl NodeSnapshot {
                 trusted_by,
                 pulled_by,
                 retention,
+                sessions,
             });
         }
         let mut trusted = Vec::new();
@@ -525,6 +532,7 @@ mod tests {
                 trusted_by: vec![([4; 32], vec![[1; 32]])],
                 pulled_by: vec![([6; 32], vec![[4; 32]])],
                 retention: 604_800,
+                sessions: Vec::new(),
             }],
             trusted: vec![([4; 32], "bob".into())],
             connected_peers: vec![[4; 32]],

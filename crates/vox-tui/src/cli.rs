@@ -365,6 +365,9 @@ enum RoomCmd {
     Tail(RoomTailArgs),
     /// Print the fingerprints of the room's members.
     Roster(RoomRefArgs),
+    /// The room's Sessions (ADR-029): one per harness session working in the room, each by your
+    /// name for its node, the session's name and its short id; open ones first, ended ones apart.
+    Sessions(RoomSessionsArgs),
     /// Ask a member's node which agent sessions it holds, and whether each can be reached.
     ///
     /// The ping is answered by that node's **daemon**, never by a model: it lists each session,
@@ -1083,6 +1086,18 @@ pub struct RoomPostArgs {
     pub no_card: bool,
     #[command(flatten)]
     pub coord: CoordArgs,
+}
+
+/// `vox room sessions`
+#[derive(Args, Debug, Clone)]
+pub struct RoomSessionsArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// One JSON object per Session, one per line.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `vox room read`
@@ -2032,6 +2047,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Post(a) => &a.profile,
                 RoomCmd::Read(a) => &a.profile,
                 RoomCmd::Roster(a) => &a.profile,
+                RoomCmd::Sessions(a) => &a.profile,
                 RoomCmd::Ping(a) => &a.profile,
                 RoomCmd::Tail(a) => &a.profile,
                 RoomCmd::Board(a) => &a.profile,
@@ -2105,6 +2121,9 @@ pub fn run() -> ExitCode {
                             crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
                         }
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::Sessions(a) => {
+                            crate::room_cli::sessions(&paths, &a.room, a.json).await
+                        }
                         RoomCmd::Ping(a) => {
                             crate::ping::ping(
                                 &paths,

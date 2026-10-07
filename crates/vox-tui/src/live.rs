@@ -1291,13 +1291,24 @@ impl DaemonCore {
                     && !quoted_late(p) =>
             {
                 if p.len < held.len() {
-                    std::sync::Arc::make_mut(&mut p.rows).extend(held[p.len..].iter().map(view_of));
+                    // A Session's opening and end are not the room's conversation (ADR-029 CL-2).
+                    std::sync::Arc::make_mut(&mut p.rows).extend(
+                        held[p.len..]
+                            .iter()
+                            .filter(|r| !crate::agent_hook::is_session_record(r))
+                            .map(view_of),
+                    );
                     p.len = held.len();
                 }
                 std::sync::Arc::clone(&p.rows)
             }
             _ => {
-                let rows = std::sync::Arc::new(held.iter().map(view_of).collect::<Vec<_>>());
+                let rows = std::sync::Arc::new(
+                    held.iter()
+                        .filter(|r| !crate::agent_hook::is_session_record(r))
+                        .map(view_of)
+                        .collect::<Vec<_>>(),
+                );
                 *projected = Some(Projected {
                     verified: images.len(),
                     me,

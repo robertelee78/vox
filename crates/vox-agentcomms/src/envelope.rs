@@ -18,10 +18,31 @@ pub const PING: &str = "ping";
 /// a model and never a wake.
 pub const PONG: &str = "pong";
 
-/// Whether `kind` is plumbing between nodes ([`PING`], [`PONG`]), never meant for a model.
+/// Reserved: a node saying one of its harness sessions works in this room (ADR-029 SE-1): the
+/// Session's opening. `from` is the harness's own session id; `data.session.harness` names the
+/// harness.
+pub const SESSION: &str = "session";
+/// Reserved: a node saying that session really ended (ADR-029 SE-4); `data.reason` is the
+/// harness's own reason.
+pub const SESSION_END: &str = "session-end";
+
+/// Whether `kind` is plumbing between nodes ([`PING`], [`PONG`], a Session's opening or end), never
+/// meant for a model and never shown in a room's conversation.
 #[must_use]
 pub fn is_plumbing(kind: &str) -> bool {
-    kind == PING || kind == PONG
+    kind == PING || kind == PONG || kind == SESSION || kind == SESSION_END
+}
+
+/// How a Session is labelled (ADR-029 SE-3), in the TUI, the app and `vox` alike (CL-1): the
+/// viewer's alias for its node, its name when it has one, and the first 8 characters of its id,
+/// `codex@device-2 · gso-cap · 3f0c25bf`.
+#[must_use]
+pub fn session_label(node_alias: &str, name: Option<&str>, id: &str) -> String {
+    let short: String = id.chars().take(8).collect();
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => format!("{node_alias} \u{b7} {name} \u{b7} {short}"),
+        None => format!("{node_alias} \u{b7} {short}"),
+    }
 }
 
 /// Default hop budget, decremented on every relay and dropped at zero.
@@ -163,6 +184,10 @@ pub struct Context {
     /// Working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The sending session's current name, as its harness gives it (ADR-029 MD-1): the node's
+    /// claim, filled by Vox, never by the model. Absent when the harness gives none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 /// One agent-comms message, carried as JSON in a log entry's text.
