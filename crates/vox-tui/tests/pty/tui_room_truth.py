@@ -105,6 +105,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             runs a turn through Claude Code's hook, Bob's `:session` shows each line his `vox room
             session` prints, not "Only members …"; `d` on the tool call's line shows its output
             (ADR-029 SC-1, CL-1, #553);
+  approve   Alice's session asks to run a command through Claude Code's PermissionRequest hook:
+            Bob's TUI lists the room with "waiting 1" and the Session "· waiting on you"; `a` on
+            the request's line approves it, the waiting hook gives Claude Code "allow", and the line
+            then reads "approved here" (ADR-029 DR-1.4, CL-2, #553);
   attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
             message: a `file` announcement carrying the note in it and `to` naming her, no second
             message for the note (ADR-028 F-1, #493);
@@ -1228,6 +1232,60 @@ try:
           f"`vox room session` printed {cli!r}; the TUI showed each of them: {same}; said the "
           f"Session is sealed off: {sealed_off}; `d` on the tool call showed its output: {opened}; "
           f"help line: {hint.strip()!r}" + ("" if same and opened else f"; the pane: {details!r}"))
+
+    stage("approve")
+    # A request waiting on a driver (ADR-029 DR-1.4, CL-2, #553): Alice's session asks to run a
+    # command, through Claude Code's PermissionRequest hook, which waits for an answer. Bob's TUI
+    # puts the room under needs you ("waiting 1") and the Session's row says "waiting on you"; `a`
+    # on the request's line in the Session approves it: the hook gives Claude Code "allow", and once
+    # the call has run the line reads "approved here".
+    touch = {"command": "touch e2", "description": "Make e2"}
+    turn("PreToolUse", tool_name="Bash", tool_input=touch, tool_use_id="toolu_2")
+    e = env("alice")
+    e["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+    asking = subprocess.Popen([VOX, "agent", "hook", "--node", "default", "--room", room], env=e,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+    PROCS.append(asking)
+    asking.stdin.write(json.dumps({"session_id": OPEN_ID, "transcript_path": transcript, "cwd": work,
+                                   "permission_mode": "default", "hook_event_name": "PermissionRequest",
+                                   "tool_name": "Bash", "tool_input": touch, "permission_suggestions": []}))
+    asking.stdin.close()
+    side_rows = lambda: [bare(r) for r in pane(tui.display(), "Rooms")]
+    flagged = tui.until(lambda: any(r.startswith(f"! {open_label} · waiting on you") or
+                                    f"! {open_label} · waiting on you" in r for r in sessions_pane())
+                        and any("waiting 1" in r for r in side_rows()), 60, 1)
+    flags = (sessions_pane(), side_rows())
+    tui.key(f":session {OPEN_ID[:8]}\r", 2)
+    focus("Timeline")
+    tui.until(lambda: "approve or reject?" in flat(), 30, 1)
+    for _ in range(12):
+        if any(bare(r).startswith("▶ ") and "approve or reject?" in r for r in pane(tui.display(), "Timeline")):
+            break
+        tui.key("\x1b[A", 0.3)  # Up: an older line
+    tui.key("a", 2)
+    said_a = " ".join(r.strip() for r in tui.display()[-2:])
+    try:
+        out, err = asking.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        asking.kill()
+        out, err = asking.communicate()
+    try:
+        decision = json.loads(out)["hookSpecificOutput"]["decision"]
+    except (ValueError, KeyError, TypeError):
+        decision = None
+    # The harness takes the answer: the call runs, and its result is in the transcript.
+    with open(transcript, "a") as f:
+        f.write(json.dumps({"type": "user", "sessionId": OPEN_ID, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_2", "content": "", "is_error": False}]}}) + "\n")
+    turn("PostToolUse", tool_name="Bash", tool_input=touch, tool_use_id="toolu_2",
+         tool_response={"stdout": "", "stderr": "", "interrupted": False})
+    approved = tui.until(lambda: "Bash: touch e2 — approved here" in flat(), 60, 1)
+    tui.key(":general\r", 2)
+    claim("approve", flagged and (decision or {}).get("behavior") == "allow" and approved,
+          f"needs you: Sessions pane {flags[0]!r}, rooms {flags[1]!r} (flagged: {flagged}); `a` "
+          f"said {said_a!r}; the hook gave Claude Code {decision!r} (stdout {out!r}, stderr "
+          f"{err.strip()[:200]!r}); the line then read \"approved here\": {approved}")
 
     stage("attach")
     # A file shared from the composer is one message, addressed like one (ADR-028 F-1, #493): its

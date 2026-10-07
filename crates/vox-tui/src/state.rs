@@ -11,6 +11,7 @@ use secrecy::SecretString;
 use vox_core::hash::Digest32;
 use zeroize::Zeroizing;
 
+use crate::session_cli::Waiting;
 use crate::viewmodel::{Command, DriveAct, SessionView, ViewModel};
 
 /// How many lines PageUp/PageDown scroll the timeline.
@@ -678,6 +679,44 @@ impl UiState {
                         self.ended_open = !self.ended_open;
                         Action::Redraw
                     }
+                    None => Action::Redraw,
+                }
+            }
+            // In a Session, a driver answers the request on the selected line: `a` approves, `r`
+            // rejects, a number picks an option of a one-question question (ADR-029 DR-1.4, 1.5).
+            KeyCode::Char(c @ ('a' | 'r' | '1'..='9'))
+                if self.screen == Screen::Channel
+                    && self.focus == Focus::Timeline
+                    && matches!(self.showing, Showing::Session(..)) =>
+            {
+                let Some(x) = showing_session(self, vm).filter(|x| x.can_drive) else {
+                    return Action::Redraw;
+                };
+                let Some(line) = self
+                    .selected_session_line
+                    .and_then(|i| vm.active.as_ref()?.session_lines.get(i))
+                else {
+                    return Action::Redraw;
+                };
+                let act = match (line.waiting, c) {
+                    (Some(Waiting::Approval), 'a') => DriveAct::Approve(line.reference.clone()),
+                    (Some(Waiting::Approval), 'r') => {
+                        DriveAct::Reject(line.reference.clone(), None)
+                    }
+                    (Some(Waiting::Question), '1'..='9') if line.questions.len() == 1 => {
+                        DriveAct::Answer(
+                            line.reference.clone(),
+                            vec![(line.questions[0].clone(), c.to_string())],
+                        )
+                    }
+                    _ => return Action::Redraw,
+                };
+                match self.active_channel_id(vm) {
+                    Some(channel_id) => Action::Dispatch(Command::Drive {
+                        channel_id,
+                        session: (x.node, x.id.clone()),
+                        act,
+                    }),
                     None => Action::Redraw,
                 }
             }
@@ -1598,7 +1637,9 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     let channel = ui.active_channel_id(vm)?;
     // Interrupting or stopping is driving the Session on screen (DR-1.3); without drive it is
     // refused (CL-3), and outside a Session there is nothing to send it to.
-    if let (Showing::Session(..), "interrupt" | "stop") = (&ui.showing, verb) {
+    if let (Showing::Session(..), "interrupt" | "stop" | "approve" | "reject" | "answer") =
+        (&ui.showing, verb)
+    {
         let Some(x) = showing_session(ui, vm) else {
             return Some(Parsed::Refused("this Session is no longer listed".into()));
         };
@@ -1608,15 +1649,60 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
                 x.node_alias
             )));
         }
-        return Some(Parsed::Drive(
-            channel,
-            (x.node, x.id.clone()),
-            if verb == "stop" {
-                DriveAct::Stop
-            } else {
-                DriveAct::Interrupt
-            },
-        ));
+        // `:approve`, `:reject` and `:answer` act on the oldest request still waiting.
+        let lines = vm.active.as_ref().map_or(&[][..], |c| &c.session_lines[..]);
+        let oldest = |w: Waiting| lines.iter().find(|l| l.waiting == Some(w));
+        let act = match verb {
+            "stop" => DriveAct::Stop,
+            "interrupt" => DriveAct::Interrupt,
+            "approve" | "reject" => {
+                let Some(l) = oldest(Waiting::Approval) else {
+                    return Some(Parsed::Refused(format!(
+                        "no approval in {} waits on you",
+                        x.label
+                    )));
+                };
+                if verb == "approve" {
+                    DriveAct::Approve(l.reference.clone())
+                } else {
+                    DriveAct::Reject(
+                        l.reference.clone(),
+                        Some(rest.to_owned()).filter(|w| !w.is_empty()),
+                    )
+                }
+            }
+            _ => {
+                let Some(l) = oldest(Waiting::Question) else {
+                    return Some(Parsed::Refused(format!(
+                        "no question in {} waits on you",
+                        x.label
+                    )));
+                };
+                // One answer per question, in order, separated by `;`: an option's number or
+                // the answer's text.
+                let given: Vec<&str> = if l.questions.len() > 1 {
+                    rest.split(';').map(str::trim).collect()
+                } else {
+                    vec![rest]
+                };
+                if given.len() != l.questions.len() || given.iter().any(|g| g.is_empty()) {
+                    return Some(Parsed::Refused(format!(
+                        "not sent to {}: the question asks {} thing(s); answer each, separated                          by ;",
+                        x.label,
+                        l.questions.len()
+                    )));
+                }
+                DriveAct::Answer(
+                    l.reference.clone(),
+                    l.questions
+                        .iter()
+                        .cloned()
+                        .zip(given.into_iter().map(str::to_owned))
+                        .collect(),
+                )
+            }
+        };
+        return Some(Parsed::Drive(channel, (x.node, x.id.clone()), act));
     }
     // In a Session, the composer's verbs would write to the room, not the session: refused.
     if let (Showing::Session(..), "send" | "share") = (&ui.showing, verb) {

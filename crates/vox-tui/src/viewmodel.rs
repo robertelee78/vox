@@ -186,6 +186,9 @@ pub struct ChannelSummary {
     pub unread: usize,
     /// Unread coordination traffic (presence, progress, claims), counted only: the third level.
     pub coordination: usize,
+    /// Approvals and questions waiting on this node in Sessions it may drive here (ADR-029
+    /// CL-2).
+    pub waiting: usize,
     /// What the room needs from the person, which group the sidebar lists it under (ADR-028 W-2,
     /// #511).
     pub group: vox_agentcomms::attention::RoomGroup,
@@ -260,6 +263,8 @@ pub struct SessionView {
     pub ended: Option<u64>,
     /// Whether the session's node trusts this node with drive (SC-2, CL-3).
     pub can_drive: bool,
+    /// An approval or a question in it waits on this node (CL-2).
+    pub waiting: bool,
 }
 
 /// What a driver sends a Session (ADR-029 DR-1).
@@ -273,6 +278,13 @@ pub enum DriveAct {
     Interrupt,
     /// Stop it (its Ctrl-C).
     Stop,
+    /// Approve the approval request with this ref (DR-1.4).
+    Approve(String),
+    /// Reject the approval request with this ref, with the reason the model is given, if any.
+    Reject(String, Option<String>),
+    /// Answer the question request with this ref: for each question, an option's number as shown
+    /// or text typed as the answer (DR-1.5).
+    Answer(String, Vec<(crate::session_drive_ui::Question, String)>),
 }
 
 /// One activity of a Session, as the reader sees it (ADR-029 SC-1).
@@ -282,6 +294,12 @@ pub struct SessionLineView {
     pub text: String,
     /// Its full input and output, labelled, in order: Details.
     pub details: Vec<(String, String)>,
+    /// The harness's id for the request it is about (`ref`), empty for none.
+    pub reference: String,
+    /// What it waits for from a driver: an open approval or question, or `None` (DR-1.4, DR-1.5).
+    pub waiting: Option<crate::session_cli::Waiting>,
+    /// A waiting question's questions and their options, for an answer.
+    pub questions: Vec<crate::session_drive_ui::Question>,
 }
 
 /// Overall sync status surfaced in the status bar: what the node can say, which is how many

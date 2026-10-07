@@ -282,6 +282,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
         // The three unread levels (ADR-028 R-8, #484): to this node first.
         let levels: Vec<String> = [
             (c.to_you > 0).then(|| format!("to you {}", c.to_you)),
+            (c.waiting > 0).then(|| format!("waiting {}", c.waiting)),
             (c.unread > 0).then(|| format!("{} new", c.unread)),
             (c.coordination > 0).then(|| format!("{} coordination", c.coordination)),
         ]
@@ -786,6 +787,8 @@ fn render_sessions(
                     let on = ui.showing == Showing::Session(x.node, x.id.clone());
                     if x.ended.is_some() {
                         (format!("  {} · ended", x.label), on)
+                    } else if x.waiting {
+                        (format!("! {} · waiting on you", x.label), on)
                     } else {
                         (format!("● {}", x.label), on)
                     }
@@ -1320,7 +1323,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
         // for a member with drive only (CL-3).
         Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {
-            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · type to the session, /command · :interrupt · :stop · :general · :all · : command · Esc back"
+            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :interrupt · :stop · :general · : command · Esc back"
         }
         Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
