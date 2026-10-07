@@ -824,7 +824,17 @@ impl Router {
             // **A file is pulled after the answer** (#546): its bytes may take longer than the
             // driver waits. The answer says it was accepted; its second outcome, when the pull
             // ends, is written beside the first.
-            Action::File { size, .. } => Ok(format!("accepted, pulling {size} bytes")),
+            // **Not past the disk's reserve** (ADR-028 F-3: a pull never fills the disk): a driver
+            // names the size, and a file that would leave less than the reserve is refused before
+            // anything is pulled. The pull itself stops at the reserve too.
+            Action::File { size, .. } => {
+                let dir = vox_core::node::pulls::room_dir(&paths, &info.channel_id);
+                let _ = vox_core::node::paths::create_private_dir(&dir);
+                match vox_core::node::pulls::short_of_space(&dir, *size) {
+                    Some(why) => Err(format!("not accepted: {why}")),
+                    None => Ok(format!("accepted, pulling {size} bytes")),
+                }
+            }
             input => self.steer(node, &reg, input).await,
         };
         // Every drive's outcome, beside it (DR-6): what happened, or why it was not delivered.

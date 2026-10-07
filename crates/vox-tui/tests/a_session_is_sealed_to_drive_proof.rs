@@ -100,6 +100,20 @@ const HARNESS_VARS: &[&str] = &[
 /// variable a harness adds later is cleared too.
 fn vox_cmd() -> Command {
     let mut cmd = Command::new(VOX);
+    // A clean environment: only this whitelist of what any program needs passes, so nothing of a
+    // harness, a terminal or the operator's own vox reaches it.
+    cmd.env_clear();
+    for k in [
+        "HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL",
+    ] {
+        if let Some(v) = std::env::var_os(k) {
+            cmd.env(k, v);
+        }
+    }
+    // A daemon this starts never takes port 1080.
+    cmd.env("VOX_PROXY", "127.0.0.1:0");
+    // Removed by name as well: a keyring change is run through `typed`, which copies a command's
+    // named variables and removals but cannot see `env_clear`.
     for (k, _) in std::env::vars_os() {
         let name = k.to_string_lossy();
         if ["TMUX", "CLAUDE", "CODEX", "OPENCODE"]
