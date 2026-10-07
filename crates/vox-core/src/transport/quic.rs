@@ -1064,11 +1064,13 @@ impl SharedEndpoint {
     pub fn close(&self) {
         // A stopping node's last word to every connection it still has (V210-93): "stopped",
         // the same as `ConnectionManager::close_all` says, never a code that reads as a fault.
+        // Marked closed first: the accept loop that ends on it reads this to know the end was
+        // asked for.
+        self.closed.send_replace(true);
         self.endpoint.close(
             close_code(WireError::ShuttingDown),
             WireError::ShuttingDown.to_string().as_bytes(),
         );
-        self.closed.send_replace(true);
     }
 
     /// Whether the endpoint is closed, as a watch: `true` once [`Self::close`] has run.

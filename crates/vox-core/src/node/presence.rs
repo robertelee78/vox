@@ -927,6 +927,15 @@ fn spawn_accept_loop(
                 }
             });
         }
+        // **An endpoint that ends while the node runs is said** (`MuxSocket::read_failed`): quinn
+        // ends it on an I/O error it reports only on its `tracing` output, and the node then went
+        // on running unreachable without a word.
+        if !*shared.closed().borrow() {
+            eprintln!(
+                "vox: this node stopped taking connections: its endpoint ended though nothing \
+                 closed it, so nobody can reach it until its daemon restarts"
+            );
+        }
     })
     .abort_handle()
 }
