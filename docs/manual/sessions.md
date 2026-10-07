@@ -40,9 +40,12 @@ repo /opt/vox
 When a harness session starts, its node looks up the directory the session started in. The match
 is exact: `/opt/vox` matches a session started in `/opt/vox`, and not one started in
 `/opt/vox/crates` or in a worktree beside it. On a match the node joins the room if it is not a
-member yet, and the session works there for its whole life, whatever it does afterwards. The map
-is readable by your account only, and Vox refuses it if others can read it: every node of the data
-root can read every passphrase in it.
+member yet, and the session works there for its whole life, whatever it does afterwards. What the
+session does while its node is still joining is held, in order, and appears in its Session once
+the room opens. Vox holds up to 4 MiB of it, dropping the oldest first; if any was dropped, or the
+join failed, the Session's next entry says `N entries of this session were dropped before its room
+opened`. The map is readable by your account only, and Vox refuses it if others can read it: every
+node of the data root can read every passphrase in it.
 
 A session started in a directory the map does not name works in no room. Its first turn is told
 so:
@@ -179,9 +182,11 @@ vox room post ROOM_ID --to alice/3f0c25bf "the lexer is yours"
 ```
 
 A message addressed to a session is shown in full in that session's next turn, as a message from
-another participant, not as the operator's input. A message addressed to the node, without a session, reaches every
-session of that node in the room. A message to a session that has ended is refused, and nothing is
-posted. An urgent message to a session wakes only that session.
+another participant, not as the operator's input. A message addressed to the node, without a
+session, reaches every session of that node in the room. A message to a session that has ended is
+refused, and nothing is posted. An urgent message to a session wakes only that session.
+
+A file can be addressed the same way: `vox share ROOM_ID FILE --to alice/3f0c25bf`.
 
 ## Sessions in the TUI
 
