@@ -1705,6 +1705,115 @@ fn drain_as(d: &Daemon, session: &str) -> String {
     out
 }
 
+/// ADR-028 K-19 (#528) — **an offer for an agent's node is shown in its harness, and only the
+/// operator accepts it.** Two real daemons: bob joins alice's room, which offers bob to alice's
+/// keyring (K-15). alice's operator has just made a keyring change typed at a terminal, so her
+/// keyring window is open: a hook that accepted would not be refused by the passphrase gate.
+///
+/// 1. alice's agent's next turn shows the offer, as every client says it, with the command her
+///    operator types outside the session: `vox trust add <bob> --name <name> [--drive] --node
+///    default`.
+/// 2. the same session's next turn does not show it again: a quiet turn costs nothing.
+/// 3. bob is not in alice's keyring: the hook shows, it never accepts (K-13).
+///
+/// **Mutant**: the hook accepts each offer it shows (a trust add with no passphrase, made in the
+/// open window). Red on (3), PRODUCT.
+#[test]
+#[ignore = "two daemons with production Argon2id; drives the real binary; CI runs it in release"]
+fn an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accepts_it() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let alice = Daemon::start(&tmp.path().join("alice"));
+    let bob = Daemon::start_bare(&tmp.path().join("bob"));
+    let alice_pass = alice
+        .data
+        .parent()
+        .expect("APPARATUS: a root")
+        .join("identity.pass");
+    let alice_pass = alice_pass.to_str().expect("APPARATUS: a UTF-8 path");
+    // A third node, only for its fingerprint: alice's operator trusts it, typed at a terminal,
+    // and her keyring window opens (ADR-028 K-12).
+    let (carol_data, carol_cfg) = (tmp.path().join("carol/data"), tmp.path().join("carol/cfg"));
+    std::fs::create_dir_all(&carol_cfg).expect("APPARATUS: a directory");
+    let (ok, carol_fp, err) = hook(
+        &carol_data,
+        &carol_cfg,
+        &["id", "--identity-passphrase-file", alice_pass],
+        "",
+    );
+    assert!(ok, "PRODUCT (staging): vox id for carol failed: {err}");
+    let carol_fp = carol_fp.trim().to_owned();
+    let (ok, said, err) = hook(
+        &alice.data,
+        &alice.cfg,
+        &[
+            "trust",
+            "add",
+            &carol_fp,
+            "--name",
+            "carol",
+            "--identity-passphrase-file",
+            alice_pass,
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): alice's operator's typed trust of carol failed: {said}{err}"
+    );
+    // bob joins alice's room: alice's node is offered him.
+    let label: String = alice.room_key.chars().take(12).collect();
+    let link = alice.link(&label);
+    let (ok, _, err) = hook(
+        &bob.data,
+        &bob.cfg,
+        &["room", "join", "--passphrase-file", "-", &link],
+        "channel passphrase",
+    );
+    assert!(
+        ok,
+        "PRODUCT (staging): bob could not join alice's room: {err}"
+    );
+
+    // (1) a turn shows the offer, with the operator's command.
+    let accept = format!(
+        "accept: vox trust add {} --name <name> [--drive] --node default",
+        bob.fingerprint
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut turn = 0;
+    let shown = loop {
+        turn += 1;
+        let out = drain_as(&alice, &format!("k19-{turn}"));
+        if out.contains(&bob.fingerprint) || Instant::now() >= deadline {
+            break out;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!("[proof] (1) alice's agent's turn {turn}: {shown:?}");
+    assert!(
+        shown.contains(&accept) && shown.contains("typing the passphrase in a terminal"),
+        "PRODUCT: bob joined alice's room and is offered to her keyring, so her agent's turn must \
+         show the offer with the command her operator types outside the session ({accept:?}) \
+         (ADR-028 K-19); within 90 s it showed:\n{shown}"
+    );
+    // (2) once per session.
+    let again = drain_as(&alice, &format!("k19-{turn}"));
+    assert!(
+        !again.contains(&bob.fingerprint),
+        "PRODUCT: the same session's next turn showed the offer again: {again}"
+    );
+    // (3) the hook never accepts, though the keyring window is open.
+    let (ok, list, err) = hook(&alice.data, &alice.cfg, &["trust", "list"], "");
+    println!("[proof] (3) alice's keyring after the turns: {list:?}");
+    assert!(
+        ok && list.contains(&carol_fp) && !list.contains(&bob.fingerprint),
+        "PRODUCT: the hook accepted the offer of bob: only the operator, typing the passphrase \
+         outside the session, accepts one (ADR-028 K-13, K-19); `vox trust list` says \
+         {list}{err}"
+    );
+}
+
 /// ADR-028 §6 (#503) — **a drain posts read records, and nobody is shown one.**
 ///
 /// Two real daemons, alice and bob, each trusting the other, in alice's room. alice posts with
