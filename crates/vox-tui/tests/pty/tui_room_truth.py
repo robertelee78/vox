@@ -477,7 +477,7 @@ try:
     stage("renamed")
     # The room's creator renames it; the room's one name reaches Bob's node, and his timeline says
     # who renamed it and to what, by his name for her (he trusts her as "alice").
-    r = run("alice", "room", "rename", room, "family", "--identity-passphrase-file", f"{S}/idpass")
+    r = run("alice", "room", "rename", room, "family")
     if r.returncode != 0: product(f"alice's `vox room rename` failed: {r.stderr.strip()}")
     said = "alice renamed the room to family"
     renamed = tui.until(lambda: said in timeline(), 60, 1)

@@ -4016,14 +4016,9 @@ pub async fn create(
 /// `vox room rename` — give a room a new name, for every member (ADR-028 R-1).
 ///
 /// # Errors
-/// A name that is not one DNS label, an unreachable node, an unknown room, a wrong identity
-/// passphrase, or a caller who is not the room's creator or an admin.
-pub async fn rename(
-    paths: &Paths,
-    room: &str,
-    name: &str,
-    identity_passphrase: &str,
-) -> Result<(), AppError> {
+/// A name that is not one DNS label, an unreachable node, an unknown room, or a caller who is
+/// not the room's creator or an admin. No passphrase is asked for (ADR-028 K-11).
+pub async fn rename(paths: &Paths, room: &str, name: &str) -> Result<(), AppError> {
     let name = vox_core::governance::name::room_name(name)
         .map_err(|why| AppError::Usage(format!("cannot rename the room: {why}")))?;
     let mut client = attach(paths).await?;
@@ -4032,7 +4027,6 @@ pub async fn rename(
         .request(&Request::RenameRoom {
             channel_id,
             name: name.clone(),
-            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
         })
         .await
     {

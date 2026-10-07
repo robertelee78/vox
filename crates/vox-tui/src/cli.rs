@@ -526,14 +526,8 @@ pub struct RenameArgs {
     pub profile: NodeArgs,
     /// The room: its name, or its id or a unique prefix of it.
     pub room: String,
-    /// The new name: one DNS label (a-z, 0-9 and `-`).
+    /// The new name: one DNS label (a-z, 0-9 and `-`). Asks for no passphrase (ADR-028 K-11).
     pub name: String,
-    /// **Refused**, as on `vox trust add`: a command line is world-readable.
-    #[arg(long)]
-    pub identity_passphrase: Option<String>,
-    /// Read the identity passphrase from this file (first line).
-    #[arg(long)]
-    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox room retention`
@@ -2186,12 +2180,7 @@ pub fn run() -> ExitCode {
                                 .await
                         }
                         RoomCmd::Rename(a) => {
-                            let identity = crate::tunnel_cli::identity_passphrase_for(
-                                &paths,
-                                a.identity_passphrase.clone(),
-                                a.identity_passphrase_file.clone(),
-                            )?;
-                            crate::room_cli::rename(&paths, &a.room, &a.name, &identity).await
+                            crate::room_cli::rename(&paths, &a.room, &a.name).await
                         }
                         RoomCmd::Retention(a) => {
                             crate::room_cli::retention(&paths, &a.room, &a.duration).await

@@ -607,10 +607,8 @@ pub enum Command {
     RenameRoom {
         /// The room.
         channel_id: Digest32,
-        /// The new name, one DNS label.
+        /// The new name, one DNS label. No passphrase is asked for (ADR-028 K-11).
         name: String,
-        /// The identity passphrase, as `vox room rename` asks for it (redacted/zeroized).
-        identity_passphrase: SecretString,
     },
     /// Add a node to the keyring under a name (ADR-028 K-3, K-5), as `vox trust add` does, once
     /// the person has compared its fingerprint.

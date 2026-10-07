@@ -1989,15 +1989,9 @@ impl CoreHandle for DaemonCore {
                 name,
                 passphrase: Zeroizing::new(secret(&passphrase)),
             }),
-            Command::RenameRoom {
-                channel_id,
-                name,
-                identity_passphrase,
-            } => self.send(Request::RenameRoom {
-                channel_id,
-                name,
-                identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
-            }),
+            Command::RenameRoom { channel_id, name } => {
+                self.send(Request::RenameRoom { channel_id, name })
+            }
             Command::Trust {
                 target,
                 petname,

@@ -337,7 +337,7 @@ const T_END: u64 = 32;
 const T_IDLE_END: u64 = 33;
 const T_SET_ADMIN: u64 = 34;
 const T_ADMINS: u64 = 35;
-/// `[36, channel_id, name, identity_passphrase]` — [`Request::RenameRoom`] (ADR-028 R-1).
+/// `[36, channel_id, name]` — [`Request::RenameRoom`] (ADR-028 R-1).
 const T_RENAME_ROOM: u64 = 36;
 /// `NodeEvent::RoomEnded` and `NodeEvent::RoomRemoved` (V030-08). Additive.
 const T_ROOM_ENDED: u64 = 2440;
@@ -561,15 +561,14 @@ pub enum Request {
         /// Seconds a message body is kept; `0` keeps it forever.
         ttl: u64,
     },
-    /// Name a room for every member (ADR-028 R-1); its creator or an admin only. Requires the
-    /// identity passphrase: it changes what every member sees.
+    /// Name a room for every member (ADR-028 R-1); its creator or an admin only, as the room's
+    /// governance says. **Not gated on the identity passphrase** (ADR-028 K-11): it is asked for
+    /// only to attach a node and to change its keyring.
     RenameRoom {
         /// The room.
         channel_id: Digest32,
         /// The new name, one DNS label.
         name: String,
-        /// The identity passphrase, proving this is the operator and not an agent.
-        identity_passphrase: zeroize::Zeroizing<String>,
     },
     /// End a room for everyone (V030-08); its creator only.
     End {
@@ -871,16 +870,8 @@ impl Request {
             Request::Create { name, passphrase } => {
                 e.array(3).uint(T_CREATE).text(name).text(passphrase);
             }
-            Request::RenameRoom {
-                channel_id,
-                name,
-                identity_passphrase,
-            } => {
-                e.array(4)
-                    .uint(T_RENAME_ROOM)
-                    .bytes(channel_id)
-                    .text(name)
-                    .text(identity_passphrase);
+            Request::RenameRoom { channel_id, name } => {
+                e.array(3).uint(T_RENAME_ROOM).bytes(channel_id).text(name);
             }
             Request::Invite { channel_id } => {
                 e.array(2).uint(T_INVITE).bytes(channel_id);
@@ -1195,17 +1186,12 @@ impl Request {
                     identity_passphrase,
                 })
             }
-            (T_RENAME_ROOM, 4) => {
+            (T_RENAME_ROOM, 3) => {
                 let channel_id = digest(&mut d)?;
                 let name = text(&mut d, "ipc room name")?;
-                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
-                Ok(Request::RenameRoom {
-                    channel_id,
-                    name,
-                    identity_passphrase,
-                })
+                Ok(Request::RenameRoom { channel_id, name })
             }
             (T_RETENTION, 3) => {
                 let channel_id = digest(&mut d)?;
@@ -3513,20 +3499,14 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
-        Request::RenameRoom {
-            channel_id,
-            name,
-            identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
-            Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::RenameRoom { channel_id, name })
-                .await
-            {
-                crate::node::api::Outcome::Done => Frame::Ok,
-                other => Frame::Error {
-                    reason: other.to_string(),
-                },
+        // Not gated on the passphrase (ADR-028 K-11): the room's governance says who may.
+        Request::RenameRoom { channel_id, name } => match handle
+            .apply(crate::node::api::NodeCommand::RenameRoom { channel_id, name })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            other => Frame::Error {
+                reason: other.to_string(),
             },
         },
         // Not gated on the passphrase (ADR-028 K-11): the node's governance says who may.

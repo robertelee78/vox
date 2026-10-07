@@ -58,7 +58,7 @@ impl PromptKind {
             PromptKind::CreateChannel => &["room name", "room passphrase", "confirm passphrase"],
             PromptKind::OpenChannel => &["room passphrase"],
             PromptKind::JoinChannel => &["room link (vox://…)", "room passphrase"],
-            PromptKind::RenameRoom => &["new room name", "identity passphrase"],
+            PromptKind::RenameRoom => &["new room name"],
             PromptKind::LeaveRoom => &["type leave to leave it"],
             PromptKind::EndRoom => &["type end to end it for everyone"],
             PromptKind::Trust => &[
@@ -74,7 +74,8 @@ impl PromptKind {
     pub fn is_secret(self, i: usize) -> bool {
         match self {
             // A room's name is not a secret.
-            PromptKind::CreateChannel | PromptKind::RenameRoom => i != 0,
+            PromptKind::CreateChannel => i != 0,
+            PromptKind::RenameRoom => false,
             // The link is not; only the passphrase.
             PromptKind::JoinChannel => i == 1,
             // A confirming word is no secret.
@@ -833,11 +834,7 @@ impl UiState {
                     return Action::Redraw;
                 };
                 match vox_core::governance::name::room_name(&p.fields[0]) {
-                    Ok(name) => Action::Dispatch(Command::RenameRoom {
-                        channel_id,
-                        name,
-                        identity_passphrase: secret(&p.fields[1]),
-                    }),
+                    Ok(name) => Action::Dispatch(Command::RenameRoom { channel_id, name }),
                     Err(why) => {
                         self.status_message = Some(why);
                         self.mode = Mode::Prompt(Prompt::new(PromptKind::RenameRoom, p.target));
@@ -1104,11 +1101,18 @@ impl UiState {
                             .then(|| self.active_channel_id(vm))
                             .flatten();
                         let mut p = Prompt::new(kind, target);
+                        let named = name.is_some();
                         if let Some(n) = name {
                             p.fields[0] = Zeroizing::new(n);
                             p.step = 1;
                         }
+                        // Nothing left to ask once the name is given (`:rename home`): it is
+                        // made, as typed (ADR-028 K-11: a rename asks for no passphrase).
+                        let done = named && p.step >= p.fields.len();
                         self.mode = Mode::Prompt(p);
+                        if done {
+                            return self.submit_prompt();
+                        }
                         Action::Redraw
                     }
                     None => {
@@ -1370,8 +1374,8 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
         // Each says what it does and waits for the person to confirm it (ADR-028 E-5).
         "leave" => return Some(Parsed::Confirm(PromptKind::LeaveRoom, channel)),
         "end" => return Some(Parsed::Confirm(PromptKind::EndRoom, channel)),
-        // The room's new name is not secret; the identity passphrase that follows is, so like
-        // `new` it opens the masked prompt.
+        // The room's new name, filled in for the person to confirm: no passphrase follows
+        // (ADR-028 K-11).
         "rename" => {
             return Some(Parsed::Prompt(
                 PromptKind::RenameRoom,
