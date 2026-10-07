@@ -55,16 +55,27 @@ pub fn parse_duration(text: &str) -> Option<u64> {
     n.checked_mul(scale)
 }
 
-/// A retention as a person reads it: the named durations by name, anything else in seconds.
+/// A retention as a person reads it: a whole count of the largest unit that divides it evenly,
+/// `2 weeks` for `2w` (it said `1209600 seconds`: only one of each unit had a name).
 #[must_use]
 pub fn describe(secs: u64) -> String {
-    match secs {
-        0 => "forever".into(),
-        HOUR => "1 hour".into(),
-        WEEK => "1 week".into(),
-        MONTH => "1 month".into(),
-        s => format!("{s} seconds"),
+    if secs == 0 {
+        return "forever".into();
     }
+    let units = [
+        (MONTH, "month"),
+        (WEEK, "week"),
+        (24 * HOUR, "day"),
+        (HOUR, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ];
+    let (size, name) = units
+        .into_iter()
+        .find(|(size, _)| secs.is_multiple_of(*size))
+        .unwrap_or((1, "second"));
+    let n = secs / size;
+    format!("{n} {name}{}", if n == 1 { "" } else { "s" })
 }
 
 /// The shorter of two retentions, where `0` means forever and so never wins.
