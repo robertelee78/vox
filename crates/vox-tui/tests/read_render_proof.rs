@@ -18,7 +18,7 @@ use std::io::{BufRead as _, Read as _};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use support::{until, Out, HARNESS_SESSION_VARS, VOX};
+use support::{until, Out, VOX};
 
 /// Lines that START a row: a full 52-character base32 hash, then a space.
 fn row_starts(out: &str) -> usize {
@@ -55,9 +55,7 @@ fn a_message_cannot_forge_a_row_in_read_or_tail() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for v in HARNESS_SESSION_VARS {
-        cmd.env_remove(v);
-    }
+    support::strip_harness_env(&mut cmd);
     let mut tail = cmd.spawn().expect("APPARATUS: spawn `vox room tail`");
     let (tx, rx) = std::sync::mpsc::channel();
     let so = tail.stdout.take().expect("APPARATUS: tail's stdout");

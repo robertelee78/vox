@@ -451,9 +451,7 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
             std::fs::File::create(&tail_out).expect("APPARATUS: create the tail's output file"),
         ))
         .stderr(std::process::Stdio::null());
-    for v in support::HARNESS_SESSION_VARS {
-        tail_cmd.env_remove(v);
-    }
+    support::strip_harness_env(&mut tail_cmd);
     let mut tail = tail_cmd.spawn().expect("APPARATUS: spawn `vox room tail`");
 
     // ---- the rounds: one urgent message to all three, measured to each wake ----
