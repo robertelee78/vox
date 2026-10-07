@@ -543,14 +543,9 @@ pub struct RetentionArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
-    /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`.
+    /// `1h`, `1w`, `1m` (a month), a number of seconds, or `forever`. Asks for no passphrase
+    /// (ADR-028 K-11).
     pub duration: String,
-    /// **Refused**, as on `vox trust add`: a command line is world-readable.
-    #[arg(long)]
-    pub identity_passphrase: Option<String>,
-    /// Read the identity passphrase from this file (first line).
-    #[arg(long)]
-    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox room get`
@@ -2199,13 +2194,7 @@ pub fn run() -> ExitCode {
                             crate::room_cli::rename(&paths, &a.room, &a.name, &identity).await
                         }
                         RoomCmd::Retention(a) => {
-                            let identity = crate::tunnel_cli::identity_passphrase_for(
-                                &paths,
-                                a.identity_passphrase.clone(),
-                                a.identity_passphrase_file.clone(),
-                            )?;
-                            crate::room_cli::retention(&paths, &a.room, &a.duration, &identity)
-                                .await
+                            crate::room_cli::retention(&paths, &a.room, &a.duration).await
                         }
                         RoomCmd::Get(a) => {
                             crate::room_cli::get_file(

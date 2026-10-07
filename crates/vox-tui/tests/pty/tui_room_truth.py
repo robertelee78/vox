@@ -769,7 +769,7 @@ try:
         text = "".join(bare(r) for r in pane(t.display(), "Timeline")).replace(" ", "")
         return want.replace(" ", "") in text
     before = (header(atui), header(tui))
-    r = run("alice", "room", "retention", room, "1w", "--identity-passphrase-file", f"{S}/idpass")
+    r = run("alice", "room", "retention", room, "1w")
     if r.returncode != 0: product(f"alice's `vox room retention {room} 1w` failed: {r.stderr.strip()}")
     LINE = "set the room's retention to 1 week: messages older than 1 week are removed from now on"
     both_until(lambda: says(atui, f"you {LINE}") and says(tui, f"alice {LINE}")

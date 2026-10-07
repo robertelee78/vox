@@ -552,18 +552,17 @@ pub enum Request {
         /// wire only when `true`, so an older client's request still decodes.
         full_history: bool,
     },
-    /// Set a room's retention (ADR-023 decision 2). Requires the identity passphrase:
-    /// shortening it deletes stored history, which is not an agent's call.
+    /// Set a room's retention (ADR-023 decision 2). **Not gated on the identity passphrase**
+    /// (ADR-028 K-11, ADR-010 AR-28 as amended): the passphrase is asked for only to attach a node
+    /// and to change its keyring. Who may set it for every member is the room's governance.
     SetRetention {
         /// The room.
         channel_id: Digest32,
         /// Seconds a message body is kept; `0` keeps it forever.
         ttl: u64,
-        /// The identity passphrase, proving this is the operator and not an agent.
-        identity_passphrase: zeroize::Zeroizing<String>,
     },
     /// Name a room for every member (ADR-028 R-1); its creator or an admin only. Requires the
-    /// identity passphrase, as [`Request::SetRetention`] does: it changes what every member sees.
+    /// identity passphrase: it changes what every member sees.
     RenameRoom {
         /// The room.
         channel_id: Digest32,
@@ -953,16 +952,8 @@ impl Request {
                     .text(petname)
                     .text(identity_passphrase);
             }
-            Request::SetRetention {
-                channel_id,
-                ttl,
-                identity_passphrase,
-            } => {
-                e.array(4)
-                    .uint(T_RETENTION)
-                    .bytes(channel_id)
-                    .uint(*ttl)
-                    .text(identity_passphrase);
+            Request::SetRetention { channel_id, ttl } => {
+                e.array(3).uint(T_RETENTION).bytes(channel_id).uint(*ttl);
             }
             Request::Untrust {
                 target,
@@ -1216,17 +1207,12 @@ impl Request {
                     identity_passphrase,
                 })
             }
-            (T_RETENTION, 4) => {
+            (T_RETENTION, 3) => {
                 let channel_id = digest(&mut d)?;
                 let ttl = d.uint().map_err(|_| Error::MalformedBundle("ipc ttl"))?;
-                let identity_passphrase = secret_text(&mut d, "ipc identity passphrase")?;
                 d.finish()
                     .map_err(|_| Error::MalformedBundle("ipc request trailing"))?;
-                Ok(Request::SetRetention {
-                    channel_id,
-                    ttl,
-                    identity_passphrase,
-                })
+                Ok(Request::SetRetention { channel_id, ttl })
             }
             (T_UNTRUST, 3) => {
                 let target = digest(&mut d)?;
@@ -3543,23 +3529,17 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
                 },
             },
         },
-        Request::SetRetention {
-            channel_id,
-            ttl,
-            identity_passphrase,
-        } => match verify_operator(handle, identity_passphrase).await {
-            Err(f) => f,
-            Ok(()) => match handle
-                .apply(crate::node::api::NodeCommand::SetRetention { channel_id, ttl })
-                .await
-            {
-                crate::node::api::Outcome::Done => Frame::Ok,
-                crate::node::api::Outcome::OwnRetention { own, room } => {
-                    Frame::OwnRetention { own, room }
-                }
-                other => Frame::Error {
-                    reason: other.to_string(),
-                },
+        // Not gated on the passphrase (ADR-028 K-11): the node's governance says who may.
+        Request::SetRetention { channel_id, ttl } => match handle
+            .apply(crate::node::api::NodeCommand::SetRetention { channel_id, ttl })
+            .await
+        {
+            crate::node::api::Outcome::Done => Frame::Ok,
+            crate::node::api::Outcome::OwnRetention { own, room } => {
+                Frame::OwnRetention { own, room }
+            }
+            other => Frame::Error {
+                reason: other.to_string(),
             },
         },
         Request::Untrust {

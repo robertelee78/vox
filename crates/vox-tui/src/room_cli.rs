@@ -4053,14 +4053,9 @@ pub async fn rename(
 /// `vox room retention` — set how long the room keeps messages (ADR-023 decision 2).
 ///
 /// # Errors
-/// An unparseable duration, an unreachable node, an unknown room, a wrong identity
-/// passphrase, or a caller who is not the room's admin.
-pub async fn retention(
-    paths: &Paths,
-    room: &str,
-    duration: &str,
-    identity_passphrase: &str,
-) -> Result<(), AppError> {
+/// An unparseable duration, an unreachable node, an unknown room, or a caller who is not the
+/// room's admin. No passphrase is asked for (ADR-028 K-11).
+pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), AppError> {
     let ttl = vox_core::node::retention::parse_duration(duration).ok_or_else(|| {
         AppError::Usage(format!(
             "{duration:?} is not a retention: use 1h, 1w, 1m (a month), a number of seconds, \
@@ -4085,11 +4080,7 @@ pub async fn retention(
         );
     }
     match client
-        .request(&Request::SetRetention {
-            channel_id,
-            ttl,
-            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
-        })
+        .request(&Request::SetRetention { channel_id, ttl })
         .await
     {
         Ok(Frame::Ok) => {
