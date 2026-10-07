@@ -37,10 +37,11 @@ extension NodeModel {
         return sessions.first { $0.nodeFingerprint == node && $0.sessionId == id }
     }
 
-    /// A Session's header, to a member with drive (CL-1): its name and id are its node's claim
-    /// (MD-3). None for this node's own Sessions (their node's alias is empty): the claim is its own.
+    /// Another node's Session's header, with drive or without (ADR-029 MD-3, as the TUI says it):
+    /// its name and id are that node's claim. None for this node's own Sessions (their node's
+    /// alias is empty): the claim is this node's own.
     var sessionHeader: String? {
-        guard let s = shownSession, s.canDrive, !s.nodeAlias.isEmpty else { return nil }
+        guard let s = shownSession, !s.nodeAlias.isEmpty else { return nil }
         return "\(s.label) — name and id as \(s.nodeAlias) says"
     }
 }

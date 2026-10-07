@@ -346,7 +346,8 @@ struct StateMark: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(glyph).font(Theme.mono)
-            Text(words)
+            // Its own face: a sidebar list sets its rows' font over the one inherited.
+            Text(words).font(Theme.text)
         }
         .foregroundStyle(color)
         .accessibilityElement(children: .ignore)
