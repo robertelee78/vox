@@ -41,6 +41,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A short root for the run's directories: a Unix socket's path must fit the platform's bound
+/// (104 bytes on macOS), which the system's temporary directory does not leave room for.
+#[cfg(target_os = "macos")]
+const SHORT_ROOT: &str = "/private/tmp/vc";
+#[cfg(not(target_os = "macos"))]
+const SHORT_ROOT: &str = "/tmp/vc";
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const PERSON: &str = "person";
 const AGENT: &str = "claude-a";
@@ -248,11 +255,11 @@ impl World {
     /// `claude-a` in one room, `claude-a` trusting `person` with drive and `person` trusting it.
     /// The world, its daemon's guard, and the room's id.
     fn setup() -> (World, Daemon, String) {
-        std::fs::create_dir_all("/private/tmp/vc")
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+        std::fs::create_dir_all(SHORT_ROOT)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make {SHORT_ROOT}: {e}"));
         let tmp = tempfile::Builder::new()
             .prefix("cs-")
-            .tempdir_in("/private/tmp/vc")
+            .tempdir_in(SHORT_ROOT)
             .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
         let root = tmp.path().to_path_buf();
         for d in ["home", "work"] {

@@ -86,6 +86,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A short root for the run's directories: a Unix socket's path must fit the platform's bound
+/// (104 bytes on macOS), which the system's temporary directory does not leave room for.
+#[cfg(target_os = "macos")]
+const SHORT_ROOT: &str = "/private/tmp/vc";
+#[cfg(not(target_os = "macos"))]
+const SHORT_ROOT: &str = "/tmp/vc";
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 /// The agent's own node (ADR-026 N-6): `<harness>-<host>`, as the skill names it.
 const NODE: &str = "codex-proof";
@@ -445,11 +452,11 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
         .unwrap_or_else(|_| panic!("APPARATUS: ~/.codex/auth.json is not JSON"));
 
     // ---- the run's root: short, so the node's socket sits in its profile ----
-    std::fs::create_dir_all("/private/tmp/vc")
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+    std::fs::create_dir_all(SHORT_ROOT)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {SHORT_ROOT}: {e}"));
     let tmp = tempfile::Builder::new()
         .prefix("cxl-")
-        .tempdir_in("/private/tmp/vc")
+        .tempdir_in(SHORT_ROOT)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let root = oc_sandbox::real(tmp.path());
     let data = root.join("vd");
