@@ -134,7 +134,15 @@ fn dry_run() -> bool {
 }
 
 fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, String, String) {
+    // A cleared environment: nothing of a real harness's terminal (`TMUX*`, `CLAUDE*`, `CODEX*`,
+    // `OPENCODE*`) reaches a `vox` here, or the daemon it starts.
+    let home = data.with_file_name("home");
+    let _ = std::fs::create_dir_all(&home);
     let mut child = Command::new(VOX)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("VOX_PROXY", "127.0.0.1:0")
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
@@ -531,6 +539,8 @@ fn a_live_codex_turn_reads_the_room_only_through_a_trusted_hook() {
 
     // ---- two isolated Codex homes, each with exactly what `vox agent plugin codex` prints ----
     let plugin = Command::new(VOX)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
         .args(["agent", "plugin", "codex", "--node", NODE])
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin codex: {e}"));
@@ -777,8 +787,18 @@ fn vox_as(
     args: &[&str],
     input: Option<&str>,
 ) -> (bool, String) {
+    // **A cleared environment** (the lead, 2026-10-07): this process may run beneath a real
+    // harness's terminal, so nothing of its `TMUX*`, `CLAUDE*`, `CODEX*` or `OPENCODE*` (nor a
+    // messaging socket or an app-server it names) may reach a `vox` here, the daemon it starts
+    // above all: a session registered from them could be driven into a real one.
+    let home = data.with_file_name("home");
+    let _ = std::fs::create_dir_all(&home);
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("LANG", "en_US.UTF-8")
+        .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         .env(
@@ -1057,6 +1077,8 @@ fn a_live_codex_session_is_mirrored_and_driven() {
     // ---- (2) Codex's home: Vox's hooks, trusted through Codex's own RPCs; its app-server ----
     let h = CodexHome::new(&root, "s");
     let plugin = Command::new(VOX)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
         .args(["agent", "plugin", "codex", "--node", NODE])
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin codex: {e}"));

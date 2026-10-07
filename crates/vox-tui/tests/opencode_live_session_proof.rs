@@ -93,8 +93,18 @@ fn vox_as(
     args: &[&str],
     input: Option<&str>,
 ) -> (bool, String) {
+    // **A cleared environment** (the lead, 2026-10-07): this process may run beneath a real
+    // harness's terminal, so nothing of its `TMUX*`, `CLAUDE*`, `CODEX*` or `OPENCODE*` (nor a
+    // messaging socket or an app-server it names) may reach a `vox` here, the daemon it starts
+    // above all: a session registered from them could be driven into a real one.
+    let home = data.with_file_name("home");
+    let _ = std::fs::create_dir_all(&home);
     let mut cmd = Command::new(VOX);
-    cmd.args(args)
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &home)
+        .env("LANG", "en_US.UTF-8")
+        .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
         .env(
@@ -344,6 +354,8 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
     }
     // The plugin as `vox agent plugin opencode` prints it on stdout (its advice goes to stderr).
     let plugin = Command::new(VOX)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
         .args(["agent", "plugin", "opencode", "--node", NODE])
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot run vox agent plugin opencode: {e}"));
