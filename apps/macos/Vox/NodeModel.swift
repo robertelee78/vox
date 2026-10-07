@@ -503,14 +503,11 @@ final class NodeModel: ObservableObject {
     }
 
     /// Rename the room on screen: its one name, as every member sees it (ADR-028 R-1). Only its
-    /// creator or an admin may; the node's refusal is said as it comes.
-    func renameRoom(to name: String, passphrase secret: Secret) async -> Bool {
-        defer { secret.wipe() }
+    /// creator or an admin may; the node's refusal is said as it comes. No passphrase (K-11).
+    func renameRoom(to name: String) async -> Bool {
         guard let id = roomOnScreen else { return false }
         do {
-            let passphrase = try secret.passphrase()
-            defer { passphrase.wipe() }
-            try await client.renameRoom(room: id, name: name, identityPassphrase: passphrase)
+            try await client.renameRoom(room: id, name: name)
             did = "The room is now \(name) for every member."
             await refresh()
             return true

@@ -333,24 +333,21 @@ private struct RetentionSheet: View {
     }
 }
 
-/// Rename the room: its one name, as every member sees it, said before it is set (E-5); the
-/// identity passphrase always, as `vox room rename` asks it.
+/// Rename the room: its one name, as every member sees it, said before it is set (E-5); no
+/// passphrase (ADR-028 K-11), as `vox room rename` asks none.
 private struct RenameSheet: View {
     @ObservedObject var model: NodeModel
     @State private var name = ""
-    @State private var field = SecureFieldHolder()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Rename the room").heading()
-            TextField("Its new name", text: $name).accessibilityIdentifier("rename-name")
+            TextField("Its new name", text: $name).onSubmit { submit() }
+                .accessibilityIdentifier("rename-name")
             Text("Every member sees the new name, in their sidebar and in every address of the "
                 + "room's services. Only the room's creator or an admin may rename it.")
                 .secondaryText()
                 .accessibilityIdentifier("rename-effect")
-            Text("Your identity passphrase:").secondaryText()
-            SecureInput(holder: field) { submit() }.frame(width: 320)
-                .accessibilityIdentifier("rename-passphrase")
             if let said = model.said {
                 StateMark(kind: .danger, words: said).textSelection(.enabled)
                     .accessibilityIdentifier("rename-said")
@@ -367,9 +364,9 @@ private struct RenameSheet: View {
     }
 
     private func submit() {
-        guard let secret = field.take() else { return }
         let n = name.trimmingCharacters(in: .whitespaces)
-        Task { if await model.renameRoom(to: n, passphrase: secret) { model.sheet = nil } }
+        guard !n.isEmpty else { return }
+        Task { if await model.renameRoom(to: n) { model.sheet = nil } }
     }
 }
 
