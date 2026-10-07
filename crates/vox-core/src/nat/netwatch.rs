@@ -35,11 +35,39 @@ impl NetShape {
     pub async fn now() -> Self {
         Self {
             addrs: crate::nat::reachability::local_route_ips().await,
-            route_v4: crate::nat::portmap::gateway::default_gateway_v4().ok(),
+            route_v4: route_v4_now(),
             route_v6: crate::nat::portmap::gateway::default_gateway_v6()
                 .ok()
                 .map(|(ip, _)| ip),
         }
+    }
+}
+
+/// The IPv4 default route's next hop now, or the one a proof staged ([`TEST_ROUTE_V4_FILE_ENV`]).
+fn route_v4_now() -> Option<Ipv4Addr> {
+    #[cfg(feature = "test-knobs")]
+    if let Some(staged) = test_route_v4() {
+        return staged;
+    }
+    crate::nat::portmap::gateway::default_gateway_v4().ok()
+}
+
+/// **Test-only: the IPv4 default route's next hop, read from a file** (`VOX_TEST_ROUTE_V4_FILE`, in a
+/// build with the `test-knobs` feature; no shipped build reads it, V210-105). The file holds an
+/// address or `none`; writing it stages a move of the machine's default route through the node's
+/// own change path ([`NetWatch::settled`] wakes on it as on the operating system's event), with no
+/// privilege and no real interface touched.
+#[cfg(feature = "test-knobs")]
+pub const TEST_ROUTE_V4_FILE_ENV: &str = "VOX_TEST_ROUTE_V4_FILE";
+
+/// The route the [`TEST_ROUTE_V4_FILE_ENV`] file stages: `None` when the knob is not set (the real
+/// route is read), `Some(None)` for `none`.
+#[cfg(feature = "test-knobs")]
+fn test_route_v4() -> Option<Option<Ipv4Addr>> {
+    let text = std::fs::read_to_string(std::env::var_os(TEST_ROUTE_V4_FILE_ENV)?).ok()?;
+    match text.trim() {
+        "none" => Some(None),
+        ip => ip.parse().ok().map(Some),
     }
 }
 
@@ -157,6 +185,24 @@ impl NetWatch {
     /// the machine went quiet for [`NETWORK_SETTLE`], which it may not do for as long as that
     /// connection lasts: a move to another network was never noticed, and nothing was redialled.
     pub async fn settled(&mut self) -> std::io::Result<()> {
+        #[cfg(feature = "test-knobs")]
+        if std::env::var_os(TEST_ROUTE_V4_FILE_ENV).is_some() {
+            let seen = test_route_v4();
+            let staged = async {
+                while test_route_v4() == seen {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            return tokio::select! {
+                r = self.settled_os() => r,
+                () = staged => Ok(()),
+            };
+        }
+        self.settled_os().await
+    }
+
+    /// [`NetWatch::settled`] on the operating system's events alone.
+    async fn settled_os(&mut self) -> std::io::Result<()> {
         while !self.read_relevant().await? {}
         let mut quiet_from = tokio::time::Instant::now() + NETWORK_SETTLE;
         loop {
