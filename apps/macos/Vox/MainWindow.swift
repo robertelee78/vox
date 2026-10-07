@@ -117,6 +117,18 @@ private struct RoomRow: View {
 }
 
 /// The room on screen: its timeline and a field to post, with its members beside it.
+/// The timeline draws its own focus ring on the row the keyboard is on; the system's ring around
+/// the whole timeline is left out where SwiftUI can leave it out (macOS 14).
+private struct OwnFocusRing: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+        } else {
+            content
+        }
+    }
+}
+
 private struct RoomView: View {
     @ObservedObject var model: NodeModel
     let room: String
@@ -224,10 +236,21 @@ private struct RoomView: View {
                             // system's own ring around the whole timeline is not drawn as well.
                             .focusable()
                             .focused($timelineFocused)
-                            .focusEffectDisabled()
+                            .modifier(OwnFocusRing())
                             .onMoveCommand { direction in move(direction, scroller) }
-                            .onKeyPress(.return) { openSelected() ? .handled : .ignored }
-                            .onKeyPress(.space) { lookSelected() ? .handled : .ignored }
+                            // Return and Space while the timeline holds the keyboard, as buttons
+                            // with keys (onKeyPress is macOS 14 only); off when it does not, so
+                            // the composer still types a space.
+                            .background {
+                                Button("") { _ = openSelected() }
+                                    .keyboardShortcut(.return, modifiers: [])
+                                    .disabled(!timelineFocused)
+                                    .hidden()
+                                Button("") { _ = lookSelected() }
+                                    .keyboardShortcut(.space, modifiers: [])
+                                    .disabled(!timelineFocused)
+                                    .hidden()
+                            }
                             .onReceive(NotificationCenter.default.publisher(for: .voxFocusTimeline)) { _ in
                                 timelineFocused = true
                                 if model.selectedMessage == nil, let last = model.messages.last {
