@@ -4121,6 +4121,15 @@ impl ChannelState {
         crate::node::retention::shortest(self.room_retention(), self.node_retention)
     }
 
+    /// `(this node's own retention, the room's)` when the node's own asks to keep messages longer
+    /// than the room does (V030-32): ignored, since a member may keep less than its room, never
+    /// more. `None` otherwise.
+    #[must_use]
+    pub fn retention_above_room(&self) -> Option<(u64, u64)> {
+        let (node, room) = (self.node_retention, self.room_retention());
+        (node != 0 && room != 0 && node > room).then_some((node, room))
+    }
+
     /// Set this node's own retention for the room (from its config; `0` = no node limit).
     /// Takes effect at the next [`ChannelState::sweep_retention`].
     pub fn set_node_retention(&mut self, secs: u64) {

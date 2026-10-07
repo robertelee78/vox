@@ -482,16 +482,26 @@ fn r7_only_the_admin_changes_retention_later_and_it_reaches_what_every_member_ho
 
     // ---- carol's file asked for longer than the room: ignored, and her node says so -----
     // The presets above already showed carol reporting the room's value each time. What a person
-    // running her node reads is the warning on its output.
-    let carol_said = std::fs::read_to_string(carol.join("daemon-carol.err")).unwrap_or_default();
+    // running her node reads is the warning on its output: said once she is in a room that keeps
+    // less, so within seconds of her reporting the room's value, not at the instant she does.
+    let waiting = Instant::now();
+    let carol_said = loop {
+        let said = std::fs::read_to_string(carol.join("daemon-carol.err")).unwrap_or_default();
+        if said.contains("longer than the room keeps it") || waiting.elapsed().as_secs() >= 10 {
+            break said;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     println!(
-        "R7: carol's node, whose file asks for 60 days: warned = {}",
-        carol_said.contains("longer than the room keeps it")
+        "R7: carol's node, whose file asks for 60 days: warned = {} ({:?} after she reported the \
+         room's 1 week)",
+        carol_said.contains("longer than the room keeps it"),
+        waiting.elapsed()
     );
     assert!(
         carol_said.contains("longer than the room keeps it"),
         "PRODUCT: carol's node file asks for longer than the room keeps messages; it is ignored, \
-         and her node must say so. Her daemon said:\n{carol_said}"
+         and her node must say so within 10 s. Her daemon said:\n{carol_said}"
     );
 
     // ---- a member who is not the admin never keeps longer than the room -------------------
