@@ -329,6 +329,51 @@ pub fn render(lines: &[Line], details: bool) -> String {
     s
 }
 
+/// The entries of the Session `id` of `node` among a room's Session entries, in the order they were
+/// written: the session node's own, and the drive entries that name the session; each author's
+/// send time, and within one moment the session node's own numbering (a split entry's parts share
+/// a millisecond).
+#[must_use]
+pub fn of_session(rows: Vec<SessionRow>, id: &str, node: &Digest32) -> Vec<SessionRow> {
+    let field = |r: &SessionRow, k: &str| {
+        serde_json::from_str::<Value>(&r.body)
+            .ok()
+            .and_then(|v| v.get(k).cloned())
+    };
+    let mut mine: Vec<SessionRow> = rows
+        .into_iter()
+        .filter(|r| {
+            r.session_id == id
+                && (r.author == *node
+                    || field(r, "kind").as_ref().and_then(Value::as_str) == Some("drive"))
+        })
+        .collect();
+    mine.sort_by_key(|r| {
+        (
+            r.created_millis,
+            field(r, "seq")
+                .as_ref()
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+    });
+    mine
+}
+
+/// One Session's lines, each with its Details as plain lines, named as this node names its members:
+/// what `vox room session --details` prints, for the TUI to draw the same words (CL-1). `rows` are
+/// the Session's entries, in order; `label` its label.
+#[must_use]
+pub fn drawn(rows: &[SessionRow], label: &str) -> Vec<(String, Vec<String>)> {
+    lines(rows, label, &ByIdent)
+        .into_iter()
+        .map(|l| {
+            let details = crate::session_drive_ui::details(&l.details);
+            (l.text, details)
+        })
+        .collect()
+}
+
 /// How this command names nodes: the names this node gave them ([`crate::ident`]).
 struct ByIdent;
 
@@ -433,20 +478,7 @@ pub async fn show(
                 )
             }
         };
-    // The Session's own entries are its node's; a driver's entries name the session too.
-    let mut mine: Vec<SessionRow> = rows
-        .into_iter()
-        .filter(|r| r.session_id == id && (r.author == node || kind(r) == "drive"))
-        .collect();
-    // In the order the entries were written: each author's send time, and within one moment the
-    // session node's own numbering (a split entry's parts share a millisecond).
-    let seq = |r: &SessionRow| {
-        serde_json::from_str::<Value>(&r.body)
-            .ok()
-            .and_then(|v| v.get("seq").and_then(Value::as_u64))
-            .unwrap_or(0)
-    };
-    mine.sort_by_key(|r| (r.created_millis, seq(r)));
+    let mine = of_session(rows, &id, &node);
     use std::io::Write as _;
     // A member without drive holds the entries but cannot open them (SC-2, SC-3): it is told whose
     // trust it lacks, never shown an empty Session.
