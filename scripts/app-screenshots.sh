@@ -105,6 +105,16 @@ printf 'Shopping: leeks, potatoes, cream, bread.\n' >"$DEMO/shopping-list.txt"
 "$VOX" share --node ben "$ROOM" "$DEMO/shopping-list.txt" --to "$ANN" -m "the list for Saturday" >/dev/null
 "$VOX" share --node ben "$ROOM" "$DEMO/hike.png" -m "the view from Sunday's hike" >/dev/null
 "$VOX" room post --node ann "$ROOM" "The soup: http://$PAGE_AT/recipe.html" >/dev/null
+printf 'Leeks, potatoes, stock, cream. Forty minutes.\n' >"$DEMO/soup-recipe.txt"
+"$VOX" share --node ann "$ROOM" "$DEMO/soup-recipe.txt" --to "$BEN" -m "the recipe, for Saturday" >/dev/null
+# ben collects it, so ann's view says who pulled it; the render waits until ann's node says so.
+for i in $(seq 1 30); do
+    "$VOX" room get --node ben "$ROOM" soup-recipe.txt >/dev/null 2>&1 &&
+        "$VOX" room read --node ann "$ROOM" 2>/dev/null | grep -q "pulled by" && break
+    sleep 1
+done
+"$VOX" room read --node ann "$ROOM" | grep -q "pulled by" ||
+    { echo "APPARATUS: ben's pull of soup-recipe.txt never showed as pulled by in ann's room read" >&2; exit 1; }
 # The agent's own session, named here: a claim is owned per session.
 VOX_SESSION=builder-demo "$VOX" room claim --node builder "$ROOM" photo-album >/dev/null
 VOX_SESSION=builder-demo "$VOX" room post --node builder --type working "$ROOM" \

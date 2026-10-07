@@ -25,6 +25,13 @@ func settle(_ seconds: Double) {
     RunLoop.main.run(until: Date().addingTimeInterval(seconds))
 }
 
+/// Let the model's own tasks run for `seconds`: its room loop (who read, who pulled) runs on the
+/// main actor, which a run loop spun inside this task would hold the whole time.
+@MainActor
+func wait(_ seconds: Double) async {
+    try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+}
+
 /// Draw `view` at `size` in a window that is never shown, and write it to `name`.png.
 @MainActor
 func render<V: View>(_ view: V, _ name: String, size: CGSize = CGSize(width: 1280, height: 800)) throws {
@@ -53,19 +60,19 @@ Task { @MainActor in
         let me = try await client.attach(node: nodeName, passphrase: nil)
         let model = NodeModel(client: client, node: nodeName, me: me, notify: false)
         await model.start()
-        settle(2)
+        await wait(2)
         guard let room = model.rooms.first(where: { $0.name == roomName }) else {
             throw NSError(domain: "VoxScreens", code: 3,
                           userInfo: [NSLocalizedDescriptionKey: "the demo node holds no room \(roomName)"])
         }
         await model.show(.room(room.id))
-        settle(3)
+        await wait(3)
         try render(MainWindow(model: model), "main-window")
         await model.show(.keyring)
-        settle(1)
+        await wait(1)
         try render(MainWindow(model: model), "keyring")
         await model.show(.decisions)
-        settle(4)
+        await wait(4)
         try render(MainWindow(model: model), "decision-record")
         await client.close()
         exit(0)
