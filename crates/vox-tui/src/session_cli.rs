@@ -334,7 +334,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
 /// `lines` as the terminal prints them; with `details`, each entry's full input and output
 /// indented under its line.
 #[must_use]
-pub fn render(lines: &[Line], details: bool) -> String {
+///
+/// `answer_with` is the command that drives this Session (`vox room session ROOM SESSION`): each
+/// request still waiting for an answer is followed by the command that gives it, with its ref.
+pub fn render(lines: &[Line], details: bool, answer_with: &str) -> String {
     let mut s = String::new();
     for l in lines {
         s.push_str(&l.text);
@@ -344,10 +347,10 @@ pub fn render(lines: &[Line], details: bool) -> String {
         match (l.waiting, l.reference.as_str()) {
             (_, "") | (None, _) => {}
             (Some(Waiting::Approval), r) => s.push_str(&format!(
-                "    waiting: approve with --approve {r}, or reject with --reject {r}\n"
+                "    waiting: {answer_with} --approve {r}, or --reject {r}\n"
             )),
             (Some(Waiting::Question), r) => s.push_str(&format!(
-                "    waiting: answer with --answer {r} \"<question>=<answer>\"\n"
+                "    waiting: {answer_with} --answer {r} \"<question>=<answer>\"\n"
             )),
         }
         if details {
@@ -516,7 +519,8 @@ pub async fn show(
         }
     } else {
         let _ = writeln!(out, "{label} · {state}");
-        let _ = write!(out, "{}", render(&drawn, details));
+        let answer_with = format!("vox room session {} {id}", room.trim());
+        let _ = write!(out, "{}", render(&drawn, details, &answer_with));
     }
     Ok(())
 }
