@@ -12,7 +12,7 @@ struct MainWindow: View {
         VStack(spacing: 0) {
             NavigationSplitView {
                 Sidebar(model: model)
-                    .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+                    .navigationSplitViewColumnWidth(min: Theme.scaled(220), ideal: Theme.scaled(260))
             } detail: {
                 switch model.selection {
                 case let .room(id):
@@ -260,7 +260,7 @@ private struct RoomView: View {
             }
             Divider()
             Inspector(model: model, room: room)
-                .frame(width: 240)
+                .frame(width: Theme.scaled(240))
         }
         // On the room, not its timeline: ⌘O, ⌘↩ and a file from the Finder Services item work
         // wherever the room's focus is.
@@ -314,7 +314,7 @@ private struct RoomView: View {
             .accessibilityIdentifier("attach")
             TextField("Say something to the room", text: $draft)
                 .textFieldStyle(.plain)
-                .frame(minWidth: 160, maxWidth: .infinity)
+                .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                 .layoutPriority(1)
                 .onSubmit { send(urgent: urgent) }
                 .accessibilityIdentifier("compose")

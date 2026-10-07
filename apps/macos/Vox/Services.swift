@@ -117,7 +117,7 @@ private struct SharedServiceBox: View {
             Text("by \(service.by) in \(room)  ·  \(service.kind)").caption().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
                 HStack(alignment: .firstTextBaseline) {
-                    Text(command.what).eyebrow().secondaryText().frame(width: 56, alignment: .leading)
+                    Text(command.what).eyebrow().secondaryText().frame(width: Theme.scaled(56), alignment: .leading)
                     Text(command.command.replacingOccurrences(of: service.canonical, with: service.address))
                         .font(Theme.mono).lineLimit(1).truncationMode(.middle)
                     Spacer()

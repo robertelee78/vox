@@ -62,7 +62,7 @@ struct AttachSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 }
 

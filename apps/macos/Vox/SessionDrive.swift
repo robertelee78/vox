@@ -61,7 +61,7 @@ struct SessionComposer: View {
                 .accessibilityIdentifier("session-attach")
                 TextField("Composer — to \(session.label)", text: $draft)
                     .textFieldStyle(.plain)
-                    .frame(minWidth: 160, maxWidth: .infinity)
+                    .frame(minWidth: Theme.scaled(160), maxWidth: .infinity)
                     .layoutPriority(1)
                     .onSubmit(send)
                     .accessibilityIdentifier("session-compose")
@@ -148,7 +148,7 @@ struct RequestView: View {
             .accessibilityIdentifier("request-reject-\(request.reference)")
             TextField("Why (optional, told to the model)", text: $why)
                 .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 260)
+                .frame(maxWidth: Theme.scaled(260))
                 .accessibilityIdentifier("request-why-\(request.reference)")
         }
     }

@@ -17,6 +17,10 @@ struct VoxApp: App {
     var body: some Scene {
         Window("Vox", id: "main") {
             RootView(model: model)
+                // Every view's text in the app's face and size; drawn again when the size
+                // changes (View > Bigger, Smaller, Actual Size).
+                .font(Theme.text)
+                .id(model.textScale)
                 // The sidebar (260) and the inspector (240) leave the room 400 or more: room
                 // for the composer's field beside its To: and Urgent controls.
                 .frame(minWidth: 900, minHeight: 360)
@@ -29,6 +33,8 @@ struct VoxApp: App {
                      isInserted: Binding(get: { model.menuBar },
                                          set: { model.showMenuBar($0) })) {
             MenuBarContent(app: model)
+                .font(Theme.text)
+                .id(model.textScale)
                 .preferredColorScheme(.dark)
         }
         .menuBarExtraStyle(.window)

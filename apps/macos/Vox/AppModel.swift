@@ -40,6 +40,16 @@ final class AppModel: ObservableObject {
     }
     /// Whether the menu bar extra is shown: off until the person turns it on (M-22).
     @Published private(set) var menuBar = MenuBarChoice.on()
+    /// The app's text size (Theme.scale): the window is drawn again when it changes.
+    @Published private(set) var textScale = Theme.scale
+
+    /// Step the app's text size `by` sizes (+1 Bigger, -1 Smaller), or back to Actual Size (0).
+    func stepTextSize(_ by: Int) {
+        let i = Theme.scales.firstIndex(of: Theme.scale) ?? 1
+        let next = by == 0 ? 1 : Theme.scales[max(0, min(Theme.scales.count - 1, i + by))]
+        UserDefaults.standard.set(next, forKey: Theme.scaleKey)
+        textScale = next
+    }
 
     /// Show or hide the menu bar extra, and keep the choice. Setting the value it already has does
     /// nothing: SwiftUI sets a MenuBarExtra's `isInserted` on its updates, and a change notice for

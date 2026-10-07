@@ -91,6 +91,10 @@ extension VoxAction {
             VoxAction("View", "Decision Record", "d", [.command, .shift], enabled: live) {
                 Task { await node?.show(.decisions) }
             },
+            // The app's own text size (WCAG 1.4.4): macOS has none for the whole system.
+            VoxAction("View", "Bigger", "+") { AppModel.shared.stepTextSize(1) },
+            VoxAction("View", "Smaller", "-") { AppModel.shared.stepTextSize(-1) },
+            VoxAction("View", "Actual Size", "0") { AppModel.shared.stepTextSize(0) },
         ] + digits
     }
 }
@@ -182,7 +186,7 @@ struct Palette: View {
             .frame(height: 280)
         }
         .padding(16)
-        .frame(width: 420)
+        .frame(width: Theme.scaled(420))
     }
 
     private func done(_ action: VoxAction) {
@@ -231,7 +235,7 @@ private struct RoomForm: View {
             }
             Text(joining ? "The room's passphrase, sent to you another way than its link."
                 : "A passphrase for the room: send it another way than its link.").secondaryText()
-            SecureInput(holder: field) { submit() }.frame(width: 320)
+            SecureInput(holder: field) { submit() }.frame(width: Theme.scaled(320))
                 .accessibilityIdentifier("room-form-passphrase")
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             HStack {
@@ -242,7 +246,7 @@ private struct RoomForm: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 
     private func submit() {
@@ -324,7 +328,7 @@ private struct RetentionSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 
     private func submit() {
@@ -360,7 +364,7 @@ private struct RenameSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 
     private func submit() {
@@ -396,7 +400,7 @@ private struct AdminsSheet: View {
             Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
         .task { admins = await model.admins() }
     }
 }
@@ -426,6 +430,6 @@ private struct LeaveSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 440)
+        .frame(width: Theme.scaled(440))
     }
 }

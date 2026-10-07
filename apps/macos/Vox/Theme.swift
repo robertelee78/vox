@@ -29,6 +29,19 @@ enum Theme {
     /// A heading's size when the token file gives none.
     static let headingSize = 28.0
 
+    /// The app's text size, a multiple of Actual Size (View > Bigger, Smaller, Actual Size): every
+    /// face the app draws scales by it, to twice its size (WCAG 2.1 1.4.4). macOS has no app-wide
+    /// text size, so the app keeps its own, on this Mac.
+    static var scale: Double {
+        let kept = UserDefaults.standard.double(forKey: scaleKey)
+        return scales.contains(kept) ? kept : 1
+    }
+    static let scaleKey = "textScale"
+    /// A width that holds text, at the app's text size.
+    static func scaled(_ points: CGFloat) -> CGFloat { points * CGFloat(scale) }
+    /// The sizes Bigger and Smaller step through.
+    static let scales: [Double] = [0.85, 1, 1.15, 1.3, 1.5, 1.75, 2]
+
     /// `face` as a font. A bundled face scales with `relativeTo`; a system face that names a text
     /// style is that style; a size the token file gives is kept as it is.
     static func font(_ face: VoxTokens.Face, defaultSize: Double? = nil,
@@ -37,13 +50,27 @@ enum Theme {
         if let bundled = face.bundled, registered(bundled) {
             // A bundled file is one face: it is named by its PostScript name, the file's name.
             let postScript = (bundled as NSString).deletingPathExtension
-            return .custom(postScript, size: face.size ?? defaultSize ?? 13, relativeTo: relativeTo)
+            return .custom(postScript, size: (face.size ?? defaultSize ?? 13) * scale,
+                           relativeTo: relativeTo)
         }
         let design: Font.Design = face.system == "monospaced" ? .monospaced : .default
-        if let size = face.size ?? defaultSize {
-            return .system(size: size, weight: weight, design: design)
+        let size = face.size ?? defaultSize ?? points(textStyle(face.system) ?? relativeTo)
+        return .system(size: size * scale, weight: weight, design: design)
+    }
+
+    /// macOS's size for a text style at Actual Size, in points.
+    static func points(_ style: Font.TextStyle) -> Double {
+        switch style {
+        case .largeTitle: return 26
+        case .title: return 22
+        case .title2: return 17
+        case .title3: return 15
+        case .headline, .body: return 13
+        case .callout: return 12
+        case .subheadline: return 11
+        case .footnote, .caption, .caption2: return 10
+        @unknown default: return 13
         }
-        return .system(textStyle(face.system) ?? relativeTo, design: design).weight(weight)
     }
 
     /// The text style a token's system role names, if it names one.
@@ -140,8 +167,9 @@ private struct CardOutline: ViewModifier {
     }
 }
 
-/// A selected row or card: drawn on bg.overlay, outlined in the focus accent under Increase
-/// Contrast (L-3, L-5), and said to be selected.
+/// A selected row or card: drawn on bg.overlay with a bar in the accent at its leading edge, so
+/// it is marked by more than its colour (WCAG 1.4.1, 1.4.11); outlined in the accent too under
+/// Increase Contrast (L-3, L-5); and said to be selected.
 private struct SelectionMark: ViewModifier {
     let selected: Bool
     @Environment(\.colorSchemeContrast) private var contrast
@@ -149,6 +177,11 @@ private struct SelectionMark: ViewModifier {
     func body(content: Content) -> some View {
         content
             .background(selected ? VoxTokens.Colors.bgOverlay : Color.clear)
+            .overlay(alignment: .leading) {
+                if selected {
+                    Rectangle().fill(VoxTokens.Colors.accent).frame(width: 2)
+                }
+            }
             .overlay {
                 if selected && contrast == .increased {
                     RoundedRectangle(cornerRadius: 4).stroke(VoxTokens.Colors.accent)
@@ -166,7 +199,7 @@ extension View {
     func eyebrow() -> some View {
         let face = VoxTokens.Fonts.appEyebrow
         return modifier(Typeset(face: face, font: Theme.eyebrow,
-                                size: face.size ?? NSFont.systemFontSize))
+                                size: (face.size ?? NSFont.systemFontSize) * Theme.scale))
     }
 
     /// The eyebrow's face, size and tracking, never its case: for what carries a name, a link or
@@ -175,14 +208,15 @@ extension View {
     func caption() -> some View {
         let face = VoxTokens.Fonts.appEyebrow
         return modifier(Typeset(face: face, font: Theme.eyebrow,
-                                size: face.size ?? NSFont.systemFontSize, keepCase: true))
+                                size: (face.size ?? NSFont.systemFontSize) * Theme.scale,
+                                keepCase: true))
     }
 
     /// A large heading, in the token file's face and tracking (L-7).
     func heading() -> some View {
         let face = VoxTokens.Fonts.appHeading
         return modifier(Typeset(face: face, font: Theme.heading,
-                                size: face.size ?? Theme.headingSize))
+                                size: (face.size ?? Theme.headingSize) * Theme.scale))
     }
 
     /// Outline a card (L-5).
