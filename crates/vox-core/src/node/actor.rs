@@ -6251,7 +6251,7 @@ impl Node {
         let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
             return;
         };
-        let (anchors, own, members) = {
+        let (anchors, own, members, settled) = {
             let mut channel = shared.lock().await;
             if let Some(profile) = self.profile.as_ref() {
                 let mut add = self.anchors.clone();
@@ -6271,7 +6271,7 @@ impl Node {
                     let _ = own.add(n.clone());
                 }
             }
-            (channel.anchors().clone(), own, members)
+            (channel.anchors().clone(), own, members, channel.is_settled())
         };
         self.room_anchors.insert(*channel_id, own);
         let Some(net) = self.net.as_ref().map(Arc::clone) else {
@@ -6290,9 +6290,11 @@ impl Node {
         }
         // **A member the room's address names is reached as a member** (V030-51): left out of the
         // anchors' dial above, it must still be dialled, through the member ladder, which asks a
-        // relay when it must. Nothing else dials it after a restart: a room with an anchor is
-        // left to its board (`reach_members_of`), and the board need not name it.
-        for member in members {
+        // relay when it must. Nothing else dials it when a room that has synced is opened again
+        // (a restart): a room with an anchor is left to its board (`reach_members_of`), and the
+        // board need not name it. A room not yet synced reaches every member already
+        // (`reach_members_of`), and a dial here would race the joiner's own.
+        for member in members.into_iter().filter(|_| settled) {
             if member != net.local_id() && net.manager().existing(&member).is_none() {
                 let _ = self.reach_member(channel_id, member, false).await;
             }
