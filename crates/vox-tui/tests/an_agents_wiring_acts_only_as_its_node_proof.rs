@@ -340,6 +340,17 @@ fn setup_makes_a_node_for_each_installed_harness() {
     );
 
     let mut setup = Setup::spawn(&d, &path);
+    // ---- Codex is said not found, and offered nothing ----
+    // Read before anything is answered: what it found is said first, and a question for Codex
+    // would come before OpenCode's.
+    setup.answer("wire Claude Code to it?", 1, "");
+    let found = setup.said();
+    assert!(
+        found
+            .lines()
+            .any(|l| l.trim_start().starts_with("Codex") && l.contains("not found")),
+        "PRODUCT: `vox setup` must say Codex, which is not on PATH, is not found:\n{found}"
+    );
     setup.answer("wire Claude Code to it?", 1, "\r");
     setup.answer("passphrase for claude-", 1, "claude passphrase\r");
     setup.answer("again:", 1, "claude passphrase\r");
@@ -358,12 +369,9 @@ fn setup_makes_a_node_for_each_installed_harness() {
         "PRODUCT: `vox setup` failed ({status:?}):\n{said}"
     );
 
-    // ---- Codex is said not found, and offered nothing ----
     assert!(
-        said.lines()
-            .any(|l| l.trim_start().starts_with("Codex") && l.contains("not found"))
-            && !said.contains("wire Codex"),
-        "PRODUCT: `vox setup` must say Codex is not found and offer it nothing:\n{said}"
+        !said.contains("wire Codex"),
+        "PRODUCT: `vox setup` must offer Codex, which is not installed, nothing:\n{said}"
     );
 
     // ---- exactly the two nodes ----
