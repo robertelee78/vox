@@ -9,6 +9,21 @@
 //!    in the room's timeline (`vox room read`).
 //!    `vox room sessions --json` says so too: alice's Session is listed for both, `can_drive`
 //!    true for bob and false for carol.
+//! 3. **A file out of a Session reaches only drive** (DR-1.8, #546). Alice's session runs
+//!    `vox agent send`: bob's node pulls the file by itself, byte for byte, into its files
+//!    directory; carol's pulls nothing. Carol, given the share's tag by a member that has it (an
+//!    apparatus attacker reading bob's Session), forwards to alice's service and asks for it
+//!    herself: refused (403), though alice's node trusts her.
+//! 4. **A file into a Session comes only from drive** (DR-1.7, #546). Bob runs `vox room session
+//!    ROOM SESSION --file PATH --note …`: alice's node answers that it is pulling it, the file lands
+//!    in alice's files directory byte for byte, and the Session shows it come in, as bob reads it.
+//!    Carol, read only, sending a file the same way is refused by alice's node, and nothing of
+//!    hers lands there. A file larger than alice's disk can take past its reserve is refused when
+//!    it is offered, before anything is pulled (ADR-028 F-3: a pull never fills the disk): bob's
+//!    node, as an apparatus attacker, sends a drive request naming a petabyte. That the session is
+//!    then told the path is not asserted here: alice's
+//!    session has no terminal in this proof (its hook runs with no tmux of anyone's), so the told
+//!    line is proved in the tmux proof's own scratch server (a_claude_session_is_mirrored…, arm 11).
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
 //!    Bob's node opens none of the entries alice's Session writes afterwards, while it still holds
 //!    the ones it read before and still reads alice's messages to the room; and its
@@ -35,6 +50,12 @@
 //! - **`can_drive` always true** (claims 1 and 2): `sessions::fold` in
 //!   `crates/vox-core/src/node/sessions.rs` sets it true. Carol's listing says she can drive:
 //!   red PRODUCT.
+//! - **A Session's file served to any trusted member** (claim 3): `Witness::allowed` in
+//!   `crates/vox-core/src/node/shares.rs` lets anyone in. Carol is served the file: red PRODUCT.
+//! - **A driven file taken without checking drive** (claim 4): the DR-2 check in `drive` in
+//!   `crates/vox-tui/src/host.rs` is removed. Carol's file lands on alice's node: red PRODUCT.
+//! - **A driven file's size not checked** (claim 4): `short_of_space` is not asked in `drive`'s
+//!   file arm in `crates/vox-tui/src/host.rs`. The petabyte is accepted: red PRODUCT.
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
@@ -61,21 +82,42 @@ const SESSION: &str = "3f0c25bf-1d2e-4c5b-9a8f-session-proof";
 /// How many entries alice's Session writes before, and after, bob's downgrade.
 const ENTRIES: usize = 3;
 
-/// What a harness puts in a hook's environment: cleared from every `vox` here, so none of the
-/// harness this proof itself may run under reaches it.
-const HARNESS_VARS: &[&str] = &[
-    "VOX_SESSION",
-    "VOX_ROOM",
-    "VOX_AGENT_NAME",
-    "VOX_HARNESS",
-    "VOX_NODE",
-    "VOX_ANCHORS",
-    "VOX_LISTEN",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "OPENCODE_SERVER_URL",
-];
+/// `vox` with none of the environment of whatever runs this proof: above all no `TMUX*` (a staged
+/// hook inheriting the operator's tmux binds its session to the operator's own pane, and a drive is
+/// typed there), `CLAUDE*`, `CODEX*`, `OPENCODE*` or `VOX_*`. Walked from the environment itself,
+/// not a fixed list, so a variable a harness adds later is cleared too.
+fn vox_cmd() -> Command {
+    let mut cmd = Command::new(VOX);
+    // A clean environment: every variable this process has is removed by name except this
+    // whitelist of what any program needs, so nothing of a harness, a terminal or the operator's
+    // own vox reaches it. By name, not `env_clear`: a keyring change is run through `typed`, which
+    // copies a command's named variables and removals, and a removal made after `env_clear` is not
+    // recorded as one.
+    const PASS: [&str; 7] = [
+        "HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL",
+    ];
+    for (k, _) in std::env::vars_os() {
+        if !PASS.iter().any(|p| k == *p) {
+            cmd.env_remove(&k);
+        }
+    }
+    // A daemon this starts never takes port 1080.
+    cmd.env("VOX_PROXY", "127.0.0.1:0");
+    // **Checked, not trusted**: every such variable in this process's environment is removed from
+    // the child's, or nothing runs. A staged hook given a pane would bind a real terminal.
+    let removed: std::collections::BTreeSet<_> = cmd
+        .get_envs()
+        .filter(|(_, v)| v.is_none())
+        .map(|(k, _)| k.to_owned())
+        .collect();
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if (name.starts_with("TMUX") || name.starts_with("CLAUDE")) && !removed.contains(&k) {
+            panic!("APPARATUS: {name} would reach a vox this proof starts; nothing is run");
+        }
+    }
+    cmd
+}
 
 /// A child killed and reaped by its own PID when dropped — never by pattern.
 struct Proc(Child);
@@ -106,10 +148,7 @@ impl Member {
         stdin: Option<&str>,
         env: &[(&str, &str)],
     ) -> (bool, String, String) {
-        let mut cmd = Command::new(VOX);
-        for v in HARNESS_VARS {
-            cmd.env_remove(v);
-        }
+        let mut cmd = vox_cmd();
         // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
         // K-13): the passphrase file's first line, typed at the prompt.
         if typed::is_keyring_change(args) {
@@ -239,7 +278,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     );
     let err = std::fs::File::create(tmp.join(format!("{name}.daemon.err")))
         .expect("APPARATUS: create a log file");
-    let child = Command::new(VOX)
+    let child = vox_cmd()
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
         .arg(&m.pass)
@@ -268,7 +307,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
     std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging dir");
     let out = tmp.join("anchor.out");
     let p = Proc(
-        Command::new(VOX)
+        vox_cmd()
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
@@ -385,6 +424,49 @@ fn opened(m: &Member, room: &str) -> Vec<String> {
                 .map(str::to_owned)
         })
         .collect()
+}
+
+/// The file `name` in `m`'s files directory for the room, if it has landed (ADR-028 F-4).
+fn landed(m: &Member, room: &[u8; 32], name: &str) -> Option<Vec<u8>> {
+    let dir = m
+        .data
+        .join("nodes")
+        .join("default")
+        .join("files")
+        .join(vox_core::node::link::b32_encode(room));
+    std::fs::read(dir.join(name)).ok()
+}
+
+/// Ask `m`'s node to forward to `host`'s service `tag` and GET it: the HTTP status line it
+/// answers, or why there was no answer.
+fn fetch_as(
+    rt: &tokio::runtime::Runtime,
+    m: &Member,
+    room: [u8; 32],
+    host: [u8; 32],
+    tag: &str,
+) -> Result<String, String> {
+    use std::io::{Read as _, Write as _};
+    // The forward lives as long as the connection that asked for it: held until the fetch ends.
+    let mut client = m.socket(rt);
+    let bound = match rt.block_on(client.request(&Request::Forward {
+        channel_id: room,
+        host,
+        service_tag: tag.to_owned(),
+        local: "127.0.0.1:0".into(),
+    })) {
+        Ok(Frame::Bound { local }) => local,
+        other => return Err(format!("no forward: {other:?}")),
+    };
+    let mut s = std::net::TcpStream::connect(&bound).map_err(|e| format!("connect: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+    s.write_all(b"GET / HTTP/1.1\r\nHost: share\r\nConnection: close\r\n\r\n")
+        .map_err(|e| format!("send: {e}"))?;
+    let mut got = Vec::new();
+    let _ = s.read_to_end(&mut got);
+    drop(client);
+    let head = String::from_utf8_lossy(&got);
+    Ok(head.lines().next().unwrap_or_default().to_owned())
 }
 
 /// How many entries `m`'s node holds in the room, as `vox status --json` counts them.
@@ -508,6 +590,188 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         !timeline_bob.contains("BEFORE-DOWNGRADE") && !timeline_carol.contains("BEFORE-DOWNGRADE"),
         "PRODUCT: Session activity must not show in the room's timeline (SC-4): bob's read: \
          {timeline_bob}\ncarol's read: {timeline_carol}"
+    );
+
+    // ---- claim 3: alice's session sends a file out of its Session; it reaches bob alone ----
+    let file = tmp.path().join("for-drive.bin");
+    let bytes: Vec<u8> = (0..120_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    std::fs::write(&file, &bytes).expect("APPARATUS: write the file to send");
+    let (ok, o, e) = alice.vox_with(
+        &[
+            "agent",
+            "send",
+            file.to_str().expect("APPARATUS: a UTF-8 temp path"),
+            "--note",
+            "the numbers",
+            "--node",
+            "default",
+            "--session",
+            SESSION,
+        ],
+        None,
+        &[],
+    );
+    assert!(ok, "PRODUCT: `vox agent send` failed: {o}{e}");
+    let bob_got = until(Duration::from_secs(120), || {
+        landed(&bob, &id, "for-drive.bin").as_deref() == Some(&bytes[..])
+    });
+    // The tag, as a member with drive reads it in the Session: what an attacker would be handed.
+    let tag = match rt.block_on(
+        bob.socket(&rt)
+            .request(&Request::SessionEntries { channel_id: id }),
+    ) {
+        Ok(Frame::SessionEntries { rows }) => rows
+            .iter()
+            .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+            .find(|v| v["kind"] == "file" && v["name"] == "for-drive.bin")
+            .and_then(|v| v["tag"].as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        other => panic!("APPARATUS: bob's Session entries: {other:?}"),
+    };
+    // Five seconds more for carol's node, as long as bob's had.
+    std::thread::sleep(Duration::from_secs(5));
+    let carol_landed = landed(&carol, &id, "for-drive.bin").is_some();
+    let alice_fp: [u8; 32] = vox_core::node::link::b32_decode(&alice.fp, "alice")
+        .expect("APPARATUS: alice's fingerprint");
+    let carol_fetch = if tag.is_empty() {
+        Err("no tag".to_owned())
+    } else {
+        fetch_as(&rt, &carol, id, alice_fp, &tag)
+    };
+    eprintln!(
+        "[proof] claim 3: bob pulled it: {bob_got}; carol's node pulled it: {carol_landed}; \
+         carol asking by tag {tag:?}: {carol_fetch:?}"
+    );
+    assert!(
+        bob_got,
+        "PRODUCT: bob, whom alice trusts with drive, must pull the file her session sent out of its \
+         Session, byte for byte"
+    );
+    assert!(
+        !tag.is_empty(),
+        "PRODUCT: bob's Session must carry the file's entry with its tag"
+    );
+    assert!(
+        !carol_landed,
+        "PRODUCT: carol, read only, must not get a file sent out of alice's Session"
+    );
+    let status = carol_fetch.unwrap_or_else(|e| {
+        panic!("CANNOT MEASURE (apparatus): carol's forward to alice's share was not made: {e}")
+    });
+    assert!(
+        status.contains("403"),
+        "PRODUCT: alice's node must refuse carol the Session's file though she asks by its tag: it \
+         answered {status:?}"
+    );
+
+    // ---- claim 4: bob drives a file into alice's Session; carol, read only, cannot ----
+    let into = tmp.path().join("for-session.bin");
+    let into_bytes: Vec<u8> = (0..90_000u32).map(|i| (i * 17 % 241) as u8).collect();
+    std::fs::write(&into, &into_bytes).expect("APPARATUS: write the file to drive in");
+    let (bob_ok, bob_said, bob_err) = bob.vox(
+        &[
+            "room",
+            "session",
+            &room,
+            SESSION,
+            "--file",
+            into.to_str().expect("APPARATUS: a UTF-8 temp path"),
+            "--note",
+            "for your review",
+        ],
+        None,
+    );
+    let alice_got = until(Duration::from_secs(120), || {
+        landed(&alice, &id, "for-session.bin").as_deref() == Some(&into_bytes[..])
+    });
+    let came_in = until(Duration::from_secs(60), || {
+        let (_, out, _) = bob.vox(&["room", "session", &room, SESSION, "--json"], None);
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| {
+                v["kind"] == "file"
+                    && v["line"]
+                        .as_str()
+                        .is_some_and(|l| l.starts_with("file to ") && l.contains("for-session.bin"))
+            })
+    });
+    let carol_file = tmp.path().join("from-carol.bin");
+    std::fs::write(&carol_file, b"carol has read only").expect("APPARATUS: write carol's file");
+    let (carol_ok, carol_said, carol_err) = carol.vox(
+        &[
+            "room",
+            "session",
+            &room,
+            SESSION,
+            "--file",
+            carol_file.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ],
+        None,
+    );
+    // As long as alice's node took to land bob's, and five seconds more.
+    std::thread::sleep(Duration::from_secs(5));
+    let carol_landed_at_alice = landed(&alice, &id, "from-carol.bin").is_some();
+    eprintln!(
+        "[proof] claim 4: bob's --file: {bob_ok} {bob_said}{bob_err}; it landed at alice: \
+         {alice_got}; bob's Session shows it come in: {came_in}; carol's --file: {carol_ok} \
+         {carol_said}{carol_err}; hers landed at alice: {carol_landed_at_alice}"
+    );
+    assert!(
+        bob_ok && bob_said.contains("pulling"),
+        "PRODUCT: bob, whom alice trusts with drive, must have his file accepted: {bob_said}{bob_err}"
+    );
+    assert!(
+        alice_got,
+        "PRODUCT: the file bob drove into alice's Session must land on her node, byte for byte"
+    );
+    assert!(
+        came_in,
+        "PRODUCT: alice's Session must show the file come in, as bob reads it"
+    );
+    // A petabyte, named by bob's node as an attacker would: never accepted.
+    let alice_fp_for_drive: [u8; 32] = vox_core::node::link::b32_decode(&alice.fp, "alice")
+        .expect("APPARATUS: alice's fingerprint");
+    let bob_at = {
+        let paths = vox_core::node::paths::Paths::resolve(
+            "default",
+            Some(&bob.data),
+            Some(&bob.data.join("cfg")),
+        )
+        .expect("APPARATUS: bob's paths");
+        NodeSocket::one_shot(
+            paths.account().socket(),
+            vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: a node name"),
+        )
+    };
+    let huge = rt.block_on(vox_core::node::drive_input::send(
+        &bob_at,
+        id,
+        alice_fp_for_drive,
+        &vox_agentcomms::drive::Request {
+            v: 1,
+            session: SESSION.to_owned(),
+            action: vox_agentcomms::drive::Action::File {
+                name: "huge.bin".into(),
+                size: 1_000_000_000_000_000,
+                sha256: "0".repeat(64),
+                tag: "file-0000000000000000-0000000000000000".into(),
+                note: None,
+            },
+        },
+    ));
+    eprintln!("[proof] claim 4: a petabyte offered: {huge:?}");
+    let huge = huge.unwrap_or_else(|e| {
+        panic!("CANNOT MEASURE (apparatus): bob's crafted drive request got no answer: {e:?}")
+    });
+    assert!(
+        !huge.ok && huge.said.contains("not enough free disk on"),
+        "PRODUCT: a file past alice's disk reserve must be refused when it is offered: she \
+         answered {huge:?}"
+    );
+    assert!(
+        !carol_ok && !carol_landed_at_alice,
+        "PRODUCT: carol, read only, must be refused a file into alice's Session, and none of hers \
+         may land: she was told {carol_said}{carol_err}"
     );
 
     // ---- claim 2: alice downgrades bob to read; her Session's later entries are not his ----

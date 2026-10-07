@@ -750,6 +750,54 @@ impl Router {
             .find(|(fp, _)| *fp == info.peer)
             .map_or_else(|| by.chars().take(8).collect(), |(_, n)| n.clone());
         let sink = &self.inner.sink;
+        // What is driven, as this node's claim of who drove it (ADR-029 MD-3), written before it
+        // is handed to the harness, so the Session shows it ahead of what it caused. An answer
+        // shows on its request's line.
+        let mut copy = serde_json::Map::new();
+        copy.insert(
+            "v".into(),
+            serde_json::json!(vox_agentcomms::activity::VERSION),
+        );
+        copy.insert("session".into(), serde_json::json!(req.session));
+        copy.insert("kind".into(), serde_json::json!("drive"));
+        copy.insert("by".into(), serde_json::json!(by));
+        copy.insert("action".into(), serde_json::json!(req.action.name()));
+        match &req.action {
+            Action::Text { text } => {
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Slash { text } => {
+                copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
+                copy.insert("text".into(), serde_json::json!(text));
+            }
+            Action::Approve { r#ref }
+            | Action::Reject { r#ref, .. }
+            | Action::Answer { r#ref, .. } => {
+                copy.insert("ref".into(), serde_json::json!(r#ref));
+            }
+            Action::Interrupt | Action::Stop => {}
+            Action::File {
+                name,
+                size,
+                sha256,
+                tag,
+                note,
+            } => {
+                copy.insert("name".into(), serde_json::json!(name));
+                copy.insert("size".into(), serde_json::json!(size));
+                copy.insert("sha256".into(), serde_json::json!(sha256));
+                copy.insert("id".into(), serde_json::json!(tag));
+                if let Some(note) = note {
+                    copy.insert("note".into(), serde_json::json!(note));
+                }
+            }
+        }
+        sink.activity(
+            node,
+            &req.session,
+            vox_agentcomms::activity::split(copy, "text", vox_core::node::content::MAX_TEXT_LEN),
+            None,
+        );
         let outcome: Result<String, String> = match &req.action {
             Action::Approve { r#ref } => handed(sink.answer(
                 node,
@@ -781,36 +829,30 @@ impl Router {
                 &alias,
                 crate::session_sink::Given::Answer(answers.clone()),
             )),
+            // **A file is pulled after the answer** (#546): its bytes may take longer than the
+            // driver waits. The answer says it was accepted; its second outcome, when the pull
+            // ends, is written beside the first.
+            // **Not past the disk's reserve** (ADR-028 F-3: a pull never fills the disk): a driver
+            // names the size, and a file that would leave less than the reserve is refused before
+            // anything is pulled. The pull itself stops at the reserve too.
+            Action::File { size, .. } => {
+                use vox_core::node::pulls::{bytes, free_space, room_dir, RESERVE};
+                let dir = room_dir(&paths, &info.channel_id);
+                let _ = vox_core::node::paths::create_private_dir(&dir);
+                let needs = size.saturating_add(RESERVE);
+                match free_space(&dir) {
+                    Ok(has) if has < needs => Err(format!(
+                        "not enough free disk on {node}: needs {} (the file, and {} kept free), \
+                         has {}",
+                        bytes(needs),
+                        bytes(RESERVE),
+                        bytes(has)
+                    )),
+                    _ => Ok(format!("accepted, pulling {size} bytes")),
+                }
+            }
             input => self.steer(node, &reg, input).await,
         };
-        // What was driven, as this node's claim of who drove it (ADR-029 MD-3), and what came of
-        // it when it was not delivered (DR-6). An answer shows on its request's line.
-        let mut copy = serde_json::Map::new();
-        copy.insert(
-            "v".into(),
-            serde_json::json!(vox_agentcomms::activity::VERSION),
-        );
-        copy.insert("session".into(), serde_json::json!(req.session));
-        copy.insert("kind".into(), serde_json::json!("drive"));
-        copy.insert("by".into(), serde_json::json!(by));
-        copy.insert("action".into(), serde_json::json!(req.action.name()));
-        match &req.action {
-            Action::Text { text } => {
-                copy.insert("text".into(), serde_json::json!(text));
-            }
-            Action::Slash { text } => {
-                copy.insert("cmd".into(), serde_json::json!(crate::drive::slash(text).0));
-                copy.insert("text".into(), serde_json::json!(text));
-            }
-            Action::Approve { r#ref }
-            | Action::Reject { r#ref, .. }
-            | Action::Answer { r#ref, .. } => {
-                copy.insert("ref".into(), serde_json::json!(r#ref));
-            }
-            Action::Interrupt | Action::Stop => {}
-        }
-        let mut bodies =
-            vox_agentcomms::activity::split(copy, "text", vox_core::node::content::MAX_TEXT_LEN);
         // Every drive's outcome, beside it (DR-6): what happened, or why it was not delivered.
         let mut result = serde_json::json!({
             "v": vox_agentcomms::activity::VERSION, "session": req.session,
@@ -821,12 +863,110 @@ impl Router {
             Ok(said) => result["said"] = serde_json::json!(said),
             Err(why) => result["why"] = serde_json::json!(why),
         }
-        bodies.push(result.to_string());
-        sink.activity(node, &req.session, bodies, None);
+        if let Action::File { tag, .. } = &req.action {
+            result["of"] = serde_json::json!(tag);
+        }
+        sink.activity(node, &req.session, vec![result.to_string()], None);
+        if let Action::File {
+            name,
+            size,
+            sha256,
+            tag,
+            note,
+        } = &req.action
+        {
+            let driven = vox_core::node::pulls::Driven {
+                room: info.channel_id,
+                from: info.peer,
+                name: name.clone(),
+                size: *size,
+                sha256: sha256.clone(),
+                tag: tag.clone(),
+            };
+            let (router, handle, node) = (self.clone(), handle.clone(), node.clone());
+            let (session, note) = (req.session.clone(), note.clone());
+            tokio::spawn(async move {
+                router
+                    .land_driven(
+                        &node, &handle, &paths, &reg, &session, &by, &alias, driven, note,
+                    )
+                    .await;
+            });
+        }
         match outcome {
             Ok(said) => Answer { ok: true, said },
             Err(said) => Answer { ok: false, said },
         }
+    }
+
+    /// A file driven into a Session (DR-1.7, #546): pulled from the driver's node, verified, put
+    /// in the room's files directory (ADR-028 F-4), said in the Session as a `file` entry, and
+    /// told to `reg`'s session alone as a typed line. Its second outcome, paired with the first by
+    /// `of`, says where it landed or why it did not (DR-6). No retry, and no other session.
+    #[allow(clippy::too_many_arguments)]
+    async fn land_driven(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        paths: &vox_core::node::paths::Paths,
+        reg: &crate::wake::Session,
+        session: &str,
+        by: &str,
+        alias: &str,
+        driven: vox_core::node::pulls::Driven,
+        note: Option<String>,
+    ) {
+        let outcome: Result<String, String> = async {
+            let path = vox_core::node::pulls::pull_driven(handle, paths, &driven)
+                .await
+                .map_err(|e| format!("not delivered: the file did not arrive whole: {e}"))?;
+            let shown = path.display().to_string();
+            let entry = serde_json::json!({
+                "v": vox_agentcomms::activity::VERSION, "session": session, "kind": "file",
+                "dir": "in", "by": by, "name": driven.name, "size": driven.size,
+                "sha256": driven.sha256, "path": shown,
+            });
+            // Through the sink, numbered and in order with the Session's other entries.
+            self.inner
+                .sink
+                .activity(node, session, vec![entry.to_string()], None);
+            // Recorded so the copy goes when the room's retention says (ADR-028 F-5), which is
+            // all a record's expiry reads; its id is the share's, the one the drive named.
+            let _ = vox_core::node::pulls::record(
+                paths,
+                &vox_core::node::pulls::Pulled {
+                    room: driven.room,
+                    entry: vox_core::hash::sha256(driven.tag.as_bytes()),
+                    path: path.clone(),
+                    created: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                    folder: None,
+                    files: Vec::new(),
+                },
+            );
+            let line = match note.as_deref().map(str::trim) {
+                Some(n) if !n.is_empty() => format!("{alias} sent you a file: {shown} — {n}"),
+                _ => format!("{alias} sent you a file: {shown}"),
+            };
+            self.steer(node, reg, &crate::drive::Action::Text { text: line })
+                .await
+                .map(|_| format!("landed at {shown}, and the session was told"))
+                .map_err(|e| format!("landed at {shown}, but the session was not told: {e}"))
+        }
+        .await;
+        let mut result = serde_json::json!({
+            "v": vox_agentcomms::activity::VERSION, "session": session,
+            "kind": "drive-result", "by": by, "action": "file", "of": driven.tag,
+            "ok": outcome.is_ok(),
+        });
+        match &outcome {
+            Ok(said) => result["said"] = serde_json::json!(said),
+            Err(why) => result["why"] = serde_json::json!(why),
+        }
+        self.inner
+            .sink
+            .activity(node, session, vec![result.to_string()], None);
     }
 
     /// Typed text, an interrupt, a stop or a slash command, to `reg`'s harness alone.

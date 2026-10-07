@@ -408,6 +408,80 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// What a driver's drive request says of a file it sends into a Session (ADR-029 DR-1.7, #546).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Driven {
+    /// The room the Session is in.
+    pub room: Digest32,
+    /// The driver's node, which serves it.
+    pub from: Digest32,
+    /// Its name.
+    pub name: String,
+    /// Its size, bytes.
+    pub size: u64,
+    /// Its SHA-256, hex.
+    pub sha256: String,
+    /// The driver's service it is served on.
+    pub tag: String,
+}
+
+/// Pull a file a driver sent into a Session on this node (ADR-029 DR-1.7, #546): from the
+/// driver's node, verified by its SHA-256 before it is kept, into the room's files directory
+/// (ADR-028 F-4). Returns where it landed. Record it with [`record`] under the Session entry that
+/// says so, so it ages with the room (F-5).
+///
+/// # Errors
+/// The forward to the driver's node could not be made, or what came was not the file announced.
+pub async fn pull_driven(
+    handle: &crate::node::actor::NodeHandle,
+    paths: &Paths,
+    driven: &Driven,
+) -> Result<PathBuf, String> {
+    let sha = driven.sha256.to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("the file's SHA-256 is not one".into());
+    }
+    let dir = room_dir(paths, &driven.room);
+    crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+    let offer = Offer {
+        room: driven.room,
+        entry: crate::hash::sha256(driven.tag.as_bytes()),
+        author: driven.from,
+        name: driven.name.clone(),
+        size: driven.size,
+        sha256: sha,
+        tag: driven.tag.clone(),
+        http: true,
+        created: now_secs(),
+        files: None,
+    };
+    let bound = match handle
+        .apply(NodeCommand::Forward {
+            channel_id: offer.room,
+            host: offer.author,
+            service_tag: offer.tag.clone(),
+            local: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        })
+        .await
+    {
+        Outcome::Bound(local) => local,
+        other => return Err(other.to_string()),
+    };
+    let name = safe_file_name(&offer.name);
+    let part = dir.join(format!(".{name}.{}.part", hex(&offer.entry[..8])));
+    let received = receive(bound, &part, &offer).await;
+    let _ = handle
+        .apply(NodeCommand::StopForward { local: bound })
+        .await;
+    if let Err(e) = received {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    let placed = place(&part, &dir, &name);
+    let _ = std::fs::remove_file(&part);
+    placed
+}
+
 /// The share `text` announces, if it is one this node may pull: a `file` announcement addressed to
 /// `me` or to no one. `None` for anything else, for good.
 #[allow(clippy::type_complexity)]
@@ -453,6 +527,44 @@ fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool, 
         sha256,
         s("tag")?,
         d.get("http")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        files,
+    ))
+}
+
+/// The share a Session's `file` entry announces (ADR-029 DR-1.8, #546), as [`offer_in`] reads a
+/// room's: its fields sit in the entry itself, and it is for every member that can open it.
+#[allow(clippy::type_complexity)]
+fn offer_in_session(body: &str) -> Option<(String, u64, String, String, bool, Option<u64>)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v["kind"] != "file" || v["dir"] != "out" {
+        return None;
+    }
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let sha256 = s("sha256")?;
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let files = match v.get("files") {
+        None => None,
+        Some(n) => {
+            Some(n.as_u64()?).filter(|n| (1..=crate::node::folder::MAX_FILES as u64).contains(n))
+        }
+    };
+    if v.get("files").is_some() && files.is_none() {
+        return None;
+    }
+    Some((
+        s("name")?,
+        v.get("size").and_then(serde_json::Value::as_u64)?,
+        sha256.to_ascii_lowercase(),
+        s("tag")?,
+        v.get("http")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         files,
@@ -540,6 +652,38 @@ impl Pulls {
                         continue;
                     }
                     // From a member this node has not trusted: not yet. A later trust pulls it.
+                    if !view.trusted.iter().any(|(fp, _)| *fp == r.author) {
+                        continue;
+                    }
+                    found.push(Offer {
+                        room: d.channel_id,
+                        entry: r.entry_hash,
+                        author: r.author,
+                        name,
+                        size,
+                        sha256,
+                        tag,
+                        http,
+                        created,
+                        files,
+                    });
+                }
+                // **A file a Session sent out** (ADR-029 DR-1.8): this node opened its entry, so
+                // its node trusts it with drive; it is pulled as a share addressed to it is.
+                for r in &d.session_files {
+                    if settled.contains(&r.entry_hash) {
+                        continue;
+                    }
+                    let Some((name, size, sha256, tag, http, files)) = offer_in_session(&r.body)
+                    else {
+                        never.push(r.entry_hash);
+                        continue;
+                    };
+                    let created = (r.created_millis / 1000).min(now);
+                    if d.retention > 0 && now >= created.saturating_add(d.retention) {
+                        never.push(r.entry_hash);
+                        continue;
+                    }
                     if !view.trusted.iter().any(|(fp, _)| *fp == r.author) {
                         continue;
                     }

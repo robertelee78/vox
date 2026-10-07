@@ -88,6 +88,120 @@ pub async fn run(
     session: &str,
     action: Action,
 ) -> Result<(), crate::app::AppError> {
+    let (channel_id, node, id, label) = target(paths, room, session).await?;
+    deliver(paths, channel_id, node, id, &label, action).await
+}
+
+/// `vox room session ROOM SESSION --file PATH [--note TEXT]`: send the session a file (ADR-029
+/// DR-1.7, #546). This node serves it as a share only the session's node may fetch, once, then
+/// says so on the drive request; the session's node answers that it is pulling it, and says in
+/// the Session where it landed, or why not.
+///
+/// # Errors
+/// As [`run`]; and a file that cannot be read or served is not sent.
+pub async fn run_file(
+    paths: &vox_core::node::paths::Paths,
+    room: &str,
+    session: &str,
+    path: &std::path::Path,
+    note: Option<&str>,
+) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
+    let (channel_id, node, id, label) = target(paths, room, session).await?;
+    match send_file(paths, channel_id, node, id, path, note).await {
+        Ok(said) => {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stdout().lock(), "{label}: {said}");
+            Ok(())
+        }
+        Err(not) => Err(AppError::Usage(not.sentence(&label))),
+    }
+}
+
+/// Send Session `session_id` of `node` in room `channel_id` a file (ADR-029 DR-1.7, #546), as
+/// `vox room session --file` and the TUI's `:share` do: serve `path` as a share only `node` may
+/// fetch, once, then say so on the drive request. What the session's node answered ("accepted,
+/// pulling n bytes"); or why not, in the words every drive uses (CL-1). A file not taken is not
+/// served on.
+///
+/// # Errors
+/// [`NotDelivered`]: the file could not be read or served (not sent), the session's node refused
+/// it, or no answer came.
+pub async fn send_file(
+    paths: &vox_core::node::paths::Paths,
+    channel_id: vox_core::hash::Digest32,
+    node: vox_core::hash::Digest32,
+    session_id: String,
+    path: &std::path::Path,
+    note: Option<&str>,
+) -> Result<String, NotDelivered> {
+    use vox_core::node::ipc::{Request as Ipc, SessionTo};
+    let path = std::fs::canonicalize(path)
+        .map_err(|e| NotDelivered::NotSent(format!("{}: {e}", path.display())))?;
+    let note = note.map(str::trim).filter(|n| !n.is_empty());
+    let mut env =
+        vox_agentcomms::envelope::Envelope::new(crate::room_cli::FILE, note.unwrap_or(""));
+    if let Some(n) = note {
+        env.data = serde_json::json!({ "note": n });
+    }
+    let mut client = crate::room_cli::attach(paths)
+        .await
+        .map_err(|e| NotDelivered::NotSent(e.to_string()))?;
+    let row = crate::share_cli::shares_of(
+        client
+            .request(&Ipc::SessionShare {
+                channel_id,
+                path: path.to_string_lossy().into_owned(),
+                envelope: env.to_text(),
+                to: SessionTo::Node(node),
+            })
+            .await,
+    )
+    .map_err(|e| NotDelivered::NotSent(e.to_string()))?
+    .into_iter()
+    .next()
+    .ok_or_else(|| NotDelivered::NotSent("the daemon did not serve it".into()))?;
+    let tag = row.tag.clone();
+    let request = Request {
+        v: 1,
+        session: session_id,
+        action: Action::File {
+            name: row.name,
+            size: row.size,
+            sha256: row.sha256,
+            tag: row.tag,
+            note: note.map(str::to_owned),
+        },
+    };
+    let sent = send(paths, channel_id, node, &request).await;
+    // Not taken: served to no one, so not served at all.
+    if sent.is_err() {
+        let _ = client
+            .request(&Ipc::ShareStop {
+                channel_id,
+                selector: tag,
+            })
+            .await;
+    }
+    sent
+}
+
+/// The one open Session `session` names in `room`: its room, its node, its id and its label;
+/// refused before anything is sent when it names none, several, an ended one, or one of a node
+/// this node does not trust.
+async fn target(
+    paths: &vox_core::node::paths::Paths,
+    room: &str,
+    session: &str,
+) -> Result<
+    (
+        vox_core::hash::Digest32,
+        vox_core::hash::Digest32,
+        String,
+        String,
+    ),
+    crate::app::AppError,
+> {
     use crate::app::AppError;
     use vox_core::node::ipc::{Frame, Request as Ipc};
     let mut client = crate::room_cli::attach(paths).await?;
@@ -126,20 +240,32 @@ pub async fn run(
              Sessions"
         )));
     }
+    Ok((channel_id, row.node, row.id.clone(), label))
+}
+
+/// Send `action` to Session `id` of `node`, and say what came of it.
+async fn deliver(
+    paths: &vox_core::node::paths::Paths,
+    channel_id: vox_core::hash::Digest32,
+    node: vox_core::hash::Digest32,
+    id: String,
+    label: &str,
+    action: Action,
+) -> Result<(), crate::app::AppError> {
+    use crate::app::AppError;
     // Whether this node may drive it is the session's node's to say, from its own keyring
     // (DR-2): it is asked, never assumed.
-    drop(client);
     let request = Request {
         v: 1,
-        session: row.id.clone(),
+        session: id,
         action,
     };
-    match send(paths, channel_id, row.node, &request).await {
+    match send(paths, channel_id, node, &request).await {
         Ok(said) => {
             use std::io::Write as _;
             let _ = writeln!(std::io::stdout().lock(), "{label}: {said}");
             Ok(())
         }
-        Err(not) => Err(AppError::Usage(not.sentence(&label))),
+        Err(not) => Err(AppError::Usage(not.sentence(label))),
     }
 }

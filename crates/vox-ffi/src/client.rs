@@ -389,6 +389,15 @@ pub enum DriveAction {
         /// Each question's answer; several choices joined with ", ".
         answers: HashMap<String, String>,
     },
+    /// Send the session a file (DR-1.7, #546): this node serves it to the session's node alone,
+    /// which pulls it, verifies it and tells the session where it landed. The answer says it was
+    /// accepted; where it landed, or why not, follows in the Session.
+    File {
+        /// The file, as this app can read it.
+        path: String,
+        /// A note the session is told with it.
+        note: Option<String>,
+    },
 }
 
 /// Whether a drive reached its session's node, and what that node said (DR-6).
@@ -513,6 +522,50 @@ fn unexpected(frame: &Frame) -> VoxError {
         "the vox daemon answered with {name}, which this app does not expect; if vox was updated, \
          restart the daemon so both are the same version"
     ))
+}
+
+/// Serve `path` to `node` alone, for a file driven into its Session (ADR-029 DR-1.7, #546), and
+/// the drive action that says so; or why it cannot be served.
+async fn start_file_for(
+    client: &mut IpcClient,
+    channel_id: Digest32,
+    node: Digest32,
+    path: &str,
+    note: Option<String>,
+) -> Result<vox_agentcomms::drive::Action, String> {
+    let path = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
+    let note = note.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+    let mut env = vox_agentcomms::envelope::Envelope::new(
+        vox_core::node::shares::FILE,
+        note.as_deref().unwrap_or(""),
+    );
+    if let Some(n) = &note {
+        env.data = serde_json::json!({ "note": n });
+    }
+    let req = Request::SessionShare {
+        channel_id,
+        path: path.to_string_lossy().into_owned(),
+        envelope: env.to_text(),
+        to: vox_core::node::ipc::SessionTo::Node(node),
+    };
+    match ask(client, &req).await {
+        Ok(Frame::Shares { shares }) => {
+            let row = shares
+                .into_iter()
+                .next()
+                .ok_or_else(|| "the vox daemon did not serve it".to_owned())?;
+            Ok(vox_agentcomms::drive::Action::File {
+                name: row.name,
+                size: row.size,
+                sha256: row.sha256,
+                tag: row.tag,
+                note,
+            })
+        }
+        Ok(Frame::Error { reason }) => Err(reason),
+        Ok(other) => Err(unexpected(&other).to_string()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn not_attached() -> VoxError {
@@ -1549,7 +1602,14 @@ impl VoxClient {
     ) -> Result<DriveAnswer, VoxError> {
         use vox_agentcomms::drive::{Action, Request as Drive};
         let channel_id = digest(&room, "room id")?;
+        // A file is served before it is said: its share is started once the Session's node is
+        // known, below.
+        let mut file = None;
         let action = match action {
+            DriveAction::File { path, note } => {
+                file = Some((path, note));
+                Action::Interrupt
+            }
             DriveAction::Text { text } => Action::Text { text },
             DriveAction::Interrupt => Action::Interrupt,
             DriveAction::Stop => Action::Stop,
@@ -1566,7 +1626,7 @@ impl VoxClient {
         };
         let held = Arc::clone(&self.held);
         self.on_rt(async move {
-            let (at, node, trusted) = {
+            let (at, node, trusted, action) = {
                 let mut slot = held.lock().await;
                 let h = slot.as_mut().ok_or_else(not_attached)?;
                 let names = names(&mut h.client).await?;
@@ -1578,7 +1638,24 @@ impl VoxClient {
                     .into_iter()
                     .find(|s| s.id == session && s.open)
                     .ok_or_else(|| failed("no open Session in this room has that id"))?;
-                (h.at.clone(), row.node, names.contains_key(&row.node))
+                let trusted = names.contains_key(&row.node);
+                let action = match file {
+                    Some((path, note)) if trusted => {
+                        match start_file_for(&mut h.client, channel_id, row.node, &path, note).await
+                        {
+                            Ok(a) => a,
+                            Err(said) => {
+                                return Ok(DriveAnswer {
+                                    ok: false,
+                                    said: format!("not sent: {said}"),
+                                    delivery: DriveDelivery::Unreachable,
+                                })
+                            }
+                        }
+                    }
+                    _ => action,
+                };
+                (h.at.clone(), row.node, trusted, action)
             };
             // The app gate opens a stream only between nodes that trust each other; a member
             // with drive trusts the session's node already, since it reads the Session only
@@ -1598,7 +1675,11 @@ impl VoxClient {
                 session,
                 action,
             };
-            Ok(
+            let file_tag = match &request.action {
+                Action::File { tag, .. } => Some(tag.clone()),
+                _ => None,
+            };
+            let answer =
                 match vox_core::node::drive_input::send(&at, channel_id, node, &request).await {
                     Ok(a) => DriveAnswer {
                         ok: a.ok,
@@ -1615,8 +1696,21 @@ impl VoxClient {
                         said,
                         delivery: DriveDelivery::NoAnswer,
                     },
-                },
-            )
+                };
+            // A file not taken is served to no one, so not served at all.
+            if let (Some(tag), false) = (file_tag, answer.ok) {
+                if let Some(h) = held.lock().await.as_mut() {
+                    let _ = ask(
+                        &mut h.client,
+                        &Request::ShareStop {
+                            channel_id,
+                            selector: tag,
+                        },
+                    )
+                    .await;
+                }
+            }
+            Ok(answer)
         })
         .await
     }
