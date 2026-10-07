@@ -32,16 +32,22 @@ final class NodeModel: ObservableObject {
         /// Other unread messages: new to the room, and coordination traffic.
         var new = 0
         var coordination = 0
+        /// Approvals and questions waiting on this node in Sessions it may drive here (ADR-029
+        /// CL-2).
+        var waiting = 0
 
-        /// What it needs from the person, by the rule the TUI groups by (W-2).
+        /// What it needs from the person, by the rule the TUI groups by (W-2): a Session waiting
+        /// on this node needs it too (CL-2).
         var need: RoomGroup {
-            roomGroup(toYou: UInt32(addressed), new: UInt32(new), coordination: UInt32(coordination))
+            waiting > 0 ? .needsYou
+                : roomGroup(toYou: UInt32(addressed), new: UInt32(new), coordination: UInt32(coordination))
         }
 
         /// The room's unread in words, as its row says it.
         var words: String {
             var parts: [String] = []
             if addressed > 0 { parts.append("\(addressed) to you") }
+            if waiting > 0 { parts.append("waiting \(waiting)") }
             if urgent > 0 { parts.append("\(urgent) urgent") }
             if new > 0 { parts.append("\(new) new") }
             if coordination > 0 { parts.append("\(coordination) coordination") }
@@ -190,8 +196,9 @@ final class NodeModel: ObservableObject {
     }
 
     /// Read the node's facts again every few seconds, each published only when it changed: the
-    /// keyring and its window, the nodes on this Mac, the peers. A change made elsewhere (the
-    /// CLI, another client) shows without a notice.
+    /// keyring and its window, the nodes on this Mac, the peers, and what waits on this node in
+    /// each room's Sessions. A change made elsewhere (the CLI, another client) shows without a
+    /// notice.
     private func follow() {
         following?.cancel()
         following = Task { [weak self] in
@@ -199,6 +206,7 @@ final class NodeModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard let self else { return }
                 await self.readFacts()
+                await self.readWaiting()
             }
         }
     }
@@ -265,10 +273,12 @@ final class NodeModel: ObservableObject {
                     room.urgent = held.urgent
                     room.new = held.new
                     room.coordination = held.coordination
+                    room.waiting = held.waiting
                 }
                 return room
             }
             if now != rooms { rooms = now }
+            await readWaiting()
             await readFacts()
             let back = await readTrustsBack()
             if back != trustsBack { trustsBack = back }
@@ -863,8 +873,25 @@ extension NodeModel {
         }
     }
 
+    /// Each open room's approvals and questions waiting on this node (CL-2), as the TUI counts
+    /// them: what its Sessions say waits on this node.
+    func readWaiting() async {
+        for room in rooms where room.open {
+            guard let listed = try? await client.sessions(room: room.id) else { continue }
+            let n = listed.reduce(0) { $0 + Int($1.pending) }
+            if let i = rooms.firstIndex(where: { $0.id == room.id }), rooms[i].waiting != n {
+                rooms[i].waiting = n
+            }
+        }
+    }
+
     /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
     fileprivate func sessionsChanged(in room: String) async {
+        if let listed = try? await client.sessions(room: room),
+           let i = rooms.firstIndex(where: { $0.id == room }) {
+            let n = listed.reduce(0) { $0 + Int($1.pending) }
+            if rooms[i].waiting != n { rooms[i].waiting = n }
+        }
         guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
               roomOnScreen == room else { return }
         if listed != sessions { sessions = listed }
