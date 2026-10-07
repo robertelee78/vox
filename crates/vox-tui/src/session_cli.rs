@@ -446,7 +446,16 @@ pub async fn show(
             )))
         }
     };
-    let mine: Vec<SessionRow> = rows.into_iter().filter(|r| r.session_id == id).collect();
+    let mut mine: Vec<SessionRow> = rows.into_iter().filter(|r| r.session_id == id).collect();
+    // In the order the entries were written: each author's send time, and within one moment the
+    // session node's own numbering (a split entry's parts share a millisecond).
+    let seq = |r: &SessionRow| {
+        serde_json::from_str::<Value>(&r.body)
+            .ok()
+            .and_then(|v| v.get("seq").and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+    mine.sort_by_key(|r| (r.created_millis, seq(r)));
     let owner = mine
         .iter()
         .find(|r| {

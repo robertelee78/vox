@@ -444,63 +444,119 @@ fn call(ev: &Event, id: &str) -> vox_core::node::daemonipc::ToolCall {
 /// Returns what the hook prints for the harness: only a permission request answered in Vox prints
 /// anything. Every failure is said on stderr and the turn goes on.
 pub async fn hook(daemon: &crate::agent_hook::Daemon, ev: &Event, session: &str) -> Option<String> {
-    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    use vox_core::node::daemonipc::{DaemonFrame, DaemonRequest};
     let now = now_ms();
-    let request = if let Some(entry) = ev.request(session, now) {
-        DaemonRequest::SessionAsk {
-            node: daemon.node.clone(),
-            session: session.to_owned(),
-            body: Value::Object(entry).to_string(),
-            call: call(ev, ""),
-            transcript: ev.transcript().unwrap_or_default().to_owned(),
-        }
-    } else {
-        let bodies = ev.entries(session, now);
-        if bodies.is_empty() {
-            return None;
-        }
-        DaemonRequest::SessionActivity {
-            node: daemon.node.clone(),
-            session: session.to_owned(),
-            bodies,
-            call: (ev.name == "PreToolUse")
-                .then(|| ev.tool_use_id().map(|id| call(ev, id)))
-                .flatten(),
-        }
-    };
-    let asking = matches!(request, DaemonRequest::SessionAsk { .. });
-    let sent = async {
-        let mut d = DaemonClient::open(&daemon.account.socket()).await?;
-        d.request(request).await
-    };
-    // An ask waits as long as the harness lets its hook run: the terminal's own prompt is live the
-    // whole time (DR-3), so waiting holds nothing up.
-    let answer = if asking {
-        sent.await
-    } else {
-        match tokio::time::timeout(QUEUE_WITHIN, sent).await {
-            Ok(r) => r,
-            Err(_) => {
-                eprintln!(
-                    "vox agent hook: the daemon did not take this session's activity within {} s",
-                    QUEUE_WITHIN.as_secs()
-                );
-                return None;
+    if let Some(mut entry) = ev.request(session, now) {
+        // The request travels in one frame; an input too large for it is cut, and says so.
+        if let Some(Value::String(input)) = entry.get_mut("input") {
+            if input.len() > ASK_INPUT_MAX {
+                let mut cut = ASK_INPUT_MAX;
+                while !input.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let more = input.len() - cut;
+                input.truncate(cut);
+                input.push_str(&format!("\n(cut here: {more} bytes more)"));
             }
         }
-    };
-    match answer {
-        Ok(DaemonFrame::SessionAnswer(Some(a))) => claude_decision(ev, &a),
-        Ok(DaemonFrame::SessionAnswer(None) | DaemonFrame::Ok) => None,
+        // An ask waits as long as the harness lets its hook run: the terminal's own prompt is
+        // live the whole time (DR-3), so waiting holds nothing up.
+        let asked = send(
+            daemon,
+            DaemonRequest::SessionAsk {
+                node: daemon.node.clone(),
+                session: session.to_owned(),
+                body: Value::Object(entry).to_string(),
+                call: call(ev, ""),
+                transcript: ev.transcript().unwrap_or_default().to_owned(),
+            },
+        )
+        .await;
+        return match asked {
+            Ok(DaemonFrame::SessionAnswer(Some(a))) => claude_decision(ev, &a),
+            other => {
+                said(other);
+                None
+            }
+        };
+    }
+    let bodies = ev.entries(session, now);
+    if bodies.is_empty() {
+        return None;
+    }
+    // In frames the daemon takes, in order: a long output is several entries, and may be more
+    // than one frame holds.
+    let mut batches: Vec<Vec<String>> = vec![Vec::new()];
+    let mut used = 0;
+    for b in bodies {
+        if used + b.len() > BATCH_MAX && !batches.last().is_some_and(Vec::is_empty) {
+            batches.push(Vec::new());
+            used = 0;
+        }
+        used += b.len();
+        if let Some(last) = batches.last_mut() {
+            last.push(b);
+        }
+    }
+    let mut first_call = (ev.name == "PreToolUse")
+        .then(|| ev.tool_use_id().map(|id| call(ev, id)))
+        .flatten();
+    let queued = tokio::time::timeout(QUEUE_WITHIN, async {
+        for bodies in batches {
+            let r = send(
+                daemon,
+                DaemonRequest::SessionActivity {
+                    node: daemon.node.clone(),
+                    session: session.to_owned(),
+                    bodies,
+                    call: first_call.take(),
+                },
+            )
+            .await;
+            if !matches!(r, Ok(DaemonFrame::Ok)) {
+                return r;
+            }
+        }
+        Ok(DaemonFrame::Ok)
+    })
+    .await;
+    match queued {
+        Ok(Ok(DaemonFrame::Ok)) => {}
+        Ok(other) => said(other),
+        Err(_) => eprintln!(
+            "vox agent hook: the daemon did not take this session's activity within {} s",
+            QUEUE_WITHIN.as_secs()
+        ),
+    }
+    None
+}
+
+/// The most a hook puts in one frame to the daemon: well under the IPC limit, for the frame's own
+/// fields and encoding.
+const BATCH_MAX: usize = vox_core::node::ipc::MAX_FRAME / 2;
+
+/// The most of a tool's input an approval request carries.
+const ASK_INPUT_MAX: usize = vox_core::node::ipc::MAX_FRAME / 2;
+
+/// One request to the daemon, on its own connection.
+async fn send(
+    daemon: &crate::agent_hook::Daemon,
+    request: vox_core::node::daemonipc::DaemonRequest,
+) -> vox_core::error::Result<vox_core::node::daemonipc::DaemonFrame> {
+    let mut d = vox_core::node::daemonipc::DaemonClient::open(&daemon.account.socket()).await?;
+    d.request(request).await
+}
+
+/// Say on stderr why the Session did not take what the hook sent, if it did not.
+fn said(r: vox_core::error::Result<vox_core::node::daemonipc::DaemonFrame>) {
+    use vox_core::node::daemonipc::DaemonFrame;
+    match r {
+        Ok(DaemonFrame::Ok | DaemonFrame::SessionAnswer(_)) => {}
         Ok(DaemonFrame::Refused(r)) => {
-            eprintln!("vox agent hook: the Session did not take this: {r}");
-            None
+            eprintln!("vox agent hook: the Session did not take this: {r}")
         }
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("vox agent hook: the Session did not take this: {e}");
-            None
-        }
+        Ok(other) => eprintln!("vox agent hook: the daemon answered {other:?}"),
+        Err(e) => eprintln!("vox agent hook: the Session did not take this: {e}"),
     }
 }
 

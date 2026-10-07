@@ -304,12 +304,12 @@ impl Sink {
                 // Shown, so the person knows it is there, but answered only at the terminal.
                 entry.insert("answerable".into(), json!(false));
                 entry.insert("why".into(), json!(why));
-                self.post_numbered(node, session, vec![Value::Object(entry).to_string()]);
+                self.post_numbered(node, session, crate::session_mirror::split(entry, "input"));
                 None
             }
             Ok(id) => {
                 entry.insert("ref".into(), json!(id));
-                self.post_numbered(node, session, vec![Value::Object(entry).to_string()]);
+                self.post_numbered(node, session, crate::session_mirror::split(entry, "input"));
                 self.watch(node, session, &id);
                 rx.await.ok().flatten()
             }
