@@ -1311,7 +1311,23 @@ final class FirstRunProof: XCTestCase {
     /// A staging step: `vox` must succeed, else the staging was not achieved. Its output, trimmed.
     @discardableResult
     private func staged(_ vox: String, _ args: [String], env: [String: String]) throws -> String {
-        let (status, out) = run(vox, args, env: env)
+        var argv = [vox] + args
+        var input: String?
+        // A keyring change's passphrase is typed at a terminal, never read from a file (ADR-028
+        // K-13): the file's passphrase is typed at vox's prompt by the pty driver
+        // (scripts/type-passphrase.py, copied into the scratch directory by app-proofs.sh).
+        if let t = args.firstIndex(of: "trust"), t + 1 < args.count,
+           ["add", "remove", "rename", "drive", "read"].contains(args[t + 1]),
+           let f = args.firstIndex(of: "--identity-passphrase-file"), f + 1 < args.count {
+            guard let scratch = ProcessInfo.processInfo.environment["VOX_PROOF_SCRATCH"] else {
+                throw Apparatus("VOX_PROOF_SCRATCH is set by scripts/app-proofs.sh")
+            }
+            input = stager.run(["/bin/cat", args[f + 1]], env: [:]).out
+            var rest = args
+            rest.removeSubrange(f...(f + 1))
+            argv = ["/usr/bin/python3", scratch + "/type-passphrase.py", "120", vox] + rest
+        }
+        let (status, out) = stager.run(argv, env: env, input: input)
         guard status == 0 else {
             throw Apparatus("`vox \(args.joined(separator: " "))` exited \(status): \(out)")
         }

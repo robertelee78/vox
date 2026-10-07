@@ -110,7 +110,12 @@ LINK=$("$VOX" room link --node ann "$ROOM" | grep '^vox://')
 for n in ben builder; do
     "$VOX" room join --node "$n" --passphrase-file "$DEMO/room" "$LINK" >/dev/null
 done
-trust() { "$VOX" trust add --node "$1" "$2" --name "$3" --identity-passphrase-file "$DEMO/identity" >/dev/null; }
+# A keyring change's passphrase is typed at a terminal (ADR-028 K-13): typed here, as a person does.
+trust() {
+    python3 scripts/type-passphrase.py 120 "$VOX" trust add --node "$1" "$2" --name "$3" \
+        <"$DEMO/identity" >"$DEMO/trust.log" 2>&1 ||
+        { echo "app-screenshots: trusting $3 as $1 failed:" >&2; cat "$DEMO/trust.log" >&2; exit 2; }
+}
 trust ann "$BEN" ben; trust ann "$BUILDER" builder
 trust ben "$ANN" ann; trust builder "$ANN" ann; trust ben "$BUILDER" builder; trust builder "$BEN" ben
 for i in $(seq 1 30); do

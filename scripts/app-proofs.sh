@@ -152,6 +152,9 @@ fi
 # starts inherits it, so a test's `vox daemon` could not write its scratch data root. The stager
 # runs, outside the sandbox, what the proofs stage, on loopback, for whoever holds its token.
 TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+# The walkthrough types a keyring change's passphrase at a terminal, as a person does (ADR-028
+# K-13), with this driver, run by the stager from the scratch directory.
+cp scripts/type-passphrase.py "$SCRATCH/type-passphrase.py"
 python3 scripts/app-proof-stager.py "$SCRATCH/stager.port" "$TOKEN" &
 STAGER=$!
 # A run that goes red keeps its scratch data root (the daemon's log, every node's files) for
