@@ -132,9 +132,12 @@ fn vox(data: &Path, cfg: &Path, args: &[&str], input: Option<&str>) -> (bool, St
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
-        // The agent's node has no passphrase (ADR-026 N-6): its hook, in Codex's cleared
-        // environment, attaches it with none.
-        .env("VOX_IDENTITY_PASSPHRASE", "")
+        // Every node has a passphrase (ADR-028 K-11); the operator attaches the agent's node
+        // before Codex starts, and its hook finds it attached.
+        .env(
+            "VOX_IDENTITY_PASSPHRASE",
+            "the agent node's identity passphrase",
+        )
         .env("VOX_NODE", NODE)
         .env("VOX_LISTEN", "127.0.0.1:0")
         .env_remove("VOX_ROOM")

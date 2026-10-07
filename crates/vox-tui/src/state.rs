@@ -780,13 +780,20 @@ impl UiState {
                 None => Action::Redraw,
             },
             PromptKind::CreateIdentity => {
-                // An empty passphrase is accepted, and encouraged against (V030-36).
+                // **Every node has a passphrase** (ADR-028 K-11): an empty one is asked again.
+                if p.fields[0].is_empty() {
+                    self.status_message = Some(
+                        "every node has an identity passphrase; an empty one is refused — type one"
+                            .into(),
+                    );
+                    self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateIdentity, None));
+                    return Action::Redraw;
+                }
                 if p.fields[0].as_str() != p.fields[1].as_str() {
                     self.status_message = Some("passphrases do not match — try again".into());
                     self.mode = Mode::Prompt(Prompt::new(PromptKind::CreateIdentity, None));
                     return Action::Redraw;
                 }
-                self.status_message = no_passphrase_note(&p.fields[0]);
                 Action::Dispatch(Command::CreateIdentity {
                     passphrase: secret(&p.fields[0]),
                 })
@@ -1426,8 +1433,8 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     Some(Parsed::Core(cmd))
 }
 
-/// The status line for a passphrase left empty: it is accepted, and one is encouraged (V030-36,
-/// decider 2026-10-02: "passphrase is a good idea, but is technically optional").
+/// The status line for a room passphrase left empty: it is accepted, and one is encouraged
+/// (V030-36's room half; an identity passphrase is never empty, ADR-028 K-11).
 fn no_passphrase_note(passphrase: &Zeroizing<String>) -> Option<String> {
     passphrase
         .is_empty()

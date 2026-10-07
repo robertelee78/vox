@@ -53,7 +53,10 @@ impl Dirs {
             .env("HOME", r.join("home"))
             .env("VOX_DATA_DIR", r.join("d"))
             .env("VOX_CONFIG_DIR", r.join("c"))
-            .env("VOX_IDENTITY_PASSPHRASE", "")
+            .env(
+                "VOX_IDENTITY_PASSPHRASE",
+                "the agent node's identity passphrase",
+            )
             .env("CLAUDE_CONFIG_DIR", r.join("claude"))
             .env("CODEX_HOME", r.join("codex"))
             .env("OPENCODE_CONFIG_DIR", r.join("oc"))

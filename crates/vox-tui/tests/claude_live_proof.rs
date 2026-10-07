@@ -141,9 +141,9 @@ fn vox(
         .args(args)
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", cfg)
-        // Every node here has no passphrase (ADR-026 N-6): an agent's hook, in Claude Code's
-        // cleared environment, attaches its node with none.
-        .env("VOX_IDENTITY_PASSPHRASE", "")
+        // Every node has a passphrase (ADR-028 K-11); each is attached before Claude Code starts,
+        // and an agent's hook finds its node attached.
+        .env("VOX_IDENTITY_PASSPHRASE", "an identity passphrase")
         .env("VOX_NODE", node)
         .env("VOX_LISTEN", "127.0.0.1:0")
         .env_remove("VOX_ROOM")

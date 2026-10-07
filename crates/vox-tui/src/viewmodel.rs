@@ -333,6 +333,8 @@ pub struct ServePreview {
 pub enum UiError {
     /// Wrong room passphrase on join.
     WrongPassphrase,
+    /// An identity was to be made with an empty passphrase (ADR-028 K-11).
+    PassphraseEmpty,
     /// The identity opened, but what it sealed in the store would not (V210-40).
     SealedUnreadable,
     /// Join proof-of-work is still being computed (Equihash delay).
@@ -429,6 +431,9 @@ impl UiError {
     pub fn message(self) -> &'static str {
         match self {
             UiError::WrongPassphrase => "wrong passphrase",
+            UiError::PassphraseEmpty => {
+                "every node has an identity passphrase; an empty one is refused"
+            }
             UiError::SealedUnreadable => {
                 "passphrase right, but this node's keyring or prekeys will not open — altered, or another identity's"
             }

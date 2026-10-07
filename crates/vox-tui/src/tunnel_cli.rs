@@ -88,18 +88,16 @@ pub fn identity_passphrase_given(
                 .into(),
         ));
     }
-    // **An empty passphrase is a passphrase** (V030-36, decider 2026-10-02: "technically
-    // optional"). An empty file, or the variable set to nothing, gives none on purpose, which is
-    // not the same as giving no source at all: that still asks, or fails without a terminal.
+    // The file's first line, as given: a new identity refuses an empty one (ADR-028 K-11).
     if let Some(path) = file {
         let text = passphrase_file_text(&path)?;
         let first = text.lines().next().unwrap_or_default();
-        return Ok(Some(encouraged(first.to_owned(), "identity")));
+        return Ok(Some(first.to_owned()));
     }
     // Read the variable here rather than through clap's `env`, because clap merges a flag
     // and its variable into one value and the whole point is to tell them apart.
     if let Ok(p) = std::env::var("VOX_IDENTITY_PASSPHRASE") {
-        return Ok(Some(encouraged(p, "identity")));
+        return Ok(Some(p));
     }
     Ok(None)
 }
@@ -115,10 +113,7 @@ pub fn ask_identity_passphrase() -> Result<String, AppError> {
              \x20      {GIVE_IDENTITY_PASSPHRASE}"
         )));
     }
-    Ok(encouraged(
-        prompt_passphrase("identity passphrase")?,
-        "identity",
-    ))
+    prompt_passphrase("identity passphrase")
 }
 
 /// Collect the identity passphrase, asking for confirmation when the profile has no
@@ -132,10 +127,11 @@ pub fn identity_passphrase_for(
     given: Option<String>,
     file: Option<std::path::PathBuf>,
 ) -> Result<String, AppError> {
+    let creates = !vox_core::node::profile::Profile::exists(paths);
     if let Some(p) = identity_passphrase_given(given, file)? {
-        return Ok(p);
+        return if creates { not_empty(p) } else { Ok(p) };
     }
-    if vox_core::node::profile::Profile::exists(paths) {
+    if !creates {
         return ask_identity_passphrase();
     }
     // **Without a terminal there is nobody to ask twice.**
@@ -148,14 +144,27 @@ pub fn identity_passphrase_for(
         ));
     }
     println!("vox: this node has no identity yet; creating one.");
-    let first = prompt_passphrase("new identity passphrase")?;
+    let first = not_empty(prompt_passphrase("new identity passphrase")?)?;
     let again = prompt_passphrase("again")?;
     if first != again {
         return Err(AppError::Usage(
             "the two passphrases differ; nothing was created".into(),
         ));
     }
-    Ok(encouraged(first, "identity"))
+    Ok(first)
+}
+
+/// A new identity's passphrase, refused when empty: **every node has one** (ADR-028 K-11),
+/// whichever way it was given.
+fn not_empty(passphrase: String) -> Result<String, AppError> {
+    if passphrase.is_empty() {
+        return Err(AppError::Usage(
+            "every node has an identity passphrase, and an empty one is refused; nothing was \
+             created"
+                .into(),
+        ));
+    }
+    Ok(passphrase)
 }
 
 /// What a CLI verb says on stderr when creating or unlocking the identity waits for another vox
@@ -1093,9 +1102,9 @@ pub fn refuse_disclosed_room_passphrase(given: Option<&String>) -> Result<(), Ap
 
 /// `passphrase`, after one line on stderr encouraging one when it is empty (V030-36).
 ///
-/// **An empty passphrase is accepted, not refused** (decider 2026-10-02: "passphrase is a good
-/// idea, but is technically optional"). The node takes one; a client may only encourage. `what`
-/// is `identity` or `room`.
+/// **An empty room passphrase is accepted, not refused** (decider 2026-10-02: "passphrase is a
+/// good idea, but is technically optional"); an identity passphrase never is (ADR-028 K-11).
+/// `what` is `room`.
 pub fn encouraged<S: AsRef<str>>(passphrase: S, what: &str) -> S {
     if passphrase.as_ref().is_empty() {
         eprintln!("vox: no {what} passphrase; going on without one. A passphrase is encouraged.");
