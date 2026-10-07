@@ -387,6 +387,14 @@ enum RoomCmd {
     /// The room's Sessions (ADR-029): one per harness session working in the room, each by your
     /// name for its node, the session's name and its short id; open ones first, ended ones apart.
     Sessions(RoomSessionsArgs),
+    /// Read one Session of the room: what that harness session did, one line per activity
+    /// (ADR-029 SC-1).
+    ///
+    /// Tool calls with what they returned, the replies, the end of each turn, what was typed at
+    /// the terminal or in Vox, approvals and questions with who answered them, files either way.
+    /// `--details` prints each entry's full input and output under its line. Only members the
+    /// session's node trusts with drive see inside a Session; anyone else is told so.
+    Session(RoomSessionArgs),
     /// Ask a member's node which agent sessions it holds, and whether each can be reached.
     ///
     /// The ping is answered by that node's **daemon**, never by a model: it lists each session,
@@ -1058,6 +1066,23 @@ pub struct RoomRefArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
+}
+
+/// `vox room session`
+#[derive(Args, Debug, Clone)]
+pub struct RoomSessionArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The Session: its session id, at least 8 characters of it, or its name.
+    pub session: String,
+    /// Print each entry's full input and output under its line.
+    #[arg(long)]
+    pub details: bool,
+    /// Print one JSON object per line instead.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `vox room post`
@@ -2091,6 +2116,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Read(a) => &a.profile,
                 RoomCmd::Roster(a) => &a.profile,
                 RoomCmd::Sessions(a) => &a.profile,
+                RoomCmd::Session(a) => &a.profile,
                 RoomCmd::Ping(a) => &a.profile,
                 RoomCmd::Tail(a) => &a.profile,
                 RoomCmd::Board(a) => &a.profile,
@@ -2166,6 +2192,10 @@ pub fn run() -> ExitCode {
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
                         RoomCmd::Sessions(a) => {
                             crate::room_cli::sessions(&paths, &a.room, a.json).await
+                        }
+                        RoomCmd::Session(a) => {
+                            crate::session_cli::show(&paths, &a.room, &a.session, a.details, a.json)
+                                .await
                         }
                         RoomCmd::Ping(a) => {
                             crate::ping::ping(

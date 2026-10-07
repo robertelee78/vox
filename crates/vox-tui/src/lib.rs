@@ -37,6 +37,7 @@ pub mod node_tasks;
 pub mod notify;
 pub mod ping;
 pub mod room_cli;
+pub mod session_cli;
 pub mod session_mirror;
 pub mod session_sink;
 pub mod setup;
