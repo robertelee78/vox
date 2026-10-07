@@ -13,6 +13,9 @@
 		B0000000000000000000A004 /* us.vox.lanhelper.plist in Copy Launch Daemon */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A004 /* us.vox.lanhelper.plist */; };
 		B0000000000000000000A005 /* VoxTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A007 /* VoxTokens.swift */; };
 		B0000000000000000000A006 /* VoxTokens.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A008 /* VoxTokens.xcassets */; };
+		B0000000000000000000A007 /* vox_ffi.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A001 /* vox_ffi.swift */; };
+		B0000000000000000000A008 /* VoxFFI.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A002 /* VoxFFI.xcframework */; };
+		B0000000000000000000A009 /* ShareExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = F0000000000000000000A009 /* ShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -22,6 +25,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 70000000000000000000A001;
 			remoteInfo = Vox;
+		};
+		C0000000000000000000A003 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 90000000000000000000A001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 70000000000000000000A003;
+			remoteInfo = ShareExtension;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -48,6 +58,17 @@
 			name = "Copy Launch Daemon";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		E0000000000000000000A008 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				B0000000000000000000A009 /* ShareExtension.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -59,6 +80,8 @@
 		F0000000000000000000A006 /* VoxAppProofs.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VoxAppProofs.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		F0000000000000000000A007 /* VoxTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = VoxTokens.swift; path = ../../target/theme/VoxTokens.swift; sourceTree = SOURCE_ROOT; };
 		F0000000000000000000A008 /* VoxTokens.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = VoxTokens.xcassets; path = ../../target/theme/VoxTokens.xcassets; sourceTree = SOURCE_ROOT; };
+		F0000000000000000000A009 /* ShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		F0000000000000000000A00A /* Vox-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Vox-Info.plist"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -68,6 +91,14 @@
 				Vox.entitlements,
 			);
 			target = 70000000000000000000A001 /* Vox */;
+		};
+		D0000000000000000000A005 /* Exceptions for "ShareExtension" folder in "ShareExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+				ShareExtension.entitlements,
+			);
+			target = 70000000000000000000A003 /* ShareExtension */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -83,6 +114,14 @@
 		D0000000000000000000A002 /* VoxAppProofs */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = VoxAppProofs;
+			sourceTree = "<group>";
+		};
+		D0000000000000000000A004 /* ShareExtension */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				D0000000000000000000A005 /* Exceptions for "ShareExtension" folder in "ShareExtension" target */,
+			);
+			path = ShareExtension;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -103,6 +142,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		E0000000000000000000A022 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0000000000000000000A008 /* VoxFFI.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -111,6 +158,7 @@
 			children = (
 				D0000000000000000000A001 /* Vox */,
 				D0000000000000000000A002 /* VoxAppProofs */,
+				D0000000000000000000A004 /* ShareExtension */,
 				A0000000000000000000A002 /* VoxFFI */,
 				A0000000000000000000A007 /* Theme */,
 				A0000000000000000000A003 /* Bundle */,
@@ -139,6 +187,7 @@
 		A0000000000000000000A003 /* Bundle */ = {
 			isa = PBXGroup;
 			children = (
+				F0000000000000000000A00A /* Vox-Info.plist */,
 				A0000000000000000000A004 /* LaunchAgents */,
 				A0000000000000000000A005 /* LaunchDaemons */,
 			);
@@ -166,6 +215,7 @@
 			children = (
 				F0000000000000000000A005 /* Vox.app */,
 				F0000000000000000000A006 /* VoxAppProofs.xctest */,
+				F0000000000000000000A009 /* ShareExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -183,10 +233,12 @@
 				E0000000000000000000A003 /* Resources */,
 				E0000000000000000000A005 /* Copy Launch Agent */,
 				E0000000000000000000A006 /* Copy Launch Daemon */,
+				E0000000000000000000A008 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				C0000000000000000000A004 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				D0000000000000000000A001 /* Vox */,
@@ -217,6 +269,26 @@
 			productReference = F0000000000000000000A006 /* VoxAppProofs.xctest */;
 			productType = "com.apple.product-type.bundle.ui-testing";
 		};
+		70000000000000000000A003 /* ShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 80000000000000000000A004 /* Build configuration list for PBXNativeTarget "ShareExtension" */;
+			buildPhases = (
+				E0000000000000000000A021 /* Sources */,
+				E0000000000000000000A022 /* Frameworks */,
+				E0000000000000000000A023 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				D0000000000000000000A004 /* ShareExtension */,
+			);
+			name = ShareExtension;
+			productName = ShareExtension;
+			productReference = F0000000000000000000A009 /* ShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -233,6 +305,9 @@
 					70000000000000000000A002 = {
 						CreatedOnToolsVersion = 27.0;
 						TestTargetID = 70000000000000000000A001;
+					};
+					70000000000000000000A003 = {
+						CreatedOnToolsVersion = 27.0;
 					};
 				};
 			};
@@ -252,6 +327,7 @@
 			targets = (
 				70000000000000000000A001 /* Vox */,
 				70000000000000000000A002 /* VoxAppProofs */,
+				70000000000000000000A003 /* ShareExtension */,
 			);
 		};
 /* End PBXProject section */
@@ -266,6 +342,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		E0000000000000000000A013 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E0000000000000000000A023 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -317,6 +400,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		E0000000000000000000A021 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B0000000000000000000A007 /* vox_ffi.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -324,6 +415,11 @@
 			isa = PBXTargetDependency;
 			target = 70000000000000000000A001 /* Vox */;
 			targetProxy = C0000000000000000000A001 /* PBXContainerItemProxy */;
+		};
+		C0000000000000000000A004 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 70000000000000000000A003 /* ShareExtension */;
+			targetProxy = C0000000000000000000A003 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -360,6 +456,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
 				COPY_PHASE_STRIP = NO;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -380,6 +477,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Bundle/Vox-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Vox;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -406,6 +504,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Bundle/Vox-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Vox;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.social-networking";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
@@ -448,6 +547,62 @@
 			};
 			name = Release;
 		};
+		84000000000000000000A001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Vox;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 0.4.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					Security,
+					"-framework",
+					SystemConfiguration,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = us.vox.app.share;
+				PRODUCT_NAME = ShareExtension;
+				SKIP_INSTALL = YES;
+			};
+			name = Debug;
+		};
+		84000000000000000000A002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Vox;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 0.4.0;
+				OTHER_LDFLAGS = (
+					"-framework",
+					Security,
+					"-framework",
+					SystemConfiguration,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = us.vox.app.share;
+				PRODUCT_NAME = ShareExtension;
+				SKIP_INSTALL = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -474,6 +629,15 @@
 			buildConfigurations = (
 				83000000000000000000A001 /* Debug */,
 				83000000000000000000A002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		80000000000000000000A004 /* Build configuration list for PBXNativeTarget "ShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				84000000000000000000A001 /* Debug */,
+				84000000000000000000A002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

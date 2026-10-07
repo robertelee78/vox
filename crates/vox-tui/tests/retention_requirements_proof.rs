@@ -698,8 +698,27 @@ async fn as_member(
     (signer, ep, profile)
 }
 
+/// Where on the author's feed [`equivocate`] forks it.
+enum Position {
+    /// The author's first message: below everything posted after it. Found by what each entry
+    /// is, never by a fixed number, since how many governance entries precede it (the room's
+    /// name, trust, retention) and how many probes it took to see readers read are the room's.
+    FirstMessage,
+    /// Five below the author's head.
+    NearHead,
+}
+
+/// Whether `entry` is a message, the only kind of entry that expires: its body pruned, or a
+/// sealed group message. Governance and checkpoints are never pruned.
+fn is_message(entry: &Entry) -> bool {
+    entry
+        .payload
+        .as_ref()
+        .is_none_or(|p| p.starts_with(vox_core::group::wire::GROUP_MSG_SIGN_DOMAIN.as_bytes()))
+}
+
 /// As the room's author (whose node is stopped), connect to `victim` at `victim_at`, read the
-/// entry the victim holds at `seq` of the author's feed — waiting, up to 60 s, until whether it
+/// entry the victim holds at `at` on the author's feed — waiting, up to 60 s, until whether it
 /// still carries its signature is `expect_signed` (a checkpoint takes time to reach it) — and
 /// **offer** the victim a second entry for that position, signed by the author, as the head of
 /// the author's feed. The victim asks for it because that head differs from its own (V210-63);
@@ -712,7 +731,7 @@ fn equivocate(
     victim_id: vox_core::hash::Digest32,
     victim_at: &str,
     channel_id: vox_core::hash::Digest32,
-    seq: Option<u64>,
+    at: Position,
     expect_signed: bool,
 ) -> (u64, bool, bool, usize, Option<String>) {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -730,7 +749,6 @@ fn equivocate(
             )
             .await
             .expect("CANNOT MEASURE: the author's client could not connect to the victim");
-        // Where: a fixed position, or, if none is given, five below the author's head.
         let mut have = None;
         for _ in 0..40 {
             let y = raw_sync::ask(&conn, channel_id, 0, Ask::Ranges(vec![]), None).await;
@@ -746,7 +764,47 @@ fn equivocate(
         }
         let head = have
             .expect("CANNOT MEASURE: no answered session listed the author's feed on the victim");
-        let seq = seq.unwrap_or(head - 4);
+        let seq = match at {
+            Position::NearHead => head - 4,
+            Position::FirstMessage => {
+                let mut feed = Vec::new();
+                for _ in 0..40 {
+                    let y = raw_sync::ask(
+                        &conn,
+                        channel_id,
+                        0,
+                        Ask::Ranges(vec![WantRange {
+                            author_id,
+                            from_seq: 1,
+                            to_seq: head,
+                        }]),
+                        None,
+                    )
+                    .await;
+                    if y.hello {
+                        feed = y.wires;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                let feed: Vec<Entry> = feed
+                    .iter()
+                    .map(|w| {
+                        Entry::from_wire(w)
+                            .expect("PRODUCT (staging): the victim served a malformed entry")
+                    })
+                    .collect();
+                let kinds: String = feed
+                    .iter()
+                    .map(|e| if is_message(e) { 'm' } else { 'g' })
+                    .collect();
+                println!("R10: alice's feed on bob, seq 1 up (m message, g other): {kinds}");
+                feed.iter()
+                    .find(|e| is_message(e))
+                    .map(|e| e.skeleton.seq)
+                    .expect("APPARATUS: staging not achieved: bob served no message of alice's")
+            }
+        };
         let waiting = Instant::now();
         let held = loop {
             let mut held = None;
@@ -778,6 +836,11 @@ fn equivocate(
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
+        assert!(
+            is_message(&held),
+            "APPARATUS: staging not achieved: alice's seq {seq} on bob is not a message (governance \
+             or a checkpoint), so it never expires"
+        );
         let pruned = held.payload.is_none();
         let signed = held.is_signed();
         println!(
@@ -904,7 +967,7 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
         bob_id,
         &bob_at,
         channel_id,
-        Some(5),
+        Position::FirstMessage,
         false,
     );
     alice_d = Some(daemon(
@@ -920,7 +983,8 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     );
     assert!(
         pruned,
-        "PRODUCT (staging): the position must be expired (its body pruned) on bob"
+        "PRODUCT: bob must have pruned the expired message's body at seq {seq} (it read none of \
+         them)"
     );
     assert!(
         !signed,
@@ -982,8 +1046,15 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
         |t| count(t, "b ") == 0,
     );
     drop(alice_d.take());
-    let (seq, pruned, signed, served, ended) =
-        equivocate(&alice, alice_id, bob_id, &bob_at, channel_id, None, true);
+    let (seq, pruned, signed, served, ended) = equivocate(
+        &alice,
+        alice_id,
+        bob_id,
+        &bob_at,
+        channel_id,
+        Position::NearHead,
+        true,
+    );
     let _a = daemon(
         &alice,
         "alice-3",
@@ -997,7 +1068,8 @@ fn r10_an_expired_entrys_skeleton_still_catches_a_fork() {
     );
     assert!(
         pruned,
-        "PRODUCT (staging): the position must be expired (its body pruned) on bob"
+        "PRODUCT: bob must have pruned the expired message's body at seq {seq} (it read none of \
+         them)"
     );
     assert!(
         signed,

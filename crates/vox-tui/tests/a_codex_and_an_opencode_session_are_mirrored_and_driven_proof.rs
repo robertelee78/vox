@@ -29,7 +29,8 @@
 //! 4. S1 closes and is resumed under its id (`codex resume`): its second turn's reply reaches the
 //!    Session.
 //! 5. `person --say` to S1 reaches S1's thread alone as `turn/start`; `--slash /clear` is refused
-//!    (it would start a new thread, DR-7); `watcher --say` is refused (no drive, DR-2).
+//!    (it would start a new thread, DR-7); `watcher --say` is refused (no drive, DR-2), naming
+//!    the agent's node as the watcher knows it, never by the node's own name.
 //! 6. The app-server goes away: `--say` to S1 is refused and says why (DR-5, DR-6).
 //!
 //! **OpenCode** (`an_opencode_session_is_mirrored_and_driven`): one session of `oc-a` through the
@@ -284,7 +285,13 @@ fn world(agents: &[&str]) -> (World, Daemon) {
     }
     for agent in agents {
         let fp = w.fp(agent);
-        w.staged(WATCHER, &["trust", "add", &fp, "--name", agent], None);
+        // The watcher's own name for the agent's node, not the node's name for itself: what the
+        // watcher is told names it so (#544).
+        w.staged(
+            WATCHER,
+            &["trust", "add", &fp, "--name", &format!("seen-{agent}")],
+            None,
+        );
         w.staged(
             agent,
             &["trust", "add", &person, "--name", PERSON, "--drive"],
@@ -729,9 +736,10 @@ fn a_codex_session_is_mirrored_and_driven() {
     let (ok, said) = w.drive(WATCHER, S1, &["--say", "may I?"]);
     println!("[proof] (5) watcher --say: {said}");
     assert!(
-        !ok && said.contains("drive"),
+        !ok && said.contains(&format!("seen-{CODEX} does not trust you with drive")),
         "PRODUCT: {WATCHER}, trusted to read only, must be refused and told it lacks drive \
-         (DR-2); it said: {said}"
+         (DR-2), naming {CODEX}'s node as the watcher knows it (seen-{CODEX}), never by the \
+         node's own name; it said: {said}"
     );
     let stray = app.received(Duration::from_secs(2), |v| {
         v["method"] == "turn/start" && v.pointer("/params/input/0/text") == Some(&json!("may I?"))

@@ -2478,9 +2478,9 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
     .expect("APPARATUS: cannot make the room map private");
 
     let person = [("CLAUDE_CODE_ENTRYPOINT", "cli")];
-    let turn = |session: &str, cwd: &Path| -> String {
+    let turn_saying = |session: &str, cwd: &Path, prompt: &str| -> String {
         let payload = format!(
-            r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"hi","transcript_path":"/tmp/t.jsonl"}}"#,
+            r#"{{"session_id":"{session}","hook_event_name":"UserPromptSubmit","cwd":"{}","prompt":"{prompt}","transcript_path":"/tmp/t.jsonl"}}"#,
             cwd.display()
         );
         let (ok, out, err) = hook_env(
@@ -2493,6 +2493,7 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         assert!(ok, "PRODUCT: the hook must exit 0; it said {out}{err}");
         out
     };
+    let turn = |session: &str, cwd: &Path| turn_saying(session, cwd, "hi");
     let rooms = || hook(&data, &cfg, &["room", "list"], "").1;
     let sessions = |room: &str| -> Vec<serde_json::Value> {
         let (_, out, _) = hook(&data, &cfg, &["room", "sessions", room, "--json"], "");
@@ -2508,7 +2509,9 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
 
     // (1) A session started in the mapped directory: its node joins the room by itself.
     let mapped = "11111111-aaaa-4bbb-8ccc-000000000001";
-    let first = turn(mapped, &repo);
+    // Its first prompt is typed before its node is a member of the room: the Session still
+    // carries it, once the room opens (SC-1).
+    let first = turn_saying(mapped, &repo, "SAID-BEFORE-THE-JOIN");
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut turns = 1;
     while !(rooms().contains(&home) && open_in(&home, mapped)) {
@@ -2531,6 +2534,21 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
         "PRODUCT: a session whose room is being joined must be told so on its turn; it was told \
          {first:?}"
     );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let read_before = loop {
+        let (_, shown, _) = hook(&data, &cfg, &["room", "session", &home, mapped], "");
+        if shown.contains("SAID-BEFORE-THE-JOIN") {
+            break shown;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: what a session did while its room was being joined must be in its Session \
+             once the room opens; within 30 s of opening, `vox room session` showed no \
+             \"SAID-BEFORE-THE-JOIN\":\n{shown}"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    eprintln!("[proof] (1) its Session, read once open:\n{read_before}");
 
     // (2) A session started in a subfolder of the mapped directory: no room.
     let below = "22222222-aaaa-4bbb-8ccc-000000000002";

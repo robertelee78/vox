@@ -125,15 +125,19 @@ pub struct DaemonCore {
     shown_session: Option<(Digest32, Digest32, String)>,
     /// Its lines, as last read, for a member with drive (SC-1).
     session_lines: Vec<crate::viewmodel::SessionLineView>,
-    /// When its entries were last read; `None` reads them on the next frame.
-    session_read: Option<Instant>,
+    /// Its entries are to be read again on the next frame: it was just shown or driven, or the
+    /// node said it has news (`NodeEvent::SessionEntry`).
+    session_stale: bool,
     /// Per room, the approvals and questions waiting on this node in Sessions it may drive there
     /// (ADR-029 CL-2): what puts a room under needs you.
     waiting: BTreeMap<Digest32, usize>,
     /// The Sessions with one waiting: room, node and session id.
     waiting_sessions: BTreeSet<(Digest32, Digest32, String)>,
-    /// When they were last counted.
-    waiting_read: Option<Instant>,
+    /// They are to be counted again: the node said a Session has news, or one was driven.
+    waiting_stale: bool,
+    /// The Sessions this node may drive, room by room, when they were last counted: a Session
+    /// opened, ended or given drive since is counted again.
+    waiting_of: Vec<(Digest32, Vec<(Digest32, String)>)>,
     /// Unread per room off screen, at three levels (ADR-028 R-8, #484).
     unread: BTreeMap<Digest32, RoomUnread>,
     /// Rooms whose unread was counted, when the TUI first saw them open, from what the node
@@ -378,10 +382,11 @@ impl DaemonCore {
             seeded: BTreeSet::new(),
             shown_session: None,
             session_lines: Vec::new(),
-            session_read: None,
+            session_stale: true,
             waiting: BTreeMap::new(),
             waiting_sessions: BTreeSet::new(),
-            waiting_read: None,
+            waiting_stale: true,
+            waiting_of: Vec::new(),
             arrived: BTreeMap::new(),
             notified: BTreeSet::new(),
             notify_to,
@@ -691,6 +696,9 @@ impl DaemonCore {
                 Ev::Node(ev) => self.on_node_event(ev),
                 Ev::Lagged => {
                     self.asked = None;
+                    // Events were lost: a Session's news among them, maybe.
+                    self.session_stale = true;
+                    self.waiting_stale = true;
                     if let Some(t) = self.timeline.as_mut() {
                         t.stale = true;
                     }
@@ -743,6 +751,19 @@ impl DaemonCore {
         };
         match ev {
             NodeEvent::NewEntry { channel_id, .. } => rows_in(self, channel_id, 1),
+            // A Session entry is sealed apart from the room's log: this is the one word that one
+            // arrived (ADR-029 SC-1, CL-2). The Session on screen and the waiting count are read
+            // again; nothing polls for them.
+            NodeEvent::SessionEntry { channel_id, .. } => {
+                if self
+                    .shown_session
+                    .as_ref()
+                    .is_some_and(|(room, _, _)| *room == channel_id)
+                {
+                    self.session_stale = true;
+                }
+                self.waiting_stale = true;
+            }
             NodeEvent::Shutdown => self.active = None,
             NodeEvent::ChannelClosed { channel_id } => {
                 if self.active == Some(channel_id) {
@@ -1128,24 +1149,18 @@ impl DaemonCore {
             }
         });
         // What the Session says of it is read again at once.
-        self.session_read = None;
-        self.waiting_read = None;
+        self.session_stale = true;
+        self.waiting_stale = true;
         match said {
             Some(Ok(s) | Err(s)) => CommandStatus::Said(s),
             None => CommandStatus::Said(format!("not sent to {}: the TUI is stopping", t.label)),
         }
     }
 
-    /// Count, once a second, the approvals and questions waiting on this node in each open room's
-    /// Sessions it may drive, by the rule that words them (`Line::waiting`, ADR-029 CL-2).
+    /// Count the approvals and questions waiting on this node in each open room's Sessions it may
+    /// drive, by the rule that words them (`Line::waiting`, ADR-029 CL-2): again only when the
+    /// node says a Session has news, or the Sessions it may drive change.
     fn count_waiting(&mut self) {
-        if self
-            .waiting_read
-            .is_some_and(|at| at.elapsed() < SNAPSHOT_EVERY)
-        {
-            return;
-        }
-        self.waiting_read = Some(Instant::now());
         let rooms: Vec<(Digest32, Vec<(Digest32, String)>)> = self
             .snapshot
             .open
@@ -1161,6 +1176,11 @@ impl DaemonCore {
                 )
             })
             .collect();
+        if !self.waiting_stale && rooms == self.waiting_of {
+            return;
+        }
+        self.waiting_stale = false;
+        self.waiting_of = rooms.clone();
         let mut waiting = BTreeMap::new();
         let mut sessions = BTreeSet::new();
         for (room, drivable) in rooms {
@@ -1194,7 +1214,7 @@ impl DaemonCore {
         self.waiting_sessions = sessions;
     }
 
-    /// Read the shown Session's entries, at most once a second, and draw them as `vox room
+    /// Read the shown Session's entries when they are stale, and draw them as `vox room
     /// session` does (ADR-029 SC-1, CL-1). Entries this node cannot open are not among them: a
     /// member without drive reads none (SC-2).
     fn read_session(&mut self) {
@@ -1204,13 +1224,10 @@ impl DaemonCore {
         if Some(room) != self.active {
             return;
         }
-        if self
-            .session_read
-            .is_some_and(|at| at.elapsed() < SNAPSHOT_EVERY)
-        {
+        if !self.session_stale {
             return;
         }
-        self.session_read = Some(Instant::now());
+        self.session_stale = false;
         let Ok(Frame::SessionEntries { rows }) =
             self.request(&Request::SessionEntries { channel_id: room })
         else {
@@ -2356,7 +2373,7 @@ impl CoreHandle for DaemonCore {
             } => {
                 self.shown_session = session.map(|(node, id)| (channel_id, node, id));
                 self.session_lines.clear();
-                self.session_read = None;
+                self.session_stale = true;
                 CommandStatus::Done
             }
             Command::SelectChannel { channel_id } => {

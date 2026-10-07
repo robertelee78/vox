@@ -51,7 +51,12 @@ impl Dirs {
     fn new() -> Self {
         let tmp = tempfile::Builder::new()
             .prefix("vw")
-            .tempdir_in("/private/tmp")
+            // Short, for the socket path: macOS's /private/tmp, else /tmp (Linux).
+            .tempdir_in(if cfg!(target_os = "macos") {
+                "/private/tmp"
+            } else {
+                "/tmp"
+            })
             .expect("APPARATUS: a temp dir");
         let root = tmp.path().to_path_buf();
         for d in ["claude", "codex", "oc", "c", "home"] {

@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks forty-three claims, each
+//! 160x50. It checks forty-four claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -101,6 +101,10 @@
 //!   hook: Bob's TUI lists the room with "waiting 1" and the Session "· waiting on you"; `a` on the
 //!   request's line approves it, the waiting hook gives Claude Code "allow", and the line then
 //!   reads "approved here" (ADR-029 DR-1.4, CL-2, #553);
+//! - `answer`: Alice's session asks one question through the PermissionRequest hook: `:answer 1;
+//!   2` is refused with "not sent to <label>: the question asks 1 thing(s); answer each, separated
+//!   by ;", word for word; the digit 2 on its line gives the hook "allow" with the answer Blue, and
+//!   the line then reads "answered here: Blue" (ADR-029 DR-1.5, #553);
 //! - `steer`: a stand-in for Claude Code (apparatus, `support/claude_pane_standin.py`) in a pane of
 //!   a scratch tmux server under the run directory, every child with a cleared environment, opens
 //!   a Session Bob may drive: from Bob's TUI, text typed in its composer reaches the pane as typed,
@@ -165,7 +169,7 @@
 //! (`drive`), `a` sending a rejection (`approve`),
 //! `:interrupt` sent as a stop (`steer`),
 //! or a Session's `:share` sending the path as text (`share`). It passes only on the script's PASS with
-//! all 43 claims ok.
+//! all 44 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -261,7 +265,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (43 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (44 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -275,8 +279,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (43, 43),
-                "APPARATUS: the driver said PASS without all 43 claims ok: {said}"
+                (44, 44),
+                "APPARATUS: the driver said PASS without all 44 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

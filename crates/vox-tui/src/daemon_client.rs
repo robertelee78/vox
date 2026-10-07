@@ -57,11 +57,25 @@ pub async fn ensure_daemon(
         }
         Err(_) => {}
     }
+    start_daemon(&std::env::current_exe()?, account, listen, anchors).await
+}
+
+/// Start `exe` as `account`'s daemon, detached, listening on `listen`, and wait for it to answer:
+/// [`ensure_daemon`]'s start, and `vox update`'s restart onto the vox it put in place.
+///
+/// # Errors
+/// As [`ensure_daemon`].
+pub async fn start_daemon(
+    exe: &Path,
+    account: &Account,
+    listen: std::net::SocketAddr,
+    anchors: &[String],
+) -> Result<Daemon, AppError> {
+    let socket = account.socket();
     let log_path = account.log_file();
     vox_core::node::paths::create_private_dir(&account.daemon_dir())
         .map_err(|e| AppError::Usage(e.to_string()))?;
     let log = open_log(&log_path)?;
-    let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
         .arg(AS_DETACHED)
