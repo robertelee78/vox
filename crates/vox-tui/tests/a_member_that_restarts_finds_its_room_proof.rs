@@ -26,7 +26,11 @@
 //!   (`VOX_TEST_NO_NEARBY`, a `test-knobs` knob: on one computer, what a node says nearby finds
 //!   the other within seconds too), so the books are the only way the two find each other. Each
 //!   must read the other's new message within 10 s, and the posts from before still read.
-//!   Mutation: a version-1 book refused — they never reconverge.
+//!   Mutation: a version-1 book refused — they never reconverge. A version-1 book's times read
+//!   as milliseconds instead of seconds is not asserted: nothing a person sees shows a book's
+//!   times (they only spare a rewrite of an address seen again within ten minutes, and choose
+//!   whom a full book forgets). Bob's fixed port taken by another program at run time is
+//!   APPARATUS (the daemon says it cannot bind), never PRODUCT.
 //!
 //! The 10 s bar also needs the survivor to stop using its connection to the dead process as soon
 //! as the restarted one connects (`prd1/restart-probe` 582f18a). Without that, both directions
