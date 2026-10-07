@@ -71,8 +71,8 @@ impl RoomGroup {
 
 /// The group a room's unread counts, by [`UnreadLevel`], put it in.
 ///
-/// W-2 also makes a room active while a member holds a claim; that waits on the lanes' claim
-/// state (#512), so a room is grouped by its unread alone until then.
+/// W-2 also makes a room active while a member holds a claim, and needs you for a trust offer or a
+/// Session waiting on this node; those are not read here, so a room is grouped by its unread alone.
 #[must_use]
 pub fn group(to_you: usize, new: usize, coordination: usize) -> RoomGroup {
     if to_you > 0 {

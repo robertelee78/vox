@@ -62,8 +62,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             pane's border names it once ("Members [focus]", never "MembersMembers [focus]");
   words     `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)": the
             decider's words, never "invite link" (#406);
-  unknown   `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant` and `:revoke`
-            each answer "unknown command", and
+  unknown   `:show`, `:hide`, `:block`, `:unblock`, `:verify`, `:consent`, `:grant`, `:revoke`
+            and `:lanes` (#556) each answer "unknown command", and
             the help line names none of them: the TUI offers only what vox supports (V210-155);
   sync      the status bar says how many peers the node is connected to: the anchor and at least
             one member, so 2 or more (it said "idle" always);
@@ -89,14 +89,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             nothing and is never shown;
   onenode   `:node spare` is refused, naming the one node this window acts as, and the window
             still acts as default: its status bar and sidebar say so (ADR-028 E-4, #470);
-  lanes     Alice's node claims work and posts `working`, `status` and an `ask` as an agent, and
-            Carol's claims work too: in Bob's lanes (`:lanes`), Alice's lane is headed "alice ·
-            working" and shows her ask, with her coordination folded into one counted line and
-            none of it shown; Carol's lane carries one of the five state chips (ADR-028 W-3, #513);
   to        `:to alice` and `:urgent` show on the composer as "To: alice · urgent", and the
             message Bob then sends reaches Alice with `to` naming her and `urgent` (W-4, #513);
-  seen      Bob leaves his lanes and Alice posts again: looking again, only her new post is marked
-            new in her lane, her earlier ask not (W-3, #513);
   attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
             message: a `file` announcement carrying the note in it and `to` naming her, no second
             message for the note (ADR-028 F-1, #493);
@@ -869,7 +863,8 @@ try:
     # an "unknown command" seen is this command's answer and not the one before it.
     def bottom():
         return "\n".join(r.rstrip() for r in tui.display()[-3:])
-    REMOVED = ("show", "hide", "block", "unblock", "verify", "consent", "grant", "revoke")
+    REMOVED = ("show", "hide", "block", "unblock", "verify", "consent", "grant", "revoke",
+               "lanes")
     answers = {}
     for c in REMOVED:
         tui.key(":link\r", 2)
@@ -1016,59 +1011,10 @@ try:
     claim("onenode", said and "node default" in bar and "node spare" not in bar
           and top == "node default · attached",
           f"answer: {tui.display()[-1].strip()!r}; status bar: {bar.strip()!r}; sidebar: {top!r}")
-    stage("lanes")
-    # The room's lanes (ADR-028 W-3, #513): Alice's node acts as an agent here, claiming work and
-    # saying so; Carol's claims work too. What Bob's lanes are judged by is Alice's; Carol's lane
-    # must carry one of the five chips, whatever Bob's node can read of her.
-    def as_agent(w, session, *args):
-        e = env(w)
-        e["VOX_SESSION"] = session
-        r = subprocess.run([VOX, *args], env=e, capture_output=True, text=True, timeout=120)
-        # A claim some member cannot agree to (Carol and Dave, whom not everyone trusts) is posted
-        # all the same, and says so: what Bob's lanes are about is what it posted.
-        posted = args[1] == "claim" and "Your claim is posted" in r.stderr
-        if r.returncode != 0 and not posted:
-            product(f"{w}'s `vox {' '.join(args[:2])}` as an agent failed: {r.stderr.strip()}")
-        return r
-    as_agent("alice", "alice-agent", "room", "claim", room, "codec-port")
-    as_agent("alice", "alice-agent", "room", "post", room, "--type", "working", "LANE-WORKING porting")
-    as_agent("alice", "alice-agent", "room", "post", room, "--type", "status", "LANE-STATUS half way")
-    as_agent("alice", "alice-agent", "room", "post", room, "--type", "ask", "LANE-ASK which codec stays?")
-    as_agent("carol", "carol-agent", "room", "claim", room, "flaky-test")
-    tui.key("\r", 2)  # into the room, selected in the sidebar
-    tui.key(":lanes\r", 2)
-    def lane(name):
-        """(the lane's title, its rows) for the member Bob calls `name` (his name for it, or the
-        start of its fingerprint), found by its title on Bob's screen."""
-        rows = tui.display()
-        for r in rows:
-            for g in ("⇄ ", "→ ", "· ", ""):
-                start = r.find("┌" + g + name)
-                if start >= 0:
-                    end = r.find("┐", start)
-                    title = r[start + 1:end if end > 0 else len(r)].strip("─")
-                    return title, [bare(x) for x in pane(rows, g + name)]
-        return None, []
-    tui.until(lambda: (lane("alice")[0] or "").endswith("working") and "LANE-ASK" in " ".join(lane("alice")[1]), 60, 1)
-    (a_title, arows), (c_title, crows) = lane("alice"), lane(fp["carol"][:6])
-    carol_read = [l for l in run("bob", "room", "read", room, "--json").stdout.splitlines()
-                  if fp["carol"] in l]
-    atext = " ".join(arows)
-    # A lane is narrow, so its rows wrap: read it as one text, without the spaces a wrap took.
-    joined = "".join(arows).replace(" ", "")
-    CHIPS = ("needs you", "working", "ready", "done", "away")
-    claim("lanes", (a_title or "").endswith("· working")
-          and any((c_title or "").endswith("· " + c) for c in CHIPS)
-          and "LANE-ASKwhichcodecstays?" in joined
-          and re.search(r"(\d+)coordinationposts?", joined) is not None
-          and "LANE-WORKING" not in joined and "LANE-STATUS" not in joined,
-          f"alice's lane {a_title!r}: {arows!r}; carol's lane {c_title!r}: {crows!r}; carol's rows "
-          f"in bob's `vox room read --json`: {carol_read!r}"
-          + ("" if a_title else "; screen:\n" + tui.text()))
-
     stage("to")
     # To: and urgent in the composer (ADR-028 W-4): the message carries them, as `vox room post
     # --to … --urgent` writes it, posted as Bob into this room.
+    tui.key("\r", 2)  # into the room, selected in the sidebar
     # A name that is no member is refused with a sentence, and sets nothing (#513).
     tui.key(":to zz-nobody\r", 1)
     refused = " ".join(r.strip() for r in tui.display()[-4:])
@@ -1094,20 +1040,6 @@ try:
           and "at" not in env_,
           f"bob's composer: {composer.strip()!r}; alice reads the message as {row!r}; `:to zz-nobody` "
           f"said {refused!r}, To: left unset: {unset}")
-
-    stage("seen")
-    # A lane marks new what came after the person last looked at the lanes (W-3): Bob leaves
-    # them, Alice says something, and only that is new when he looks again.
-    tui.key(":lanes\r", 1)  # leave the lanes: what they showed is seen
-    p = run("alice", "room", "post", room, "LANE-AFTER since bob looked")
-    if p.returncode != 0: product(f"alice's `vox room post` failed: {p.stderr.strip()}")
-    tui.until(lambda: has(timeline(), "LANE-AFTER"), 60, 1)
-    tui.key(":lanes\r", 2)
-    tui.until(lambda: "LANE-AFTER" in "".join(lane("alice")[1]), 30, 1)
-    joined = "".join(lane("alice")[1]).replace(" ", "")
-    claim("seen", "newLANE-AFTERsincebob" in joined and "LANE-ASK" in joined and "newask:LANE-ASK" not in joined,
-          f"alice's lane after bob looked and she posted again: {lane('alice')[1]!r}")
-    tui.key(":lanes\r", 1)  # back to the timeline
 
     stage("attach")
     # A file shared from the composer is one message, addressed like one (ADR-028 F-1, #493): its

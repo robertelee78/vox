@@ -132,12 +132,12 @@ fn every_member_is_back_after_an_anchor_restart() {
     ];
 
     // ---- MEMBERS identities, a few at a time (each is a production Argon2id) --------------------
-    let lanes = std::thread::available_parallelism().map_or(4, |n| n.get().min(12));
+    let at_once = std::thread::available_parallelism().map_or(4, |n| n.get().min(12));
     let dirs: Vec<PathBuf> = (0..MEMBERS)
         .map(|i| tmp.path().join(format!("m{i:03}")))
         .collect();
     let made = Instant::now();
-    for batch in dirs.chunks(lanes) {
+    for batch in dirs.chunks(at_once) {
         let handles: Vec<_> = batch
             .iter()
             .map(|dir| {
@@ -162,7 +162,7 @@ fn every_member_is_back_after_an_anchor_restart() {
         .expect("APPARATUS: cannot write the passphrase file");
     let started = Instant::now();
     let mut daemons: Vec<VoxProc> = Vec::with_capacity(MEMBERS);
-    for batch in dirs.chunks(lanes) {
+    for batch in dirs.chunks(at_once) {
         for dir in batch {
             // Even members from 127.0.0.1, odd ones from ::1.
             let i = daemons.len();

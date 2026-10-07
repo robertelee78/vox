@@ -43,8 +43,6 @@
 //!   voids it (ADR-021 §6).
 //! - [`version`] — workers must run the same Vox version, and refuse to coordinate
 //!   when one does not (ADR-021 §5).
-//! - [`lanes`] — each member's lane state, the chip a lanes view heads its column with
-//!   (ADR-028 W-3).
 //!
 //! ## What this crate is not
 //!
@@ -59,7 +57,6 @@
 pub mod attention;
 pub mod claim;
 pub mod envelope;
-pub mod lanes;
 pub mod ops;
 pub mod version;
 
