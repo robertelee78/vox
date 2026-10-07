@@ -189,9 +189,8 @@ impl Record {
         };
         let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
         // Milliseconds; a record written before held whole seconds under the old name.
-        let ms = |k: &str| {
-            n(&format!("{k}_ms")).or_else(|| n(k).map(|secs| secs.saturating_mul(1_000)))
-        };
+        let ms =
+            |k: &str| n(&format!("{k}_ms")).or_else(|| n(k).map(|secs| secs.saturating_mul(1_000)));
         Some(Self {
             tag: s("tag")?,
             room: b32_decode(&s("room")?, "share record room").ok()?,
@@ -946,8 +945,9 @@ impl Shares {
                                 Some(d)
                                     if d.retention > 0
                                         && now
-                                            >= r.created_ms
-                                                .saturating_add(d.retention.saturating_mul(1_000)) =>
+                                            >= r.created_ms.saturating_add(
+                                                d.retention.saturating_mul(1_000),
+                                            ) =>
                                 {
                                     Verdict::Stop("its message expired".into())
                                 }

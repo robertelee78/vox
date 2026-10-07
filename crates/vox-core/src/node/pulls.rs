@@ -896,7 +896,9 @@ impl Pulls {
                     view.open_channels.iter().any(|d| {
                         d.channel_id == p.room
                             && d.retention > 0
-                            && now >= p.created_ms.saturating_add(d.retention.saturating_mul(1_000))
+                            && now
+                                >= p.created_ms
+                                    .saturating_add(d.retention.saturating_mul(1_000))
                     })
                 })
                 .cloned()

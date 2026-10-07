@@ -3253,10 +3253,10 @@ pub async fn get_file(
                 offers.push(Offer {
                     entry: r.entry_hash,
                     created_ms: r.created_millis.min(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
-            ),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                    ),
                     author: r.author,
                     name,
                     size,

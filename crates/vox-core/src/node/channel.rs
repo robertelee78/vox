@@ -5004,9 +5004,7 @@ impl ChannelState {
                     let Some(payload) = payload else {
                         // A skeleton: stored, never rendered. Its body is owed unless it has
                         // expired here (V030-10).
-                        if !self
-                            .body_expired(claimed, crate::time::Ms(now_ms))
-                        {
+                        if !self.body_expired(claimed, crate::time::Ms(now_ms)) {
                             self.owed.insert((author, seq));
                         }
                         return Ok(Ok(Vec::new()));
@@ -5451,12 +5449,7 @@ impl ChannelState {
             SEG_DRIVE,
             &self.drive.to_state(),
         )?;
-        let seen_seg = seal_segment(
-            &self.sek,
-            SegmentKind::Index,
-            id,
-            &first_seen_bytes(now_ms),
-        )?;
+        let seen_seg = seal_segment(&self.sek, SegmentKind::Index, id, &first_seen_bytes(now_ms))?;
         let key = signer.public_key();
         self.dag
             .accept(entry, EntryKind::Content, &key, &self.admission)
@@ -5755,10 +5748,8 @@ impl ChannelState {
                 let Some(payload) = entry.payload.as_deref() else {
                     // Expired: its key is needed by nothing. Not expired: a body still to come,
                     // under a generation not known yet — every generation from here on stays.
-                    if self.body_expired(
-                        entry.skeleton.claimed_ms,
-                        crate::time::Ms(self.now_hint),
-                    ) {
+                    if self.body_expired(entry.skeleton.claimed_ms, crate::time::Ms(self.now_hint))
+                    {
                         continue;
                     }
                     break;
