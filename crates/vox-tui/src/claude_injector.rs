@@ -44,7 +44,9 @@ const SUBMIT_RETRIES: u32 = 2;
 /// tolerates a label on the rule (Claude Code writes the session's name there).
 const RULE_MIN_DASHES: usize = 20;
 
-/// Held while a send types into a pane.
+/// Held while a send types into a pane. **Process-wide, deliberately** (ADR-026 P-1): one send at a
+/// time whichever node's Session it types into, so two drives never interleave their keys; it
+/// holds no node's state.
 static SENDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What a driver asks of the session.
