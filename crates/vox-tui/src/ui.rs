@@ -1235,6 +1235,10 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         Screen::ChannelList => {
             " ↑/↓ select · Enter open · t tunnels · k keyring · d decisions · :new <name> · :join · :attach · Ctrl-C quit"
         }
+        // A Session's own help line (ADR-029 §8): its driving words join it as they are built.
+        Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
+            " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
+        }
         Screen::Channel => {
             " Tab switch pane · ↑/↓ select · Ctrl-R reply · Enter send, or go to the quoted · PgUp/PgDn scroll · :to <name> · :urgent · :share <path> · :link · :general · :all · :session <name> · : command · Esc back"
         }
