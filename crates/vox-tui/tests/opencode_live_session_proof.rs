@@ -437,12 +437,7 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
     println!("[proof] (4) Session {id} while the approval waits:\n{plain}");
     let reference = json
         .iter()
-        .find(|l| {
-            l["kind"] == "approval"
-                && l["line"]
-                    .as_str()
-                    .is_some_and(|t| t.contains("approve or reject?"))
-        })
+        .find(|l| l["kind"] == "approval" && l["waiting"] == true)
         .and_then(|l| l["ref"].as_str().map(str::to_owned))
         .unwrap_or_else(|| {
             panic!(
@@ -503,7 +498,7 @@ fn a_live_opencode_session_is_mirrored_and_driven() {
     if let Some(r) = json
         .iter()
         .rev()
-        .find(|l| l["kind"] == "approval")
+        .find(|l| l["kind"] == "approval" && l["waiting"] == true)
         .and_then(|l| l["ref"].as_str())
     {
         let _ = vox_as(

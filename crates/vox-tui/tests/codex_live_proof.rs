@@ -1215,12 +1215,7 @@ fn a_live_codex_session_is_mirrored_and_driven() {
     println!("[proof] (4) Session {id} while the approval waits:\n{plain}");
     let reference = json
         .iter()
-        .find(|l| {
-            l["kind"] == "approval"
-                && l["line"]
-                    .as_str()
-                    .is_some_and(|t| t.contains("approve or reject?"))
-        })
+        .find(|l| l["kind"] == "approval" && l["waiting"] == true)
         .and_then(|l| l["ref"].as_str().map(str::to_owned))
         .unwrap_or_else(|| {
             panic!(
