@@ -1088,9 +1088,12 @@ fn read_ms(dir: &Path, room: &str) -> Vec<(String, u64)> {
 /// 2 s are up, and is gone soon after. Reckoned in whole seconds, its age ran from the start of
 /// its second, and it was swept up to a second early.
 ///
-/// The node sweeps once a second, at a phase this proof does not set, so one message posted late
-/// in its second would show an early sweep only most of the time: four are, each judged alone,
-/// and every one must still read 250 ms before its own 2 s.
+/// The node sweeps once a second, at a phase set when its daemon starts, so one message posted
+/// late in its second would show an early sweep only most of the time. So six are, each after the
+/// daemon is started again (a new phase), each judged alone: every one must still read 150 ms
+/// before its own 2 s. Reckoned in whole seconds, each is swept early unless that daemon's sweep
+/// happens to fall in the last 35% of its second: all six escaping is about two chances in a
+/// thousand.
 ///
 /// Mutant: expiry compared in whole seconds again (`claimed_ms / 1_000 <= now_secs - ttl`) → red,
 /// the message gone before its 2 s.
@@ -1101,13 +1104,13 @@ fn retention_runs_from_the_millisecond_a_message_was_posted() {
     const TTL_MS: u64 = 2_000;
     let t = tempfile::tempdir().expect("APPARATUS: a temporary directory");
     let (alice, _) = identity(t.path(), "alice");
-    let _a = daemon(
+    let mut alice_d = Some(daemon(
         &alice,
         "alice",
         &format!("{IDENTITY}\n"),
         "127.0.0.1:0",
         &[],
-    );
+    ));
     let room = create(&alice);
     let (ok, said) = set_retention(&alice, &room, "2");
     assert!(
@@ -1117,11 +1120,11 @@ fn retention_runs_from_the_millisecond_a_message_was_posted() {
     until_retention(&alice, "PRODUCT (staging)", "alice", 2, 30);
     let mut judged = 0;
     let mut posted = 0;
-    while judged < 4 {
+    while judged < 6 {
         posted += 1;
         assert!(
-            posted <= 40,
-            "APPARATUS: 40 posts, and fewer than four were claimed late enough in their second \
+            posted <= 60,
+            "APPARATUS: 60 posts, and fewer than six were claimed late enough in their second \
              to judge"
         );
         // Late in a second: a post takes a few tens of milliseconds to be claimed.
@@ -1137,11 +1140,11 @@ fn retention_runs_from_the_millisecond_a_message_was_posted() {
         else {
             panic!("PRODUCT: alice's own post {text:?} does not read at once");
         };
-        if claimed % 1_000 < 700 {
+        if claimed % 1_000 < 800 {
             continue; // claimed too early in its second for a whole-second sweep to show
         }
-        // 250 ms before its 2 s are up: it must still read.
-        let at = claimed + TTL_MS - 250;
+        // 150 ms before its 2 s are up: it must still read.
+        let at = claimed + TTL_MS - 150;
         while wall_ms() < at {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1168,9 +1171,21 @@ fn retention_runs_from_the_millisecond_a_message_was_posted() {
             5,
             |texts| !texts.contains(&text),
         );
+        println!(
+            "[proof] {text}: gone {} ms after its claim",
+            wall_ms().saturating_sub(claimed)
+        );
         judged += 1;
+        // The next message is judged by a daemon started again: its sweep at a new phase.
+        drop(alice_d.take());
+        alice_d = Some(daemon(
+            &alice,
+            "alice",
+            &format!("{IDENTITY}\n"),
+            "127.0.0.1:0",
+            &[],
+        ));
     }
-    println!(
-        "[proof] four messages, each claimed late in its second, read until their 2 s were up"
-    );
+    drop(alice_d);
+    println!("[proof] six messages, each claimed late in its second, read until their 2 s were up");
 }
