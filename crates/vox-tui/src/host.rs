@@ -686,14 +686,17 @@ impl Router {
             (Err(_), _) => Answer {
                 ok: false,
                 said: "no drive request arrived in time".into(),
+                code: None,
             },
             (_, Err(_)) if buf.len() > MAX_REQUEST => Answer {
                 ok: false,
                 said: "the drive request is too long".into(),
+                code: None,
             },
             (_, Err(_)) => Answer {
                 ok: false,
                 said: "not a drive request this vox reads".into(),
+                code: None,
             },
             (Ok(()), Ok(req)) => self.drive(node, handle, &info, req).await,
         };
@@ -714,7 +717,11 @@ impl Router {
         req: crate::drive::Request,
     ) -> crate::drive::Answer {
         use crate::drive::{Action, Answer};
-        let refuse = |said: String| Answer { ok: false, said };
+        let refuse = |said: String| Answer {
+            ok: false,
+            said,
+            code: None,
+        };
         if req.v != 1 {
             return refuse(format!(
                 "drive protocol {} is not one this vox speaks",
@@ -723,11 +730,14 @@ impl Router {
         }
         let view = handle.view();
         // DR-2: only a member this node trusts with drive.
+        // Said without this node's name for itself, which the driver may not know it by: the
+        // driver names it (`code`).
         if !view.drive.contains(&info.peer) {
-            return refuse(format!(
-                "{} does not trust you with drive; it trusts you to read only, or not at all",
-                node
-            ));
+            return Answer {
+                ok: false,
+                said: vox_agentcomms::drive::no_drive("the session's node"),
+                code: Some(vox_agentcomms::drive::NO_DRIVE.to_owned()),
+            };
         }
         let Ok(paths) = self.inner.account.node_paths(node) else {
             return refuse("this node's files cannot be read".into());
@@ -894,8 +904,16 @@ impl Router {
             });
         }
         match outcome {
-            Ok(said) => Answer { ok: true, said },
-            Err(said) => Answer { ok: false, said },
+            Ok(said) => Answer {
+                ok: true,
+                said,
+                code: None,
+            },
+            Err(said) => Answer {
+                ok: false,
+                said,
+                code: None,
+            },
         }
     }
 
