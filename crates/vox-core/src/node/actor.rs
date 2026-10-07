@@ -6284,6 +6284,9 @@ impl Node {
         {
             return false;
         }
+        // Untold until a publish round says it holds this node's records (`PublishDone`): a
+        // circuit it refuses as a stranger meanwhile is asked again then.
+        net.board_untold(id);
         let (net, tx, dials) = (
             Arc::clone(net),
             self.net_tx.clone(),
@@ -6300,6 +6303,7 @@ impl Node {
                     let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
                 }
                 Err(e) => {
+                    net.board_told(&id);
                     let _ = tx
                         .send(NetEvent::ReachFailed {
                             peer: id,
@@ -7120,6 +7124,18 @@ impl Node {
                     )
                     .await;
                 }
+                // A node with no room to publish (one still joining, say) has nothing to wait for:
+                // the board knows it as far as it ever will before the join (`PublishDone` tells
+                // a board otherwise).
+                if !self
+                    .channels
+                    .keys()
+                    .any(|room| !self.withdrawn.contains_key(room))
+                {
+                    if let Some(net) = self.net.as_ref() {
+                        net.board_told(&peer);
+                    }
+                }
                 // An anchor that was away when a room was left or ended is told now, and is given
                 // each room's admin roster this node signs (V030-14).
                 let mut puts: Vec<Vec<u8>> = Vec::new();
@@ -7320,6 +7336,15 @@ impl Node {
                 holds_room,
             } => {
                 self.publishing.remove(&(channel_id, board));
+                // **The board knows this node now**: a circuit it refused as a stranger before its
+                // records were taken (a board that had restarted keeps none, in memory) is asked
+                // again. Reported as it was, `vox forward` said its cleanly stopped anchor had
+                // "authenticator invalid".
+                if holds_room {
+                    if let Some(net) = self.net.as_ref() {
+                        net.board_told(&board);
+                    }
+                }
                 // **Our own record refused as stale, from a fresh process: publish again just past
                 // the next second.** A board takes a replacement only with a later `timestamp`, in
                 // whole seconds (the one-change-a-second anti-spam bound, `nat::store`), and a
