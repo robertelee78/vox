@@ -241,10 +241,11 @@ fn store_file(dir: &Path) -> PathBuf {
 /// table held before, and the deleted row's length (`None`: there was no such row).
 fn delete_counter(dir: &Path) -> (Vec<String>, Option<usize>) {
     const META: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("meta");
-    // Opening fails while any vox process still holds the store: the staging (every process of
-    // alice's stopped) was not achieved.
+    // Opening fails while any vox process still holds the store. Every process of alice's has
+    // stopped by now, its daemon too: a store still held is the product's, a stop that leaves it
+    // held.
     let db = redb::Database::open(store_file(dir)).unwrap_or_else(|e| {
-        panic!("PRODUCT (staging): store still held, or unreadable, when it should be stopped: {e}")
+        panic!("PRODUCT: alice's store is still held, or unreadable, after every vox process of hers stopped: {e}")
     });
     let tx = db
         .begin_write()
@@ -360,6 +361,16 @@ fn a_deleted_consent_counter_releases_nothing_sealed_before_the_trust() {
     );
 
     // ---- the attack: delete the counter while every vox process of alice's is stopped ---------
+    // `vox tui` is a client of the data root's daemon (ADR-026 S-4): with none answering, it
+    // started one, detached, that outlives it and holds alice's store. Stopped here by its pid, as
+    // a person stops a daemon; a store still held after that is the product's.
+    match layout::daemon_pid(&alice) {
+        Some(pid) => println!(
+            "[proof] the daemon `vox tui` started still holds alice's store (pid {pid}): stopping it"
+        ),
+        None => println!("[proof] no daemon holds alice's data root after the TUI"),
+    }
+    layout::reap_daemon(&alice);
     let (rows, removed) = delete_counter(&alice);
     println!(
         "[proof] alice's meta rows before: {rows:?}; deleted {COUNTER_ROW:?}: {removed:?} bytes"
