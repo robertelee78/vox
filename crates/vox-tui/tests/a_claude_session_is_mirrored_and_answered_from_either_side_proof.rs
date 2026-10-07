@@ -888,16 +888,17 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
     // must be the harness, known by its executable's path from the kernel). The daemon's
     // `harnesses` file names the stand-in's executable, as it names a Claude Code installed
     // somewhere other than its native install; nothing else changes.
-    let exe = Command::new("/usr/sbin/lsof")
-        .args(["-a", "-p", &a.pid().to_string(), "-d", "txt", "-Fn"])
-        .output()
+    // Read from the kernel, as the daemon reads it: no `lsof`, which a sandbox may refuse to run.
+    #[cfg(target_os = "macos")]
+    let exe = i32::try_from(a.pid())
         .ok()
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .find_map(|l| l.strip_prefix('n').map(str::to_owned))
-        })
-        .unwrap_or_else(|| panic!("APPARATUS: the stand-in's executable is not known to lsof"));
+        .and_then(|pid| libproc::proc_pid::pidpath(pid).ok());
+    #[cfg(not(target_os = "macos"))]
+    let exe = std::fs::read_link(format!("/proc/{}/exe", a.pid()))
+        .ok()
+        .map(|p| p.display().to_string());
+    let exe = exe
+        .unwrap_or_else(|| panic!("APPARATUS: the kernel did not give the stand-in's executable"));
     std::fs::create_dir_all(&w.cfg)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make the config dir: {e}"));
     std::fs::write(w.cfg.join("harnesses"), format!("{exe}\n"))

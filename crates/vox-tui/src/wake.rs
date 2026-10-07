@@ -133,7 +133,7 @@ pub struct Session {
 
 /// What a hook's environment says of its tmux pane: claimed, not proven. The daemon proves it
 /// from the process table and tmux itself, since a hook may run where neither can be read (a
-/// sandbox refuses the setuid `ps`).
+/// sandbox).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TmuxClaim {
     /// `$TMUX`'s first field.
