@@ -673,7 +673,12 @@ pub struct ShareArgs {
     #[arg(required = true)]
     pub path: Option<PathBuf>,
     /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint
-    /// (`vox room roster`). Repeat for several. Without one, the share is for the whole room.
+    /// (`vox room roster`). Or address one session of a member as `<member>/<session>`, the
+    /// session named as `vox room sessions` names it: its id, 8 or more of its first
+    /// characters, or its name. A session that has ended is refused. Repeat for several.
+    /// Without one, the share is for the whole room.
+    ///
+    /// For example: `--to bob/gso-cap`
     #[arg(long)]
     pub to: Vec<String>,
     /// May interrupt the addressed members' agents mid-turn.
@@ -1233,7 +1238,12 @@ pub struct RoomPostArgs {
     #[arg(long)]
     pub attempt: Option<String>,
     /// Address a member of the room: your name for it (`vox trust list`) or its fingerprint
-    /// (`vox room roster`). Repeat for several. A name that is no member is refused.
+    /// (`vox room roster`). Or address one session of a member as `<member>/<session>`, the
+    /// session named as `vox room sessions` names it: its id, 8 or more of its first
+    /// characters, or its name. Repeat for several. A name that is no member is refused, and
+    /// so is a session that has ended.
+    ///
+    /// For example: `--to bob/gso-cap`
     #[arg(long)]
     pub to: Vec<String>,
     /// May interrupt the addressed members' agents mid-turn.
