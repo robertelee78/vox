@@ -377,11 +377,6 @@ pub async fn show(
             &s.id,
         )
     };
-    // An ended Session stays readable (ADR-029 SE-5).
-    let row = vox_core::node::sessions::resolve(&sessions, session, true, label_of)
-        .map_err(AppError::Usage)?;
-    let label = label_of(row);
-    let state = if row.open { "open" } else { "ended" };
     let rows = match client
         .request(&Request::SessionEntries { channel_id })
         .await
@@ -397,10 +392,51 @@ pub async fn show(
             .and_then(|v| v.get("kind").and_then(Value::as_str).map(str::to_owned))
             .unwrap_or_default()
     };
+    // An ended Session stays readable (ADR-029 SE-5).
+    let (id, node, label, state, can_drive) =
+        match vox_core::node::sessions::resolve(&sessions, session, true, label_of) {
+            Ok(row) => (
+                row.id.clone(),
+                row.node,
+                label_of(row),
+                if row.open { "open" } else { "ended" },
+                row.can_drive,
+            ),
+            // Entries this node can open, of a Session whose opening it does not hold yet: the
+            // opening is a room message, and the entries are sealed apart (SC-2), so either can
+            // arrive first. They are shown, named by their node and id, never guessed: one
+            // session id, matched whole or by 8 characters or more.
+            Err(refused) => {
+                let typed = session.trim();
+                let mut found: Vec<(&str, Digest32)> = rows
+                    .iter()
+                    .filter(|r| kind(r) != "drive")
+                    .filter(|r| {
+                        r.session_id == typed
+                            || (typed.chars().count() >= 8 && r.session_id.starts_with(typed))
+                    })
+                    .map(|r| (r.session_id.as_str(), r.author))
+                    .collect();
+                found.sort_unstable();
+                found.dedup();
+                let [(id, node)] = found.as_slice() else {
+                    return Err(AppError::Usage(refused));
+                };
+                let label =
+                    vox_agentcomms::envelope::session_label(&crate::ident::name_of(node), None, id);
+                (
+                    (*id).to_owned(),
+                    *node,
+                    label,
+                    "opening not received yet",
+                    true,
+                )
+            }
+        };
     // The Session's own entries are its node's; a driver's entries name the session too.
     let mut mine: Vec<SessionRow> = rows
         .into_iter()
-        .filter(|r| r.session_id == row.id && (r.author == row.node || kind(r) == "drive"))
+        .filter(|r| r.session_id == id && (r.author == node || kind(r) == "drive"))
         .collect();
     // In the order the entries were written: each author's send time, and within one moment the
     // session node's own numbering (a split entry's parts share a millisecond).
@@ -414,13 +450,13 @@ pub async fn show(
     use std::io::Write as _;
     // A member without drive holds the entries but cannot open them (SC-2, SC-3): it is told whose
     // trust it lacks, never shown an empty Session.
-    if !row.can_drive && mine.iter().all(|r| r.author != row.node) {
+    if !can_drive && mine.iter().all(|r| r.author != node) {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "{label} · {state}");
         let _ = writeln!(
             out,
             "Only members {} trusts with drive see inside this Session.",
-            crate::ident::name_of(&row.node)
+            crate::ident::name_of(&node)
         );
         return Ok(());
     }

@@ -22,7 +22,7 @@
 //!
 //! **Which side a red is on.** What `vox room session` printed, or what the hook printed or did
 //! not do, is `PRODUCT:`. Setup that the product refused (`vox node create`, the room, trust) is
-//! `PRODUCT (staging):` with what it said; a fixture this proof could not make is `APPARATUS:`.
+//! `APPARATUS (staging):` with what it said; a fixture this proof could not make is `APPARATUS:`.
 //!
 //! **Mutations that must turn it red:** the turn's end not mirrored (`Stop` gives no `turn-end`)
 //! → no "— turn ended —" line (#540); a request retired by its waiting hook's release rather than
@@ -32,6 +32,9 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -96,6 +99,12 @@ impl World {
     }
 
     fn vox(&self, node: &str, args: &[&str], input: Option<&str>) -> (bool, String, String) {
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&self.command(node, args));
+            return (ok, shown.clone(), shown);
+        }
         let mut child = self
             .command(node, args)
             .stdin(if input.is_some() {
@@ -126,7 +135,7 @@ impl World {
         let (ok, out, err) = self.vox(node, args, input);
         assert!(
             ok,
-            "PRODUCT (staging): `vox {}` as {node} failed: {out}{err}",
+            "APPARATUS (staging): `vox {}` as {node} failed: {out}{err}",
             args.join(" ")
         );
         out
@@ -265,7 +274,7 @@ impl World {
         let daemon = Daemon(w.data.clone());
         assert!(
             ok,
-            "PRODUCT (staging): `vox node attach {PERSON}` failed: {out}{err}"
+            "APPARATUS (staging): `vox node attach {PERSON}` failed: {out}{err}"
         );
         w.staged(AGENT, &["node", "attach", AGENT], None);
         let person_fp = w.staged(PERSON, &["id"], None).trim().to_owned();
@@ -279,7 +288,9 @@ impl World {
         let room = list
             .split_whitespace()
             .next()
-            .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` shows no room: {list:?}"))
+            .unwrap_or_else(|| {
+                panic!("APPARATUS (staging): `vox room list` shows no room: {list:?}")
+            })
             .to_owned();
         let link = w
             .staged(PERSON, &["room", "link", &room], None)
@@ -734,7 +745,7 @@ fn session_listed(w: &World, room: &str, session: &str) {
         }
         assert!(
             t0.elapsed() < Duration::from_secs(60),
-            "PRODUCT (staging): within 60 s, {PERSON} never saw Session {session} listed: {out}"
+            "APPARATUS (staging): within 60 s, {PERSON} never saw Session {session} listed: {out}"
         );
         std::thread::sleep(Duration::from_millis(300));
     }

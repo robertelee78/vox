@@ -39,7 +39,7 @@
 //!
 //! **Which side a red is on.** What `vox room session` printed, what the stand-in app-server
 //! received, and the calls the hosted plugin made are `PRODUCT:`. Setup the product refused (`vox
-//! node create`, the room, trust) is `PRODUCT (staging):` with what it said; a fixture this proof
+//! node create`, the room, trust) is `APPARATUS (staging):` with what it said; a fixture this proof
 //! could not make, or `node` missing, is `APPARATUS:` / `CANNOT MEASURE`.
 //!
 //! **Mutations that must turn it red**, one per claim: a closed thread not subscribed again (#541,
@@ -51,6 +51,9 @@
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
+
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -137,6 +140,12 @@ impl World {
     }
 
     fn vox(&self, node: &str, args: &[&str], input: Option<&str>) -> (bool, String, String) {
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&self.command(node, args));
+            return (ok, shown.clone(), shown);
+        }
         let mut child = self
             .command(node, args)
             .stdin(if input.is_some() {
@@ -167,7 +176,7 @@ impl World {
         let (ok, out, err) = self.vox(node, args, input);
         assert!(
             ok,
-            "PRODUCT (staging): `vox {}` as {node} failed: {out}{err}",
+            "APPARATUS (staging): `vox {}` as {node} failed: {out}{err}",
             args.join(" ")
         );
         out
@@ -235,7 +244,7 @@ fn world(agents: &[&str]) -> (World, Daemon) {
     let daemon = Daemon(w.data.clone());
     assert!(
         ok,
-        "PRODUCT (staging): `vox node attach {PERSON}` failed: {out}{err}"
+        "APPARATUS (staging): `vox node attach {PERSON}` failed: {out}{err}"
     );
     for node in &nodes[1..] {
         w.staged(node, &["node", "attach", node], None);
@@ -249,7 +258,7 @@ fn world(agents: &[&str]) -> (World, Daemon) {
     w.room = list
         .split_whitespace()
         .next()
-        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` shows no room: {list:?}"))
+        .unwrap_or_else(|| panic!("APPARATUS (staging): `vox room list` shows no room: {list:?}"))
         .to_owned();
     let link = w
         .staged(PERSON, &["room", "link", &w.room], None)

@@ -35,6 +35,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -70,6 +73,19 @@ struct Member {
 
 impl Member {
     fn vox(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13): the passphrase file's first line, typed at the prompt.
+        if typed::is_keyring_change(args) {
+            let mut cmd = Command::new(VOX);
+            cmd.args(args)
+                .env("VOX_DATA_DIR", &self.data)
+                .env("VOX_CONFIG_DIR", self.data.join("cfg"))
+                .env_remove("VOX_ROOM")
+                .env_remove("VOX_SESSION")
+                .env_remove("VOX_ROOM_PASSPHRASE");
+            let (ok, shown) = typed::keyring(&cmd);
+            return (ok, shown.clone(), shown);
+        }
         let mut child = Command::new(VOX)
             .args(args)
             .env("VOX_DATA_DIR", &self.data)
@@ -92,7 +108,7 @@ impl Member {
                 .take()
                 .expect("APPARATUS: vox's stdin")
                 .write_all(text.as_bytes())
-                .expect("PRODUCT (staging): vox exited without reading its stdin");
+                .expect("APPARATUS (staging): vox exited without reading its stdin");
         }
         let out = child.wait_with_output().expect("APPARATUS: wait for vox");
         let r = (
@@ -136,7 +152,7 @@ impl Member {
         let (ok, o, e) = self.vox(&args, None);
         assert!(
             ok,
-            "PRODUCT (staging): {} could not trust {}: {o}{e}",
+            "APPARATUS (staging): {} could not trust {}: {o}{e}",
             self.name, other.name
         );
     }
@@ -175,7 +191,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
         _daemon: None,
     };
     let (ok, out, err) = m.vox(&["id", "--identity-passphrase-file", m.pass()], None);
-    assert!(ok, "PRODUCT (staging): {name}: vox id: {err}");
+    assert!(ok, "APPARATUS (staging): {name}: vox id: {err}");
     m.fp = out.trim().to_owned();
     assert_eq!(
         m.fp.len(),
@@ -202,7 +218,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     while !m.vox(&["room", "list"], None).0 {
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): {name}'s daemon never answered"
+            "APPARATUS (staging): {name}'s daemon never answered"
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -236,7 +252,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
         }
         assert!(
             Instant::now() < deadline,
-            "PRODUCT (staging): the anchor never printed its spec"
+            "APPARATUS (staging): the anchor never printed its spec"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -276,13 +292,13 @@ fn until(within: Duration, ok: impl Fn() -> bool) -> bool {
 /// The id `vox room list` prints for the room named `name`.
 fn room_id(m: &Member, name: &str) -> String {
     let (ok, list, e) = m.vox(&["room", "list"], None);
-    assert!(ok, "PRODUCT (staging): {}'s room list: {e}", m.name);
+    assert!(ok, "APPARATUS (staging): {}'s room list: {e}", m.name);
     list.lines()
         .find(|l| l.split_whitespace().any(|w| w == name))
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or_else(|| {
             panic!(
-                "PRODUCT (staging): {name} is not in {}'s list: {list}",
+                "APPARATUS (staging): {name} is not in {}'s list: {list}",
                 m.name
             )
         })
@@ -296,8 +312,8 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
             .iter()
             .map(|(id, _, _, _)| *id)
             .find(|id| vox_core::node::link::b32_encode(id).starts_with(short))
-            .unwrap_or_else(|| panic!("PRODUCT (staging): the room is not on {}'s node", m.name)),
-        other => panic!("PRODUCT (staging): {}'s rooms: {other:?}", m.name),
+            .unwrap_or_else(|| panic!("APPARATUS (staging): the room is not on {}'s node", m.name)),
+        other => panic!("APPARATUS (staging): {}'s rooms: {other:?}", m.name),
     }
 }
 
@@ -355,10 +371,10 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         &["room", "create", "--passphrase-file", "-", "--name", "repo"],
         Some(&format!("{ROOM_PASS}\n")),
     );
-    assert!(ok, "PRODUCT (staging): vox room create failed: {e}");
+    assert!(ok, "APPARATUS (staging): vox room create failed: {e}");
     let room = room_id(&alice, "repo");
     let (ok, link, e) = alice.vox(&["room", "link", &room], None);
-    assert!(ok, "PRODUCT (staging): vox room link failed: {e}");
+    assert!(ok, "APPARATUS (staging): vox room link failed: {e}");
     for m in [&bob, &carol] {
         let (ok, o, e) = m.vox(
             &["room", "join", "--passphrase-file", "-", link.trim()],
@@ -373,7 +389,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     assert!(
         posts_until_read(&alice, &bob, &room, "READY-BOB")
             && posts_until_read(&alice, &carol, &room, "READY-CAROL"),
-        "PRODUCT (staging): bob and carol never read alice's room messages"
+        "APPARATUS (staging): bob and carol never read alice's room messages"
     );
     let id = channel_id(&rt, &alice, &room);
 
@@ -407,7 +423,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     );
     assert!(
         carol_synced && carol_holds as usize >= ENTRIES,
-        "PRODUCT (staging): carol's node never held the log past alice's Session entries ({carol_holds} \
+        "APPARATUS (staging): carol's node never held the log past alice's Session entries ({carol_holds} \
          new entries, synced {carol_synced}), so her opening none would say nothing"
     );
     assert!(
@@ -462,7 +478,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     );
     assert!(
         bob_synced,
-        "PRODUCT (staging): bob never read alice's room message after the later Session entries, \
+        "APPARATUS (staging): bob never read alice's room message after the later Session entries, \
          so his opening none of them would say nothing"
     );
     assert!(
