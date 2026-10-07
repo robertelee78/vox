@@ -564,7 +564,8 @@ pub fn attach_passphrase(
 pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppError> {
     // The node's own clock, a test step included (V210-64): an identity made here is stamped as
     // the node making it would have stamped it.
-    let now = (vox_core::time::clock_with_test_skew())();
+    let now_ms = (vox_core::time::clock_with_test_skew())();
+    let now = now_ms / 1_000;
     // **A wait is said, once, after a second** (V210-100): another vox making this node's identity
     // holds its directory, and one stopped (Ctrl-Z) holds it until resumed; this one waiting with
     // nothing on the screen looked hung.
@@ -581,7 +582,7 @@ pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppE
         Ok(p) => {
             let signer = p.signer()?;
             let dh_secret = *signer.x25519_identity_secret();
-            vox_core::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now)?;
+            vox_core::node::prekeys::load_or_create(p.store(), signer, &dh_secret, now_ms)?;
             Ok(p.fingerprint())
         }
         // Waited the whole patience and the holder is still not done: say what holds it and how to

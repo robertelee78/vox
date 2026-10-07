@@ -56,8 +56,9 @@ pub const PEER_BOOK_META_KEY: &str = "peer-book";
 /// a different id, so neither can be opened as the other.
 const PEER_BOOK_SEGMENT_ID: u64 = 1;
 
-/// Encoding version of the book body.
-const PEER_BOOK_VERSION: u64 = 1;
+/// Encoding version of the book body: 2 keeps each sighting in unix milliseconds. A version-1
+/// book, kept in seconds, is still read, its times taken ×1000.
+const PEER_BOOK_VERSION: u64 = 2;
 
 /// Addresses kept per member.
 pub const MAX_ADDRS_PER_PEER: usize = 4;
@@ -68,7 +69,7 @@ pub const MAX_PEERS: usize = 4096;
 /// How stale a kept address's time may grow before a fresh sighting is worth a write. Seeing
 /// the same address again is not news; persisting every connection would write the store on
 /// every reconnect for nothing.
-pub const REFRESH_SECS: u64 = 600;
+pub const REFRESH_MS: u64 = 600_000;
 
 fn peer_book_sek(signer: &dyn RootSigner) -> Result<Sek> {
     use crate::atrest::idfactor::{IdentityFactor, SignatureIdentityFactor};
@@ -82,7 +83,8 @@ fn peer_book_sek(signer: &dyn RootSigner) -> Result<Sek> {
     Ok(Sek::from_bytes(key))
 }
 
-/// Where each member was last reached: `(address, last seen, unix seconds)`, most recent first.
+/// Where each member was last reached: `(address, last seen, unix milliseconds)`, most recent
+/// first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PeerBook {
     peers: BTreeMap<Digest32, Vec<(SocketAddr, u64)>>,
@@ -95,10 +97,10 @@ impl PeerBook {
         Self::default()
     }
 
-    /// Record that `peer` was reached directly at `addr` at `now`. Returns whether the book
+    /// Record that `peer` was reached directly at `addr` at `now_ms`. Returns whether the book
     /// changed enough to be worth saving: a new address, or a known one last seen more than
-    /// [`REFRESH_SECS`] ago.
-    pub fn note(&mut self, peer: Digest32, addr: SocketAddr, now: u64) -> bool {
+    /// [`REFRESH_MS`] ago.
+    pub fn note(&mut self, peer: Digest32, addr: SocketAddr, now_ms: u64) -> bool {
         if !self.peers.contains_key(&peer) && self.peers.len() >= MAX_PEERS {
             // Forget whoever was seen longest ago.
             if let Some(oldest) = self
@@ -114,11 +116,11 @@ impl PeerBook {
         let changed = match addrs.iter().position(|(a, _)| *a == addr) {
             Some(i) => {
                 let (_, seen) = addrs.remove(i);
-                now.saturating_sub(seen) >= REFRESH_SECS || i != 0
+                now_ms.saturating_sub(seen) >= REFRESH_MS || i != 0
             }
             None => true,
         };
-        addrs.insert(0, (addr, now));
+        addrs.insert(0, (addr, now_ms));
         addrs.truncate(MAX_ADDRS_PER_PEER);
         changed
     }
@@ -166,11 +168,14 @@ impl PeerBook {
     pub fn from_bytes(b: &[u8]) -> Result<Self> {
         let bad = |what| Error::MalformedAtRest(what);
         let mut d = Decoder::new(b);
-        if d.array().map_err(|_| bad("peer book"))? != 2
-            || d.uint().map_err(|_| bad("peer book version"))? != PEER_BOOK_VERSION
-        {
+        if d.array().map_err(|_| bad("peer book"))? != 2 {
             return Err(bad("peer book version"));
         }
+        let per_unit = match d.uint().map_err(|_| bad("peer book version"))? {
+            PEER_BOOK_VERSION => 1,
+            1 => 1_000,
+            _ => return Err(bad("peer book version")),
+        };
         let n = d.array().map_err(|_| bad("peer book len"))?;
         if n > MAX_PEERS {
             return Err(Error::SizeLimitExceeded("peer book"));
@@ -197,7 +202,7 @@ impl PeerBook {
                     .parse()
                     .map_err(|_| bad("peer book addr parse"))?;
                 let seen = d.uint().map_err(|_| bad("peer book seen"))?;
-                addrs.push((addr, seen));
+                addrs.push((addr, seen.saturating_mul(per_unit)));
             }
             peers.insert(peer, addrs);
         }

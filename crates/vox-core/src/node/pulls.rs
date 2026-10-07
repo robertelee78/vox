@@ -132,8 +132,8 @@ struct Offer {
     sha256: String,
     tag: String,
     http: bool,
-    /// When it was announced, seconds.
-    created: u64,
+    /// When it was announced, milliseconds.
+    created_ms: u64,
     /// How many files a folder lists (ADR-028 F-8); `None` for a file. Its list is fetched from
     /// the sharer, and taken only if its SHA-256 is `sha256`.
     files: Option<u64>,
@@ -148,8 +148,8 @@ pub struct Pulled {
     pub entry: Digest32,
     /// Where the verified copy is.
     pub path: PathBuf,
-    /// When it was announced, seconds.
-    pub created: u64,
+    /// When it was announced, milliseconds.
+    pub created_ms: u64,
     /// For a folder (ADR-028 F-8): who shared it and under what name, so pulling it again goes
     /// to the same place; `None` for a file.
     pub folder: Option<(Digest32, String)>,
@@ -164,7 +164,7 @@ impl Pulled {
             "room": b32_encode(&self.room),
             "entry": b32_encode(&self.entry),
             "path": self.path.to_string_lossy(),
-            "created": self.created,
+            "created_ms": self.created_ms,
         });
         if let Some((author, name)) = &self.folder {
             v["author"] = b32_encode(author).into();
@@ -203,7 +203,15 @@ impl Pulled {
             room: b32_decode(s("room")?, "pull record room").ok()?,
             entry: b32_decode(s("entry")?, "pull record entry").ok()?,
             path: PathBuf::from(s("path")?),
-            created: v.get("created").and_then(serde_json::Value::as_u64)?,
+            // Milliseconds; a record written before held whole seconds as `created`.
+            created_ms: v
+                .get("created_ms")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    v.get("created")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|secs| secs.saturating_mul(1_000))
+                })?,
             folder,
             files,
         })
@@ -394,10 +402,9 @@ pub(crate) struct Pulls {
     pending: Mutex<BTreeMap<Digest32, State>>,
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// The node's clock in milliseconds, a test step included, as the node's own clock has it.
+fn now_ms() -> u64 {
+    (crate::time::clock_with_test_skew())()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -443,6 +450,38 @@ pub async fn pull_driven(
     }
     let dir = room_dir(paths, &driven.room);
     crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+    // **From this node itself** (a node driving its own Session, ADR-029 SC-2): no tunnel runs
+    // from a node to itself, so the file is copied from where its share serves it, and held to
+    // what the drive named as a pull is.
+    if handle.view().identity.map(|i| i.fingerprint) == Some(driven.from) {
+        let (served, size, served_sha) = handle
+            .shares()
+            .served_file(&driven.room, &driven.tag)
+            .await
+            .ok_or("this node does not serve that file")?;
+        if size != driven.size || served_sha != sha {
+            return Err("the file this node serves is not the one the drive named".into());
+        }
+        let name = safe_file_name(&driven.name);
+        let part = dir.join(format!(
+            ".{name}.{}.part",
+            hex(&crate::hash::sha256(driven.tag.as_bytes())[..8])
+        ));
+        let copied = {
+            let (part, sha) = (part.clone(), sha.clone());
+            tokio::task::spawn_blocking(move || copy_checked(&served, &part, size, &sha))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+        };
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+        let placed = place(&part, &dir, &name);
+        let _ = std::fs::remove_file(&part);
+        return placed;
+    }
     let offer = Offer {
         room: driven.room,
         entry: crate::hash::sha256(driven.tag.as_bytes()),
@@ -452,7 +491,7 @@ pub async fn pull_driven(
         sha256: sha,
         tag: driven.tag.clone(),
         http: true,
-        created: now_secs(),
+        created_ms: now_ms(),
         files: None,
     };
     let bound = match handle
@@ -480,6 +519,39 @@ pub async fn pull_driven(
     let placed = place(&part, &dir, &name);
     let _ = std::fs::remove_file(&part);
     placed
+}
+
+/// Copy `from` to `to`, holding it to `size` bytes and SHA-256 `sha` as a pull's bytes are held.
+fn copy_checked(from: &Path, to: &Path, size: u64, sha: &str) -> Result<(), String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let mut src =
+        std::fs::File::open(from).map_err(|e| format!("reading {}: {e}", from.display()))?;
+    let mut dst =
+        std::fs::File::create(to).map_err(|e| format!("writing {}: {e}", to.display()))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = src.read(&mut buf).map_err(|e| format!("reading: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > size {
+            return Err("the file is longer than the drive named".into());
+        }
+        hasher.update(&buf[..n]);
+        dst.write_all(&buf[..n])
+            .map_err(|e| format!("writing: {e}"))?;
+    }
+    dst.sync_all().map_err(|e| format!("writing: {e}"))?;
+    if total != size || hex(&hasher.finalize()) != sha {
+        return Err(format!(
+            "the file does not match what the drive named: expected sha256 {sha} over {size} bytes"
+        ));
+    }
+    Ok(())
 }
 
 /// The share `text` announces, if it is one this node may pull: a `file` announcement addressed to
@@ -616,7 +688,7 @@ impl Pulls {
 
     /// Look over every open room, and start what is due.
     async fn scan(self: Arc<Self>) {
-        let now = now_secs();
+        let now = now_ms();
         let mut found: Vec<Offer> = Vec::new();
         let mut never: Vec<Digest32> = Vec::new();
         {
@@ -645,9 +717,11 @@ impl Pulls {
                     };
                     // Its age runs from the author's time, never later than now (retention.rs):
                     // a future-dated share must not outlive its message.
-                    let created = (r.created_millis / 1000).min(now);
+                    let created = r.created_millis.min(now);
                     // Expired under the room's retention: there is nothing left to pull.
-                    if d.retention > 0 && now >= created.saturating_add(d.retention) {
+                    if d.retention > 0
+                        && now >= created.saturating_add(d.retention.saturating_mul(1_000))
+                    {
                         never.push(r.entry_hash);
                         continue;
                     }
@@ -664,7 +738,7 @@ impl Pulls {
                         sha256,
                         tag,
                         http,
-                        created,
+                        created_ms: created,
                         files,
                     });
                 }
@@ -679,8 +753,10 @@ impl Pulls {
                         never.push(r.entry_hash);
                         continue;
                     };
-                    let created = (r.created_millis / 1000).min(now);
-                    if d.retention > 0 && now >= created.saturating_add(d.retention) {
+                    let created = r.created_millis.min(now);
+                    if d.retention > 0
+                        && now >= created.saturating_add(d.retention.saturating_mul(1_000))
+                    {
                         never.push(r.entry_hash);
                         continue;
                     }
@@ -696,7 +772,7 @@ impl Pulls {
                         sha256,
                         tag,
                         http,
-                        created,
+                        created_ms: created,
                         files,
                     });
                 }
@@ -808,7 +884,7 @@ impl Pulls {
                 room: offer.room,
                 entry: offer.entry,
                 path,
-                created: offer.created,
+                created_ms: offer.created_ms,
                 folder: None,
                 files: Vec::new(),
             },
@@ -837,7 +913,7 @@ impl Pulls {
             room: offer.room,
             entry: offer.entry,
             path: dir.clone(),
-            created: offer.created,
+            created_ms: offer.created_ms,
             folder: Some((offer.author, safe_file_name(&offer.name))),
             files: Vec::new(),
         };
@@ -867,7 +943,7 @@ impl Pulls {
     /// Delete every pulled copy whose message has expired here, and its record (ADR-028 F-5).
     /// A room this node does not hold open is left until it does: its retention is not known.
     fn expire(&self) {
-        let now = now_secs();
+        let now = now_ms();
         // Read before the view is borrowed: a borrow held holds up the node's next view. A folder
         // pull cut short is one too: its files go with its message.
         let mut all = records(&self.paths);
@@ -885,7 +961,9 @@ impl Pulls {
                     view.open_channels.iter().any(|d| {
                         d.channel_id == p.room
                             && d.retention > 0
-                            && now >= p.created.saturating_add(d.retention)
+                            && now
+                                >= p.created_ms
+                                    .saturating_add(d.retention.saturating_mul(1_000))
                     })
                 })
                 .cloned()

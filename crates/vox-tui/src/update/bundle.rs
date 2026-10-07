@@ -226,10 +226,10 @@ const RETIRED_PREFIX: &str = ".Vox.app.retired.";
 
 /// Rename `bundle` aside as retired: a daemon not restarted since an earlier update runs from it.
 fn retire(apps: &Path, bundle: &Path) -> Result<(), AppError> {
-    let secs = std::time::SystemTime::now()
+    let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let name = format!("{RETIRED_PREFIX}{secs}.{}", std::process::id());
+        .map_or(0, |d| d.as_millis());
+    let name = format!("{RETIRED_PREFIX}{ms}.{}", std::process::id());
     fs::rename(bundle, apps.join(name)).map_err(AppError::Io)
 }
 

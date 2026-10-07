@@ -55,16 +55,27 @@ pub fn parse_duration(text: &str) -> Option<u64> {
     n.checked_mul(scale)
 }
 
-/// A retention as a person reads it: the named durations by name, anything else in seconds.
+/// A retention as a person reads it: a whole count of the largest unit that divides it evenly,
+/// `2 weeks` for `2w` (it said `1209600 seconds`: only one of each unit had a name).
 #[must_use]
 pub fn describe(secs: u64) -> String {
-    match secs {
-        0 => "forever".into(),
-        HOUR => "1 hour".into(),
-        WEEK => "1 week".into(),
-        MONTH => "1 month".into(),
-        s => format!("{s} seconds"),
+    if secs == 0 {
+        return "forever".into();
     }
+    let units = [
+        (MONTH, "month"),
+        (WEEK, "week"),
+        (24 * HOUR, "day"),
+        (HOUR, "hour"),
+        (60, "minute"),
+        (1, "second"),
+    ];
+    let (size, name) = units
+        .into_iter()
+        .find(|(size, _)| secs.is_multiple_of(*size))
+        .unwrap_or((1, "second"));
+    let n = secs / size;
+    format!("{n} {name}{}", if n == 1 { "" } else { "s" })
 }
 
 /// The shorter of two retentions, where `0` means forever and so never wins.
@@ -208,19 +219,20 @@ impl RetentionConfig {
 pub(crate) struct Tracked {
     /// The entry's `LogDb` segment id.
     pub log_id: u64,
-    /// When this node first saw it, seconds.
-    pub first_seen: u64,
-    /// The author's claimed time in seconds, once this node has read it.
-    pub claimed: Option<u64>,
+    /// When this node first saw it, milliseconds since the Unix epoch.
+    pub first_seen_ms: u64,
+    /// The author's claimed time in milliseconds, once this node has read it.
+    pub claimed_ms: Option<u64>,
     /// Its plaintext cache row, once rendered.
     pub cache_id: Option<u64>,
 }
 
 impl Tracked {
-    /// The instant its age runs from: the claim, clamped to no later than first sight.
+    /// The instant its age runs from, milliseconds: the claim, clamped to no later than first
+    /// sight.
     pub fn base(&self) -> u64 {
-        self.claimed
-            .map_or(self.first_seen, |c| c.min(self.first_seen))
+        self.claimed_ms
+            .map_or(self.first_seen_ms, |c| c.min(self.first_seen_ms))
     }
 }
 
@@ -240,10 +252,10 @@ impl RetentionIndex {
         self.live.insert(hash, tracked);
     }
 
-    /// Record that the body was read: its claimed time and its cache row.
-    pub fn rendered(&mut self, hash: &Digest32, claimed: u64, cache_id: u64) {
+    /// Record that the body was read: its claimed time, milliseconds, and its cache row.
+    pub fn rendered(&mut self, hash: &Digest32, claimed_ms: u64, cache_id: u64) {
         if let Some(mut t) = self.live.get(hash).copied() {
-            t.claimed = Some(claimed);
+            t.claimed_ms = Some(claimed_ms);
             t.cache_id = Some(cache_id);
             self.track(*hash, t);
         }
@@ -261,12 +273,12 @@ impl RetentionIndex {
         Some(t)
     }
 
-    /// Remove and return every entry whose age base is at or before `cutoff`.
-    pub fn take_due(&mut self, cutoff: u64) -> Vec<(Digest32, Tracked)> {
+    /// Remove and return every entry whose age base is at or before `cutoff_ms`.
+    pub fn take_due(&mut self, cutoff_ms: u64) -> Vec<(Digest32, Tracked)> {
         let due: Vec<Digest32> = self
             .by_age
             .iter()
-            .take_while(|(base, _)| *base <= cutoff)
+            .take_while(|(base, _)| *base <= cutoff_ms)
             .map(|(_, h)| *h)
             .collect();
         due.into_iter()

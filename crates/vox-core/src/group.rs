@@ -75,5 +75,5 @@ pub use history::OriginKeyStore;
 pub use message::{GroupMessage, MessageHeader};
 pub use senderkey::{ChainKey, SenderKeyCrossSig, SenderKeySigningKey, CHAIN_KEY_LEN};
 pub use skdm::{Skdm, SkdmBody};
-pub use state::{ReceiverChain, SenderChain, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_SECS};
+pub use state::{ReceiverChain, SenderChain, ROTATE_AFTER_MESSAGES, ROTATE_AFTER_MS};
 pub use wire::{SENDER_KEY_SIGNING_PUB_LEN, SENDER_KEY_SIGN_DOMAIN};

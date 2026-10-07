@@ -30,6 +30,21 @@ pub enum Error {
         version: u8,
     },
 
+    /// A struct from a Vox whose times were in seconds, refused rather than read in the wrong
+    /// unit (a board record: it expires anyway, and every node upgrades together).
+    #[error(
+        "a {what} from an older Vox (format {version}, its times in seconds); this Vox reads \
+         format {current}, in milliseconds"
+    )]
+    OlderFormat {
+        /// What it is, for a person.
+        what: &'static str,
+        /// The format it came in.
+        version: u8,
+        /// The format this build reads.
+        current: u8,
+    },
+
     /// An `algo_id` (u16) was not found in the ADR-003 registry.
     #[error("unknown algorithm id {0:#06x}")]
     UnknownAlgoId(u16),

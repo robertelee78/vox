@@ -63,7 +63,7 @@ enum Daemon {
     }
 
     /// The login item's last word on why it would not start, with when: its daemon writes it to
-    /// `~/Library/Logs/Vox/login-item.log` (as `<unix seconds> <reason>`) and ends, rather than
+    /// `~/Library/Logs/Vox/login-item.log` (as `<unix milliseconds> <reason>`) and ends, rather than
     /// being started again every ten seconds.
     static func loginItemSaid() -> String? {
         let home = ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()
@@ -71,8 +71,8 @@ enum Daemon {
         guard let text = try? String(contentsOf: log, encoding: .utf8),
               let last = text.split(separator: "\n").last(where: { !$0.isEmpty }) else { return nil }
         let parts = last.split(separator: " ", maxSplits: 1)
-        guard parts.count == 2, let secs = Double(parts[0]) else { return String(last) }
-        let when = Date(timeIntervalSince1970: secs).formatted(date: .abbreviated, time: .shortened)
+        guard parts.count == 2, let ms = Double(parts[0]) else { return String(last) }
+        let when = Date(timeIntervalSince1970: ms / 1_000).formatted(date: .abbreviated, time: .shortened)
         return "\(parts[1]) (\(when))"
     }
 

@@ -8,25 +8,39 @@
 
 use std::sync::Arc;
 
-/// A wall-clock source (seconds since the Unix epoch).
+/// A wall-clock source, **milliseconds** since the Unix epoch (the decider, 2026-10-07: every time
+/// Vox stores, sends, compares, orders or expires is in milliseconds; it is rounded only when shown
+/// to a person). A format that is specified in seconds (OpenPGP's key creation time) converts at
+/// that boundary, with [`Ms::secs`].
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-/// The system clock.
-#[must_use]
-pub fn system_clock() -> Clock {
-    Arc::new(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs())
-    })
+/// A wall-clock instant, milliseconds since the Unix epoch: what the node's APIs take, so a value
+/// in seconds cannot be passed for one in milliseconds without the compiler seeing it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ms(pub u64);
+
+impl Ms {
+    /// Whole seconds, rounded down: for a format specified in seconds, never to compare.
+    #[must_use]
+    pub fn secs(self) -> u64 {
+        self.0 / 1_000
+    }
+
+    /// The milliseconds.
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
 }
 
-/// A wall-clock source in **milliseconds** since the Unix epoch.
-///
-/// Deliberately a second seam rather than a change to [`Clock`]. Ten call sites feed `Clock`
-/// straight into ADR-012 record TTLs, ADR-011 session records and connection retirement grace, all
-/// specified in seconds; repurposing it would make every one of them silently wrong by a factor of
-/// a thousand — no compiler error, records expiring a thousand times too early or too late.
+/// The system clock, in milliseconds, from a single read.
+#[must_use]
+pub fn system_clock() -> Clock {
+    system_millis_clock()
+}
+
+/// The node's second clock, also in milliseconds: the one a message's claimed time is read from,
+/// which [`TEST_CLOCK_SKEW_ENV`] moves while [`Clock`] stays (a skewed author, not a skewed node).
 ///
 /// Injected for the same reason `Clock` is: so a test can pin it.
 pub type MillisClock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -57,16 +71,15 @@ pub fn system_millis_clock() -> MillisClock {
     })
 }
 
-/// [`system_clock`], shifted by [`TEST_CLOCK_STEP_ENV`] in whole seconds (rounded down).
+/// [`system_clock`], shifted by [`TEST_CLOCK_STEP_ENV`] milliseconds.
 /// **Test-only: for proofs; nothing in a real deployment sets it**, and without the `test-knobs`
 /// feature (V210-105) it is the system clock.
 ///
-/// **A clock step moves both clocks** (V210-64): the seconds a record is stamped with as well as
-/// the milliseconds that floor its `seq`, and a board refuses a record that is behind on either.
-/// Moving only the milliseconds proved half the cure. It has its own knob, apart from
-/// [`TEST_CLOCK_SKEW_ENV`], because the v0.3.0 proofs that skew a message's claimed time by an
-/// hour or by ten years must not move the seconds clock: that would make the node unreachable,
-/// which is a different test.
+/// **A clock step moves both clocks** (V210-64): this one, which stamps records, as well as the
+/// one that floors a record's `seq`; a board refuses a record that is behind on either. It has
+/// its own knob, apart from [`TEST_CLOCK_SKEW_ENV`], because the proofs that skew a message's
+/// claimed time by an hour or by ten years must not move this clock: that would make the node
+/// unreachable, which is a different test.
 #[must_use]
 pub fn clock_with_test_skew() -> Clock {
     let step = env_ms(TEST_CLOCK_STEP_ENV);
@@ -74,8 +87,7 @@ pub fn clock_with_test_skew() -> Clock {
     if step == 0 {
         return system;
     }
-    let secs = step.div_euclid(1000);
-    Arc::new(move || system().saturating_add_signed(secs))
+    Arc::new(move || system().saturating_add_signed(step))
 }
 
 /// The signed milliseconds `var` names; zero when unset or unparsable.

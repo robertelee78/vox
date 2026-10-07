@@ -122,21 +122,27 @@ const SEG_DELIVERED: u64 = 7;
 const SEG_ADMISSION: u64 = 8;
 
 /// Version of an entry's retention record: the `Index` segment sharing its `LogDb` id,
-/// `[version, first_seen_secs]` (ADR-023 decision 2).
-const FIRST_SEEN_VERSION: u64 = 1;
+/// `[version, first_seen]` (ADR-023 decision 2). Version 2 holds milliseconds; version 1, which
+/// stores made before held, whole seconds.
+const FIRST_SEEN_VERSION: u64 = 2;
 
-fn first_seen_bytes(first_seen: u64) -> Vec<u8> {
+fn first_seen_bytes(first_seen_ms: u64) -> Vec<u8> {
     let mut e = Encoder::new();
-    e.array(2).uint(FIRST_SEEN_VERSION).uint(first_seen);
+    e.array(2).uint(FIRST_SEEN_VERSION).uint(first_seen_ms);
     e.finish()
 }
 
+/// When this node first saw an entry, milliseconds, from its retention record of either version.
 fn parse_first_seen(bytes: &[u8]) -> Result<u64> {
     let mut d = Decoder::new(bytes);
-    if d.array()? != 2 || d.uint()? != FIRST_SEEN_VERSION {
+    if d.array()? != 2 {
         return Err(Error::MalformedAtRest("retention record"));
     }
-    let t = d.uint()?;
+    let t = match d.uint()? {
+        1 => d.uint()?.saturating_mul(1_000),
+        FIRST_SEEN_VERSION => d.uint()?,
+        _ => return Err(Error::MalformedAtRest("retention record")),
+    };
     d.finish()?;
     Ok(t)
 }
@@ -317,8 +323,9 @@ const SERVICES_VERSION: u64 = 2;
 /// The most services one channel may offer — a sanity bound on host config.
 pub const MAX_SERVICES: usize = 64;
 /// Manifest encoding version. **2 holds the shared name's hint** where 1 held a per-member local
-/// name (ADR-028 R-1 removed those); 1 is still read, without its name.
-const MANIFEST_VERSION: u64 = 2;
+/// name (ADR-028 R-1 removed those); 1 is still read, without its name. **3 holds the creation time
+/// in milliseconds**; 1 and 2 held it in seconds, and are read as milliseconds.
+const MANIFEST_VERSION: u64 = 3;
 /// Plaintext-cache row encoding version.
 /// Version of the plaintext rendering cache. **2 stores the timestamp in milliseconds**, and is the
 /// only version this build reads: version 1 (seconds) was an earlier release's (#423).
@@ -703,27 +710,10 @@ pub const MAX_OWED_ASKED: usize = 256;
 /// held without one (V030-10).
 type Arrived = (Digest32, Digest32, Option<Vec<u8>>, Option<u64>);
 
-/// The milliseconds an entry authored at `now_secs` claims: the wall clock's, while it is within
-/// that second (or the next, just past it: that second's last millisecond), so governance and
-/// control entries order and show in milliseconds like messages, and a retention change made just
-/// after a post is never drawn before it (the decider, 2026-10-07: all time in milliseconds). A
-/// caller acting at another time (a test's clock) claims its second.
-fn claim_ms(now_secs: u64) -> u64 {
-    let wall = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    let second = now_secs.saturating_mul(1_000);
-    match wall / 1_000 {
-        s if s == now_secs => wall,
-        s if s == now_secs.saturating_add(1) => second.saturating_add(999),
-        _ => second,
-    }
-}
-
-/// Whether an entry claimed at `claimed_ms` is past `ttl` seconds of retention at `now_secs`
-/// (`ttl == 0` keeps everything).
-fn expired_at(claimed_ms: u64, now_secs: u64, ttl: u64) -> bool {
-    ttl != 0 && claimed_ms / 1_000 <= now_secs.saturating_sub(ttl)
+/// Whether an entry claimed at `claimed_ms` is past `ttl` seconds of retention at `now_ms`
+/// (`ttl == 0` keeps everything), compared in milliseconds.
+fn expired_at(claimed_ms: u64, now_ms: u64, ttl: u64) -> bool {
+    ttl != 0 && claimed_ms <= now_ms.saturating_sub(ttl.saturating_mul(1_000))
 }
 
 /// How long nothing new must have expired before an author closes a backlog smaller than
@@ -753,6 +743,7 @@ pub struct ChannelState {
     /// The room's shared name as this node first heard it, shown only while the log names it not
     /// (ADR-028 R-1); empty for none.
     name_hint: String,
+    /// When this node made or joined the room, milliseconds since the Unix epoch.
     created: u64,
     epoch: u64,
     sek: Sek,
@@ -797,7 +788,7 @@ pub struct ChannelState {
     /// The last owed position [`ChannelState::owed_wants`] asked for: the next session asks from
     /// after it, so bodies no peer holds never keep the rest from being asked for.
     owed_asked_to: Option<(Digest32, u64)>,
-    /// The latest time this room was told (seconds): what "expired by now" is reckoned against
+    /// The latest time this room was told (milliseconds): what "expired by now" is reckoned against
     /// where no clock is passed in (the view, the want-list).
     now_hint: u64,
     /// Rendered rows in the room's one order ([`Dag::causal_order`]), never in the
@@ -891,7 +882,7 @@ pub struct ChannelState {
     /// This node's own retention for the room, seconds; `0` is no node limit. Set by the
     /// actor from the node's config; the room's own lives in the evaluator's policy.
     node_retention: u64,
-    /// When this node last pruned anything in the room (seconds), or opened it: what a closing
+    /// When this node last pruned anything in the room (milliseconds), or opened it: what a closing
     /// checkpoint waits [`ChannelState::set_checkpoint_idle`] past (ADR-023 decision 3).
     last_pruned_at: u64,
     /// How long nothing new must have expired before an author closes a backlog smaller than
@@ -935,13 +926,13 @@ impl std::fmt::Debug for ChannelState {
     }
 }
 
-fn manifest_bytes(genesis: &Genesis, name_hint: &str, created: u64, epoch: u64) -> Vec<u8> {
+fn manifest_bytes(genesis: &Genesis, name_hint: &str, created_ms: u64, epoch: u64) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(5)
         .uint(MANIFEST_VERSION)
         .bytes(&genesis.to_wire())
         .text(name_hint)
-        .uint(created)
+        .uint(created_ms)
         .uint(epoch);
     e.finish()
 }
@@ -952,7 +943,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
         return Err(Error::MalformedAtRest("room manifest arity"));
     }
     let version = d.uint()?;
-    if version != MANIFEST_VERSION && version != 1 {
+    if !(1..=MANIFEST_VERSION).contains(&version) {
         return Err(Error::MalformedAtRest("room manifest version"));
     }
     let genesis = Genesis::from_wire(d.bytes()?)?;
@@ -967,9 +958,14 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
         name.to_owned()
     };
     let created = d.uint()?;
+    let created_ms = if version < MANIFEST_VERSION {
+        created.saturating_mul(1_000)
+    } else {
+        created
+    };
     let epoch = d.uint()?;
     d.finish()?;
-    Ok((genesis, name, created, epoch))
+    Ok((genesis, name, created_ms, epoch))
 }
 
 /// The admitted-authors segment: `[version, [[fingerprint, composite_pubkey], …]]`
@@ -1503,13 +1499,13 @@ impl ChannelState {
         profile: &Profile,
         name: &str,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
         Self::create_with_profile(
             profile,
             name,
             channel_passphrase,
-            now_secs,
+            now,
             Argon2Profile::default(),
         )
     }
@@ -1519,22 +1515,14 @@ impl ChannelState {
         profile: &Profile,
         name: &str,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
         argon2: Argon2Profile,
     ) -> Result<Self> {
-        let (genesis, sek) = Self::create_genesis(profile, name, now_secs)?;
+        let (genesis, sek) = Self::create_genesis(profile, name, now)?;
         let signer = profile.signer()?;
         let factor = SignatureIdentityFactor::new(signer);
         let wrap = sek.seal(&factor, &genesis.channel_id(), channel_passphrase, argon2)?;
-        Self::create_from_sealed(
-            profile,
-            name,
-            channel_passphrase,
-            genesis,
-            sek,
-            &wrap,
-            now_secs,
-        )
+        Self::create_from_sealed(profile, name, channel_passphrase, genesis, sek, &wrap, now)
     }
 
     /// The fast first step of creating a room: its genesis and a fresh room key.
@@ -1547,17 +1535,21 @@ impl ChannelState {
     /// # Errors
     /// A name that is not a room name ([`crate::governance::name::room_name`]), no unlocked
     /// signer, or a genesis or key that cannot be made.
-    pub fn create_genesis(profile: &Profile, name: &str, now_secs: u64) -> Result<(Genesis, Sek)> {
+    pub fn create_genesis(
+        profile: &Profile,
+        name: &str,
+        now: crate::time::Ms,
+    ) -> Result<(Genesis, Sek)> {
         if crate::governance::name::room_name(name).as_deref() != Ok(name) {
             return Err(Error::MalformedGovernance("room name is not a DNS label"));
         }
         let signer = profile.signer()?;
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            ttl: 0,
+            ttl_ms: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
-        let genesis = Genesis::create(signer, now_secs, policy)?;
+        let genesis = Genesis::create(signer, now.get(), policy)?;
         Ok((genesis, Sek::generate()?))
     }
 
@@ -1573,13 +1565,14 @@ impl ChannelState {
         genesis: Genesis,
         sek: Sek,
         wrap: &crate::atrest::SekWrap,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
+        let now_ms = now.get();
         let signer = profile.signer()?;
         let channel_id = genesis.channel_id();
         let epoch = 0u64;
         let me = signer.fingerprint();
-        let sender = SenderChain::new(&channel_id, epoch, &me, 0, now_secs)?;
+        let sender = SenderChain::new(&channel_id, epoch, &me, 0, now_ms)?;
         // Retain generation 0's origin at the moment it is minted: once the live
         // chain ratchets past iteration 0 the origin is unrecoverable, so it is kept
         // now or never (ADR-006 §History).
@@ -1591,11 +1584,11 @@ impl ChannelState {
             epoch,
             &me,
             &sender,
-            now_secs,
+            now_ms,
             mint_seq,
         )?;
 
-        let manifest = manifest_bytes(&genesis, name, now_secs, epoch);
+        let manifest = manifest_bytes(&genesis, name, now_ms, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
         let sender_seg = seal_segment(
             &sek,
@@ -1648,14 +1641,14 @@ impl ChannelState {
 
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
-        let origin_ms = genesis.body.created.saturating_mul(1_000);
-        let evaluator = Arc::new(Self::build_evaluator(&genesis, &authors, &[], now_secs)?);
+        let origin_ms = genesis.body.created_ms;
+        let evaluator = Arc::new(Self::build_evaluator(&genesis, &authors, &[], now_ms)?);
         let mut room = Self {
             channel_id,
             genesis,
             name_hint: name.to_owned(),
             passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
-            created: now_secs,
+            created: now_ms,
             epoch,
             sek,
             authors,
@@ -1673,7 +1666,7 @@ impl ChannelState {
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
-            now_hint: now_secs,
+            now_hint: now_ms,
             timeline: Vec::new(),
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
@@ -1692,7 +1685,7 @@ impl ChannelState {
             delivered: BTreeMap::new(),
             retention: RetentionIndex::default(),
             node_retention: 0,
-            last_pruned_at: now_secs,
+            last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
             history: BTreeMap::new(),
             entitled: BTreeMap::new(),
@@ -1708,7 +1701,7 @@ impl ChannelState {
         // The room's name is stated on its log as its first entry after the genesis, so every
         // member that joins reads it there (ADR-028 R-1).
         let statement = crate::governance::name::RoomName::build(signer, &channel_id, epoch, name)?;
-        room.append_governance(profile, &statement.to_wire(), now_secs)?;
+        room.append_governance(profile, &statement.to_wire(), now_ms)?;
         Ok(room)
     }
 
@@ -1720,7 +1713,7 @@ impl ChannelState {
         profile: &Profile,
         channel_id: &Digest32,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
         let signer = profile.signer()?;
         let store = profile.store();
@@ -1730,7 +1723,7 @@ impl ChannelState {
         let factor = SignatureIdentityFactor::new(signer);
         let sek = wrap.unwrap_sek(&factor, channel_id, channel_passphrase)?;
         let me = signer.fingerprint();
-        Self::open_with_sek(store, channel_id, sek, channel_passphrase, me, now_secs)
+        Self::open_with_sek(store, channel_id, sek, channel_passphrase, me, now)
     }
 
     /// Open a channel from the store with its SEK already in hand: the half of [`Self::open`]
@@ -1746,8 +1739,9 @@ impl ChannelState {
         sek: Sek,
         channel_passphrase: &[u8],
         me: Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Self> {
+        let now_ms = now.get();
         let manifest_seg = store
             .get_segment(channel_id, SegmentKind::KeyMaterial, SEG_MANIFEST)?
             .ok_or(Error::MalformedAtRest("room manifest missing"))?;
@@ -1791,7 +1785,7 @@ impl ChannelState {
         // ones again. Anything else that fails acceptance is a tampered store, and the room does
         // not open. (A body-less entry is not set aside here, as it is in v0.2.10: in v0.3.0 it is
         // a pruned skeleton, kept on purpose — ADR-023 decision 2.)
-        let mut dag = Dag::for_room(genesis.body.created.saturating_mul(1_000));
+        let mut dag = Dag::for_room(genesis.body.created_ms);
         let mut log_ids = std::collections::HashMap::new();
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
@@ -1859,14 +1853,14 @@ impl ChannelState {
                             parse_first_seen(&open_segment(&sek, SegmentKind::Index, id, &seg)?)?
                         }
                         // No record: aged from now, which can only keep it longer, never shorter.
-                        None => now_secs,
+                        None => now_ms,
                     };
                     retention.track(
                         entry.entry_hash(),
                         Tracked {
                             log_id: id,
-                            first_seen,
-                            claimed: None,
+                            first_seen_ms: first_seen,
+                            claimed_ms: None,
                             cache_id: None,
                         },
                     );
@@ -1974,18 +1968,14 @@ impl ChannelState {
                 CacheRow::Text(mut rendered) => {
                     rendered.arrival = id;
                     if retention.get(&rendered.entry_hash).is_some() {
-                        retention.rendered(
-                            &rendered.entry_hash,
-                            rendered.created_millis / 1_000,
-                            id,
-                        );
+                        retention.rendered(&rendered.entry_hash, rendered.created_millis, id);
                         timeline.push(rendered);
                     }
                 }
                 // A read record ages like a message (RR-2) and is never a row of the timeline.
                 CacheRow::Read(r) => {
                     if retention.get(&r.entry_hash).is_some() {
-                        retention.rendered(&r.entry_hash, r.created_millis / 1_000, id);
+                        retention.rendered(&r.entry_hash, r.created_millis, id);
                         index_read(&mut read_records, &mut reads, r);
                     }
                 }
@@ -1993,7 +1983,7 @@ impl ChannelState {
                 // (SC-4).
                 CacheRow::Session(r) => {
                     if retention.get(&r.entry_hash).is_some() {
-                        retention.rendered(&r.entry_hash, r.created_millis / 1_000, id);
+                        retention.rendered(&r.entry_hash, r.created_millis, id);
                         sessions.push(r);
                     }
                 }
@@ -2118,14 +2108,14 @@ impl ChannelState {
             &genesis,
             &authors,
             &gov_entries,
-            now_secs,
+            now_ms,
         )?);
         // By the room's retention; the node's own, set once the room is open, settles the rest
         // (`set_node_retention`).
-        let room_ttl = evaluator.policy().ttl;
+        let room_ttl = evaluator.policy().ttl_ms / 1_000;
         let owed = held_bare
             .into_iter()
-            .filter(|(_, _, claimed)| !expired_at(*claimed, now_secs, room_ttl))
+            .filter(|(_, _, claimed)| !expired_at(*claimed, now_ms, room_ttl))
             .map(|(author, seq, _)| (author, seq))
             .collect();
         Ok(Self {
@@ -2151,7 +2141,7 @@ impl ChannelState {
             held,
             owed,
             owed_asked_to: None,
-            now_hint: now_secs,
+            now_hint: now_ms,
             timeline,
             timeline_generation,
             log_ids,
@@ -2168,7 +2158,7 @@ impl ChannelState {
             delivered,
             retention,
             node_retention: 0,
-            last_pruned_at: now_secs,
+            last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
             history,
             entitled,
@@ -2187,7 +2177,7 @@ impl ChannelState {
         genesis: &Genesis,
         authors: &BTreeMap<Digest32, CompositePublicKey>,
         gov_entries: &[GovEntry],
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<Evaluator> {
         // The admitted authors are this node's view of *who is a member*: local state by
         // ADR-007's design (membership is emergent, there is no roster). It confers no
@@ -2195,7 +2185,7 @@ impl ChannelState {
         Evaluator::build_with_members(
             genesis,
             gov_entries,
-            now_secs,
+            now_ms,
             |id| authors.get(id).cloned(),
             authors.keys().copied().collect(),
         )
@@ -2207,13 +2197,13 @@ impl ChannelState {
         genesis: &Genesis,
         authors: &BTreeMap<Digest32, CompositePublicKey>,
         gov_entries: &[GovEntry],
-        now_secs: u64,
+        now_ms: u64,
         prior: &Evaluator,
     ) -> Result<Evaluator> {
         Evaluator::build_reusing(
             genesis,
             gov_entries,
-            now_secs,
+            now_ms,
             |id| authors.get(id).cloned(),
             authors.keys().copied().collect(),
             Some(prior),
@@ -2259,17 +2249,18 @@ impl ChannelState {
         channel_id: &Digest32,
         name_hint: Option<&str>,
         channel_passphrase: &[u8],
-        now_secs: u64,
+        now: crate::time::Ms,
         sealed: (Sek, crate::atrest::SekWrap),
         own_admission: Admission,
     ) -> Result<Self> {
+        let now_ms = now.get();
         Self::join_checks(profile, genesis, channel_id)?;
         let name_hint = name_hint.unwrap_or_default();
         let (sek, wrap) = sealed;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         let epoch = 0u64;
-        let sender = SenderChain::new(channel_id, epoch, &me, 0, now_secs)?;
+        let sender = SenderChain::new(channel_id, epoch, &me, 0, now_ms)?;
         let mut origins = OriginKeyStore::new();
         let mint_seq = crate::node::consent_order::stamp_mint(profile.store(), signer, 0)?;
         retain_generation(
@@ -2278,7 +2269,7 @@ impl ChannelState {
             epoch,
             &me,
             &sender,
-            now_secs,
+            now_ms,
             mint_seq,
         )?;
 
@@ -2287,7 +2278,7 @@ impl ChannelState {
         authors.insert(creator, genesis.body.creator_pubkey.clone());
         authors.insert(me, signer.public_key());
 
-        let manifest = manifest_bytes(genesis, name_hint, now_secs, epoch);
+        let manifest = manifest_bytes(genesis, name_hint, now_ms, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
         let sender_seg = seal_segment(
             &sek,
@@ -2367,18 +2358,18 @@ impl ChannelState {
         for author in authors.keys() {
             admission.admit(*channel_id, epoch, *author);
         }
-        let evaluator = Arc::new(Self::build_evaluator(genesis, &authors, &[], now_secs)?);
+        let evaluator = Arc::new(Self::build_evaluator(genesis, &authors, &[], now_ms)?);
         Ok(Self {
             channel_id: *channel_id,
             genesis: genesis.clone(),
             name_hint: name_hint.to_owned(),
             passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
-            created: now_secs,
+            created: now_ms,
             epoch,
             sek,
             authors,
             admission,
-            dag: Dag::for_room(genesis.body.created.saturating_mul(1_000)),
+            dag: Dag::for_room(genesis.body.created_ms),
             forks_kept: 0,
             evaluator,
             sender,
@@ -2391,7 +2382,7 @@ impl ChannelState {
             held: BTreeMap::new(),
             owed: BTreeSet::new(),
             owed_asked_to: None,
-            now_hint: now_secs,
+            now_hint: now_ms,
             timeline: Vec::new(),
             timeline_generation: 0,
             log_ids: std::collections::HashMap::new(),
@@ -2409,7 +2400,7 @@ impl ChannelState {
             delivered: BTreeMap::new(),
             retention: RetentionIndex::default(),
             node_retention: 0,
-            last_pruned_at: now_secs,
+            last_pruned_at: now_ms,
             checkpoint_idle: CHECKPOINT_IDLE_SECS,
             history: BTreeMap::new(),
             entitled: BTreeMap::new(),
@@ -2464,8 +2455,9 @@ impl ChannelState {
         store: &Store,
         key: &CompositePublicKey,
         admission: &Admission,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<bool> {
+        let now_ms = now.get();
         let fingerprint = key.fingerprint();
         match admission {
             Admission::Creator => {
@@ -2491,7 +2483,7 @@ impl ChannelState {
         }
         // Past the cap if it must be: another member admitted it, on its own view that there was
         // room. Refusing it here would split the room (V210-128).
-        self.admit_within(store, key, now_secs, AUTHORS_HARD_LIMIT)
+        self.admit_within(store, key, now_ms / 1_000, AUTHORS_HARD_LIMIT)
     }
 
     /// Admit `key` as a log author for this channel: its entries are accepted into
@@ -2522,9 +2514,10 @@ impl ChannelState {
         &mut self,
         store: &Store,
         key: &CompositePublicKey,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<bool> {
-        self.admit_within(store, key, now_secs, max_authors())
+        let now_ms = now.get();
+        self.admit_within(store, key, now_ms / 1_000, max_authors())
     }
 
     /// [`ChannelState::admit_author`], refused at `limit` authors.
@@ -2532,7 +2525,7 @@ impl ChannelState {
         &mut self,
         store: &Store,
         key: &CompositePublicKey,
-        now_secs: u64,
+        now_ms: u64,
         limit: usize,
     ) -> Result<bool> {
         let fingerprint = key.fingerprint();
@@ -2574,7 +2567,7 @@ impl ChannelState {
             &self.genesis,
             &self.authors,
             &self.gov_entries,
-            now_secs,
+            now_ms,
             &self.evaluator,
         )?);
         Ok(true)
@@ -2708,8 +2701,9 @@ impl ChannelState {
         profile: &Profile,
         service_tag: &str,
         shared: bool,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<()> {
+        let now_ms = now.get();
         let statement = crate::governance::share::ServiceShare::build(
             profile.signer()?,
             &self.channel_id,
@@ -2719,14 +2713,14 @@ impl ChannelState {
             shared,
             self.kind_of(service_tag),
         )?;
-        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        self.append_governance(profile, &statement.to_wire(), now_ms)?;
         Ok(())
     }
 
     /// State every share this node offers here that the log does not yet say it shares, and
     /// return whether anything was written. A share made in a room joined and not yet synced is
     /// offered at once but can be said only once the room settles (V210-164); this says it then.
-    pub fn say_unsaid_shares(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+    pub fn say_unsaid_shares(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
         let me = profile.signer()?.fingerprint();
         let said: BTreeSet<String> = self
             .shares()
@@ -2741,7 +2735,7 @@ impl ChannelState {
             .cloned()
             .collect();
         for tag in &unsaid {
-            self.say_share(profile, tag, true, now_secs)?;
+            self.say_share(profile, tag, true, now)?;
         }
         Ok(!unsaid.is_empty())
     }
@@ -3083,15 +3077,16 @@ impl ChannelState {
     ///
     /// **What is kept for someone who has not joined is kept for a while, not forever** (PRD-001
     /// R14, decider 2026-09-28): for the room's retention when it has one, otherwise
-    /// [`UNJOINED_HOLD_SECS`]. A generation created before `now_secs` less that hold goes even
+    /// [`UNJOINED_HOLD_SECS`]. A generation created before `now_ms` less that hold goes even
     /// though a trusted identity never came to collect it; one that joins later reads what is
     /// still held. History floors owed to members who have joined are not bounded here.
     #[must_use]
     pub fn oldest_generation_needed(
         &self,
         trusted: &BTreeSet<Digest32>,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Option<u64> {
+        let now_ms = now.get();
         let me = self.me();
         let unjoined = |id: &Digest32| *id != me && !self.entitled.contains_key(id);
         // A trusted identity with **no mark here** was trusted before this room existed, so every
@@ -3111,7 +3106,7 @@ impl ChannelState {
         // The hold: nothing older than it is kept for a waiting identity. No generation inside it
         // means none is kept for them at all.
         let waiting = waiting.map(|floor| {
-            let cutoff = now_secs.saturating_sub(self.unjoined_hold_secs());
+            let cutoff = now_ms.saturating_sub(self.unjoined_hold_secs().saturating_mul(1_000));
             let young = self
                 .origins
                 .oldest_created_since(&self.channel_id, self.epoch, &me, cutoff)
@@ -3190,8 +3185,9 @@ impl ChannelState {
         delivered_skdm: &Skdm,
         full_history: bool,
         entitled_from: (u64, u64),
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<(ConsentGrant, bool)> {
+        let now_ms = now.get();
         let signer = profile.signer()?;
         // The grant records what this approval actually released (PRD-001 R12): the
         // approver's per-grant choice, not a room-wide default.
@@ -3254,7 +3250,7 @@ impl ChannelState {
                 )?,
             ));
         }
-        self.append_governance_with(profile, &grant.to_wire(), now_secs, &rows)?;
+        self.append_governance_with(profile, &grant.to_wire(), now_ms, &rows)?;
         self.entitled = entitled;
         self.history = history;
         Ok((grant, history_owed))
@@ -3265,8 +3261,9 @@ impl ChannelState {
     /// [`ChannelState::rotate_sender`] and re-keys whoever is
     /// [`owed`](ChannelState::owed_rekeys).
     #[must_use]
-    pub fn should_rotate_sender(&self, now_secs: u64) -> bool {
-        self.sender.should_rotate(now_secs)
+    pub fn should_rotate_sender(&self, now: crate::time::Ms) -> bool {
+        let now_ms = now.get();
+        self.sender.should_rotate(now_ms)
     }
 
     /// The generation this identity is currently sending under.
@@ -3290,9 +3287,10 @@ impl ChannelState {
     /// rotation that persisted the chain but lost the origin would leave the members
     /// who kept consent permanently unable to read the messages sent before their
     /// re-key.
-    pub fn rotate_sender(&mut self, profile: &Profile, now_secs: u64) -> Result<u64> {
-        let next = self.sender.rotated(now_secs)?;
-        self.rotate_sender_to(profile, next, now_secs)
+    pub fn rotate_sender(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<u64> {
+        let now_ms = now.get();
+        let next = self.sender.rotated(now_ms)?;
+        self.rotate_sender_to(profile, next, now_ms)
     }
 
     /// Move this identity to a sender generation above every one its own feed shows it used here,
@@ -3303,7 +3301,8 @@ impl ChannelState {
     /// that number. They refuse a second key for a generation they hold, so nothing it sent would
     /// ever read. Its feed, once synced, says what it used: each message's header names its
     /// generation, a revocation the one it moved to, and a presence statement the one it was on.
-    pub fn catch_up_generation(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+    pub fn catch_up_generation(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
+        let now_ms = now.get();
         let me = self.me();
         let Some(feed) = self.dag.feed(&me).filter(|f| !f.is_empty()) else {
             return Ok(false);
@@ -3334,8 +3333,8 @@ impl ChannelState {
         let next_id = used
             .checked_add(1)
             .ok_or(Error::MalformedBundle("chain_id overflow"))?;
-        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now_secs)?;
-        self.rotate_sender_to(profile, next, now_secs)?;
+        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now_ms)?;
+        self.rotate_sender_to(profile, next, now_ms)?;
         Ok(true)
     }
 
@@ -3344,7 +3343,7 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         next: SenderChain,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<u64> {
         if self.poisoned {
             return Err(Error::Profile(
@@ -3367,7 +3366,7 @@ impl ChannelState {
             self.epoch,
             &me,
             &next,
-            now_secs,
+            now_ms,
             mint_seq,
         )?;
         let sender_seg = seal_segment(
@@ -3612,8 +3611,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         target: Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<ConsentRevocation> {
+        let now_ms = now.get();
         let me = self.me();
         if target == me {
             return Err(Error::MalformedGovernance(
@@ -3628,11 +3628,11 @@ impl ChannelState {
         }
         // Rotate first: the entry names the generation that excludes `target`, so
         // that generation has to exist before the fact is signed.
-        let new_chain_id = self.rotate_sender(profile, now_secs)?;
+        let new_chain_id = self.rotate_sender(profile, now)?;
         let signer = profile.signer()?;
         let revocation =
             issue_consent_revocation(signer, &self.channel_id, self.epoch, target, new_chain_id)?;
-        self.append_governance(profile, &revocation.to_wire(), now_secs)?;
+        self.append_governance(profile, &revocation.to_wire(), now_ms)?;
         // Nothing is owed to a revoked member; drop the row so a later re-consent
         // starts from "holds nothing".
         if self.delivered.remove(&target).is_some() {
@@ -4112,7 +4112,7 @@ impl ChannelState {
     /// force, as the evaluator folds it from the log.
     #[must_use]
     pub fn room_retention(&self) -> u64 {
-        self.evaluator.policy().ttl
+        self.evaluator.policy().ttl_ms / 1_000
     }
 
     /// Whether `member` sets this room's retention: its creator, or an admin it named — a holder
@@ -4142,6 +4142,15 @@ impl ChannelState {
         crate::node::retention::shortest(self.room_retention(), self.node_retention)
     }
 
+    /// `(this node's own retention, the room's)` when the node's own asks to keep messages longer
+    /// than the room does (V030-32): ignored, since a member may keep less than its room, never
+    /// more. `None` otherwise.
+    #[must_use]
+    pub fn retention_above_room(&self) -> Option<(u64, u64)> {
+        let (node, room) = (self.node_retention, self.room_retention());
+        (node != 0 && room != 0 && node > room).then_some((node, room))
+    }
+
     /// Set this node's own retention for the room (from its config; `0` = no node limit).
     /// Takes effect at the next [`ChannelState::sweep_retention`].
     pub fn set_node_retention(&mut self, secs: u64) {
@@ -4149,12 +4158,13 @@ impl ChannelState {
         self.forget_settled_owed();
     }
 
-    /// Whether an entry claimed at `claimed_ms` has expired here by `now_secs`: past this node's
+    /// Whether an entry claimed at `claimed_ms` has expired here by `now_ms`: past this node's
     /// effective retention (the room's, or its own shorter one). **The receiver's own reckoning**
     /// (V030-10): from the author's signed claim, never from what a peer did or did not send.
     #[must_use]
-    pub fn body_expired(&self, claimed_ms: u64, now_secs: u64) -> bool {
-        expired_at(claimed_ms, now_secs, self.effective_retention())
+    pub fn body_expired(&self, claimed_ms: u64, now: crate::time::Ms) -> bool {
+        let now_ms = now.get();
+        expired_at(claimed_ms, now_ms, self.effective_retention())
     }
 
     /// Drop from the owed bodies every one that has arrived, or has expired here since.
@@ -4283,7 +4293,13 @@ impl ChannelState {
     /// `ttl` seconds (`0` = forever). Only a holder of the `policy` capability may — the
     /// room's admin; anyone else is refused here rather than writing an entry every other
     /// node would ignore. It applies to what is already stored, at the next sweep (R8).
-    pub fn set_retention(&mut self, profile: &Profile, ttl: u64, now_secs: u64) -> Result<()> {
+    pub fn set_retention(
+        &mut self,
+        profile: &Profile,
+        ttl: u64,
+        now: crate::time::Ms,
+    ) -> Result<()> {
+        let now_ms = now.get();
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if !self
@@ -4299,9 +4315,9 @@ impl ChannelState {
             signer,
             &self.channel_id,
             self.epoch,
-            ttl,
+            ttl.saturating_mul(1_000),
         )?;
-        self.append_governance(profile, &update.to_wire(), now_secs)?;
+        self.append_governance(profile, &update.to_wire(), now_ms)?;
         Ok(())
     }
 
@@ -4311,17 +4327,20 @@ impl ChannelState {
     /// against the policy in force now. Returns how many entries were pruned.
     ///
     /// Costs what it prunes, not what the room holds: the index is ordered by age.
-    pub fn sweep_retention(&mut self, store: &Store, now_secs: u64) -> Result<usize> {
-        self.now_hint = self.now_hint.max(now_secs);
+    pub fn sweep_retention(&mut self, store: &Store, now: crate::time::Ms) -> Result<usize> {
+        let now_ms = now.get();
+        self.now_hint = self.now_hint.max(now_ms);
         self.forget_settled_owed();
         let ttl = self.effective_retention();
         if ttl == 0 || self.poisoned {
             return Ok(0);
         }
-        let due = self.retention.take_due(now_secs.saturating_sub(ttl));
+        let due = self
+            .retention
+            .take_due(now_ms.saturating_sub(ttl.saturating_mul(1_000)));
         let pruned = self.prune(store, &due, false)?;
         if pruned > 0 {
-            self.last_pruned_at = now_secs;
+            self.last_pruned_at = now_ms;
         }
         Ok(pruned)
     }
@@ -4348,7 +4367,8 @@ impl ChannelState {
     /// restart, or pruned while the room kept everything) without waiting for another prune. The position named is the highest one below which every content entry of
     /// this author has had its body pruned on this node; governance and earlier checkpoints
     /// keep their bodies and never hold it back.
-    pub fn checkpoint_if_due(&mut self, profile: &Profile, now_secs: u64) -> Result<bool> {
+    pub fn checkpoint_if_due(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<bool> {
+        let now_ms = now.get();
         if self.poisoned || self.room_retention() == 0 {
             return Ok(false);
         }
@@ -4374,12 +4394,13 @@ impl ChannelState {
         let Some((seq, entry_hash)) = below else {
             return Ok(false);
         };
-        let idle = now_secs.saturating_sub(self.last_pruned_at) >= self.checkpoint_idle;
+        let idle = now_ms.saturating_sub(self.last_pruned_at)
+            >= self.checkpoint_idle.saturating_mul(1_000);
         if seq <= already || (expired < CHECKPOINT_EVERY && !idle) {
             return Ok(false);
         }
         let payload = crate::log::checkpoint::Checkpoint { seq, entry_hash }.to_wire();
-        self.append_control(profile, &payload, now_secs)?;
+        self.append_control(profile, &payload, now_ms)?;
         Ok(true)
     }
 
@@ -4422,13 +4443,13 @@ impl ChannelState {
 
     /// Append a control entry (a checkpoint) on this identity's own feed: signed and stored
     /// like governance, never folded into the ADR-007 evaluator, since it grants nothing.
-    fn append_control(&mut self, profile: &Profile, payload: &[u8], now_secs: u64) -> Result<()> {
+    fn append_control(&mut self, profile: &Profile, payload: &[u8], now_ms: u64) -> Result<()> {
         if !self.settled {
             return Err(Error::RoomNotSynced);
         }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
-        let skeleton = self.next_skeleton(&me, payload, claim_ms(now_secs));
+        let skeleton = self.next_skeleton(&me, payload, now_ms);
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let id = self.next_log_id;
@@ -4461,7 +4482,7 @@ impl ChannelState {
 
     /// Whether an entry this node is about to render has already outlived the effective
     /// retention — a late arrival of a message that is expired everywhere else.
-    fn already_expired(&self, entry_hash: &Digest32, claimed: u64, now_secs: u64) -> bool {
+    fn already_expired(&self, entry_hash: &Digest32, claimed_ms: u64, now_ms: u64) -> bool {
         let ttl = self.effective_retention();
         if ttl == 0 {
             return false;
@@ -4469,8 +4490,8 @@ impl ChannelState {
         let first_seen = self
             .retention
             .get(entry_hash)
-            .map_or(now_secs, |t| t.first_seen);
-        claimed.min(first_seen) <= now_secs.saturating_sub(ttl)
+            .map_or(now_ms, |t| t.first_seen_ms);
+        claimed_ms.min(first_seen) <= now_ms.saturating_sub(ttl.saturating_mul(1_000))
     }
 
     /// Drop the bodies of `due`: rewrite each log page with the skeleton alone, delete its
@@ -4551,20 +4572,20 @@ impl ChannelState {
         Ok(due.len())
     }
 
-    /// Start tracking a content body just stored under `log_id`, first seen `now_secs`, and
+    /// Start tracking a content body just stored under `log_id`, first seen `now_ms`, and
     /// record that time durably beside it.
     fn track_body(
         &mut self,
         store: &Store,
         entry_hash: Digest32,
         log_id: u64,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
             SegmentKind::Index,
             log_id,
-            &first_seen_bytes(now_secs),
+            &first_seen_bytes(now_ms),
         )?;
         if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg) {
             self.poisoned = true;
@@ -4574,8 +4595,8 @@ impl ChannelState {
             entry_hash,
             Tracked {
                 log_id,
-                first_seen: now_secs,
-                claimed: None,
+                first_seen_ms: now_ms,
+                claimed_ms: None,
                 cache_id: None,
             },
         );
@@ -4588,21 +4609,21 @@ impl ChannelState {
         batch: &mut crate::node::store::Batch<'_>,
         entry_hash: Digest32,
         log_id: u64,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<()> {
         let seg = seal_segment(
             &self.sek,
             SegmentKind::Index,
             log_id,
-            &first_seen_bytes(now_secs),
+            &first_seen_bytes(now_ms),
         )?;
         batch.put_segment(&self.channel_id, SegmentKind::Index, log_id, &seg)?;
         self.retention.track(
             entry_hash,
             Tracked {
                 log_id,
-                first_seen: now_secs,
-                claimed: None,
+                first_seen_ms: now_ms,
+                claimed_ms: None,
                 cache_id: None,
             },
         );
@@ -4614,9 +4635,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         payload: &[u8],
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<Digest32> {
-        self.append_governance_with(profile, payload, now_secs, &[])
+        self.append_governance_with(profile, payload, now_ms, &[])
     }
 
     /// [`Self::append_governance`], committing `rows` — sealed `KeyMaterial` segments by id — in
@@ -4625,7 +4646,7 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         payload: &[u8],
-        now_secs: u64,
+        now_ms: u64,
         rows: &[(u64, SealedSegment)],
     ) -> Result<Digest32> {
         if self.poisoned {
@@ -4641,7 +4662,7 @@ impl ChannelState {
         if !self.authors.contains_key(&me) {
             return Err(Error::Profile("this identity is not an author of the room"));
         }
-        let skeleton = self.next_skeleton(&me, payload, claim_ms(now_secs));
+        let skeleton = self.next_skeleton(&me, payload, now_ms);
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -4673,7 +4694,7 @@ impl ChannelState {
             &self.genesis,
             &self.authors,
             &self.gov_entries,
-            now_secs,
+            now_ms,
             &self.evaluator,
         )?);
         Ok(hash)
@@ -4773,8 +4794,9 @@ impl ChannelState {
         &mut self,
         store: &Store,
         transport: &mut T,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<SyncOutcome> {
+        let now_ms = now.get();
         if self.poisoned {
             return Err(Error::Profile(
                 "room is poisoned after a failed persist; reopen it",
@@ -4791,7 +4813,7 @@ impl ChannelState {
 
         // Collect what arrived, in per-author sequence order, before touching the
         // store (the borrow of `self.dag` ends here).
-        let mut out = self.absorb_arrived(store, &before, now_secs)?;
+        let mut out = self.absorb_arrived(store, &before, now_ms)?;
         if let Ok(n) = session {
             out.applied = n;
         }
@@ -4816,7 +4838,7 @@ impl ChannelState {
         could_read: &BTreeSet<Digest32>,
         rendered: &[Rendered],
         run: usize,
-        now_secs: u64,
+        now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<(Vec<Rendered>, usize)> {
         let mut dropped = 0usize;
@@ -4825,7 +4847,7 @@ impl ChannelState {
             &self.genesis,
             &self.authors,
             &self.gov_entries,
-            now_secs,
+            now_ms,
             &self.evaluator,
         ) {
             Ok(evaluator) => self.evaluator = Arc::new(evaluator),
@@ -4839,7 +4861,7 @@ impl ChannelState {
                         &self.genesis,
                         &self.authors,
                         &self.gov_entries,
-                        now_secs,
+                        now_ms,
                         &self.evaluator,
                     ) {
                         Ok(evaluator) => self.evaluator = Arc::new(evaluator),
@@ -4855,7 +4877,7 @@ impl ChannelState {
         // while this one is open blocks forever (redb).
         let skip: BTreeSet<Digest32> = rendered.iter().map(|r| r.entry_hash).collect();
         Ok((
-            self.backfill_newly_readable_into(batch, could_read, &skip, now_secs, expired)?,
+            self.backfill_newly_readable_into(batch, could_read, &skip, now_ms, expired)?,
             dropped,
         ))
     }
@@ -4878,7 +4900,7 @@ impl ChannelState {
         &mut self,
         store: &Store,
         before: &BTreeMap<Digest32, u64>,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<SyncOutcome> {
         // A fork this sync recorded is kept before anything else, so a restart does not forget it
         // (V210-63).
@@ -4888,7 +4910,7 @@ impl ChannelState {
         //
         // The fourth field is the log page an entry is already stored in: set for a body that
         // arrived for a skeleton held without one (V030-10), whose page is rewritten in place.
-        self.now_hint = self.now_hint.max(now_secs);
+        self.now_hint = self.now_hint.max(now_ms);
         let mut arrived: Vec<Arrived> = Vec::new();
         for (author, head) in before {
             let Some(feed) = self.dag.feed(author) else {
@@ -4999,7 +5021,7 @@ impl ChannelState {
                     let Some(payload) = payload else {
                         // A skeleton: stored, never rendered. Its body is owed unless it has
                         // expired here (V030-10).
-                        if !self.body_expired(claimed, now_secs) {
+                        if !self.body_expired(claimed, crate::time::Ms(now_ms)) {
                             self.owed.insert((author, seq));
                         }
                         return Ok(Ok(Vec::new()));
@@ -5042,7 +5064,7 @@ impl ChannelState {
                                 &could_read,
                                 &rendered_rows,
                                 std::mem::take(&mut gov_run),
-                                now_secs,
+                                now_ms,
                                 &mut expired,
                             )?;
                             out.refused += dropped;
@@ -5056,14 +5078,14 @@ impl ChannelState {
                     if self.queue_if_key_package(&payload) {
                         return Ok(Ok(rows));
                     }
-                    self.track_body_into(&mut batch, entry_hash, id, now_secs)?;
+                    self.track_body_into(&mut batch, entry_hash, id, now_ms)?;
                     let before_expired = expired.len();
                     let row = self.render_content_into(
                         &mut batch,
                         author,
                         entry_hash,
                         &payload,
-                        now_secs,
+                        now_ms,
                         &mut expired,
                     )?;
                     chains_advanced |= row.is_some() || expired.len() > before_expired;
@@ -5087,7 +5109,7 @@ impl ChannelState {
                 &could_read,
                 &rendered_rows,
                 std::mem::take(&mut gov_run),
-                now_secs,
+                now_ms,
                 &mut expired,
             ) {
                 Ok((rows, dropped)) => {
@@ -5136,10 +5158,11 @@ impl ChannelState {
         shared: &tokio::sync::Mutex<Self>,
         store: &Store,
         transport: &mut T,
-        now_secs: u64,
+        now: crate::time::Ms,
         fence: &crate::transport::stream_transport::Fence,
         on_stored: &dyn Fn(),
     ) -> SessionReport {
+        let now_ms = now.get();
         let epoch = {
             let ch = shared.blocking_lock();
             if ch.poisoned {
@@ -5152,7 +5175,7 @@ impl ChannelState {
         let room = ChannelSessionRoom {
             shared,
             store,
-            now_secs,
+            now_ms,
             epoch,
             fence,
             on_stored,
@@ -5183,7 +5206,13 @@ impl ChannelState {
     /// as ciphertext before consent renders as soon as the key arrives — the
     /// monotone per-sender fill-in ADR-007 describes. Returns how many entries that
     /// backfill rendered.
-    pub fn accept_skdm(&mut self, store: &Store, skdm: &Skdm, now_secs: u64) -> Result<usize> {
+    pub fn accept_skdm(
+        &mut self,
+        store: &Store,
+        skdm: &Skdm,
+        now: crate::time::Ms,
+    ) -> Result<usize> {
+        let now_ms = now.get();
         if self.poisoned {
             return Err(Error::Profile(
                 "room is poisoned after a failed persist; reopen it",
@@ -5198,7 +5227,7 @@ impl ChannelState {
         // A drive key (ADR-029 SC-2) comes by the same paths as a sender key and is told apart
         // by what it is bound to.
         if skdm.body.channel_id == drive_channel(&self.channel_id) {
-            return self.accept_drive_skdm(store, skdm, &key, now_secs);
+            return self.accept_drive_skdm(store, skdm, &key, now_ms);
         }
         let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
         let slot = (author, chain.chain_id());
@@ -5212,7 +5241,7 @@ impl ChannelState {
         }
         self.receivers.insert(slot, chain);
         self.persist_receivers(store)?;
-        self.backfill(store, &author, now_secs)
+        self.backfill(store, &author, now_ms)
     }
 
     /// Whether this node holds a sender key for `author`.
@@ -5339,7 +5368,7 @@ impl ChannelState {
 
     /// A new drive generation for this node here: past every one it used, owed whole to
     /// `holders`.
-    fn begin_drive(&mut self, holders: &BTreeSet<Digest32>, now_secs: u64) -> Result<()> {
+    fn begin_drive(&mut self, holders: &BTreeSet<Digest32>, now_ms: u64) -> Result<()> {
         let floor = self
             .drive
             .chain
@@ -5358,7 +5387,7 @@ impl ChannelState {
             self.epoch,
             &me,
             next,
-            now_secs,
+            now_ms,
         )?;
         let members = self.drive_members();
         self.drive.begin(
@@ -5397,13 +5426,13 @@ impl ChannelState {
             return Err(Error::Profile("this room has ended"));
         }
         let content = crate::node::content::SessionEntry::new(now_millis, session_id, body)?;
-        let now_secs = now_millis / 1_000;
+        let now_ms = now_millis;
         let stale = match &self.drive.chain {
             None => true,
-            Some(c) => c.epoch() != self.epoch || c.should_rotate(now_secs),
+            Some(c) => c.epoch() != self.epoch || c.should_rotate(now_ms),
         };
         if stale {
-            self.begin_drive(holders, now_secs)?;
+            self.begin_drive(holders, now_ms)?;
         }
         let chain = self
             .drive
@@ -5437,12 +5466,7 @@ impl ChannelState {
             SEG_DRIVE,
             &self.drive.to_state(),
         )?;
-        let seen_seg = seal_segment(
-            &self.sek,
-            SegmentKind::Index,
-            id,
-            &first_seen_bytes(now_secs),
-        )?;
+        let seen_seg = seal_segment(&self.sek, SegmentKind::Index, id, &first_seen_bytes(now_ms))?;
         let key = signer.public_key();
         self.dag
             .accept(entry, EntryKind::Content, &key, &self.admission)
@@ -5476,8 +5500,8 @@ impl ChannelState {
             entry_hash,
             Tracked {
                 log_id: id,
-                first_seen: now_secs,
-                claimed: Some(now_secs),
+                first_seen_ms: now_ms,
+                claimed_ms: Some(now_ms),
                 cache_id: Some(id),
             },
         );
@@ -5502,14 +5526,15 @@ impl ChannelState {
         &mut self,
         store: &Store,
         holders: &BTreeSet<Digest32>,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Vec<Digest32>> {
+        let now_ms = now.get();
         let lost = self.drive.lost(holders);
         if lost.is_empty() || self.drive.chain.is_none() {
             return Ok(lost);
         }
         self.drive.forget(&lost);
-        self.begin_drive(holders, now_secs)?;
+        self.begin_drive(holders, now_ms)?;
         self.persist_drive(store)?;
         Ok(lost)
     }
@@ -5554,7 +5579,7 @@ impl ChannelState {
         store: &Store,
         skdm: &Skdm,
         key: &CompositePublicKey,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<usize> {
         let chain =
             ReceiverChain::from_skdm(skdm, key, &drive_channel(&self.channel_id), self.epoch)?;
@@ -5568,7 +5593,7 @@ impl ChannelState {
         self.drive.receivers.insert(slot, chain);
         self.persist_drive(store)?;
         let before = self.drive.sessions.len();
-        self.backfill(store, &skdm.body.author_id, now_secs)?;
+        self.backfill(store, &skdm.body.author_id, now_ms)?;
         Ok(self.drive.sessions.len() - before)
     }
 
@@ -5580,7 +5605,7 @@ impl ChannelState {
         author: Digest32,
         entry_hash: Digest32,
         msg: &GroupMessage,
-        now_secs: u64,
+        now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<()> {
         let Some(chain) = self.drive.receivers.get_mut(&(author, msg.header.chain_id)) else {
@@ -5595,7 +5620,7 @@ impl ChannelState {
         let Ok(Decoded::Session(entry)) = crate::node::content::decode(&plaintext) else {
             return Ok(());
         };
-        if self.already_expired(&entry_hash, entry.created_millis / 1_000, now_secs) {
+        if self.already_expired(&entry_hash, entry.created_millis, now_ms) {
             expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
             return Ok(());
         }
@@ -5740,7 +5765,8 @@ impl ChannelState {
                 let Some(payload) = entry.payload.as_deref() else {
                     // Expired: its key is needed by nothing. Not expired: a body still to come,
                     // under a generation not known yet — every generation from here on stays.
-                    if self.body_expired(entry.skeleton.claimed_ms, self.now_hint) {
+                    if self.body_expired(entry.skeleton.claimed_ms, crate::time::Ms(self.now_hint))
+                    {
                         continue;
                     }
                     break;
@@ -5803,7 +5829,7 @@ impl ChannelState {
         &mut self,
         store: &Store,
         could_read: &BTreeSet<Digest32>,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<usize> {
         let mut rows: Vec<Rendered> = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
@@ -5813,7 +5839,7 @@ impl ChannelState {
                 &mut batch,
                 could_read,
                 &BTreeSet::new(),
-                now_secs,
+                now_ms,
                 &mut expired,
             )?;
             if rows.is_empty() && expired.is_empty() && !self.chains_advanced {
@@ -5840,7 +5866,7 @@ impl ChannelState {
         batch: &mut crate::node::store::Batch<'_>,
         could_read: &BTreeSet<Digest32>,
         skip: &BTreeSet<Digest32>,
-        now_secs: u64,
+        now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Vec<Rendered>> {
         let newly: Vec<Digest32> = self
@@ -5850,19 +5876,19 @@ impl ChannelState {
             .collect();
         let mut rows = Vec::new();
         for author in newly {
-            rows.extend(self.backfill_into(batch, &author, skip, now_secs, expired)?);
+            rows.extend(self.backfill_into(batch, &author, skip, now_ms, expired)?);
         }
         Ok(rows)
     }
 
-    fn backfill(&mut self, store: &Store, author: &Digest32, now_secs: u64) -> Result<usize> {
+    fn backfill(&mut self, store: &Store, author: &Digest32, now_ms: u64) -> Result<usize> {
         // One durable commit for the whole backfill (see `render_content_into`).
         let mut rows: Vec<Rendered> = Vec::new();
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let result = (|| -> Result<()> {
             let mut batch = store.batch()?;
             rows =
-                self.backfill_into(&mut batch, author, &BTreeSet::new(), now_secs, &mut expired)?;
+                self.backfill_into(&mut batch, author, &BTreeSet::new(), now_ms, &mut expired)?;
             if rows.is_empty() && expired.is_empty() && !self.chains_advanced {
                 return Ok(());
             }
@@ -5886,7 +5912,7 @@ impl ChannelState {
         batch: &mut crate::node::store::Batch<'_>,
         author: &Digest32,
         skip: &BTreeSet<Digest32>,
-        now_secs: u64,
+        now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Vec<Rendered>> {
         let already: BTreeSet<Digest32> = self
@@ -5910,7 +5936,7 @@ impl ChannelState {
                 continue;
             }
             if let Some(r) =
-                self.render_content_into(batch, *author, entry_hash, &payload, now_secs, expired)?
+                self.render_content_into(batch, *author, entry_hash, &payload, now_ms, expired)?
             {
                 rows.push(r);
             }
@@ -5931,7 +5957,7 @@ impl ChannelState {
         author: Digest32,
         entry_hash: Digest32,
         payload: &[u8],
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<bool> {
         let mut expired: Vec<(Digest32, Tracked)> = Vec::new();
         let persisted = (|| -> Result<Option<Rendered>> {
@@ -5941,7 +5967,7 @@ impl ChannelState {
                 author,
                 entry_hash,
                 payload,
-                now_secs,
+                now_ms,
                 &mut expired,
             )?;
             if row.is_none()
@@ -5992,7 +6018,7 @@ impl ChannelState {
         author: Digest32,
         entry_hash: Digest32,
         payload: &[u8],
-        now_secs: u64,
+        now_ms: u64,
         expired: &mut Vec<(Digest32, Tracked)>,
     ) -> Result<Option<Rendered>> {
         let me = self.me();
@@ -6006,7 +6032,7 @@ impl ChannelState {
         // **A Session entry opens only with its node's drive key** (ADR-029 SC-2): a member
         // without it skips the entry, quietly; it is never owed, never a row.
         if msg.header.channel_id == drive_channel(&self.channel_id) {
-            self.render_session_into(batch, author, entry_hash, &msg, now_secs, expired)?;
+            self.render_session_into(batch, author, entry_hash, &msg, now_ms, expired)?;
             return Ok(None);
         }
         let slot = (author, msg.header.chain_id);
@@ -6032,7 +6058,7 @@ impl ChannelState {
             // survives a restart (its key is used up), and ages like one (RR-2), and is indexed
             // for `read by` once the batch has committed.
             Ok(Decoded::Read(record)) => {
-                if self.already_expired(&entry_hash, record.created_millis / 1_000, now_secs) {
+                if self.already_expired(&entry_hash, record.created_millis, now_ms) {
                     expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
                     return Ok(None);
                 }
@@ -6063,7 +6089,7 @@ impl ChannelState {
             // reader, and the Session is only for those with drive (SC-2). Not shown.
             Ok(Decoded::Session(_)) | Err(_) => return Ok(None),
         };
-        if self.already_expired(&entry_hash, content.created_millis / 1_000, now_secs) {
+        if self.already_expired(&entry_hash, content.created_millis, now_ms) {
             expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
             return Ok(None);
         }
@@ -6108,19 +6134,19 @@ impl ChannelState {
     ) -> Result<()> {
         for (row, cache_id) in std::mem::take(&mut self.drive.pending) {
             self.retention
-                .rendered(&row.entry_hash, row.created_millis / 1_000, cache_id);
+                .rendered(&row.entry_hash, row.created_millis, cache_id);
             self.drive.news.push(row.session_id.clone());
             self.drive.sessions.push(row);
         }
         for (row, cache_id) in std::mem::take(&mut self.pending_reads) {
             self.retention
-                .rendered(&row.entry_hash, row.created_millis / 1_000, cache_id);
+                .rendered(&row.entry_hash, row.created_millis, cache_id);
             index_read(&mut self.read_records, &mut self.reads, row);
         }
         for rendered in rows {
             self.retention.rendered(
                 &rendered.entry_hash,
-                rendered.created_millis / 1_000,
+                rendered.created_millis,
                 rendered.arrival,
             );
             self.place_rendered(rendered);
@@ -6225,7 +6251,13 @@ impl ChannelState {
     /// rendering needs that author's sender key, which only arrives with its SKDM,
     /// and this node's consent view (ADR-007 — the newcomer sees ciphertext until a
     /// member consents).
-    pub fn accept_entry(&mut self, store: &Store, entry: Entry, now_secs: u64) -> Result<Accepted> {
+    pub fn accept_entry(
+        &mut self,
+        store: &Store,
+        entry: Entry,
+        now: crate::time::Ms,
+    ) -> Result<Accepted> {
+        let now_ms = now.get();
         if self.poisoned {
             return Err(Error::Profile(
                 "room is poisoned after a failed persist; reopen it",
@@ -6303,10 +6335,10 @@ impl ChannelState {
                     &self.genesis,
                     &self.authors,
                     &self.gov_entries,
-                    now_secs,
+                    now_ms,
                     &self.evaluator,
                 )?);
-                self.backfill_newly_readable(store, &could_read, now_secs)?;
+                self.backfill_newly_readable(store, &could_read, now_ms)?;
                 Ok(Accepted::Governance)
             }
             // Content: render it if we hold the author's sender key and the author
@@ -6323,8 +6355,8 @@ impl ChannelState {
                 if self.queue_if_key_package(&payload) {
                     return Ok(Accepted::ContentNotReadable);
                 }
-                self.track_body(store, entry_hash, id, now_secs)?;
-                if self.render_content(store, author, entry_hash, &payload, now_secs)? {
+                self.track_body(store, entry_hash, id, now_ms)?;
+                if self.render_content(store, author, entry_hash, &payload, now_ms)? {
                     Ok(Accepted::Rendered)
                 } else {
                     Ok(Accepted::ContentNotReadable)
@@ -6396,7 +6428,7 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         text: &str,
-        // **Milliseconds**, from one read of one clock. Renamed from `now_secs` rather than
+        // **Milliseconds**, from one read of one clock. Renamed from `now_ms` rather than
         // converted at the call site: this value becomes half the ADR-020 claim ordering key, and a
         // caller still thinking in seconds should fail to compile rather than stamp 1970.
         now_millis: u64,
@@ -6476,7 +6508,7 @@ impl ChannelState {
             &self.sek,
             SegmentKind::Index,
             id,
-            &first_seen_bytes(now_millis / 1_000),
+            &first_seen_bytes(now_millis),
         )?;
 
         // Validate against the DAG first (structural), then persist, then commit
@@ -6520,8 +6552,8 @@ impl ChannelState {
             entry_hash,
             Tracked {
                 log_id: id,
-                first_seen: now_millis / 1_000,
-                claimed: Some(now_millis / 1_000),
+                first_seen_ms: now_millis,
+                claimed_ms: Some(now_millis),
                 cache_id: Some(id),
             },
         );
@@ -6742,7 +6774,7 @@ impl ChannelState {
             &self.sek,
             SegmentKind::Index,
             id,
-            &first_seen_bytes(now_millis / 1_000),
+            &first_seen_bytes(now_millis),
         )?;
         let key = signer.public_key();
         self.dag
@@ -6777,8 +6809,8 @@ impl ChannelState {
             entry_hash,
             Tracked {
                 log_id: id,
-                first_seen: now_millis / 1_000,
-                claimed: Some(now_millis / 1_000),
+                first_seen_ms: now_millis,
+                claimed_ms: Some(now_millis),
                 cache_id: Some(id),
             },
         );
@@ -6852,12 +6884,12 @@ impl ChannelState {
             author: c.author,
             created_millis: at(&c.entry_hash),
             after: None,
-            what: if c.ttl == 0 {
+            what: if c.ttl_ms == 0 {
                 "set the room's retention to forever: from now on no message is removed for its \
                  age"
                     .to_owned()
             } else {
-                let d = crate::node::retention::describe(c.ttl);
+                let d = crate::node::retention::describe(c.ttl_ms / 1_000);
                 format!(
                     "set the room's retention to {d}: messages older than {d} are removed from \
                      now on"
@@ -6915,7 +6947,8 @@ impl ChannelState {
     ///
     /// # Errors
     /// Not an admin, not a room name, or an append that fails.
-    pub fn set_name(&mut self, profile: &Profile, name: &str, now_secs: u64) -> Result<()> {
+    pub fn set_name(&mut self, profile: &Profile, name: &str, now: crate::time::Ms) -> Result<()> {
+        let now_ms = now.get();
         let signer = profile.signer()?;
         if !self.may_rename(&signer.fingerprint()) {
             return Err(Error::MalformedGovernance(
@@ -6924,11 +6957,11 @@ impl ChannelState {
         }
         let statement =
             crate::governance::name::RoomName::build(signer, &self.channel_id, self.epoch, name)?;
-        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        self.append_governance(profile, &statement.to_wire(), now_ms)?;
         Ok(())
     }
 
-    /// Creation time recorded in the manifest.
+    /// Creation time recorded in the manifest, milliseconds since the Unix epoch.
     #[must_use]
     pub fn created(&self) -> u64 {
         self.created
@@ -7098,7 +7131,13 @@ impl ChannelState {
 
     /// Write that this identity has left the room (`here` = false) or is back in it, unless its
     /// feed already says so (V210-164). Returns whether an entry was written.
-    pub fn say_presence(&mut self, profile: &Profile, here: bool, now_secs: u64) -> Result<bool> {
+    pub fn say_presence(
+        &mut self,
+        profile: &Profile,
+        here: bool,
+        now: crate::time::Ms,
+    ) -> Result<bool> {
+        let now_ms = now.get();
         let me = profile.signer()?.fingerprint();
         if self.said_left(&me) != here {
             return Ok(false);
@@ -7110,7 +7149,7 @@ impl ChannelState {
             here,
             self.sender.chain_id(),
         )?;
-        self.append_governance(profile, &statement.to_wire(), now_secs)?;
+        self.append_governance(profile, &statement.to_wire(), now_ms)?;
         Ok(true)
     }
 
@@ -7143,25 +7182,25 @@ impl ChannelState {
         if lifecycle.ended_by.is_some() {
             return Some(RoomEnd::ByCreator);
         }
-        let idle = lifecycle.idle_end_secs?;
-        let last = self
-            .dag
-            .newest_clock()
-            .unwrap_or_else(|| self.created().saturating_mul(1_000));
-        let at = last.saturating_add(idle.saturating_mul(1_000));
-        (now_ms >= at).then_some(RoomEnd::Idle { idle_secs: idle })
+        let idle_ms = lifecycle.idle_end_ms?;
+        let last = self.dag.newest_clock().unwrap_or_else(|| self.created());
+        let at = last.saturating_add(idle_ms);
+        (now_ms >= at).then_some(RoomEnd::Idle {
+            idle_secs: idle_ms / 1_000,
+        })
     }
 
     /// The idle end this room's creator chose, in seconds, if any (V030-08).
     #[must_use]
     pub fn idle_end(&self) -> Option<u64> {
-        self.evaluator.lifecycle().idle_end_secs
+        self.evaluator.lifecycle().idle_end_ms.map(|ms| ms / 1_000)
     }
 
     /// End the room for everyone (V030-08). Only its creator, or an admin the creator delegated,
     /// may: anyone else is refused here rather than writing an entry every other node would
     /// ignore.
-    pub fn end(&mut self, profile: &Profile, now_secs: u64) -> Result<Digest32> {
+    pub fn end(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<Digest32> {
+        let now_ms = now.get();
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         if me != self.evaluator.root_admin() && !self.evaluator.admins().contains(&me) {
@@ -7175,7 +7214,7 @@ impl ChannelState {
             self.epoch,
             crate::governance::lifecycle::LifecycleKind::End,
         )?;
-        self.append_governance(profile, &fact.to_wire(), now_secs)
+        self.append_governance(profile, &fact.to_wire(), now_ms)
     }
 
     /// Make `member` an admin of the room (V030-08, the decider 2026-10-01): an admin
@@ -7186,8 +7225,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         member: &Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Digest32> {
+        let now_ms = now.get();
         let signer = profile.signer()?;
         // The client's own check. The room's is the certificate: it carries no `delegate`, so an
         // admin's certificate for anyone else verifies nowhere (#319).
@@ -7220,7 +7260,7 @@ impl ChannelState {
             Self::delegated_admin_caps(),
             0,
         )?;
-        self.append_governance(profile, &cert.to_wire(), now_secs)
+        self.append_governance(profile, &cert.to_wire(), now_ms)
     }
 
     /// What a delegated admin holds (#319): the room's policy, which is its retention — the one
@@ -7240,8 +7280,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         member: &Digest32,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<usize> {
+        let now_ms = now.get();
         use crate::governance::entry::GovBody;
         let signer = profile.signer()?;
         let me = signer.fingerprint();
@@ -7279,7 +7320,7 @@ impl ChannelState {
                 *hash,
                 crate::governance::cert::RevocationReason::NoLongerNeeded,
             )?;
-            self.append_governance(profile, &rev.to_wire(), now_secs)?;
+            self.append_governance(profile, &rev.to_wire(), now_ms)?;
         }
         Ok(certs.len())
     }
@@ -7311,8 +7352,9 @@ impl ChannelState {
         &mut self,
         profile: &Profile,
         idle_secs: u64,
-        now_secs: u64,
+        now: crate::time::Ms,
     ) -> Result<Digest32> {
+        let now_ms = now.get();
         let signer = profile.signer()?;
         if signer.fingerprint() != self.evaluator.root_admin() {
             return Err(Error::Profile(
@@ -7323,9 +7365,9 @@ impl ChannelState {
             signer,
             &self.channel_id,
             self.epoch,
-            crate::governance::lifecycle::LifecycleKind::IdleEnd(idle_secs),
+            crate::governance::lifecycle::LifecycleKind::IdleEnd(idle_secs.saturating_mul(1_000)),
         )?;
-        self.append_governance(profile, &fact.to_wire(), now_secs)
+        self.append_governance(profile, &fact.to_wire(), now_ms)
     }
 
     /// Number of accepted log entries.
@@ -7409,7 +7451,7 @@ impl ChannelState {
 struct ChannelSessionRoom<'a> {
     shared: &'a tokio::sync::Mutex<ChannelState>,
     store: &'a Store,
-    now_secs: u64,
+    now_ms: u64,
     /// The epoch the session began at; a room that has moved on refuses what was staged for it.
     epoch: u64,
     /// Retired sessions stop at their next step (ADR-025 D1a).
@@ -7509,7 +7551,7 @@ impl crate::log::sync::SessionRoom for ChannelSessionRoom<'_> {
             &ch.admission,
             &staged,
         );
-        match ch.absorb_arrived(self.store, &before, self.now_secs) {
+        match ch.absorb_arrived(self.store, &before, self.now_ms) {
             Ok(got) => {
                 let mut out = self.out.borrow_mut();
                 out.rendered += got.rendered;

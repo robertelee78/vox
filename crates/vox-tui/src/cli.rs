@@ -304,7 +304,7 @@ pub struct LanHelperArgs {
     #[arg(long, default_value = crate::lan_cli::DEFAULT_HELPER_SOCKET)]
     pub socket: PathBuf,
     /// Serve the person who owns the Vox.app this `vox` is inside, as the app's login-time
-    /// helper does (ADR-014 M-10), instead of the person who ran `sudo`. Refused for a Vox.app
+    /// helper does, instead of the person who ran `sudo`. Refused for a Vox.app
     /// owned by root, one with a directory or file down to this `vox` that others may write,
     /// or one not signed by the same Developer ID team as this `vox`.
     #[arg(long)]
@@ -1326,7 +1326,7 @@ pub struct RoomReadArgs {
     /// With `--json`, also what was done to the room (its retention set, its name changed), each
     /// as a `vox.room.notice/1` object right after the row it follows in the room's order, its
     /// time in milliseconds. Off by default: a program that reads rows takes only
-    /// `vox.room.row/1` (ADR-021 7.6).
+    /// `vox.room.row/1`.
     #[arg(long, requires = "json", conflicts_with = "late")]
     pub notices: bool,
     /// Print every entry this node holds for the room in the room's order, one per
@@ -2275,6 +2275,8 @@ pub fn run() -> ExitCode {
             let waiting = crate::tunnel_cli::Waiting::new("the room was not joined");
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
+                // An address that will not parse is refused before its passphrase is asked for.
+                crate::tunnel_cli::readable(&args.address)?;
                 steps.on("the room passphrase");
                 let (given, file) = (args.passphrase.clone(), args.passphrase_file.clone());
                 let room_pp = tokio::task::spawn_blocking(move || {

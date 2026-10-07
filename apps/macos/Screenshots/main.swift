@@ -74,6 +74,13 @@ Task { @MainActor in
             await wait(1)
             try render(MainWindow(model: model), "offer")
         }
+        // A Session of ann's own, staged by the script, waiting on her (ADR-029 §8).
+        if let s = model.openSessions.first {
+            model.showing = .session(node: s.nodeFingerprint, id: s.sessionId)
+            await wait(3)
+            try render(MainWindow(model: model), "room-session")
+            model.showing = .general
+        }
         await model.show(.keyring)
         await wait(1)
         try render(MainWindow(model: model), "keyring")

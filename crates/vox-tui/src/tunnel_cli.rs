@@ -715,19 +715,23 @@ pub(crate) fn say_if_it_explains_a_failure(ev: &NodeEvent) {
             channel_id,
             node,
             room,
-        } => {
-            eprintln!(
-                "vox: warning: this node's retention file asks to keep room {} for {}, longer than \
-                 the room keeps it ({}); a member may keep less than the room, never more, so the \
-                 room's {} is in force",
-                short(channel_id),
-                vox_core::node::retention::describe(*node),
-                vox_core::node::retention::describe(*room),
-                vox_core::node::retention::describe(*room)
-            );
-        }
+        } => say_retention_above_room(channel_id, *node, *room),
         _ => {}
     }
+}
+
+/// Say that this node's own retention file asks to keep a room longer than the room does, and is
+/// ignored (V030-32).
+pub(crate) fn say_retention_above_room(channel_id: &Digest32, node: u64, room: u64) {
+    eprintln!(
+        "vox: warning: this node's retention file asks to keep room {} for {}, longer than the \
+         room keeps it ({}); a member may keep less than the room, never more, so the room's {} \
+         is in force",
+        short(channel_id),
+        vox_core::node::retention::describe(node),
+        vox_core::node::retention::describe(room),
+        vox_core::node::retention::describe(room)
+    );
 }
 
 /// [`join_advice`], told what the join said about itself: `said` is its reason and its steps.
@@ -784,6 +788,19 @@ fn board_unreachable_advice(said: &str) -> &'static str {
             "neither the room's host nor any anchor tried for it answered, so no member was asked\n       your passphrase was never checked — this is not a verdict on it\n       check that the host is running and that this machine can reach its address; an anchor matters only when the host cannot be reached directly"
         }
     }
+}
+
+/// **An address that will not parse is refused here, with what is wrong with it**, before any
+/// node or board is asked: the node can only answer "will not parse", which sent a person to
+/// check they had copied all of an address that was whole (a member marked with `m=` that the
+/// address gives no `a=`/`b=` for, 2026-10-07). Shared by `vox room join` and `vox connect`.
+///
+/// # Errors
+/// The parse's own reason.
+pub(crate) fn readable(link: &str) -> Result<(), AppError> {
+    vox_core::node::link::InviteLink::parse(link)
+        .map(|_| ())
+        .map_err(|e| AppError::Usage(format!("cannot join: {e}")))
 }
 
 /// What to tell a person whose join failed, chosen by the fault the node reported.

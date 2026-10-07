@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks forty-four claims, each
+//! 160x50. It checks forty-six claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -28,6 +28,10 @@
 //!   said "⏱ forever", says "⏱ 1 week", and each timeline shows one line saying who set it and
 //!   that messages older than that are removed from now on (ADR-028 R-7, #483); and a focused
 //!   pane's border names it once;
+//! - `order`: Alice posts, then sets the room's retention (`2w`), within one wall-clock second: in
+//!   Bob's timeline the post shows first and the retention line under it (#562: the notice follows
+//!   the message before it in the room's order, times kept in milliseconds), worded "2 weeks", never
+//!   "1209600 seconds";
 //! - `words`: `:link` says "room link: vox://…" and `:join` asks for a "room link (vox://…)",
 //!   never an "invite link" (the decider's words, #406);
 //! - `follows`: m-071, posted while the TUI is open, is shown when it arrives;
@@ -104,6 +108,9 @@
 //!   the room's messages; `:session <short id>`, without drive, shows only that it exists and
 //!   "Only members alice trusts with drive see inside this Session.", with no composer, and
 //!   `:send` there is refused and reaches nobody (ADR-029 CL-2, CL-3, #553);
+//! - `session-order`: Alice posts, then her hook opens a new Session, within one wall-clock second:
+//!   in Bob's All the post reads first and "<label> opened" under it (#562: a Session's opened line
+//!   follows no message, so it is placed by its time, kept in milliseconds);
 //! - `drive`: once Alice gives Bob drive (`vox trust drive`, typed at a terminal) and her open
 //!   Session runs a turn through Claude Code's hook (a tool call, its result, the reply), Bob's
 //!   `:session` shows each line his `vox room session` prints, and not "Only members …"; `d` on the
@@ -179,8 +186,9 @@
 //! offering a composer (`sessions`), a member with drive shown only that the Session exists
 //! (`drive`), `a` sending a rejection (`approve`),
 //! `:interrupt` sent as a stop (`steer`),
-//! or a Session's `:share` sending the path as text (`share`). It passes only on the script's PASS with
-//! all 48 claims ok. Also: the dismissals not kept across a restart (`offer`), or no offer from a
+//! a Session's `:share` sending the path as text (`share`), notices placed by time again
+//! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
+//! all 50 claims ok. Also: the dismissals not kept across a restart (`offer`), or no offer from a
 //! consent grant, so no offer back (`offerback`).
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
@@ -278,7 +286,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (48 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (50 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -292,8 +300,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (48, 48),
-                "APPARATUS: the driver said PASS without all 48 claims ok: {said}"
+                (50, 50),
+                "APPARATUS: the driver said PASS without all 50 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

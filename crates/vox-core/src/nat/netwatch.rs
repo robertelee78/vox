@@ -47,7 +47,7 @@ impl NetShape {
 /// routes moved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetChange {
-    /// When it was found, unix seconds.
+    /// When it was found, unix milliseconds.
     pub at: u64,
     /// Routable addresses the machine has now and did not before.
     pub came: Vec<IpAddr>,

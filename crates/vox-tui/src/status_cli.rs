@@ -36,9 +36,9 @@ fn short(id: &str) -> String {
     id.chars().take(12).collect()
 }
 
-fn ago(now: u64, v: &Value) -> String {
+fn ago(now_ms: u64, v: &Value) -> String {
     match v.as_u64() {
-        Some(t) => format!("{}s ago", now.saturating_sub(t)),
+        Some(t_ms) => format!("{}s ago", now_ms.saturating_sub(t_ms) / 1_000),
         None => "never".into(),
     }
 }
@@ -46,7 +46,7 @@ fn ago(now: u64, v: &Value) -> String {
 /// The report for a person.
 fn render(v: &Value) -> String {
     use std::fmt::Write as _;
-    let now = v.get("now").and_then(Value::as_u64).unwrap_or(0);
+    let now = v.get("now_ms").and_then(Value::as_u64).unwrap_or(0);
     let mut o = String::new();
     let _ = writeln!(
         o,
@@ -98,11 +98,10 @@ fn render(v: &Value) -> String {
                 Some(alias) => format!("{alias} ({})", short(s(e, "by"))),
                 None => short(s(e, "by")),
             };
-            let at = e.get("at_ms").and_then(Value::as_u64).map(|ms| ms / 1_000);
             let _ = writeln!(
                 o,
                 "  {}  refused {who} {}: {}",
-                ago(now, &at.map_or(Value::Null, Value::from)),
+                ago(now, &e["at_ms"]),
                 s(e, "asked"),
                 s(e, "why")
             );
@@ -116,7 +115,7 @@ fn render(v: &Value) -> String {
             short(s(r, "id")),
             s(r, "name"),
             r.get("epoch").and_then(Value::as_u64).unwrap_or(0),
-            ago(now, &r["last_sync"]),
+            ago(now, &r["last_sync_ms"]),
             r.get("entries").and_then(Value::as_u64).unwrap_or(0),
             r.get("key_generations")
                 .and_then(Value::as_u64)
@@ -159,8 +158,8 @@ fn render(v: &Value) -> String {
                 } else {
                     "not connected"
                 },
-                ago(now, &m["last_seen"]),
-                ago(now, &m["last_sync"])
+                ago(now, &m["last_seen_ms"]),
+                ago(now, &m["last_sync_ms"])
             );
         }
     }
@@ -347,9 +346,9 @@ fn render(v: &Value) -> String {
 /// seen. Said before the sync rows.
 fn tunnels(v: &serde_json::Value, out: &mut String) {
     use std::fmt::Write as _;
-    let now = vox_core::transport::quic::unix_now();
-    let ago = |t: u64| {
-        let s = now.saturating_sub(t);
+    let now_ms = vox_core::transport::quic::unix_now_ms();
+    let ago = |t_ms: u64| {
+        let s = now_ms.saturating_sub(t_ms) / 1_000;
         if s < 120 {
             format!("{s}s")
         } else if s < 7200 {
@@ -377,8 +376,8 @@ fn tunnels(v: &serde_json::Value, out: &mut String) {
             "tunnel {} {way} for {}: open {}, last moved {} ago",
             n("id"),
             s("service"),
-            ago(n("opened")),
-            ago(n("last_moved"))
+            ago(n("opened_ms")),
+            ago(n("last_moved_ms"))
         );
     }
     // Ended for a reason a person should see (V030-11): closed here, there, or as stuck.
@@ -402,7 +401,7 @@ fn tunnels(v: &serde_json::Value, out: &mut String) {
             n("id"),
             s("service"),
             s("why"),
-            ago(n("closed"))
+            ago(n("closed_ms"))
         );
     }
 }

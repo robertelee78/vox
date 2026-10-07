@@ -1,4 +1,5 @@
-//! The **room lifecycle** facts (tag `0x0019`, domain `vox/room-lifecycle/v1`): the creator, or
+//! The **room lifecycle** facts (tag `0x0019`, domain `vox/room-lifecycle/v2`; `v1` for a format-1
+//! fact, whose idle end was in seconds and is read as milliseconds): the creator, or
 //! an admin it named, ending the room for everyone, and the creator's chosen idle end (V030-08).
 //!
 //! ## Why these are log facts
@@ -12,12 +13,12 @@
 //!   delegated (the decider, 2026-10-01). Once a node holds it, the room takes no new message,
 //!   and each member's node deletes it once it has passed the end on (the decider, 2026-10-03).
 //! - **Idle end** is signed by the creator when the room is made. The room then ends once it
-//!   has seen no message for the chosen number of seconds. A room whose creator did not
+//!   has seen no message for the chosen number of milliseconds. A room whose creator did not
 //!   choose one never ends by itself.
 //!
 //! Neither is bound to an epoch's lifetime. The `epoch` field records when it was said.
 //!
-//! Body: `[kind, channelID, epoch, issuer_id, idle_secs]`, `idle_secs` 0 unless the kind is
+//! Body: `[kind, channelID, epoch, issuer_id, idle_ms]`, `idle_ms` 0 unless the kind is
 //! idle end. Kind codes 1 and 4 (a leave and a return, before the decider's 2026-10-03 ruling)
 //! are reserved and refused.
 
@@ -25,14 +26,14 @@ use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::{Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
-use crate::wire::{frame, parse_frame, signing_input, StructTag};
+use crate::wire::{frame_at, parse_frame, signing_input_at, time_decoded, time_encoded, StructTag};
 
 /// Which lifecycle fact an entry states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleKind {
     /// The room's creator has ended the room for everyone.
     End,
-    /// The room's creator chose that the room end after this many seconds with no message.
+    /// The room's creator chose that the room end after this many milliseconds with no message.
     IdleEnd(u64),
 }
 
@@ -44,15 +45,15 @@ impl LifecycleKind {
         }
     }
 
-    fn idle_secs(self) -> u64 {
+    fn idle_ms(self) -> u64 {
         match self {
             LifecycleKind::IdleEnd(s) => s,
             _ => 0,
         }
     }
 
-    fn from_parts(code: u64, idle_secs: u64) -> Result<Self> {
-        match (code, idle_secs) {
+    fn from_parts(code: u64, idle_ms: u64) -> Result<Self> {
+        match (code, idle_ms) {
             (2, 0) => Ok(LifecycleKind::End),
             (3, s) if s > 0 => Ok(LifecycleKind::IdleEnd(s)),
             _ => Err(Error::MalformedGovernance("room-lifecycle kind")),
@@ -71,10 +72,12 @@ pub struct RoomLifecycleBody {
     pub epoch: u64,
     /// The signer: the creator, or an admin it named.
     pub issuer_id: Digest32,
+    /// The format it was written in (see [`crate::governance::genesis`]).
+    pub format: u8,
 }
 
 impl RoomLifecycleBody {
-    /// Canonical-CBOR body `[kind, channelID, epoch, issuer_id, idle_secs]`.
+    /// Canonical-CBOR body `[kind, channelID, epoch, issuer_id, idle_ms]` (idle seconds in format 1).
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
@@ -83,14 +86,19 @@ impl RoomLifecycleBody {
             .bytes(&self.channel_id)
             .uint(self.epoch)
             .bytes(&self.issuer_id)
-            .uint(self.kind.idle_secs());
+            .uint(time_encoded(self.kind.idle_ms(), self.format));
         e.finish()
     }
 
-    /// The signing input: `vox/room-lifecycle/v1 ‖ canonical_body` (ADR-008).
+    /// The signing input: `vox/room-lifecycle/v2 ‖ canonical_body` (ADR-008), or the `v1` label
+    /// for a format-1 fact.
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
-        signing_input(StructTag::RoomLifecycle, &self.canonical_body())
+        signing_input_at(
+            StructTag::RoomLifecycle,
+            self.format,
+            &self.canonical_body(),
+        )
     }
 }
 
@@ -119,6 +127,7 @@ impl RoomLifecycle {
             channel_id: *channel_id,
             epoch,
             issuer_id: issuer_root.fingerprint(),
+            format: StructTag::RoomLifecycle.format_version(),
         };
         let signature = issuer_root.sign(&body.signing_input())?;
         Ok(Self { body, signature })
@@ -134,9 +143,9 @@ impl RoomLifecycle {
             .bytes(&b.channel_id)
             .uint(b.epoch)
             .bytes(&b.issuer_id)
-            .uint(b.kind.idle_secs())
+            .uint(time_encoded(b.kind.idle_ms(), b.format))
             .bytes(&self.signature.to_bytes());
-        frame(StructTag::RoomLifecycle, &e.finish())
+        frame_at(StructTag::RoomLifecycle, b.format, &e.finish())
     }
 
     /// Parse a framed lifecycle fact (does NOT verify).
@@ -155,10 +164,10 @@ impl RoomLifecycle {
         let channel_id = take_digest(&mut d)?;
         let epoch = d.uint()?;
         let issuer_id = take_digest(&mut d)?;
-        let idle_secs = d.uint()?;
+        let idle = time_decoded(d.uint()?, parsed.version);
         let sig_bytes = d.bytes()?.to_vec();
         d.finish()?;
-        let kind = LifecycleKind::from_parts(code, idle_secs)?;
+        let kind = LifecycleKind::from_parts(code, idle)?;
         let sig: [u8; COMPOSITE_SIG_LEN] = sig_bytes
             .as_slice()
             .try_into()
@@ -170,6 +179,7 @@ impl RoomLifecycle {
                 channel_id,
                 epoch,
                 issuer_id,
+                format: parsed.version,
             },
             signature,
         })

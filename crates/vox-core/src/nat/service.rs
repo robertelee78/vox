@@ -743,7 +743,7 @@ impl RendezvousService {
                 w.verify(&key).map_err(|e| RejectReason::for_error(&e))?;
                 match w.scope {
                     WithdrawScope::Member => {
-                        store.withdraw_member(&w.channel_id, &w.author_id, w.timestamp);
+                        store.withdraw_member(&w.channel_id, &w.author_id, w.timestamp_ms);
                     }
                     WithdrawScope::Room => {
                         store.withdraw_room(&w.channel_id, Some(record.to_vec()));

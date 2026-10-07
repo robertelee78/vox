@@ -14,14 +14,13 @@
 //! - **Monotone freshness.** A replacement must strictly advance both `seq` and
 //!   `timestamp`; an equal-or-older `(seq, timestamp)` is a replay and is rejected — except a
 //!   record making the same claim as the held one inside the refresh floor, which is already held.
-//! - **Rate floor.** A *refresh* — the same claim re-announced — inside [`MIN_REFRESH_SECS`] is a
+//! - **Rate floor.** A *refresh* — the same claim re-announced — inside [`MIN_REFRESH_MS`] is a
 //!   no-op: the held record stands and nothing is reported. A *changed* claim (new endpoints, new
-//!   prekeys) is accepted as soon as it is strictly newer, which the monotone timestamp bounds to
-//!   one per second per author.
-//! - **TTL.** Member records carry a `ttl_secs` capped at [`MAX_TTL_SECS`]; pre-join
-//!   records (no TTL field, ADR-012) get [`DEFAULT_TTL_SECS`]. Expired records are
+//!   prekeys) is accepted once it is at least [`MIN_CHANGE_MS`] newer: one change a second per author.
+//! - **TTL.** Member records carry a `ttl_ms` capped at [`MAX_TTL_MS`]; pre-join
+//!   records (no TTL field, ADR-012) get [`DEFAULT_TTL_MS`]. Expired records are
 //!   never served and are pruned.
-//! - **Bounded clock skew.** A `timestamp` more than [`MAX_CLOCK_SKEW_SECS`] in the
+//! - **Bounded clock skew.** A `timestamp` more than [`MAX_CLOCK_SKEW_MS`] in the
 //!   future is rejected, so a forged far-future timestamp cannot pin a stale record
 //!   forever or evade TTL.
 //! - **Epoch-scoping.** Member records bucket by `(channelID, epoch)`; after a
@@ -34,7 +33,7 @@
 //!   than refusing the newest; member buckets are bounded by
 //!   [`MAX_AUTHORS_PER_BUCKET`] as defense in depth.
 //!
-//! All time is caller-supplied `now` (epoch-seconds): the store is deterministic
+//! All time is caller-supplied `now` (milliseconds since the Unix epoch): the store is deterministic
 //! and has no ambient clock, which keeps it unit-testable and side-effect-free.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -45,21 +44,26 @@ use crate::hash::Digest32;
 use crate::identity::composite::CompositePublicKey;
 use crate::nat::record::{MemberBundleRecord, PreJoinRecord, RendezvousRecord};
 
-/// Minimum seconds between successive accepted records for one
+/// Minimum milliseconds between successive accepted records for one
 /// `(author, channel, epoch)` — the ADR-012 refresh cap (≥ 60 s).
-pub const MIN_REFRESH_SECS: u64 = 60;
+pub const MIN_REFRESH_MS: u64 = 60_000;
+
+/// The least a replacement's timestamp must be past the held record's: an author changes its claim
+/// at most once a second. When timestamps were whole seconds a change in the same second was refused
+/// as not newer; in milliseconds the bound is kept by this, so the unit change loosens no flood bound.
+pub const MIN_CHANGE_MS: u64 = 1_000;
 
 /// The environment variable [`test_record_ttl`] reads. **Test-only.**
 #[cfg(feature = "test-knobs")]
-pub const TEST_RECORD_TTL_ENV: &str = "VOX_TEST_RECORD_TTL_SECS";
+pub const TEST_RECORD_TTL_ENV: &str = "VOX_TEST_RECORD_TTL_MS";
 
 /// A shorter lifetime for this node's own address records, read once from
 /// [`TEST_RECORD_TTL_ENV`]. **Test-only: for proofs; nothing in a real deployment sets it.**
 ///
 /// A node renews its own record at half its lifetime (V210-68, #258). At the real two hours, a
 /// proof that a node idle for several lifetimes stays findable would take a day. It only ever
-/// shortens the lifetime, clamped to [`MIN_TEST_RECORD_TTL_SECS`]..=[`MAX_TTL_SECS`], and scales
-/// the refresh floor with it ([`min_refresh_secs`]) so a renewal at half the lifetime is still
+/// shortens the lifetime, clamped to [`MIN_TEST_RECORD_TTL_MS`]..=[`MAX_TTL_MS`], and scales
+/// the refresh floor with it ([`min_refresh_ms`]) so a renewal at half the lifetime is still
 /// past the floor. Unset, empty or unparsable is `None`: the real lifetime and floor.
 #[cfg(feature = "test-knobs")]
 #[must_use]
@@ -69,7 +73,7 @@ pub fn test_record_ttl() -> Option<u64> {
         std::env::var(TEST_RECORD_TTL_ENV)
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|t| t.clamp(MIN_TEST_RECORD_TTL_SECS, MAX_TTL_SECS))
+            .map(|t| t.clamp(MIN_TEST_RECORD_TTL_MS, MAX_TTL_MS))
     })
 }
 
@@ -80,41 +84,41 @@ pub const fn test_record_ttl() -> Option<u64> {
     None
 }
 
-/// The shortest lifetime `VOX_TEST_RECORD_TTL_SECS` may set.
-pub const MIN_TEST_RECORD_TTL_SECS: u64 = 8;
+/// The shortest lifetime `VOX_TEST_RECORD_TTL_MS` may set.
+pub const MIN_TEST_RECORD_TTL_MS: u64 = 8_000;
 
-/// The lifetime this node gives its own address records: [`MAX_TTL_SECS`], or a proof's shorter
+/// The lifetime this node gives its own address records: [`MAX_TTL_MS`], or a proof's shorter
 /// one ([`test_record_ttl`]).
 #[must_use]
-pub fn own_record_ttl_secs() -> u64 {
-    test_record_ttl().unwrap_or(MAX_TTL_SECS)
+pub fn own_record_ttl_ms() -> u64 {
+    test_record_ttl().unwrap_or(MAX_TTL_MS)
 }
 
-/// The refresh floor in force: [`MIN_REFRESH_SECS`], or a quarter of a proof's shorter record
+/// The refresh floor in force: [`MIN_REFRESH_MS`], or a quarter of a proof's shorter record
 /// lifetime ([`test_record_ttl`]), never more than the real one.
 #[must_use]
-pub fn min_refresh_secs() -> u64 {
-    test_record_ttl().map_or(MIN_REFRESH_SECS, |t| (t / 4).clamp(1, MIN_REFRESH_SECS))
+pub fn min_refresh_ms() -> u64 {
+    test_record_ttl().map_or(MIN_REFRESH_MS, |t| (t / 4).clamp(1_000, MIN_REFRESH_MS))
 }
 
-/// Default record TTL in seconds (ADR-012 "short TTL (default 2 h)"). Applied to
+/// Default record TTL in milliseconds (ADR-012 "short TTL (default 2 h)"). Applied to
 /// pre-join records, which carry no TTL field of their own.
-pub const DEFAULT_TTL_SECS: u64 = 2 * 60 * 60;
+pub const DEFAULT_TTL_MS: u64 = 2 * 60 * 60 * 1_000;
 
-/// Hard ceiling on a member record's requested `ttl_secs`. A record asking for more
+/// Hard ceiling on a member record's requested `ttl_ms`. A record asking for more
 /// is rejected (ADR-012 "short TTL"): a member cannot pin a long-lived stale
 /// advertisement.
-pub const MAX_TTL_SECS: u64 = 2 * 60 * 60;
+pub const MAX_TTL_MS: u64 = 2 * 60 * 60 * 1_000;
 
-/// Hard ceiling on a member **bundle** record's requested `ttl_secs` (ADR-016
+/// Hard ceiling on a member **bundle** record's requested `ttl_ms` (ADR-016
 /// M14): the ADR-002 signed-prekey rotation cadence, 7 days. A bundle is
 /// republished on rotation and when the one-time pool runs low, so a longer
 /// pin would only serve a stale bundle.
-pub const BUNDLE_MAX_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+pub const BUNDLE_MAX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
-/// Maximum seconds a record's `timestamp` may lead `now` before it is rejected as
+/// Maximum milliseconds a record's `timestamp_ms` may lead `now` before it is rejected as
 /// implausibly future-dated (clock-skew tolerance).
-pub const MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
+pub const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1_000;
 
 /// Maximum distinct pre-join `asserted_id`s retained per channel (anti-spam: a
 /// pre-join author is unauthenticated-as-member, so the count is otherwise
@@ -163,27 +167,27 @@ pub const MAX_SOURCES_PER_ROOM: usize = 16;
 // source holds more.
 pub use crate::nat::source::Source;
 
-/// The expiry instant of a member record (epoch-seconds).
+/// The expiry instant of a member record (milliseconds since the Unix epoch).
 fn member_expiry(rec: &RendezvousRecord) -> u64 {
-    rec.timestamp.saturating_add(rec.ttl_secs)
+    rec.timestamp_ms.saturating_add(rec.ttl_ms)
 }
 
-/// The expiry instant of a pre-join record (epoch-seconds): store-applied default
+/// The expiry instant of a pre-join record (milliseconds since the Unix epoch): store-applied default
 /// TTL, since pre-join records carry no TTL field (ADR-012).
 fn prejoin_expiry(rec: &PreJoinRecord) -> u64 {
-    rec.timestamp.saturating_add(DEFAULT_TTL_SECS)
+    rec.timestamp_ms.saturating_add(DEFAULT_TTL_MS)
 }
 
-/// The expiry instant of a member bundle record (epoch-seconds).
+/// The expiry instant of a member bundle record (milliseconds since the Unix epoch).
 fn bundle_expiry(rec: &MemberBundleRecord) -> u64 {
-    rec.timestamp.saturating_add(rec.ttl_secs)
+    rec.timestamp_ms.saturating_add(rec.ttl_ms)
 }
 
 /// Shared freshness checks for a replacement against the current record's
-/// `(seq, timestamp)`: strict monotonicity, so a record is never replaced by an older one and
-/// an author can change its claim at most once a second.
+/// `(seq, timestamp_ms)`: strict monotonicity, so a record is never replaced by an older one, and
+/// its timestamp at least [`MIN_CHANGE_MS`] past the held one's.
 ///
-/// **The refresh floor governs refreshes, not changes.** [`MIN_REFRESH_SECS`] is ADR-012's cap
+/// **The refresh floor governs refreshes, not changes.** [`MIN_REFRESH_MS`] is ADR-012's cap
 /// on how often a member re-announces; the callers apply it to a record whose claim is the same
 /// as the held one, where arriving early makes it a no-op. It is not applied here, to a record
 /// whose claim *changed*, because that is where it did harm: a node publishes its first address
@@ -192,8 +196,8 @@ fn bundle_expiry(rec: &MemberBundleRecord) -> u64 {
 /// times in one measured session, the node unreachable from any other machine meanwhile. Its
 /// updated prekey bundle was refused the same way, 131 times. ADR-012 called that refusal benign
 /// because "the previous announcement is still live"; the previous announcement was the wrong one.
-/// A changed claim is still bounded to one per second per author by the strict timestamp, and
-/// the board keeps one current record per author, so the anti-spam bound stands.
+/// A changed claim must be at least [`MIN_CHANGE_MS`] newer, and the board keeps one current record
+/// per author, so the anti-spam bound stands.
 ///
 /// **Not reached for a record identical to the one held**: the callers accept that as a no-op
 /// first. A board is re-offered records it already has all the time — a member vouching for
@@ -215,7 +219,7 @@ fn same_member_claim(cur: &RendezvousRecord, new: &RendezvousRecord) -> bool {
         && cur.channel_id == new.channel_id
         && cur.epoch == new.epoch
         && cur.endpoints == new.endpoints
-        && cur.ttl_secs == new.ttl_secs
+        && cur.ttl_ms == new.ttl_ms
 }
 
 /// See [`same_member_claim`].
@@ -224,7 +228,7 @@ fn same_bundle_claim(cur: &MemberBundleRecord, new: &MemberBundleRecord) -> bool
         && cur.channel_id == new.channel_id
         && cur.epoch == new.epoch
         && cur.prekey_bundle == new.prekey_bundle
-        && cur.ttl_secs == new.ttl_secs
+        && cur.ttl_ms == new.ttl_ms
         && cur.admission == new.admission
 }
 
@@ -239,7 +243,7 @@ fn check_replacement(new_seq: u64, new_ts: u64, cur_seq: u64, cur_ts: u64) -> Re
     if new_seq <= cur_seq {
         return Err(Error::RendezvousRejected("non-increasing seq (replay)"));
     }
-    if new_ts <= cur_ts {
+    if new_ts < cur_ts.saturating_add(MIN_CHANGE_MS) {
         return Err(Error::RendezvousRejected(
             "non-increasing timestamp (replay)",
         ));
@@ -247,16 +251,16 @@ fn check_replacement(new_seq: u64, new_ts: u64, cur_seq: u64, cur_ts: u64) -> Re
     Ok(())
 }
 
-/// Whether a same-claim record arrived inside the [`MIN_REFRESH_SECS`] floor, which makes it a
+/// Whether a same-claim record arrived inside the [`MIN_REFRESH_MS`] floor, which makes it a
 /// no-op rather than a renewal.
 fn within_refresh_floor(new_ts: u64, cur_ts: u64) -> bool {
-    new_ts < cur_ts.saturating_add(min_refresh_secs())
+    new_ts < cur_ts.saturating_add(min_refresh_ms())
 }
 
 /// Common time-sanity checks applied to every incoming record before it can be
 /// stored: not implausibly future-dated, and not already expired.
 fn check_time_validity(timestamp: u64, expiry: u64, now: u64) -> Result<()> {
-    if timestamp > now.saturating_add(MAX_CLOCK_SKEW_SECS) {
+    if timestamp > now.saturating_add(MAX_CLOCK_SKEW_MS) {
         return Err(Error::RendezvousRejected("timestamp too far in the future"));
     }
     if now >= expiry {
@@ -456,18 +460,18 @@ impl RendezvousStore {
             .ok_or(Error::RendezvousRejected("author is not a room member"))?;
         // 2. Cryptographic authenticity + author binding.
         record.verify(&author_pubkey)?;
-        if self.withdrawn(&record.channel_id, &record.author_id, record.timestamp) {
+        if self.withdrawn(&record.channel_id, &record.author_id, record.timestamp_ms) {
             return Err(Error::RendezvousRejected("withdrawn"));
         }
 
         // 3. TTL bounds and time sanity.
-        if record.ttl_secs == 0 {
+        if record.ttl_ms == 0 {
             return Err(Error::RendezvousRejected("zero ttl"));
         }
-        if record.ttl_secs > MAX_TTL_SECS {
+        if record.ttl_ms > MAX_TTL_MS {
             return Err(Error::RendezvousRejected("ttl exceeds maximum"));
         }
-        check_time_validity(record.timestamp, member_expiry(&record), now)?;
+        check_time_validity(record.timestamp_ms, member_expiry(&record), now)?;
 
         let bucket_key = (record.channel_id, record.epoch);
         let bucket = self.members.entry(bucket_key).or_default();
@@ -475,10 +479,10 @@ impl RendezvousStore {
         // 4. Freshness vs the current record for this author (if any).
         let learned = if let Some(cur) = bucket.get(&record.author_id) {
             let same = same_member_claim(cur, &record);
-            if same && within_refresh_floor(record.timestamp, cur.timestamp) {
+            if same && within_refresh_floor(record.timestamp_ms, cur.timestamp_ms) {
                 return Ok(false); // already held: see `check_replacement`
             }
-            check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
+            check_replacement(record.seq, record.timestamp_ms, cur.seq, cur.timestamp_ms)?;
             !same
         } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
@@ -503,7 +507,7 @@ impl RendezvousStore {
     /// Admit (or refresh) a **member bundle** record (ADR-016 M14), enforcing the
     /// same member-only, anti-replay, time-sanity and capacity policy as
     /// [`RendezvousStore::accept_member`], with the TTL capped at
-    /// [`BUNDLE_MAX_TTL_SECS`] instead of [`MAX_TTL_SECS`]. Bundles are keyed
+    /// [`BUNDLE_MAX_TTL_MS`] instead of [`MAX_TTL_MS`]. Bundles are keyed
     /// per `(channelID, epoch)` like address records but live in their own
     /// buckets: a member's address refresh never displaces its bundle and vice
     /// versa.
@@ -526,18 +530,18 @@ impl RendezvousStore {
         // 2. Record signature, author binding, bundle root == author, bundle
         //    self-signatures.
         record.verify(&author_pubkey)?;
-        if self.withdrawn(&record.channel_id, &record.author_id, record.timestamp) {
+        if self.withdrawn(&record.channel_id, &record.author_id, record.timestamp_ms) {
             return Err(Error::RendezvousRejected("withdrawn"));
         }
 
         // 3. TTL bounds and time sanity.
-        if record.ttl_secs == 0 {
+        if record.ttl_ms == 0 {
             return Err(Error::RendezvousRejected("zero ttl"));
         }
-        if record.ttl_secs > BUNDLE_MAX_TTL_SECS {
+        if record.ttl_ms > BUNDLE_MAX_TTL_MS {
             return Err(Error::RendezvousRejected("ttl exceeds maximum"));
         }
-        check_time_validity(record.timestamp, bundle_expiry(&record), now)?;
+        check_time_validity(record.timestamp_ms, bundle_expiry(&record), now)?;
 
         let bucket_key = (record.channel_id, record.epoch);
         let bucket = self.bundles.entry(bucket_key).or_default();
@@ -545,10 +549,10 @@ impl RendezvousStore {
         // 4. Freshness vs the current bundle for this author (if any).
         let learned = if let Some(cur) = bucket.get(&record.author_id) {
             let same = same_bundle_claim(cur, &record);
-            if same && within_refresh_floor(record.timestamp, cur.timestamp) {
+            if same && within_refresh_floor(record.timestamp_ms, cur.timestamp_ms) {
                 return Ok(false); // already held: see `check_replacement`
             }
-            check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
+            check_replacement(record.seq, record.timestamp_ms, cur.seq, cur.timestamp_ms)?;
             !same
         } else {
             if bucket.len() >= MAX_AUTHORS_PER_BUCKET {
@@ -772,7 +776,7 @@ impl RendezvousStore {
         record.verify()?;
 
         // 2. Time sanity (store-applied default TTL).
-        check_time_validity(record.timestamp, prejoin_expiry(&record), now)?;
+        check_time_validity(record.timestamp_ms, prejoin_expiry(&record), now)?;
 
         // 2a. A pre-join is only meaningful for a channel this board actually serves.
         //
@@ -800,11 +804,11 @@ impl RendezvousStore {
         // 3. Freshness vs the current record for this asserted identity.
         if let Some((_, cur)) = bucket.get(&asserted_id) {
             if same_prejoin_claim(cur, &record)
-                && within_refresh_floor(record.timestamp, cur.timestamp)
+                && within_refresh_floor(record.timestamp_ms, cur.timestamp_ms)
             {
                 return Ok(()); // already held: see `check_replacement`
             }
-            check_replacement(record.seq, record.timestamp, cur.seq, cur.timestamp)?;
+            check_replacement(record.seq, record.timestamp_ms, cur.seq, cur.timestamp_ms)?;
         } else if bucket.len() >= MAX_PREJOIN_PER_CHANNEL {
             bucket.retain(|_, (_, r)| now < prejoin_expiry(r));
             // **A full bucket makes room; it never turns the newcomer away** (V210-70). A

@@ -1240,13 +1240,13 @@ fn a_stuck_tunnel_is_closed_and_an_idle_one_is_not() {
         let host = status_of(&w.host_dir, "the host");
         let guest = status_of(&guest_dir, "the guest");
         for t in rows(&host, "tunnels", &port, "in") {
-            if let (Some(id), Some(at)) = (t["id"].as_u64(), t["last_moved"].as_u64()) {
+            if let (Some(id), Some(at)) = (t["id"].as_u64(), t["last_moved_ms"].as_u64()) {
                 last_moved.insert(id, at);
             }
         }
         guest_closed = rows(&guest, "closed_tunnels", &port, "out")
             .iter()
-            .filter_map(|t| Some((t["id"].as_u64()?, t["closed"].as_u64()?)))
+            .filter_map(|t| Some((t["id"].as_u64()?, t["closed_ms"].as_u64()?)))
             .collect();
         // The host's own word, and the guest's row once it has one: the far end's reset lands
         // just after the host's close.
@@ -1264,7 +1264,7 @@ fn a_stuck_tunnel_is_closed_and_an_idle_one_is_not() {
                         .as_str()
                         .is_some_and(|w| w.starts_with("closed as stuck:"))
                 })
-                .filter_map(|t| Some((t["id"].as_u64()?, t["closed"].as_u64()?)))
+                .filter_map(|t| Some((t["id"].as_u64()?, t["closed_ms"].as_u64()?)))
                 .collect();
             far_why = rows(&guest, "closed_tunnels", &port, "out")
                 .iter()
@@ -1319,7 +1319,9 @@ fn a_stuck_tunnel_is_closed_and_an_idle_one_is_not() {
         .iter()
         .map(|(id, closed)| (*id, last_moved.get(id).map(|m| closed.saturating_sub(*m))))
         .collect();
-    eprintln!("[test] the host's stuck tunnel(s), and seconds from last move to close: {waited:?}");
+    eprintln!(
+        "[test] the host's stuck tunnel(s), and milliseconds from last move to close: {waited:?}"
+    );
     // And the reason says how long the bytes really waited, which is at least the stuck time: a
     // close that came early must not say the configured time (c4 verdict).
     let stated: Vec<Option<u64>> = said

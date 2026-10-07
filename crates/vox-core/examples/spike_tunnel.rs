@@ -49,7 +49,7 @@ fn parse_id(s: &str) -> Digest32 {
 fn policy() -> ChannelPolicy {
     ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        ttl: 0,
+        ttl_ms: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     }
 }

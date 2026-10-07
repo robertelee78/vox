@@ -7,7 +7,7 @@
 //! two hours either way, and after #179 so did a room that only carried messages. Then a joiner,
 //! or a member restarting, that finds this node through the board found nothing.
 //!
-//! Every process here runs with `VOX_TEST_RECORD_TTL_SECS` = [`TTL`] ([`CHURN_TTL`] in the second
+//! Every process here runs with `VOX_TEST_RECORD_TTL_MS` at [`TTL`] seconds ([`CHURN_TTL`] in the second
 //! arm) (test-only, lower-only: a
 //! shorter record lifetime, and the board's refresh floor scaled with it), so several lifetimes
 //! pass in under a minute:
@@ -128,7 +128,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> V
                 .to_str()
                 .expect("APPARATUS: a path that is not UTF-8"),
         ]),
-        &[("VOX_TEST_RECORD_TTL_SECS", ttl)],
+        &[("VOX_TEST_RECORD_TTL_MS", ttl)],
     );
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
@@ -196,7 +196,8 @@ fn moved(
         .collect()
 }
 
-/// `address` without the `a=<who>&b=<endpoint>` pair naming `who`: what is left names the anchor.
+/// `address` without the `a=<who>&b=<endpoint>` pair naming `who`, and without the `m=<who>` that
+/// marks it a member (an `m=` must name an entry the address gives): what is left names the anchor.
 fn without_endpoint_of(address: &str, who: &str) -> String {
     let (head, query) = address
         .split_once('?')
@@ -209,6 +210,10 @@ fn without_endpoint_of(address: &str, who: &str) -> String {
             i += 2;
             continue;
         }
+        if parts[i] == format!("m={who}") {
+            i += 1;
+            continue;
+        }
         kept.push(parts[i]);
         i += 1;
     }
@@ -219,7 +224,7 @@ fn without_endpoint_of(address: &str, who: &str) -> String {
 #[test]
 #[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; optional, run it in release"]
 fn an_idle_node_stays_findable_on_its_board() {
-    test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
+    test_knobs::require(&["VOX_TEST_RECORD_TTL_MS"]);
     idle_then_join(false);
 }
 
@@ -227,7 +232,7 @@ fn an_idle_node_stays_findable_on_its_board() {
 #[test]
 #[ignore = "real vox processes with production Argon2id, idle for several record lifetimes; optional, run it in release"]
 fn a_round_to_one_anchor_does_not_put_off_the_others() {
-    test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
+    test_knobs::require(&["VOX_TEST_RECORD_TTL_MS"]);
     idle_then_join(true);
 }
 
@@ -239,7 +244,7 @@ fn anchor_on(name: &str, data: &Path, port: u16, ttl: &str) -> (VoxProc, String)
         name,
         data,
         &args(&["node", "--listen", &format!("127.0.0.1:{port}")]),
-        &[("VOX_TEST_RECORD_TTL_SECS", ttl)],
+        &[("VOX_TEST_RECORD_TTL_MS", ttl)],
     );
     let spec = p
         .expect_line("an --anchor spec", |l| {
@@ -272,7 +277,7 @@ fn idle_then_join(churn: bool) {
     // arms run in one test process, and a process-wide variable let one arm's lifetime decide the
     // other's (found by V210-68's verifier).
     let ttl = if churn { CHURN_TTL } else { TTL };
-    let ttl_s = ttl.to_string();
+    let ttl_s = (ttl * 1_000).to_string();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);

@@ -174,6 +174,13 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
         ..Tending::default()
     };
     let deaf = wake_deaf();
+    // Each room whose retention this node's own file asks to exceed, as said (V030-32): said
+    // once, from the event or from the view, whichever comes first. The view is the record: the
+    // event reaches no subscriber started after it (a room opened before this loop subscribed)
+    // nor one that fell behind, and the notice is said all the same.
+    let mut said_above: std::collections::HashSet<(vox_core::hash::Digest32, u64, u64)> =
+        std::collections::HashSet::new();
+    say_retention_above_room(&node.view(), &mut said_above);
     // Counted at once, not at the first tick.
     if !deaf {
         tend(&paths, &node.view(), &answered, &mut tending);
@@ -190,7 +197,20 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
                     // **A daemon is the node nobody is watching, so it has to say
                     // things out loud** — unreachable peers, refused publishes,
                     // stalls — which `vox node` has always reported.
-                    crate::tunnel_cli::say_if_it_explains_a_failure(&ev);
+                    match &ev {
+                        vox_core::node::api::NodeEvent::RetentionAboveRoom {
+                            channel_id,
+                            node: asked,
+                            room,
+                        } => {
+                            if said_above.insert((*channel_id, *asked, *room)) {
+                                crate::tunnel_cli::say_retention_above_room(
+                                    channel_id, *asked, *room,
+                                );
+                            }
+                        }
+                        other => crate::tunnel_cli::say_if_it_explains_a_failure(other),
+                    }
                     match ev {
                         vox_core::node::api::NodeEvent::NewEntry { channel_id, row } => {
                             // The view — every open room's timeline — is copied only
@@ -225,6 +245,9 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             },
             _ = tick.tick() => true,
         };
+        if sweep {
+            say_retention_above_room(&node.view(), &mut said_above);
+        }
         if sweep && !deaf {
             let view = node.view();
             // Every unseen row is marked seen; only one that could interrupt
@@ -267,6 +290,20 @@ async fn watch_for_interrupts(node: NodeHandle, paths: Paths) {
             }
             tend(&paths, &view, &answered, &mut tending);
             answered.clear();
+        }
+    }
+}
+
+/// Say, once each, every room whose retention this node's own file asks to exceed (V030-32).
+fn say_retention_above_room(
+    view: &vox_core::node::api::NodeView,
+    said: &mut std::collections::HashSet<(vox_core::hash::Digest32, u64, u64)>,
+) {
+    for d in &view.open_channels {
+        if let Some((asked, room)) = d.retention_above_room {
+            if said.insert((d.channel_id, asked, room)) {
+                crate::tunnel_cli::say_retention_above_room(&d.channel_id, asked, room);
+            }
         }
     }
 }

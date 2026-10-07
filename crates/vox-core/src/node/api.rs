@@ -532,6 +532,12 @@ pub struct ChannelDetail {
     /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
     /// so a reader never has to take the room's lock, which a sync session holds while it runs.
     pub retention: u64,
+    /// `(what this node's own retention file asks, the room's)`, seconds, when the file asks to
+    /// keep the room's messages longer than the room does (V030-32): ignored, the room's is in
+    /// force, and the node says so. Carried in the view so a daemon says it from what the node
+    /// holds, not only from the one-time event, which a subscriber started after it, or one that
+    /// fell behind, never receives.
+    pub retention_above_room: Option<(u64, u64)>,
     /// How many generations of this node's own sender key it still holds here (PRD-001 R14).
     pub key_generations: usize,
     /// How many generations of other members' sender keys it holds here (PRD-001 R14 on the
@@ -1008,7 +1014,7 @@ pub enum Fault {
     /// An input exceeded its bound (name or text length).
     TooLong,
     /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
-    /// change within [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) (V210-159,
+    /// change within [`KEYRING_WINDOW_MS`](crate::node::actor::KEYRING_WINDOW_MS) (V210-159,
     /// ADR-028 K-12). Not
     /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
     PassphraseNeeded,
@@ -1187,7 +1193,8 @@ impl Fault {
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
     // `Fault::PassphraseNeeded`'s explanation names the window in words.
-    const _KEYRING_WINDOW_NAMED: () = assert!(crate::node::actor::KEYRING_WINDOW_SECS == 30 * 60);
+    const _KEYRING_WINDOW_NAMED: () =
+        assert!(crate::node::actor::KEYRING_WINDOW_MS == 30 * 60 * 1_000);
 
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,

@@ -138,8 +138,8 @@ pub struct RetentionChange {
     pub entry_hash: Digest32,
     /// Who set it: the room's creator or an admin.
     pub author: Digest32,
-    /// What it set, seconds; `0` forever.
-    pub ttl: u64,
+    /// What it set, milliseconds; `0` forever.
+    pub ttl_ms: u64,
 }
 
 /// The deterministic evaluator over a channel's governance log.
@@ -217,15 +217,15 @@ pub struct NameStatement {
 pub struct Lifecycle {
     /// The log entry in which the creator ended the room, if it has.
     pub ended_by: Option<Digest32>,
-    /// The idle end the creator chose, in seconds; `None` when it chose none.
-    pub idle_end_secs: Option<u64>,
+    /// The idle end the creator chose, in milliseconds; `None` when it chose none.
+    pub idle_end_ms: Option<u64>,
 }
 
 impl Evaluator {
     /// Build the evaluator from genesis + governance entries.
     ///
-    /// `now_secs` is the wall clock used only for **expiry** comparisons (a cert
-    /// with `0 < expiry <= now_secs` is expired). `author_key` resolves an author
+    /// `now_ms` is the wall clock, milliseconds since the Unix epoch, used only for **expiry**
+    /// comparisons (a cert with `0 < expiry_ms <= now_ms` is expired). `author_key` resolves an author
     /// fingerprint to its composite root public key for signature verification;
     /// returning `None` for an entry's author makes that entry's signature
     /// unverifiable and the entry is dropped (it cannot confer authority).
@@ -243,13 +243,13 @@ impl Evaluator {
     pub fn build<F>(
         genesis: &Genesis,
         entries: &[GovEntry],
-        now_secs: u64,
+        now_ms: u64,
         author_key: F,
     ) -> Result<Self>
     where
         F: Fn(&Digest32) -> Option<CompositePublicKey>,
     {
-        Self::build_with_members(genesis, entries, now_secs, author_key, BTreeSet::new())
+        Self::build_with_members(genesis, entries, now_ms, author_key, BTreeSet::new())
     }
 
     /// [`Evaluator::build`] with this node's **admitted-author set**, recorded so callers
@@ -258,14 +258,14 @@ impl Evaluator {
     pub fn build_with_members<F>(
         genesis: &Genesis,
         entries: &[GovEntry],
-        now_secs: u64,
+        now_ms: u64,
         author_key: F,
         members: BTreeSet<Digest32>,
     ) -> Result<Self>
     where
         F: Fn(&Digest32) -> Option<CompositePublicKey>,
     {
-        Self::build_reusing(genesis, entries, now_secs, author_key, members, None)
+        Self::build_reusing(genesis, entries, now_ms, author_key, members, None)
     }
 
     /// [`Evaluator::build_with_members`], taking from `prior` — an evaluator built earlier for
@@ -283,7 +283,7 @@ impl Evaluator {
     pub fn build_reusing<F>(
         genesis: &Genesis,
         entries: &[GovEntry],
-        now_secs: u64,
+        now_ms: u64,
         author_key: F,
         members: BTreeSet<Digest32>,
         prior: Option<&Evaluator>,
@@ -324,7 +324,7 @@ impl Evaluator {
         // and epoch-admission decision is computed from the deciding entry's STRICT
         // causal past only (`hb(X)`); the only concurrent-or-after consultation is
         // the final removal-wins kill test on the head authority. ----
-        let mut resolver = Resolver::new(root_admin, &causality, now_secs);
+        let mut resolver = Resolver::new(root_admin, &causality, now_ms);
         let head = resolver.head()?;
         let authority = head.authority;
         let denied = head.denied;
@@ -522,7 +522,7 @@ struct Resolved {
 struct Resolver<'a> {
     root_admin: Digest32,
     causality: &'a Causality<'a>,
-    now_secs: u64,
+    now_ms: u64,
     /// Memo: entry hash → resolved authority+epoch over that entry's STRICT past.
     strict_before: BTreeMap<Digest32, Resolved>,
     /// Entries whose strict-past resolution is currently on the call stack. A
@@ -534,11 +534,11 @@ struct Resolver<'a> {
 }
 
 impl<'a> Resolver<'a> {
-    fn new(root_admin: Digest32, causality: &'a Causality<'a>, now_secs: u64) -> Self {
+    fn new(root_admin: Digest32, causality: &'a Causality<'a>, now_ms: u64) -> Self {
         Self {
             root_admin,
             causality,
-            now_secs,
+            now_ms,
             strict_before: BTreeMap::new(),
             in_progress: BTreeSet::new(),
         }
@@ -642,7 +642,7 @@ impl<'a> Resolver<'a> {
             let GovBody::AdminCert(c) = &e.body else {
                 continue;
             };
-            let unexpired = c.body.expiry == 0 || c.body.expiry > self.now_secs;
+            let unexpired = c.body.expiry_ms == 0 || c.body.expiry_ms > self.now_ms;
             let in_effect = self.in_effect(e)?;
             let before = self.strict_before(&e.entry_hash)?;
             // The issuer must hold a superset of the granted set in this
@@ -774,12 +774,12 @@ impl<'a> Resolver<'a> {
             {
                 continue;
             }
-            if let Some(ttl) = p.body.ttl {
-                policy.ttl = ttl;
+            if let Some(ttl) = p.body.ttl_ms {
+                policy.ttl_ms = ttl;
                 changes.push(RetentionChange {
                     entry_hash: e.entry_hash,
                     author: e.author_id,
-                    ttl,
+                    ttl_ms: ttl,
                 });
             }
         }
@@ -891,8 +891,8 @@ impl<'a> Resolver<'a> {
                         out.ended_by.get_or_insert(e.entry_hash);
                     }
                 }
-                LifecycleKind::IdleEnd(secs) if l.body.issuer_id == self.root_admin => {
-                    out.idle_end_secs = Some(secs);
+                LifecycleKind::IdleEnd(ms) if l.body.issuer_id == self.root_admin => {
+                    out.idle_end_ms = Some(ms);
                 }
                 _ => {}
             }
@@ -1079,5 +1079,6 @@ impl<'a> Causality<'a> {
 }
 
 /// Re-exported for callers building expiry-aware queries; the evaluator compares a
-/// non-zero cert expiry against this many epoch-seconds at [`Evaluator::build`].
-pub type EpochSeconds = u64;
+/// non-zero cert expiry against this many milliseconds since the Unix epoch at
+/// [`Evaluator::build`].
+pub type EpochMillis = u64;

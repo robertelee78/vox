@@ -787,8 +787,8 @@ fn a_room_that_cannot_sync_notifies_once_and_once_when_it_syncs_again() {
              anchor were killed; alice's room last synced at {} (now {}); her status says {}; \
              notifications: {:?}",
             killed.elapsed(),
-            s["rooms"][0]["last_sync"],
-            s["now"],
+            s["rooms"][0]["last_sync_ms"],
+            s["now_ms"],
             s["unhealthy"],
             notes(&file)
         );

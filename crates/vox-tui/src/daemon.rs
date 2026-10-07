@@ -338,9 +338,10 @@ fn refused_for_good(args: &DaemonArgs, error: AppError) -> Result<(), AppError> 
     if !args.login_item {
         return Err(error);
     }
+    // When, in milliseconds since the Unix epoch: the app reads it and shows it to the minute.
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+        .map_or(0, |d| d.as_millis());
     let line = format!("{at} vox daemon will not start: {error}\n");
     eprint!("{line}");
     if let Some(log) = login_item_log() {
@@ -362,7 +363,8 @@ fn refused_for_good(args: &DaemonArgs, error: AppError) -> Result<(), AppError> 
     Ok(())
 }
 
-/// Where the login item says why it did not start: `~/Library/Logs/Vox/login-item.log`, outside
+/// Where the login item says why it did not start: `~/Library/Logs/Vox/login-item.log`, one line
+/// `<unix milliseconds> <reason>` per refusal, outside
 /// the data root (a data root this version does not read is left byte for byte as it was).
 fn login_item_log() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;

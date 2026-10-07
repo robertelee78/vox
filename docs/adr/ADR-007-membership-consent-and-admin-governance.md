@@ -24,9 +24,14 @@ only room governance is who sets the room's retention. This builds on identity (
 ### §"Trust anchor": the genesis record
 
 - **G-1.** A room MUST begin with a genesis record, its own struct (tag `0x000D`, domain
-  `vox/genesis/v1`), with this pinned canonical body:
+  `vox/genesis/v2`), with this pinned canonical body:
   `[nonce(16 B random), created, [history_mode, deniability_slot, ttl, min_suite], [service_grant_token…],
   creator_pubkey(composite, ADR-002), [sign_algo]]`, self-signed by the creator's composite identity key.
+  `created` and `ttl` MUST be milliseconds (#562).
+- **G-1a.** A genesis, admin cert, policy update or lifecycle fact at format 1 (domain `…/v1`), whose
+  times are seconds, MUST still be read: its times MUST be held as milliseconds (seconds × 1000), and it
+  MUST be encoded, hashed and verified exactly as written, so a room made before keeps its channelID. A
+  time MUST NOT be read in the wrong unit.
 - **G-2.** The `channelID` MUST be `SHA-256(canonical genesis record)`: 256-bit, self-certifying, bound
   to one genesis. A node MUST accept a genesis fetched from a board only if its hash equals the channelID
   it joined with (ADR-005 J-8). The genesis hash is the channelID, the rendezvous seed (ADR-005) and the

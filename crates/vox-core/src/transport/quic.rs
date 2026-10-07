@@ -185,7 +185,7 @@ pub struct VoxEndpoint {
 pub struct LocalNode {
     id: Digest32,
     instance: [u8; 16],
-    stuck_after_secs: AtomicU64,
+    stuck_after_ms: AtomicU64,
     origin_key: [u8; 32],
 }
 
@@ -200,7 +200,9 @@ impl LocalNode {
         Ok(Arc::new(Self {
             id,
             instance: crate::identity::rng::random_array()?,
-            stuck_after_secs: AtomicU64::new(crate::tunnel::session::STUCK_AFTER.as_secs()),
+            stuck_after_ms: AtomicU64::new(
+                u64::try_from(crate::tunnel::session::STUCK_AFTER.as_millis()).unwrap_or(u64::MAX),
+            ),
             origin_key: crate::identity::rng::random_array()?,
         }))
     }
@@ -220,14 +222,14 @@ impl LocalNode {
     /// Give this node's tunnels `after` before one whose bytes wait is closed as stuck
     /// (V030-11): the node's `tunnel-stuck-after` setting. At least a second.
     pub fn set_stuck_after(&self, after: std::time::Duration) {
-        self.stuck_after_secs
-            .store(after.as_secs().max(1), Ordering::Relaxed);
+        let ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        self.stuck_after_ms.store(ms.max(1_000), Ordering::Relaxed);
     }
 
     /// How long this node's tunnels' bytes may wait before the tunnel is closed as stuck.
     #[must_use]
     pub fn stuck_after(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.stuck_after_secs.load(Ordering::Relaxed))
+        std::time::Duration::from_millis(self.stuck_after_ms.load(Ordering::Relaxed))
     }
 
     /// The secret this node, as a relay, keys the origin tags it tells a target with
@@ -1641,7 +1643,7 @@ impl Drop for TunnelCredit {
                 service: live.service,
                 outbound: live.outbound,
                 opened: live.opened,
-                closed: unix_now(),
+                closed: unix_now_ms(),
                 why,
             });
         }
@@ -1696,7 +1698,7 @@ impl TunnelWatch {
 
     /// Mark that the tunnel moved a byte just now.
     pub fn mark_moved(&self) {
-        self.moved.store(unix_now(), Ordering::Relaxed);
+        self.moved.store(unix_now_ms(), Ordering::Relaxed);
     }
 
     /// Resolves once the tunnel is asked to close ([`close_tunnels`]), with the reason.
@@ -1735,9 +1737,9 @@ pub struct ClosedTunnel {
     pub service: String,
     /// Whether this node opened it.
     pub outbound: bool,
-    /// When it was opened, in Unix seconds.
+    /// When it was opened, in Unix milliseconds.
     pub opened: u64,
-    /// When it ended, in Unix seconds.
+    /// When it ended, in Unix milliseconds.
     pub closed: u64,
     /// Why: closed by a person here, closed at the other end, or closed as stuck.
     pub why: String,
@@ -1847,9 +1849,9 @@ pub struct LiveTunnel {
     pub service: String,
     /// Whether this node opened it (to reach the member's service), rather than serving it.
     pub outbound: bool,
-    /// When it was opened, in Unix seconds.
+    /// When it was opened, in Unix milliseconds.
     pub opened: u64,
-    /// When it last moved a byte either way, in Unix seconds; `opened` until it has.
+    /// When it last moved a byte either way, in Unix milliseconds; `opened` until it has.
     pub last_moved: u64,
 }
 
@@ -1885,12 +1887,18 @@ static LIVE: Mutex<std::collections::BTreeMap<u64, Live>> =
 /// The next key in [`LIVE`].
 static NEXT_TUNNEL: AtomicU64 = AtomicU64::new(0);
 
-/// The time now in Unix seconds, as [`LiveTunnel`] states times.
+/// The time now in Unix seconds.
 #[must_use]
 pub fn unix_now() -> u64 {
+    unix_now_ms() / 1_000
+}
+
+/// The time now in Unix milliseconds, as [`LiveTunnel`] states times.
+#[must_use]
+pub fn unix_now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The member at the other end of the tunnel `owner` serves whose connection to its service comes
@@ -1984,7 +1992,7 @@ impl VoxConnection {
     /// [`live_tunnels`] lists it as.
     pub fn carry_tunnel(&self, service: &str, outbound: bool) -> Result<TunnelCredit> {
         let id = NEXT_TUNNEL.fetch_add(1, Ordering::Relaxed);
-        let opened = unix_now();
+        let opened = unix_now_ms();
         let watch = TunnelWatch::new(opened, self.local.id, self.local.stuck_after());
         {
             // Counted and taken under one lock, so two tunnels asked for at once cannot both

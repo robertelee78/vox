@@ -390,9 +390,9 @@ fn render_offer(frame: &mut Frame, area: Rect, o: &vox_core::node::api::Offer) {
 /// The live tunnels, one per line with its number, member, service and how long it has been
 /// still, then those that ended for a reason, with that reason (V030-11).
 fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
-    let now = vox_core::transport::quic::unix_now();
-    let ago = |t: u64| {
-        let s = now.saturating_sub(t);
+    let now_ms = vox_core::transport::quic::unix_now_ms();
+    let ago = |t_ms: u64| {
+        let s = now_ms.saturating_sub(t_ms) / 1_000;
         if s < 120 {
             format!("{s}s")
         } else if s < 7200 {
@@ -452,7 +452,7 @@ fn render_tunnels(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
 /// What this node decided, newest first, one line each (ADR-028 D-3): when, what, about whom (this
 /// node's name for them, else their fingerprint's start), what was asked and why.
 fn render_decisions(frame: &mut Frame, area: Rect, vm: &ViewModel) {
-    let now_ms = vox_core::transport::quic::unix_now().saturating_mul(1_000);
+    let now_ms = vox_core::transport::quic::unix_now_ms();
     let ago = |at_ms: u64| {
         let s = now_ms.saturating_sub(at_ms) / 1_000;
         if s < 120 {
@@ -585,11 +585,13 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             for x in &channel.sessions {
                 notices.push(NoticeView {
                     timestamp: x.opened,
+                    after: None,
                     text: format!("{} opened", x.label),
                 });
                 if let Some(at) = x.ended {
                     notices.push(NoticeView {
                         timestamp: at,
+                        after: None,
                         text: format!("{} ended", x.label),
                     });
                 }
@@ -602,17 +604,20 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             if let Some(x) = session {
                 notices.push(NoticeView {
                     timestamp: x.opened,
+                    after: None,
                     text: format!("{} opened", x.label),
                 });
                 if let Some(at) = x.ended {
                     notices.push(NoticeView {
                         timestamp: at,
+                        after: None,
                         text: format!("{} ended", x.label),
                     });
                 }
                 if !x.can_drive {
                     notices.push(NoticeView {
                         timestamp: u64::MAX,
+                        after: None,
                         text: format!(
                             "Only members {} trusts with drive see inside this Session.",
                             x.node_alias
@@ -946,7 +951,18 @@ fn render_timeline(
             Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
         ))
     };
-    let mut said = room_notices.iter().rev().peekable();
+    // Each notice goes right after the message it follows in the room's order (`after`, #562): its
+    // time claims whole seconds, so by time a change made just after a post drew above it. One
+    // whose message is not in the timeline goes by time.
+    let anchored = |n: &NoticeView| {
+        n.after
+            .is_some_and(|h| timeline.iter().any(|m| m.entry_hash == h))
+    };
+    let mut said = room_notices
+        .iter()
+        .filter(|n| !anchored(n))
+        .rev()
+        .peekable();
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
     // are wrapped here, not by the widget, so the count the window is taken from is the count
@@ -982,6 +998,13 @@ fn render_timeline(
             break;
         }
         while let Some(n) = said.next_if(|n| n.timestamp > m.timestamp) {
+            push(&mut rows, None, None, notice_line(n));
+        }
+        for n in room_notices
+            .iter()
+            .rev()
+            .filter(|n| n.after == Some(m.entry_hash))
+        {
             push(&mut rows, None, None, notice_line(n));
         }
         // Under a message it sent, who has read it, or where it is while nobody is known to

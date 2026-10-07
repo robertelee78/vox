@@ -56,10 +56,15 @@ pub struct MemberView {
 /// One line the timeline tells about the room, not a message (ADR-028 E-5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeView {
-    /// When, seconds since the Unix epoch, as a message's `timestamp` is.
+    /// When, milliseconds since the Unix epoch, as a message's `timestamp` is: the timeline orders
+    /// by it, so it is never rounded (a change made just after a post, in the same second, drew
+    /// above it).
     pub timestamp: u64,
     /// The whole line: `ann renamed the room to family`.
     pub text: String,
+    /// The message it follows in the room's order, where it is drawn (#562); `None`, or a message
+    /// not in the timeline, places it by `timestamp`.
+    pub after: Option<Digest32>,
 }
 
 /// A timeline entry as surfaced to the UI. Carries decrypted display text only when
@@ -75,7 +80,8 @@ pub struct MessageView {
     /// Who an addressed message is to, as this node names each (PRD-001 R15): `to you, bob`,
     /// or empty for a message to the whole room.
     pub addressed: String,
-    /// Wall-clock send time (epoch-seconds) as recorded in the entry.
+    /// Wall-clock send time (epoch-milliseconds) as recorded in the entry; rounded only where it
+    /// is shown.
     pub timestamp: u64,
     /// The rendered body if decryptable to you, else `None` (shown as a marker).
     pub body: Option<String>,
@@ -257,9 +263,9 @@ pub struct SessionView {
     pub label: String,
     /// This node's alias for the session's node, as the label begins.
     pub node_alias: String,
-    /// When it opened, seconds since the Unix epoch.
+    /// When it opened, milliseconds since the Unix epoch.
     pub opened: u64,
-    /// When it ended, seconds since the Unix epoch; `None` while it is open (SE-5).
+    /// When it ended, milliseconds since the Unix epoch; `None` while it is open (SE-5).
     pub ended: Option<u64>,
     /// Whether the session's node trusts this node with drive (SC-2, CL-3).
     pub can_drive: bool,

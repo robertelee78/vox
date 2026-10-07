@@ -2494,7 +2494,8 @@ impl VoxClient {
                     .into_iter()
                     .find(|s| s.id == session && s.open)
                     .ok_or_else(|| failed("no open Session in this room has that id"))?;
-                let trusted = names.contains_key(&row.node);
+                // This node's own Sessions it drives as their operator (SC-2), over its own socket.
+                let trusted = names.contains_key(&row.node) || h.client.me() == Some(row.node);
                 // The session's node as this node knows it: its alias, or its short fingerprint.
                 let shown = names
                     .get(&row.node)
@@ -2697,7 +2698,7 @@ impl VoxClient {
                 .map(|p| PulledFile {
                     entry: b32_encode(&p.entry),
                     path: p.path.to_string_lossy().into_owned(),
-                    created: p.created,
+                    created: p.created_ms / 1_000,
                 })
                 .collect();
             pulled.sort_by_key(|p| p.created);

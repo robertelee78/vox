@@ -20,8 +20,10 @@
 //! kept per node.
 //!
 //! **Which side a red is on.** A node listing, closing or timing out another node's tunnel is
-//! `PRODUCT:`; a verb the scene needs failing is `PRODUCT (staging):`; this file's own sockets and
-//! threads are `APPARATUS:`.
+//! `PRODUCT:`; a verb the scene needs failing is `APPARATUS (staging not achieved):`, since the
+//! scene never formed and nothing was measured; this file's own sockets and threads are
+//! `APPARATUS:`. The two rooms have names of their own (`room-a`, `room-b`): a node holds one room
+//! of a name, so the guest could not join two rooms named alike.
 //!
 //! **Mutations that must turn it red** (each reverted after): the owner filter removed from
 //! `close_tunnels` → red on 1; `LocalNode::stuck_after` read from one process-wide value → red
@@ -109,7 +111,7 @@ impl Scene {
             let (ok, out, err) = vox_once(&host, &args(&["id", "--node", node]));
             assert!(
                 ok,
-                "PRODUCT (staging): `vox id --node {node}` failed: {out}{err}"
+                "APPARATUS (staging not achieved): `vox id --node {node}` failed: {out}{err}"
             );
         }
         stuck_after(&host, "a", STUCK_AFTER);
@@ -135,7 +137,7 @@ impl Scene {
             );
             assert!(
                 ok,
-                "PRODUCT (staging): node {node}'s `vox trust add` of the guest failed: {out}{err}"
+                "APPARATUS (staging not achieved): node {node}'s `vox trust add` of the guest failed: {out}{err}"
             );
         }
 
@@ -157,6 +159,8 @@ impl Scene {
                     &spec,
                     "--listen",
                     "127.0.0.1:0",
+                    "--name",
+                    &format!("room-{node}"),
                 ]),
             );
             let room = after_label(
@@ -177,7 +181,7 @@ impl Scene {
         let daemons = world::daemon_pid(&host);
         assert!(
             daemons.is_some(),
-            "PRODUCT (staging): no daemon holds the host's data root after both nodes serve"
+            "APPARATUS (staging not achieved): no daemon holds the host's data root after both nodes serve"
         );
 
         // The guest joins both rooms, and forwards to each node's service.
@@ -199,10 +203,13 @@ impl Scene {
             );
             assert!(
                 ok,
-                "PRODUCT (staging): the guest could not join node {node}'s room: {out}{err}"
+                "APPARATUS (staging not achieved): the guest could not join node {node}'s room: {out}{err}"
             );
             let (ok, fp, err) = vox_once(&host, &args(&["id", "--node", node]));
-            assert!(ok, "PRODUCT (staging): `vox id --node {node}`: {err}");
+            assert!(
+                ok,
+                "APPARATUS (staging not achieved): `vox id --node {node}`: {err}"
+            );
             let mut fwd = VoxProc::spawn(
                 &format!("forward-{node}"),
                 &guest,
@@ -285,15 +292,17 @@ impl Scene {
 
 /// A session to `at` that echoes once and then stays open, idle.
 fn session(at: SocketAddr) -> TcpStream {
-    let mut s = TcpStream::connect(at)
-        .unwrap_or_else(|e| panic!("PRODUCT (staging): the forward refused a session: {e}"));
+    let mut s = TcpStream::connect(at).unwrap_or_else(|e| {
+        panic!("APPARATUS (staging not achieved): the forward refused a session: {e}")
+    });
     s.set_read_timeout(Some(Duration::from_secs(20)))
         .expect("APPARATUS: set a read timeout");
     s.write_all(b"ping")
-        .expect("PRODUCT (staging): write to the forward");
+        .expect("APPARATUS (staging not achieved): write to the forward");
     let mut got = [0u8; 4];
-    s.read_exact(&mut got)
-        .unwrap_or_else(|e| panic!("PRODUCT (staging): no echo through the forward: {e}"));
+    s.read_exact(&mut got).unwrap_or_else(|e| {
+        panic!("APPARATUS (staging not achieved): no echo through the forward: {e}")
+    });
     s
 }
 
@@ -307,7 +316,7 @@ fn a_node_closes_only_its_own_tunnels() {
     let (a_live, b_live) = (s.live("a", 1), s.live("b", 1));
     assert!(
         a_live.len() == 1 && b_live.len() == 1,
-        "PRODUCT (staging): each node should list its one tunnel: a {a_live:?}, b {b_live:?}"
+        "APPARATUS (staging not achieved): each node should list its one tunnel: a {a_live:?}, b {b_live:?}"
     );
     let a_id = a_live[0]["id"]
         .as_u64()
@@ -382,8 +391,9 @@ fn a_stuck_tunnel_closes_by_its_own_nodes_setting() {
     let mut writers = Vec::new();
     let mut sockets = Vec::new();
     for (_, at) in &s.forwards {
-        let stuck = TcpStream::connect(at)
-            .unwrap_or_else(|e| panic!("PRODUCT (staging): the forward refused a session: {e}"));
+        let stuck = TcpStream::connect(at).unwrap_or_else(|e| {
+            panic!("APPARATUS (staging not achieved): the forward refused a session: {e}")
+        });
         let mut w = stuck
             .try_clone()
             .expect("APPARATUS: clone a session's socket");
