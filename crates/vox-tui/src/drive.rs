@@ -133,7 +133,7 @@ pub async fn run_file(
     .into_iter()
     .next()
     .ok_or_else(|| AppError::Usage(format!("not sent to {label}: the daemon did not serve it")))?;
-    drop(client);
+    let tag = row.tag.clone();
     let action = Action::File {
         name: row.name,
         size: row.size,
@@ -141,7 +141,17 @@ pub async fn run_file(
         tag: row.tag,
         note: note.map(str::to_owned),
     };
-    deliver(paths, channel_id, node, id, &label, action).await
+    let delivered = deliver(paths, channel_id, node, id, &label, action).await;
+    // Not taken: served to no one, so not served at all.
+    if delivered.is_err() {
+        let _ = client
+            .request(&Ipc::ShareStop {
+                channel_id,
+                selector: tag,
+            })
+            .await;
+    }
+    delivered
 }
 
 /// The one open Session `session` names in `room`: its room, its node, its id and its label;
