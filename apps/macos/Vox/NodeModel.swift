@@ -814,6 +814,11 @@ private final class Listener: ClientListener, @unchecked Sendable {
     func onEnded(text: String) {
         Task { @MainActor [weak model] in model?.stopped(text) }
     }
+
+    // A room's Sessions are drawn by #554, which reads them again on these.
+    func onSessions(room: String) {}
+
+    func onSessionEntry(room: String, node: String, sessionId: String) {}
 }
 
 // The menu bar extra's facts (M-22, A-3), here for the client they are read with.
