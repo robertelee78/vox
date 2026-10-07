@@ -408,10 +408,55 @@ fn every_member_is_back_after_an_anchor_restart() {
             eprintln!("[proof]     +{:?} {l}", t.duration_since(away));
         }
     }
+    // **A member that never came back is the product's red, whatever its dials did** (the full
+    // pass of 75c22d4f: 27 of 32 back after a minute, and the staging line, read first, called it
+    // a staging miss). Each one is named, with what it said since the anchor went away.
+    let missing: Vec<String> = daemons
+        .iter()
+        .filter(|d| {
+            !d.timed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(t, l)| *t >= back && l.contains("connected to this anchor"))
+        })
+        .map(|d| {
+            let lines = d.timed.lock().unwrap_or_else(|e| e.into_inner());
+            let said: Vec<String> = lines
+                .iter()
+                .filter(|(t, _)| *t >= away)
+                .map(|(t, l)| format!("    +{:?} {l}", t.duration_since(away)))
+                .collect();
+            format!("  {}:\n{}", d.name, said.join("\n"))
+        })
+        .collect();
+    assert!(
+        most >= MEMBERS,
+        "PRODUCT: only {most}/{MEMBERS} members were connected to the anchor again within {:?} of it \
+         listening after the outage; those that did not say they were:\n{}",
+        BACK_WITHIN + Duration::from_secs(50),
+        missing.join("\n")
+    );
+    // Which members, and what they said while it was away: a staging miss names its cause.
+    let short: Vec<String> = daemons
+        .iter()
+        .zip(&failed)
+        .filter(|(_, n)| **n < 2)
+        .map(|(d, n)| {
+            let lines = d.timed.lock().unwrap_or_else(|e| e.into_inner());
+            let said: Vec<String> = lines
+                .iter()
+                .filter(|(t, _)| *t >= away)
+                .map(|(t, l)| format!("    +{:?} {l}", t.duration_since(away)))
+                .collect();
+            format!("  {} ({n} failed dial(s)):\n{}", d.name, said.join("\n"))
+        })
+        .collect();
     assert!(
         fewest >= 2,
         "PRODUCT (staging): a member's dials failed only {fewest} time(s) while its anchor was away, \
-         so its backoff never grew"
+         so its backoff never grew; {most}/{MEMBERS} were back. The members short of two:\n{}",
+        short.join("\n")
     );
     assert!(
         most >= MEMBERS && at <= BACK_WITHIN,

@@ -2,7 +2,7 @@
 //! through the shipped `vox` binary.
 //!
 //! A `Rooms` reply used to be the whole list in one IPC frame, and the client refuses a
-//! frame over its limit (256 KiB): past about 1,540 rooms at the 128-byte local-name limit,
+//! frame over its limit (256 KiB): past about 1,540 rooms at the then 128-byte local-name limit,
 //! `vox room list` and every command that resolves a room by name failed with "declared size
 //! exceeds hard limit: ipc frame length". A reply is now one page (`PAGE_ENTRIES` entries,
 //! bounded by bytes too) and the client asks for every page. `Trusted` is paged the same way.
@@ -16,7 +16,8 @@
 //! What this drives, on alice's node, and then `vox room list` and `vox trust list` must
 //! name every one:
 //!
-//! - **200 rooms at the 128-byte name limit: about 38 KB, past two whole 16 KiB frames.** This
+//! - **200 rooms at the 63-character name limit** (a room name is one part of a service address,
+//!   `vox_core::governance::name::MAX_ROOM_NAME`): about 20 KB, past one whole 16 KiB frame. This
 //!   is the defect itself: without paging, `vox room list` fails with "ipc frame length".
 //!   Created eight at a time: a room create seals its key with production Argon2id on a
 //!   blocking thread, so creates in parallel use the machine's cores;
@@ -47,7 +48,7 @@ const TRUSTED: usize = 200;
 /// The petname limit (`vox_core::node::trust::MAX_PETNAME`).
 const PETNAME: usize = 64;
 
-/// Rooms: past two [`FRAME`]s at the 128-byte name limit; the decider's realistic ceiling.
+/// Rooms: past one [`FRAME`] at the 63-character name limit; the decider's realistic ceiling.
 const ROOMS: usize = 200;
 
 /// The IPC frame limit every process in this proof runs with (`VOX_TEST_MAX_FRAME`).
@@ -81,7 +82,9 @@ fn every_room_and_trusted_identity_is_listed_past_one_page() {
 
     // Rooms: the harness made one; make the rest.
     let names: BTreeSet<String> = (1..ROOMS)
-        .map(|i| format!("page-room-{i:05}-{}", "r".repeat(128 - 16)))
+        // At the room-name limit, 63 characters: a longer name is refused (`vox room create`
+        // names the limit), which is the product's rule, not this proof's subject.
+        .map(|i| format!("page-room-{i:05}-{}", "r".repeat(63 - 16)))
         .collect();
     let started = std::time::Instant::now();
     let queue: Vec<&String> = names.iter().collect();

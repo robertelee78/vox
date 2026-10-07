@@ -36,13 +36,15 @@ mod row {
         "test-knob maps by room (actor.rs), the LEFT counter: keyed (node, room)";
     pub const TEST_KNOB_ENV: &str =
         "test-knob environment OnceLocks (prekeys.rs, channel.rs, log/sync.rs, nat/store.rs, \
-         ipc.rs): process-wide, test builds only";
+         ipc.rs, transport/mux.rs): process-wide, test builds only";
     pub const COUNTERS: &str =
         "NEXT_TUNNEL, NEXT_SERIAL, paths::NEXT: process-wide unique counters";
     pub const PINNED: &str = "PINNED (atrest/lock.rs): process-wide mlock bookkeeping";
     pub const CACHED: &str = "SAID (quic.rs), cached strings (api.rs, viewmodel.rs): process-wide";
     pub const SENDING: &str =
         "SENDING (claude_injector.rs): process-wide, one tmux send at a time across nodes";
+    pub const TERMINAL: &str =
+        "ASCII, DEPTH (theme.rs, vox-tui): process-wide, what this process's terminal can show";
 }
 
 /// Every process-wide item: (file under `crates/`, name, how many the file has, its ADR row,
@@ -68,6 +70,9 @@ const LISTED: &[(&str, &str, usize, &str, Option<&str>)] = &[
     ("vox-core/src/node/api.rs", "TEXT", 1, row::CACHED, None),
     ("vox-tui/src/viewmodel.rs", "TEXT", 1, row::CACHED, None),
     ("vox-tui/src/claude_injector.rs", "SENDING", 1, row::SENDING, None),
+    ("vox-tui/src/theme.rs", "ASCII", 1, row::TERMINAL, None),
+    ("vox-core/src/transport/mux.rs", "FILE", 1, row::TEST_KNOB_ENV, None),
+    ("vox-tui/src/theme.rs", "DEPTH", 1, row::TERMINAL, None),
     (
         "vox-tui/src/ident.rs",
         "NAMES",
