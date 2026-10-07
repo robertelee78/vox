@@ -52,6 +52,8 @@
 //!   everyone, then "? unverified" on every row and "← in-only" for Carol, though Bob's node
 //!   refuses her key; V210-155); and no row of the pane names a verified, TOFU or key-changed
 //!   state, a consent or a block: one trust state, in the keyring or not (ADR-028 K-2, K-6, #473);
+//! - `capability`: under each member's state line, what Bob's keyring grants it: Alice "read",
+//!   Dave "read + drive", Carol (not in his keyring) nothing (ADR-028 K-14, #525);
 //! - `look`: in truecolour, Alice's row reads "⇄ alice" (each trusts the other) and Dave's
 //!   "→ dave" (only Bob trusts him), both in text.primary bold, and Carol's "· <fingerprint>" in
 //!   text.secondary, not bold; the accent is on the focused members pane's border and nowhere
@@ -134,10 +136,11 @@
 //! composer's To: and urgent left off what it sends, an attach's note posted as a message of its own, a quote of the thread's root rather than `re`, Enter on a reply not
 //! moving the selection, a trusted member shown as "verified" (`consent`), `:node <name>` acting as
 //! another node again, a copied command that is not the service's canonical address (`copies`), or
-//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), or an image
-//! drawn before this node's copy is verified (`inline`), or a read of a hung-up terminal that never
-//! returns (`gone`). It passes only on the script's PASS with
-//! all 37 claims ok.
+//! a pasted fingerprint that is not the node's let through to the keyring (`trust`), an image
+//! drawn before this node's copy is verified (`inline`), a member's keyring capability not
+//! drawn (`capability`), or a read of a hung-up terminal that never returns (`gone`). It passes
+//! only on the script's PASS with
+//! all 38 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -233,7 +236,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (37 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (38 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -247,8 +250,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (37, 37),
-                "APPARATUS: the driver said PASS without all 37 claims ok: {said}"
+                (38, 38),
+                "APPARATUS: the driver said PASS without all 38 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

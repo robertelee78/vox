@@ -23,6 +23,7 @@ pub mod app_cli;
 pub mod claude_injector;
 pub mod cli;
 pub mod client;
+pub mod codex_app_server;
 pub mod codex_mirror;
 pub mod codex_trust;
 pub mod coord;
