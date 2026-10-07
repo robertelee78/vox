@@ -391,6 +391,14 @@ enum RoomCmd {
     /// The room's Sessions (ADR-029): one per harness session working in the room, each by your
     /// name for its node, the session's name and its short id; open ones first, ended ones apart.
     Sessions(RoomSessionsArgs),
+    /// Read one Session of the room: what that harness session did, one line per activity
+    /// (ADR-029 SC-1).
+    ///
+    /// Tool calls with what they returned, the replies, the end of each turn, what was typed at
+    /// the terminal or in Vox, approvals and questions with who answered them, files either way.
+    /// `--details` prints each entry's full input and output under its line. Only members the
+    /// session's node trusts with drive see inside a Session; anyone else is told so.
+    Session(RoomSessionArgs),
     /// Ask a member's node which agent sessions it holds, and whether each can be reached.
     ///
     /// The ping is answered by that node's **daemon**, never by a model: it lists each session,
@@ -1072,6 +1080,95 @@ pub struct RoomRefArgs {
     pub profile: NodeArgs,
     /// The room's id, or a unique prefix of it.
     pub room: String,
+}
+
+/// `vox room session`
+#[derive(Args, Debug, Clone)]
+pub struct RoomSessionArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The room's id, or a unique prefix of it.
+    pub room: String,
+    /// The Session: its session id, at least 8 characters of it, or its name.
+    pub session: String,
+    /// Print each entry's full input and output under its line.
+    #[arg(long)]
+    pub details: bool,
+    /// Print one JSON object per line instead.
+    #[arg(long)]
+    pub json: bool,
+    /// Drive the session instead of reading it (ADR-029 §3), as a member its node trusts with
+    /// drive. Each input reaches that session alone, or is refused with the reason.
+    #[command(flatten)]
+    pub drive: SessionDriveArgs,
+}
+
+/// What `vox room session` sends to the session, when it drives it: at most one of these.
+#[derive(Args, Debug, Clone, Default)]
+#[group(multiple = false)]
+pub struct SessionDriveArgs {
+    /// Type TEXT into the session as its operator, and submit it.
+    #[arg(long, value_name = "TEXT")]
+    pub say: Option<String>,
+    /// Interrupt the turn it is running (Esc).
+    #[arg(long)]
+    pub interrupt: bool,
+    /// Stop it (Ctrl-C).
+    #[arg(long)]
+    pub stop: bool,
+    /// Send it a slash command, as typed: "/compact", "/clear", "/rename NAME".
+    #[arg(long, value_name = "COMMAND")]
+    pub slash: Option<String>,
+    /// Approve the tool call the Session shows as waiting, by its ref.
+    #[arg(long, value_name = "REF")]
+    pub approve: Option<String>,
+    /// Reject the tool call waiting under REF, optionally saying why: `--reject REF "reason"`.
+    #[arg(long, value_name = "REF", num_args = 1..=2)]
+    pub reject: Option<Vec<String>>,
+    /// Answer the question waiting under REF: `--answer REF "QUESTION=ANSWER" …`, one pair per
+    /// question (a question by its id or its text; several choices joined with ", ").
+    #[arg(long, value_name = "REF", num_args = 2..)]
+    pub answer: Option<Vec<String>>,
+}
+
+impl SessionDriveArgs {
+    /// The input asked for, or `None` for a read; a malformed answer is said.
+    ///
+    /// # Errors
+    /// A `--answer` pair without `=`.
+    pub fn action(&self) -> Result<Option<crate::drive::Action>, String> {
+        use crate::drive::Action;
+        Ok(Some(if let Some(t) = &self.say {
+            Action::Text { text: t.clone() }
+        } else if self.interrupt {
+            Action::Interrupt
+        } else if self.stop {
+            Action::Stop
+        } else if let Some(t) = &self.slash {
+            Action::Slash { text: t.clone() }
+        } else if let Some(r) = &self.approve {
+            Action::Approve { r#ref: r.clone() }
+        } else if let Some(v) = &self.reject {
+            Action::Reject {
+                r#ref: v[0].clone(),
+                why: v.get(1).cloned(),
+            }
+        } else if let Some(v) = &self.answer {
+            let mut answers = std::collections::BTreeMap::new();
+            for pair in &v[1..] {
+                let (q, a) = pair
+                    .split_once('=')
+                    .ok_or_else(|| format!("--answer takes QUESTION=ANSWER, not {pair:?}"))?;
+                answers.insert(q.trim().to_owned(), a.trim().to_owned());
+            }
+            Action::Answer {
+                r#ref: v[0].clone(),
+                answers,
+            }
+        } else {
+            return Ok(None);
+        }))
+    }
 }
 
 /// `vox room post`
@@ -2105,6 +2202,7 @@ pub fn run() -> ExitCode {
                 RoomCmd::Read(a) => &a.profile,
                 RoomCmd::Roster(a) => &a.profile,
                 RoomCmd::Sessions(a) => &a.profile,
+                RoomCmd::Session(a) => &a.profile,
                 RoomCmd::Ping(a) => &a.profile,
                 RoomCmd::Tail(a) => &a.profile,
                 RoomCmd::Board(a) => &a.profile,
@@ -2178,6 +2276,18 @@ pub fn run() -> ExitCode {
                             crate::room_cli::tail(&paths, &a.room, a.since.as_deref(), a.json).await
                         }
                         RoomCmd::Roster(a) => crate::room_cli::roster(&paths, &a.room).await,
+                        RoomCmd::Session(a) => match a.drive.action() {
+                            Err(e) => Err(crate::app::AppError::Usage(e)),
+                            Ok(Some(action)) => {
+                                crate::drive::run(&paths, &a.room, &a.session, action).await
+                            }
+                            Ok(None) => {
+                                crate::session_cli::show(
+                                    &paths, &a.room, &a.session, a.details, a.json,
+                                )
+                                .await
+                            }
+                        },
                         RoomCmd::Sessions(a) => {
                             crate::room_cli::sessions(&paths, &a.room, a.json).await
                         }

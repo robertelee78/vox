@@ -1212,6 +1212,36 @@ pub async fn run(
         input.session_id = s.trim().to_owned();
     }
 
+    // A Codex session starts: Codex's app-server is kept running (the decider, 2026-10-06), so
+    // the next `codex` joins it and can be read and driven from Vox (ADR-029 #541). It is not
+    // this session's turn yet, and its drain runs at its prompt, so nothing is read here.
+    if input.codex && input.event == "SessionStart" {
+        crate::codex_mirror::ensure_app_server();
+        return Ok(());
+    }
+
+    // ADR-029 SC-1: what the session does goes to its Session (#540), and an approval or a
+    // question waits there for an answer from either side (#545).
+    let mirrored = crate::session_mirror::Event::parse(&raw)
+        .filter(|ev| crate::session_mirror::mirrors(&ev.name));
+    if let Some(ev) = &mirrored {
+        if ev.name != "UserPromptSubmit" {
+            // **Every hook binds the session** (ADR-029 DR-5): its registration, with the tmux pane
+            // it proves, is refreshed on each event, so a session first seen by a tool call is
+            // known, and a session resumed in another pane is rebound at once.
+            if let Err(e) = daemon.register(&input, room_arg).await {
+                eprintln!("vox agent hook: {e}");
+            }
+            if ev.name == "Stop" {
+                crate::wake::record_idle(paths, &input.session_id);
+            }
+            if let Some(out) = crate::session_mirror::hook(daemon, ev, &input.session_id).await {
+                println!("{out}");
+            }
+            return Ok(());
+        }
+    }
+
     match input.event.as_str() {
         "Stop" => {
             crate::wake::record_idle(paths, &input.session_id);
@@ -1228,6 +1258,10 @@ pub async fn run(
 
     let drained = match daemon.register(&input, room_arg).await {
         Ok(answer) => {
+            // The prompt goes to the Session first: it is what the turn the drain starts answers.
+            if let Some(ev) = &mirrored {
+                crate::session_mirror::hook(daemon, ev, &input.session_id).await;
+            }
             let note = crate::room_map::note(
                 answer.room.as_deref(),
                 answer.new,
@@ -2093,13 +2127,43 @@ async fn read_room(
 }
 
 /// The hook entries `vox agent plugin claude` prints, for `~/.claude/settings.json`: one per event
-/// `vox agent hook` acts on (see [`run`]).
+/// `vox agent hook` acts on (see [`run`]). The tool events and `PermissionRequest` feed the
+/// session's Session (ADR-029 SC-1, DR-3); `PermissionRequest` waits for an answer from it for up
+/// to an hour, while the terminal's own prompt stays live, so its timeout is that long.
 pub const CLAUDE_HOOKS: &str = r#"{
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook", "timeout": 3600 }
         ]
       }
     ],
@@ -2149,14 +2213,34 @@ pub fn claude_settings(node: &vox_core::node::paths::NodeName) -> String {
     text
 }
 
-/// Codex's `hooks.json` entry for `node`, as `vox agent plugin codex --node <name>` prints it.
-/// `async` MUST be false: an async hook's output is observed and discarded.
+/// Codex's `hooks.json` entries for `node`, as `vox agent plugin codex --node <name>` prints them.
+///
+/// - `UserPromptSubmit` drains the rooms into the turn, so it MUST be synchronous: an async
+///   hook's output is observed and discarded. It also posts the prompt to the Session.
+/// - `PreToolUse`, `PostToolUse` and `Stop` feed the Session (ADR-029 SC-1) when the session
+///   cannot be read from Codex's app-server (one was not running when `codex` started); the
+///   daemon drops them for a session it reads there. Async: a mirror never holds a turn up.
+/// - `SessionEnd` ends the Session (SE-4). Codex runs it synchronously, whatever it is told.
+/// - `SessionStart` keeps Codex's app-server running, so the next `codex` joins it (async).
+/// - No `PermissionRequest`: a hook that decided would take the prompt from the terminal, and
+///   Codex's request carries no id to answer it by. An approval is answered from Vox only
+///   through the app-server.
 #[must_use]
 pub fn codex_hooks(node: &vox_core::node::paths::NodeName) -> String {
+    let entry = |sync: bool| {
+        serde_json::json!([ { "hooks": [
+            { "type": "command", "command": hook_command(node), "async": !sync }
+        ] } ])
+    };
     let v = serde_json::json!({
-        "hooks": { "UserPromptSubmit": [ { "hooks": [
-            { "type": "command", "command": hook_command(node), "async": false }
-        ] } ] }
+        "hooks": {
+            "SessionStart": entry(false),
+            "UserPromptSubmit": entry(true),
+            "PreToolUse": entry(false),
+            "PostToolUse": entry(false),
+            "Stop": entry(false),
+            "SessionEnd": entry(true),
+        }
     });
     let mut text = serde_json::to_string_pretty(&v).unwrap_or_default();
     text.push('\n');
