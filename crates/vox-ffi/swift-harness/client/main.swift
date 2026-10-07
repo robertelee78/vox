@@ -100,7 +100,7 @@ do {
     say("JOINED \(room)")
     // A keyring change takes the identity passphrase: attaching opened no window (ADR-028 K-12).
     let again = try Passphrase(bytes: Data(args[3].utf8))
-    try await client.trustAdd(fingerprint: peer, name: "peer", identityPassphrase: again)
+    try await client.trustAdd(fingerprint: peer, name: "peer", drive: false, identityPassphrase: again)
     again.wipe()
     try await client.post(room: room, text: "hello from swift", to: [], re: "", urgent: false)
     // A post is answered once the node has it: the room read back at once holds it.
