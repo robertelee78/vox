@@ -71,6 +71,9 @@
 //! directory in the room map; run by the operator at a terminal (a pty), it offers to, says what
 //! that changes, and on yes saves it with the room's passphrase typed there, so the next session
 //! started in that directory works in the room by itself. Mutant: the save writes nothing.
+//! A session started in a mapped directory whose room's host is gone is told the join is under way,
+//! then, on a later turn, why it could not join, though that turn tries again. Mutant: the retry's
+//! "joining" overwrites the failure before the turn reads it.
 //!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
@@ -2369,6 +2372,41 @@ fn a_session_works_in_the_room_its_start_directory_is_mapped_to() {
          the new room: in {home} {:?}, in {scratch} {:?}; it said {moved}{err}",
         sessions(&home),
         sessions(&scratch)
+    );
+
+    // (6) A mapped room whose host is gone: the join fails, and the session is told why on a
+    // later turn, even though that turn tries the join again.
+    let ghost = Daemon::start(&tmp.path().join("ghost"));
+    let ghost_room: String = ghost.room_key.chars().take(12).collect();
+    let ghost_link = ghost.link(&ghost_room);
+    drop(ghost); // its daemon, killed by its own handle
+    let gone_repo = tmp.path().join("gone-repo");
+    std::fs::create_dir_all(&gone_repo).expect("APPARATUS: cannot make a repository directory");
+    let mut text = std::fs::read_to_string(&map).expect("APPARATUS: cannot read the room map");
+    text.push_str(&format!(
+        "\nrepo {}\n    room       {ghost_link}\n    passphrase channel passphrase\n",
+        gone_repo.display()
+    ));
+    std::fs::write(&map, text).expect("APPARATUS: cannot write the room map");
+    let stranded = "44444444-aaaa-4bbb-8ccc-000000000004";
+    let first_try = turn(stranded, &gone_repo);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut told = String::new();
+    while !told.contains("could not join room") {
+        assert!(
+            Instant::now() < deadline,
+            "PRODUCT: a session whose mapped room could not be joined must be told why on a later \
+             turn; within 120 s its turns were told only {told:?} (first: {first_try:?})"
+        );
+        std::thread::sleep(Duration::from_secs(5));
+        told = turn(stranded, &gone_repo);
+    }
+    eprintln!("[proof] (6) a turn after the join failed was told: {told:?}");
+    assert!(
+        first_try.contains("joining room")
+            && told.contains(&format!("could not join room {ghost_room}")),
+        "PRODUCT: the session must be told the join is under way, then why it failed: first \
+         {first_try:?}, later {told:?}"
     );
 }
 

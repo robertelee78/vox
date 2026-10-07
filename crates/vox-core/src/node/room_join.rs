@@ -54,6 +54,9 @@ impl Joins {
     }
 }
 
+/// How a status that says a join failed begins.
+const FAILED: &str = "could not join room";
+
 /// Start joining `room` from `link` with `passphrase`, and open `session`'s Session once the node is
 /// a member. Returns at once: how it goes is told to the session on its next turn
 /// ([`Joins::status`]). A join of `room` already running is left to finish; this one is dropped.
@@ -75,7 +78,17 @@ pub fn join_in_background(
     }
     // The room as a person reads it in a sentence: its id's start, as `vox room list` shows it.
     let named: String = room.chars().take(12).collect();
-    joins.set_status(room, Some(format!("joining room {named}…")));
+    // **A failure is told before it is tried again**: the next turn's registration starts the retry
+    // and reads the status right after, so a retry that only said "joining" again would hide why the
+    // last one failed from the session for ever.
+    let failed = joins.status(room).filter(|s| s.starts_with(FAILED));
+    joins.set_status(
+        room,
+        Some(match failed {
+            Some(why) => format!("{why}; joining it again…"),
+            None => format!("joining room {named}…"),
+        }),
+    );
     let (handle, joins, room, link) = (
         handle.clone(),
         Arc::clone(joins),
@@ -99,7 +112,7 @@ pub fn join_in_background(
                     }),
                 Err(e) => Some(format!("joined room {named}, and could not name it: {e}")),
             },
-            other => Some(format!("could not join room {named}: {other}")),
+            other => Some(format!("{FAILED} {named}: {other}")),
         };
         joins.set_status(&room, said);
         joins
