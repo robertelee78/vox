@@ -97,6 +97,10 @@ pub struct Session {
     /// only `vox agent room` moves it (RB-5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room: Option<String>,
+    /// The directory the session started in, as its first registration gave it (ADR-029 RB-2):
+    /// what `vox agent room` offers to save in the room map. Kept, like `room`, for its life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
     /// The session's current name, as its harness gives it (ADR-029 MD-1); `None` when it gives
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -273,6 +277,7 @@ pub fn store(paths: &Paths, reg: &Session) {
         .filter(|b| b.room.is_some() || b.first_seen_ms != 0)
     {
         reg.room.clone_from(&b.room);
+        reg.start.clone_from(&b.start);
     }
     // **A name, once given, stays until the harness gives another** (ADR-029 MD-1): a turn whose
     // harness said nothing of it (a sub-agent's event, a transcript not yet written) keeps it.
@@ -320,6 +325,7 @@ impl Session {
                 first_seen_ms: 0,
                 last_drained_ms: 0,
                 room: None,
+                start: None,
                 name: None,
                 interactive: interactive_now(),
             }
@@ -337,6 +343,7 @@ impl Session {
                 first_seen_ms: 0,
                 last_drained_ms: 0,
                 room: None,
+                start: None,
                 name: None,
                 interactive: interactive_now(),
             }
@@ -354,6 +361,7 @@ impl Session {
                 first_seen_ms: 0,
                 last_drained_ms: 0,
                 room: None,
+                start: None,
                 name: None,
                 interactive: interactive_now(),
             }
@@ -368,6 +376,7 @@ impl Session {
                 first_seen_ms: 0,
                 last_drained_ms: 0,
                 room: None,
+                start: None,
                 name: None,
                 interactive: interactive_now(),
             }

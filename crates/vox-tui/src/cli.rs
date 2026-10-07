@@ -920,6 +920,12 @@ enum AgentCmd {
     /// vox agent doctor --room <room>
     /// ```
     Doctor(AgentDoctorArgs),
+    /// Set the room this harness session works in, or move it to another (ADR-029 RB-5).
+    ///
+    /// Run from the session, when its hook says it works in no room, or to move it: its
+    /// Session ends in the room it worked in and opens in this one. The room is one the
+    /// node holds. A session works in one room at a time.
+    Room(AgentRoomArgs),
 }
 
 /// `vox agent doctor`
@@ -1003,6 +1009,21 @@ pub struct AgentPluginArgs {
     /// Required: an agent never uses a person's node.
     #[arg(long, required = true)]
     pub node: String,
+}
+
+/// `vox agent room`
+#[derive(Args, Debug, Clone)]
+pub struct AgentRoomArgs {
+    #[command(flatten)]
+    pub profile: AccountArgs,
+    /// The room: its id, a unique start of it, or its name.
+    pub room: String,
+    /// The agent's own node, as its hook names it; `VOX_NODE` in the session's environment.
+    #[arg(long, env = "VOX_NODE", required = true)]
+    pub node: String,
+    /// The harness session to move; else `VOX_SESSION`, or the harness's own id.
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 /// `vox agent hook`
@@ -2448,6 +2469,28 @@ pub fn run() -> ExitCode {
             // Not `rt` dropping: stdin's reader thread may still be blocked in a read, and
             // the runtime would wait for it.
             rt.shutdown_background();
+            match outcome {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("vox: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Agent(AgentCmd::Room(args)) => {
+            let outcome = vox_core::node::paths::NodeName::parse(&args.node)
+                .map_err(AppError::from)
+                .and_then(|node| {
+                    let account = vox_core::node::paths::Account::of(
+                        args.profile.data_dir.as_deref(),
+                        args.profile.config_dir.as_deref(),
+                    )?;
+                    vox_core::node::layout::refuse_old_layout(&account)?;
+                    block_on_client(async move {
+                        crate::agent_room::run(&account, &node, args.session.as_deref(), &args.room)
+                            .await
+                    })
+                });
             match outcome {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

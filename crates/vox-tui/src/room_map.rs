@@ -183,3 +183,38 @@ pub fn note(
             .to_owned()
     })
 }
+
+/// Add a `repo` block to `data_root`'s room map: `repo` works in the room `link` names, joined with
+/// `passphrase` (none when empty). The map is made, mode 0600, if there is none; what it held is
+/// kept.
+///
+/// # Errors
+/// The map cannot be read (what [`read`] refuses) or written, or it names `repo` already.
+pub fn add(data_root: &Path, repo: &Path, link: &str, passphrase: &str) -> Result<(), AppError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let entries = read(data_root)?;
+    if lookup(&entries, repo).is_some() {
+        return Err(AppError::Usage(format!(
+            "the room map names {} already; change it there",
+            repo.display()
+        )));
+    }
+    let mut block = format!("\nrepo {}\n    room       {link}\n", repo.display());
+    if !passphrase.is_empty() {
+        block.push_str(&format!("    passphrase {passphrase}\n"));
+    }
+    let block = Zeroizing::new(block);
+    let file = path(data_root);
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&file)
+        .map_err(|e| {
+            AppError::Usage(format!("cannot write the room map {}: {e}", file.display()))
+        })?;
+    f.write_all(block.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| AppError::Usage(format!("cannot write the room map {}: {e}", file.display())))
+}
