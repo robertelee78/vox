@@ -39,8 +39,8 @@ use crate::pairwise::{MAX_CACHE, MAX_SKIP};
 /// Default scheduled-rotation message bound: rotate the sender key after this
 /// many messages (ADR-006, `N` = 1000).
 pub const ROTATE_AFTER_MESSAGES: u64 = 1000;
-/// Default scheduled-rotation time bound in seconds (ADR-006, `T` = 7 days).
-pub const ROTATE_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default scheduled-rotation time bound in milliseconds (ADR-006, `T` = 7 days).
+pub const ROTATE_AFTER_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// The send side of one sender-key generation for `(channel, epoch, author,
 /// chain_id)`: live chain key, next iteration, signing key, and rotation clock.
@@ -53,7 +53,8 @@ pub struct SenderChain {
     /// The iteration the *next* [`encrypt`](Self::encrypt) will use/emit.
     next_iteration: u64,
     signing_key: SenderKeySigningKey,
-    /// Wall-clock (Unix seconds) when this generation was created (rotation clock).
+    /// Wall-clock (milliseconds since the Unix epoch) when this generation was created (rotation
+    /// clock).
     created_at: u64,
 }
 
@@ -95,8 +96,8 @@ impl SenderChain {
 
     /// Serialize the chain's **secret** state for the sealed at-rest key-material
     /// segment (ADR-010 §"per-channel key material"; ADR-016 M13). Canonical CBOR
-    /// `[1, channel_id, epoch, author_id, chain_id, chain_key, next_iteration,
-    /// ed25519_seed, ml_dsa_seed, created_at]`. Returned zeroizing; it must only
+    /// `[2, channel_id, epoch, author_id, chain_id, chain_key, next_iteration,
+    /// ed25519_seed, ml_dsa_seed, created_at]`, `created_at` in milliseconds. Returned zeroizing; it must only
     /// ever be handed to [`crate::atrest::store::seal_segment`].
     #[must_use]
     pub fn to_state(&self) -> Zeroizing<Vec<u8>> {
@@ -123,9 +124,12 @@ impl SenderChain {
         if d.array()? != 10 {
             return Err(Error::MalformedBundle("sender chain state arity"));
         }
-        if d.uint()? != SENDER_STATE_VERSION {
-            return Err(Error::MalformedBundle("sender chain state version"));
-        }
+        // Version 1 held `created_at` in seconds: read it as milliseconds, never in the wrong unit.
+        let seconds = match d.uint()? {
+            SENDER_STATE_VERSION => false,
+            SENDER_STATE_VERSION_SECONDS => true,
+            _ => return Err(Error::MalformedBundle("sender chain state version")),
+        };
         let channel_id: Digest32 = d
             .bytes()?
             .try_into()
@@ -150,6 +154,11 @@ impl SenderChain {
             .try_into()
             .map_err(|_| Error::MalformedBundle("sender chain state ml-dsa seed"))?;
         let created_at = d.uint()?;
+        let created_at = if seconds {
+            created_at.saturating_mul(1_000)
+        } else {
+            created_at
+        };
         d.finish()?;
         let ed = Zeroizing::new(ed);
         let ml = Zeroizing::new(ml);
@@ -257,13 +266,13 @@ impl SenderChain {
     }
 
     /// Whether the scheduled-rotation bound has been reached (ADR-006): the chain
-    /// has emitted at least `ROTATE_AFTER_MESSAGES`, or `ROTATE_AFTER_SECS` have
+    /// has emitted at least `ROTATE_AFTER_MESSAGES`, or `ROTATE_AFTER_MS` have
     /// elapsed since creation. The caller (M6/M7) acts on this by minting a new
     /// generation with [`SenderChain::rotated`].
     #[must_use]
     pub fn should_rotate(&self, now: u64) -> bool {
         self.next_iteration >= ROTATE_AFTER_MESSAGES
-            || now.saturating_sub(self.created_at) >= ROTATE_AFTER_SECS
+            || now.saturating_sub(self.created_at) >= ROTATE_AFTER_MS
     }
 
     /// Mint the next generation: a fresh chain key, signing key, and iteration-0,
@@ -292,8 +301,11 @@ impl SenderChain {
     }
 }
 
-/// Version of the sealed sender-chain state encoding.
-const SENDER_STATE_VERSION: u64 = 1;
+/// Version of the sealed sender-chain state encoding: 2, its creation time in milliseconds.
+const SENDER_STATE_VERSION: u64 = 2;
+
+/// The sender-chain state's version 1, its creation time in seconds: still read.
+const SENDER_STATE_VERSION_SECONDS: u64 = 1;
 
 /// At-rest version of a [`ReceiverChain`] state blob.
 const RECEIVER_STATE_VERSION: u64 = 1;

@@ -323,8 +323,9 @@ const SERVICES_VERSION: u64 = 2;
 /// The most services one channel may offer — a sanity bound on host config.
 pub const MAX_SERVICES: usize = 64;
 /// Manifest encoding version. **2 holds the shared name's hint** where 1 held a per-member local
-/// name (ADR-028 R-1 removed those); 1 is still read, without its name.
-const MANIFEST_VERSION: u64 = 2;
+/// name (ADR-028 R-1 removed those); 1 is still read, without its name. **3 holds the creation time
+/// in milliseconds**; 1 and 2 held it in seconds, and are read as milliseconds.
+const MANIFEST_VERSION: u64 = 3;
 /// Plaintext-cache row encoding version.
 /// Version of the plaintext rendering cache. **2 stores the timestamp in milliseconds**, and is the
 /// only version this build reads: version 1 (seconds) was an earlier release's (#423).
@@ -742,6 +743,7 @@ pub struct ChannelState {
     /// The room's shared name as this node first heard it, shown only while the log names it not
     /// (ADR-028 R-1); empty for none.
     name_hint: String,
+    /// When this node made or joined the room, milliseconds since the Unix epoch.
     created: u64,
     epoch: u64,
     sek: Sek,
@@ -924,13 +926,13 @@ impl std::fmt::Debug for ChannelState {
     }
 }
 
-fn manifest_bytes(genesis: &Genesis, name_hint: &str, created: u64, epoch: u64) -> Vec<u8> {
+fn manifest_bytes(genesis: &Genesis, name_hint: &str, created_ms: u64, epoch: u64) -> Vec<u8> {
     let mut e = Encoder::new();
     e.array(5)
         .uint(MANIFEST_VERSION)
         .bytes(&genesis.to_wire())
         .text(name_hint)
-        .uint(created)
+        .uint(created_ms)
         .uint(epoch);
     e.finish()
 }
@@ -941,7 +943,7 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
         return Err(Error::MalformedAtRest("room manifest arity"));
     }
     let version = d.uint()?;
-    if version != MANIFEST_VERSION && version != 1 {
+    if !(1..=MANIFEST_VERSION).contains(&version) {
         return Err(Error::MalformedAtRest("room manifest version"));
     }
     let genesis = Genesis::from_wire(d.bytes()?)?;
@@ -956,9 +958,14 @@ fn parse_manifest(bytes: &[u8]) -> Result<(Genesis, String, u64, u64)> {
         name.to_owned()
     };
     let created = d.uint()?;
+    let created_ms = if version < MANIFEST_VERSION {
+        created.saturating_mul(1_000)
+    } else {
+        created
+    };
     let epoch = d.uint()?;
     d.finish()?;
-    Ok((genesis, name, created, epoch))
+    Ok((genesis, name, created_ms, epoch))
 }
 
 /// The admitted-authors segment: `[version, [[fingerprint, composite_pubkey], …]]`
@@ -1565,7 +1572,7 @@ impl ChannelState {
         let channel_id = genesis.channel_id();
         let epoch = 0u64;
         let me = signer.fingerprint();
-        let sender = SenderChain::new(&channel_id, epoch, &me, 0, now_ms / 1_000)?;
+        let sender = SenderChain::new(&channel_id, epoch, &me, 0, now_ms)?;
         // Retain generation 0's origin at the moment it is minted: once the live
         // chain ratchets past iteration 0 the origin is unrecoverable, so it is kept
         // now or never (ADR-006 §History).
@@ -1577,11 +1584,11 @@ impl ChannelState {
             epoch,
             &me,
             &sender,
-            now_ms / 1_000,
+            now_ms,
             mint_seq,
         )?;
 
-        let manifest = manifest_bytes(&genesis, name, now_ms / 1_000, epoch);
+        let manifest = manifest_bytes(&genesis, name, now_ms, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
         let sender_seg = seal_segment(
             &sek,
@@ -1641,7 +1648,7 @@ impl ChannelState {
             genesis,
             name_hint: name.to_owned(),
             passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
-            created: now_ms / 1_000,
+            created: now_ms,
             epoch,
             sek,
             authors,
@@ -2253,7 +2260,7 @@ impl ChannelState {
         let signer = profile.signer()?;
         let me = signer.fingerprint();
         let epoch = 0u64;
-        let sender = SenderChain::new(channel_id, epoch, &me, 0, now_ms / 1_000)?;
+        let sender = SenderChain::new(channel_id, epoch, &me, 0, now_ms)?;
         let mut origins = OriginKeyStore::new();
         let mint_seq = crate::node::consent_order::stamp_mint(profile.store(), signer, 0)?;
         retain_generation(
@@ -2262,7 +2269,7 @@ impl ChannelState {
             epoch,
             &me,
             &sender,
-            now_ms / 1_000,
+            now_ms,
             mint_seq,
         )?;
 
@@ -2271,7 +2278,7 @@ impl ChannelState {
         authors.insert(creator, genesis.body.creator_pubkey.clone());
         authors.insert(me, signer.public_key());
 
-        let manifest = manifest_bytes(genesis, name_hint, now_ms / 1_000, epoch);
+        let manifest = manifest_bytes(genesis, name_hint, now_ms, epoch);
         let manifest_seg = seal_segment(&sek, SegmentKind::KeyMaterial, SEG_MANIFEST, &manifest)?;
         let sender_seg = seal_segment(
             &sek,
@@ -2357,7 +2364,7 @@ impl ChannelState {
             genesis: genesis.clone(),
             name_hint: name_hint.to_owned(),
             passphrase: Some(Zeroizing::new(channel_passphrase.to_vec())),
-            created: now_ms / 1_000,
+            created: now_ms,
             epoch,
             sek,
             authors,
@@ -3099,7 +3106,7 @@ impl ChannelState {
         // The hold: nothing older than it is kept for a waiting identity. No generation inside it
         // means none is kept for them at all.
         let waiting = waiting.map(|floor| {
-            let cutoff = (now_ms / 1_000).saturating_sub(self.unjoined_hold_secs());
+            let cutoff = now_ms.saturating_sub(self.unjoined_hold_secs().saturating_mul(1_000));
             let young = self
                 .origins
                 .oldest_created_since(&self.channel_id, self.epoch, &me, cutoff)
@@ -3256,7 +3263,7 @@ impl ChannelState {
     #[must_use]
     pub fn should_rotate_sender(&self, now: crate::time::Ms) -> bool {
         let now_ms = now.get();
-        self.sender.should_rotate(now_ms / 1_000)
+        self.sender.should_rotate(now_ms)
     }
 
     /// The generation this identity is currently sending under.
@@ -3282,7 +3289,7 @@ impl ChannelState {
     /// re-key.
     pub fn rotate_sender(&mut self, profile: &Profile, now: crate::time::Ms) -> Result<u64> {
         let now_ms = now.get();
-        let next = self.sender.rotated(now_ms / 1_000)?;
+        let next = self.sender.rotated(now_ms)?;
         self.rotate_sender_to(profile, next, now_ms)
     }
 
@@ -3326,7 +3333,7 @@ impl ChannelState {
         let next_id = used
             .checked_add(1)
             .ok_or(Error::MalformedBundle("chain_id overflow"))?;
-        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now_ms / 1_000)?;
+        let next = SenderChain::new(&self.channel_id, self.epoch, &me, next_id, now_ms)?;
         self.rotate_sender_to(profile, next, now_ms)?;
         Ok(true)
     }
@@ -3359,7 +3366,7 @@ impl ChannelState {
             self.epoch,
             &me,
             &next,
-            now_ms / 1_000,
+            now_ms,
             mint_seq,
         )?;
         let sender_seg = seal_segment(
@@ -5380,7 +5387,7 @@ impl ChannelState {
             self.epoch,
             &me,
             next,
-            now_ms / 1_000,
+            now_ms,
         )?;
         let members = self.drive_members();
         self.drive.begin(
@@ -5422,7 +5429,7 @@ impl ChannelState {
         let now_ms = now_millis;
         let stale = match &self.drive.chain {
             None => true,
-            Some(c) => c.epoch() != self.epoch || c.should_rotate(now_ms / 1_000),
+            Some(c) => c.epoch() != self.epoch || c.should_rotate(now_ms),
         };
         if stale {
             self.begin_drive(holders, now_ms)?;
@@ -6954,7 +6961,7 @@ impl ChannelState {
         Ok(())
     }
 
-    /// Creation time recorded in the manifest.
+    /// Creation time recorded in the manifest, milliseconds since the Unix epoch.
     #[must_use]
     pub fn created(&self) -> u64 {
         self.created
@@ -7105,10 +7112,7 @@ impl ChannelState {
             return Some(RoomEnd::ByCreator);
         }
         let idle_ms = lifecycle.idle_end_ms?;
-        let last = self
-            .dag
-            .newest_clock()
-            .unwrap_or_else(|| self.created().saturating_mul(1_000));
+        let last = self.dag.newest_clock().unwrap_or_else(|| self.created());
         let at = last.saturating_add(idle_ms);
         (now_ms >= at).then_some(RoomEnd::Idle {
             idle_secs: idle_ms / 1_000,
