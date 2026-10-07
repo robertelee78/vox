@@ -262,6 +262,19 @@ pub struct SessionView {
     pub can_drive: bool,
 }
 
+/// What a driver sends a Session (ADR-029 DR-1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DriveAct {
+    /// Text typed into the session as its operator.
+    Say(String),
+    /// A slash command: `/compact`, `/clear`, `/rename <name>`.
+    Slash(String),
+    /// Interrupt it (its Esc).
+    Interrupt,
+    /// Stop it (its Ctrl-C).
+    Stop,
+}
+
 /// One activity of a Session, as the reader sees it (ADR-029 SC-1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionLineView {
@@ -627,6 +640,15 @@ pub enum Command {
     SelectChannel {
         /// The channel now on screen, if any.
         channel_id: Option<Digest32>,
+    },
+    /// Drive the Session on screen (ADR-029 DR-1): what it is sent, said back in words.
+    Drive {
+        /// The room.
+        channel_id: Digest32,
+        /// The Session's node and the harness's session id.
+        session: (Digest32, String),
+        /// What it is sent.
+        act: DriveAct,
     },
     /// The Session the room's timeline now shows, by its node and session id; `None` for General
     /// or All (ADR-029 CL-2).
