@@ -43,6 +43,7 @@ VOX="$BUILD/target/release/vox"
 
 DAEMON=""
 PAGE=""
+ASKING=""
 # Stop one process this script started, by its PID: asked first, killed after 10 s, and said so.
 stop() {
     local pid=$1
@@ -56,6 +57,7 @@ stop() {
     wait "$pid" 2>/dev/null || true
 }
 cleanup() {
+    stop "$ASKING"
     stop "$PAGE"
     stop "$DAEMON"
     echo "app-screenshots: the demo data root was $DEMO (scratch; remove it when done)"
@@ -149,6 +151,35 @@ VOX_SESSION=builder-demo "$VOX" room post --node builder --type working "$ROOM" 
 VOX_SESSION=ben-demo "$VOX" room post --node ben --to "$ANN" "$ROOM" \
     "Can you check the photo album when it's done?" >/dev/null
 "$VOX" room join --node stranger --passphrase-file "$DEMO/wrong" "$LINK" >/dev/null 2>&1 || true
+# A Claude Code session of ann's own (ADR-029), staged through her real hook with Claude Code's own
+# hook JSON; no model runs: a prompt, a call and its result, and a second call that asks
+# permission and is left waiting, so the room needs ann and the Session waits on her.
+SESSION=f1e2d3c4-0000-4aaa-8bbb-5e55fe550554
+mkdir -p "$DEMO/work"
+: >"$DEMO/work/$SESSION.jsonl"
+payload() {
+    python3 -c 'import json, sys
+event, extra, sid, work = sys.argv[1:5]
+p = {"session_id": sid, "transcript_path": f"{work}/{sid}.jsonl", "cwd": work,
+     "permission_mode": "default", "hook_event_name": event}
+p.update(json.loads(extra))
+print(json.dumps(p))' "$1" "$2" "$SESSION" "$DEMO/work"
+}
+hook() {
+    payload "$1" "$2" | (cd "$DEMO/work" && CLAUDE_CODE_ENTRYPOINT=cli "$VOX" agent hook --node ann \
+        --room "$ROOM") >/dev/null 2>&1
+}
+hook UserPromptSubmit '{"prompt": "Tidy the recipe folder, then add the soup."}'
+LS='{"command": "ls recipes", "description": "List the recipes"}'
+hook PreToolUse "{\"tool_name\": \"Bash\", \"tool_input\": $LS, \"tool_use_id\": \"toolu_L\"}"
+hook PostToolUse "{\"tool_name\": \"Bash\", \"tool_input\": $LS, \"tool_use_id\": \"toolu_L\",
+    \"tool_response\": {\"stdout\": \"bread.md\\nsoup-old.md\\n\", \"stderr\": \"\", \"interrupted\": false}}"
+RM='{"command": "rm recipes/soup-old.md", "description": "Remove the old soup recipe"}'
+hook PreToolUse "{\"tool_name\": \"Bash\", \"tool_input\": $RM, \"tool_use_id\": \"toolu_R\"}"
+payload PermissionRequest "{\"tool_name\": \"Bash\", \"tool_input\": $RM, \"permission_suggestions\": []}" |
+    (cd "$DEMO/work" && CLAUDE_CODE_ENTRYPOINT=cli exec "$VOX" agent hook --node ann --room "$ROOM") \
+    >/dev/null 2>&1 &
+ASKING=$!
 sleep 3
 
 # ---- the renderer: the app's views, offscreen ------------------------------------------------

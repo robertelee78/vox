@@ -163,6 +163,12 @@ private struct RoomView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12).padding(.top, 8)
                     .accessibilityIdentifier("timeline-title")
+                if let header = model.sessionHeader {
+                    Text(header)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 12).padding(.top, 4)
+                        .accessibilityIdentifier("session-header")
+                }
                 Group {
                     GeometryReader { viewport in
                         ScrollViewReader { scroller in
@@ -190,6 +196,10 @@ private struct RoomView: View {
                                             Text(notice).secondaryText().italic()
                                                 .padding(.horizontal, 4)
                                                 .accessibilityIdentifier(item.id)
+                                                .id(item.id)
+                                        } else if let entry = item.entry, let session = model.shownSession {
+                                            SessionEntryRow(model: model, session: session,
+                                                            entry: entry) { looking = $0 }
                                                 .id(item.id)
                                         }
                                     }
@@ -239,36 +249,14 @@ private struct RoomView: View {
                     .accessibilityIdentifier("timeline")
                     .quickLookPreview($looking)
                 }
-                Divider()
-                if let reply = model.replyTo {
-                    HStack {
-                        Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
-                            .lineLimit(1).secondaryText()
-                        Spacer()
-                        Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
-                    }
-                    .padding(.horizontal, 12).padding(.top, 8)
-                    .accessibilityIdentifier("replying-to")
+                // A Session has no room composer (CL-1): the room's composer never speaks into
+                // a Session. An open one's own composer is for a member with drive only (CL-3).
+                if !model.showingSession {
+                    composer
+                } else if let s = model.shownSession, s.canDrive, s.open {
+                    Divider()
+                    SessionComposer(model: model, session: s)
                 }
-                HStack(spacing: 8) {
-                    Button {
-                        if let url = chooseFile() { attaching = Attaching(url: url) }
-                    } label: {
-                        Image(systemName: "paperclip")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Attach a file or folder")
-                    .accessibilityLabel("Attach a file or folder")
-                    .accessibilityIdentifier("attach")
-                    TextField("Say something to the room", text: $draft)
-                        .textFieldStyle(.plain)
-                        .frame(minWidth: 160, maxWidth: .infinity)
-                        .layoutPriority(1)
-                        .onSubmit { send(urgent: urgent) }
-                        .accessibilityIdentifier("compose")
-                    ComposerAddress(model: model, to: $to, urgent: $urgent)
-                }
-                .padding(12)
             }
             Divider()
             Inspector(model: model, room: room)
@@ -299,6 +287,40 @@ private struct RoomView: View {
                 model.incoming = nil
             }
         }
+    }
+
+    /// The room's composer, To: and urgent, under its own conversation and All.
+    @ViewBuilder private var composer: some View {
+        Divider()
+        if let reply = model.replyTo {
+            HStack {
+                Text("Replying to \(reply.authorName.isEmpty ? String(reply.author.prefix(12)) : reply.authorName): \(reply.text.prefix(60))")
+                    .lineLimit(1).secondaryText()
+                Spacer()
+                Button("Cancel") { model.replyTo = nil }.buttonStyle(.borderless)
+            }
+            .padding(.horizontal, 12).padding(.top, 8)
+            .accessibilityIdentifier("replying-to")
+        }
+        HStack(spacing: 8) {
+            Button {
+                if let url = chooseFile() { attaching = Attaching(url: url) }
+            } label: {
+                Image(systemName: "paperclip")
+            }
+            .buttonStyle(.borderless)
+            .help("Attach a file or folder")
+            .accessibilityLabel("Attach a file or folder")
+            .accessibilityIdentifier("attach")
+            TextField("Say something to the room", text: $draft)
+                .textFieldStyle(.plain)
+                .frame(minWidth: 160, maxWidth: .infinity)
+                .layoutPriority(1)
+                .onSubmit { send(urgent: urgent) }
+                .accessibilityIdentifier("compose")
+            ComposerAddress(model: model, to: $to, urgent: $urgent)
+        }
+        .padding(12)
     }
 
     /// Post the draft, To: and replying as set; urgent when asked (⌘↩ or the switch).
@@ -484,13 +506,15 @@ private struct ServiceCard: View {
     }
 }
 
-/// The room's members and their trust (L-4).
+/// The room's Sessions (ADR-029 CL-2), then its members and their trust (L-4).
 private struct Inspector: View {
     @ObservedObject var model: NodeModel
     let room: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            SessionsList(model: model)
+            Divider().padding(.vertical, 8)
             Text("MEMBERS").eyebrow().secondaryText()
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
