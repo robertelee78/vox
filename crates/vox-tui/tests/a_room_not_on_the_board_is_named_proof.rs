@@ -31,6 +31,12 @@
 //! 3. **An unpublished room.** Anchor A and the host are both gone — both held the room, and the
 //!    address names both as boards — and the guest joins again the same way.
 //!
+//! 0. **An address that will not parse.** The real address with one more `m=`, marking as a member
+//!    an entry the address does not give. The join is refused before any board is asked, saying
+//!    what is wrong with it, never "check you copied all of it": it said only "will not parse, or
+//!    names a room this node cannot use … check you copied all of it" (2026-10-07). Mutant: the
+//!    check before the node is asked removed: red PRODUCT.
+//!
 //! Asserted in each: the join fails; the reason names the board reached and the room; the advice
 //! names both causes (not published yet, host must be online; or a wrong room id) and never says
 //! the address is fine; and the old "will not parse" advice is gone. Mutations: returning
@@ -120,6 +126,17 @@ fn a_join_to_a_board_without_the_room_names_the_board_and_the_remedy() {
         address.contains(&spec_a[..52]),
         "PRODUCT (staging): the address must name anchor A, or B is not the only board the join can \
          reach: {address}"
+    );
+
+    // ---- Case 0: an address that will not parse ----
+    let (_, guest_fp, _) = vox_once(&guest_dir, &args(&["id"]));
+    let marked = format!("{address}&m={}", guest_fp.trim());
+    let said = join(&guest_dir, &marked, &passphrase, &spec_a);
+    assert!(
+        said.contains("a member it marks (m=) has no address in it (a=, b=)")
+            && !said.contains("check you copied"),
+        "PRODUCT: an address that marks a member it gives no address for must be refused saying \
+         so, not sent to check it was copied whole; the join said:\n{said}"
     );
 
     // ---- Case 1: a mistyped room id, against boards that are up ----

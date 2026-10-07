@@ -341,6 +341,8 @@ pub struct TrustedNode {
     pub fingerprint: String,
     /// The name it was trusted under.
     pub name: String,
+    /// What its entry grants: read, and (`true`) drive as well (ADR-028 K-14).
+    pub drive: bool,
 }
 
 /// A room link and what it carries.
@@ -1099,6 +1101,15 @@ fn file_offer(env: &vox_agentcomms::envelope::Envelope) -> Option<FileOffer> {
 
 /// The keyring's names, by fingerprint. A read: the node checks no passphrase.
 async fn names(client: &mut IpcClient) -> Result<HashMap<Digest32, String>, VoxError> {
+    Ok(keyring(client)
+        .await?
+        .into_iter()
+        .map(|(fp, name, _)| (fp, name))
+        .collect())
+}
+
+/// The keyring's entries: fingerprint, name as shown, and whether the entry grants drive.
+async fn keyring(client: &mut IpcClient) -> Result<Vec<(Digest32, String, bool)>, VoxError> {
     match answered(
         client
             .trusted("")
@@ -1107,7 +1118,7 @@ async fn names(client: &mut IpcClient) -> Result<HashMap<Digest32, String>, VoxE
     )? {
         Frame::Trusted { entries } => Ok(entries
             .into_iter()
-            .map(|(fp, name, _)| (fp, shown_name(&name)))
+            .map(|(fp, name, capability)| (fp, shown_name(&name), capability.drive()))
             .collect()),
         other => Err(unexpected(&other)),
     }
@@ -1811,8 +1822,9 @@ impl VoxClient {
         on_held!(self, |c| done(c, &req).await)
     }
 
-    /// Trust `fingerprint` under `name`. The identity passphrase is needed unless one was given
-    /// for a keyring change within the keyring window; attaching opens no window (ADR-028 K-12).
+    /// Trust `fingerprint` under `name`, granting read, and drive as well when `drive` (ADR-028
+    /// K-14, K-16). The identity passphrase is needed unless one was given for a keyring change
+    /// within the keyring window; attaching opens no window (ADR-028 K-12).
     ///
     /// # Errors
     /// A malformed fingerprint, the passphrase needed or wrong, or the node's refusal.
@@ -1820,6 +1832,7 @@ impl VoxClient {
         &self,
         fingerprint: String,
         name: String,
+        drive: bool,
         identity_passphrase: Option<Arc<Passphrase>>,
     ) -> Result<(), VoxError> {
         let req = Request::Trust {
@@ -1827,7 +1840,7 @@ impl VoxClient {
             petname: name,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
             full_history: false,
-            drive: false,
+            drive,
         };
         on_held!(self, |c| done(c, &req).await)
     }
@@ -1837,11 +1850,12 @@ impl VoxClient {
     /// # Errors
     /// The node's refusal.
     pub async fn trust_list(&self) -> Result<Vec<TrustedNode>, VoxError> {
-        let mut list: Vec<TrustedNode> = on_held!(self, |c| names(c).await)?
+        let mut list: Vec<TrustedNode> = on_held!(self, |c| keyring(c).await)?
             .into_iter()
-            .map(|(fp, name)| TrustedNode {
+            .map(|(fp, name, drive)| TrustedNode {
                 fingerprint: b32_encode(&fp),
                 name,
+                drive,
             })
             .collect();
         list.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
@@ -1861,6 +1875,25 @@ impl VoxClient {
         let req = Request::Rename {
             target: digest(&fingerprint, "fingerprint")?,
             petname: name,
+            identity_passphrase: copy_of(identity_passphrase.as_ref()),
+        };
+        on_held!(self, |c| done(c, &req).await)
+    }
+
+    /// Change what a trusted node's entry grants: read, and drive as well when `drive` (ADR-028
+    /// K-14), as `vox trust drive|read`. A keyring change, behind the passphrase gate.
+    ///
+    /// # Errors
+    /// As [`VoxClient::trust_add`].
+    pub async fn set_capability(
+        &self,
+        fingerprint: String,
+        drive: bool,
+        identity_passphrase: Option<Arc<Passphrase>>,
+    ) -> Result<(), VoxError> {
+        let req = Request::SetCapability {
+            target: digest(&fingerprint, "fingerprint")?,
+            drive,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
         };
         on_held!(self, |c| done(c, &req).await)
@@ -2380,7 +2413,8 @@ impl VoxClient {
                     .into_iter()
                     .find(|s| s.id == session && s.open)
                     .ok_or_else(|| failed("no open Session in this room has that id"))?;
-                let trusted = names.contains_key(&row.node);
+                // This node's own Sessions it drives as their operator (SC-2), over its own socket.
+                let trusted = names.contains_key(&row.node) || h.client.me() == Some(row.node);
                 // The session's node as this node knows it: its alias, or its short fingerprint.
                 let shown = names
                     .get(&row.node)

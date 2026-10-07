@@ -859,9 +859,8 @@ pub struct ResponderConfig<'a> {
     pub base_difficulty: Difficulty,
     /// Joins currently in flight, for `Difficulty::adapted_for_load`.
     pub pending_joins: u32,
-    /// Wall clock in whole seconds, for the transport session, which is specified in seconds.
-    pub now_secs: u64,
-    /// Wall clock in milliseconds: the prekey ring's consume record and the join witness.
+    /// Wall clock in milliseconds: the prekey ring's consume record, the session's skipped-key
+    /// expiry and the join witness.
     pub now_ms: u64,
     /// Set once the joiner's proof of work verifies, so its join slot is never the one ended for
     /// a newcomer (V210-92, `node::joinslots`).
@@ -1004,7 +1003,7 @@ where
                 let message = crate::pairwise::message::Message::from_wire(&sealed)?;
                 // An empty plaintext is the whole payload; what matters is that
                 // decrypting it steps the ratchet and yields a sending chain.
-                let _ = outcome.session.decrypt(&message, cfg.now_secs)?;
+                let _ = outcome.session.decrypt(&message, cfg.now_ms)?;
             }
             let _ = send.finish();
         }

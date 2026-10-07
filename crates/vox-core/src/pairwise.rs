@@ -62,5 +62,5 @@ pub use header::{RatchetHeader, PQXDH_INIT_DOMAIN, RATCHET_MSG_DOMAIN};
 pub use init_message::InitialMessage;
 pub use message::{Message, OtpReuseTracker};
 pub use pqxdh::ResponderPrekeys;
-pub use ratchet::{MAX_CACHE, MAX_SKIP, SKIP_EXPIRY_SECS};
+pub use ratchet::{MAX_CACHE, MAX_SKIP, SKIP_EXPIRY_MS};
 pub use session::Session;

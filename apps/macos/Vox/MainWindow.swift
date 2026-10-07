@@ -551,6 +551,12 @@ private struct Inspector: View {
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
                     .accessibilityIdentifier("member-\(member.name)")
+                // What this node's keyring grants it (K-14), once it is in the keyring.
+                if member.trust != .none {
+                    Text(Capability.words(member.drive)).eyebrow().secondaryText()
+                        .padding(.leading, 18)
+                        .accessibilityIdentifier("member-capability-\(member.name)")
+                }
             }
             Divider().padding(.vertical, 8)
             FamilyLan(model: model, room: room)

@@ -50,8 +50,12 @@ pub const MAX_RETAINED_ORIGINS: usize = 256;
 
 /// At-rest version of an [`OriginKeyStore`] state blob. Version 3 keeps each generation's
 /// consent-order stamp — value **and** the counter's order id ([`crate::node::consent_order`],
-/// V210-49). It is the only version this build reads: 1 and 2 were an earlier release's (#423).
-const ORIGIN_STATE_VERSION: u64 = 3;
+/// V210-49); version 4 holds its creation time in milliseconds. 1 and 2 were an earlier
+/// release's (#423) and are not read.
+const ORIGIN_STATE_VERSION: u64 = 4;
+
+/// The origin store's version 3, its creation times in seconds: still read.
+const ORIGIN_STATE_VERSION_SECONDS: u64 = 3;
 
 /// A retained origin record for one `(channel_id, epoch, chain_id)` generation:
 /// the iteration-0 chain key, the composite Sender-Key signing public key, the
@@ -68,7 +72,7 @@ struct OriginRecord {
     author_id: Digest32,
     origin_key: ChainKey,
     signing_pubkey: [u8; crate::group::wire::SENDER_KEY_SIGNING_PUB_LEN],
-    /// Wall-clock (Unix seconds) the generation was created — the TTL anchor.
+    /// Wall-clock (milliseconds since the Unix epoch) the generation was created — the TTL anchor.
     created_at: u64,
     /// The generation's place in this profile's consent order (V210-45), drawn when it was
     /// minted, with the id of the counter that drew it (V210-49). `None` for a generation
@@ -201,10 +205,13 @@ impl OriginKeyStore {
         if d.array()? != 2 {
             return Err(Error::MalformedBundle("origin store state arity"));
         }
-        // The one encoding this build reads (#423: versions 1 and 2 were an earlier release's).
-        if d.uint()? != ORIGIN_STATE_VERSION {
-            return Err(Error::MalformedBundle("origin store state version"));
-        }
+        // The encodings this build reads (#423: versions 1 and 2 were an earlier release's). Version
+        // 3 held `created_at` in seconds: read as milliseconds, never in the wrong unit.
+        let seconds = match d.uint()? {
+            ORIGIN_STATE_VERSION => false,
+            ORIGIN_STATE_VERSION_SECONDS => true,
+            _ => return Err(Error::MalformedBundle("origin store state version")),
+        };
         let arity = 9;
         let n = d.array()?;
         if n > MAX_RETAINED_ORIGINS {
@@ -234,6 +241,11 @@ impl OriginKeyStore {
                 .try_into()
                 .map_err(|_| Error::MalformedBundle("origin record signing_pubkey"))?;
             let created_at = d.uint()?;
+            let created_at = if seconds {
+                created_at.saturating_mul(1_000)
+            } else {
+                created_at
+            };
             let mint_seq = {
                 let seq = d.uint()?;
                 let order = d.bytes()?;
@@ -292,7 +304,7 @@ impl OriginKeyStore {
     }
 
     /// The oldest generation `author` minted for `(channel_id, epoch)` that was created at or
-    /// after `cutoff` (Unix seconds); `None` when every retained one is older. What a bounded
+    /// after `cutoff` (milliseconds since the Unix epoch); `None` when every retained one is older. What a bounded
     /// hold (PRD-001 R14) keeps from.
     #[must_use]
     pub fn oldest_created_since(
@@ -400,7 +412,8 @@ impl OriginKeyStore {
         )
     }
 
-    /// Drop every retained origin created strictly before `cutoff` (Unix seconds)
+    /// Drop every retained origin created strictly before `cutoff` (milliseconds since the Unix
+    /// epoch)
     /// — the ADR-010/M8 channel-TTL enforcement seam. After pruning, those
     /// generations can no longer be released as history (the keys are zeroized on
     /// drop), which is exactly the retention bound M8 enforces.

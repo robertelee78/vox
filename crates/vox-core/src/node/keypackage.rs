@@ -113,9 +113,9 @@ impl KeyPackage {
     ///
     /// # Errors
     /// If the message does not parse or does not decrypt under `session`.
-    pub fn open(&self, session: &mut Session, now_secs: u64) -> Result<Skdm> {
+    pub fn open(&self, session: &mut Session, now_ms: u64) -> Result<Skdm> {
         let message = Message::from_wire(&self.sealed)?;
-        Skdm::open_from(session, &message, now_secs)
+        Skdm::open_from(session, &message, now_ms)
     }
 
     /// Try to open this package with `ring`, **persisting nothing** — the question "could this
@@ -167,7 +167,7 @@ impl KeyPackage {
             &mut reuse,
             ctx.floor,
         )?;
-        self.open(&mut session, now_ms / 1_000)
+        self.open(&mut session, now_ms)
     }
 
     /// The framed entry payload.

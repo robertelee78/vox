@@ -4046,6 +4046,8 @@ pub async fn join(
     link: &str,
     passphrase_file: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
+    // An address that will not parse is refused before anything is asked, with what is wrong.
+    crate::tunnel_cli::readable(link)?;
     let mut client = attach(paths).await?;
     // A room this node holds open, and has not left, is not joined again: its address is taken
     // as where the room's host is now, and the host is dialled there (V210-167). No passphrase is read for it: none
@@ -4363,7 +4365,7 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
         Ok(Frame::Ok) => {
             println!(
                 "vox: {} keeps messages {}",
-                short(&channel_id),
+                which,
                 match ttl {
                     0 => "forever".to_owned(),
                     t => format!("for {}", vox_core::node::retention::describe(t)),
@@ -4389,13 +4391,13 @@ pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), 
                 println!(
                     "vox: you follow the room's retention for {} again: this node keeps its \
                      messages {}",
-                    short(&channel_id),
+                    which,
                     say(own)
                 );
             } else {
                 println!(
                     "vox: set your own retention for {}: this node keeps its messages {}",
-                    short(&channel_id),
+                    which,
                     say(own)
                 );
             }

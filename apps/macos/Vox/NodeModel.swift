@@ -60,6 +60,8 @@ final class NodeModel: ObservableObject {
         let id: String
         let name: String
         let trust: Trust
+        /// Whether this node's keyring entry for it grants drive as well as read (K-14).
+        let drive: Bool
     }
 
     let node: String
@@ -348,12 +350,23 @@ final class NodeModel: ObservableObject {
 
     // ---- the keyring (M-16) ----------------------------------------------------------------
 
-    /// Trust `fingerprint` as `alias`. Whether it was done.
-    func trust(_ fingerprint: String, as alias: String) async -> Bool {
+    /// Trust `fingerprint` as `alias`, granting read, and drive as well when `drive` (K-14,
+    /// K-16). Whether it was done.
+    func trust(_ fingerprint: String, as alias: String, drive: Bool) async -> Bool {
         let fp = fingerprint.filter { !$0.isWhitespace && $0 != "-" && $0 != "·" }.lowercased()
         return await keyringChange { [client] pass in
-            try await client.trustAdd(fingerprint: fp, name: alias, identityPassphrase: pass)
-            return "Trusting \(fp.prefix(12)) as \(alias)."
+            try await client.trustAdd(fingerprint: fp, name: alias, drive: drive,
+                                      identityPassphrase: pass)
+            return "Trusting \(fp.prefix(12)) as \(alias), \(Capability.words(drive))."
+        }
+    }
+
+    /// Give `node` drive as well as read, or (`drive` false) read only (K-14).
+    func setCapability(_ node: TrustedNode, drive: Bool) async -> Bool {
+        await keyringChange { [client] pass in
+            try await client.setCapability(fingerprint: node.fingerprint, drive: drive,
+                                           identityPassphrase: pass)
+            return "\(node.name) now has \(Capability.words(drive))."
         }
     }
 
@@ -716,14 +729,14 @@ final class NodeModel: ObservableObject {
     private func memberRows(_ room: String) async throws -> [MemberRow] {
         let roster = try await client.roster(room: room)
         let consents = try await client.consents(room: room)
-        let keyring = Set(trusted.map(\.fingerprint))
+        let keyring = Dictionary(trusted.map { ($0.fingerprint, $0.drive) }) { $1 }
         let back = Set(consents.inbound)
         return roster.filter { $0.fingerprint != me }.map { m in
-            let trust: Trust = keyring.contains(m.fingerprint)
+            let trust: Trust = keyring[m.fingerprint] != nil
                 ? (back.contains(m.fingerprint) ? .mutual : .oneWay) : .none
             return MemberRow(id: m.fingerprint,
                              name: m.name.isEmpty ? String(m.fingerprint.prefix(12)) : m.name,
-                             trust: trust)
+                             trust: trust, drive: keyring[m.fingerprint] ?? false)
         }
     }
 

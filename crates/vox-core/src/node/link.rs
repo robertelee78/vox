@@ -355,7 +355,9 @@ impl InviteLink {
             }
         }
         if members.iter().any(|m| !anchors.iter().any(|a| a.id == *m)) {
-            return Err(Error::MalformedLink("member names no entry"));
+            return Err(Error::MalformedLink(
+                "a member it marks (m=) has no address in it (a=, b=)",
+            ));
         }
         Ok(Self {
             channel_id,
@@ -486,7 +488,9 @@ impl InviteLink {
             ));
         }
         if members.iter().any(|m| !anchors.iter().any(|a| a.id == *m)) {
-            return Err(Error::MalformedLink("member names no entry"));
+            return Err(Error::MalformedLink(
+                "a member it marks (m=) has no address in it (a=, b=)",
+            ));
         }
         Ok(Self {
             channel_id,

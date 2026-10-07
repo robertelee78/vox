@@ -781,6 +781,19 @@ impl Shares {
         }
     }
 
+    /// Where this node's file share `tag` in `room` is served from, with its size and SHA-256:
+    /// what a file driven into one of this node's own Sessions is taken from, since no tunnel runs
+    /// from a node to itself. `None` for no such share, or a folder.
+    pub async fn served_file(&self, room: &Digest32, tag: &str) -> Option<(PathBuf, u64, String)> {
+        self.active
+            .lock()
+            .await
+            .get(tag)
+            .map(|a| &a.record)
+            .filter(|r| r.room == *room && r.files.is_empty())
+            .map(|r| (r.served.clone(), r.size, r.sha256.clone()))
+    }
+
     /// This node's shares in `room`, in tag order.
     pub async fn list(&self, room: &Digest32) -> Vec<ShareRow> {
         self.active

@@ -6319,6 +6319,9 @@ impl Node {
         {
             return false;
         }
+        // Untold until a publish round says it holds this node's records (`PublishDone`): a
+        // circuit it refuses as a stranger meanwhile is asked again then.
+        net.board_untold(id);
         let (net, tx, dials) = (
             Arc::clone(net),
             self.net_tx.clone(),
@@ -6335,6 +6338,7 @@ impl Node {
                     let _ = tx.send(NetEvent::AnchorConnected { conn }).await;
                 }
                 Err(e) => {
+                    net.board_told(&id);
                     let _ = tx
                         .send(NetEvent::ReachFailed {
                             peer: id,
@@ -7157,6 +7161,18 @@ impl Node {
                     )
                     .await;
                 }
+                // A node with no room to publish (one still joining, say) has nothing to wait for:
+                // the board knows it as far as it ever will before the join (`PublishDone` tells
+                // a board otherwise).
+                if !self
+                    .channels
+                    .keys()
+                    .any(|room| !self.withdrawn.contains_key(room))
+                {
+                    if let Some(net) = self.net.as_ref() {
+                        net.board_told(&peer);
+                    }
+                }
                 // An anchor that was away when a room was left or ended is told now, and is given
                 // each room's admin roster this node signs (V030-14).
                 let mut puts: Vec<Vec<u8>> = Vec::new();
@@ -7357,6 +7373,15 @@ impl Node {
                 holds_room,
             } => {
                 self.publishing.remove(&(channel_id, board));
+                // **The board knows this node now**: a circuit it refused as a stranger before its
+                // records were taken (a board that had restarted keeps none, in memory) is asked
+                // again. Reported as it was, `vox forward` said its cleanly stopped anchor had
+                // "authenticator invalid".
+                if holds_room {
+                    if let Some(net) = self.net.as_ref() {
+                        net.board_told(&board);
+                    }
+                }
                 // **Our own record refused as stale, from a fresh process: publish again just past
                 // the next second.** A board takes a replacement only with a later `timestamp`, in
                 // whole seconds (the one-change-a-second anti-spam bound, `nat::store`), and a
@@ -11730,7 +11755,7 @@ impl Node {
             (packages, ctx)
         };
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
+        let now = now_ms.get();
         for package in packages {
             let Ok(init) = package.initial_message() else {
                 continue;
@@ -12585,7 +12610,7 @@ impl Node {
             // sending chain (M17.6). Decrypt it so the ratchet steps, then stop: there
             // is nothing behind it and nothing is granted by it.
             PairwiseFrame::Open { channel_id, sealed } => {
-                let now = self.now();
+                let now = self.now_ms().get();
                 if let Some(session) = self.sessions.get_mut(&(channel_id, peer)) {
                     if let Ok(message) = crate::pairwise::message::Message::from_wire(&sealed) {
                         let _ = session.decrypt(&message, now);
@@ -12603,7 +12628,7 @@ impl Node {
                 match second {
                     Some(PairwiseFrame::Skdm { channel_id, sealed }) => (channel_id, sealed),
                     Some(PairwiseFrame::Open { channel_id, sealed }) => {
-                        let now = self.now();
+                        let now = self.now_ms().get();
                         if let Some(session) = self.sessions.get_mut(&(channel_id, peer)) {
                             if let Ok(message) =
                                 crate::pairwise::message::Message::from_wire(&sealed)
@@ -12622,7 +12647,7 @@ impl Node {
             }
         };
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
+        let now = now_ms.get();
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
             // No session with this peer for that channel: nothing can open it. Said, so the
             // sender sends it again once a join or key exchange establishes one.
