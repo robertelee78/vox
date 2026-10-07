@@ -303,7 +303,8 @@ fn check(p: &TmuxPane) -> Result<(), String> {
     })?;
     if now.trim().parse::<u32>().ok() != Some(p.pane_pid) {
         return Err(format!(
-            "tmux pane {} is not the pane the session ran in (its process changed): tmux              restarted, or the pane was reused; the session is known again after its next turn",
+            "tmux pane {} is not the pane the session ran in (its process changed): tmux \
+             restarted, or the pane was reused; the session is known again after its next turn",
             p.pane
         ));
     }
@@ -316,7 +317,8 @@ fn check(p: &TmuxPane) -> Result<(), String> {
         .is_some_and(|q| q.start == p.process_start);
     if !alive {
         return Err(format!(
-            "the session is no longer running in tmux pane {}: its process ({} {}) has ended,              so nothing was typed",
+            "the session is no longer running in tmux pane {}: its process ({} {}) has ended, \
+             so nothing was typed",
             p.pane, p.process_name, p.process
         ));
     }
