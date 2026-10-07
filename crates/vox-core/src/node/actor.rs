@@ -6288,6 +6288,15 @@ impl Node {
             self.anchor_ids.insert(anchor.id);
             self.dial_anchor(&net, anchor.id, anchor.endpoints.direct_candidates());
         }
+        // **A member the room's address names is reached as a member** (V030-51): left out of the
+        // anchors' dial above, it must still be dialled, through the member ladder, which asks a
+        // relay when it must. Nothing else dials it after a restart: a room with an anchor is
+        // left to its board (`reach_members_of`), and the board need not name it.
+        for member in members {
+            if member != net.local_id() && net.manager().existing(&member).is_none() {
+                let _ = self.reach_member(channel_id, member, false).await;
+            }
+        }
     }
 
     /// Put a channel's genesis and this node's records on every anchor this node is
