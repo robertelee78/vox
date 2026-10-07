@@ -45,11 +45,15 @@ pub struct SessionRow {
 
 /// The Sessions a room's log holds, oldest opening first: each `session` entry opens one, and a
 /// later `session-end` from the same node and session ends it. A `session` from a session already
-/// open names it again and changes nothing else.
+/// open names it again and changes nothing else. A Session's name is the newest its node gave, on
+/// those records or on any message the session posted while open (ADR-029 SE-3, MD-1), so a
+/// renamed session's label changes with its next message.
 #[must_use]
 pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
     let types = [SESSION.to_owned(), SESSION_END.to_owned()];
     let mut rows: Vec<SessionRow> = Vec::new();
+    // Per row: the position that last named it, and the one that ended it.
+    let mut spans: Vec<(u32, Option<u32>)> = Vec::new();
     let mut positions = detail.structured.positions(&types, &[]);
     positions.sort_unstable();
     for i in positions {
@@ -72,26 +76,31 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
             (SESSION, Some(k)) if rows[k].open => {
                 if env.at.session_name.is_some() {
                     rows[k].name.clone_from(&env.at.session_name);
+                    spans[k].0 = i;
                 }
             }
-            (SESSION, _) => rows.push(SessionRow {
-                node: r.author,
-                id: env.from.clone(),
-                name: env.at.session_name.clone(),
-                harness: env.data["session"]["harness"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                open: true,
-                opened_millis: r.created_millis,
-                ended_millis: None,
-                opening: r.entry_hash,
-                ended: None,
-                // This node reads inside it when it holds the node's drive key, or is the node
-                // (ADR-029 SC-2, #543).
-                can_drive: detail.drive_from.contains(&r.author),
-            }),
+            (SESSION, _) => {
+                spans.push((i, None));
+                rows.push(SessionRow {
+                    node: r.author,
+                    id: env.from.clone(),
+                    name: env.at.session_name.clone(),
+                    harness: env.data["session"]["harness"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    open: true,
+                    opened_millis: r.created_millis,
+                    ended_millis: None,
+                    opening: r.entry_hash,
+                    ended: None,
+                    // This node reads inside it when it holds the node's drive key, or is the node
+                    // (ADR-029 SC-2, #543).
+                    can_drive: detail.drive_from.contains(&r.author),
+                });
+            }
             (SESSION_END, Some(k)) if rows[k].open => {
+                spans[k].1 = Some(i);
                 rows[k].open = false;
                 rows[k].ended_millis = Some(r.created_millis);
                 rows[k].ended = Some(r.entry_hash);
@@ -99,7 +108,58 @@ pub fn fold(detail: &ChannelDetail) -> Vec<SessionRow> {
             _ => {}
         }
     }
+    renamed(detail, &mut rows, &spans);
     rows
+}
+
+/// Each row's name from the newest message its session posted after the record that last named
+/// it, and before its end: one pass from the room's newest entry back, parsing only entries that
+/// carry a session name, by a node with a Session, until every row has its newest name.
+fn renamed(detail: &ChannelDetail, rows: &mut [SessionRow], spans: &[(u32, Option<u32>)]) {
+    let Some(floor) = spans.iter().map(|s| s.0).min() else {
+        return;
+    };
+    let mut left: Vec<bool> = vec![true; rows.len()];
+    let mut pending = rows.len();
+    let newest = (0..detail.timeline.len()).rev();
+    for (i, r) in newest.zip(detail.timeline.iter().rev()) {
+        let Ok(i) = u32::try_from(i) else { continue };
+        if pending == 0 || i <= floor {
+            break;
+        }
+        // A row whose naming record is at or past this entry is settled already.
+        for (k, l) in left.iter_mut().enumerate() {
+            if *l && spans[k].0 >= i {
+                *l = false;
+                pending -= 1;
+            }
+        }
+        if pending == 0 {
+            break;
+        }
+        if r.owed || !r.text.contains("session_name") || !rows.iter().any(|s| s.node == r.author) {
+            continue;
+        }
+        let Ok(env) = Envelope::parse(&r.text) else {
+            continue;
+        };
+        let (Some(name), false) = (env.at.session_name, env.from.trim().is_empty()) else {
+            continue;
+        };
+        for (k, s) in rows.iter_mut().enumerate() {
+            let (named, end) = spans[k];
+            if left[k]
+                && s.node == r.author
+                && s.id == env.from
+                && i > named
+                && end.is_none_or(|e| i < e)
+            {
+                s.name = Some(name.clone());
+                left[k] = false;
+                pending -= 1;
+            }
+        }
+    }
 }
 
 /// The Sessions of the open room `room`, as `handle`'s node holds it; empty for a room not open.

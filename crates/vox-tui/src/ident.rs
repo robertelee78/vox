@@ -339,15 +339,31 @@ pub fn recipient(t: &str) -> Option<Digest32> {
 }
 
 /// Who a message is addressed to, as the reader knows them (V210-161): each recipient by
-/// [`name_in`], the reader itself as `you`. A recipient that is not a fingerprint (an older
-/// build addressed sessions by name) is shown as written, on one line.
+/// [`name_in`], the reader itself as `you`, and one session of a node as the node's name and the
+/// session's short id (ADR-029 TA-1, SE-3). A recipient that is not a fingerprint (an older build
+/// addressed sessions by name) is shown as written, on one line.
 #[must_use]
 pub fn recipients(to: &[String], me: Option<&Digest32>, trusted: &[(Digest32, String)]) -> String {
     to.iter()
-        .map(|t| match recipient(t) {
-            Some(fp) if Some(&fp) == me => YOU.to_owned(),
-            Some(fp) => name_in(trusted, &fp),
-            None => vox_agentcomms::envelope::shown(t, vox_agentcomms::envelope::SHOWN_NAME),
+        .map(|t| {
+            let (node, session) = vox_agentcomms::envelope::addressee(t);
+            let node = match recipient(node) {
+                Some(fp) if Some(&fp) == me => YOU.to_owned(),
+                Some(fp) => name_in(trusted, &fp),
+                None => {
+                    return vox_agentcomms::envelope::shown(t, vox_agentcomms::envelope::SHOWN_NAME)
+                }
+            };
+            match session {
+                Some(s) => format!(
+                    "{node}/{}",
+                    vox_agentcomms::envelope::shown(
+                        &s.chars().take(8).collect::<String>(),
+                        vox_agentcomms::envelope::SHOWN_NAME
+                    )
+                ),
+                None => node,
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")

@@ -504,14 +504,20 @@ const PULLING_DIR: &str = "pulling";
 pub const PULLED_TO: &str = "  \u{21b3} pulled to ";
 
 /// The entry of a share this node pulls by itself (F-3): a file announcement addressed to this
-/// node or to no one, from another member. `None` for any other row.
+/// node, to one of its sessions (ADR-029 TA-1), or to no one, from another member. `None` for any
+/// other row.
 fn pulled_share(r: &vox_core::node::api::MessageRow, me: Option<&Digest32>) -> Option<String> {
     let e = vox_agentcomms::envelope::Envelope::parse(&r.text).ok()?;
     let me = me?;
     let fp = b32_encode(me);
-    (e.kind == crate::room_cli::FILE && r.author != *me && (e.to.is_empty() || e.to.contains(&fp)))
-        .then(|| e.data["name"].as_str().map(str::to_owned))
-        .flatten()
+    (e.kind == crate::room_cli::FILE
+        && r.author != *me
+        && (e.to.is_empty()
+            || e.to
+                .iter()
+                .any(|t| vox_agentcomms::envelope::addressee(t).0 == fp)))
+    .then(|| e.data["name"].as_str().map(str::to_owned))
+    .flatten()
 }
 
 /// **An agent is given the local path of the copy** (ADR-028 F-6): the line after a share this
@@ -756,7 +762,7 @@ struct Reader {
 
 impl Reader {
     /// Whether `e` is for this session, by any field that can say so:
-    /// - `to` names this node;
+    /// - `to` names this node, or this one session of it (ADR-029 TA-1, TA-4);
     /// - it is a handoff reserved for it: `data.to_fp` is this node and `data.to_session` is this
     ///   session, or names none (any session of this node may take it);
     /// - its `re` answers an entry this session posted (a `result`, `accept` or `decline`
@@ -771,7 +777,7 @@ impl Reader {
         let to_me = self
             .me_fp
             .as_deref()
-            .is_some_and(|fp| e.is_addressed_to(fp));
+            .is_some_and(|fp| e.is_addressed_to_session(fp, &self.session));
         let handoff_to_me = e.kind == vox_agentcomms::claim::HANDOFF
             && self.me.is_some()
             && data("to_fp").and_then(vox_agentcomms::claim::from_b32) == self.me
@@ -792,6 +798,24 @@ impl Reader {
 fn chatter_kind(row: &vox_core::node::api::MessageRow, reader: &Reader) -> Option<String> {
     let e = vox_agentcomms::envelope::Envelope::parse(&row.text).ok()?;
     (CHATTER.contains(&e.kind.as_str()) && !reader.addressed_by(&e)).then_some(e.kind)
+}
+
+/// Whether `row` is addressed to another session of this node and not to this one (ADR-029
+/// TA-2): this session counts it as the room's traffic and never shows it in full.
+fn for_a_sibling(row: &vox_core::node::api::MessageRow, reader: &Reader) -> bool {
+    reader.me_fp.as_deref().is_some_and(|fp| {
+        vox_agentcomms::envelope::Envelope::parse(&row.text)
+            .is_ok_and(|e| e.is_for_a_sibling_of(fp, &reader.session))
+    })
+}
+
+/// The one line that stands for the messages to this node's other sessions a room's drain
+/// counted (ADR-029 TA-2).
+fn siblings_line(room_label: &str, n: usize) -> String {
+    format!(
+        "{n} message(s) to another session of this node, not shown; `vox room read {room_label}` \
+         has them\n"
+    )
 }
 
 /// The one line that stands for the chatter a room's drain counted, by kind (V030-18).
@@ -927,13 +951,25 @@ fn render(
         out.push_str(n);
         out.push('\n');
     }
-    let counts_any = rows.iter().any(|r| chatter_kind(r, reader).is_some());
+    let counts_any = rows
+        .iter()
+        .any(|r| chatter_kind(r, reader).is_some() || for_a_sibling(r, reader));
     let overhead = out.len() + NOTE_RESERVE + if counts_any { CHATTER_RESERVE } else { 0 };
     let mut body = String::new();
     // `shown` is how many of `rows`, from the start, this carries; `full` how many in full.
     let (mut shown, mut full) = (0usize, 0usize);
     let mut chatter = std::collections::BTreeMap::<String, usize>::new();
+    let mut siblings = 0usize;
     for r in rows {
+        if for_a_sibling(r, reader) {
+            if !budget.first && overhead + body.len() > budget.bytes {
+                break;
+            }
+            siblings += 1;
+            shown += 1;
+            budget.first = false;
+            continue;
+        }
         if let Some(kind) = chatter_kind(r, reader) {
             // Counted, it costs only its share of the one line, reserved above.
             if !budget.first && overhead + body.len() > budget.bytes {
@@ -971,6 +1007,9 @@ fn render(
     out.push_str(&body);
     if !chatter.is_empty() {
         out.push_str(&chatter_line(room_label, &chatter));
+    }
+    if siblings > 0 {
+        out.push_str(&siblings_line(room_label, siblings));
     }
     let rest = rows.len() - shown + beyond;
     if rest > 0 {
