@@ -95,8 +95,9 @@ pub struct SharedEndpoint {
     /// Set once [`SharedEndpoint::close`] has run.
     closed: tokio::sync::watch::Sender<bool>,
     /// Each node's connections, by node, so a node gone without detaching can still have its own
-    /// closed ([`SharedEndpoint::evict`]). Closed ones are dropped as new ones are added.
-    by_node: Mutex<std::collections::HashMap<Digest32, Vec<Connection>>>,
+    /// closed ([`SharedEndpoint::evict`]). Closed ones are dropped as new ones are added, and each
+    /// is taken out when its [`VoxConnection`] is dropped (see [`Tracked`]).
+    by_node: Arc<ByNode>,
     /// The socket's own drop count, `(epoch, drops)`, as the overflow sampler last read it
     /// (ADR-024 RO-1); `None` until it has, and for a socket with no such count. Each direct
     /// connection reports it to its peer ([`crate::transport::overflow`]).
@@ -863,7 +864,7 @@ impl SharedEndpoint {
             registry: Mutex::new(std::collections::HashMap::new()),
             limiter: identity::AskLimiter::standard(),
             closed: tokio::sync::watch::channel(false).0,
-            by_node: Mutex::new(std::collections::HashMap::new()),
+            by_node: Arc::new(Mutex::new(std::collections::HashMap::new())),
             overflow,
         }))
     }
@@ -926,11 +927,16 @@ impl SharedEndpoint {
     }
 
     /// File `conn` under the node `local`, for [`Self::evict`].
-    fn track(&self, local: Digest32, conn: &Connection) {
+    fn track(&self, local: Digest32, conn: &Connection) -> Tracked {
         let mut by = lock(&self.by_node);
         let list = by.entry(local).or_default();
         list.retain(|c| c.close_reason().is_none());
         list.push(conn.clone());
+        Tracked {
+            by_node: Arc::downgrade(&self.by_node),
+            local,
+            id: conn.stable_id(),
+        }
     }
 
     /// **Evict a node** that went without detaching — its actor panicked (ADR-026 L-6): take it
@@ -1033,10 +1039,11 @@ impl SharedEndpoint {
                 "the node asked for went away during the identity exchange".to_owned(),
             ));
         };
-        self.track(local.id(), &connection);
+        let local_id = local.id();
         let overflow = (!via_circuit).then(|| self.overflow.clone());
         let mut conn =
             finish_connection(connection, local, &proven, now_ms, via_circuit, overflow)?;
+        conn.tracked = Some(self.track(local_id, &conn.connection));
         conn.circuit_origin = circuit_origin.filter(|_| via_circuit);
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
@@ -1283,7 +1290,6 @@ impl VoxEndpoint {
         let proven = identity::dial(&connection, &*signer, self.local.instance(), expected_peer)
             .await
             .map_err(|f| f.into_error(addr, &expected_peer))?;
-        self.shared.track(self.local_id, &connection);
         let mut conn = finish_connection(
             connection,
             Arc::clone(&self.local),
@@ -1292,6 +1298,7 @@ impl VoxEndpoint {
             via_circuit,
             (!via_circuit).then(|| self.shared.overflow.clone()),
         )?;
+        conn.tracked = Some(self.shared.track(self.local_id, &conn.connection));
         conn.carrier = carrier.filter(|_| via_circuit);
         Ok(conn)
     }
@@ -1519,6 +1526,7 @@ fn finish_connection(
         carrier: None,
         tunnels: Arc::new(Mutex::new(0)),
         dropped: None,
+        tracked: None,
     })
 }
 
@@ -1586,6 +1594,8 @@ pub struct VoxConnection {
     tunnels: Arc<Mutex<u32>>,
     /// Told when this is dropped (see [`Self::tell_when_dropped`]).
     dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Its entry in the endpoint's per-node list, taken out when this is dropped.
+    tracked: Option<Tracked>,
 }
 
 impl Drop for VoxConnection {
@@ -1594,6 +1604,41 @@ impl Drop for VoxConnection {
         // an otherwise-unused connection open for ever. Flows still bound keep it
         // reading until they end.
         self.router.release_owner();
+        // So does the endpoint's per-node list. **A connection nobody holds any more must close**,
+        // as quinn closes one when its last handle goes: kept alive by the list, a connection one
+        // end dropped unfiled (a dial that lost a race) stayed open at the other end, which filed
+        // it and opened streams nobody here would ever serve — the two ends then held different
+        // connections to each other (`a_displaced_relay_is_let_go`).
+        if let Some(t) = self.tracked.take() {
+            t.release();
+        }
+    }
+}
+
+/// The endpoint's per-node connection list ([`SharedEndpoint::evict`]'s).
+type ByNode = Mutex<std::collections::HashMap<Digest32, Vec<Connection>>>;
+
+/// A connection's place in [`ByNode`]: dropped with the connection, so the list never keeps a
+/// connection open that nothing else holds.
+#[derive(Debug)]
+struct Tracked {
+    by_node: std::sync::Weak<ByNode>,
+    local: Digest32,
+    id: usize,
+}
+
+impl Tracked {
+    fn release(self) {
+        let Some(by_node) = self.by_node.upgrade() else {
+            return;
+        };
+        let mut by = lock(&by_node);
+        if let Some(list) = by.get_mut(&self.local) {
+            list.retain(|c| c.stable_id() != self.id);
+            if list.is_empty() {
+                by.remove(&self.local);
+            }
+        }
     }
 }
 
