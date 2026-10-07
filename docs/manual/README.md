@@ -34,7 +34,8 @@ data roots. It does not claim that every task, network or agent integration has 
 - [Rooms and messages](rooms.md): create, share the room link, join, read, reply, retention, leave, end.
 - [Reach a shared service](services.md): SSH or another TCP or UDP service, by its `.vox` address.
 - [Send and receive files](files.md): live availability, verified bytes, folders, safe destinations.
-- [Agent communications](agents.md): an agent's own node, hooks, delivery timing, claims and handoffs.
+- [Agent communications](agents.md): `vox setup`, an agent's own node, hooks, delivery timing, claims and handoffs.
+- [Sessions](sessions.md): follow an agent's session, and drive it, from the CLI or the TUI.
 - [Commands and local state](reference.md): help, node selection, paths and automation.
 
 ## Find a symptom
