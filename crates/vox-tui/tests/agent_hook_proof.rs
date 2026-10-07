@@ -42,6 +42,14 @@
 //! `PRODUCT (staging):` with what it said. Every `vox` here runs with the harness's own session variables
 //! removed, so the hook under test never picks up the session of the agent running the proof.
 //!
+//! **A Session per interactive harness session** (ADR-029 SE-1–SE-5,
+//! [`a_session_opens_with_its_hook_and_ends_only_on_a_real_end`]): the hook of a session a person
+//! is at (Claude Code's `CLAUDE_CODE_ENTRYPOINT=cli`) opens one Session in its room, named by the
+//! harness's own session id; a headless run's (`sdk-cli`) opens none; a sub-agent's event, which
+//! carries its parent's session id, opens no other. `Stop` and a `SessionEnd` whose reason is
+//! `resume` leave it open; a real `SessionEnd` ends it, set apart under "ended", and what was said
+//! in the room stays readable. Mutant: end the Session on `Stop`.
+//!
 //! Not proved here, and stated rather than implied: that a harness actually
 //! *shows* the model what it injects. The probe could not confirm it because this
 //! machine's API key returned 401, so no model ran. That is the rehearsal's job.
@@ -73,6 +81,7 @@ const HARNESS_VARS: &[&str] = &[
     "VOX_LISTEN",
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_ENTRYPOINT",
     "OPENCODE_SERVER_URL",
 ];
 
@@ -1761,7 +1770,16 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         "read-me three",
         "read-me four",
     ];
-    let rows: Vec<String> = shown_rows(&alice).into_iter().map(|(_, t)| t).collect();
+    // A Session's opening and end are rows of their own (ADR-029): a read record is never one.
+    let is_session = |t: &String| {
+        vox_agentcomms::envelope::Envelope::parse(t).is_ok_and(|e| {
+            e.kind == vox_agentcomms::envelope::SESSION
+                || e.kind == vox_agentcomms::envelope::SESSION_END
+        })
+    };
+    let every: Vec<String> = shown_rows(&alice).into_iter().map(|(_, t)| t).collect();
+    let session_rows = every.iter().filter(|t| is_session(t)).count() as u64;
+    let rows: Vec<String> = every.into_iter().filter(|t| !is_session(t)).collect();
     assert_eq!(
         rows, all,
         "PRODUCT: alice's `vox room read` must show her four posts and nothing else; it shows \
@@ -1779,8 +1797,9 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
         .and_then(|v| v["position"]["entries"].as_u64());
     assert_eq!(
         counted,
-        Some(4),
-        "PRODUCT: alice's room must count her four posts, never a read record; \
+        Some(4 + session_rows),
+        "PRODUCT: alice's room must count her four posts (and the {session_rows} Session \
+         record(s) its sessions' turns made), never a read record; \
          `vox room board --json` said {board}"
     );
     let out = drain_as(&alice, "watcher");
@@ -1796,5 +1815,161 @@ fn a_drain_posts_read_records_that_nobody_is_shown() {
     assert!(
         out.trim().is_empty(),
         "PRODUCT: a read record must never reach an agent's turn; alice's next turn was told: {out}"
+    );
+}
+
+/// [`hook`], with `env` set for that one `vox`: what a harness puts in its hook's environment.
+fn hook_env(
+    data: &Path,
+    cfg: &Path,
+    args: &[&str],
+    stdin: &str,
+    env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut child = vox(data, cfg)
+        .args(args)
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("APPARATUS: cannot start vox");
+    child
+        .stdin
+        .as_mut()
+        .expect("APPARATUS: vox has no stdin")
+        .write_all(stdin.as_bytes())
+        .expect("APPARATUS: cannot write vox's stdin");
+    let out = child
+        .wait_with_output()
+        .expect("APPARATUS: cannot wait for vox");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A Claude Code hook payload for `event` in `session`, with `extra` JSON fields.
+fn claude_event(session: &str, event: &str, extra: &str) -> String {
+    format!(
+        r#"{{"session_id":"{session}","hook_event_name":"{event}","cwd":"/tmp","transcript_path":"/tmp/t.jsonl"{extra}}}"#
+    )
+}
+
+#[test]
+#[ignore = "production Argon2id at setup + drives the real binary; CI runs it in release"]
+fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
+    watchdog::arm();
+    let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let daemon = Daemon::start(tmp.path());
+    let (data, cfg) = (daemon.data.clone(), daemon.cfg.clone());
+    let room: String = daemon.room_key.chars().take(12).collect();
+    let person = [("CLAUDE_CODE_ENTRYPOINT", "cli")];
+    let headless = [("CLAUDE_CODE_ENTRYPOINT", "sdk-cli")];
+    let hook_args = [
+        "agent",
+        "hook",
+        "--node",
+        "default",
+        "--room",
+        room.as_str(),
+    ];
+    let at = "3f0c25bf-aaaa-4bbb-8ccc-dddddddddddd";
+    let run = |payload: String, env: &[(&str, &str)]| {
+        let (ok, out, err) = hook_env(&data, &cfg, &hook_args, &payload, env);
+        assert!(ok, "PRODUCT: the hook must exit 0; it said {out}{err}");
+    };
+    let sessions = || -> Vec<serde_json::Value> {
+        let (ok, out, err) = hook(&data, &cfg, &["room", "sessions", &room, "--json"], "");
+        assert!(ok, "PRODUCT: `vox room sessions --json` failed: {err}");
+        out.lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let of = |rows: &[serde_json::Value], id: &str| -> Vec<serde_json::Value> {
+        rows.iter().filter(|r| r["id"] == id).cloned().collect()
+    };
+
+    // (1) A session a person is at: its first turn opens its Session.
+    run(
+        claude_event(at, "UserPromptSubmit", r#","prompt":"hi""#),
+        &person,
+    );
+    // (2) A headless run in the same room: no Session.
+    run(
+        claude_event("headless-run-0001", "UserPromptSubmit", r#","prompt":"hi""#),
+        &headless,
+    );
+    // (3) A sub-agent's event, under its parent's session id: no other Session.
+    run(
+        claude_event(
+            at,
+            "SubagentStop",
+            r#","agent_id":"agent-7","agent_type":"Explore""#,
+        ),
+        &person,
+    );
+    let after_open = sessions();
+    // (4) The turn ends: `Stop`. (5) A resume: `SessionEnd` whose reason is `resume`.
+    run(claude_event(at, "Stop", ""), &person);
+    run(
+        claude_event(at, "SessionEnd", r#","reason":"resume""#),
+        &person,
+    );
+    let after_resume = sessions();
+    // What the room said stays readable after its end.
+    daemon.post("SAID-WHILE-OPEN the codec is ported");
+    // (6) The real end.
+    run(
+        claude_event(at, "SessionEnd", r#","reason":"prompt_input_exit""#),
+        &person,
+    );
+    let after_end = sessions();
+    let (_, listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
+    let (_, read, _) = hook(&data, &cfg, &["room", "read", &room], "");
+    eprintln!(
+        "[proof] after opening: {after_open:?}\n[proof] after Stop and a resume: \
+         {after_resume:?}\n[proof] after the real end: {after_end:?}\n[proof] `vox room \
+         sessions`:\n{listed}\n[proof] `vox room read`:\n{read}"
+    );
+
+    let opened = of(&after_open, at);
+    assert!(
+        opened.len() == 1 && opened[0]["open"] == true && opened[0]["harness"] == "claude",
+        "PRODUCT: a session a person is at must open exactly one Session, named by the harness's \
+         own id, even after a sub-agent's event under that id; the room lists {after_open:?}"
+    );
+    assert!(
+        after_open.len() == 1,
+        "PRODUCT: a headless run must open no Session; the room lists {after_open:?}"
+    );
+    assert!(
+        of(&after_resume, at).len() == 1 && of(&after_resume, at)[0]["open"] == true,
+        "PRODUCT: `Stop` and a `SessionEnd` whose reason is `resume` must leave the Session open; \
+         the room lists {after_resume:?}"
+    );
+    let ended = of(&after_end, at);
+    assert!(
+        ended.len() == 1 && ended[0]["open"] == false && ended[0]["ended_millis"].is_u64(),
+        "PRODUCT: a real `SessionEnd` must end the Session, and keep it; the room lists \
+         {after_end:?}"
+    );
+    let short = &at[..8];
+    let ended_part = listed.split("ended:").nth(1).unwrap_or_default();
+    assert!(
+        ended_part.contains(short)
+            && !listed
+                .split("ended:")
+                .next()
+                .unwrap_or_default()
+                .contains(short),
+        "PRODUCT: an ended Session must be set apart under \"ended\", by its short id; `vox room \
+         sessions` printed:\n{listed}"
+    );
+    assert!(
+        read.contains("SAID-WHILE-OPEN the codec is ported"),
+        "PRODUCT: what was said in the room must stay readable after the Session ends; `vox room \
+         read` printed:\n{read}"
     );
 }

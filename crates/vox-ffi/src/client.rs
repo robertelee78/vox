@@ -328,6 +328,31 @@ pub struct FileShare {
     pub fetched: u64,
 }
 
+/// One Session of a room (ADR-029): a harness session working in it, as its node says.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSession {
+    /// The fingerprint of the node whose session it is, base32.
+    pub node_fingerprint: String,
+    /// This node's name for that node (ADR-028 K-3); empty for none.
+    pub node_alias: String,
+    /// The harness's own session id, as its node claims it.
+    pub session_id: String,
+    /// The first 8 characters of the id.
+    pub short_id: String,
+    /// The session's current name, as its node last gave it.
+    pub name: Option<String>,
+    /// How every client labels it (SE-3): `codex@device-2 · gso-cap · 3f0c25bf`.
+    pub label: String,
+    /// Open, or ended (SE-5).
+    pub open: bool,
+    /// When it opened, milliseconds since the Unix epoch.
+    pub opened_at_ms: u64,
+    /// When it ended, if it has.
+    pub ended_at_ms: Option<u64>,
+    /// Whether this node may drive it (ADR-029 §3).
+    pub can_drive: bool,
+}
+
 /// A share this node pulled by itself and verified (ADR-028 F-3, F-4).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PulledFile {
@@ -1402,6 +1427,47 @@ impl VoxClient {
                     .next()
                     .map(file_share)
                     .ok_or_else(|| failed("the vox daemon did not say what it shares")),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
+    /// The Sessions of `room`, oldest opening first (ADR-029; `vox room sessions`).
+    ///
+    /// # Errors
+    /// A malformed id, or the node's refusal (a room not open).
+    pub async fn sessions(&self, room: String) -> Result<Vec<FfiSession>, VoxError> {
+        let channel_id = digest(&room, "room id")?;
+        on_held!(self, |c| {
+            let names = names(c).await?;
+            match ask(c, &Request::Sessions { channel_id }).await? {
+                Frame::Sessions { sessions } => Ok(sessions
+                    .into_iter()
+                    .map(|s| {
+                        let alias = names.get(&s.node).cloned().unwrap_or_default();
+                        let shown = if alias.is_empty() {
+                            b32_encode(&s.node).chars().take(12).collect()
+                        } else {
+                            alias.clone()
+                        };
+                        FfiSession {
+                            node_fingerprint: b32_encode(&s.node),
+                            node_alias: alias,
+                            short_id: s.id.chars().take(8).collect(),
+                            label: vox_agentcomms::envelope::session_label(
+                                &shown,
+                                s.name.as_deref(),
+                                &s.id,
+                            ),
+                            session_id: s.id,
+                            name: s.name,
+                            open: s.open,
+                            opened_at_ms: s.opened_millis,
+                            ended_at_ms: s.ended_millis,
+                            can_drive: s.can_drive,
+                        }
+                    })
+                    .collect()),
                 other => Err(unexpected(&other)),
             }
         })

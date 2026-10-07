@@ -61,4 +61,6 @@ pub mod ops;
 pub mod version;
 
 pub use claim::{ClaimOp, Fold, Outcome, Owner, Posted, State};
-pub use envelope::{Context, Envelope, ParseError, BYE, HELLO, PING, PONG, SAY};
+pub use envelope::{
+    session_label, Context, Envelope, ParseError, BYE, HELLO, PING, PONG, SAY, SESSION, SESSION_END,
+};

@@ -1287,9 +1287,16 @@ pub async fn read(
         }
         let take = if take == 0 { usize::MAX } else { take };
         // An address in a message, readable in this node's names (ADR-028 S-1a); `--json` keeps
-        // the canonical form a program copies (S-1).
+        // the canonical form a program copies (S-1). A Session's opening and end are not the
+        // room's conversation (ADR-029 CL-2): `vox room sessions` lists Sessions; `--json` keeps
+        // every row for programs.
         let names = names_in(&mut client).await;
-        for r in rows.iter().filter(|r| r.late || !only_late).take(take) {
+        for r in rows
+            .iter()
+            .filter(|r| r.late || !only_late)
+            .filter(|r| !crate::agent_hook::is_session_record(r))
+            .take(take)
+        {
             let _ = writeln!(out, "{}", names.readable_in(&plain_row(r)));
             // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
             if let Some(line) = pulled_by.get(&r.entry_hash).and_then(|w| pulled_by_line(w)) {
@@ -1446,6 +1453,67 @@ pub async fn roster(paths: &Paths, room: &str) -> Result<(), AppError> {
         Ok(other) => Err(crate::client::unexpected(&other)),
         Err(e) => Err(AppError::Usage(e.to_string())),
     }
+}
+
+/// `vox room sessions` — the room's Sessions (ADR-029 SE-3, SE-5): open ones first, then the
+/// ended ones apart, each labelled as every client labels it
+/// ([`vox_agentcomms::envelope::session_label`]): this node's name for the session's node, the
+/// session's name and its short id. With `--json`, one object per Session.
+///
+/// # Errors
+/// If the node cannot be reached, or the room is unknown or not open.
+pub async fn sessions(paths: &Paths, room: &str, json: bool) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    let channel_id = room_of(&mut client, room).await?;
+    crate::ident::load_names(&mut client).await;
+    let rows = match client.request(&Request::Sessions { channel_id }).await {
+        Ok(Frame::Sessions { sessions }) => sessions,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let label = |s: &vox_core::node::sessions::SessionRow| {
+        vox_agentcomms::envelope::session_label(
+            &crate::ident::name_of(&s.node),
+            s.name.as_deref(),
+            &s.id,
+        )
+    };
+    if json {
+        for s in &rows {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "node": id(&s.node),
+                    "id": s.id,
+                    "name": s.name,
+                    "harness": s.harness,
+                    "label": label(s),
+                    "open": s.open,
+                    "opened_millis": s.opened_millis,
+                    "ended_millis": s.ended_millis,
+                    "can_drive": s.can_drive,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("(no Sessions in this room)");
+        return Ok(());
+    }
+    for s in rows.iter().filter(|s| s.open) {
+        println!("open   {}", label(s));
+    }
+    // **An ended Session is set apart** (SE-5), kept as long as the room keeps messages.
+    let ended: Vec<_> = rows.iter().filter(|s| !s.open).collect();
+    if !ended.is_empty() {
+        println!("ended:");
+        for s in ended {
+            println!("ended  {}", label(s));
+        }
+    }
+    Ok(())
 }
 
 /// `vox room tail` — every row after a cursor, then every row as it lands, **with no
