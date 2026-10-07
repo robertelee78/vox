@@ -31,14 +31,7 @@
 use serde_json::{json, Map, Value};
 use vox_core::node::content::MAX_TEXT_LEN;
 
-/// The format's version.
-pub const VERSION: u64 = 1;
-
-/// The longest one-line summary, in characters, before it is cut with "…".
-pub const SUMMARY_CHARS: usize = 160;
-
-/// Room left in each part for `"part":[i,n]` and the separators around it.
-const PART_ROOM: usize = 48;
+pub use vox_agentcomms::activity::{one_line, VERSION};
 
 /// One event of Claude Code's, as `vox agent hook` read it from stdin.
 #[derive(Debug, Clone)]
@@ -325,75 +318,10 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
 
-/// `text` on one line: runs of whitespace (newlines included) become one space, and past
-/// [`SUMMARY_CHARS`] it is cut with "…".
-#[must_use]
-pub fn one_line(text: &str) -> String {
-    let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if folded.chars().count() <= SUMMARY_CHARS {
-        return folded;
-    }
-    let mut cut: String = folded.chars().take(SUMMARY_CHARS - 1).collect();
-    cut.push('…');
-    cut
-}
-
-/// How many bytes `c` takes inside a JSON string, as serde_json writes it.
-fn escaped_len(c: char) -> usize {
-    match c {
-        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
-        c if (c as u32) < 0x20 => 6,
-        c => c.len_utf8(),
-    }
-}
-
-/// `m` as entries of at most [`MAX_TEXT_LEN`] bytes each: one when it fits, else parts that cut
-/// the string field `big` and carry `part: [i, n]`.
+/// `m` as entries of at most the log's text limit each (the shared format's `split`).
 #[must_use]
 pub fn split(m: Map<String, Value>, big: &str) -> Vec<String> {
-    let whole = Value::Object(m.clone()).to_string();
-    if whole.len() <= MAX_TEXT_LEN {
-        return vec![whole];
-    }
-    let Some(text) = m.get(big).and_then(Value::as_str).map(str::to_owned) else {
-        // Nothing to cut: the fields other than `big` are bounded (a summary is one line), so
-        // this is an entry no harness event produces. Said, not dropped.
-        let mut short = m;
-        short.insert(
-            "summary".into(),
-            json!("(this entry was too large to keep)"),
-        );
-        return vec![Value::Object(short).to_string()];
-    };
-    let mut empty = m.clone();
-    empty.insert(big.into(), json!(""));
-    let budget = MAX_TEXT_LEN
-        .saturating_sub(Value::Object(empty).to_string().len() + PART_ROOM)
-        .max(1024);
-    let mut chunks: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut used = 0;
-    for c in text.chars() {
-        let n = escaped_len(c);
-        if used + n > budget && !cur.is_empty() {
-            chunks.push(std::mem::take(&mut cur));
-            used = 0;
-        }
-        cur.push(c);
-        used += n;
-    }
-    chunks.push(cur);
-    let n = chunks.len();
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(|(i, chunk)| {
-            let mut p = m.clone();
-            p.insert(big.into(), json!(chunk));
-            p.insert("part".into(), json!([i + 1, n]));
-            Value::Object(p).to_string()
-        })
-        .collect()
+    vox_agentcomms::activity::split(m, big, MAX_TEXT_LEN)
 }
 
 // ---- the hook's side ---------------------------------------------------------------------------

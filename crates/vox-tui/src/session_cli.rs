@@ -36,76 +36,12 @@ pub trait Names {
     fn alias_b32(&self, by: &str) -> String;
 }
 
-/// A body read back, with what assembling it needs.
-struct Body {
-    author: Digest32,
-    v: serde_json::Map<String, Value>,
-}
-
-impl Body {
-    fn str(&self, k: &str) -> &str {
-        self.v.get(k).and_then(Value::as_str).unwrap_or_default()
-    }
-    fn kind(&self) -> &str {
-        self.str("kind")
-    }
-    fn reference(&self) -> &str {
-        self.str("ref")
-    }
-    fn part(&self) -> Option<(u64, u64)> {
-        let p = self.v.get("part")?.as_array()?;
-        Some((p.first()?.as_u64()?, p.get(1)?.as_u64()?))
-    }
-}
-
-/// The field a kind's split cuts (session_mirror's `split`).
-fn big_field(kind: &str) -> &'static str {
-    match kind {
-        "tool" | "approval" => "input",
-        "tool-done" => "output",
-        _ => "text",
-    }
-}
+type Body = vox_agentcomms::activity::Entry<Digest32>;
 
 /// `rows`, one Session's entries in this node's order, joined: the parts of a split entry become
 /// one entry, whole.
 fn joined(rows: &[SessionRow]) -> Vec<Body> {
-    let mut out: Vec<Body> = Vec::new();
-    // A split entry waiting for its later parts: (author, kind, ref) → its index in `out`.
-    let mut open: BTreeMap<(Digest32, String, String), usize> = BTreeMap::new();
-    for r in rows {
-        let Ok(Value::Object(v)) = serde_json::from_str::<Value>(&r.body) else {
-            continue;
-        };
-        let b = Body {
-            author: r.author,
-            v,
-        };
-        let Some((i, n)) = b.part() else {
-            out.push(b);
-            continue;
-        };
-        let key = (b.author, b.kind().to_owned(), b.reference().to_owned());
-        let field = big_field(b.kind());
-        match open.get(&key) {
-            Some(&at) if i > 1 => {
-                let more = b.str(field).to_owned();
-                if let Some(Value::String(s)) = out[at].v.get_mut(field) {
-                    s.push_str(&more);
-                }
-                if i >= n {
-                    open.remove(&key);
-                }
-            }
-            _ => {
-                if n > 1 {
-                    open.insert(key, out.len());
-                }
-                out.push(b);
-            }
-        }
-    }
-    out
+    vox_agentcomms::activity::join(rows.iter().map(|r| (r.author, r.body.as_str())))
 }
 
 fn one_line(s: &str) -> String {
@@ -169,7 +105,7 @@ fn outcome_words(resolved: &Body, names: &dyn Names) -> String {
         "allowed" => "approved".to_owned(),
         "denied" => "rejected".to_owned(),
         "answered" => resolved
-            .v
+            .fields
             .get("answers")
             .map(answers_line)
             .unwrap_or_default(),
@@ -210,7 +146,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
     }
     let mut out = Vec::new();
     for b in &bodies {
-        let seq = b.v.get("seq").and_then(Value::as_u64).unwrap_or(0);
+        let seq = b.fields.get("seq").and_then(Value::as_u64).unwrap_or(0);
         let prefix = match b.str("agent") {
             "" => String::new(),
             t => format!("[{t}] "),
@@ -228,9 +164,9 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     None => format!("{head} …"),
                     Some(d) => {
                         details.push(("output".into(), d.str("output").to_owned()));
-                        let ok = d.v.get("ok").and_then(Value::as_bool) != Some(false);
+                        let ok = d.fields.get("ok").and_then(Value::as_bool) != Some(false);
                         let interrupted =
-                            d.v.get("interrupted").and_then(Value::as_bool) == Some(true);
+                            d.fields.get("interrupted").and_then(Value::as_bool) == Some(true);
                         if interrupted {
                             format!("{head} ✗ interrupted")
                         } else if ok {
@@ -251,7 +187,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             "approval" => {
                 details.push(("input".into(), b.str("input").to_owned()));
                 let head = format!("{}: {}", b.str("tool"), b.str("summary"));
-                if b.v.get("answerable").and_then(Value::as_bool) == Some(false) {
+                if b.fields.get("answerable").and_then(Value::as_bool) == Some(false) {
                     format!("{head} — not answerable from Vox: {}", b.str("why"))
                 } else {
                     match resolved.get(b.reference()).map(|&i| &bodies[i]) {
@@ -261,11 +197,12 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 }
             }
             "question" => {
-                let qs: Vec<Value> =
-                    b.v.get("questions")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
+                let qs: Vec<Value> = b
+                    .fields
+                    .get("questions")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 for q in &qs {
                     let mut d = q
                         .get("text")
@@ -301,7 +238,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     .collect::<Vec<_>>()
                     .join(" | ");
                 let head = format!("question: {head}");
-                if b.v.get("answerable").and_then(Value::as_bool) == Some(false) {
+                if b.fields.get("answerable").and_then(Value::as_bool) == Some(false) {
                     format!("{head} — not answerable from Vox: {}", b.str("why"))
                 } else {
                     match resolved.get(b.reference()).map(|&i| &bodies[i]) {
@@ -314,7 +251,7 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 let what = format!(
                     "{} ({})",
                     b.str("name"),
-                    size(b.v.get("size").and_then(Value::as_u64).unwrap_or(0))
+                    size(b.fields.get("size").and_then(Value::as_u64).unwrap_or(0))
                 );
                 if b.str("dir") == "in" {
                     format!("file to {label}: {what}")
@@ -341,8 +278,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     _ => continue,
                 }
             }
+            // A line Vox itself says in the Session.
+            "notice" => format!("Vox: {}", one_line(b.str("text"))),
             "drive-result" => {
-                if b.v.get("ok").and_then(Value::as_bool) == Some(true) {
+                if b.fields.get("ok").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
                 format!("not delivered to {label}: {}", b.str("why"))
