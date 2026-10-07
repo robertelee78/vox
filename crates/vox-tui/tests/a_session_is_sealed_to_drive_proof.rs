@@ -18,7 +18,9 @@
 //!    ROOM SESSION --file PATH --note …`: alice's node answers that it is pulling it, the file lands
 //!    in alice's files directory byte for byte, and the Session shows it come in, as bob reads it.
 //!    Carol, read only, sending a file the same way is refused by alice's node, and nothing of
-//!    hers lands there.
+//!    hers lands there. That the session is then told the path is not asserted here: alice's
+//!    session has no terminal in this proof (its hook runs with no tmux of anyone's), so the told
+//!    line is proved in the tmux proof's own scratch server (a_claude_session_is_mirrored…, arm 11).
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
 //!    Bob's node opens none of the entries alice's Session writes afterwards, while it still holds
 //!    the ones it read before and still reads alice's messages to the room; and its
@@ -91,6 +93,28 @@ const HARNESS_VARS: &[&str] = &[
     "OPENCODE_SERVER_URL",
 ];
 
+/// `vox` with none of the environment of whatever runs this proof that could reach a real harness
+/// or terminal: every `TMUX*` (a staged hook inheriting the operator's tmux binds its session to
+/// the operator's own pane, and a drive is typed there), `CLAUDE*`, `CODEX*` and `OPENCODE*`
+/// variable, and [`HARNESS_VARS`]. Walked from the environment itself, not a fixed list, so a
+/// variable a harness adds later is cleared too.
+fn vox_cmd() -> Command {
+    let mut cmd = Command::new(VOX);
+    for (k, _) in std::env::vars_os() {
+        let name = k.to_string_lossy();
+        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        {
+            cmd.env_remove(&k);
+        }
+    }
+    for v in HARNESS_VARS {
+        cmd.env_remove(v);
+    }
+    cmd
+}
+
 /// A child killed and reaped by its own PID when dropped — never by pattern.
 struct Proc(Child);
 
@@ -120,10 +144,7 @@ impl Member {
         stdin: Option<&str>,
         env: &[(&str, &str)],
     ) -> (bool, String, String) {
-        let mut cmd = Command::new(VOX);
-        for v in HARNESS_VARS {
-            cmd.env_remove(v);
-        }
+        let mut cmd = vox_cmd();
         // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
         // K-13): the passphrase file's first line, typed at the prompt.
         if typed::is_keyring_change(args) {
@@ -253,7 +274,7 @@ fn member(tmp: &Path, name: &'static str, anchor: &str) -> Member {
     );
     let err = std::fs::File::create(tmp.join(format!("{name}.daemon.err")))
         .expect("APPARATUS: create a log file");
-    let child = Command::new(VOX)
+    let child = vox_cmd()
         .args(["daemon", "--listen", "127.0.0.1:0", "--anchor", anchor])
         .arg("--passphrase-file")
         .arg(&m.pass)
@@ -282,7 +303,7 @@ fn anchor(tmp: &Path) -> (Proc, String) {
     std::fs::create_dir_all(dir.join("cfg")).expect("APPARATUS: create a staging dir");
     let out = tmp.join("anchor.out");
     let p = Proc(
-        Command::new(VOX)
+        vox_cmd()
             .args(["node", "--listen", "127.0.0.1:0"])
             .env("VOX_DATA_DIR", &dir)
             .env("VOX_CONFIG_DIR", dir.join("cfg"))
