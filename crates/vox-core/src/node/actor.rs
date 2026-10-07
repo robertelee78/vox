@@ -7647,6 +7647,7 @@ impl Node {
                             rendered: o.rendered as u64,
                         });
                     }
+                    self.say_session_news(&channel_id).await;
                 }
                 if let Some(sent) = heard {
                     self.finish_leave_if_heard(channel_id, sent).await;
@@ -14832,7 +14833,24 @@ impl Node {
         };
         self.note_local_append(channel_id);
         self.tend_drive_keys_in(channel_id, &holders).await;
+        self.say_session_news(channel_id).await;
         Outcome::Appended(entry)
+    }
+
+    /// Say [`NodeEvent::SessionEntry`] once for each session of the room `channel_id` with an
+    /// entry placed since it was last said (ADR-029 CL-2): its entries are not room messages, so no
+    /// other event tells a client of them.
+    async fn say_session_news(&self, channel_id: &Digest32) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let news = shared.lock().await.take_session_news();
+        for session_id in news {
+            let _ = self.event_tx.send(NodeEvent::SessionEntry {
+                channel_id: *channel_id,
+                session_id,
+            });
+        }
     }
 
     /// [`Self::tend_drive_keys_in`] in every open room.

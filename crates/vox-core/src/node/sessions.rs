@@ -387,6 +387,26 @@ pub fn resolve<'a>(
     }
 }
 
+/// The id of the one open Session of the node `node` that `typed` names, for a message to address
+/// (ADR-029 TA-1, TA-5): its newest opening for each id, so a session that ended and came back is
+/// the one that is open. Named as [`resolve`] names one; one that has ended is refused.
+///
+/// # Errors
+/// The refusal, as a sentence: "… has ended", "no Session in this room is named …".
+pub fn addressable(
+    rows: &[SessionRow],
+    node: &Digest32,
+    typed: &str,
+    label: impl Fn(&SessionRow) -> String,
+) -> Result<String, String> {
+    let mut mine: Vec<SessionRow> = Vec::new();
+    for r in rows.iter().filter(|r| r.node == *node) {
+        mine.retain(|m| m.id != r.id);
+        mine.push(r.clone());
+    }
+    resolve(&mine, typed, false, label).map(|s| s.id.clone())
+}
+
 /// `text` with its session's current name in `at.session_name` (ADR-029 MD-1, MD-2): when it is an
 /// envelope from a session registered on this node (`from` names it) and carries no name yet, the
 /// name that session's harness last gave, from its registration. Anything else is `text` as it is.

@@ -5437,8 +5437,18 @@ impl ChannelState {
                 cache_id: Some(id),
             },
         );
+        self.drive.news.push(row.session_id.clone());
         self.drive.sessions.push(row);
         Ok(entry_hash)
+    }
+
+    /// The sessions with an entry placed in this room since the last call, each once: what the
+    /// node says as [`crate::node::api::NodeEvent::SessionEntry`] (ADR-029 CL-2).
+    pub fn take_session_news(&mut self) -> Vec<String> {
+        let mut news = std::mem::take(&mut self.drive.news);
+        news.sort_unstable();
+        news.dedup();
+        news
     }
 
     /// Change this node's drive key if a member it was released to is no longer in `holders`
@@ -6055,6 +6065,7 @@ impl ChannelState {
         for (row, cache_id) in std::mem::take(&mut self.drive.pending) {
             self.retention
                 .rendered(&row.entry_hash, row.created_millis / 1_000, cache_id);
+            self.drive.news.push(row.session_id.clone());
             self.drive.sessions.push(row);
         }
         for (row, cache_id) in std::mem::take(&mut self.pending_reads) {

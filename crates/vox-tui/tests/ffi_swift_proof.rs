@@ -50,12 +50,21 @@
 //!    is fetched from a local server, so this test needs `--features vox-tui/test-knobs`
 //!    (`VOX_TEST_CARD_ALLOW`) and refuses as CANNOT MEASURE without it.
 //!
+//! 8. **A Session, as the app reads it** (ADR-029 SC-1, CL-1, CL-2, #554): a session of the app's
+//!    own node, staged through its real hook with Claude Code's own hook JSON (a prompt, a Bash
+//!    call and its result, a second call that asks permission and is left waiting), is listed by
+//!    `sessions` with one request waiting on the app (`pending` 1); `sessionRead` gives its
+//!    entries line for line as `vox room session --json` prints them on the app's own data root,
+//!    the request open with its reference; and the listener heard of the entries and of the
+//!    room's Sessions changing.
+//!
 //! Mutant for (3): `services` drops the address (`SharedService.address` empty): red PRODUCT.
 //! Mutant for (3): the FFI's commands carry the readable address: red PRODUCT.
 //! Mutant for (6): `servicePreview` says no warning: red PRODUCT.
 //! Mutants for (7), one per claim, each red PRODUCT: `RoomMessage.card` always nil;
 //! `RoomMessage.image` always nil; `renameRoom` answers without asking the node; `pulledBy`
 //! always empty.
+//! Mutant for (8): `sessionRead` gives each entry's kind for its line: red PRODUCT.
 //!
 //! **The iOS app's embedded node** (`VoxNode`, ADR-026 S-4's exception): the Swift program runs
 //! the node in its own process, against a real `vox daemon`. What must hold:
@@ -941,7 +950,160 @@ fn a_swift_app_acts_as_a_node_through_the_daemon() {
          list`: {peer_rooms}"
     );
 
-    // (8) The app closes; the daemon lets the node go.
+    // (8) A Session of the app's own node, through its hook as Claude Code runs it. The hook is
+    // given Claude Code's environment for a session a person is at, and none of this process's.
+    let session = "f1e2d3c4-0000-4aaa-8bbb-5e55fe550554";
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).expect("APPARATUS: make the session's working directory");
+    let transcript = work.join(format!("{session}.jsonl"));
+    std::fs::write(&transcript, "").expect("APPARATUS: make the session's transcript");
+    let hook = |event: &str, extra: serde_json::Value| -> Child {
+        let mut payload = serde_json::json!({
+            "session_id": session,
+            "transcript_path": transcript.display().to_string(),
+            "cwd": work.display().to_string(),
+            "permission_mode": "default",
+            "hook_event_name": event,
+        });
+        if let (Some(m), Some(e)) = (payload.as_object_mut(), extra.as_object()) {
+            m.extend(e.clone());
+        }
+        let mut c = mine.command(&["agent", "hook", "--node", "alice", "--room", &joined[7..]]);
+        for v in [
+            "CLAUDE_CODE_MESSAGING_SOCKET",
+            "CLAUDE_CODE_MESSAGING_TOKEN",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CODEX_THREAD_ID",
+            "VOX_SESSION",
+            "VOX_HARNESS",
+            "VOX_OPENCODE_WAKE_SOCKET",
+            "VOX_OPENCODE_WAKE_TOKEN",
+        ] {
+            c.env_remove(v);
+        }
+        let mut child = c
+            .env("CLAUDE_CODE_ENTRYPOINT", "cli")
+            .current_dir(&work)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("APPARATUS: could not start `vox agent hook`");
+        let _ = child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes());
+        child
+    };
+    let finished = |event: &str, extra: serde_json::Value| {
+        let mut child = hook(event, extra);
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    assert!(
+                        st.success(),
+                        "PRODUCT (staging): the {event} hook exited {st}"
+                    );
+                    return;
+                }
+                Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(50)),
+                _ => {
+                    let _ = child.kill();
+                    panic!("PRODUCT (staging): the {event} hook did not finish within 30 s");
+                }
+            }
+        }
+    };
+    finished(
+        "UserPromptSubmit",
+        serde_json::json!({ "prompt": "List the files, then make e1." }),
+    );
+    let ls = serde_json::json!({ "command": "ls", "description": "List the files" });
+    finished(
+        "PreToolUse",
+        serde_json::json!({ "tool_name": "Bash", "tool_input": ls, "tool_use_id": "toolu_L" }),
+    );
+    finished(
+        "PostToolUse",
+        serde_json::json!({
+            "tool_name": "Bash", "tool_input": ls, "tool_use_id": "toolu_L",
+            "tool_response": { "stdout": "a.txt\nb.txt\n", "stderr": "", "interrupted": false },
+        }),
+    );
+    let touch = serde_json::json!({ "command": "touch e1", "description": "Make e1" });
+    finished(
+        "PreToolUse",
+        serde_json::json!({ "tool_name": "Bash", "tool_input": touch, "tool_use_id": "toolu_T" }),
+    );
+    // Asks permission, and waits for an answer it is never given: the request stays open.
+    let asking = Proc(hook(
+        "PermissionRequest",
+        serde_json::json!({ "tool_name": "Bash", "tool_input": touch, "permission_suggestions": [] }),
+    ));
+    writeln!(to_app, "{session}").unwrap();
+    let session_row = expect(&from_app, &seen, "SESSION ");
+    let note = expect(&from_app, &seen, "NOTE ");
+    let heard = expect(&from_app, &seen, "HEARD ");
+    let said = seen.lock().unwrap().clone();
+    let from = said
+        .iter()
+        .rposition(|l| l.starts_with("SESSION "))
+        .unwrap_or(0);
+    let app_lines: Vec<String> = said[from..]
+        .iter()
+        .filter_map(|l| l.strip_prefix("ENTRY ").map(str::to_owned))
+        .collect();
+    let requests: Vec<&String> = said[from..]
+        .iter()
+        .filter(|l| l.starts_with("REQUEST "))
+        .collect();
+    let cli_lines: Vec<String> = mine
+        .run(&["room", "session", &joined[7..], session, "--json"], "")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .map(|v| v["line"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    eprintln!(
+        "{session_row}\nthe app's lines: {app_lines:?}\n`vox room session --json`: {cli_lines:?}\n\
+         {requests:?}\n{note}\n{heard}"
+    );
+    assert!(
+        session_row.ends_with("PENDING 1 DRIVE true"),
+        "PRODUCT: `sessions` must list the app's own Session with the one request that waits on \
+         it: {session_row}"
+    );
+    assert!(
+        cli_lines.len() >= 3 && app_lines == cli_lines,
+        "PRODUCT: `sessionRead` must give the Session's entries line for line as `vox room \
+         session` prints them (ADR-029 CL-1); the app read {app_lines:?}, the CLI printed \
+         {cli_lines:?}"
+    );
+    assert!(
+        requests.len() == 1 && requests[0].ends_with(" OPEN true") && requests[0].len() > 18,
+        "PRODUCT: `sessionRead` must give the waiting request with its reference, open: \
+         {requests:?}"
+    );
+    // The session ends as Claude Code ends one, so it no longer holds the node (ADR-026): the
+    // request is let go of first, as Claude Code's own exit would.
+    drop(asking);
+    finished(
+        "SessionEnd",
+        serde_json::json!({ "reason": "prompt_input_exit" }),
+    );
+    let counts: Vec<u64> = heard[6..]
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    assert!(
+        counts.len() == 2 && counts[0] >= 1 && counts[1] >= 1,
+        "PRODUCT: the listener must hear of the Session's entries and of the room's Sessions \
+         changing: {heard}"
+    );
+
+    // (9) The app closes; the daemon lets the node go.
     writeln!(to_app).unwrap();
     expect(&from_app, &seen, "CLOSED");
     let until = Instant::now() + TIMEOUT;
