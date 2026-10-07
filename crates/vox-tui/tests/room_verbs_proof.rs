@@ -573,10 +573,10 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
             "vox: about to set how long",
             &["\"team\""],
             "vox: ",
-            "keeps messages for"
+            "\"team\" keeps messages for 1 week"
         ),
         "PRODUCT: `vox room retention` must say what it is to do, naming the room, then what it \
-         did: {out:?}"
+         did, naming the room the same way: {out:?}"
     );
     let (ok, out, err) = vox(
         &data,
