@@ -120,6 +120,7 @@ private struct NodeFacts: View {
                         NSPasteboard.general.setString(service.canonical, forType: .string)
                     }
                     .help("by \(service.by)")
+                    .accessibilityLabel("Copy \(service.address), shared by \(service.by)")
                 }
             }
         }
@@ -144,7 +145,7 @@ private struct NodeFacts: View {
 
     @ViewBuilder
     private func section(_ title: String, @ViewBuilder _ rows: () -> some View) -> some View {
-        Text(title).font(Theme.eyebrow).secondaryText()
+        Text(title).eyebrow().secondaryText()
         rows()
     }
 }

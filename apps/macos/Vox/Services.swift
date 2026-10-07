@@ -47,12 +47,12 @@ struct ServicesView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("Services").font(Theme.heading)
+                Text("Services").heading()
                 if let did = model.did {
                     StateMark(kind: .plain, words: did).textSelection(.enabled)
                         .accessibilityIdentifier("services-did")
                 }
-                Text("SHARED WITH YOU").font(Theme.eyebrow).secondaryText()
+                Text("SHARED WITH YOU").eyebrow().secondaryText()
                 let theirs = rows.flatMap { r in r.shared.filter { $0.by != "you" }.map { (r, $0) } }
                 if theirs.isEmpty {
                     Text("Nothing is shared with this node in its open rooms.").secondaryText()
@@ -61,7 +61,7 @@ struct ServicesView: View {
                     SharedServiceBox(model: model, room: room.name, service: service)
                 }
                 Divider()
-                Text("YOUR SHARES").font(Theme.eyebrow).secondaryText()
+                Text("YOUR SHARES").eyebrow().secondaryText()
                 let mine = rows.flatMap { r in r.offered.map { (r, $0) } }
                 if mine.isEmpty { Text("This node shares nothing.").secondaryText() }
                 ForEach(mine, id: \.1.tag) { room, offered in
@@ -114,14 +114,15 @@ private struct SharedServiceBox: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
-            Text("by \(service.by) in \(room)  ·  \(service.kind)").font(Theme.eyebrow).secondaryText()
+            Text("by \(service.by) in \(room)  ·  \(service.kind)").eyebrow().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
                 HStack(alignment: .firstTextBaseline) {
-                    Text(command.what).font(Theme.eyebrow).secondaryText().frame(width: 56, alignment: .leading)
+                    Text(command.what).eyebrow().secondaryText().frame(width: 56, alignment: .leading)
                     Text(command.command.replacingOccurrences(of: service.canonical, with: service.address))
                         .font(Theme.mono).lineLimit(1).truncationMode(.middle)
                     Spacer()
                     Button("Copy") { model.copyCommand(command.command) }
+                        .accessibilityLabel("Copy the \(command.what) command for \(service.address)")
                         .accessibilityIdentifier("copy-\(command.what)-\(service.address)")
                 }
             }
@@ -132,7 +133,7 @@ private struct SharedServiceBox: View {
             }
         }
         .padding(10)
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
+        .cardOutline()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("service-box-\(service.address)")
     }
@@ -154,7 +155,7 @@ private struct ShareForm: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("SHARE A SERVICE").font(Theme.eyebrow).secondaryText()
+            Text("SHARE A SERVICE").eyebrow().secondaryText()
             if let listening {
                 ForEach(listening.services, id: \.line) { service in
                     Button {
@@ -164,8 +165,7 @@ private struct ShareForm: View {
                     }
                     .buttonStyle(.plain)
                     .padding(4)
-                    .background(picked?.line == service.line
-                                ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
+                    .selectionMark(picked?.line == service.line)
                     .accessibilityIdentifier("listening-\(service.port)")
                 }
                 Text(listening.mayBeMissing).secondaryText()

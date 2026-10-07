@@ -29,7 +29,7 @@ struct RootView: View {
                 ProgressView("Reaching the vox daemon…")
             case let .unreachable(said):
                 Text("Vox could not reach the vox daemon.")
-                    .font(Theme.heading)
+                    .heading()
                 Said(text: said)
                 if let why = model.loginItemSaid {
                     // The login item's daemon ended on a refusal no retry changes: said here,
@@ -78,7 +78,7 @@ private struct LoginItemQuestion: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Text("Keep Vox running while you're logged in?").font(Theme.heading)
+        Text("Keep Vox running while you're logged in?").heading()
         Text("Vox keeps your rooms reachable while you are logged in, even with the app closed.")
             .secondaryText()
             .accessibilityIdentifier("login-item-why")
@@ -102,7 +102,7 @@ private struct LoginItemApproval: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Text("Allow Vox in Login Items").font(Theme.heading)
+        Text("Allow Vox in Login Items").heading()
         Text("To keep running while you're logged in, Vox needs your approval in System Settings, "
             + "General, Login Items. Until then Vox runs while it is open.")
             .secondaryText()
@@ -125,7 +125,7 @@ private struct Chooser: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Text("Which node is this app?").font(Theme.heading)
+        Text("Which node is this app?").heading()
         Text(
             "Vox acts as one node on this Mac: everything you post, trust and share is that node's."
         )
@@ -155,7 +155,7 @@ private struct PassphraseForm: View {
     @State private var keepInKeychain = false
 
     var body: some View {
-        Text("Attach node \(node)").font(Theme.heading)
+        Text("Attach node \(node)").heading()
         Text("Type node \(node)'s identity passphrase.").secondaryText()
         SecureInput(holder: field) { submit() }
             .frame(width: 320)

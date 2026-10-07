@@ -25,7 +25,7 @@ struct KeyringView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text("Keyring").font(Theme.heading)
+                Text("Keyring").heading()
                 Text(model.keyring).font(Theme.mono).secondaryText()
                 if let did = model.keyringDid {
                     StateMark(kind: .plain, words: did)
@@ -48,10 +48,9 @@ struct KeyringView: View {
                 }
                 ForEach(model.trusted, id: \.fingerprint) { node in
                     KeyringRow(model: model, node: node) { removing = node }
-                        .background(model.keyringSelected == node.fingerprint
-                                    ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
-                        .contentShape(Rectangle())
-                        .onTapGesture { model.keyringSelected = node.fingerprint }
+                        .selectable(model.keyringSelected == node.fingerprint) {
+                            model.keyringSelected = node.fingerprint
+                        }
                 }
             }
             .padding(24)
@@ -75,7 +74,7 @@ struct KeyringView: View {
     /// done (E-5).
     private var addForm: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("ADD A NODE").font(Theme.eyebrow).secondaryText()
+            Text("ADD A NODE").eyebrow().secondaryText()
             TextField("Fingerprint (paste or type)", text: $fingerprint)
                 .font(Theme.mono)
                 .focused($adding)
@@ -223,7 +222,7 @@ private struct RemoveSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Untrust \(node.name)?").font(Theme.heading)
+            Text("Untrust \(node.name)?").heading()
             Text(Effects.untrusting(node.name))
                 .accessibilityIdentifier("keyring-remove-effect")
             HStack {

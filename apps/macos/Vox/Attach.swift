@@ -24,8 +24,8 @@ struct AttachSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Share \(file.url.lastPathComponent)").font(Theme.heading)
-            Text("TO").font(Theme.eyebrow).secondaryText()
+            Text("Share \(file.url.lastPathComponent)").heading()
+            Text("TO").eyebrow().secondaryText()
             if model.members.isEmpty {
                 Text("No one else is in this room yet.").secondaryText()
             }
@@ -35,6 +35,9 @@ struct AttachSheet: View {
                     TrustMark(name: member.name, trust: member.trust)
                 }
                 .accessibilityIdentifier("attach-to-\(member.name)")
+                .accessibilityLabel(to.contains(member.id)
+                    ? "\(member.name), \(member.trust.words), addressed"
+                    : "\(member.name), \(member.trust.words), not addressed")
             }
             Text(to.isEmpty ? "For the whole room." : "For the members ticked; the room sees it too.")
                 .secondaryText()

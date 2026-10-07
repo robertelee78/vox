@@ -31,7 +31,7 @@ struct ComposerAddress: View {
                 .accessibilityIdentifier("compose-urgent")
                 .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
         }
-        .font(Theme.eyebrow)
+        .eyebrow()
     }
 
     private var names: [String] { model.members.filter { to.contains($0.id) }.map(\.name) }

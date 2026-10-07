@@ -67,7 +67,7 @@ private struct Sidebar: View {
                     }
                 } header: {
                     Text("\(need.words) (\(rooms.count))")
-                        .font(Theme.eyebrow)
+                        .eyebrow()
                         .accessibilityIdentifier("group-\(need.words)")
                         .accessibilityLabel("\(need.words) (\(rooms.count))")
                 }
@@ -87,7 +87,7 @@ private struct Sidebar: View {
                         .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
-                Text("nodes on this Mac").font(Theme.eyebrow)
+                Text("nodes on this Mac").eyebrow()
             }
         }
         .listStyle(.sidebar)
@@ -102,7 +102,7 @@ private struct RoomRow: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
-                Text(room.words).font(Theme.eyebrow).secondaryText()
+                Text(room.words).eyebrow().secondaryText()
             }
         }
         .accessibilityElement(children: .ignore)
@@ -144,8 +144,7 @@ private struct RoomView: View {
                                 // (with or without a shape) let clicks through unanswered.
                                 Button { model.selectedService = service } label: {
                                     ServiceCard(service: service)
-                                        .background(selected
-                                                    ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
+                                        .selectionMark(selected)
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
@@ -172,10 +171,9 @@ private struct RoomView: View {
                                                    pulled: model.pulled[message.id]) { looking = $0 }
                                             .frame(maxWidth: .infinity, alignment: .leading)
                                             .padding(4)
-                                            .background(model.selectedMessage == message.id
-                                                        ? VoxTokens.Colors.textSecondary.opacity(0.15) : Color.clear)
-                                            .contentShape(Rectangle())
-                                            .onTapGesture { model.selectedMessage = message.id }
+                                            .selectable(model.selectedMessage == message.id) {
+                                                model.selectedMessage = message.id
+                                            }
                                             .reportsFrame(of: message.id)
                                             .id(message.id)
                                     }
@@ -323,10 +321,10 @@ private struct MessageRow: View {
             HStack(spacing: 6) {
                 Text(author).fontWeight(.bold)
                 if message.urgent { StateMark(kind: .attention, words: "urgent") }
-                if message.to.contains(me) { Text("to you").font(Theme.eyebrow) }
+                if message.to.contains(me) { Text("to you").eyebrow() }
                 if message.late {
                     // ADR-023: it took its place above messages already shown.
-                    Text("arrived late").font(Theme.eyebrow).secondaryText()
+                    Text("arrived late").eyebrow().secondaryText()
                         .accessibilityIdentifier("late-\(message.id)")
                 }
             }
@@ -342,7 +340,7 @@ private struct MessageRow: View {
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
-                    .font(Theme.eyebrow).secondaryText()
+                    .eyebrow().secondaryText()
                     .accessibilityIdentifier("read-by-\(message.id)")
                     .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
             }
@@ -380,7 +378,7 @@ private struct FileCard: View {
                     .accessibilityIdentifier("thumb-\(file.name)")
             } else {
                 Image(systemName: file.folder ? "folder" : "doc")
-                    .font(.system(size: 22))
+                    .font(Theme.glyph)
                     .accessibilityHidden(true)
             }
             VStack(alignment: .leading, spacing: 2) {
@@ -402,7 +400,7 @@ private struct FileCard: View {
             }
         }
         .padding(8)
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
+        .cardOutline()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("file-\(file.name)")
         .accessibilityLabel("\(file.folder ? "folder" : "file") \(file.name), \(file.size) bytes")
@@ -429,16 +427,16 @@ private struct LinkCardView: View {
                 // other scheme (file:, an app's own) is drawn as text, never opened.
                 if let url = URL(string: card.url),
                    ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-                    Link(card.url, destination: url).font(Theme.eyebrow).lineLimit(1)
+                    Link(card.url, destination: url).eyebrow().lineLimit(1)
                         .truncationMode(.middle)
                 } else {
-                    Text(card.url).font(Theme.eyebrow).lineLimit(1).truncationMode(.middle)
+                    Text(card.url).eyebrow().lineLimit(1).truncationMode(.middle)
                         .textSelection(.enabled)
                 }
             }
         }
         .padding(8)
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
+        .cardOutline()
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("card-\(card.url)")
     }
@@ -454,11 +452,11 @@ private struct ServiceCard: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(service.address).font(Theme.mono).textSelection(.enabled)
                 Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
-                    .font(Theme.eyebrow).secondaryText()
+                    .eyebrow().secondaryText()
             }
         }
         .padding(8)
-        .overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textSecondary.opacity(0.4)))
+        .cardOutline()
     }
 }
 
@@ -469,7 +467,7 @@ private struct Inspector: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("MEMBERS").font(Theme.eyebrow).secondaryText()
+            Text("MEMBERS").eyebrow().secondaryText()
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
                     .accessibilityIdentifier("member-\(member.name)")
@@ -493,7 +491,7 @@ private struct FamilyLan: View {
     let room: String
 
     var body: some View {
-        Text("FAMILY LAN").font(Theme.eyebrow).secondaryText()
+        Text("FAMILY LAN").eyebrow().secondaryText()
         if model.lanHelperReady {
             Toggle("On this room's LAN", isOn: Binding(
                 get: { model.lanOn.contains(room) },

@@ -171,7 +171,7 @@ struct Palette: View {
                             HStack {
                                 Text(action.title)
                                 Spacer()
-                                Text(action.menu).font(Theme.eyebrow).secondaryText()
+                                Text(action.menu).eyebrow().secondaryText()
                             }
                         }
                         .buttonStyle(.plain)
@@ -222,7 +222,7 @@ private struct RoomForm: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(joining ? "Join a room" : "New room").font(Theme.heading)
+            Text(joining ? "Join a room" : "New room").heading()
             if joining {
                 TextField("Room link (vox://…)", text: $link).font(Theme.mono)
             } else {
@@ -264,7 +264,7 @@ private struct FingerprintSheet: View {
     var body: some View {
         let card = fingerprintCard(fingerprint: model.me)
         VStack(alignment: .leading, spacing: 12) {
-            Text("Node \(model.node)").font(Theme.heading)
+            Text("Node \(model.node)").heading()
             VStack(spacing: 0) {
                 ForEach(Array(card.art.enumerated()), id: \.offset) { Text($0.element) }
             }
@@ -277,6 +277,7 @@ private struct FingerprintSheet: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(model.me, forType: .string)
                 }
+                .accessibilityLabel("Copy this node's fingerprint")
                 Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
             }
         }
@@ -304,7 +305,7 @@ private struct RetentionSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Retention").font(Theme.heading)
+            Text("Retention").heading()
             Picker("Keep messages", selection: $seconds) {
                 ForEach(Retention.choices, id: \.1) { Text($0.0).tag($0.1) }
             }
@@ -340,7 +341,7 @@ private struct RenameSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Rename the room").font(Theme.heading)
+            Text("Rename the room").heading()
             TextField("Its new name", text: $name).accessibilityIdentifier("rename-name")
             Text("Every member sees the new name, in their sidebar and in every address of the "
                 + "room's services. Only the room's creator or an admin may rename it.")
@@ -378,7 +379,7 @@ private struct AdminsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Admins").font(Theme.heading)
+            Text("Admins").heading()
             Text("An admin may end the room and set its retention.").secondaryText()
             ForEach(model.members) { member in
                 Toggle(isOn: Binding(get: { admins.contains(member.id) }, set: { on in
@@ -390,6 +391,8 @@ private struct AdminsSheet: View {
                     TrustMark(name: member.name, trust: member.trust)
                 }
                 .disabled(admins.first == member.id)
+                .accessibilityLabel(admins.contains(member.id) ? "\(member.name), admin"
+                                                               : "\(member.name), not an admin")
             }
             if let said = model.said { StateMark(kind: .danger, words: said).textSelection(.enabled) }
             Button("Done") { model.sheet = nil }.keyboardShortcut(.defaultAction)
@@ -407,7 +410,7 @@ private struct LeaveSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(ending ? "End this room for everyone?" : "Leave this room?").font(Theme.heading)
+            Text(ending ? "End this room for everyone?" : "Leave this room?").heading()
             Text(ending
                 ? "Every member's copy of the room is deleted, and no one can post in it again. "
                     + "Only its creator or an admin can do this."
