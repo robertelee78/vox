@@ -330,7 +330,7 @@ pub async fn recv_pairwise(recv: &mut RecvStream) -> Result<Option<PairwiseFrame
 
 /// Open sealed bytes from [`recv_pairwise`] into an SKDM (still unverified — the
 /// channel verifies it against the author's admitted key).
-pub fn open_skdm(session: &mut Session, sealed: &[u8], now_secs: u64) -> Result<Skdm> {
+pub fn open_skdm(session: &mut Session, sealed: &[u8], now_ms: u64) -> Result<Skdm> {
     let message = Message::from_wire(sealed)?;
-    Skdm::open_from(session, &message, now_secs)
+    Skdm::open_from(session, &message, now_ms)
 }

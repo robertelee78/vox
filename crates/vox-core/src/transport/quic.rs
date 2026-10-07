@@ -185,7 +185,7 @@ pub struct VoxEndpoint {
 pub struct LocalNode {
     id: Digest32,
     instance: [u8; 16],
-    stuck_after_secs: AtomicU64,
+    stuck_after_ms: AtomicU64,
     origin_key: [u8; 32],
 }
 
@@ -200,7 +200,9 @@ impl LocalNode {
         Ok(Arc::new(Self {
             id,
             instance: crate::identity::rng::random_array()?,
-            stuck_after_secs: AtomicU64::new(crate::tunnel::session::STUCK_AFTER.as_secs()),
+            stuck_after_ms: AtomicU64::new(
+                u64::try_from(crate::tunnel::session::STUCK_AFTER.as_millis()).unwrap_or(u64::MAX),
+            ),
             origin_key: crate::identity::rng::random_array()?,
         }))
     }
@@ -220,14 +222,14 @@ impl LocalNode {
     /// Give this node's tunnels `after` before one whose bytes wait is closed as stuck
     /// (V030-11): the node's `tunnel-stuck-after` setting. At least a second.
     pub fn set_stuck_after(&self, after: std::time::Duration) {
-        self.stuck_after_secs
-            .store(after.as_secs().max(1), Ordering::Relaxed);
+        let ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        self.stuck_after_ms.store(ms.max(1_000), Ordering::Relaxed);
     }
 
     /// How long this node's tunnels' bytes may wait before the tunnel is closed as stuck.
     #[must_use]
     pub fn stuck_after(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.stuck_after_secs.load(Ordering::Relaxed))
+        std::time::Duration::from_millis(self.stuck_after_ms.load(Ordering::Relaxed))
     }
 
     /// The secret this node, as a relay, keys the origin tags it tells a target with

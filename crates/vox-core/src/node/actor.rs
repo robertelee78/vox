@@ -11730,7 +11730,7 @@ impl Node {
             (packages, ctx)
         };
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
+        let now = now_ms.get();
         for package in packages {
             let Ok(init) = package.initial_message() else {
                 continue;
@@ -12585,7 +12585,7 @@ impl Node {
             // sending chain (M17.6). Decrypt it so the ratchet steps, then stop: there
             // is nothing behind it and nothing is granted by it.
             PairwiseFrame::Open { channel_id, sealed } => {
-                let now = self.now();
+                let now = self.now_ms().get();
                 if let Some(session) = self.sessions.get_mut(&(channel_id, peer)) {
                     if let Ok(message) = crate::pairwise::message::Message::from_wire(&sealed) {
                         let _ = session.decrypt(&message, now);
@@ -12603,7 +12603,7 @@ impl Node {
                 match second {
                     Some(PairwiseFrame::Skdm { channel_id, sealed }) => (channel_id, sealed),
                     Some(PairwiseFrame::Open { channel_id, sealed }) => {
-                        let now = self.now();
+                        let now = self.now_ms().get();
                         if let Some(session) = self.sessions.get_mut(&(channel_id, peer)) {
                             if let Ok(message) =
                                 crate::pairwise::message::Message::from_wire(&sealed)
@@ -12622,7 +12622,7 @@ impl Node {
             }
         };
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
+        let now = now_ms.get();
         let Some(session) = self.sessions.get_mut(&(channel_id, peer)) else {
             // No session with this peer for that channel: nothing can open it. Said, so the
             // sender sends it again once a join or key exchange establishes one.

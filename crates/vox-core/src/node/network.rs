@@ -2198,7 +2198,6 @@ impl NodeNet {
             root: signer,
             base_difficulty: Difficulty::DEFAULT_INVITE,
             pending_joins,
-            now_secs: self.now_secs(),
             now_ms: self.now_ms(),
             worked: slot
                 .as_ref()

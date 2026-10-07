@@ -39,8 +39,8 @@ type HmacSha256 = Hmac<Sha256>;
 pub const MAX_SKIP: u64 = 1000;
 /// Default total skipped-key cache size per session (ADR-004).
 pub const MAX_CACHE: usize = 2000;
-/// Default skipped-key expiry in seconds (7 days, ADR-004).
-pub const SKIP_EXPIRY_SECS: u64 = 7 * 24 * 60 * 60;
+/// Default skipped-key expiry in milliseconds (7 days, ADR-004).
+pub const SKIP_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// HKDF info label for the root KDF (domain-separated, ADR-004).
 const ROOT_KDF_INFO: &[u8] = b"vox/ratchet-root/v1";
@@ -140,7 +140,7 @@ fn message_nonce(mk: &Key32) -> Result<[u8; 12]> {
 }
 
 /// A cached skipped message key, keyed by `(ratchet_pubkey, N)`, with an
-/// insertion timestamp for expiry.
+/// insertion time for expiry (milliseconds since the Unix epoch).
 struct SkippedKey {
     mk: Key32,
     inserted_at: u64,
@@ -178,7 +178,7 @@ impl SkippedStore {
     /// called only on the post-authentication commit path.
     fn peek(&self, pubkey: &[u8; X25519_PUB_LEN], n: u64, now: u64) -> Option<&Key32> {
         let entry = self.map.get(&(*pubkey, n))?;
-        if now.saturating_sub(entry.inserted_at) > SKIP_EXPIRY_SECS {
+        if now.saturating_sub(entry.inserted_at) > SKIP_EXPIRY_MS {
             return None; // expired: treated as absent, not removed
         }
         Some(&entry.mk)
@@ -196,7 +196,7 @@ impl SkippedStore {
     fn live_len(&self, now: u64) -> usize {
         self.map
             .values()
-            .filter(|e| now.saturating_sub(e.inserted_at) <= SKIP_EXPIRY_SECS)
+            .filter(|e| now.saturating_sub(e.inserted_at) <= SKIP_EXPIRY_MS)
             .count()
     }
 
@@ -204,7 +204,7 @@ impl SkippedStore {
     /// path, so an unauthenticated packet can never trigger this mutation.
     fn prune_expired(&mut self, now: u64) {
         self.map
-            .retain(|_, e| now.saturating_sub(e.inserted_at) <= SKIP_EXPIRY_SECS);
+            .retain(|_, e| now.saturating_sub(e.inserted_at) <= SKIP_EXPIRY_MS);
     }
 }
 
