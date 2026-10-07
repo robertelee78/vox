@@ -65,6 +65,21 @@ pub enum Action {
         /// Each question's answer.
         answers: std::collections::BTreeMap<String, String>,
     },
+    /// Send the session a file (DR-1.7, #546). Its bytes do not travel here: the driver's node
+    /// serves them as a share only the session's node may fetch, once, on `tag`.
+    File {
+        /// Its name.
+        name: String,
+        /// Its size, bytes.
+        size: u64,
+        /// Its SHA-256, hex: what the session's node checks before it keeps it.
+        sha256: String,
+        /// The driver's service it is served on: also what pairs its two outcomes (`of`).
+        tag: String,
+        /// A note the session is told with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 impl Action {
@@ -79,6 +94,7 @@ impl Action {
             Action::Approve { .. } => "approve",
             Action::Reject { .. } => "reject",
             Action::Answer { .. } => "answer",
+            Action::File { .. } => "file",
         }
     }
 }
