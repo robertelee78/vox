@@ -97,6 +97,8 @@ struct Inner {
     joins: Mutex<BTreeMap<NodeName, Arc<vox_core::node::room_join::Joins>>>,
     /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
     sink: Arc<crate::session_sink::Sink>,
+    /// One queue per (node, session) into its Session, so its entries keep their order.
+    posting: Mutex<BTreeMap<(NodeName, String), tokio::sync::mpsc::UnboundedSender<String>>>,
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -255,6 +257,7 @@ impl Router {
                     connections: Arc::default(),
                     proxy,
                     sink,
+                    posting: Mutex::default(),
                     joins: Mutex::default(),
                 }
             }),
@@ -577,11 +580,26 @@ impl Router {
     }
 
     /// Post `bodies`, numbered, to `session`'s Session: sealed to the members `node` trusts with
-    /// drive (ADR-029 SC-2), in the room the session works in.
-    // WIP(#540): reads2's `NodeCommand::AppendSession` and files2's session room are not on
-    // integrate yet; until they are, nothing is posted. Never posted unsealed.
+    /// drive (ADR-029 SC-2), in the room the session works in. One task per session posts them in
+    /// order, so a split entry's parts stay together.
     fn post_session(&self, node: &NodeName, session: &str, bodies: Vec<String>) {
-        let _ = (node, session, bodies);
+        let mut posting = lock(&self.inner.posting);
+        let key = (node.clone(), session.to_owned());
+        let tx = match posting.get(&key).filter(|tx| !tx.is_closed()) {
+            Some(tx) => tx.clone(),
+            None => {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let weak = Arc::downgrade(&self.inner);
+                self.inner
+                    .rt
+                    .spawn(post_in_order(weak, key.0.clone(), key.1.clone(), rx));
+                posting.insert(key, tx.clone());
+                tx
+            }
+        };
+        for b in bodies {
+            let _ = tx.send(b);
+        }
     }
 
     /// Unregister an agent session of `node`, and detach the node if it was attached implicitly
@@ -598,6 +616,8 @@ impl Router {
         }
         // Whatever it was asking, nobody can answer now.
         self.inner.sink.session_end(node, session);
+        // Its queue closes once what it holds is posted.
+        lock(&self.inner.posting).remove(&(node.clone(), session.to_owned()));
         // Its Session ends first, while the node is still attached to say so.
         if let (Some(handle), Ok(paths)) =
             (self.handle_of(node), self.inner.account.node_paths(node))
@@ -1459,6 +1479,57 @@ impl Dispatch for Router {
 /// the daemon process): concurrent attaches, holders and the implicit detach, a session's end with
 /// its detach, a detach answering connections "node detached", and one node's panic leaving the
 /// other running. Production Argon2id: run in release.
+/// Post one session's entries into its Session, in the order they were queued. Each goes to the
+/// room its session works in now; a session in no room, or headless (ADR-029 SE-1), has no
+/// Session, and its entries go nowhere. A failure is said in the daemon's log, naming the entry's
+/// kind: the session goes on.
+async fn post_in_order(
+    weak: std::sync::Weak<Inner>,
+    node: NodeName,
+    session: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    while let Some(body) = rx.recv().await {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let router = Router { inner };
+        let Some(handle) = router.handle_of(&node) else {
+            continue;
+        };
+        let reg = router
+            .inner
+            .account
+            .node_paths(&node)
+            .ok()
+            .and_then(|p| crate::wake::registration(&p, &session));
+        let Some(room) = reg
+            .filter(|r| r.interactive)
+            .and_then(|r| r.room)
+            .and_then(|r| vox_core::node::link::b32_decode(&r, "room").ok())
+        else {
+            continue;
+        };
+        let outcome = handle
+            .apply(vox_core::node::api::NodeCommand::AppendSession {
+                channel_id: room,
+                session_id: session.clone(),
+                body: body.clone(),
+            })
+            .await;
+        if !matches!(outcome, vox_core::node::api::Outcome::Done) {
+            let kind = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+                .unwrap_or_default();
+            eprintln!(
+                "vox daemon: {node}: session {session}: a {kind} entry did not reach its Session: \
+                 {outcome}"
+            );
+        }
+    }
+}
+
 /// Bring the proxy up if any node is attached, down if none is.
 fn proxy_follow(weak: &std::sync::Weak<Inner>) {
     let Some(inner) = weak.upgrade() else {
