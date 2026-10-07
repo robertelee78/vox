@@ -323,7 +323,12 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                 }
             }
             "drive" => {
-                let by = names.alias(&b.author);
+                // The session's node writes what a driver did, naming the driver it admitted on
+                // the drive stream: the driver cannot seal under the session's key.
+                let by = match b.str("by") {
+                    "" => names.alias(&b.author),
+                    by => names.alias_b32(by),
+                };
                 match b.str("action") {
                     "text" => {
                         details.push(("typed".into(), b.str("text").to_owned()));
