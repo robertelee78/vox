@@ -1574,8 +1574,32 @@ impl DaemonCore {
                             })
                             .collect()
                     },
-                    // The room's Sessions (ADR-029 CL-2): the snapshot is to carry them (#538).
-                    sessions: Vec::new(),
+                    // The room's Sessions (ADR-029 CL-2), newest opening first, each labelled as
+                    // `vox room sessions` labels it (SE-3).
+                    sessions: d
+                        .sessions
+                        .iter()
+                        .rev()
+                        .map(|x| {
+                            let node_alias =
+                                crate::ident::author_for(&snap.trusted, me.as_ref(), &x.node);
+                            crate::viewmodel::SessionView {
+                                node: x.node,
+                                id: x.id.clone(),
+                                name: x.name.clone(),
+                                label: vox_agentcomms::envelope::session_label(
+                                    &node_alias,
+                                    x.name.as_deref(),
+                                    &x.id,
+                                ),
+                                node_alias,
+                                opened: x.opened_millis / 1_000,
+                                ended: (!x.open)
+                                    .then(|| x.ended_millis.unwrap_or(x.opened_millis) / 1_000),
+                                can_drive: x.can_drive,
+                            }
+                        })
+                        .collect(),
                     // **Every member held back, each on its own line** (V210-66).
                     held_back: d
                         .equivocations
