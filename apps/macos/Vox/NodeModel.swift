@@ -76,6 +76,16 @@ final class NodeModel: ObservableObject {
     @Published private(set) var pulledBy: [String: [String]] = [:]
     /// The room on screen's retention, as a person reads it (ADR-028 R-7).
     @Published private(set) var retention = ""
+    /// What the room on screen's timeline shows (ADR-029 CL-2): General each time a room opens.
+    @Published var showing: Showing = .general {
+        didSet { if showing != oldValue { Task { await readSession() } } }
+    }
+    /// The room on screen's Sessions, open and ended (ADR-029 CL-2).
+    @Published private(set) var sessions: [FfiSession] = []
+    /// The Session on screen's entries, oldest first, to a member with drive (SC-1).
+    @Published private(set) var sessionEntries: [FfiSessionEntry] = []
+    /// What the node says of the Session on screen besides its entries: "opening not received yet".
+    @Published private(set) var sessionNote: String?
     /// What was done to the room on screen (its retention set, its name changed), oldest first.
     @Published private(set) var notices: [RoomNoticeRow] = []
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
@@ -279,6 +289,10 @@ final class NodeModel: ObservableObject {
         pulled = [:]
         retention = ""
         notices = []
+        showing = .general
+        sessions = []
+        sessionEntries = []
+        sessionNote = nil
         members = []
         roomServices = []
         selectedMessage = nil
@@ -309,11 +323,13 @@ final class NodeModel: ObservableObject {
             let rows = try await memberRows(id)
             let kept = (try? await client.retention(room: id)) ?? ""
             let done = (try? await client.notices(room: id)) ?? []
+            let listed = (try? await client.sessions(room: id)) ?? []
             guard case .room(id) = self.selection else { return }
             roomServices = services
             members = rows
             retention = kept
             notices = done
+            sessions = listed
             watchReads(id)
         } catch {
             said = sentence(error)
@@ -721,6 +737,9 @@ final class NodeModel: ObservableObject {
                 guard case .room(room) = self.selection else { return }
                 if let kept, kept != self.retention { self.retention = kept }
                 if let done, done != self.notices { self.notices = done }
+                let listed = try? await self.client.sessions(room: room)
+                guard case .room(room) = self.selection else { return }
+                if let listed, listed != self.sessions { self.sessions = listed }
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
@@ -813,6 +832,55 @@ private final class Listener: ClientListener, @unchecked Sendable {
 
     func onEnded(text: String) {
         Task { @MainActor [weak model] in model?.stopped(text) }
+    }
+
+    func onSessions(room: String) {
+        Task { @MainActor [weak model] in await model?.sessionsChanged(in: room) }
+    }
+
+    func onSessionEntry(room: String, node: String, sessionId: String) {
+        Task { @MainActor [weak model] in await model?.sessionEntry(in: room, node: node, session: sessionId) }
+    }
+}
+
+// A room's Sessions (ADR-029): read when one is shown, and again when the node says it changed.
+extension NodeModel {
+    /// The Session on screen's entries, to a member with drive; nothing to one without (SC-3).
+    func readSession() async {
+        guard let room = roomOnScreen, let s = shownSession, s.canDrive else {
+            if !sessionEntries.isEmpty { sessionEntries = [] }
+            if sessionNote != nil { sessionNote = nil }
+            return
+        }
+        do {
+            let read = try await client.sessionRead(room: room, node: s.nodeFingerprint,
+                                                    sessionId: s.sessionId)
+            guard shownSession?.sessionId == s.sessionId else { return }
+            if read.entries != sessionEntries { sessionEntries = read.entries }
+            if read.note != sessionNote { sessionNote = read.note }
+        } catch {
+            said = sentence(error)
+        }
+    }
+
+    /// A Session in `room` opened, ended or was renamed, or what waits on this node changed.
+    fileprivate func sessionsChanged(in room: String) async {
+        guard roomOnScreen == room, let listed = try? await client.sessions(room: room),
+              roomOnScreen == room else { return }
+        if listed != sessions { sessions = listed }
+        await readSession()
+    }
+
+    /// A Session has a new entry, or a request in it was resolved.
+    fileprivate func sessionEntry(in room: String, node: String, session: String) async {
+        guard roomOnScreen == room, shownSession?.nodeFingerprint == node,
+              shownSession?.sessionId == session else { return }
+        await readSession()
+    }
+
+    /// Drive a Session (ADR-029 DR-1), for the Session view's controls (SessionDrive.swift).
+    func drive(room: String, session: String, action: DriveAction) async throws -> DriveAnswer {
+        try await client.drive(room: room, session: session, action: action)
     }
 }
 
