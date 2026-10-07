@@ -386,7 +386,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
             session_id: SESSION.to_owned(),
             body: body.clone(),
         })) {
-            Ok(Frame::Ok) => {}
+            Ok(Frame::Appended { .. }) => {}
             other => panic!("PRODUCT: alice's node refused a Session entry: {other:?}"),
         }
     }
@@ -448,7 +448,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
             session_id: SESSION.to_owned(),
             body: body.clone(),
         })) {
-            Ok(Frame::Ok) => {}
+            Ok(Frame::Appended { .. }) => {}
             other => panic!("PRODUCT: alice's node refused a Session entry: {other:?}"),
         }
     }

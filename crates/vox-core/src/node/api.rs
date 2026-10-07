@@ -1440,6 +1440,9 @@ pub enum Outcome {
         /// The room's retention, seconds (`0` = forever).
         room: u64,
     },
+    /// A Session entry was appended (ADR-029 SC-1): its entry hash, which a later entry's `re`
+    /// names.
+    Appended(Digest32),
     /// The command failed for the given reason.
     Failed(Fault),
 }
@@ -1471,7 +1474,7 @@ impl Outcome {
     pub fn is_done(self) -> bool {
         matches!(
             self,
-            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. }
+            Outcome::Done | Outcome::Bound(_) | Outcome::OwnRetention { .. } | Outcome::Appended(_)
         )
     }
 }
@@ -1481,6 +1484,9 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Done => f.write_str("done"),
             Outcome::Bound(local) => write!(f, "bound at {local}"),
+            Outcome::Appended(entry) => {
+                write!(f, "appended {}", crate::node::link::b32_encode(entry))
+            }
             Outcome::OwnRetention { own, room } => write!(
                 f,
                 "this node keeps the room's messages for {own} s; the room keeps them for {room} s"

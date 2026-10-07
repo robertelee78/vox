@@ -14789,7 +14789,7 @@ impl Node {
         };
         let holders = self.drive_holders();
         let now_millis = (self.millis_clock)();
-        let appended = {
+        let entry = {
             let mut ch = shared.lock().await;
             // **Never sealed under a key a member that lost drive still holds** (SC-2b): the key
             // changes here, before the entry, whatever the tick has not got to yet.
@@ -14798,12 +14798,13 @@ impl Node {
                 Err(e) => Err(e),
             }
         };
-        if let Err(e) = appended {
-            return Outcome::Failed(fault_of(&e));
-        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
         self.note_local_append(channel_id);
         self.tend_drive_keys_in(channel_id, &holders).await;
-        Outcome::Done
+        Outcome::Appended(entry)
     }
 
     /// [`Self::tend_drive_keys_in`] in every open room.

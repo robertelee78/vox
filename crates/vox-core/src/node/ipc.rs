@@ -361,6 +361,8 @@ const T_SESSION_ENTRIES: u64 = 5431;
 const T_SESSION_ROWS: u64 = 5432;
 const T_SESSIONS_REQ: u64 = 4940;
 const T_SESSIONS: u64 = 4941;
+/// [`Frame::Appended`].
+const T_APPENDED: u64 = 5433;
 
 /// What a client sends.
 ///
@@ -1649,6 +1651,11 @@ pub enum Frame {
         /// Each share.
         shares: Vec<crate::node::shares::ShareRow>,
     },
+    /// The Session entry a [`Request::AppendSession`] appended.
+    Appended {
+        /// Its entry hash.
+        entry: Digest32,
+    },
     /// Session entries, as a [`Request::SessionEntries`] asked for, in the order this node
     /// opened or wrote them.
     SessionEntries {
@@ -1805,6 +1812,9 @@ impl Frame {
                         .uint(r.fetched)
                         .uint(r.files);
                 }
+            }
+            Frame::Appended { entry } => {
+                e.array(2).uint(T_APPENDED).bytes(entry);
             }
             Frame::SessionEntries { rows } => {
                 e.array(2).uint(T_SESSION_ROWS).array(rows.len());
@@ -2400,6 +2410,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
                 });
             }
             return Ok(Frame::Shares { shares });
+        }
+        (T_APPENDED, 2) => {
+            let entry = digest(d)?;
+            return Ok(Frame::Appended { entry });
         }
         (T_SESSION_ROWS, 2) => {
             let count = d
@@ -4166,7 +4180,7 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             })
             .await
         {
-            crate::node::api::Outcome::Done => Frame::Ok,
+            crate::node::api::Outcome::Appended(entry) => Frame::Appended { entry },
             other => Frame::Error {
                 reason: other.to_string(),
             },
