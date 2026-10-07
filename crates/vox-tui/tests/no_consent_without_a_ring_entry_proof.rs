@@ -46,7 +46,9 @@
 //! since a key taken and merely hidden would render the moment his ring names her. Before that,
 //! alice's key changes: she removes carol from her ring and trusts her again, which rotates her
 //! sender key, so every post so far sits under a **retired** generation, and she posts once more
-//! under the new one (carol renders it, or `CANNOT MEASURE`). Dave, whom alice trusts and who
+//! under the new one (carol renders it, or `CANNOT MEASURE`). Bob and dave are away across the
+//! rotation (their daemons stopped before it and started 10 s after), so alice's node prunes (R14)
+//! with nothing in flight from them to say they are owed the retired generation. Dave, whom alice trusts and who
 //! never trusted her, then trusts her while she is online, and within 120 s renders every post
 //! she made after trusting him, the retired generation's included. Alice's daemon starts again, and
 //! within 120 s bob renders **every** post she made after trusting him, those under the retired
@@ -72,6 +74,10 @@
 //! - M5 (V210-118, the log): a key-package's key taken from any author — the `is_trusted` check
 //!   removed from `install_key_packages` in `crates/vox-core/src/node/actor.rs`. Bob renders
 //!   dave's posts.
+//! - M6: a retired generation not owed at the rotation to readers that never took it — the
+//!   `owe_history` loop removed from `ChannelState::rotate_sender_to` in
+//!   `crates/vox-core/src/node/channel.rs`. Alice's next prune deletes it, and dave never renders
+//!   the posts under it.
 #![cfg(unix)]
 
 #[path = "support/typed.rs"]
@@ -380,7 +386,7 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     let mut bob = member(tmp.path(), "bob", &spec);
     let carol = member(tmp.path(), "carol", &spec);
     // Dave reads alice only once he trusts her, while she is online (V210-118 c2).
-    let dave = member(tmp.path(), "dave", &spec);
+    let mut dave = member(tmp.path(), "dave", &spec);
 
     let rooms = [make_room(&alice, "one"), make_room(&alice, "two")];
     for ((_, link), name) in rooms.iter().zip(["one", "two"]) {
@@ -541,6 +547,13 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
          her in his ring: his node took the key she released to him"
     );
 
+    // **Bob and dave are away while alice's key changes**: their daemons stop before the rotation
+    // and start again 10 s after it, so alice's node prunes (R14) with both owed the retired
+    // generation and no refusal of theirs in flight to say so (with either online, his refusal of
+    // the new key owes it again within moments, and the prune keeps it for both). It must keep it
+    // for them, as history.
+    drop(bob.daemon.take());
+    drop(dave.daemon.take());
     // **Alice's key changes before bob trusts her.** She removes carol from her ring, which
     // rotates her sender key in every room she consented in, and trusts carol again. Every post so
     // far now sits under a retired generation; she posts once more under the new one, and carol
@@ -566,6 +579,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
         assert!(ok, "PRODUCT (staging): alice posts: {e}");
     }
     std::thread::sleep(Duration::from_secs(10));
+    start_daemon(&mut bob, tmp.path(), &spec, "daemon-after-rotation");
+    start_daemon(&mut dave, tmp.path(), &spec, "daemon-after-rotation");
     for (name, room, _) in &alice_posted {
         assert!(
             !carol.reads(room, &format!("A118-WHILE-CAROL-REMOVED-IN-{name}")),
@@ -705,7 +720,8 @@ fn joining_grants_nothing_and_only_the_ring_releases_a_key() {
     // or drained. Then bob trusts dave, and reads them: the key was held, not lost.
     bob.daemon = None;
     dave.trust(&bob);
-    let dave_log = tmp_path.join("dave.daemon.err");
+    // Dave's daemon since it came back after alice's rotation.
+    let dave_log = tmp_path.join("dave.daemon-after-rotation.err");
     let bob_short: String = bob.fp.chars().take(26).collect();
     assert!(
         until(
