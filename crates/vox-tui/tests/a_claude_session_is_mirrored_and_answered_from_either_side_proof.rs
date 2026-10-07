@@ -1026,6 +1026,20 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
     );
 }
 
+/// The ref a waiting request's line says to answer it with: the word after `flag` on the
+/// "waiting:" line under the line holding `line`.
+fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
+    let lines: Vec<&str> = plain.lines().collect();
+    let at = lines.iter().position(|l| l.contains(line))?;
+    let next = lines.get(at + 1)?.trim();
+    let rest = next.strip_prefix("waiting:")?.split(flag).nth(1)?;
+    Some(
+        rest.split(|c: char| c.is_whitespace() || c == ',')
+            .next()?
+            .to_owned(),
+    )
+}
+
 /// ADR-029 DR-3, DR-4 (#545) — **an approval or a question is answered from either side, and the
 /// harness's own record says which answer took effect.**
 ///
@@ -1111,7 +1125,17 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
     // ---- 1. approved in the Session ----
     let e2 = serde_json::json!({ "command": "touch e2" });
     let hook = ask("toolu_2", "Bash", &e2);
-    let (ok, said) = drive(&w, &room, SESSION, &["--approve", "toolu_2"]);
+    // A person approves with the ref the Session prints, and nothing else.
+    let plain = session_says("Bash: touch e2 — approve or reject?");
+    let printed = waiting_ref(&plain, "Bash: touch e2 — approve or reject?", "--approve ");
+    println!("[proof] 1. the Session names the approval's ref: {printed:?}");
+    let Some(printed) = printed else {
+        panic!(
+            "PRODUCT: arm 1: a waiting approval must say how to answer it, with its ref \
+             (\"waiting: approve with --approve <ref>\"); the Session read:\n{plain}"
+        );
+    };
+    let (ok, said) = drive(&w, &room, SESSION, &["--approve", &printed]);
     println!("[proof] 1. --approve toolu_2: {said}");
     let d = decision(hook);
     assert!(
@@ -1153,11 +1177,19 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
         "multiSelect": false, "options": [ { "label": "Red", "description": "red" },
         { "label": "Blue", "description": "blue" } ] } ] });
     let hook = ask("toolu_q", "AskUserQuestion", &q);
+    let plain = session_says("question: Which colour?");
+    let printed =
+        waiting_ref(&plain, "question: Which colour?", "--answer ").unwrap_or_else(|| {
+            panic!(
+                "PRODUCT: arm 3: a waiting question must say how to answer it, with its ref; the \
+             Session read:\n{plain}"
+            )
+        });
     let (ok, said) = drive(
         &w,
         &room,
         SESSION,
-        &["--answer", "toolu_q", "Which colour?=Blue"],
+        &["--answer", &printed, "Which colour?=Blue"],
     );
     println!("[proof] 3. --answer toolu_q: {said}");
     let d = decision(hook);
