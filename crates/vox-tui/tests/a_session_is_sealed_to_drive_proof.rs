@@ -9,6 +9,11 @@
 //!    in the room's timeline (`vox room read`).
 //!    `vox room sessions --json` says so too: alice's Session is listed for both, `can_drive`
 //!    true for bob and false for carol.
+//! 3. **A file out of a Session reaches only drive** (DR-1.8, #546). Alice's session runs
+//!    `vox agent send`: bob's node pulls the file by itself, byte for byte, into its files
+//!    directory; carol's pulls nothing. Carol, given the share's tag by a member that has it (an
+//!    apparatus attacker reading bob's Session), forwards to alice's service and asks for it
+//!    herself: refused (403), though alice's node trusts her.
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
 //!    Bob's node opens none of the entries alice's Session writes afterwards, while it still holds
 //!    the ones it read before and still reads alice's messages to the room; and its
@@ -35,6 +40,8 @@
 //! - **`can_drive` always true** (claims 1 and 2): `sessions::fold` in
 //!   `crates/vox-core/src/node/sessions.rs` sets it true. Carol's listing says she can drive:
 //!   red PRODUCT.
+//! - **A Session's file served to any trusted member** (claim 3): `Witness::allowed` in
+//!   `crates/vox-core/src/node/shares.rs` lets anyone in. Carol is served the file: red PRODUCT.
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
@@ -387,6 +394,46 @@ fn opened(m: &Member, room: &str) -> Vec<String> {
         .collect()
 }
 
+/// The file `name` in `m`'s files directory for the room, if it has landed (ADR-028 F-4).
+fn landed(m: &Member, room: &[u8; 32], name: &str) -> Option<Vec<u8>> {
+    let dir = m
+        .data
+        .join("nodes")
+        .join("default")
+        .join("files")
+        .join(vox_core::node::link::b32_encode(room));
+    std::fs::read(dir.join(name)).ok()
+}
+
+/// Ask `m`'s node to forward to `host`'s service `tag` and GET it: the HTTP status line it
+/// answers, or why there was no answer.
+fn fetch_as(
+    rt: &tokio::runtime::Runtime,
+    m: &Member,
+    room: [u8; 32],
+    host: [u8; 32],
+    tag: &str,
+) -> Result<String, String> {
+    use std::io::{Read as _, Write as _};
+    let bound = match rt.block_on(m.socket(rt).request(&Request::Forward {
+        channel_id: room,
+        host,
+        service_tag: tag.to_owned(),
+        local: "127.0.0.1:0".into(),
+    })) {
+        Ok(Frame::Bound { local }) => local,
+        other => return Err(format!("no forward: {other:?}")),
+    };
+    let mut s = std::net::TcpStream::connect(&bound).map_err(|e| format!("connect: {e}"))?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+    s.write_all(b"GET / HTTP/1.1\r\nHost: share\r\nConnection: close\r\n\r\n")
+        .map_err(|e| format!("send: {e}"))?;
+    let mut got = Vec::new();
+    let _ = s.read_to_end(&mut got);
+    let head = String::from_utf8_lossy(&got);
+    Ok(head.lines().next().unwrap_or_default().to_owned())
+}
+
 /// How many entries `m`'s node holds in the room, as `vox status --json` counts them.
 fn entries(m: &Member, room: &str) -> u64 {
     let (_, o, _) = m.vox(&["status", "--json"], None);
@@ -508,6 +555,78 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         !timeline_bob.contains("BEFORE-DOWNGRADE") && !timeline_carol.contains("BEFORE-DOWNGRADE"),
         "PRODUCT: Session activity must not show in the room's timeline (SC-4): bob's read: \
          {timeline_bob}\ncarol's read: {timeline_carol}"
+    );
+
+    // ---- claim 3: alice's session sends a file out of its Session; it reaches bob alone ----
+    let file = tmp.path().join("for-drive.bin");
+    let bytes: Vec<u8> = (0..120_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    std::fs::write(&file, &bytes).expect("APPARATUS: write the file to send");
+    let (ok, o, e) = alice.vox_with(
+        &[
+            "agent",
+            "send",
+            file.to_str().expect("APPARATUS: a UTF-8 temp path"),
+            "--note",
+            "the numbers",
+            "--node",
+            "default",
+            "--session",
+            SESSION,
+        ],
+        None,
+        &[],
+    );
+    assert!(ok, "PRODUCT: `vox agent send` failed: {o}{e}");
+    let bob_got = until(Duration::from_secs(120), || {
+        landed(&bob, &id, "for-drive.bin").as_deref() == Some(&bytes[..])
+    });
+    // The tag, as a member with drive reads it in the Session: what an attacker would be handed.
+    let tag = match rt.block_on(
+        bob.socket(&rt)
+            .request(&Request::SessionEntries { channel_id: id }),
+    ) {
+        Ok(Frame::SessionEntries { rows }) => rows
+            .iter()
+            .filter_map(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok())
+            .find(|v| v["kind"] == "file" && v["name"] == "for-drive.bin")
+            .and_then(|v| v["tag"].as_str().map(str::to_owned))
+            .unwrap_or_default(),
+        other => panic!("APPARATUS: bob's Session entries: {other:?}"),
+    };
+    // Five seconds more for carol's node, as long as bob's had.
+    std::thread::sleep(Duration::from_secs(5));
+    let carol_landed = landed(&carol, &id, "for-drive.bin").is_some();
+    let alice_fp: [u8; 32] = vox_core::node::link::b32_decode(&alice.fp, "alice")
+        .expect("APPARATUS: alice's fingerprint");
+    let carol_fetch = if tag.is_empty() {
+        Err("no tag".to_owned())
+    } else {
+        fetch_as(&rt, &carol, id, alice_fp, &tag)
+    };
+    eprintln!(
+        "[proof] claim 3: bob pulled it: {bob_got}; carol's node pulled it: {carol_landed}; \
+         carol asking by tag {tag:?}: {carol_fetch:?}"
+    );
+    assert!(
+        bob_got,
+        "PRODUCT: bob, whom alice trusts with drive, must pull the file her session sent out of its \
+         Session, byte for byte"
+    );
+    assert!(
+        !tag.is_empty(),
+        "PRODUCT: bob's Session must carry the file's entry with its tag"
+    );
+    assert!(
+        !carol_landed,
+        "PRODUCT: carol, read only, must not get a file sent out of alice's Session"
+    );
+    let status = carol_fetch.unwrap_or_else(|e| {
+        panic!("CANNOT MEASURE (apparatus): carol's forward to alice's share was not made: {e}")
+    });
+    assert!(
+        status.contains("403"),
+        "PRODUCT: alice's node must refuse carol the Session's file though she asks by its tag: it \
+         answered {status:?}"
     );
 
     // ---- claim 2: alice downgrades bob to read; her Session's later entries are not his ----
