@@ -532,6 +532,9 @@ pub struct NodeView {
     /// The trust keyring: `(fingerprint, petname)` in fingerprint order, empty
     /// while locked because the keyring is sealed under the identity (ADR-020 §3).
     pub trusted: Vec<(Digest32, String)>,
+    /// The keyring entries that carry drive (ADR-028 K-14), in fingerprint order; every other
+    /// entry in [`NodeView::trusted`] grants read.
+    pub drive: Vec<Digest32>,
     /// Peers this node currently reaches **through a relay** rather than directly.
     ///
     /// Worth surfacing rather than hiding: a relayed path means a third party is carrying
@@ -749,6 +752,18 @@ pub enum NodeCommand {
         petname: String,
         /// What its consents release.
         history: crate::node::trust::HistoryGrant,
+        /// What the entry grants (ADR-028 K-14); `None` keeps what it grants now, and read for a
+        /// new entry.
+        capability: Option<crate::node::trust::Capability>,
+    },
+    /// Change what a trusted identity's keyring entry grants, read or read + drive (ADR-028
+    /// K-14): a keyring change, behind the passphrase gate. Fails with [`Fault::NotConsented`]
+    /// for an identity that is not trusted.
+    SetCapability {
+        /// The trusted identity.
+        fingerprint: Digest32,
+        /// What its entry grants from now on.
+        capability: crate::node::trust::Capability,
     },
     /// Stop trusting an identity node-wide, and **change the lock** (ADR-020 §3).
     ///
@@ -1469,6 +1484,16 @@ impl std::fmt::Display for Outcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeEvent {
+    /// Whether a keyring entry carries drive changed (ADR-028 K-14): granted, taken back, or gone
+    /// with the entry. Raised once per change that moves it, so a node's Sessions can release
+    /// their key to a member that gained drive and rotate it away from one that lost it (ADR-029
+    /// SC-2a, SC-2b).
+    CapabilityChanged {
+        /// The identity whose entry changed.
+        fingerprint: Digest32,
+        /// Whether it now carries drive.
+        drive: bool,
+    },
     /// Creating the identity has waited more than a second for another vox that holds this
     /// profile's lock (it is creating the identity, or holds the profile, or is stopped while
     /// doing so). Sent once per wait; the command goes on when the lock is free. Each front end
@@ -1856,6 +1881,16 @@ impl NodeEvent {
         match self {
             NodeEvent::WaitingForProfile => {
                 "waiting for another vox that is using this identity's files".into()
+            }
+            NodeEvent::CapabilityChanged { fingerprint, drive } => {
+                if *drive {
+                    format!("{} can now drive this node's Sessions", short(fingerprint))
+                } else {
+                    format!(
+                        "{} can no longer drive this node's Sessions",
+                        short(fingerprint)
+                    )
+                }
             }
             NodeEvent::NewEntry { channel_id, .. } => {
                 format!("a new message in room {}", short(channel_id))

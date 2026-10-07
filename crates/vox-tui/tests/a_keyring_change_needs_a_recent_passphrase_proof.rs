@@ -22,11 +22,18 @@
 //! (`VOX_TEST_PROVED_CHANGE_DELAY_MS`), as when the clock moves on between the two. The
 //! right-passphrase changes of 2, 4 and 5 must still succeed.
 //!
+//! **What an entry grants is part of it** (ADR-028 K-14, #525): in 2 bob is trusted with `--drive`
+//! and `vox trust list` says `read + drive`; in 3, past the window, `vox trust read` with no
+//! passphrase is refused for it and bob still has drive; in 4 carol is trusted with drive over the
+//! raw socket; in 5, given the passphrase, `vox trust read` makes bob `read`; and 6, carol still
+//! has drive after the daemon restarts, when the keyring is read back from the disk.
+//!
 //! Mutations: the window opened at the attach — red, PRODUCT (1: the change with no passphrase is
 //! made). No window check in the node — red, PRODUCT (the change past the window is made). A
 //! change given the right passphrase put through the window like one given none — red, PRODUCT (it
 //! is refused as needing the passphrase it was given). The window reported open after it closed —
-//! red, PRODUCT.
+//! red, PRODUCT. The capability dropped when the keyring is saved — red, PRODUCT (6: carol reads
+//! `read` after the restart).
 
 #![cfg(unix)]
 
@@ -127,6 +134,38 @@ fn profile(root: &Path, name: &str) -> (std::path::PathBuf, String) {
     (dir, String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// The line `vox trust list` gives `fp`, or nothing.
+fn entry<'a>(list: &'a str, fp: &str) -> &'a str {
+    list.lines().find(|l| l.starts_with(fp)).unwrap_or_default()
+}
+
+/// `vox daemon` on `dir`, unlocked from the environment with the shortened window, and where its
+/// control socket is, if it said.
+fn start_daemon(dir: &Path) -> (std::process::Child, Option<std::path::PathBuf>) {
+    let mut daemon = vox_cmd(dir, &["daemon", "--listen", "127.0.0.1:0"])
+        .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
+        .env(KNOB, WINDOW.as_secs().to_string())
+        .env(DELAY_KNOB, PROVED_DELAY.as_millis().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("APPARATUS: spawn vox daemon");
+    std::mem::forget(daemon.stdin.take());
+    let mut out = std::io::BufReader::new(daemon.stdout.take().expect("APPARATUS: stdout"));
+    let mut line = String::new();
+    while out.read_line(&mut line).is_ok_and(|n| n > 0) {
+        if let Some(at) = line.trim().strip_prefix("vox daemon: control socket ") {
+            let sock = std::path::PathBuf::from(at);
+            // Drained, so the daemon never blocks on a full pipe.
+            std::thread::spawn(move || std::io::copy(&mut out, &mut std::io::sink()));
+            return (daemon, Some(sock));
+        }
+        line.clear();
+    }
+    (daemon, None)
+}
+
 fn trusted(dir: &Path) -> String {
     let (ok, said) = run(&mut vox_cmd(dir, &["trust", "list"]));
     assert!(
@@ -137,7 +176,7 @@ fn trusted(dir: &Path) -> String {
 }
 
 /// A raw `Trust` request on the control socket, as any client of it sends one.
-fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Frame {
+fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str, drive: bool) -> Frame {
     let target =
         vox_core::node::link::b32_decode(target, "fingerprint").expect("APPARATUS: a fingerprint");
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -156,6 +195,7 @@ fn raw_trust(sock: &Path, target: &str, petname: &str, passphrase: &str) -> Fram
                 petname: petname.to_owned(),
                 identity_passphrase: zeroize::Zeroizing::new(passphrase.to_owned()),
                 full_history: false,
+                drive,
             }),
         )
         .await
@@ -245,6 +285,7 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
             &bob,
             "--name",
             "bob",
+            "--drive",
             "--identity-passphrase-file",
             pass_file.to_str().expect("APPARATUS: path"),
         ],
@@ -253,6 +294,15 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     if !ok {
         kill(daemon);
         panic!("PRODUCT: `vox trust add --identity-passphrase-file` was refused: {said}");
+    }
+    // K-14: bob was trusted with drive, and the list says so.
+    let drive_list = trusted(&alice);
+    if !entry(&drive_list, &bob).ends_with("bob  read + drive") {
+        kill(daemon);
+        panic!(
+            "PRODUCT: bob was trusted with --drive, and `vox trust list` must say `read + drive` \
+             for him; it said:\n{drive_list}"
+        );
     }
     let (ok, open_said) = run(&mut vox_cmd(&alice, &["status"]));
     let (again_ok, again_said) = run(&mut vox_cmd(
@@ -287,6 +337,20 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         );
     }
 
+    // K-14: changing what an entry grants is a keyring change, refused past the window for want
+    // of the passphrase, and nothing changes.
+    let (read_ok, read_said) = run(&mut vox_cmd(&alice, &["trust", "read", &bob]));
+    let list = trusted(&alice);
+    if read_ok || !read_said.contains(needed_first) || !entry(&list, &bob).ends_with("read + drive")
+    {
+        kill(daemon);
+        panic!(
+            "PRODUCT: past the window, `vox trust read` with no passphrase must be refused for it \
+             and leave bob with drive (succeeded {read_ok}); it said:\n{read_said}\nthe \
+             keyring now:\n{list}"
+        );
+    }
+
     // K-9: past the window, `vox status` says a keyring change will ask for the passphrase.
     let (ok, closed_said) = run(&mut vox_cmd(&alice, &["status"]));
     if !(ok
@@ -307,11 +371,12 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         closed_said.lines().find(|l| l.starts_with("keyring"))
     );
 
-    // 4. Past the window, a raw socket request: none given, then a wrong one, then the right one.
-    let none = raw_trust(&sock, &carol, "carol", "");
-    let wrong = raw_trust(&sock, &carol, "carol", "not the passphrase");
+    // 4. Past the window, a raw socket request: none given, then a wrong one, then the right one,
+    // which trusts carol with drive (K-14).
+    let none = raw_trust(&sock, &carol, "carol", "", true);
+    let wrong = raw_trust(&sock, &carol, "carol", "not the passphrase", true);
     let after_refusals = trusted(&alice);
-    let right = raw_trust(&sock, &carol, "carol", IDPASS);
+    let right = raw_trust(&sock, &carol, "carol", IDPASS, true);
     let after_right = trusted(&alice);
     let refused = |f: &Frame| matches!(f, Frame::Error { .. });
     if !matches!(&none, Frame::Error { reason } if reason == needed)
@@ -335,6 +400,18 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         &alice,
         &["trust", "add", &dave, "--name", "d"],
     ));
+    // K-14: given the passphrase, `vox trust read` makes bob read only.
+    let (to_read, to_read_said) = run(&mut vox_cmd(
+        &alice,
+        &[
+            "trust",
+            "read",
+            &bob,
+            "--identity-passphrase-file",
+            pass_file.to_str().expect("APPARATUS: path"),
+        ],
+    ));
+    let read_list = trusted(&alice);
     let given = run(&mut vox_cmd(
         &alice,
         &[
@@ -348,6 +425,11 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
     let list = trusted(&alice);
     kill(daemon);
     assert!(
+        to_read && entry(&read_list, &bob).ends_with("bob  read"),
+        "PRODUCT: `vox trust read --identity-passphrase-file` must make bob `read`: \
+         {to_read_said}\nthe keyring:\n{read_list}"
+    );
+    assert!(
         !refused_ok && refused_said.contains(needed_first) && !list.contains(&dave),
         "PRODUCT: past the window again, `vox trust add` with no passphrase was not refused for \
          it: {refused_said}\nthe keyring:\n{list}"
@@ -359,4 +441,19 @@ fn a_keyring_change_past_the_window_needs_the_passphrase_from_every_client() {
         given.1
     );
     eprintln!("the window held for the CLI and the control socket alike; the keyring:\n{list}");
+
+    // 6. K-14: what an entry grants is saved with it. The daemon starts again and reads the
+    // keyring back from the disk: carol, trusted with drive over the socket, still has it.
+    let (again, sock_again) = start_daemon(&alice);
+    if sock_again.is_none() {
+        kill(again);
+        panic!("CANNOT MEASURE: the restarted daemon never said where its control socket is");
+    }
+    let restarted = trusted(&alice);
+    kill(again);
+    assert!(
+        entry(&restarted, &carol).ends_with("carol  read + drive"),
+        "PRODUCT: carol was trusted with drive, and after the daemon restarted `vox trust list` \
+         must still say `read + drive` for her; it said:\n{restarted}"
+    );
 }
