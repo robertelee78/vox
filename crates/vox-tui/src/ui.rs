@@ -1323,7 +1323,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
         // for a member with drive only (CL-3).
         Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {
-            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :interrupt · :stop · :general · : command · Esc back"
+            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · a approve · r reject · 1-9 answer · type to the session, /command · :share <path> · :interrupt · :stop · :general · : command · Esc back"
         }
         Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"

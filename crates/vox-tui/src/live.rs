@@ -1122,6 +1122,9 @@ impl DaemonCore {
                 DriveAct::Approve(r) => d::approve(&paths, &t, r).await,
                 DriveAct::Reject(r, why) => d::reject(&paths, &t, r, why.as_deref()).await,
                 DriveAct::Answer(r, answers) => d::answer(&paths, &t, r, answers).await,
+                DriveAct::File(path, note) => {
+                    d::file(&paths, &t, std::path::Path::new(path), note.as_deref()).await
+                }
             }
         });
         // What the Session says of it is read again at once.
