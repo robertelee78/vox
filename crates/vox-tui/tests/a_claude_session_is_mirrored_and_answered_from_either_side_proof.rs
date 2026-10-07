@@ -1267,9 +1267,21 @@ fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
 ///    before the harness has recorded the rejection. Exactly one takes effect, the terminal's: the
 ///    Session reads "answered in the terminal: rejected", and an answer after the record is
 ///    refused, saying it was answered at the terminal.
+/// 5. approved from the Session's own node: `claude-a`, the node the session runs on, approves
+///    with `vox room session` as its operator (ADR-029 SC-2), trusting nobody but `person`. The
+///    hook gives the approval; `person`'s Session reads "answered in Vox by claude-a: approved".
+/// 6. a file sent in from the Session's own node: it lands whole on that node, where the Session
+///    says (no tunnel runs from a node to itself, so it is copied from the share).
+/// 7. another node on the same daemon, through the own-node path: the test, as an attacker
+///    (apparatus), writes the own-node drive request (`OwnDrive`) for `claude-a`'s Session on
+///    `person`'s own connection to the daemon. It is refused, and the hook is still waiting
+///    3 s later: that path drives only the attached node's own Sessions.
 ///
-/// **Mutation that must turn it red** (#545's own): the request closed when the Session's answer
-/// is sent → arm 4 reads "approved here".
+/// **Mutations that must turn it red** (#545's own): the request closed when the Session's answer
+/// is sent → arm 4 reads "approved here". A node's own drive refused as an untrusted node's (DR-2
+/// without the node itself) → arm 5 is refused. A file from the node itself pulled as from another
+/// node → arm 6 reads "did not arrive whole". The own-node request served as whichever attached node
+/// holds the Session (not the one the connection is attached as) → arm 7's request is delivered.
 #[test]
 #[ignore = "real binary; run in release"]
 fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
@@ -1448,5 +1460,162 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
         !ok && said.contains("already answered at the terminal"),
         "PRODUCT: arm 4: an answer after the harness settled the request must be refused, saying \
          it was answered at the terminal; vox said {said:?}"
+    );
+
+    // ---- 5. approved from the Session's own node ----
+    let e5 = serde_json::json!({ "command": "touch e5" });
+    let hook = ask("toolu_5", "Bash", &e5);
+    session_says("Bash: touch e5 — approve or reject?");
+    let (ok, out, err) = w.vox(
+        AGENT,
+        &["room", "session", &room, SESSION, "--approve", "toolu_5"],
+        None,
+    );
+    let said = format!("{out}{err}").trim().to_owned();
+    println!("[proof] 5. --approve toolu_5 from {AGENT}, the Session's own node: {said}");
+    let d = decision(hook);
+    assert!(
+        ok && d["behavior"] == "allow",
+        "PRODUCT: arm 5: the Session's own node must approve its own Session's request; vox said \
+         {said:?}, the hook gave {d}"
+    );
+    transcript.tool_result("toolu_5", "", false);
+    session_says(&format!(
+        "Bash: touch e5 — answered in Vox by {AGENT}: approved"
+    ));
+    // ---- 6. a file sent in from the Session's own node ----
+    // This world's stand-in runs in no tmux, so the session itself is not told; what is proved is
+    // that the file lands whole on the node and the Session says where.
+    let sent = w.root.join("from-its-own-node.txt");
+    std::fs::write(&sent, "bytes from the session's own node\n")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the file to send: {e}"));
+    let (ok, out, err) = w.vox(
+        AGENT,
+        &[
+            "room",
+            "session",
+            &room,
+            SESSION,
+            "--file",
+            &sent.to_string_lossy(),
+        ],
+        None,
+    );
+    let said = format!("{out}{err}").trim().to_owned();
+    println!("[proof] 6. --file from {AGENT}, the Session's own node: {said}");
+    assert!(
+        ok,
+        "PRODUCT: arm 6: the Session's own node must be able to send its Session a file; vox said \
+         {said:?}"
+    );
+    let plain =
+        session_says("from-its-own-node.txt (34 bytes) — accepted, pulling 34 bytes ✗ landed at ");
+    let landed = plain
+        .split("landed at ")
+        .nth(1)
+        .and_then(|r| r.split(", but").next())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let got = std::fs::read(&landed).unwrap_or_default();
+    println!(
+        "[proof] 6. landed at {}: {} bytes",
+        landed.display(),
+        got.len()
+    );
+    assert!(
+        got == b"bytes from the session's own node\n",
+        "PRODUCT: arm 6: the file sent from the Session's own node must land whole where the \
+         Session says ({}); read {} bytes",
+        landed.display(),
+        got.len()
+    );
+
+    // ---- 7. another node on the same daemon, through the own-node path ----
+    let e7 = serde_json::json!({ "command": "touch e7" });
+    let mut hook = ask("toolu_7", "Bash", &e7);
+    session_says("Bash: touch e7 — approve or reject?");
+    let link = w.staged(PERSON, &["room", "link", &room], None);
+    let room_id = link
+        .trim()
+        .strip_prefix("vox://")
+        .and_then(|r| r.split('?').next())
+        .and_then(|id| vox_core::node::link::b32_decode(id, "room").ok())
+        .unwrap_or_else(|| panic!("APPARATUS (staging): no room id in `vox room link`: {link:?}"));
+    let socket = w.data.join(".daemon").join("vox.sock");
+    let at = vox_core::node::ipc::NodeSocket::one_shot(
+        socket,
+        vox_core::node::paths::NodeName::parse(PERSON).expect("APPARATUS: a node name"),
+    );
+    let forged = vox_core::node::drive_input::OwnDrive {
+        room: room_id,
+        request: vox_agentcomms::drive::Request {
+            v: 1,
+            session: SESSION.to_owned(),
+            action: vox_agentcomms::drive::Action::Approve {
+                r#ref: "toolu_7".to_owned(),
+            },
+        },
+    }
+    .to_bytes()
+    .expect("APPARATUS: the forged request");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a runtime");
+    let answer = rt.block_on(async {
+        let (mut stream, me) = vox_core::node::ipc::open_as(&at)
+            .await
+            .unwrap_or_else(|e| panic!("APPARATUS: {PERSON}'s connection to the daemon: {e}"));
+        vox_core::node::ipc::write_frame(&mut stream, &forged)
+            .await
+            .unwrap_or_else(|e| panic!("APPARATUS: writing the forged request: {e}"));
+        let body = tokio::time::timeout(
+            Duration::from_secs(30),
+            vox_core::node::ipc::read_frame(&mut stream),
+        )
+        .await;
+        (me, body)
+    });
+    let (me, body) = answer;
+    let said = match &body {
+        Ok(Ok(Some(b))) => vox_core::node::drive_input::parse_own_answer(b)
+            .map_or_else(|| format!("{b:?}"), |a| format!("ok={} {}", a.ok, a.said)),
+        other => format!("{other:?}"),
+    };
+    println!(
+        "[proof] 7. {PERSON} (connection attached as {:?}) asks the own-node path to approve \
+         {AGENT}'s request: {said}",
+        me.map(|m| vox_core::node::link::b32_encode(&m)[..12].to_owned())
+    );
+    let t0 = Instant::now();
+    let mut answered = None;
+    while t0.elapsed() < Duration::from_secs(3) {
+        if let Ok(Some(status)) = hook.try_wait() {
+            answered = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        answered.is_none() && !said.starts_with("ok=true"),
+        "PRODUCT: arm 7: another node on the same daemon must not drive {AGENT}'s Session through \
+         the own-node path; the daemon answered {said:?}, and the hook {}",
+        if answered.is_some() {
+            "gave an answer"
+        } else {
+            "still waits"
+        }
+    );
+    // Released as its operator would: the Session's own node rejects it.
+    let (ok, out, err) = w.vox(
+        AGENT,
+        &["room", "session", &room, SESSION, "--reject", "toolu_7"],
+        None,
+    );
+    let d = decision(hook);
+    assert!(
+        ok && d["behavior"] == "deny",
+        "PRODUCT: arm 7: the Session's own node must still answer the request; vox said \
+         {out}{err}, the hook gave {d}"
     );
 }

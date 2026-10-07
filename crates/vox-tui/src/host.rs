@@ -518,6 +518,7 @@ impl Router {
         let g = self
             .want(&u.node, want, u.passphrase, Vec::new(), u.anchors)
             .await?;
+        let drive = (Arc::downgrade(&self.inner), u.node.clone());
         Ok(Lease {
             node: u.node,
             handle: g.handle,
@@ -528,6 +529,7 @@ impl Router {
             // `vox lan up`: the daemon asks the root helper for the device itself (S-5); and
             // `vox up`: the daemon says where its proxy is (ADR-028 S-5).
             extension: Some(std::sync::Arc::new(DaemonExtension {
+                drive,
                 proxy: self.inner.proxy.as_ref().map(|proxy| {
                     let weak = Arc::downgrade(&self.inner);
                     crate::daemon_proxy::ProxyReport {
@@ -774,6 +776,39 @@ impl Router {
         });
     }
 
+    /// Drive input for one of `node`'s own Sessions, from a client attached as `node` on its own
+    /// socket ([`vox_core::node::drive_input::OwnDrive`]): the node is its Sessions' operator
+    /// (ADR-029 SC-2), so it is handled as a member's stream is, from the node itself.
+    async fn drive_own(
+        &self,
+        node: &NodeName,
+        handle: &NodeHandle,
+        own: vox_core::node::drive_input::OwnDrive,
+        mut stream: tokio::net::UnixStream,
+    ) {
+        let answer = match handle.view().identity.map(|i| i.fingerprint) {
+            Some(me) => {
+                let info = vox_core::node::app::AppInfo {
+                    channel_id: own.room,
+                    peer: me,
+                    label: crate::drive::LABEL.to_owned(),
+                    datagrams: false,
+                };
+                self.drive(node, handle, &info, own.request).await
+            }
+            None => crate::drive::Answer {
+                ok: false,
+                said: "this node is locked; nothing was sent".into(),
+                code: None,
+            },
+        };
+        let _ = vox_core::node::ipc::write_frame(
+            &mut stream,
+            &vox_core::node::drive_input::own_answer(&answer),
+        )
+        .await;
+    }
+
     /// One drive request on `stream`: read it, act on it, answer it, and say it in the Session.
     async fn drive_stream(
         &self,
@@ -842,10 +877,12 @@ impl Router {
             ));
         }
         let view = handle.view();
-        // DR-2: only a member this node trusts with drive.
+        let me = view.identity.as_ref().map(|i| i.fingerprint);
+        // DR-2: only a member this node trusts with drive, or the node itself, its Sessions'
+        // operator (SC-2), which reaches here only from its own socket (`drive_own`).
         // Said without this node's name for itself, which the driver may not know it by: the
         // driver names it (`code`).
-        if !view.drive.contains(&info.peer) {
+        if me != Some(info.peer) && !view.drive.contains(&info.peer) {
             return Answer {
                 ok: false,
                 said: vox_agentcomms::drive::no_drive("the session's node"),
@@ -858,7 +895,7 @@ impl Router {
         // DR-5 and TA-5: exactly this session, open on this node, and none other.
         let Some(reg) = crate::wake::registration(&paths, &req.session) else {
             return refuse(
-                "that session is not open on its node: it ended, or never registered there;                  nothing was sent to any other session"
+                "that session is not open on its node: it ended, or never registered there; nothing was sent to any other session"
                     .into(),
             );
         };
@@ -2371,9 +2408,12 @@ fn proxy_follow(weak: &std::sync::Weak<Inner>) {
     }
 }
 
-/// The requests the daemon serves itself on a node's connection (ADR-026 S-5): `vox lan up`, and
-/// `vox up`'s question about the proxy.
+/// The requests the daemon serves itself on a node's connection (ADR-026 S-5): `vox lan up`,
+/// `vox up`'s question about the proxy, and drive input for the node's own Sessions.
 struct DaemonExtension {
+    /// The router and the node the connection is attached as: who drives a Session of this node
+    /// from its own socket ([`vox_core::node::drive_input::OwnDrive`]).
+    drive: (std::sync::Weak<Inner>, NodeName),
     proxy: Option<crate::daemon_proxy::ProxyReport>,
 }
 
@@ -2381,6 +2421,7 @@ impl vox_core::node::ipc::Extension for DaemonExtension {
     fn claims(&self, body: &[u8]) -> bool {
         crate::lan_cli::LanUp.claims(body)
             || (self.proxy.is_some() && crate::daemon_proxy::ProxyReport::claims(body))
+            || vox_core::node::drive_input::OwnDrive::parse(body).is_some()
     }
 
     fn serve(
@@ -2389,6 +2430,17 @@ impl vox_core::node::ipc::Extension for DaemonExtension {
         stream: tokio::net::UnixStream,
         handle: NodeHandle,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        if let Some(own) = vox_core::node::drive_input::OwnDrive::parse(&body) {
+            let (inner, node) = self.drive.clone();
+            return Box::pin(async move {
+                // A daemon that is stopping drives nothing; the client hears no answer.
+                if let Some(inner) = inner.upgrade() {
+                    Router { inner }
+                        .drive_own(&node, &handle, own, stream)
+                        .await;
+                }
+            });
+        }
         match &self.proxy {
             Some(report) if crate::daemon_proxy::ProxyReport::claims(&body) => {
                 let report = report.clone();

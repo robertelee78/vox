@@ -450,6 +450,38 @@ pub async fn pull_driven(
     }
     let dir = room_dir(paths, &driven.room);
     crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+    // **From this node itself** (a node driving its own Session, ADR-029 SC-2): no tunnel runs
+    // from a node to itself, so the file is copied from where its share serves it, and held to
+    // what the drive named as a pull is.
+    if handle.view().identity.map(|i| i.fingerprint) == Some(driven.from) {
+        let (served, size, served_sha) = handle
+            .shares()
+            .served_file(&driven.room, &driven.tag)
+            .await
+            .ok_or("this node does not serve that file")?;
+        if size != driven.size || served_sha != sha {
+            return Err("the file this node serves is not the one the drive named".into());
+        }
+        let name = safe_file_name(&driven.name);
+        let part = dir.join(format!(
+            ".{name}.{}.part",
+            hex(&crate::hash::sha256(driven.tag.as_bytes())[..8])
+        ));
+        let copied = {
+            let (part, sha) = (part.clone(), sha.clone());
+            tokio::task::spawn_blocking(move || copy_checked(&served, &part, size, &sha))
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|r| r)
+        };
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&part);
+            return Err(e);
+        }
+        let placed = place(&part, &dir, &name);
+        let _ = std::fs::remove_file(&part);
+        return placed;
+    }
     let offer = Offer {
         room: driven.room,
         entry: crate::hash::sha256(driven.tag.as_bytes()),
@@ -487,6 +519,39 @@ pub async fn pull_driven(
     let placed = place(&part, &dir, &name);
     let _ = std::fs::remove_file(&part);
     placed
+}
+
+/// Copy `from` to `to`, holding it to `size` bytes and SHA-256 `sha` as a pull's bytes are held.
+fn copy_checked(from: &Path, to: &Path, size: u64, sha: &str) -> Result<(), String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let mut src =
+        std::fs::File::open(from).map_err(|e| format!("reading {}: {e}", from.display()))?;
+    let mut dst =
+        std::fs::File::create(to).map_err(|e| format!("writing {}: {e}", to.display()))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = src.read(&mut buf).map_err(|e| format!("reading: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > size {
+            return Err("the file is longer than the drive named".into());
+        }
+        hasher.update(&buf[..n]);
+        dst.write_all(&buf[..n])
+            .map_err(|e| format!("writing: {e}"))?;
+    }
+    dst.sync_all().map_err(|e| format!("writing: {e}"))?;
+    if total != size || hex(&hasher.finalize()) != sha {
+        return Err(format!(
+            "the file does not match what the drive named: expected sha256 {sha} over {size} bytes"
+        ));
+    }
+    Ok(())
 }
 
 /// The share `text` announces, if it is one this node may pull: a `file` announcement addressed to
