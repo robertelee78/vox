@@ -136,6 +136,23 @@ reported to the lead as staging rather than product, and a second run was green.
 | A Session keeps what its session did while its room was joining | `agent_hook_proof::a_session_works_in_the_room_its_start_directory_is_mapped_to`, release, `--ignored`, at `48b1c743` (2026-10-07) | passed in 70.9 s: the first prompt, typed before the node was a member, is read in the Session once the room opens; the dropped-entries sentence is quoted from `host.rs` (b2f4bd42), not run (it needs over 4 MiB held) |
 | `--to member/session` on `vox share` | `vox share --help` at `48b1c743` (f60207c0) | `Or address one session of a member as <member>/<session>, the session named as vox room sessions names it` … `For example: --to bob/gso-cap` |
 
+### Trust offers (`v040/trust-offers` c429f9be, `v040/agent-offers` dfbbf9ae, not merged)
+
+Written on 2026-10-07 against `dfbbf9ae`, which holds both, before either merged; to be checked
+again when they do. `cargo build --release --bin vox` with no features; one daemon in a scratch
+data root with nodes `ann` and `ben` (both with an identity passphrase), room `family`, every
+process stopped by PID.
+
+| Manual claim | Where and how | Observed |
+|---|---|---|
+| A newcomer is offered | `ben` joins `ann`'s room; `vox trust offers --node ann` | the card, then `xgfmgktt6c64dkgehy7nvxg3if (not in keyring) joined. No one you trust trusts it yet.`, `in "family"`, `accept: vox trust add … --name <name> [--drive]   dismiss: vox trust dismiss xgfmgktt6c64` |
+| The one who was there first is not | `vox trust offers --node ben` | `no offers: every node you share a room with is in your keyring, or was dismissed` |
+| Dismiss | `vox trust dismiss --node ann xgfmgk`; a prefix matching no offer | `vox: about to dismiss the offer of xgfmgktt6c64dkgehy7nvxg3if: on this node alone; …`, `vox: dismissed the offer of …; if it leaves and joins again, it is offered again`; `vox: no offer matches "zzzzzz"; vox trust offers lists them` (exit 1) |
+| Leave and join again: offered again | `vox room leave` and `vox room join` as `ben` | `ann`'s offers list `ben` again, `joined` |
+| Accept, and the offer back | `vox trust add --node ann FP --name ben`, the passphrase typed at a terminal; then `vox trust offers --node ben` | `vox: trusting xgfmgktt6c64dkgehy7nvxg3if as "ben": read`; `ann`'s offers empty; `ben`'s: `2o5a45ggy2i5ndadhow4xl776d (not in keyring) trusts you. No one you trust trusts it yet.` |
+| An agent's node is offered in its turn | `agent_hook_proof::an_offer_for_the_agents_node_is_shown_in_its_turn_and_only_the_operator_accepts_it`, release, `--ignored`, at `dfbbf9ae` | passed in 10.5 s; turn 1 carried `Vox offers your node nodes to trust (…)` and the `accept: … --node default` line quoted |
+| The TUI's offer rows, card and accept prompt | source at `dfbbf9ae` (`ui.rs`, `state.rs`); the room-truth proof's `offer`, `reoffer`, `offerback` and `accept` claims are still to be run (a first run had a `vox` without `test-knobs`: APPARATUS) | quoted from the source |
+
 ## v0.3.1 command check
 
 Run on 2026-10-05 for #425 with `vox 0.3.1` built at `bf6dfcdb` (`cargo build --release --bin
