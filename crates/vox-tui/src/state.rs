@@ -11,7 +11,7 @@ use secrecy::SecretString;
 use vox_core::hash::Digest32;
 use zeroize::Zeroizing;
 
-use crate::viewmodel::{Command, SessionView, ViewModel};
+use crate::viewmodel::{Command, DriveAct, SessionView, ViewModel};
 
 /// How many lines PageUp/PageDown scroll the timeline.
 pub const TIMELINE_PAGE: usize = 10;
@@ -525,6 +525,21 @@ impl UiState {
                     let Some(channel_id) = self.active_channel_id(vm) else {
                         return Action::Redraw;
                     };
+                    // In a Session, the composer types into the session as its operator, or sends
+                    // it a slash command (ADR-029 DR-1.2, DR-1.6). Only a driver has one (CL-3).
+                    if let Some(x) = showing_session(self, vm).filter(|x| x.can_drive) {
+                        self.composer.clear();
+                        let act = if text.starts_with('/') {
+                            DriveAct::Slash(text)
+                        } else {
+                            DriveAct::Say(text)
+                        };
+                        return Action::Dispatch(Command::Drive {
+                            channel_id,
+                            session: (x.node, x.id.clone()),
+                            act,
+                        });
+                    }
                     // `@alias` addresses a member (ADR-028 K-4): the whole fingerprint goes into
                     // `to`. One that names nobody, or more than one, keeps the text to fix.
                     let members: Vec<Digest32> = vm
@@ -690,8 +705,11 @@ impl UiState {
                 {
                     self.focus = self.focus.next();
                 }
-                // A Session has no composer: typing into one is driving (ADR-029 DR-1).
-                if self.focus == Focus::Composer && matches!(self.showing, Showing::Session(..)) {
+                // A Session has a composer only for a driver (ADR-029 DR-1, CL-3).
+                if self.focus == Focus::Composer
+                    && matches!(self.showing, Showing::Session(..))
+                    && !showing_session(self, vm).is_some_and(|x| x.can_drive)
+                {
                     self.focus = self.focus.next();
                 }
                 Action::Redraw
@@ -1217,6 +1235,13 @@ impl UiState {
                         })
                     }
                     Some(Parsed::Show(showing)) => self.show(showing, vm),
+                    Some(Parsed::Drive(channel_id, session, act)) => {
+                        Action::Dispatch(Command::Drive {
+                            channel_id,
+                            session,
+                            act,
+                        })
+                    }
                     Some(Parsed::To(names)) => {
                         self.set_to(&names, vm);
                         Action::Redraw
@@ -1269,6 +1294,7 @@ impl UiState {
         if matches!(showing, Showing::Session(..)) && self.focus == Focus::Composer {
             self.focus = Focus::Timeline;
         }
+        self.composer.clear();
         self.selected_message = None;
         self.selected_session_line = None;
         self.details_open = false;
@@ -1435,6 +1461,8 @@ pub enum Parsed {
     Urgent,
     /// Show General, All or one Session in the room's timeline (ADR-029 CL-2).
     Show(Showing),
+    /// Drive the Session on screen (ADR-029 DR-1).
+    Drive(Digest32, (Digest32, String), DriveAct),
 }
 
 /// The Session the room's timeline shows, while it shows one that the room still lists.
@@ -1568,6 +1596,28 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     }
     // Channel-scoped verbs require an active channel.
     let channel = ui.active_channel_id(vm)?;
+    // Interrupting or stopping is driving the Session on screen (DR-1.3); without drive it is
+    // refused (CL-3), and outside a Session there is nothing to send it to.
+    if let (Showing::Session(..), "interrupt" | "stop") = (&ui.showing, verb) {
+        let Some(x) = showing_session(ui, vm) else {
+            return Some(Parsed::Refused("this Session is no longer listed".into()));
+        };
+        if !x.can_drive {
+            return Some(Parsed::Refused(format!(
+                "you cannot drive this Session: {} has not given you drive",
+                x.node_alias
+            )));
+        }
+        return Some(Parsed::Drive(
+            channel,
+            (x.node, x.id.clone()),
+            if verb == "stop" {
+                DriveAct::Stop
+            } else {
+                DriveAct::Interrupt
+            },
+        ));
+    }
     // In a Session, the composer's verbs would write to the room, not the session: refused.
     if let (Showing::Session(..), "send" | "share") = (&ui.showing, verb) {
         let label = showing_session(ui, vm).map_or("this Session", |x| x.label.as_str());

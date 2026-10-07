@@ -1066,6 +1066,58 @@ impl DaemonCore {
 
     /// Read the room on screen: whole when it first comes on screen, or when a late row or an
     /// unknown cursor says the order changed above what is shown; else only what arrived since.
+    /// Send `act` to the Session `id` of `node` in `room`, through the one sender `vox room
+    /// session` uses, and say what came of it in its words (ADR-029 DR-1, DR-6, CL-1).
+    fn drive(
+        &mut self,
+        room: Digest32,
+        node: Digest32,
+        id: &str,
+        act: crate::viewmodel::DriveAct,
+    ) -> CommandStatus {
+        use crate::session_drive_ui as d;
+        use crate::viewmodel::DriveAct;
+        let names = SessionNames {
+            trusted: &self.snapshot.trusted,
+            me: self.snapshot.me,
+        };
+        let alias = names.alias_of(&node);
+        let row = self
+            .snapshot
+            .open
+            .iter()
+            .find(|o| o.channel_id == room)
+            .and_then(|o| o.sessions.iter().find(|x| x.node == node && x.id == id));
+        let Some(row) = row else {
+            return CommandStatus::Said(format!("no Session in this room is named {id}"));
+        };
+        let t = d::Target {
+            room,
+            node,
+            session: id.to_owned(),
+            label: vox_agentcomms::envelope::session_label(&alias, row.name.as_deref(), id),
+            can_drive: row.can_drive,
+        };
+        let paths = match self.account.node_paths(&self.node) {
+            Ok(p) => p,
+            Err(e) => return CommandStatus::Said(format!("not sent to {}: {e}", t.label)),
+        };
+        let said = until_stopped(&self.rt, &self.stop, async {
+            match &act {
+                DriveAct::Say(text) => d::say(&paths, &t, text).await,
+                DriveAct::Slash(text) => d::slash(&paths, &t, text).await,
+                DriveAct::Interrupt => d::interrupt(&paths, &t).await,
+                DriveAct::Stop => d::stop(&paths, &t).await,
+            }
+        });
+        // What the Session says of it is read again at once.
+        self.session_read = None;
+        match said {
+            Some(Ok(s) | Err(s)) => CommandStatus::Said(s),
+            None => CommandStatus::Said(format!("not sent to {}: the TUI is stopping", t.label)),
+        }
+    }
+
     /// Read the shown Session's entries, at most once a second, and draw them as `vox room
     /// session` does (ADR-029 SC-1, CL-1). Entries this node cannot open are not among them: a
     /// member without drive reads none (SC-2).
@@ -1088,24 +1140,9 @@ impl DaemonCore {
         else {
             return;
         };
-        let kind = |r: &vox_core::node::drive::SessionRow| {
-            serde_json::from_str::<serde_json::Value>(&r.body)
-                .ok()
-                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
-                .unwrap_or_default()
-        };
-        let seq = |r: &vox_core::node::drive::SessionRow| {
-            serde_json::from_str::<serde_json::Value>(&r.body)
-                .ok()
-                .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64))
-                .unwrap_or(0)
-        };
-        // The Session's own entries are its node's; a driver's entries name the session too.
-        let mut mine: Vec<_> = rows
-            .into_iter()
-            .filter(|r| r.session_id == id && (r.author == node || kind(r) == "drive"))
-            .collect();
-        mine.sort_by_key(|r| (r.created_millis, seq(r)));
+        // The Session's own entries and the drive entries naming it, in written order: as
+        // `vox room session` takes them.
+        let mine = crate::session_cli::of_session(rows, &id, &node);
         let me = self.snapshot.me;
         let names = SessionNames {
             trusted: &self.snapshot.trusted,
@@ -2205,6 +2242,11 @@ impl CoreHandle for DaemonCore {
                 ),
                 other => other,
             },
+            Command::Drive {
+                channel_id,
+                session: (node, id),
+                act,
+            } => self.drive(channel_id, node, &id, act),
             Command::ShowSession {
                 channel_id,
                 session,

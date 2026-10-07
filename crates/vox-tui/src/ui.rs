@@ -497,14 +497,16 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
         ])
         .split(area);
 
-    // A Session has no composer: typing into one is driving (ADR-029 DR-1).
+    // A Session has a composer only for a driver: typing into one is driving (ADR-029 DR-1,
+    // CL-3).
     let session = showing_session(ui, vm);
     let in_session = matches!(ui.showing, Showing::Session(..));
+    let composing = !in_session || session.is_some_and(|x| x.can_drive);
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(if in_session { 0 } else { 3 }),
+            Constraint::Length(if composing { 3 } else { 0 }),
         ])
         .split(cols[0]);
 
@@ -647,7 +649,11 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
                 },
             )
     });
-    if !in_session {
+    // In a Session, the composer is to the session (DR-1.2).
+    if let Some(x) = session.filter(|_| in_session) {
+        about = vec![format!("to {}", x.label)];
+    }
+    if composing {
         render_composer(
             frame,
             body[1],
@@ -1314,7 +1320,7 @@ fn hint_text(ui: &UiState, vm: &ViewModel) -> String {
         // A Session's own help line (ADR-029 §8): its driving words join it as they are built,
         // for a member with drive only (CL-3).
         Screen::Channel if showing_session(ui, vm).is_some_and(|x| x.can_drive) => {
-            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · :general · :all · :session <name> · : command · Esc back"
+            " Tab switch pane · ↑/↓ select a line · Enter or d: Details · type to the session, /command · :interrupt · :stop · :general · :all · : command · Esc back"
         }
         Screen::Channel if matches!(ui.showing, Showing::Session(..)) => {
             " Tab switch pane · ↑/↓ select · Enter show · :general · :all · :session <name> · : command · Esc back"
