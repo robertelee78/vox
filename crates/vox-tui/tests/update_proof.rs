@@ -34,12 +34,10 @@ mod watchdog;
 mod optional_proof;
 
 // This proof counts no requests; `install_sh_proof` does.
-#[cfg(target_os = "macos")]
 #[allow(dead_code)]
 #[path = "support/release_server.rs"]
 mod release_server;
 
-#[cfg(target_os = "macos")]
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
 optional_proof::not_run!(an_older_release_updates_itself_and_refuses_a_bad_download);
@@ -579,6 +577,13 @@ fn vox_update_replaces_an_install_it_owns_and_refuses_the_rest() {
 
     #[cfg(target_os = "macos")]
     bundle_claims(&mut claims, &mut receipts);
+    // A standalone install on a Mac takes only a release Apple vouches for, which no fixture is;
+    // its restart is the same code as the bundle's, measured there.
+    #[cfg(target_os = "linux")]
+    {
+        test_knobs::require(&["VOX_TEST_RELEASE_BASE"]);
+        daemon_restart_claim(&mut claims, &mut receipts, false);
+    }
 
     dispose("vox update proof", &claims, &receipts, true);
 }
@@ -667,12 +672,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// digest; every channel's app record describes the one zip.
 #[cfg(target_os = "macos")]
 fn bundle_release(root: &Path, channels: &[(&str, Option<&str>)]) {
-    let triple = target_triple();
     let work = tmpdir();
     let helper = work.path().join("vox");
     version_stub(&helper, NEWER);
-    let app = app_bundle(work.path(), NEWER, &helper);
-    let zip_name = format!("Vox-{NEWER}-{triple}.zip");
+    bundle_release_of(root, NEWER, &helper, channels);
+}
+
+/// [`bundle_release`] of `version`, its app carrying `helper` as its vox.
+#[cfg(target_os = "macos")]
+fn bundle_release_of(root: &Path, version: &str, helper: &Path, channels: &[(&str, Option<&str>)]) {
+    let triple = target_triple();
+    let work = tmpdir();
+    let app = app_bundle(work.path(), version, helper);
+    let zip_name = format!("Vox-{version}-{triple}.zip");
     let zip = work.path().join(&zip_name);
     let zipped = Command::new("/usr/bin/ditto")
         .args(["-c", "-k", "--keepParent"])
@@ -685,9 +697,9 @@ fn bundle_release(root: &Path, channels: &[(&str, Option<&str>)]) {
         "APPARATUS: zipping the fixture app failed"
     );
     let zip_bytes = std::fs::read(&zip).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
-    let helper_bytes = std::fs::read(&helper).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    let helper_bytes = std::fs::read(helper).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
 
-    let assets = root.join(format!("releases/download/v{NEWER}"));
+    let assets = root.join(format!("releases/download/v{version}"));
     let records = root.join("releases/latest/download");
     for d in [&assets, &records] {
         std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
@@ -698,7 +710,7 @@ fn bundle_release(root: &Path, channels: &[(&str, Option<&str>)]) {
         let record = |kind: &str, package: &str, size: usize, sha: &str| {
             format!(
                 "{{\"kind\":\"{kind}\",\"schema_version\":1,\"package\":\"{package}\",\
-             \"channel\":\"{channel}\",\"target\":\"{triple}\",\"version\":\"{NEWER}\",\
+             \"channel\":\"{channel}\",\"target\":\"{triple}\",\"version\":\"{version}\",\
              \"size\":{size},\"sha256\":\"{sha}\"}}\n"
             )
         };
@@ -764,9 +776,22 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
             return;
         }
     };
+    // `vox update` restarts the account's daemon: every run here names a scratch account, where
+    // none runs, so no update reaches a real one.
+    let no_daemon = tmpdir();
+    let no_data = no_daemon.path().join("data");
+    let no_config = no_daemon.path().join("config");
     let base = [
         ("VOX_TEST_RELEASE_BASE", server.base.as_str()),
         ("VOX_NO_SHELL_SETUP", "1"),
+        (
+            "VOX_DATA_DIR",
+            no_data.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ),
+        (
+            "VOX_CONFIG_DIR",
+            no_config.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ),
     ];
 
     // ---- the update: both the CLI and the app are the new version, the old kept whole ----
@@ -788,7 +813,7 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
                 && app == NEWER
                 && prev_cli.contains(VERSION)
                 && prev_app == VERSION
-                && text.contains("restart Vox and the vox daemon"),
+                && text.contains("restart Vox to run"),
             format!(
                 "after `vox update` (exit_ok={}): vox reports {cli:?}, Vox.app says {app:?}; \
                  .Vox.app.previous holds vox {prev_cli:?} and app {prev_app:?}; it said {text:?}",
@@ -997,6 +1022,8 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         }
     }
 
+    daemon_restart_claim(claims, receipts, true);
+
     // ---- a Vox.app install.sh did not make is not touched (M-29) ---------------------------
     {
         let tmp = tmpdir();
@@ -1013,6 +1040,292 @@ fn bundle_claims(claims: &mut Vec<Claim>, receipts: &mut BTreeMap<String, String
         ));
     }
     drop(server);
+}
+
+/// A copy of this build that says it is `version` (as long as [`VERSION`]): the next release, as
+/// far as anything can tell. Every `VERSION` in it that stands alone (not part of a longer version,
+/// nor a crate's `name-x.y.z` path) is rewritten; the copy is ad-hoc signed again, and refused as
+/// APPARATUS unless it answers `vox <version>`.
+fn vox_saying(dir: &Path, version: &str) -> Result<PathBuf, String> {
+    let (from, to) = (VERSION.as_bytes(), version.as_bytes());
+    if from.len() != to.len() {
+        return Err(format!("{version:?} is not as long as {VERSION:?}"));
+    }
+    let mut bytes = std::fs::read(VOX).map_err(|e| format!("reading {VOX}: {e}"))?;
+    let part = |b: u8| b.is_ascii_digit() || b == b'.';
+    let mut i = 1;
+    while i + from.len() + 1 < bytes.len() {
+        if bytes[i] == from[0]
+            && &bytes[i..i + from.len()] == from
+            && !part(bytes[i - 1])
+            && bytes[i - 1] != b'-'
+            && !bytes[i + from.len()].is_ascii_digit()
+            && !(bytes[i + from.len()] == b'.' && bytes[i + from.len() + 1].is_ascii_digit())
+        {
+            bytes[i..i + from.len()].copy_from_slice(to);
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+    let path = dir.join("vox");
+    std::fs::write(&path, &bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    make_executable(&path);
+    // A test build's debug info takes it past the 256 MiB a release binary may be; the code that
+    // runs is the same without it.
+    #[cfg(target_os = "linux")]
+    {
+        let stripped = Command::new("strip")
+            .arg("--strip-debug")
+            .arg(&path)
+            .output()
+            .map_err(|e| format!("strip: {e}"))?;
+        if !stripped.status.success() {
+            return Err(format!(
+                "strip: {}",
+                String::from_utf8_lossy(&stripped.stderr).trim()
+            ));
+        }
+        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+        if size > 256 * 1024 * 1024 {
+            return Err(format!(
+                "the stripped copy is {size} bytes, over the 256 MiB a release binary may be"
+            ));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let signed = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&path)
+        .output()
+        .map_err(|e| format!("codesign: {e}"))?;
+    #[cfg(target_os = "macos")]
+    if !signed.status.success() {
+        return Err(format!(
+            "codesign: {}",
+            String::from_utf8_lossy(&signed.stderr).trim()
+        ));
+    }
+    let says = reports(&path);
+    if says != format!("vox {version}") {
+        return Err(format!(
+            "the rewritten copy says {says:?}, not vox {version}"
+        ));
+    }
+    Ok(path)
+}
+
+/// The release a standalone install updates to, under `root`, as GitHub serves it: vox's record
+/// on `stable` naming `version`, and `helper` as its binary.
+#[cfg(target_os = "linux")]
+fn standalone_release_of(root: &Path, version: &str, helper: &Path) {
+    let triple = target_triple();
+    let assets = root.join(format!("releases/download/v{version}"));
+    let records = root.join("releases/latest/download");
+    for d in [&assets, &records] {
+        std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    }
+    copy(helper, &assets.join(format!("vox-{triple}")));
+    let bytes = std::fs::read(helper).unwrap_or_else(|e| panic!("APPARATUS: {e}"));
+    let sha = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(&bytes)
+            .iter()
+            .fold(String::new(), |mut s, b| {
+                use core::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            })
+    };
+    write(
+        &records.join(format!("stable-{triple}.json")),
+        &format!(
+            "{{\"kind\":\"vox.standalone-release\",\"schema_version\":1,\"package\":\"vox\",\
+             \"channel\":\"stable\",\"target\":\"{triple}\",\"version\":\"{version}\",\
+             \"size\":{},\"sha256\":\"{sha}\"}}\n",
+            bytes.len()
+        ),
+    );
+}
+
+/// Whatever holds a file under `dir` open: the vox processes a proof started for that account.
+fn holders(dir: &Path) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut pids = Vec::new();
+        for proc in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let pid = proc.file_name().to_string_lossy().into_owned();
+            if !pid.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let holds = std::fs::read_dir(proc.path().join("fd"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|t| t.starts_with(dir)));
+            if holds {
+                pids.push(pid);
+            }
+        }
+        pids
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Command::new("/usr/sbin/lsof")
+            .arg("-t")
+            .arg("+D")
+            .arg(dir)
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Decider 2026-10-07: once `vox update` has put the new vox in place (Vox.app when `bundle`, the
+/// standalone binary otherwise), it restarts the running daemon onto the new version. A node it
+/// keeps the passphrase of is attached again; any other attached node is detached, and the update
+/// names it with the command that attaches it again.
+fn daemon_restart_claim(
+    claims: &mut Vec<Claim>,
+    receipts: &mut BTreeMap<String, String>,
+    bundle: bool,
+) {
+    let id = if bundle {
+        "bundle.update_restarts_the_daemon_onto_the_new_version"
+    } else {
+        "update.restarts_the_daemon_onto_the_new_version"
+    };
+    // The next release: this build, saying a version above this one's.
+    let next: String = std::iter::once('9')
+        .chain(VERSION.chars().skip(1))
+        .collect();
+    let work = tmpdir();
+    let helper = match vox_saying(work.path(), &next) {
+        Ok(h) => h,
+        Err(why) => {
+            claims.push(blocked(
+                id,
+                format!("APPARATUS: the next release's vox: {why}"),
+            ));
+            return;
+        }
+    };
+    let tree = tmpdir();
+    let tmp = tmpdir();
+    let home = tmp.path();
+    let link = if bundle {
+        #[cfg(target_os = "macos")]
+        {
+            bundle_release_of(tree.path(), &next, &helper, &[("stable", None)]);
+            bundle_install(home, Some("stable"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        unreachable!("a Vox.app install is made only on macOS")
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            standalone_release_of(tree.path(), &next, &helper);
+            install_dir(home, "stable").join("vox")
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!("a standalone restart is measured only on Linux")
+    };
+    let server = match release_server::serve(tree.path()) {
+        Ok(s) => s,
+        Err(why) => {
+            claims.push(blocked(id, format!("APPARATUS: the release server: {why}")));
+            return;
+        }
+    };
+    let data = home.join("data");
+    let config = home.join("config");
+    let pass = home.join("pass");
+    write(&pass, "update proof passphrase\n");
+    let env = [
+        ("VOX_TEST_RELEASE_BASE", server.base.as_str()),
+        ("VOX_NO_SHELL_SETUP", "1"),
+        (
+            "VOX_DATA_DIR",
+            data.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ),
+        (
+            "VOX_CONFIG_DIR",
+            config.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ),
+        ("VOX_LISTEN", "127.0.0.1:0"),
+    ];
+    let pass_arg = pass.to_str().expect("APPARATUS: a UTF-8 temp path");
+    let mut staging = Vec::new();
+    for args in [
+        &["node", "create", "kept", "--passphrase-file", pass_arg][..],
+        &["node", "create", "plain", "--passphrase-file", pass_arg],
+        &[
+            "node",
+            "attach",
+            "kept",
+            "--keep",
+            "--passphrase-file",
+            pass_arg,
+        ],
+        &["node", "attach", "plain", "--passphrase-file", pass_arg],
+    ] {
+        let out = vox(&link, home, args, &env);
+        if !out.status.success() {
+            staging.push(format!("`vox {}` said {:?}", args.join(" "), said(&out)));
+        }
+    }
+    let listed = |link: &Path| -> (bool, bool, String) {
+        let out = said(&vox(link, home, &["node", "list"], &env));
+        let attached = |name: &str| {
+            out.lines()
+                .any(|l| l.split_whitespace().take(2).eq([name, "attached"]))
+        };
+        (attached("kept"), attached("plain"), out)
+    };
+    let (kept_before, plain_before, before) = listed(&link);
+
+    let out = vox(&link, home, &["update"], &env);
+    let text = said(&out);
+    let (kept_after, plain_after, after) = listed(&link);
+
+    // Every vox this left running is stopped, by its pid: whichever holds the account's files.
+    for pid in holders(&data) {
+        let _ = Command::new("/bin/kill").arg(pid).status();
+    }
+
+    if !staging.is_empty() || !kept_before || !plain_before {
+        claims.push(blocked(
+            id,
+            format!(
+                "APPARATUS: staging two attached nodes failed: {staging:?}; `vox node list` said \
+                 {before:?}"
+            ),
+        ));
+        return;
+    }
+    let restarted = format!("the vox daemon was restarted and runs vox {next}");
+    claims.push(claim(
+        id,
+        out.status.success()
+            && text.contains(&restarted)
+            && text.contains("node plain is detached")
+            && text.contains("vox node attach plain")
+            && !text.contains("node kept is detached")
+            && kept_after
+            && !plain_after,
+        format!(
+            "with nodes kept (passphrase kept) and plain attached, `vox update` (exit_ok={}) said \
+             {text:?}; then `vox node list` said {after:?} (kept attached={kept_after}, plain \
+             attached={plain_after}); wanted {restarted:?} and plain named as detached",
+            out.status.success()
+        ),
+    ));
+    receipts.insert(id.into(), text);
 }
 
 /// **Optional** (the `optional-proofs` feature): the published previous release updates itself

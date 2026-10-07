@@ -2041,6 +2041,11 @@ enum Cmd {
     /// it before anything is renamed, keeps the binary it replaced as `.vox-previous`, and
     /// refreshes your shell completions. Only an install `install.sh` or a previous `vox
     /// update` made is replaced in place; a build from source is refused, not overwritten.
+    ///
+    /// On a Mac, Vox.app is replaced whole. A running vox daemon is then restarted onto the new
+    /// version: a node whose passphrase the daemon keeps is attached again, and any other node
+    /// it had attached is named, with the `vox node attach` that attaches it again. A daemon
+    /// run by hand (`vox daemon` in a terminal) is left running, and you are told.
     Update {
         /// Report whether a newer release exists, and change nothing.
         #[arg(long)]

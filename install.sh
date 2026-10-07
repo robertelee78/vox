@@ -356,7 +356,8 @@ SWAP
     || fail "$INSTALL_DIR/vox reports ${installed:-nothing}, not vox $version (on macOS see: codesign -dv $APPS/Vox.app)"
   linked_ok=1
   say "linked: $INSTALL_DIR/vox -> $APPS/Vox.app/Contents/Helpers/vox ($installed)"
-  # As `vox update` says it: a running app or daemon keeps the old code until restarted.
+  # A running app or daemon keeps the old code until restarted (`vox update` restarts the daemon;
+  # a reinstall does not).
   say "restart Vox and the vox daemon to run vox $version: both keep running what they started with until they are restarted"
 else
   # --- vox (Linux, unchanged by ADR-014) -----------------------------------------------------

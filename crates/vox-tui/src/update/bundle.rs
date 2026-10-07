@@ -14,8 +14,8 @@
 //! and Apple vouches for both under the Developer IDs that signed the installed ones. Then one
 //! `renameatx_np(RENAME_SWAP)` puts the new bundle in place, so `Vox.app` is never missing or
 //! partial; the old one becomes `.Vox.app.previous`. A rollback is the same swap the other way.
-//! The app and the daemon keep running the old version until restarted, and the person is asked
-//! to restart both.
+//! The daemon is then restarted onto the new version ([`super::restart`]); an open app keeps
+//! running the old one until restarted, and the person is asked to restart it.
 
 use std::fs;
 use std::io::Read as _;
@@ -129,6 +129,7 @@ pub(super) fn update(
         apps.join(PREVIOUS).display()
     );
     ask_to_restart(current.to_string().as_str(), &vox.version_text);
+    super::restart::restart_daemon(&active.join(HELPER), &vox.version_text);
     shell_setup_from(apps, exe);
     Ok(())
 }
@@ -159,6 +160,7 @@ pub(super) fn rollback(apps: &Path, exe: &Path) -> Result<(), AppError> {
         previous.display()
     );
     ask_to_restart(&was, &now);
+    super::restart::restart_daemon(&active.join(HELPER), &now);
     shell_setup_from(apps, exe);
     Ok(())
 }
@@ -514,12 +516,10 @@ fn writable(dir: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// The bundle is in place, but what is already running is not: say so, and ask.
+/// The bundle is in place, but an app already open is not: say so, and ask. The daemon is
+/// restarted by the update itself ([`super::restart`]).
 fn ask_to_restart(was: &str, now: &str) {
-    println!(
-        "restart Vox and the vox daemon to run {now}: both keep running {was} until they are \
-         restarted"
-    );
+    println!("restart Vox to run {now}: an open Vox keeps running {was} until it is restarted");
 }
 
 /// Refresh completions through the path the person ran, when that is the link outside the
