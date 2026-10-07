@@ -121,6 +121,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             are each named "image <name> <w>×<h> — drawn once it is pulled and verified", and no
             kitty graphics are written; one she shares to the room is drawn as kitty graphics once
             bob's node has pulled and verified it (ADR-028 F-11, #502).
+  gone      the pty's master closed under bob's TUI, attached and in the room, as a closed window
+            closes it: the TUI has exited within 5 s (#557);
+  signals   SIGHUP, and SIGTERM, each sent to a running TUI of bob's: it exits 0 within 5 s
+            (V210-93, #557);
 
 `vox room join` is given JOIN_SECS (490 s), what a member waits for a joiner's proof of work plus
 its slack; every other verb 120 s. A verb past its time is a named RED, not a hang.
@@ -1260,6 +1264,59 @@ try:
           f"kitty graphics written before theirs.png was shared: {before}; after, once bob's node "
           f"had pulled and verified it: {drew}")
     stop(daemons["alice"])
+
+    stage("gone")
+    # A TUI whose terminal has gone exits (#557): an orphaned `vox tui`, its pty closed and its
+    # parent dead, spun for a day in a read of the hung-up terminal, deaf to SIGTERM and SIGHUP.
+    # The pty's master is closed under bob's TUI, attached and in the room, as a closed window
+    # or a dropped ssh session closes it; the TUI must have exited within 5 s.
+    def exited(t, secs, drain):
+        """`t`'s exit status once it has exited within `secs`, else None. The pty is read
+        meanwhile while it is open: a macOS exit with unread output waits on it."""
+        end = time.time() + secs
+        while time.time() < end:
+            if drain:
+                t.pump(0.05)
+            else:
+                time.sleep(0.05)
+            done, status = os.waitpid(t.pid, os.WNOHANG)
+            if done:
+                return status
+        return None
+    shown = tui.text()
+    os.close(tui.fd)
+    tui.fd, tui.closed = None, True
+    status = exited(tui, 5, False)
+    if status is None:
+        cpu = subprocess.run(["ps", "-o", "stat=,%cpu=", "-p", str(tui.pid)], capture_output=True,
+                             text=True).stdout.strip()
+        os.kill(tui.pid, signal.SIGKILL)
+        os.waitpid(tui.pid, 0)
+    claim("gone", status is not None,
+          f"bob's `vox tui` (pid {tui.pid}), its pty closed: "
+          + (f"exited within 5 s, status {status}" if status is not None
+             else f"still running 5 s later (state and CPU: {cpu!r}); it showed:\n{shown}"))
+
+    stage("signals")
+    # SIGHUP and SIGTERM stop a running TUI cleanly (V210-93, the decider: SIGHUP is a clean
+    # stop): it exits 0 within 5 s.
+    stopped = {}
+    for name, sig in (("SIGHUP", signal.SIGHUP), ("SIGTERM", signal.SIGTERM)):
+        tui = Tui([VOX, "tui", "--listen", "127.0.0.1:0"], tui_env())
+        tui.pump(4)
+        unlock(tui)
+        if not tui.until(lambda: "Rooms" in tui.text(), 30, 0.5):
+            product(f"bob's `vox tui`, opened for {name}, never drew its rooms:\n{tui.text()}")
+        os.kill(tui.pid, sig)
+        status = exited(tui, 5, True)
+        if status is None:
+            stopped[name] = "still running 5 s later"
+            tui.stop()
+        else:
+            stopped[name] = (f"exit {os.WEXITSTATUS(status)}" if os.WIFEXITED(status)
+                             else f"killed by signal {os.WTERMSIG(status)}")
+            tui.close()
+    claim("signals", all(v == "exit 0" for v in stopped.values()), f"{stopped!r}")
 
     print(f"{TAG} the TUI drew {tui.bytes} bytes")
     print(f"{TAG} screen at the end:")

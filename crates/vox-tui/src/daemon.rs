@@ -145,15 +145,51 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
         stop_requested("vox daemon")
     });
     let named = named_node(args)?;
-    let Some(serving) = take_account(
-        &account,
-        &rt,
-        args.profile.listen,
-        &args.profile.anchors,
-        args.proxy,
-    )?
-    else {
-        return already_running(args, &account, rt, &mut stop, named);
+    let take = |rt: &tokio::runtime::Runtime| {
+        take_account(
+            &account,
+            rt,
+            args.profile.listen,
+            &args.profile.anchors,
+            args.proxy,
+        )
+    };
+    let mut given = None;
+    let (rt, serving) = match take(&rt)? {
+        Some(serving) => (rt, serving),
+        None => match already_running(args, &account, rt, &mut stop, named.clone())? {
+            Handed::Done => return Ok(()),
+            // **A daemon that was stopping is waited for, and then this one serves** (ADR-026
+            // D-1): started while another let its last node go, it said "the daemon is stopping"
+            // and gave up, and whatever started it found no daemon at all.
+            Handed::TakeOver { rt, passphrases } => {
+                eprintln!(
+                    "vox daemon: the daemon that was running for {} is stopping; this one serves \
+                     once it has",
+                    account.data_root.display()
+                );
+                given = passphrases;
+                let serving = loop {
+                    let signal = rt.block_on(async {
+                        tokio::select! {
+                            signal = &mut stop => Some(signal),
+                            () = tokio::time::sleep(Duration::from_millis(100)) => None,
+                        }
+                    });
+                    if let Some(signal) = signal {
+                        say(format_args!(
+                            "vox daemon: stopped by {} while it waited",
+                            signal.name()
+                        ));
+                        return Ok(());
+                    }
+                    if let Some(serving) = take(&rt)? {
+                        break serving;
+                    }
+                };
+                (rt, serving)
+            }
+        },
     };
     let router = serving.router.clone();
     router.attach_kept();
@@ -180,7 +216,8 @@ pub fn run(args: &DaemonArgs) -> Result<(), AppError> {
     };
     match &foreground {
         Some(node) => {
-            if let Some(signal) = attach_foreground(args, &account, &rt, &mut stop, &router, node)?
+            if let Some(signal) =
+                attach_foreground(args, &account, &rt, &mut stop, &router, node, given)?
             {
                 // A stop while it asked for a passphrase ends it at once, as it always has.
                 // The timeout is made inside the runtime: built outside it, it panicked with "there
@@ -446,6 +483,7 @@ fn attach_foreground(
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = crate::app::StopSignal>>>,
     router: &Router,
     node: &NodeName,
+    given: Option<(Zeroizing<String>, Vec<String>)>,
 ) -> Result<Option<crate::app::StopSignal>, AppError> {
     // Named and not here: refused before any passphrase is asked for.
     if !account.nodes_on_disk().contains(node) {
@@ -458,9 +496,13 @@ fn attach_foreground(
     let interactive = args.passphrase_file.is_none()
         && daemon_env_passphrase().is_none()
         && io::IsTerminal::is_terminal(&io::stdin());
-    let (identity, rooms) = match daemon_passphrases(rt, stop, args.passphrase_file.clone())? {
-        Asked::Got(got) => got,
-        Asked::Stopped(signal) => return Ok(Some(signal)),
+    // Read already, by a start that waited for a stopping daemon: stdin is read once.
+    let (identity, rooms) = match given {
+        Some(got) => got,
+        None => match daemon_passphrases(rt, stop, args.passphrase_file.clone())? {
+            Asked::Got(got) => got,
+            Asked::Stopped(signal) => return Ok(Some(signal)),
+        },
     };
     let rooms: Vec<Zeroizing<String>> = rooms.into_iter().map(Zeroizing::new).collect();
     let attached =
@@ -599,13 +641,26 @@ pub(crate) fn stop_daemon(
 
 /// Another daemon holds the account (D-1). Started by a client, there is nothing to do. Naming a
 /// node, hand the node to the running daemon as a held session and stay until a stop signal.
+/// What a `vox daemon` that found another running did.
+enum Handed {
+    /// It handed its node to the running daemon and held it there until it was stopped, or there
+    /// was nothing to hand.
+    Done,
+    /// The running daemon is stopping, or stopped while this one held its node there: this one is
+    /// to serve once the account is free, with the passphrases it has read.
+    TakeOver {
+        rt: tokio::runtime::Runtime,
+        passphrases: Option<(Zeroizing<String>, Vec<String>)>,
+    },
+}
+
 fn already_running(
     args: &DaemonArgs,
     account: &Account,
     rt: tokio::runtime::Runtime,
     stop: &mut std::pin::Pin<Box<impl std::future::Future<Output = crate::app::StopSignal>>>,
     named: Option<NodeName>,
-) -> Result<(), AppError> {
+) -> Result<Handed, AppError> {
     let running = |why: &str| {
         format!(
             "a daemon is already running for {}{why}",
@@ -614,7 +669,7 @@ fn already_running(
     };
     if args.as_detached {
         eprintln!("vox daemon: {}", running(""));
-        return Ok(());
+        return Ok(Handed::Done);
     }
     let node = match named.or_else(|| {
         let mut d = account.nodes_on_disk();
@@ -632,7 +687,7 @@ fn already_running(
         Asked::Got(got) => got,
         Asked::Stopped(signal) => {
             say(format_args!("vox daemon: stopped by {}", signal.name()));
-            return Ok(());
+            return Ok(Handed::Done);
         }
     };
     let socket = account.socket();
@@ -665,6 +720,9 @@ fn already_running(
             ),
         });
     }
+    // What this start read, for a takeover: stdin is read once.
+    let read = (identity.clone(), rooms.clone());
+    let stopping = |r: &Refusal| matches!(r, Refusal::Stopping);
     let held = rt.block_on(async {
         if let Some(keep) = keep_source(args) {
             let mut d = DaemonClient::open(&socket)
@@ -686,6 +744,7 @@ fn already_running(
                         eprintln!("vox daemon: {note}");
                     }
                 }
+                DaemonFrame::Refused(r) if stopping(&r) => return Ok(None),
                 DaemonFrame::Refused(r) => {
                     return Err(AppError::Usage(refusal_words(&r, account, &node)))
                 }
@@ -703,12 +762,22 @@ fn already_running(
         )
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
-        let mut client = client.map_err(|r| AppError::Usage(refusal_words(&r, account, &node)))?;
+        let mut client = match client {
+            Ok(client) => client,
+            Err(r) if stopping(&r) => return Ok(None),
+            Err(r) => return Err(AppError::Usage(refusal_words(&r, account, &node))),
+        };
         for line in &rooms {
             open_rooms_over_socket(&mut client, line).await;
         }
-        Ok::<_, AppError>(client)
+        Ok::<_, AppError>(Some(client))
     })?;
+    let Some(held) = held else {
+        return Ok(Handed::TakeOver {
+            rt,
+            passphrases: Some(read),
+        });
+    };
     let fp = held
         .me()
         .map(|f| vox_core::node::link::b32_encode(&f))
@@ -730,13 +799,14 @@ fn already_running(
             drop(held);
             rt.shutdown_timeout(SHUTDOWN_PATIENCE);
             say(format_args!("vox daemon: stopped by {}", signal.name()));
-            Ok(())
+            Ok(Handed::Done)
         }
-        Err(()) => Err(AppError::Refused {
-            code: 1,
-            message: format!(
-                "the daemon holding node {node} stopped, so this session ended with it"
-            ),
+        // **The daemon holding the node stopped, and this one was not asked to**: it serves the
+        // node itself once that daemon has let the account go (ADR-026 D-1), rather than ending
+        // with it.
+        Err(()) => Ok(Handed::TakeOver {
+            rt,
+            passphrases: Some(read),
         }),
     }
 }

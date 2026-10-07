@@ -332,6 +332,11 @@ pub fn store(paths: &Paths, reg: &Session) {
     {
         reg.room.clone_from(&b.room);
     }
+    // **A name, once given, stays until the harness gives another** (ADR-029 MD-1): a turn whose
+    // harness said nothing of it (a sub-agent's event, a transcript not yet written) keeps it.
+    if reg.name.is_none() {
+        reg.name = earlier.and_then(|b| b.name);
+    }
     reg.last_drained_ms = now;
     // **One session per pane** (ADR-029 DR-5): the newest hook in a pane claims it, and every other
     // session of this node bound there loses its binding. Case: a new session (or `/clear`) in the

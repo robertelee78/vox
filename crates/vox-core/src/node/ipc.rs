@@ -3854,6 +3854,9 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             } else {
                 text
             };
+            // **The session's name, filled by its node** (ADR-029 MD-2): whatever verb or client
+            // posted, a message from a registered session carries the name its harness gives.
+            let text = crate::node::sessions::fill_name(handle.paths(), &text);
             // A room just joined is written to once its first sync with another member has ended
             // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
             // that rather than failing.
