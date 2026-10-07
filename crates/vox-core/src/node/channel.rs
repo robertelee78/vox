@@ -2537,7 +2537,6 @@ impl ChannelState {
         admission: &Admission,
         now: crate::time::Ms,
     ) -> Result<bool> {
-        let now_ms = now.get();
         let fingerprint = key.fingerprint();
         match admission {
             Admission::Creator => {
@@ -2577,7 +2576,7 @@ impl ChannelState {
         }
         // Past the cap if it must be: another member admitted it, on its own view that there was
         // room. Refusing it here would split the room (V210-128).
-        self.admit_within(store, key, now_ms / 1_000, AUTHORS_HARD_LIMIT)
+        self.admit_within(store, key, now, AUTHORS_HARD_LIMIT)
     }
 
     /// Admit a newcomer **from its admission notice** (#520): the evidence its bundle record would
@@ -2616,7 +2615,7 @@ impl ChannelState {
             ));
         }
         self.keep_notice(store, notice)?;
-        self.admit_within(store, &notice.key, now.get() / 1_000, AUTHORS_HARD_LIMIT)
+        self.admit_within(store, &notice.key, now, AUTHORS_HARD_LIMIT)
     }
 
     /// Whether this node holds a withdraw of `member` signed at or after `since` (#520).
@@ -2761,18 +2760,20 @@ impl ChannelState {
         key: &CompositePublicKey,
         now: crate::time::Ms,
     ) -> Result<bool> {
-        let now_ms = now.get();
-        self.admit_within(store, key, now_ms / 1_000, max_authors())
+        self.admit_within(store, key, now, max_authors())
     }
 
-    /// [`ChannelState::admit_author`], refused at `limit` authors.
+    /// [`ChannelState::admit_author`], refused at `limit` authors. `now` is what the room's
+    /// evaluator is rebuilt at, in milliseconds as every time it compares (#562): it was handed
+    /// seconds, which the evaluator read as milliseconds, a moment in January 1970.
     fn admit_within(
         &mut self,
         store: &Store,
         key: &CompositePublicKey,
-        now_ms: u64,
+        now: crate::time::Ms,
         limit: usize,
     ) -> Result<bool> {
+        let now_ms = now.get();
         let fingerprint = key.fingerprint();
         if let Some(existing) = self.authors.get(&fingerprint) {
             if existing.to_bytes() == key.to_bytes() {
