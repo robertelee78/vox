@@ -32,6 +32,10 @@ use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 use vox_core::node::daemonipc::{NodeName, ToolCall};
 
+/// How long text a driver typed into a session is remembered, so the harness's prompt event for
+/// it is not also shown as typed at the terminal.
+const DELIVERED_FOR: Duration = Duration::from_secs(30);
+
 /// How often a waiting request's transcript is read for its result.
 const TRANSCRIPT_POLL: Duration = Duration::from_millis(250);
 
@@ -56,6 +60,8 @@ struct Session {
     open: Vec<ToolCall>,
     /// Requests waiting, by the call they are tied to.
     asks: BTreeMap<String, Ask>,
+    /// Text drivers typed into the session lately, and when (see [`Sink::delivered_text`]).
+    delivered: Vec<(String, std::time::Instant)>,
 }
 
 /// One approval or question waiting.
@@ -139,10 +145,14 @@ impl Sink {
     ) {
         let mut ended: Vec<String> = Vec::new();
         let mut turn_end = false;
-        for b in &bodies {
-            let Ok(v) = serde_json::from_str::<Value>(b) else {
+        let mut kept = Vec::with_capacity(bodies.len());
+        for b in bodies {
+            let Ok(v) = serde_json::from_str::<Value>(&b) else {
                 continue;
             };
+            if self.was_delivered(node, session, &v) {
+                continue;
+            }
             match v.get("kind").and_then(Value::as_str) {
                 Some("tool-done") => {
                     if let Some(r) = v.get("ref").and_then(Value::as_str) {
@@ -152,7 +162,9 @@ impl Sink {
                 Some("turn-end") => turn_end = true,
                 _ => {}
             }
+            kept.push(b);
         }
+        let bodies = kept;
         self.with(|all| {
             let s = all.entry((node.clone(), session.to_owned())).or_default();
             if let Some(c) = call {
@@ -169,6 +181,43 @@ impl Sink {
         if turn_end {
             self.expire_all(node, session);
         }
+    }
+
+    /// A driver's text was delivered to `session` as its input (#544): its `drive` entry already
+    /// shows it as typed in Vox by that driver, so the harness's own prompt event for the same
+    /// text, if it fires one, is not shown again as typed at the terminal. A limit, stated: the
+    /// same text typed at the terminal within [`DELIVERED_FOR`] is shown once, as typed in Vox.
+    pub fn delivered_text(&self, node: &NodeName, session: &str, text: &str) {
+        self.with(|all| {
+            let s = all.entry((node.clone(), session.to_owned())).or_default();
+            s.delivered.retain(|(_, at)| at.elapsed() < DELIVERED_FOR);
+            s.delivered
+                .push((text.trim().to_owned(), std::time::Instant::now()));
+        });
+    }
+
+    /// Whether `body` is the harness's prompt event for text a driver delivered; that delivery is
+    /// then used up.
+    fn was_delivered(&self, node: &NodeName, session: &str, body: &Value) -> bool {
+        if body.get("kind").and_then(Value::as_str) != Some("user") || body.get("part").is_some() {
+            return false;
+        }
+        let Some(text) = body.get("text").and_then(Value::as_str) else {
+            return false;
+        };
+        self.with(|all| {
+            let Some(s) = all.get_mut(&(node.clone(), session.to_owned())) else {
+                return false;
+            };
+            s.delivered.retain(|(_, at)| at.elapsed() < DELIVERED_FOR);
+            match s.delivered.iter().position(|(t, _)| t == text.trim()) {
+                Some(i) => {
+                    s.delivered.remove(i);
+                    true
+                }
+                None => false,
+            }
+        })
     }
 
     /// The session ended (ADR-029 SE-4): every request still waiting expires, and its calls are
@@ -342,7 +391,10 @@ impl Sink {
                 .get_mut(&(node.clone(), session.to_owned()))
                 .and_then(|s| s.asks.get_mut(id))
             else {
-                return Handed::Refused("this request is no longer waiting".into());
+                return Handed::Refused(
+                    "this request is not waiting for an answer from Vox; answer it at the terminal"
+                        .into(),
+                );
             };
             let Some(hook) = ask.hook.take() else {
                 return Handed::Refused("another answer was already given".into());
