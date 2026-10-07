@@ -133,7 +133,13 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
     // What settles an earlier line: a tool call's result, a request's resolution.
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
     let mut resolved: BTreeMap<String, usize> = BTreeMap::new();
+    // Calls that asked first: their request's line names them, so an unanswered or refused call
+    // is not shown twice.
+    let mut asked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (i, b) in bodies.iter().enumerate() {
+        if matches!(b.kind(), "approval" | "question") {
+            asked.insert(b.reference().to_owned());
+        }
         match b.kind() {
             "tool-done" => {
                 done.insert(b.reference().to_owned(), i);
@@ -156,6 +162,9 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             "user" => {
                 details.push(("typed".into(), b.str("text").to_owned()));
                 format!("typed at the terminal: {}", one_line(b.str("text")))
+            }
+            "tool" if asked.contains(b.reference()) && !done.contains_key(b.reference()) => {
+                continue
             }
             "tool" => {
                 details.push(("input".into(), b.str("input").to_owned()));
