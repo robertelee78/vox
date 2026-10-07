@@ -1032,7 +1032,11 @@ fn waiting_ref(plain: &str, line: &str, flag: &str) -> Option<String> {
     let lines: Vec<&str> = plain.lines().collect();
     let at = lines.iter().position(|l| l.contains(line))?;
     let next = lines.get(at + 1)?.trim();
-    let rest = next.strip_prefix("waiting:")?.split(flag).nth(1)?;
+    // The command a person would run, whole: `vox room session ROOM SESSION --approve <ref>`.
+    let rest = next
+        .strip_prefix("waiting: vox room session ")?
+        .split(flag)
+        .nth(1)?;
     Some(
         rest.split(|c: char| c.is_whitespace() || c == ',')
             .next()?
@@ -1132,7 +1136,7 @@ fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
     let Some(printed) = printed else {
         panic!(
             "PRODUCT: arm 1: a waiting approval must say how to answer it, with its ref \
-             (\"waiting: approve with --approve <ref>\"); the Session read:\n{plain}"
+             (\"waiting: vox room session ROOM SESSION --approve <ref>\"); the Session read:\n{plain}"
         );
     };
     let (ok, said) = drive(&w, &room, SESSION, &["--approve", &printed]);
