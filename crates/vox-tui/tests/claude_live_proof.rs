@@ -1180,6 +1180,20 @@ fn a_live_claude_session_is_followed_answered_and_interrupted_from_vox() {
         std::thread::sleep(Duration::from_millis(500));
     };
     println!("[proof] 1. the Session: {session}");
+    // The pane the daemon proved for it, as the session's registration holds it: the hook's
+    // TMUX/TMUX_PANE, and the Claude Code process found under it.
+    let reg = std::fs::read_to_string(
+        data.join("nodes")
+            .join(AGENT)
+            .join("sessions")
+            .join(format!("{session}.json")),
+    )
+    .unwrap_or_default();
+    let reg: serde_json::Value = serde_json::from_str(&reg).unwrap_or_default();
+    println!(
+        "[proof] 1. its registration: tmux {} / why not {}",
+        reg["tmux"], reg["tmux_why"]
+    );
     let t0 = Instant::now();
     let (approval_ref, followed) = loop {
         let (_, o, e) = session_read(&[&session, "--json"]);
