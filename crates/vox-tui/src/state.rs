@@ -47,6 +47,10 @@ pub enum PromptKind {
     /// Trust the node `Prompt::target` (ADR-028 K-5): `[its fingerprint as they gave it, a
     /// name, identity passphrase]`. The fingerprint is compared before anything is added.
     Trust,
+    /// Accept the offer of the node `Prompt::target` (ADR-028 K-16): `[a name, read or read +
+    /// drive, identity passphrase]`. Its fingerprint is shown, grouped with its art; no comparison
+    /// is asked for (the member pane's trust action keeps one).
+    AcceptOffer,
 }
 
 impl PromptKind {
@@ -62,6 +66,11 @@ impl PromptKind {
             PromptKind::RenameRoom => &["new room name"],
             PromptKind::LeaveRoom => &["type leave to leave it"],
             PromptKind::EndRoom => &["type end to end it for everyone"],
+            PromptKind::AcceptOffer => &[
+                "your name for them",
+                "read, or read + drive (Enter or r: read · d: read + drive)",
+                "identity passphrase (Enter alone while the keyring is open)",
+            ],
             PromptKind::Trust => &[
                 "their fingerprint, as they gave it to you (paste or type it)",
                 "your name for them",
@@ -82,7 +91,7 @@ impl PromptKind {
             // A confirming word is no secret.
             PromptKind::LeaveRoom | PromptKind::EndRoom => false,
             // A fingerprint and a name are not; only the passphrase.
-            PromptKind::Trust => i == 2,
+            PromptKind::Trust | PromptKind::AcceptOffer => i == 2,
             _ => true,
         }
     }
@@ -118,6 +127,10 @@ impl PromptKind {
             }
             PromptKind::Trust => {
                 "Trust this node? Compare its fingerprint with the one they gave you"
+            }
+            PromptKind::AcceptOffer => {
+                "Trust this node? It is to read what you write in every room you share, now and \
+                 later"
             }
         }
     }
@@ -330,6 +343,9 @@ pub struct UiState {
     /// an unread re-sorts it, and a position would then name another room. Each frame finds its
     /// index again ([`UiState::settle`]).
     pub selected_room: Option<Digest32>,
+    /// The offer selected in the sidebar, when one is (ADR-028 K-15): offers come first, under
+    /// "needs you", before the rooms.
+    pub selected_offer: Option<Digest32>,
     /// The shared service selected in the room's Shared pane, by position (ADR-028 S-3).
     pub selected_share: usize,
     /// The member selected in the member pane, **by identity** (V210-82): the pane is in
@@ -389,6 +405,7 @@ impl Default for UiState {
             mode: Mode::Normal,
             selected_channel: 0,
             selected_room: None,
+            selected_offer: None,
             selected_share: 0,
             selected_member: None,
             timeline_scroll: 0,
@@ -621,6 +638,20 @@ impl UiState {
             KeyCode::Char('d') if self.screen == Screen::ChannelList => {
                 self.screen = Screen::Decisions;
                 Action::Redraw
+            }
+            // **An offer is accepted or dismissed where it waits** (ADR-028 K-16, K-18).
+            KeyCode::Enter if self.screen == Screen::ChannelList && self.offer(vm).is_some() => {
+                let member = self.offer(vm).map(|o| o.member);
+                self.mode = Mode::Prompt(Prompt::new(PromptKind::AcceptOffer, member));
+                Action::Redraw
+            }
+            KeyCode::Char('x')
+                if self.screen == Screen::ChannelList && self.offer(vm).is_some() =>
+            {
+                match self.offer(vm).map(|o| o.member) {
+                    Some(member) => Action::Dispatch(Command::DismissOffer { member }),
+                    None => Action::Redraw,
+                }
             }
             // The share flow (ADR-028 S-4): Enter previews the service selected, then offers it.
             KeyCode::Enter if self.screen == Screen::Serve => {
@@ -898,6 +929,38 @@ impl UiState {
         };
         let secret = |s: &Zeroizing<String>| SecretString::from(s.as_str().to_owned());
         match p.kind {
+            PromptKind::AcceptOffer => {
+                let Some(target) = p.target else {
+                    return Action::Redraw;
+                };
+                let petname = p.fields[0].trim().to_owned();
+                if petname.is_empty() {
+                    // A node in the keyring always has a name (ADR-028 K-3).
+                    self.status_message = Some("a name is required: what do you call them?".into());
+                    self.mode = Mode::Prompt(Prompt::new(PromptKind::AcceptOffer, Some(target)));
+                    return Action::Redraw;
+                }
+                let drive = match p.fields[1].trim().to_ascii_lowercase().as_str() {
+                    "" | "r" | "read" => false,
+                    "d" | "drive" | "read + drive" => true,
+                    other => {
+                        self.status_message = Some(format!(
+                            "{other:?} is neither: r for read, d for read + drive"
+                        ));
+                        let mut again = Prompt::new(PromptKind::AcceptOffer, Some(target));
+                        again.fields[0] = Zeroizing::new(petname);
+                        again.step = 1;
+                        self.mode = Mode::Prompt(again);
+                        return Action::Redraw;
+                    }
+                };
+                Action::Dispatch(Command::AcceptOffer {
+                    target,
+                    petname,
+                    drive,
+                    identity_passphrase: secret(&p.fields[2]),
+                })
+            }
             PromptKind::Trust => {
                 let Some(target) = p.target else {
                     return Action::Redraw;
@@ -1090,16 +1153,39 @@ impl UiState {
         }
     }
 
+    /// The offer selected in the sidebar, while it is still offered.
+    #[must_use]
+    pub fn offer<'a>(&self, vm: &'a ViewModel) -> Option<&'a vox_core::node::api::Offer> {
+        let member = self.selected_offer?;
+        vm.offers.iter().find(|o| o.member == member)
+    }
+
     fn move_selection(&mut self, vm: &ViewModel, delta: isize) {
         let step =
             |cur: usize, len: usize| (cur as isize + delta).rem_euclid(len as isize) as usize;
         match self.screen {
+            // The offers first, then the rooms: one list, as the sidebar draws it.
             Screen::ChannelList => {
-                let len = vm.channels.len();
+                let offers = vm.offers.len();
+                let len = offers + vm.channels.len();
                 if len > 0 {
-                    self.selected_channel = step(self.selected_channel, len);
-                    self.selected_room =
-                        vm.channels.get(self.selected_channel).map(|c| c.channel_id);
+                    let cur = match self.offer(vm) {
+                        Some(o) => vm
+                            .offers
+                            .iter()
+                            .position(|x| x.member == o.member)
+                            .unwrap_or(0),
+                        None => offers + self.selected_channel,
+                    };
+                    let next = step(cur, len);
+                    if next < offers {
+                        self.selected_offer = Some(vm.offers[next].member);
+                    } else {
+                        self.selected_offer = None;
+                        self.selected_channel = next - offers;
+                        self.selected_room =
+                            vm.channels.get(self.selected_channel).map(|c| c.channel_id);
+                    }
                 }
             }
             Screen::Keyring => {}

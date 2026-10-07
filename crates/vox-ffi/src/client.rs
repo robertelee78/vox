@@ -220,6 +220,40 @@ pub struct TrustedNode {
     pub name: String,
 }
 
+/// Why a node is offered to the keyring (ADR-028 K-15, K-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OfferWhy {
+    /// It joined a room after this node did.
+    Joined,
+    /// It trusts this node.
+    TrustsYou,
+}
+
+/// A room an offer comes from.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OfferRoom {
+    /// The room's id, base32.
+    pub id: String,
+    /// Its name as this node shows it.
+    pub name: String,
+}
+
+/// A node offered to the keyring (ADR-028 K-15 – K-18): accepted with
+/// [`VoxClient::trust_add`], dismissed with [`VoxClient::dismiss_offer`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct OfferInfo {
+    /// Its fingerprint, base32; the app groups it and draws its art.
+    pub fingerprint: String,
+    /// The rooms it is offered from.
+    pub rooms: Vec<OfferRoom>,
+    /// Why: joined, trusts you, or both.
+    pub why: Vec<OfferWhy>,
+    /// The fingerprints (base32) of the keyring's nodes that trust it (K-7).
+    pub trusted_by: Vec<String>,
+    /// What is said of it, word for word as the TUI says it (ADR-028 CL-1).
+    pub said: String,
+}
+
 /// A room link and what it carries.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct RoomLink {
@@ -1200,6 +1234,53 @@ impl VoxClient {
             .collect();
         list.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
         Ok(list)
+    }
+
+    /// The nodes offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order: as the node
+    /// keeps them, so the TUI and the app always agree, dismissals included.
+    ///
+    /// # Errors
+    /// The node's refusal.
+    pub async fn pending_offers(&self) -> Result<Vec<OfferInfo>, VoxError> {
+        on_held!(self, |c| match ask(c, &Request::Offers).await? {
+            Frame::Offers { offers } => Ok(offers
+                .into_iter()
+                .map(|o| OfferInfo {
+                    fingerprint: b32_encode(&o.member),
+                    rooms: o
+                        .rooms
+                        .into_iter()
+                        .map(|r| OfferRoom {
+                            id: b32_encode(&r.id),
+                            name: r.name,
+                        })
+                        .collect(),
+                    why: o
+                        .why
+                        .into_iter()
+                        .map(|w| match w {
+                            vox_core::node::api::OfferWhy::Joined => OfferWhy::Joined,
+                            vox_core::node::api::OfferWhy::TrustsYou => OfferWhy::TrustsYou,
+                        })
+                        .collect(),
+                    trusted_by: o.trusted_by.iter().map(b32_encode).collect(),
+                    said: o.said,
+                })
+                .collect()),
+            other => Err(unexpected(&other)),
+        })
+    }
+
+    /// Dismiss the offer of the node `fingerprint` (ADR-028 K-18): kept by the node, on this node
+    /// alone; the node offered is not told and stays out of the keyring. Asks no passphrase.
+    ///
+    /// # Errors
+    /// A malformed fingerprint, or the node's refusal.
+    pub async fn dismiss_offer(&self, fingerprint: String) -> Result<(), VoxError> {
+        let req = Request::DismissOffer {
+            member: digest(&fingerprint, "fingerprint")?,
+        };
+        on_held!(self, |c| done(c, &req).await)
     }
 
     /// Rename a trusted node, keeping what its trust releases.

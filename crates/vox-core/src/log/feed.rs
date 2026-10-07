@@ -135,6 +135,12 @@ impl Feed {
         self.entries.keys().next_back().copied().unwrap_or(0)
     }
 
+    /// The lowest seq present, or `None` if empty: where this node's copy of the feed starts.
+    #[must_use]
+    pub fn min_seq(&self) -> Option<u64> {
+        self.entries.keys().next().copied()
+    }
+
     /// The number of entries held.
     #[must_use]
     pub fn len(&self) -> usize {

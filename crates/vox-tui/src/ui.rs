@@ -172,6 +172,8 @@ pub fn render(frame: &mut Frame, vm: &ViewModel, ui: &mut UiState) {
         render_sidebar(frame, regions[0], vm, ui);
         if ui.screen == Screen::Channel {
             render_channel(frame, regions[1], vm, ui);
+        } else if let Some(offer) = ui.offer(vm) {
+            render_offer(frame, regions[1], offer);
         } else {
             let p = Paragraph::new("No room open — Enter opens the room selected in the sidebar")
                 .block(Block::default().borders(Borders::ALL));
@@ -203,7 +205,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, p: &Prompt) {
     // The trust prompt shows the node's fingerprint, grouped, beside its art (ADR-028 K-5), so
     // the person compares it by eye as well as by what they paste.
     let card: Vec<String> = match (p.kind, p.target) {
-        (PromptKind::Trust, Some(fp)) => {
+        (PromptKind::Trust | PromptKind::AcceptOffer, Some(fp)) => {
             let mut c = vec!["this node:".to_owned()];
             c.extend(vox_text::fingerprint::card(
                 &vox_core::node::link::b32_encode(&fp),
@@ -264,17 +266,44 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
             "not attached"
         }
     ))];
+    // **A trust offer waits under needs you** (ADR-028 K-15, K-18), before the rooms there.
+    let needs_you = vox_agentcomms::attention::RoomGroup::NeedsYou;
+    if !vm.offers.is_empty() {
+        let n = vm.offers.len() + vm.channels.iter().filter(|c| c.group == needs_you).count();
+        items.push(
+            ListItem::new(format!("{} ({n})", needs_you.label()))
+                .style(Style::default().add_modifier(Modifier::BOLD)),
+        );
+        for o in &vm.offers {
+            let marker = if ui.selected_offer == Some(o.member) {
+                "▶ "
+            } else {
+                "  "
+            };
+            let fp = vox_text::fingerprint::grouped(&vox_core::node::link::b32_encode(&o.member));
+            let short: String = fp.chars().take(9).collect();
+            let why = if o.why.contains(&vox_core::node::api::OfferWhy::TrustsYou) {
+                "trusts you"
+            } else {
+                "joined"
+            };
+            items.push(ListItem::new(format!("{marker}offer: {short}… {why}")));
+        }
+    }
     let mut group = None;
     for (i, c) in vm.channels.iter().enumerate() {
         if group != Some(c.group) {
             group = Some(c.group);
-            let n = vm.channels.iter().filter(|o| o.group == c.group).count();
-            items.push(
-                ListItem::new(format!("{} ({n})", c.group.label()))
-                    .style(Style::default().add_modifier(Modifier::BOLD)),
-            );
+            // Needs you is headed already, with its offers.
+            if c.group != needs_you || vm.offers.is_empty() {
+                let n = vm.channels.iter().filter(|o| o.group == c.group).count();
+                items.push(
+                    ListItem::new(format!("{} ({n})", c.group.label()))
+                        .style(Style::default().add_modifier(Modifier::BOLD)),
+                );
+            }
         }
-        let marker = if i == ui.selected_channel {
+        let marker = if i == ui.selected_channel && ui.selected_offer.is_none() {
             "▶ "
         } else {
             "  "
@@ -324,6 +353,38 @@ fn render_sidebar(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &UiState) {
     let block = Block::default().borders(Borders::ALL).title(title);
     let list = List::new(items).block(if listing { focus_block(block) } else { block });
     frame.render_widget(list, area);
+}
+
+/// **The offer selected** (ADR-028 K-15 – K-18): the node's fingerprint grouped with its art, what
+/// is said of it (why it is offered, and which of the nodes in the keyring trust it, K-7), the
+/// rooms, and the two things to do with it. Accepting asks no fingerprint comparison (K-16).
+fn render_offer(frame: &mut Frame, area: Rect, o: &vox_core::node::api::Offer) {
+    let mut lines: Vec<Line> =
+        vox_text::fingerprint::card(&vox_core::node::link::b32_encode(&o.member))
+            .into_iter()
+            .map(Line::from)
+            .collect();
+    lines.push(Line::from(""));
+    // Word for word what the app says of it (ADR-028 CL-1).
+    lines.push(Line::from(o.said.clone()));
+    let rooms: Vec<&str> = o.rooms.iter().map(|r| r.name.as_str()).collect();
+    lines.push(Line::from(format!("In: {}", rooms.join(", "))));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "It is not in your keyring. Trusting it lets it read what you write in every room you share, \
+         now and later; you are asked for a name, and for read or read + drive.",
+    ));
+    lines.push(Line::from(
+        "Dismissing it is yours alone: it is not told, and stays out of your keyring.",
+    ));
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(focus_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Trust offer (Enter: trust · x: dismiss)"),
+        ));
+    frame.render_widget(p, area);
 }
 
 /// The live tunnels, one per line with its number, member, service and how long it has been
