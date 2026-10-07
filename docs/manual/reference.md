@@ -115,15 +115,17 @@ report.
 
 ## Passphrase input
 
-The identity passphrase protects a node's key material; an empty one is allowed. A room
-passphrase is a separate join factor. At a terminal, use the masked prompt. For an unattended
+The identity passphrase protects a node's key material. Every node has one: `node create` refuses
+an empty one and creates nothing. A room passphrase is a separate join factor, and it may be
+empty. At a terminal, use the masked prompt. For an unattended
 command, use its supported passphrase-file option and restrict the file to the intended OS user.
 
 `node create` and `node attach` read the identity passphrase from `--passphrase-file`; `room
 create` and `room join` read the room passphrase from `--passphrase-file`, where `-` selects
 stdin. Without a terminal or that explicit input, they fail rather than wait on an unattended
-prompt. A keyring change (`vox trust add`, `remove`, `rename`) takes the identity passphrase only
-typed at a terminal; a room's retention or name asks for none.
+prompt. A keyring change (`vox trust add`, `remove`, `rename`, `drive`, `read`) takes the identity
+passphrase only typed at a terminal, never from a file or the environment; a room's retention or
+name asks for none (see [when the passphrase is asked for](keyring.md#when-the-passphrase-is-asked-for)).
 
 To keep a node attached across daemon restarts:
 
@@ -155,8 +157,8 @@ and shell history expose secrets. `VOX_ROOM_PASSPHRASE` is also refused.
 environment can be read by same-user processes and inherited by children. A supported mechanism is not a promise that it is equally private.
 
 Do not write a real passphrase into a documentation example, paste it to a model, or capture
-it in a screenshot. Empty passphrases change at-rest/join protection; an example should not
-silently opt you into that choice.
+it in a screenshot. An empty room passphrase leaves the room's link as its only join factor; an
+example should not silently opt you into that choice.
 
 ## Output, cursors and status
 

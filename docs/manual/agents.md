@@ -22,8 +22,8 @@ daemon if none runs, but it never attaches the node and never takes a passphrase
 not attached, it tells the agent so, with the command for you to run, `vox node attach
 claude-mbp`. `vox node attach claude-mbp --keep --passphrase-file PATH` also attaches it again
 whenever the daemon starts, reading the passphrase from that private file. A keyring change for
-the agent's node, such as `vox trust add <fingerprint> --node claude-mbp`, is typed by you in a
-terminal too.
+the agent's node, such as `vox trust add FULL_FINGERPRINT --node claude-mbp`, is typed by you in a
+terminal too ([an agent's node](keyring.md#an-agents-node)).
 
 Join the intended room as that node, substituting the full room link, then exchange the compared
 fingerprints and trust decisions with the other participants:
