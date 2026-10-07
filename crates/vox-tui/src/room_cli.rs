@@ -4046,6 +4046,8 @@ pub async fn join(
     link: &str,
     passphrase_file: Option<&std::path::Path>,
 ) -> Result<(), AppError> {
+    // An address that will not parse is refused before anything is asked, with what is wrong.
+    crate::tunnel_cli::readable(link)?;
     let mut client = attach(paths).await?;
     // A room this node holds open, and has not left, is not joined again: its address is taken
     // as where the room's host is now, and the host is dialled there (V210-167). No passphrase is read for it: none

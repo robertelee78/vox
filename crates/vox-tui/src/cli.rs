@@ -2251,6 +2251,8 @@ pub fn run() -> ExitCode {
             let waiting = crate::tunnel_cli::Waiting::new("the room was not joined");
             let steps = std::sync::Arc::clone(&waiting);
             run_session(waiting, async move {
+                // An address that will not parse is refused before its passphrase is asked for.
+                crate::tunnel_cli::readable(&args.address)?;
                 steps.on("the room passphrase");
                 let (given, file) = (args.passphrase.clone(), args.passphrase_file.clone());
                 let room_pp = tokio::task::spawn_blocking(move || {
