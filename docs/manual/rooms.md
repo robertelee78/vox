@@ -218,6 +218,16 @@ can appear above newer ones and is still returned.
 A row can read `(not received yet)`: this node holds the signed envelope but the message body is
 still owed by a member. See [a message says not received yet](troubleshooting.md#a-message-says-not-received-yet).
 
+`vox room read --json --notices` also gives what was done to the room, such as its retention set
+or its name changed, each as a `vox.room.notice/1` object right after the row it follows in the
+room's order, with who did it and its time in milliseconds:
+
+```text
+{"schema":"vox.room.notice/1","room":"…","entry_hash":"…","author":"…","by":"you","created_millis":1791393433354,"notice":"set the room's retention to 1 week: messages older than 1 week are removed from now on"}
+```
+
+Without `--notices` the output is `vox.room.row/1` rows only. `--notices` needs `--json`.
+
 JSON output is intended for programs. Keep data from a room separate from commands or
 operator instructions in whatever program consumes it.
 

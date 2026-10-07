@@ -14,10 +14,47 @@ the `vox` commands.
 
 ## Install
 
-The installer is to install the app: on a Mac it is to put `Vox.app` in `/Applications` (or
-`~/Applications`) and make `~/.local/bin/vox` a link to the `vox` inside it, so the app, the
-daemon and the CLI are one binary of one version. That part of the installer has not landed yet;
-this section is to say how once it has.
+On a Mac the installer installs the app and `vox` together (see [Install and update](install.md)
+for how to run it). It puts `Vox.app` in `/Applications`, or in `~/Applications` when it cannot
+write there, and makes `~/.local/bin/vox` a link to the `vox` inside the app, so the app, the
+daemon and the CLI are one binary of one version. Before anything is replaced it checks the
+app's size and SHA-256, and that it is signed by Vox's Developer ID and notarized:
+
+```text
+verified: Vox.app and its vox, Developer ID TEAM_ID, notarized
+installed: /Applications/Vox.app (Vox VERSION)
+linked: ~/.local/bin/vox -> /Applications/Vox.app/Contents/Helpers/vox (vox VERSION)
+```
+
+On an Intel Mac, or before macOS 13, it stops before downloading anything: `this Mac is not
+supported: Vox needs a Mac with Apple Silicon and macOS 13 or later`. It also refuses to replace a
+`Vox.app` it did not install.
+
+## Update
+
+`vox update` replaces the whole app, with the `vox` inside it, and keeps the previous app for
+`vox update --rollback`:
+
+```text
+updated: /Applications/Vox.app -> Vox VERSION
+         the previous Vox.app is kept at … for `vox update --rollback`
+```
+
+Then it restarts the vox daemon onto the new version. Stopping the daemon detaches every node.
+The new daemon attaches again each node whose passphrase it keeps: one kept with the Keychain from
+the app, or with `vox node attach --keep`. Any other node comes back detached, and the update
+names it with the command that attaches it again:
+
+```text
+node NAME is detached: the daemon keeps no passphrase for it. Attach it again: vox node attach NAME
+```
+
+How the daemon comes back depends on how it was started. The login item's daemon is started again
+by macOS from the new app. A daemon a client started (the app, `vox tui` or another `vox` command)
+is started again the same way, or, if it has no node to attach again, left stopped until the next
+command needs it. A daemon you started yourself in a terminal (`vox daemon`) is left running the
+old version, and the update says so: stop it and start it again. An open Vox keeps running the old
+version too, until you quit it and open it again.
 
 ## The first run
 
@@ -111,7 +148,8 @@ Service's Address** (⌘⇧C) copies its full address.
 Each message shows its author (`you` for your own), and marks it **urgent**, **to you**, or
 **arrived late** (it took its place above messages already shown). A message whose text has not
 arrived yet says `not received yet`, and is replaced when it does. What was done to the room,
-such as its retention set or its name changed, appears between the messages in italics, by time:
+such as its retention set or its name changed, appears in italics right after the message it
+followed in the room:
 
 ```text
 you named the room family
@@ -145,13 +183,22 @@ Type in **Say something to the room** and press Return. Beside the field:
 To reply, select a message and choose **Room > Reply to Selected Message** (⌘R). The composer
 says `Replying to NAME: …` until you send or choose **Cancel**.
 
-### Files: drag, paste or Attach
+### Files: drag, paste, Attach or Share
 
 Drop a file or folder on the timeline, paste one into it, or choose the paper clip
 (**File > Attach File…**, ⌘O). The app asks for a **To:** and an optional **Note**, then
 **Share** sends them as one share: the note and the addressees travel in the share, never as a
 message of their own. With no one ticked the share is for the whole room; with members ticked
 the room still sees it. It is the same as `vox share` (see [Send and receive files](files.md)).
+
+From the Finder or any other app, choose **Share**, then **Vox**: a sheet titled **Share to a Vox
+room** asks for the room, who it is for (none ticked: the whole room) and a note, and **Send**
+shares it. The app need not be open, but its node must be attached; otherwise the sheet says
+`Open Vox to attach node NAME first.` and sends nothing. It never asks for a passphrase. It acts as
+the node the app chose, in your account's own Vox data. Sent, it says `Shared NAME (SHA-256 …)`.
+
+In the Finder, **Services > Share to Vox Room** sends the file to the app instead, which asks for
+its To: and note in the room on screen (or the next room you open).
 
 ### Members and trust
 
@@ -304,6 +351,5 @@ sentence. The app is dark only.
 
 ## Not in the app yet
 
-These are to come, and this chapter is to describe them when they land: Sessions in the app
-(see [Sessions](sessions.md) for the CLI and the TUI), sharing from the Finder's Share menu and
-Services item, and the installer for the app.
+Sessions are to come to the app, and this chapter is to describe them when they land. Until
+then, follow and drive Sessions from the CLI or the TUI (see [Sessions](sessions.md)).

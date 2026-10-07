@@ -136,7 +136,7 @@ reported to the lead as staging rather than product, and a second run was green.
 | A Session keeps what its session did while its room was joining | `agent_hook_proof::a_session_works_in_the_room_its_start_directory_is_mapped_to`, release, `--ignored`, at `48b1c743` (2026-10-07) | passed in 70.9 s: the first prompt, typed before the node was a member, is read in the Session once the room opens; the dropped-entries sentence is quoted from `host.rs` (b2f4bd42), not run (it needs over 4 MiB held) |
 | `--to member/session` on `vox share` | `vox share --help` at `48b1c743` (f60207c0) | `Or address one session of a member as <member>/<session>, the session named as vox room sessions names it` … `For example: --to bob/gso-cap` |
 
-### The app chapter (`v040/app-stack` 6e909d10, not merged)
+### The app chapter (`v040/app-stack` 6e909d10, then integrate fa559fd8)
 
 [The Vox app on a Mac](manual/app.md) was written on 2026-10-07 against app2's candidate
 `v040/app-stack` at `6e909d10`, before it merged. No Vox.app was launched and no login item was
@@ -158,6 +158,10 @@ quit with the release `vox`. Sessions in the app (#554) and the Finder Share men
 | A wrong passphrase is the daemon's sentence | the demo build's `vox`, scratch root: `vox node attach mac --passphrase-file BAD` | `vox node: that passphrase does not open node mac's identity` (exit 1); the app shows the sentence without `vox node: ` (`AppModel.sentence`) |
 | Quit lets go; a holder keeps it | checkers appG and appK on #437, release `vox`: a holding client, then SIGTERM | `default attached … (held)`, then `default detached` |
 | First run, Keep Running, Keychain, menu bar, notifications, keys, services view, accessibility | source at 6e909d10: `RootView.swift`, `AppModel.swift`, `Daemon.swift`, `MenuBar.swift`, `Notify.swift`, `Commands.swift`, `Services.swift`, `Keyring.swift`, `Theme.swift`; `crates/vox-tui/src/keychain.rs` | quoted strings as in the source; not run |
+| Install, update and the daemon restart | source at `fa559fd8`: `install.sh`, `crates/vox-tui/src/update/bundle.rs`, `update/restart.rs` (#451–#453); not run, since an install or update replaces the real `/Applications/Vox.app` and restarts the account's daemon | quoted strings as in the source |
+| Share menu and Services item | source at `fa559fd8`: `apps/macos/ShareExtension/ShareViewController.swift`, `Bundle/Vox-Info.plist` (#449) | `Share to a Vox room`, `To (none: the whole room)`, `Open Vox to attach node NAME first.`, `Shared NAME (SHA-256 …)`; Services item `Share to Vox Room` |
+| `vox room read --json --notices` | release `vox` at `fa559fd8`, one scratch node: a post, then `vox room retention … 1w`; `--json`, `--json --notices`, `--notices` alone | `--json`: one `vox.room.row/1`; with `--notices`: `named the room family`, the row, then `set the room's retention to 1 week: …`, each `vox.room.notice/1` with `"by":"you"` and `created_millis`; alone: `error: the following required arguments were not provided: --json` (exit 2) |
+| The link card and To: are drawn as written (fixed after the renders) | source at `fa559fd8` (`f05125f3`): `.caption()` replaces `.eyebrow()`, `To:` `.fixedSize()` | not rendered again |
 
 ## v0.3.1 command check
 
