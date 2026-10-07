@@ -187,6 +187,9 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
     // What settles an earlier line: a tool call's result, a request's resolution.
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
     let mut resolved: BTreeMap<String, usize> = BTreeMap::new();
+    // A drive's results, by the drive's tag (`of` on the result, `id` on the drive), in order.
+    let mut results: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut driven: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // Calls that asked first: their request's line names them, so an unanswered or refused call
     // is not shown twice.
     let mut asked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -200,6 +203,12 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             }
             "resolved" => {
                 resolved.insert(b.reference().to_owned(), i);
+            }
+            "drive" if !b.str("id").is_empty() => {
+                driven.insert(b.str("id").to_owned());
+            }
+            "drive-result" if !b.str("of").is_empty() => {
+                results.entry(b.str("of").to_owned()).or_default().push(i);
             }
             _ => {}
         }
@@ -324,9 +333,20 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     size(b.fields.get("size").and_then(Value::as_u64).unwrap_or(0))
                 );
                 if b.str("dir") == "in" {
-                    format!("file to {label}: {what}")
+                    // Written by the session's node once the file has landed (#546).
+                    let from = match b.str("by") {
+                        "" => String::new(),
+                        by => format!(" from {}", names.alias_b32(by)),
+                    };
+                    match b.str("path") {
+                        "" => format!("file to {label}: {what}{from}"),
+                        path => format!("file to {label}: {what}{from}, at {path}"),
+                    }
                 } else {
-                    format!("file from {label}: {what}")
+                    match b.str("note").trim() {
+                        "" => format!("file from {label}: {what}"),
+                        note => format!("file from {label}: {what} — {}", one_line(note)),
+                    }
                 }
             }
             "drive" => {
@@ -344,6 +364,26 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     "interrupt" => format!("interrupt sent by {by}"),
                     "stop" => format!("stop sent by {by}"),
                     "slash" => format!("/{} sent by {by}", b.str("cmd").trim_start_matches('/')),
+                    "file" => {
+                        if !b.str("note").trim().is_empty() {
+                            details.push(("note".into(), b.str("note").to_owned()));
+                        }
+                        let mut line = format!(
+                            "file sent in by {by}: {} ({})",
+                            b.str("name"),
+                            size(b.fields.get("size").and_then(Value::as_u64).unwrap_or(0))
+                        );
+                        // What came of it, in order: each result names this drive's tag as `of`.
+                        for r in results.get(b.str("id")).into_iter().flatten() {
+                            let r = &bodies[*r];
+                            if r.fields.get("ok").and_then(Value::as_bool) == Some(true) {
+                                line.push_str(&format!(" — {}", r.str("said")));
+                            } else {
+                                line.push_str(&format!(" ✗ {}", r.str("why")));
+                            }
+                        }
+                        line
+                    }
                     // An answer shows on its request's line.
                     _ => continue,
                 }
@@ -351,6 +391,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             // A line Vox itself says in the Session.
             "notice" => format!("Vox: {}", one_line(b.str("text"))),
             "drive-result" => {
+                // A result paired with its drive's tag is drawn on that drive's line.
+                if !b.str("of").is_empty() && driven.contains(b.str("of")) {
+                    continue;
+                }
                 if b.fields.get("ok").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
