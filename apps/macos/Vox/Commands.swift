@@ -4,6 +4,11 @@
 import AppKit
 import SwiftUI
 
+extension Notification.Name {
+    /// Put the keyboard on the room's timeline (View > Focus Timeline).
+    static let voxFocusTimeline = Notification.Name("us.vox.focusTimeline")
+}
+
 /// A sheet a menu, key or palette action opens.
 enum NodeSheet: String, Identifiable {
     case palette, newRoom, joinRoom, fingerprint, rename, retention, admins, leave, end
@@ -69,6 +74,10 @@ extension VoxAction {
                 node?.replyTo = node?.messages.first { $0.id == node?.selectedMessage }
             },
             VoxAction("Room", "Send Urgent", .return, enabled: inRoom) { node?.urgentAsked += 1 },
+            // The keyboard's way into the messages (WCAG 2.1.1): ↑/↓ then move through them.
+            VoxAction("View", "Focus Timeline", "t", [.command, .shift], enabled: inRoom) {
+                NotificationCenter.default.post(name: .voxFocusTimeline, object: nil)
+            },
             VoxAction("Room", "Copy Selected Service's Address", "c", [.command, .shift],
                       enabled: node?.selectedService != nil) { node?.copyServiceCommand() },
             VoxAction("Room", "Next Room That Needs You", "j", enabled: live) {
