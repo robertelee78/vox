@@ -98,7 +98,7 @@ PAGE_AT=$(sed -n 's/.*port \([0-9]*\).*/127.0.0.1:\1/p' "$DEMO/page.log" | head 
 VOX_TEST_CARD_ALLOW="$PAGE_AT" "$VOX" daemon --listen 127.0.0.1:0 >"$DEMO/daemon.log" 2>&1 &
 DAEMON=$!
 for _ in $(seq 1 100); do grep -q "control socket" "$DEMO/daemon.log" && break; sleep 0.1; done
-for n in ann ben builder stranger; do
+for n in ann ben builder stranger cam; do
     "$VOX" node create "$n" --passphrase-file "$DEMO/identity" >/dev/null
     "$VOX" node attach "$n" --passphrase-file "$DEMO/identity" >/dev/null
 done
@@ -150,6 +150,9 @@ VOX_SESSION=builder-demo "$VOX" room post --node builder --type working "$ROOM" 
 VOX_SESSION=ben-demo "$VOX" room post --node ben --to "$ANN" "$ROOM" \
     "Can you check the photo album when it's done?" >/dev/null
 "$VOX" room join --node stranger --passphrase-file "$DEMO/wrong" "$LINK" >/dev/null 2>&1 || true
+# cam joins and trusts ann, whose keyring does not hold cam: ann is offered cam (ADR-028 K-15).
+"$VOX" room join --node cam --passphrase-file "$DEMO/room" "$LINK" >/dev/null
+trust cam "$ANN" ann
 sleep 3
 
 # ---- the renderer: the app's views, offscreen ------------------------------------------------

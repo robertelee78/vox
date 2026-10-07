@@ -68,6 +68,12 @@ Task { @MainActor in
         await model.show(.room(room.id))
         await wait(3)
         try render(MainWindow(model: model), "main-window")
+        // A trust offer waiting on ann: cam joined and trusts her (ADR-028 K-15).
+        if let offer = model.offers.first {
+            await model.show(.offer(offer.fingerprint))
+            await wait(1)
+            try render(MainWindow(model: model), "offer")
+        }
         await model.show(.keyring)
         await wait(1)
         try render(MainWindow(model: model), "keyring")
