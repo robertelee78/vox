@@ -16,6 +16,8 @@
 //!
 //! Each time, a message posted while it was down must reach it, and a message it posts once
 //! back must reach the other, both within 10 s of the restarted node answering (printed).
+//! Nothing is said nearby (`VOX_TEST_NO_NEARBY`, a `test-knobs` knob): on one computer, what a
+//! node says nearby finds the other within seconds too, and the peer book is what is proved.
 //! Mutation: nothing persisted — it never reconverges.
 //!
 //! - (c) **a pair whose peer books were written when Vox kept times in seconds** (#562). The
@@ -271,6 +273,8 @@ fn arrivals(
 #[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
 fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
     watchdog::arm();
+    test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
+    let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
     let t = tempfile::tempdir().unwrap();
     let (alice, alice_fp) = identity(t.path(), "alice");
     let (bob, bob_fp) = identity(t.path(), "bob");
@@ -279,10 +283,16 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
         "alice",
         &format!("{IDENTITY}\n"),
         "127.0.0.1:0",
-        &[],
+        &unheard,
     ));
     let alice_at = listening(&alice);
-    let _b = daemon(&bob, "bob", &format!("{IDENTITY}\n"), "127.0.0.1:0", &[]);
+    let _b = daemon(
+        &bob,
+        "bob",
+        &format!("{IDENTITY}\n"),
+        "127.0.0.1:0",
+        &unheard,
+    );
     let room = create(&alice);
     join(&alice, &bob, &room);
     trust(&alice, &bob_fp, "bob");
@@ -307,7 +317,7 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
             &format!("alice-{}", listen.replace([':', '.'], "-")),
             &format!("{IDENTITY}\n{ROOMPASS}\n"),
             &listen,
-            &[],
+            &unheard,
         ));
         let back_at = Instant::now();
         let back = format!("alice is back ({case})");
@@ -336,7 +346,7 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
     assert_eq!(
         converged,
         results.len(),
-        "a restarted member must find its room again, both ways, within {WITHIN:?} of being \
+        "PRODUCT: a restarted member must find its room again, both ways, within {WITHIN:?} of being \
          back (None = never, in 60 s): {results:?}"
     );
 }
