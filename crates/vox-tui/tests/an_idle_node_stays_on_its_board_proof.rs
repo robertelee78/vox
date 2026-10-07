@@ -196,7 +196,8 @@ fn moved(
         .collect()
 }
 
-/// `address` without the `a=<who>&b=<endpoint>` pair naming `who`: what is left names the anchor.
+/// `address` without the `a=<who>&b=<endpoint>` pair naming `who`, and without the `m=<who>` that
+/// marks it a member (an `m=` must name an entry the address gives): what is left names the anchor.
 fn without_endpoint_of(address: &str, who: &str) -> String {
     let (head, query) = address
         .split_once('?')
@@ -207,6 +208,10 @@ fn without_endpoint_of(address: &str, who: &str) -> String {
     while i < parts.len() {
         if parts[i] == format!("a={who}") && parts.get(i + 1).is_some_and(|p| p.starts_with("b=")) {
             i += 2;
+            continue;
+        }
+        if parts[i] == format!("m={who}") {
+            i += 1;
             continue;
         }
         kept.push(parts[i]);

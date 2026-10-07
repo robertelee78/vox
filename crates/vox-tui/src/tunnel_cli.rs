@@ -790,6 +790,19 @@ fn board_unreachable_advice(said: &str) -> &'static str {
     }
 }
 
+/// **An address that will not parse is refused here, with what is wrong with it**, before any
+/// node or board is asked: the node can only answer "will not parse", which sent a person to
+/// check they had copied all of an address that was whole (a member marked with `m=` that the
+/// address gives no `a=`/`b=` for, 2026-10-07). Shared by `vox room join` and `vox connect`.
+///
+/// # Errors
+/// The parse's own reason.
+pub(crate) fn readable(link: &str) -> Result<(), AppError> {
+    vox_core::node::link::InviteLink::parse(link)
+        .map(|_| ())
+        .map_err(|e| AppError::Usage(format!("cannot join: {e}")))
+}
+
 /// What to tell a person whose join failed, chosen by the fault the node reported.
 ///
 /// Shared by `vox connect` (which holds its node on the daemon while it joins) and `vox room
