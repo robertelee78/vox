@@ -43,15 +43,33 @@ VOX="$BUILD/target/release/vox"
 
 DAEMON=""
 PAGE=""
+# Stop one process this script started, by its PID: asked first, killed after 10 s, and said so.
+stop() {
+    local pid=$1
+    [ -n "$pid" ] || return 0
+    kill "$pid" 2>/dev/null || return 0
+    for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        echo "app-screenshots: pid $pid did not stop in 10 s; killed it" >&2
+    fi
+    wait "$pid" 2>/dev/null || true
+}
 cleanup() {
-    [ -n "$PAGE" ] && kill "$PAGE" 2>/dev/null && { wait "$PAGE" 2>/dev/null || true; }
-    [ -n "$DAEMON" ] && kill "$DAEMON" 2>/dev/null && wait "$DAEMON" 2>/dev/null
+    stop "$PAGE"
+    stop "$DAEMON"
     echo "app-screenshots: the demo data root was $DEMO (scratch; remove it when done)"
 }
+# However the script ends, its demo daemon and page server stop: a signal exits through the
+# EXIT trap too (bash runs no EXIT trap for a signal it does not trap). One left behind ran 7 h.
 trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---- the demo data -------------------------------------------------------------------------
-: >"$DEMO/empty"
+# Every node has an identity passphrase (ADR-028 K-11): the demo's are this one.
+printf 'demo identity\n' >"$DEMO/identity"
 printf 'family room\n' >"$DEMO/room"
 printf 'not it\n' >"$DEMO/wrong"
 # A page on this machine for a link card (title, description, image), so the demo contacts no
@@ -81,8 +99,8 @@ VOX_TEST_CARD_ALLOW="$PAGE_AT" "$VOX" daemon --listen 127.0.0.1:0 >"$DEMO/daemon
 DAEMON=$!
 for _ in $(seq 1 100); do grep -q "control socket" "$DEMO/daemon.log" && break; sleep 0.1; done
 for n in ann ben builder stranger; do
-    "$VOX" node create "$n" --passphrase-file "$DEMO/empty" >/dev/null
-    "$VOX" node attach "$n" --passphrase-file "$DEMO/empty" >/dev/null
+    "$VOX" node create "$n" --passphrase-file "$DEMO/identity" >/dev/null
+    "$VOX" node attach "$n" --passphrase-file "$DEMO/identity" >/dev/null
 done
 fp() { "$VOX" id --node "$1" | tail -1; }
 ANN=$(fp ann) BEN=$(fp ben) BUILDER=$(fp builder)
@@ -92,7 +110,7 @@ LINK=$("$VOX" room link --node ann "$ROOM" | grep '^vox://')
 for n in ben builder; do
     "$VOX" room join --node "$n" --passphrase-file "$DEMO/room" "$LINK" >/dev/null
 done
-trust() { "$VOX" trust add --node "$1" "$2" --name "$3" --identity-passphrase-file "$DEMO/empty" >/dev/null; }
+trust() { "$VOX" trust add --node "$1" "$2" --name "$3" --identity-passphrase-file "$DEMO/identity" >/dev/null; }
 trust ann "$BEN" ben; trust ann "$BUILDER" builder
 trust ben "$ANN" ann; trust builder "$ANN" ann; trust ben "$BUILDER" builder; trust builder "$BEN" ben
 for i in $(seq 1 30); do
