@@ -165,6 +165,12 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
         _ => String::new(),
     };
     let (profile, pass, pass_file) = match &sub {
+        TrustCmd::Offers(a) => (
+            a.profile.clone(),
+            a.identity_passphrase.clone(),
+            a.identity_passphrase_file.clone(),
+        ),
+        TrustCmd::Dismiss(a) => (a.profile.clone(), None, None),
         TrustCmd::List(a) => (
             a.profile.clone(),
             a.identity_passphrase.clone(),
@@ -232,6 +238,8 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
     let outcome = rt.block_on(async move {
         match sub {
             TrustCmd::List(_) => crate::room_cli::trust_list(&paths).await,
+            TrustCmd::Offers(_) => crate::room_cli::trust_offers(&paths).await,
+            TrustCmd::Dismiss(a) => crate::room_cli::trust_dismiss(&paths, &a.fingerprint).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
                 crate::room_cli::trust_add(&paths, target, &name, a.history == "full", a.drive)
@@ -1715,6 +1723,13 @@ enum TrustCmd {
     Drive(TrustCapabilityArgs),
     /// Take drive back from a trusted identity: its keyring entry grants read only.
     Read(TrustCapabilityArgs),
+    /// List the members offered to your keyring: each node that joined a room after you did,
+    /// or that trusts you, and that is not in your keyring. Accept one with `vox trust add`,
+    /// or dismiss it with `vox trust dismiss`.
+    Offers(IdentityArgs),
+    /// Dismiss an offer, on this node alone: the node offered is not told, and stays out of
+    /// your keyring. If it leaves and joins again, it is offered again.
+    Dismiss(TrustDismissArgs),
 }
 
 /// `vox trust drive` and `vox trust read`
@@ -1730,6 +1745,15 @@ pub struct TrustCapabilityArgs {
     /// Read the identity passphrase from this file (first line).
     #[arg(long)]
     pub identity_passphrase_file: Option<std::path::PathBuf>,
+}
+
+/// `vox trust dismiss`
+#[derive(Args, Debug, Clone)]
+pub struct TrustDismissArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The node offered (base32, or a unique prefix of one offered).
+    pub fingerprint: String,
 }
 
 /// `vox trust rename`

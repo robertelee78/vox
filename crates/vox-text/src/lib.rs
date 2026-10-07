@@ -7,6 +7,7 @@
 //! rest of the line reads. Every printer of such text passes it through [`shown`].
 
 pub mod fingerprint;
+pub mod offer;
 
 /// Whether `c` may not appear in text printed for somebody reading (V210-123): every control
 /// character (which includes `\n`, `\r`, VT, FF, NEL, ESC and NUL), the Unicode line and

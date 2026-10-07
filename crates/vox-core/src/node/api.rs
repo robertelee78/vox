@@ -429,6 +429,54 @@ impl StructuredIndex {
     }
 }
 
+/// Why a member is offered to this node's keyring (ADR-028 K-15, K-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OfferWhy {
+    /// It joined a room after this node did (K-15).
+    Joined,
+    /// It trusts this node: it granted it consent here (K-17, ADR-007 G-9).
+    TrustsYou,
+}
+
+/// The log entry an offer of `member` rests on in one room: its join (its admission, or its
+/// statement that it is back after leaving) or its consent grant to this node. An offer is derived
+/// from these and never written as an entry of its own (K-15); a dismissal is kept against one
+/// (K-18), so a new join or a new grant offers the member again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OfferBasis {
+    /// The member offered.
+    pub member: Digest32,
+    /// What the entry is.
+    pub why: OfferWhy,
+    /// The entry's place in the member's feed.
+    pub seq: u64,
+}
+
+/// A room an offer comes from, as the node names it here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferRoom {
+    /// The room.
+    pub id: Digest32,
+    /// Its name as this node shows it ([`crate::node::resolver::room_shown_here`]).
+    pub name: String,
+}
+
+/// A member offered to this node's keyring (ADR-028 K-15 – K-18): a node of a room it shares,
+/// not in its keyring, that joined after it or trusts it, and that it has not dismissed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Offer {
+    /// The member offered.
+    pub member: Digest32,
+    /// The open rooms it is offered from, in channelID order.
+    pub rooms: Vec<OfferRoom>,
+    /// What a client says of it, word for word in the TUI and the app ([`vox_text::offer::said`]).
+    pub said: String,
+    /// Why, each reason once: joined, trusts you, or both.
+    pub why: Vec<OfferWhy>,
+    /// The members of this node's keyring that trust it (K-7), in fingerprint order.
+    pub trusted_by: Vec<Digest32>,
+}
+
 /// An open channel's full state for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDetail {
@@ -477,6 +525,9 @@ pub struct ChannelDetail {
     /// reading them)`, in fingerprint order, a member no one trusts left out. `consenting` is this
     /// identity's own entry.
     pub trusted_by: Vec<(Digest32, Vec<Digest32>)>,
+    /// What each other member could be offered to this node on here (ADR-028 K-15, K-17), off the
+    /// log; whether it is offered is decided over every room, the keyring and the dismissals.
+    pub offer_bases: Vec<OfferBasis>,
     /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
     /// and the node's own (ADR-023 decision 2). What `vox status` reports. Carried in the view
     /// so a reader never has to take the room's lock, which a sync session holds while it runs.
@@ -547,6 +598,9 @@ pub struct NodeView {
     /// The keyring entries that carry drive (ADR-028 K-14), in fingerprint order; every other
     /// entry in [`NodeView::trusted`] grants read.
     pub drive: Vec<Digest32>,
+    /// The members offered to the keyring (ADR-028 K-15 – K-18), in fingerprint order; empty while
+    /// locked.
+    pub offers: Vec<Offer>,
     /// Peers this node currently reaches **through a relay** rather than directly.
     ///
     /// Worth surfacing rather than hiding: a relayed path means a third party is carrying
@@ -791,6 +845,13 @@ pub enum NodeCommand {
     Untrust {
         /// The identity to stop trusting.
         fingerprint: Digest32,
+    },
+    /// Dismiss the offer of `member` (ADR-028 K-18): on this node alone, and silently; the member
+    /// is not told and stays out of the keyring. Kept against the entries the offer rests on, so a
+    /// later join or grant offers it again.
+    DismissOffer {
+        /// The member offered.
+        member: Digest32,
     },
     /// Create a **service room** and offer one local TCP service in it, in one act
     /// (ADR-017 decisions 3 and 4) — what `vox serve <port>` does.

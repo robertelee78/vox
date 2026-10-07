@@ -79,12 +79,23 @@
 //!   trusts it yet.", then, once Alice (whom Bob trusts) trusts Frank, "<frank> joined. alice trusts
 //!   it.", naming neither Erin (in Bob's keyring, never in the room, never granting Frank) nor
 //!   anyone outside Bob's keyring (ADR-028 K-7, #476); Frank is added to no keyring of Bob's;
+//! - `offer`: Frank, who joined after Bob, waits under "needs you" as an offer; selected, his
+//!   fingerprint shows grouped with its art; `x` dismisses it on Bob's node alone, and nothing
+//!   reaches the room; with Bob's node detached and attached again, Frank stays dismissed and
+//!   Carol, who trusts Bob, is still offered (ADR-028 K-15, K-17, K-18, #526);
+//! - `reoffer`: Frank leaves and joins again, and is offered again: a dismissal is kept against the
+//!   join (K-18);
 //! - `trust`: the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
 //!   in the members pane opens the trust prompt showing his fingerprint; Dave's fingerprint pasted
 //!   there adds nothing, says not to trust him and shows both; Frank's own, pasted through the
 //!   `:trust` the hint offers, in groups and upper case, adds him and says so once the identity
 //!   passphrase is typed into the prompt (`VOX_TEST_KEYRING_WINDOW_SECS` makes Bob's window a
 //!   minute, so it has closed): a wrong passphrase adds nothing and is never shown;
+//! - `offerback`: Bob having trusted Frank, Frank's `vox trust offers` lists Bob as one that trusts
+//!   him; Frank accepts with `vox trust add`, and each reads the other (K-17, #527);
+//! - `accept`: Carol's offer, accepted in Bob's TUI, asks her name with her fingerprint shown, and
+//!   read or read + drive, never a fingerprint to compare; she is then in Bob's keyring and no
+//!   longer offered (K-16, #527); run after `depths`, since every claim before it reads Carol as out of the keyring;
 //! - `onenode`: `:node spare` is refused, naming the one node the window acts as, and the window
 //!   still acts as default, by its status bar and sidebar (ADR-028 E-4, #470);
 //! - `to`: `:to zz-nobody` is refused with a sentence and sets nothing; `:to alice` and `:urgent`
@@ -178,7 +189,8 @@
 //! `:interrupt` sent as a stop (`steer`),
 //! a Session's `:share` sending the path as text (`share`), notices placed by time again
 //! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
-//! all 46 claims ok.
+//! all 50 claims ok. Also: the dismissals not kept across a restart (`offer`), or no offer from a
+//! consent grant, so no offer back (`offerback`).
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -255,10 +267,11 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (#240).
     // Its bounds are the product's: a member waits 480 s for a joiner's proof of work (V210-87),
     // which a debug build can take minutes to grind, and the driver joins three members at once, then
-    // a fourth while the TUI is open, then opens the TUI three times more (`depths`, about 90 s).
-    // So the driver's budget is 1750 s, it is stopped from outside at 1780 s, and the watchdog is
+    // a fourth while the TUI is open and has it join again (`reoffer`), opens the TUI once more
+    // (`offer`) and three times more (`depths`, about 90 s).
+    // So the driver's budget is 1950 s, it is stopped from outside at 1980 s, and the watchdog is
     // past both. A release run takes about two minutes.
-    watchdog::arm_for(Duration::from_secs(1880));
+    watchdog::arm_for(Duration::from_secs(2080));
     // Bob's keyring window is a minute, so the trust prompt's passphrase field is typed into
     // (`trust`): the window is closed by then.
     test_knobs::require(&["VOX_TEST_KEYRING_WINDOW_SECS"]);
@@ -267,14 +280,14 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let out = pty_driver::run_within(
         script,
         &[env!("CARGO_BIN_EXE_vox"), "truth"],
-        Duration::from_secs(1780),
+        Duration::from_secs(1980),
     );
     let stall = clock.stop();
     let said = out.stdout.clone();
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (46 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (50 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -288,8 +301,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (46, 46),
-                "APPARATUS: the driver said PASS without all 46 claims ok: {said}"
+                (50, 50),
+                "APPARATUS: the driver said PASS without all 50 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),
