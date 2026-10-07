@@ -828,11 +828,19 @@ impl Router {
             // names the size, and a file that would leave less than the reserve is refused before
             // anything is pulled. The pull itself stops at the reserve too.
             Action::File { size, .. } => {
-                let dir = vox_core::node::pulls::room_dir(&paths, &info.channel_id);
+                use vox_core::node::pulls::{bytes, free_space, room_dir, RESERVE};
+                let dir = room_dir(&paths, &info.channel_id);
                 let _ = vox_core::node::paths::create_private_dir(&dir);
-                match vox_core::node::pulls::short_of_space(&dir, *size) {
-                    Some(why) => Err(format!("not accepted: {why}")),
-                    None => Ok(format!("accepted, pulling {size} bytes")),
+                let needs = size.saturating_add(RESERVE);
+                match free_space(&dir) {
+                    Ok(has) if has < needs => Err(format!(
+                        "not enough free disk on {node}: needs {} (the file, and {} kept free), \
+                         has {}",
+                        bytes(needs),
+                        bytes(RESERVE),
+                        bytes(has)
+                    )),
+                    _ => Ok(format!("accepted, pulling {size} bytes")),
                 }
             }
             input => self.steer(node, &reg, input).await,
@@ -910,30 +918,25 @@ impl Router {
                 "dir": "in", "by": by, "name": driven.name, "size": driven.size,
                 "sha256": driven.sha256, "path": shown,
             });
-            // Recorded under its Session entry, so the copy goes when that entry's time is up
-            // (ADR-028 F-5).
-            if let vox_core::node::api::Outcome::Appended(entry) = handle
-                .apply(vox_core::node::api::NodeCommand::AppendSession {
-                    channel_id: driven.room,
-                    session_id: session.to_owned(),
-                    body: entry.to_string(),
-                })
-                .await
-            {
-                let _ = vox_core::node::pulls::record(
-                    paths,
-                    &vox_core::node::pulls::Pulled {
-                        room: driven.room,
-                        entry,
-                        path: path.clone(),
-                        created: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs()),
-                        folder: None,
-                        files: Vec::new(),
-                    },
-                );
-            }
+            // Through the sink, numbered and in order with the Session's other entries.
+            self.inner
+                .sink
+                .activity(node, session, vec![entry.to_string()], None);
+            // Recorded so the copy goes when the room's retention says (ADR-028 F-5), which is
+            // all a record's expiry reads; its id is the share's, the one the drive named.
+            let _ = vox_core::node::pulls::record(
+                paths,
+                &vox_core::node::pulls::Pulled {
+                    room: driven.room,
+                    entry: vox_core::hash::sha256(driven.tag.as_bytes()),
+                    path: path.clone(),
+                    created: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                    folder: None,
+                    files: Vec::new(),
+                },
+            );
             let line = match note.as_deref().map(str::trim) {
                 Some(n) if !n.is_empty() => format!("{alias} sent you a file: {shown} — {n}"),
                 _ => format!("{alias} sent you a file: {shown}"),

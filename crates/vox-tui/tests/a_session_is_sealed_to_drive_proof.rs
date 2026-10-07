@@ -82,55 +82,27 @@ const SESSION: &str = "3f0c25bf-1d2e-4c5b-9a8f-session-proof";
 /// How many entries alice's Session writes before, and after, bob's downgrade.
 const ENTRIES: usize = 3;
 
-/// What a harness puts in a hook's environment: cleared from every `vox` here, so none of the
-/// harness this proof itself may run under reaches it.
-const HARNESS_VARS: &[&str] = &[
-    "VOX_SESSION",
-    "VOX_ROOM",
-    "VOX_AGENT_NAME",
-    "VOX_HARNESS",
-    "VOX_NODE",
-    "VOX_ANCHORS",
-    "VOX_LISTEN",
-    "CLAUDE_CODE_MESSAGING_SOCKET",
-    "CLAUDE_CODE_MESSAGING_TOKEN",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "OPENCODE_SERVER_URL",
-];
-
-/// `vox` with none of the environment of whatever runs this proof that could reach a real harness
-/// or terminal: every `TMUX*` (a staged hook inheriting the operator's tmux binds its session to
-/// the operator's own pane, and a drive is typed there), `CLAUDE*`, `CODEX*` and `OPENCODE*`
-/// variable, and [`HARNESS_VARS`]. Walked from the environment itself, not a fixed list, so a
-/// variable a harness adds later is cleared too.
+/// `vox` with none of the environment of whatever runs this proof: above all no `TMUX*` (a staged
+/// hook inheriting the operator's tmux binds its session to the operator's own pane, and a drive is
+/// typed there), `CLAUDE*`, `CODEX*`, `OPENCODE*` or `VOX_*`. Walked from the environment itself,
+/// not a fixed list, so a variable a harness adds later is cleared too.
 fn vox_cmd() -> Command {
     let mut cmd = Command::new(VOX);
-    // A clean environment: only this whitelist of what any program needs passes, so nothing of a
-    // harness, a terminal or the operator's own vox reaches it.
-    cmd.env_clear();
-    for k in [
+    // A clean environment: every variable this process has is removed by name except this
+    // whitelist of what any program needs, so nothing of a harness, a terminal or the operator's
+    // own vox reaches it. By name, not `env_clear`: a keyring change is run through `typed`, which
+    // copies a command's named variables and removals, and a removal made after `env_clear` is not
+    // recorded as one.
+    const PASS: [&str; 7] = [
         "HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LANG", "LC_ALL",
-    ] {
-        if let Some(v) = std::env::var_os(k) {
-            cmd.env(k, v);
+    ];
+    for (k, _) in std::env::vars_os() {
+        if !PASS.iter().any(|p| k == *p) {
+            cmd.env_remove(&k);
         }
     }
     // A daemon this starts never takes port 1080.
     cmd.env("VOX_PROXY", "127.0.0.1:0");
-    // Removed by name as well: a keyring change is run through `typed`, which copies a command's
-    // named variables and removals but cannot see `env_clear`.
-    for (k, _) in std::env::vars_os() {
-        let name = k.to_string_lossy();
-        if ["TMUX", "CLAUDE", "CODEX", "OPENCODE"]
-            .iter()
-            .any(|p| name.starts_with(p))
-        {
-            cmd.env_remove(&k);
-        }
-    }
-    for v in HARNESS_VARS {
-        cmd.env_remove(v);
-    }
     // **Checked, not trusted**: every such variable in this process's environment is removed from
     // the child's, or nothing runs. A staged hook given a pane would bind a real terminal.
     let removed: std::collections::BTreeSet<_> = cmd
@@ -792,7 +764,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         panic!("CANNOT MEASURE (apparatus): bob's crafted drive request got no answer: {e:?}")
     });
     assert!(
-        !huge.ok && huge.said.contains("not accepted"),
+        !huge.ok && huge.said.contains("not enough free disk on"),
         "PRODUCT: a file past alice's disk reserve must be refused when it is offered: she \
          answered {huge:?}"
     );
