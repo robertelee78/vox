@@ -283,7 +283,7 @@ private struct RemoveSheet: View {
 
 /// The identity passphrase, asked for when the keyring window has closed (ADR-026 N-2): the
 /// change waiting for it is made with it.
-private struct KeyringPassphrase: View {
+struct KeyringPassphrase: View {
     @ObservedObject var model: NodeModel
     @State private var field = SecureFieldHolder()
 

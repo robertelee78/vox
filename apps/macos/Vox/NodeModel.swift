@@ -19,6 +19,8 @@ final class NodeModel: ObservableObject {
         case keyring
         case decisions
         case services
+        /// A trust offer waiting, by the offered node's fingerprint (ADR-028 K-15).
+        case offer(String)
     }
 
     /// A room as the sidebar shows it.
@@ -117,6 +119,8 @@ final class NodeModel: ObservableObject {
     private var following: Task<Void, Never>?
     @Published private(set) var members: [MemberRow] = []
     @Published private(set) var trusted: [TrustedNode] = []
+    /// Trust offers waiting on this node: newcomers, and nodes that trust it (ADR-028 K-15, K-17).
+    @Published private(set) var offers: [OfferInfo] = []
     /// The trusted nodes that trust this node back, as the rooms shared with them record it (L-4).
     @Published private(set) var trustsBack: Set<String> = []
     /// The keyring row selected, by fingerprint: what Keyring > Compare, Rename and Remove act on.
@@ -199,6 +203,7 @@ final class NodeModel: ObservableObject {
     /// they changed; and who trusts back, while the keyring is on screen.
     private func readFacts() async {
         if let keyring = try? await client.trustList(), keyring != trusted { trusted = keyring }
+        if let waiting = try? await client.pendingOffers(), waiting != offers { offers = waiting }
         if let fresh = try? await client.nodes(), fresh != nodes { nodes = fresh }
         if let view = try? await client.view() {
             if Int(view.peers) != peers { peers = Int(view.peers) }
@@ -274,6 +279,11 @@ final class NodeModel: ObservableObject {
     func select(_ selection: Selection?) {
         guard selection != self.selection else { return }
         self.selection = selection
+        // An offer's view says what its own Trust did, never an earlier keyring change.
+        if case .offer = selection {
+            keyringDid = nil
+            keyringFailed = nil
+        }
         guard case .room = selection else { return }
         messages = []
         readBy = [:]
@@ -376,6 +386,28 @@ final class NodeModel: ObservableObject {
             await refresh()
         } catch {
             keyringFailed = sentence(error)
+        }
+    }
+
+    // ---- trust offers (ADR-028 K-15 to K-18) ------------------------------------------------
+
+    /// Accept `offer`: trust it under `alias`, read or read + drive (K-16), behind the passphrase
+    /// gate; the offer then leaves needs you. Whether it was done.
+    func accept(_ offer: OfferInfo, as alias: String, drive: Bool) async -> Bool {
+        guard await trust(offer.fingerprint, as: alias, drive: drive) else { return false }
+        if let waiting = try? await client.pendingOffers() { offers = waiting }
+        return true
+    }
+
+    /// Dismiss `offer`: here only, and silently (K-18); the node stays not in keyring, and trust
+    /// stays reachable from the member pane.
+    func dismiss(_ offer: OfferInfo) async {
+        do {
+            try await client.dismissOffer(fingerprint: offer.fingerprint)
+            if let waiting = try? await client.pendingOffers() { offers = waiting }
+            if selection == .offer(offer.fingerprint) { selection = nil }
+        } catch {
+            said = sentence(error)
         }
     }
 
@@ -628,8 +660,11 @@ final class NodeModel: ObservableObject {
 
     /// The next room that needs the person, if any (W-2).
     func nextNeedingYou() async {
-        guard let room = group(.needsYou).first else { return }
-        await show(.room(room.id))
+        if let room = group(.needsYou).first {
+            await show(.room(room.id))
+        } else if let offer = offers.first {
+            await show(.offer(offer.fingerprint))
+        }
     }
 
     /// Share the file or folder at `url` in the room on screen, addressed to `to` (members'
