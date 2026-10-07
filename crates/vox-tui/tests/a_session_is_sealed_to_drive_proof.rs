@@ -7,14 +7,19 @@
 //!    room's log, and bob's node opens every one of them; carol's opens none, though it reads
 //!    alice's messages to the room written before and after them. Neither shows Session activity
 //!    in the room's timeline (`vox room read`).
+//!    `vox room sessions --json` says so too: alice's Session is listed for both, `can_drive`
+//!    true for bob and false for carol.
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
 //!    Bob's node opens none of the entries alice's Session writes afterwards, while it still holds
-//!    the ones it read before and still reads alice's messages to the room.
+//!    the ones it read before and still reads alice's messages to the room; and its
+//!    `vox room sessions --json` lists alice's Session with `can_drive` false.
 //!
 //! ## The staging
 //! - Every `vox` is the shipped binary in a scratch `VOX_DATA_DIR`/`VOX_CONFIG_DIR`; every step a
 //!   person takes is typed as one types it (`vox id`, `vox room create|link|join|post|read`,
 //!   `vox trust add [--drive]`, `vox trust read`).
+//! - Alice's Session is opened by her harness's hook, as a person's Claude Code session opens it:
+//!   `vox agent hook` with the harness's own `UserPromptSubmit` payload.
 //! - A Session's entries are written as its harness's hook writes them: through the daemon's
 //!   control socket ([`Request::AppendSession`]), in the harnesses' activity format, the proof
 //!   speaking that protocol itself as apparatus (staging). Each member's verdict is read as a
@@ -27,6 +32,9 @@
 //! - **Release the drive key on read** (claim 1): `drive_holders` in
 //!   `crates/vox-core/src/node/actor.rs` returns every trusted node. Carol's node opens alice's
 //!   Session entries: red PRODUCT.
+//! - **`can_drive` always true** (claims 1 and 2): `sessions::fold` in
+//!   `crates/vox-core/src/node/sessions.rs` sets it true. Carol's listing says she can drive:
+//!   red PRODUCT.
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
@@ -53,6 +61,22 @@ const SESSION: &str = "3f0c25bf-1d2e-4c5b-9a8f-session-proof";
 /// How many entries alice's Session writes before, and after, bob's downgrade.
 const ENTRIES: usize = 3;
 
+/// What a harness puts in a hook's environment: cleared from every `vox` here, so none of the
+/// harness this proof itself may run under reaches it.
+const HARNESS_VARS: &[&str] = &[
+    "VOX_SESSION",
+    "VOX_ROOM",
+    "VOX_AGENT_NAME",
+    "VOX_HARNESS",
+    "VOX_NODE",
+    "VOX_ANCHORS",
+    "VOX_LISTEN",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "OPENCODE_SERVER_URL",
+];
+
 /// A child killed and reaped by its own PID when dropped — never by pattern.
 struct Proc(Child);
 
@@ -73,11 +97,24 @@ struct Member {
 
 impl Member {
     fn vox(&self, args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+        self.vox_with(args, stdin, &[])
+    }
+
+    fn vox_with(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> (bool, String, String) {
+        let mut cmd = Command::new(VOX);
+        for v in HARNESS_VARS {
+            cmd.env_remove(v);
+        }
         // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
         // K-13): the passphrase file's first line, typed at the prompt.
         if typed::is_keyring_change(args) {
-            let mut cmd = Command::new(VOX);
             cmd.args(args)
+                .envs(env.iter().copied())
                 .env("VOX_DATA_DIR", &self.data)
                 .env("VOX_CONFIG_DIR", self.data.join("cfg"))
                 .env_remove("VOX_ROOM")
@@ -86,8 +123,9 @@ impl Member {
             let (ok, shown) = typed::keyring(&cmd);
             return (ok, shown.clone(), shown);
         }
-        let mut child = Command::new(VOX)
+        let mut child = cmd
             .args(args)
+            .envs(env.iter().copied())
             .env("VOX_DATA_DIR", &self.data)
             .env("VOX_CONFIG_DIR", self.data.join("cfg"))
             .env_remove("VOX_ROOM")
@@ -317,6 +355,16 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
     }
 }
 
+/// Whether `m`'s `vox room sessions --json` lists alice's Session as one it can drive; `None` if
+/// it does not list it.
+fn can_drive(m: &Member, room: &str) -> Option<bool> {
+    let (_, out, _) = m.vox(&["room", "sessions", room, "--json"], None);
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == SESSION)
+        .and_then(|v| v["can_drive"].as_bool())
+}
+
 /// One reply of alice's Session, in the harnesses' activity format.
 fn reply(seq: usize, text: &str) -> String {
     serde_json::json!({ "v": 1, "session": SESSION, "kind": "reply", "seq": seq, "text": text })
@@ -392,6 +440,15 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         "APPARATUS (staging): bob and carol never read alice's room messages"
     );
     let id = channel_id(&rt, &alice, &room);
+    // Alice is at her session: its hook opens its Session in the room.
+    let (ok, o, e) = alice.vox_with(
+        &["agent", "hook", "--node", "default", "--room", &room],
+        Some(&format!(
+            r#"{{"session_id":"{SESSION}","hook_event_name":"UserPromptSubmit","cwd":"/tmp","transcript_path":"/tmp/t.jsonl","prompt":"go"}}"#
+        )),
+        &[("CLAUDE_CODE_ENTRYPOINT", "cli")],
+    );
+    assert!(ok, "APPARATUS (staging): alice's hook failed: {o}{e}");
 
     // ---- claim 1: alice's Session writes entries; bob opens them, carol none ----
     let before: Vec<String> = (1..=ENTRIES)
@@ -414,6 +471,10 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let carol_synced = posts_until_read(&alice, &carol, &room, "AFTER-ENTRIES");
     let carol_holds = entries(&carol, &room).saturating_sub(carol_held);
     let carol_opened = opened(&carol, &room);
+    let bob_lists = until(Duration::from_secs(60), || {
+        can_drive(&bob, &room) == Some(true)
+    });
+    let carol_lists = can_drive(&carol, &room);
     let timeline_bob = bob.vox(&["room", "read", &room], None).1;
     let timeline_carol = carol.vox(&["room", "read", &room], None).1;
     eprintln!(
@@ -436,6 +497,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         carol_opened.is_empty(),
         "PRODUCT: carol, whom alice trusts with read only, must open none of her Session's \
          entries: she opened {carol_opened:?}"
+    );
+    assert!(
+        bob_lists && carol_lists == Some(false),
+        "PRODUCT: `vox room sessions --json` must list alice's Session with can_drive true for bob \
+         and false for carol: bob {:?}, carol {carol_lists:?}",
+        can_drive(&bob, &room)
     );
     assert!(
         !timeline_bob.contains("BEFORE-DOWNGRADE") && !timeline_carol.contains("BEFORE-DOWNGRADE"),
@@ -473,6 +540,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     // Ten seconds more for anything still on its way.
     std::thread::sleep(Duration::from_secs(10));
     let bob_now = opened(&bob, &room);
+    let bob_lists_after = can_drive(&bob, &room);
     eprintln!(
         "[proof] claim 2: bob synced past the later entries: {bob_synced}; opened {bob_now:?}"
     );
@@ -485,6 +553,12 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         after.iter().all(|a| !bob_now.contains(a)),
         "PRODUCT: after alice downgraded bob to read, he must open none of the Session entries \
          written afterwards: he opened {bob_now:?}"
+    );
+    assert_eq!(
+        bob_lists_after,
+        Some(false),
+        "PRODUCT: after the downgrade and the entries sealed since, bob's `vox room sessions \
+         --json` must list alice's Session with can_drive false"
     );
     assert!(
         before.iter().all(|b| bob_now.contains(b)),
