@@ -408,6 +408,78 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// What a driver's drive request says of a file it sends into a Session (ADR-029 DR-1.7, #546).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Driven {
+    /// The room the Session is in.
+    pub room: Digest32,
+    /// The driver's node, which serves it.
+    pub from: Digest32,
+    /// Its name.
+    pub name: String,
+    /// Its size, bytes.
+    pub size: u64,
+    /// Its SHA-256, hex.
+    pub sha256: String,
+    /// The driver's service it is served on.
+    pub tag: String,
+}
+
+/// Pull a file a driver sent into a Session on this node (ADR-029 DR-1.7, #546): from the
+/// driver's node, verified by its SHA-256 before it is kept, into the room's files directory
+/// (ADR-028 F-4). Returns where it landed. Record it with [`record`] under the Session entry that
+/// says so, so it ages with the room (F-5).
+///
+/// # Errors
+/// The forward to the driver's node could not be made, or what came was not the file announced.
+pub async fn pull_driven(
+    handle: &crate::node::actor::NodeHandle,
+    paths: &Paths,
+    driven: &Driven,
+) -> Result<PathBuf, String> {
+    let sha = driven.sha256.to_ascii_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("the file's SHA-256 is not one".into());
+    }
+    let dir = room_dir(paths, &driven.room);
+    crate::node::paths::create_private_dir(&dir).map_err(|e| e.to_string())?;
+    let offer = Offer {
+        room: driven.room,
+        entry: crate::hash::sha256(driven.tag.as_bytes()),
+        author: driven.from,
+        name: driven.name.clone(),
+        size: driven.size,
+        sha256: sha,
+        tag: driven.tag.clone(),
+        http: true,
+        created: now_secs(),
+        files: None,
+    };
+    let bound = match handle
+        .apply(NodeCommand::Forward {
+            channel_id: offer.room,
+            host: offer.author,
+            service_tag: offer.tag.clone(),
+            local: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        })
+        .await
+    {
+        Outcome::Bound(local) => local,
+        other => return Err(other.to_string()),
+    };
+    let name = safe_file_name(&offer.name);
+    let part = dir.join(format!(".{name}.{}.part", hex(&offer.entry[..8])));
+    let received = receive(bound, &part, &offer).await;
+    let _ = handle.apply(NodeCommand::StopForward { local: bound }).await;
+    if let Err(e) = received {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    let placed = place(&part, &dir, &name);
+    let _ = std::fs::remove_file(&part);
+    placed
+}
+
 /// The share `text` announces, if it is one this node may pull: a `file` announcement addressed to
 /// `me` or to no one. `None` for anything else, for good.
 #[allow(clippy::type_complexity)]
