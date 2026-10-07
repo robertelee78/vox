@@ -29,7 +29,7 @@
 //! a member missing from the snapshot is refused (it retries), never wrongly
 //! admitted, because the key still has to verify the record's signature.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use quinn::{RecvStream, SendStream};
@@ -114,6 +114,10 @@ pub const TEST_HOLD_BOARD_READ_ENV: &str = "VOX_TEST_HOLD_BOARD_READ_MS";
 /// and the anchor carried it for its 60 s grace — an anchor working for a pair that never needed
 /// it, which is everything ADR-012's anchor principle says it must not do.
 pub const DIRECT_HEAD_START: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long a circuit refused by a board that did not know this node yet waits for this node's
+/// records to reach it before it is asked again: one publish round to a live board.
+pub const BOARD_TOLD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The longest a **dial-back** (V030-22) waits for the peer's word, counted from the reach's
 /// start: the peer asked, through a coordinator, to dial this node directly. It races the reach's
@@ -410,6 +414,13 @@ pub struct NodeNet {
     membership: SharedMembership,
     policy: SharedPolicy,
     clock: Clock,
+    /// The boards (anchors) being dialled, or connected and not yet holding a room of this
+    /// node's from a publish round. A board keeps its records in memory, so one that restarted
+    /// knows nobody: asked for a circuit the moment it was reached, it refused this node as a
+    /// stranger (`0x05`), and a `vox forward` said its cleanly stopped anchor had "authenticator
+    /// invalid". **Such a refusal from a board still untold is asked again once it is told**
+    /// ([`BOARD_TOLD_PATIENCE`]); a board that already knows this node is asked at once, as before.
+    untold: Arc<Mutex<HashSet<Digest32>>>,
 }
 
 /// Ends a [`NodeNet::reach`]'s ownership of its peer: the entry goes, and every waiter wakes.
@@ -494,7 +505,19 @@ impl NodeNet {
             membership,
             policy: SharedPolicy::new(),
             clock,
+            untold: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// The board `id` is being dialled, or is connected and has not been given this node's
+    /// records yet: a circuit it refuses as a stranger is asked again once [`Self::board_told`].
+    pub fn board_untold(&self, id: Digest32) {
+        lock(&self.untold).insert(id);
+    }
+
+    /// The board `id` holds this node's records now (or its dial failed).
+    pub fn board_told(&self, id: &Digest32) {
+        lock(&self.untold).remove(id);
     }
 
     /// Be told, by channelID, when a record by another author is admitted to this node's board.
@@ -1353,6 +1376,7 @@ impl NodeNet {
             let label = format!("circuit via {}", short_id(relay.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
+            let untold = Arc::clone(&self.untold);
             set.spawn(async move {
                 let deadline = started + DIRECT_HEAD_START;
                 let mut elsewhere = false;
@@ -1427,6 +1451,43 @@ impl NodeNet {
                         } else {
                             ""
                         }
+                    ),
+                );
+                let asked = circuitstream::connect_through(&relay, peer, &endpoint, now).await;
+                // **A board that restarted refuses a stranger** (`0x05`): it keeps its records in
+                // memory, and this node's are on their way to it. Asked again once they are there,
+                // not reported as an authentication failure.
+                let relay_id: Digest32 = relay.peer_id();
+                let refused_untold = matches!(
+                    &asked,
+                    Err(Error::PeerRefused(
+                        crate::wire::WireError::AuthenticatorInvalid
+                    ))
+                ) && lock(&untold).contains(&relay_id);
+                if !refused_untold {
+                    return (label, asked);
+                }
+                let waited = tokio::time::Instant::now();
+                while lock(&untold).contains(&relay_id) && waited.elapsed() < BOARD_TOLD_PATIENCE {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                if lock(&untold).contains(&relay_id) {
+                    // Said as what it is: a refusal of a stranger by a board our records never
+                    // reached (it stopped again, say), not a failed authentication.
+                    return (
+                        label,
+                        Err(Error::Unreachable(
+                            "it did not know this node yet: our records had not reached it",
+                        )),
+                    );
+                }
+                manager.note(
+                    peer,
+                    format!(
+                        "asking {} for a circuit again: it did not know this node until our \
+                         records reached it, {} ms later",
+                        short_id(relay.peer_id()),
+                        waited.elapsed().as_millis()
                     ),
                 );
                 (
