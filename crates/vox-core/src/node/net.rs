@@ -1371,6 +1371,11 @@ impl ConnectionManager {
     /// its peer returned for the caller to dial again. A connection this end accepted cannot follow
     /// the move: QUIC lets only the dialling end migrate (RFC 9000 §9), so the peer keeps sending to
     /// an address this machine may no longer have. One that answers survived, and is kept.
+    ///
+    /// **A connection over loopback is never stranded**: no change of the machine's network moves
+    /// it, so it is not probed. Probed, a peer on this machine that was busy for the probe's
+    /// quarter second (a join solving its puzzle on a loaded machine) lost its connection, and its
+    /// join in flight, to a default route that moved.
     pub async fn close_stranded(
         &self,
         dialled_too: &std::collections::BTreeSet<Digest32>,
@@ -1378,6 +1383,7 @@ impl ConnectionManager {
         let held: Vec<Arc<VoxConnection>> = lock(&self.conns)
             .values()
             .filter(|c| is_live(c))
+            .filter(|c| !c.quinn().remote_address().ip().to_canonical().is_loopback())
             .filter(|c| {
                 c.quinn().side() == quinn::Side::Server || dialled_too.contains(&c.peer_id())
             })
