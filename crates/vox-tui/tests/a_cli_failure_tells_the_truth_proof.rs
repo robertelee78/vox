@@ -91,6 +91,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// A room address that parses (a room id, and one anchor with its address) and names nowhere a
+/// node runs (UDP port 9 on this machine): what these verbs read only after the prompt this proof
+/// is about. An address that will not parse is refused before any prompt.
+const UNREACHABLE_ROOM: &str =
+    "vox://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?a=ccccccccccccccccccccccccccccccccccccccccccccccccccca&b=/ip4/127.0.0.1/udp/9";
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const IDPASS: &str = "an identity passphrase";
 
@@ -1282,11 +1288,8 @@ impl OnTerminal {
                 .unwrap_or_else(|e| apparatus("open the pty", &e))
         };
         let terminal: std::os::fd::OwnedFd = open().into();
-        // Nothing reads this address before both prompts are answered: the stop lands first.
-        let mut a = vec![
-            "connect".to_owned(),
-            "vox://not-read-before-the-prompts".to_owned(),
-        ];
+        // Nothing dials this address before both prompts are answered: the stop lands first.
+        let mut a = vec!["connect".to_owned(), UNREACHABLE_ROOM.to_owned()];
         if let Some(f) = room_file {
             a.push("--passphrase-file".to_owned());
             a.push(f.to_str().expect("APPARATUS: a UTF-8 path").to_owned());
