@@ -1452,6 +1452,14 @@ impl DaemonCore {
                             let is_me = me == Some(*m);
                             MemberView {
                                 id: *m,
+                                capability: (!is_me && snap.trusted.iter().any(|(fp, _)| fp == m))
+                                    .then(|| {
+                                        if snap.drive.contains(m) {
+                                            vox_core::node::trust::Capability::ReadDrive
+                                        } else {
+                                            vox_core::node::trust::Capability::Read
+                                        }
+                                    }),
                                 // The members pane says "not in keyring" on the member's state
                                 // line (ADR-028 L-4), so a member without a name is its
                                 // fingerprint alone, which fits beside its trust glyph.
@@ -2007,6 +2015,7 @@ impl CoreHandle for DaemonCore {
                 petname: petname.clone(),
                 identity_passphrase: Zeroizing::new(secret(&identity_passphrase)),
                 full_history: false,
+                drive: false,
             }) {
                 CommandStatus::Done => CommandStatus::Said(format!(
                     "you now trust {petname}: it may read what you write in every room you share"

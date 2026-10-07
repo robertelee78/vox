@@ -1244,7 +1244,7 @@ pub async fn serve(
     if picked {
         let me = held.me.as_ref().map(b32_encode).unwrap_or_default();
         let trusted = match held.client.trusted("").await {
-            Ok(Frame::Trusted { entries }) => entries,
+            Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
             _ => Vec::new(),
         };
         let (_, label) = &services[0];
@@ -1509,7 +1509,7 @@ async fn audience(
         _ => return "  (who is in the room could not be read just now)\n".to_owned(),
     };
     let trusted = match client.trusted("").await {
-        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
         _ => Vec::new(),
     };
     let (mut can, mut cannot) = (Vec::new(), Vec::new());

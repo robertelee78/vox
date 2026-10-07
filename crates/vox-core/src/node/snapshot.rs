@@ -85,6 +85,8 @@ pub struct NodeSnapshot {
     pub open: Vec<OpenRoomSnap>,
     /// The trust keyring: `(fingerprint, petname)`.
     pub trusted: Vec<(Digest32, String)>,
+    /// The keyring entries that carry drive (ADR-028 K-14); every other entry grants read.
+    pub drive: Vec<Digest32>,
     /// The peers it holds a connection to now, in fingerprint order.
     pub connected_peers: Vec<Digest32>,
     /// Its live tunnels.
@@ -136,6 +138,7 @@ impl NodeSnapshot {
                 })
                 .collect(),
             trusted: nv.trusted.clone(),
+            drive: nv.drive.clone(),
             connected_peers: nv.connected_peers.clone(),
             tunnels: me
                 .map(|me| crate::transport::quic::live_tunnels(&me))
@@ -151,7 +154,7 @@ impl NodeSnapshot {
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(10).uint(T_SNAPSHOT_REPLY);
+        e.array(11).uint(T_SNAPSHOT_REPLY);
         e.bytes(self.me.as_ref().map_or(&[][..], |d| &d[..]));
         e.uint(u64::from(self.mlock_active));
         e.array(self.rooms.len());
@@ -216,6 +219,7 @@ impl NodeSnapshot {
         for (fp, name) in &self.trusted {
             e.array(2).bytes(fp).text(name);
         }
+        digests(&mut e, &self.drive);
         digests(&mut e, &self.connected_peers);
         e.array(self.tunnels.len());
         for t in &self.tunnels {
@@ -253,7 +257,7 @@ impl NodeSnapshot {
     /// If it is a snapshot reply that does not decode.
     pub fn from_bytes(body: &[u8]) -> Result<Option<Self>> {
         let mut d = Decoder::new(body);
-        if !matches!((d.array(), d.uint()), (Ok(10), Ok(T_SNAPSHOT_REPLY))) {
+        if !matches!((d.array(), d.uint()), (Ok(11), Ok(T_SNAPSHOT_REPLY))) {
             return Ok(None);
         }
         let bad = |what: &'static str| move |_| Error::MalformedIpc(what);
@@ -372,6 +376,7 @@ impl NodeSnapshot {
             let name = d.text().map_err(bad("ipc snapshot petname"))?.to_owned();
             trusted.push((fp, name));
         }
+        let drive = read_digests(&mut d)?;
         let connected_peers = read_digests(&mut d)?;
         let mut tunnels = Vec::new();
         for _ in 0..d.array().map_err(bad("ipc snapshot tunnels"))? {
@@ -417,6 +422,7 @@ impl NodeSnapshot {
             rooms,
             open,
             trusted,
+            drive,
             connected_peers,
             tunnels,
             closed_tunnels,
@@ -535,6 +541,7 @@ mod tests {
                 sessions: Vec::new(),
             }],
             trusted: vec![([4; 32], "bob".into())],
+            drive: vec![[4; 32]],
             connected_peers: vec![[4; 32]],
             tunnels: vec![LiveTunnel {
                 id: 3,

@@ -523,6 +523,7 @@ fn net_event_name(e: &NetEvent) -> &'static str {
         NetEvent::AppDial(_) => "reaching a peer for an app stream",
         NetEvent::Status(_) => "reporting status",
         NetEvent::Names(_) => "resolving a .vox name",
+        NetEvent::SessionRows { .. } => "reading a room's Session entries",
         NetEvent::MemberDialer(_) => "lending the proxy its dialer",
     }
 }
@@ -885,6 +886,14 @@ enum NetEvent {
     /// A `.vox` name is being resolved (PRD-001 R20): answer with a snapshot of this
     /// node's rooms and keyring names.
     Names(oneshot::Sender<crate::node::resolver::VoxResolver>),
+    /// The Session entries this node can read in a room (ADR-029 SC-2), or `None` if the room
+    /// is not open.
+    SessionRows {
+        /// The room.
+        channel_id: Digest32,
+        /// Where the answer goes.
+        reply: oneshot::Sender<Option<Vec<crate::node::drive::SessionRow>>>,
+    },
     /// The daemon's proxy (ADR-028 S-5) wants this node's way of reaching a member, to carry a
     /// name that resolved to one of this node's rooms.
     MemberDialer(oneshot::Sender<crate::error::Result<MemberDialer>>),
@@ -3537,6 +3546,20 @@ impl NodeHandle {
             .map_err(|_| crate::error::Error::Unreachable("the node has stopped"))
     }
 
+    /// The Session entries this node can read in a room (ADR-029 SC-2): its own, and each node's
+    /// that released it its drive key; `None` if the room is not open.
+    pub async fn session_rows(
+        &self,
+        channel_id: Digest32,
+    ) -> Option<Vec<crate::node::drive::SessionRow>> {
+        let (reply, rx) = oneshot::channel();
+        self.net_tx
+            .send(NetEvent::SessionRows { channel_id, reply })
+            .await
+            .ok()?;
+        rx.await.ok()?
+    }
+
     /// Resolve a `.vox` name against this node's rooms and keyring (PRD-001 R20): the
     /// room and the member it leads to, or a sentence saying why it leads nowhere.
     ///
@@ -3979,6 +4002,10 @@ pub struct Node {
     /// The last `refresh_network_view` gave up on a busy room, so the view is behind and the tick
     /// rebuilds it. Atomic only because the refresh takes `&self`.
     view_stale: std::sync::atomic::AtomicBool,
+    /// A member gained or lost drive in the last command (ADR-028 K-14): this node's drive keys
+    /// are released or changed before its answer (ADR-029 SC-2a, SC-2b). Atomic only because
+    /// `note_capability` takes `&self`.
+    drive_changed: std::sync::atomic::AtomicBool,
     /// Pairwise streams for a room still being joined, held until the join reports back: see
     /// `take_inbound_skdm`.
     held_pairwise: Vec<(Digest32, PairwiseIn)>,
@@ -4480,6 +4507,7 @@ impl Node {
             locking: 0,
             unlock_after_lock: Vec::new(),
             view_stale: std::sync::atomic::AtomicBool::new(false),
+            drive_changed: std::sync::atomic::AtomicBool::new(false),
             held_pairwise: Vec::new(),
             pairwise_out: BTreeMap::new(),
             board_authors: BTreeMap::new(),
@@ -4776,6 +4804,12 @@ impl Node {
                         continue;
                     }
                     let outcome = self.handle(command).await;
+                    if self
+                        .drive_changed
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.tend_drive_keys().await;
+                    }
                     self.note_if_stalled(name, started);
                     self.publish().await;
                     if shutdown {
@@ -4821,6 +4855,9 @@ impl Node {
                     // same reason: a trusted member that was unreachable a moment
                     // ago is picked up as soon as it can be reached (ADR-020 §3).
                     self.deliver_owed_consents(None).await;
+                    // Drive keys too (ADR-029 SC-2a, SC-2b): changed if a holder lost drive,
+                    // and released to whoever is owed one.
+                    self.tend_drive_keys().await;
                     // R14: a superseded generation's key goes once no full-history grant
                     // still has to release it.
                     let pruned = self.prune_superseded_keys().await;
@@ -4926,6 +4963,11 @@ impl Node {
             NodeCommand::RenameRoom { channel_id, name } => {
                 self.rename_room(&channel_id, &name).await
             }
+            NodeCommand::AppendSession {
+                channel_id,
+                session_id,
+                body,
+            } => self.append_session(&channel_id, &session_id, &body).await,
             // Answered through `begin_open_channel`, which the run loop calls instead of this.
             NodeCommand::OpenChannel { .. } => Outcome::Failed(Fault::Internal),
             NodeCommand::CloseChannel { channel_id } => self.close_channel(&channel_id).await,
@@ -4964,6 +5006,7 @@ impl Node {
                     *change,
                     NodeCommand::Trust { .. }
                         | NodeCommand::TrustWith { .. }
+                        | NodeCommand::SetCapability { .. }
                         | NodeCommand::Rename { .. }
                         | NodeCommand::Untrust { .. }
                 ) {
@@ -4981,6 +5024,7 @@ impl Node {
             // locked one falls through, and says that: a passphrase would not make the change.
             NodeCommand::Trust { .. }
             | NodeCommand::TrustWith { .. }
+            | NodeCommand::SetCapability { .. }
             | NodeCommand::Rename { .. }
             | NodeCommand::Untrust { .. }
                 if self.profile.as_ref().is_some_and(Profile::is_unlocked)
@@ -4995,7 +5039,12 @@ impl Node {
             } => {
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
-                    .trust_identity(fingerprint, &petname, crate::node::trust::HistoryGrant::Now)
+                    .trust_identity(
+                        fingerprint,
+                        &petname,
+                        crate::node::trust::HistoryGrant::Now,
+                        None,
+                    )
                     .await;
                 self.decided_trust(was, fingerprint, &out);
                 out
@@ -5004,19 +5053,27 @@ impl Node {
                 fingerprint,
                 petname,
                 history,
+                capability,
             } => {
                 let was = self.trust.is_trusted(&fingerprint);
-                let out = self.trust_identity(fingerprint, &petname, history).await;
+                let out = self
+                    .trust_identity(fingerprint, &petname, history, capability)
+                    .await;
                 self.decided_trust(was, fingerprint, &out);
                 out
             }
+            NodeCommand::SetCapability {
+                fingerprint,
+                capability,
+            } => self.set_capability(fingerprint, capability).await,
             NodeCommand::Rename {
                 fingerprint,
                 petname,
             } => {
                 if self.trust.is_trusted(&fingerprint) {
                     let history = self.trust.history(&fingerprint);
-                    self.trust_identity(fingerprint, &petname, history).await
+                    self.trust_identity(fingerprint, &petname, history, None)
+                        .await
                 } else {
                     Outcome::Failed(Fault::NotConsented)
                 }
@@ -7570,6 +7627,13 @@ impl Node {
             NetEvent::Status(reply) => {
                 let _ = reply.send(self.status_report());
             }
+            NetEvent::SessionRows { channel_id, reply } => {
+                let rows = match self.channels.get(&channel_id).map(Arc::clone) {
+                    Some(shared) => Some(shared.lock().await.session_rows().to_vec()),
+                    None => None,
+                };
+                let _ = reply.send(rows);
+            }
             NetEvent::Names(reply) => {
                 let _ = reply.send(self.resolver_snapshot().await);
             }
@@ -9480,8 +9544,9 @@ impl Node {
         fingerprint: Digest32,
         petname: &'a str,
         history: crate::node::trust::HistoryGrant,
+        capability: Option<crate::node::trust::Capability>,
     ) -> Boxed<'a, Outcome> {
-        Box::pin(self.trust_identity_unboxed(fingerprint, petname, history))
+        Box::pin(self.trust_identity_unboxed(fingerprint, petname, history, capability))
     }
 
     /// [`Self::trust_identity`], unboxed: see [`Boxed`].
@@ -9490,6 +9555,7 @@ impl Node {
         fingerprint: Digest32,
         petname: &str,
         history: crate::node::trust::HistoryGrant,
+        capability: Option<crate::node::trust::Capability>,
     ) -> Outcome {
         match self.profile.as_ref().map(Profile::signer) {
             None => return Outcome::Failed(Fault::NoIdentity),
@@ -9497,8 +9563,12 @@ impl Node {
             Some(Ok(_)) => {}
         }
         let newly = !self.trust.is_trusted(&fingerprint);
+        let had_drive = self.trust.has_drive(&fingerprint);
+        let capability = capability
+            .or_else(|| self.trust.capability(&fingerprint))
+            .unwrap_or_default();
         let mut next = self.trust.clone();
-        if let Err(e) = next.trust_with(fingerprint, petname, history) {
+        if let Err(e) = next.trust_as(fingerprint, petname, history, capability) {
             return Outcome::Failed(fault_of(&e));
         }
         // **The decision's place in the consent order is drawn before the trust is saved**
@@ -9527,6 +9597,7 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        self.note_capability(fingerprint, had_drive);
         // A removal still waiting on a closed room is withdrawn with this decision (V210-118
         // amendment). Not load-bearing: left behind, it would change the lock on the reopen, and
         // the consent owed to a trusted member would then be released again.
@@ -9580,6 +9651,7 @@ impl Node {
             Ok(s) => s,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
+        let had_drive = self.trust.has_drive(fingerprint);
         let mut next = self.trust.clone();
         if !next.untrust(fingerprint) {
             return Outcome::Failed(Fault::NotConsented);
@@ -9632,6 +9704,7 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        self.note_capability(*fingerprint, had_drive);
         // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
         // nothing it posts from now opens on this node. A closed room drops them, and changes its
         // lock, when it opens (recorded above). What was already read stays read. A re-trust is
@@ -14690,6 +14763,104 @@ impl Node {
         }
     }
 
+    /// The members this node's keyring trusts with drive (ADR-028 K-14): who its drive keys are
+    /// for (ADR-029 SC-2).
+    fn drive_holders(&self) -> BTreeSet<Digest32> {
+        self.trust
+            .trusted()
+            .into_iter()
+            .filter(|f| self.trust.has_drive(f))
+            .collect()
+    }
+
+    /// Append one Session entry under this node's drive key (ADR-029 SC-1, SC-2), then release
+    /// that key to whoever with drive is owed it, so a member owed it from the entry reads it.
+    async fn append_session(
+        &mut self,
+        channel_id: &Digest32,
+        session_id: &str,
+        body: &str,
+    ) -> Outcome {
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return Outcome::Failed(Fault::ChannelNotOpen);
+        };
+        let holders = self.drive_holders();
+        let now_millis = (self.millis_clock)();
+        let appended = {
+            let mut ch = shared.lock().await;
+            // **Never sealed under a key a member that lost drive still holds** (SC-2b): the key
+            // changes here, before the entry, whatever the tick has not got to yet.
+            match ch.rotate_drive_if_lost(profile.store(), &holders, now_millis / 1_000) {
+                Ok(_) => ch.append_session(profile, session_id, body, &holders, now_millis),
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = appended {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.note_local_append(channel_id);
+        self.tend_drive_keys_in(channel_id, &holders).await;
+        Outcome::Done
+    }
+
+    /// [`Self::tend_drive_keys_in`] in every open room.
+    async fn tend_drive_keys(&mut self) {
+        let holders = self.drive_holders();
+        let channels: Vec<Digest32> = self.channels.keys().copied().collect();
+        for channel_id in channels {
+            self.tend_drive_keys_in(&channel_id, &holders).await;
+        }
+    }
+
+    /// This node's drive key in one room (ADR-029 SC-2a, SC-2b): **changed first** if a member it
+    /// was released to is no longer in `holders` (downgraded to read, or untrusted), then released
+    /// to each member with drive that is owed it, as a key-package in the room's log, sealed to
+    /// that member's prekeys. A member whose prekeys this node has not read yet stays owed, and the
+    /// tick tries again.
+    async fn tend_drive_keys_in(&mut self, channel_id: &Digest32, holders: &BTreeSet<Digest32>) {
+        let Some(shared) = self.channels.get(channel_id).map(Arc::clone) else {
+            return;
+        };
+        let now = self.now();
+        let releases = {
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let mut ch = shared.lock().await;
+            if ch
+                .rotate_drive_if_lost(profile.store(), holders, now)
+                .is_err()
+            {
+                return;
+            }
+            let Ok(owed) = ch.owed_drive(profile.store(), holders) else {
+                return;
+            };
+            let mut releases = Vec::new();
+            for member in owed {
+                if let Ok((skdm, generation)) = ch.drive_skdm_for(profile, &member) {
+                    releases.push((member, skdm, generation));
+                }
+            }
+            releases
+        };
+        for (member, skdm, generation) in releases {
+            if !self.post_key_package(channel_id, member, &skdm).await {
+                continue;
+            }
+            let Some(profile) = self.profile.as_ref() else {
+                return;
+            };
+            let _ = shared
+                .lock()
+                .await
+                .note_drive_delivered(profile.store(), member, generation);
+        }
+    }
+
     async fn send_text(&mut self, channel_id: &Digest32, text: &str) -> Outcome {
         let now = self.now();
         let Some(profile) = self.profile.as_ref() else {
@@ -14787,6 +14958,12 @@ impl Node {
             open_channels: Vec::new(),
             forwards: Vec::new(),
             trusted: self.trust_rows(),
+            drive: self
+                .trust
+                .iter()
+                .map(|(fp, _)| *fp)
+                .filter(|fp| self.trust.has_drive(fp))
+                .collect(),
             relayed_peers: Vec::new(),
             connected: 0,
             connected_peers: Vec::new(),
@@ -14919,6 +15096,11 @@ impl Node {
         let (relayed_peers, relaying) = self.path_view();
         let connected_peers = self.connected_peers();
         let trusted = self.trust_rows();
+        let drive = trusted
+            .iter()
+            .map(|(fp, _)| *fp)
+            .filter(|fp| self.trust.has_drive(fp))
+            .collect();
         // What the decision record names members as where the keyring is not at hand.
         self.decisions.set_aliases(&trusted);
         let view = NodeView {
@@ -14941,6 +15123,7 @@ impl Node {
                 })
                 .collect(),
             trusted,
+            drive,
             relayed_peers,
             relaying,
             connected: connected_peers.len(),
@@ -15050,6 +15233,47 @@ impl Node {
                 room,
             },
         );
+    }
+
+    /// Change what `fingerprint`'s keyring entry grants (ADR-028 K-14): saved before it is adopted,
+    /// as every keyring change is, and said to the node's Sessions when drive moved.
+    async fn set_capability(
+        &mut self,
+        fingerprint: Digest32,
+        capability: crate::node::trust::Capability,
+    ) -> Outcome {
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let signer = match profile.signer() {
+            Ok(s) => s,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let had_drive = self.trust.has_drive(&fingerprint);
+        let mut next = self.trust.clone();
+        if !next.set_capability(&fingerprint, capability) {
+            return Outcome::Failed(Fault::NotConsented);
+        }
+        if let Err(e) = next.save(profile.store(), signer) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.trust = next;
+        self.note_capability(fingerprint, had_drive);
+        self.publish().await;
+        Outcome::Done
+    }
+
+    /// Raise [`NodeEvent::CapabilityChanged`] when `fingerprint`'s drive is no longer what it was
+    /// (`had_drive`) before a keyring change.
+    fn note_capability(&self, fingerprint: Digest32, had_drive: bool) {
+        let drive = self.trust.has_drive(&fingerprint);
+        if drive != had_drive {
+            self.drive_changed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = self
+                .event_tx
+                .send(NodeEvent::CapabilityChanged { fingerprint, drive });
+        }
     }
 
     /// A trust just asked for: recorded when it added someone who was not trusted before.

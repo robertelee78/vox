@@ -120,8 +120,20 @@ pub async fn load_names(client: &mut IpcClient) {
         return;
     }
     if let Ok(Frame::Trusted { entries }) = client.trusted("").await {
-        let _ = NAMES.set(entries);
+        let _ = NAMES.set(names_of(entries));
     }
+}
+
+/// The keyring's `(fingerprint, name)` pairs, what naming needs of a trust listing whose rows also
+/// carry each entry's capability (ADR-028 K-14).
+#[must_use]
+pub fn names_of(
+    entries: Vec<(Digest32, String, vox_core::node::trust::Capability)>,
+) -> Vec<(Digest32, String)> {
+    entries
+        .into_iter()
+        .map(|(fp, name, _)| (fp, name))
+        .collect()
 }
 
 /// This node, as [`load_names`] read it, or `None` before it has.
