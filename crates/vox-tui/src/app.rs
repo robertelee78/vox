@@ -216,6 +216,9 @@ pub struct CrosstermIo {
     terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
     entered: bool,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The terminal crossterm reads, watched for its hangup before crossterm reads it (#557).
+    #[cfg(unix)]
+    tty: Option<std::fs::File>,
 }
 
 impl CrosstermIo {
@@ -226,6 +229,8 @@ impl CrosstermIo {
             terminal: None,
             entered: false,
             stop: std::sync::Arc::default(),
+            #[cfg(unix)]
+            tty: None,
         }
     }
 
@@ -233,6 +238,70 @@ impl CrosstermIo {
     #[must_use]
     pub fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         std::sync::Arc::clone(&self.stop)
+    }
+}
+
+impl CrosstermIo {
+    /// The terminal has gone: stop as a hangup would, and read nothing more from it.
+    #[cfg(unix)]
+    fn gone(&mut self) -> Option<KeyEvent> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        None
+    }
+}
+
+/// Telling a terminal that has gone (its window closed, its pty's other end shut) from one that is
+/// only quiet, before anything reads it (#557).
+#[cfg(unix)]
+mod terminal_gone {
+    use std::io::{self, IsTerminal as _};
+    use std::time::Duration;
+
+    /// The terminal crossterm reads: standard input when it is one, else `/dev/tty`.
+    pub(super) fn tty() -> io::Result<std::fs::File> {
+        use std::os::fd::AsFd as _;
+        let stdin = io::stdin();
+        if stdin.is_terminal() {
+            return Ok(std::fs::File::from(stdin.as_fd().try_clone_to_owned()?));
+        }
+        std::fs::File::options().read(true).open("/dev/tty")
+    }
+
+    /// What the terminal said within a wait.
+    pub(super) enum Ready {
+        /// It holds input to read.
+        Input,
+        /// Nothing came.
+        Nothing,
+        /// It has hung up, or is no terminal any more: nothing will come.
+        Gone,
+    }
+
+    /// Wait up to `wait` for the terminal to hold input or to hang up.
+    pub(super) fn ready(tty: &std::fs::File, wait: Duration) -> io::Result<Ready> {
+        use rustix::event::{poll, PollFd, PollFlags, Timespec};
+        use std::os::fd::AsFd as _;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let fd = tty.as_fd();
+            let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+            let ts = Timespec::try_from(left).ok();
+            match poll(&mut fds, ts.as_ref()) {
+                Ok(0) => return Ok(Ready::Nothing),
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+            let said = fds[0].revents();
+            return Ok(
+                if said.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL) {
+                    Ready::Gone
+                } else {
+                    Ready::Input
+                },
+            );
+        }
     }
 }
 
@@ -261,6 +330,10 @@ impl TerminalIo for CrosstermIo {
     fn enter(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         self.entered = true;
+        #[cfg(unix)]
+        {
+            self.tty = Some(terminal_gone::tty()?);
+        }
         let mut stdout = io::stdout();
         // Cleared as well: on a terminal without an alternate screen, anything printed before the
         // TUI started (a wait for the profile, V210-100) would otherwise show through.
@@ -282,6 +355,32 @@ impl TerminalIo for CrosstermIo {
     }
 
     fn poll_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
+        // **A terminal that has gone stops the TUI as a hangup does** (#557). crossterm reads a
+        // hung-up terminal in a loop that never returns: an orphaned `vox tui` spun for a day,
+        // deaf to SIGTERM and SIGHUP, since the loop that heeds them never ran again. So crossterm
+        // reads only once the terminal has said it holds input and has not hung up.
+        #[cfg(unix)]
+        if let Some(tty) = self.tty.as_ref() {
+            match terminal_gone::ready(tty, Duration::ZERO)? {
+                terminal_gone::Ready::Gone => return Ok(self.gone()),
+                terminal_gone::Ready::Input | terminal_gone::Ready::Nothing => {}
+            }
+            // What crossterm has already read and not yet handed out.
+            if !event::poll(Duration::ZERO)? {
+                match terminal_gone::ready(tty, timeout)? {
+                    terminal_gone::Ready::Gone => return Ok(self.gone()),
+                    terminal_gone::Ready::Nothing => return Ok(None),
+                    terminal_gone::Ready::Input => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    return Ok(None);
+                }
+            }
+            return match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => Ok(Some(key)),
+                _ => Ok(None),
+            };
+        }
         if !event::poll(timeout)? {
             return Ok(None);
         }
@@ -311,13 +410,29 @@ impl TerminalIo for CrosstermIo {
     /// sees a passphrase.
     #[cfg(unix)]
     fn poll_secret_key(&mut self, timeout: Duration) -> io::Result<Option<KeyEvent>> {
-        secret_input::poll_key(timeout)
+        if let Some(tty) = self.tty.as_ref() {
+            if let terminal_gone::Ready::Gone = terminal_gone::ready(tty, Duration::ZERO)? {
+                return Ok(self.gone());
+            }
+        }
+        match secret_input::poll_key(timeout) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(self.gone()),
+            other => other,
+        }
     }
 
     fn leave(&mut self) -> io::Result<()> {
         if self.entered {
             self.entered = false;
-            self.terminal = None;
+            // The cursor is shown here, not by ratatui's drop: when the terminal has gone, that
+            // drop prints its failure to the terminal's stderr, and printing to a closed terminal
+            // panics, so a TUI whose window closed exited 101 (#557). A terminal that cannot show
+            // its cursor is left undropped: there is nothing left to restore on it.
+            if let Some(mut t) = self.terminal.take() {
+                if t.show_cursor().is_err() {
+                    std::mem::forget(t);
+                }
+            }
             restore_terminal();
         }
         Ok(())
@@ -375,7 +490,12 @@ mod secret_input {
             }
             return match tty.read(b) {
                 Ok(1) => Ok(true),
-                Ok(_) => Ok(false),
+                // End of input: the terminal has gone, and a read would say so again at once,
+                // forever (#557).
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the terminal has gone",
+                )),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => Err(e),
             };
