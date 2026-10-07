@@ -1120,6 +1120,8 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         "PRODUCT: arm 12: a pane named by a hook the harness did not start itself must not be \
          proven, and nothing may be typed into it; vox said {said:?}"
     );
+    // The tool ends with the stand-in.
+    h.exit();
 }
 
 /// ADR-029 DR-3, DR-4 (#545) — **an approval or a question is answered from either side, and the

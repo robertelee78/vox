@@ -42,6 +42,29 @@ def run_hook(path, via=None):
     record({"hook": os.path.basename(path), "exit": p.returncode,
             "stdout": p.stdout.decode(errors="replace"), "stderr": p.stderr.decode(errors="replace")[-400:]})
 
+tools = []
+
+def run_hook_via_tool(path):
+    # A tool the session runs, still running after it started the hook (as a test runner beneath
+    # a person's pane is): the hook's parent is the tool, alive, not the harness.
+    done = path + ".done"
+    with open(path, "rb") as f:
+        event = f.read()
+    tool = subprocess.Popen(
+        ["/usr/bin/perl", "-e",
+         "system(@ARGV); open(my $f, '>', $ENV{HOOK_DONE}); close($f); sleep 600"] + hook_argv,
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, HOOK_DONE=done))
+    tool.stdin.write(event)
+    tool.stdin.close()
+    tools.append(tool)
+    import time
+    for _ in range(200):
+        if os.path.exists(done):
+            break
+        time.sleep(0.1)
+    record({"hook": os.path.basename(path), "via": "tool", "tool": tool.pid})
+
 fd = sys.stdin.fileno()
 # Outside a terminal (started by the proof itself, not in a pane) there is no tty to set raw.
 interactive = os.isatty(fd)
@@ -77,12 +100,16 @@ try:
         for line in lines[done:]:
             done += 1
             if line == "exit":
+                for t in tools:
+                    t.kill()
                 record({"exited": os.getpid()})
                 sys.exit(0)
             if line.startswith("hook "):
                 run_hook(line[5:])
             if line.startswith("hookvia "):
-                run_hook(line[8:], via=["/usr/bin/perl", "-e", "system(@ARGV); exit($? >> 8)"])
+                run_hook_via_tool(line[8:])
 finally:
+    for t in tools:
+        t.kill()
     if interactive:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
