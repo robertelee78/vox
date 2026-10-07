@@ -88,6 +88,9 @@ pub struct DriveState {
     pub(crate) sessions: Vec<SessionRow>,
     /// Entries opened in a render pass, placed once its batch has committed.
     pub(crate) pending: Vec<(SessionRow, u64)>,
+    /// The sessions with an entry placed here since the node last said so
+    /// ([`crate::node::api::NodeEvent::SessionEntry`]).
+    pub(crate) news: Vec<String>,
 }
 
 /// Whether `row` announces a file out of its Session (ADR-029 DR-1.8, #546): what a member with
@@ -276,6 +279,7 @@ impl DriveState {
             delivered,
             sessions: Vec::new(),
             pending: Vec::new(),
+            news: Vec::new(),
         })
     }
 }

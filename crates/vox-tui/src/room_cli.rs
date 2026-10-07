@@ -417,26 +417,20 @@ async fn sessions_of(
     }
 }
 
-/// The id of the one Session of the node `fp` that `typed` names, open (ADR-029 TA-1, TA-5): its
-/// newest opening for each id, so a session that ended and came back is the one that is open.
+/// The id of the one open Session of the node `fp` that `typed` names (ADR-029 TA-1, TA-5), as
+/// [`vox_core::node::sessions::addressable`] finds it, labelled as this node labels it.
 fn session_of(
     rows: &[vox_core::node::sessions::SessionRow],
     fp: &Digest32,
     typed: &str,
 ) -> Result<String, String> {
-    let mut mine: Vec<vox_core::node::sessions::SessionRow> = Vec::new();
-    for r in rows.iter().filter(|r| r.node == *fp) {
-        mine.retain(|m| m.id != r.id);
-        mine.push(r.clone());
-    }
-    vox_core::node::sessions::resolve(&mine, typed, false, |s| {
+    vox_core::node::sessions::addressable(rows, fp, typed, |s| {
         vox_agentcomms::envelope::session_label(
             &crate::ident::name_of(&s.node),
             s.name.as_deref(),
             &s.id,
         )
     })
-    .map(|s| s.id.clone())
 }
 
 /// What a structured post did, for its caller to say (`vox room post`, the TUI's composer).

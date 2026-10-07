@@ -109,6 +109,13 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             Bob's TUI lists the room with "waiting 1" and the Session "· waiting on you"; `a` on
             the request's line approves it, the waiting hook gives Claude Code "allow", and the line
             then reads "approved here" (ADR-029 DR-1.4, CL-2, #553);
+  steer     a stand-in for Claude Code in a pane of a scratch tmux server under the run directory
+            (cleared environment) opens a Session Bob may drive: from Bob's TUI, text typed in
+            its composer reaches the pane as typed, "/compact" as a slash command, `:interrupt`
+            as Esc and `:stop` as Ctrl-C (ADR-029 DR-1.2, DR-1.3, DR-1.6, #553);
+  share     in that Session, `:share <path>` as a driver: it says "accepted, pulling", Alice's node
+            lands the very bytes, and the Session's line "file sent in by you: …" reads "landed
+            at …"; without drive (in `sessions`) `:share` is refused (ADR-029 DR-1.7, #553);
   attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
             message: a `file` announcement carrying the note in it and `to` naming her, no second
             message for the note (ADR-028 F-1, #493);
@@ -1162,14 +1169,20 @@ try:
     tui.key(":send DRIVE-WITHOUT-DRIVE\r", 1)
     refused = " ".join(r.strip() for r in tui.display()[-3:])
     told = f"not sent: this is {open_label}; :general writes to the room" in refused
+    # A file sent into a Session is driving it (DR-1.7): without drive, refused, and nothing sent.
+    with open(f"{S}/nodrive-file.txt", "w") as f:
+        f.write("NODRIVE-FILE\n")
+    tui.key(f":share {S}/nodrive-file.txt\r", 2)
+    share_refused = " ".join(r.strip() for r in tui.display()[-3:])
+    share_told = "you cannot drive this Session: alice has not given you drive" in share_refused
     tui.key(":general\r", 2)
     leaked = "DRIVE-WITHOUT-DRIVE" in run("alice", "room", "read", room).stdout
     claim("sessions", listed and apart and merged and titled and nodrive and no_composer and told
-          and not leaked,
+          and not leaked and share_told,
           f"Sessions pane: {listed_rows!r} (open listed: {listed}, ended apart: {apart}); All merged the "
           f"openings and end among the messages: {merged}; `:session` titled {titled}, said no drive "
           f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
-          f"{leaked}" + ("" if merged else f"; All showed: {all_rows!r}")
+          f"{leaked}; `:share` there said {share_refused!r}" + ("" if merged else f"; All showed: {all_rows!r}")
           + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))
 
     stage("drive")
@@ -1286,6 +1299,125 @@ try:
           f"needs you: Sessions pane {flags[0]!r}, rooms {flags[1]!r} (flagged: {flagged}); `a` "
           f"said {said_a!r}; the hook gave Claude Code {decision!r} (stdout {out!r}, stderr "
           f"{err.strip()[:200]!r}); the line then read \"approved here\": {approved}")
+
+    stage("steer")
+    # Driving a session from the TUI (ADR-029 DR-1.2, DR-1.3, DR-1.6, #553): a stand-in for Claude
+    # Code (apparatus: support/claude_pane_standin.py, which records every key it gets) runs in a
+    # pane of a scratch tmux server under this run's directory, never the operator's, every child
+    # started with a cleared environment (no TMUX*, CLAUDE*, CODEX* or OPENCODE* of whoever runs the
+    # proof); Alice's node knows it as a harness by its executable, as the kernel names it
+    # (`harnesses`). Its session's hook, run as its child, opens a Session Bob may drive. From Bob's
+    # TUI: text typed in the Session's composer reaches the pane as typed, a line starting with `/`
+    # as a slash command, `:interrupt` as Esc and `:stop` as Ctrl-C.
+    import ctypes
+    STEER_ID = "5e55c0de-7777-4aaa-8bbb-cccccccccccc"
+    TMUX_BIN = next((b for b in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux")
+                     if os.path.isfile(b)), None)
+    if TMUX_BIN is None:
+        apparatus("CANNOT MEASURE: no tmux on this machine for the steer stage")
+    sock = f"{S}/steer.sock"
+    tenv = {"PATH": f"{os.path.dirname(TMUX_BIN)}:/usr/bin:/bin", "HOME": f"{S}/alice",
+            "VOX_DATA_DIR": f"{S}/alice/data", "VOX_CONFIG_DIR": f"{S}/alice/cfg",
+            "CLAUDE_CODE_ENTRYPOINT": "cli", "LANG": "en_US.UTF-8", "TERM": "xterm-256color"}
+    def tmux(*a):
+        r = subprocess.run([TMUX_BIN, "-S", sock, "-f", "/dev/null", *a], env=tenv,
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            apparatus(f"tmux {a!r}: {r.stderr.strip()}")
+        return r.stdout.strip()
+    sdir = f"{S}/standin"
+    os.makedirs(sdir, exist_ok=True)
+    slog, sctl = f"{sdir}/log", f"{sdir}/control"
+    def got():
+        try:
+            return [json.loads(l) for l in open(slog) if l.strip()]
+        except OSError:
+            return []
+    try:
+        tmux("new-session", "-d", "-x", "120", "-y", "30", "/bin/sh")
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "support",
+                              "claude_pane_standin.py")
+        hook_argv = json.dumps([VOX, "agent", "hook", "--node", "default", "--room", room])
+        tmux("send-keys", "-t", ":0.0", "-l",
+             f"python3 {script} --log {slog} --control {sctl} --hook '{hook_argv}'")
+        tmux("send-keys", "-t", ":0.0", "Enter")
+        if not until(lambda: any("started" in x for x in got()), 20):
+            apparatus(f"the stand-in did not start in the scratch pane: {tmux('capture-pane', '-p', '-t', ':0.0')!r}")
+        pid = next(x["started"] for x in got() if "started" in x)
+        exe = None
+        if sys.platform == "darwin":
+            buf = ctypes.create_string_buffer(4096)
+            if ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidpath(pid, buf, 4096) > 0:
+                exe = buf.value.decode()
+        else:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        if not exe:
+            apparatus("the kernel did not give the stand-in's executable")
+        with open(f"{S}/alice/cfg/harnesses", "w") as f:
+            f.write(exe + "\n")
+        strans = f"{work}/{STEER_ID}.jsonl"
+        open(strans, "a").close()
+        with open(f"{sdir}/event-1.json", "w") as f:
+            json.dump({"session_id": STEER_ID, "transcript_path": strans, "cwd": work,
+                       "permission_mode": "default", "hook_event_name": "UserPromptSubmit",
+                       "prompt": "hello", "prompt_id": "p"}, f)
+        with open(sctl, "a") as f:
+            f.write(f"hook {sdir}/event-1.json\n")
+        if not until(lambda: any(x.get("hook") == "event-1.json" for x in got()), 30):
+            apparatus(f"the stand-in's hook did not finish: {got()!r}")
+        def drivable():
+            for l in run("bob", "room", "sessions", room, "--json").stdout.splitlines():
+                x = json.loads(l) if l.strip() else {}
+                if x.get("id") == STEER_ID and x.get("open") and x.get("can_drive"):
+                    return x
+            return None
+        if not until(lambda: drivable() is not None, 60):
+            product(f"bob never saw alice's stand-in's Session open and his to drive within 60 s: "
+                    f"{run('bob', 'room', 'sessions', room, '--json').stdout!r}; the hook said {got()!r}")
+        steer_label = drivable()["label"]
+        tui.key(f":session {STEER_ID[:8]}\r", 2)
+        focus("Composer")
+        answers = {}
+        def act(name, keys, want):
+            before = len(got())
+            tui.key(keys, 3)
+            answers[name] = " ".join(r.strip() for r in tui.display()[-2:])
+            return until(lambda: want in got()[before:], 10)
+        reached = {
+            "say": act("say", "STEER-FROM-TUI\r", {"typed": "STEER-FROM-TUI"}),
+            "slash": act("slash", "/compact\r", {"typed": "/compact"}),
+        }
+        # A `:` typed in the composer is text for the session: the commands are typed with the
+        # timeline focused.
+        focus("Timeline")
+        reached["interrupt"] = act("interrupt", ":interrupt\r", {"key": "Escape"})
+        reached["stop"] = act("stop", ":stop\r", {"key": "C-c"})
+        # A file sent into the Session (DR-1.7): `:share <path>` in it, as a driver. Alice's node
+        # pulls it, verified, lands it and tells the session; the Session's line for it, paired with
+        # its results, says so.
+        sent = b"STEER-FILE " + os.urandom(16).hex().encode() + b"\n"
+        with open(f"{S}/steer-file.txt", "wb") as f:
+            f.write(sent)
+        tui.key(f":share {S}/steer-file.txt\r", 3)
+        share_said = " ".join(r.strip() for r in tui.display()[-2:])
+        # The pane wraps: read it as one text without spaces.
+        LINE = "filesentinbyyou:steer-file.txt"
+        tail = lambda: flat().replace(" ", "").split(LINE, 1)[-1] if LINE in flat().replace(" ", "") else ""
+        paired = tui.until(lambda: "landedat" in tail(), 90, 1)
+        import glob
+        landed = [p for p in glob.glob(f"{S}/alice/**/steer-file.txt", recursive=True)
+                  if open(p, "rb").read() == sent]
+        shown = tail()[:300]
+        tui.key(":general\r", 2)
+        claim("share", f"{steer_label}: accepted, pulling" in share_said and paired and bool(landed),
+              f"`:share` said {share_said!r}; the Session's line then read {shown!r} (paired with "
+              f"\"landed at\": {paired}); the bytes on alice's node: {landed!r}")
+        claim("steer", all(reached.values()),
+              f"{steer_label}: reached its pane {reached!r}; the TUI said {answers!r}; the stand-in "
+              f"recorded {got()!r}")
+    finally:
+        subprocess.run([TMUX_BIN, "-S", sock, "-f", "/dev/null", "kill-server"], env=tenv,
+                       capture_output=True, timeout=30)
 
     stage("attach")
     # A file shared from the composer is one message, addressed like one (ADR-028 F-1, #493): its
