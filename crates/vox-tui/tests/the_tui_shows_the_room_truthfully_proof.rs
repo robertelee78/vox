@@ -94,7 +94,8 @@
 //! - `sessions`: Alice's node, through Claude Code's hook in a session a person is at, opens two
 //!   Sessions and ends one: Bob's Sessions pane lists the open one by the label `vox room sessions`
 //!   gives it and the ended one apart under "Ended (1)"; `:all` shows each opening and end among
-//!   the room's messages; `:session <short id>`, without drive, shows only that it exists and
+//!   the room's messages; `:session <short id>`, without drive, shows only that it exists, that
+//!   its name and id are alice's node's claim ("<label> — name and id as alice says", MD-3) and
 //!   "Only members alice trusts with drive see inside this Session.", with no composer, and
 //!   `:send` there is refused and reaches nobody (ADR-029 CL-2, CL-3, #553);
 //! - `session-order`: Alice posts, then her hook opens a new Session, within one wall-clock second:
@@ -172,7 +173,7 @@
 //! a pasted fingerprint that is not the node's let through to the keyring (`trust`), an image
 //! drawn before this node's copy is verified (`inline`), a member's keyring capability not
 //! drawn (`capability`), a read of a hung-up terminal that never returns (`gone`), a Session without drive
-//! offering a composer (`sessions`), a member with drive shown only that the Session exists
+//! offering a composer or not saying whose claim its name and id are (`sessions`), a member with drive shown only that the Session exists
 //! (`drive`), `a` sending a rejection (`approve`),
 //! `:interrupt` sent as a stop (`steer`),
 //! a Session's `:share` sending the path as text (`share`), notices placed by time again
