@@ -143,7 +143,9 @@ vox connect 'ROOM_LINK'
 vox service list ROOM_ID
 ```
 
-`connect` asks for the room passphrase, joins once and exits, printing the command to list what is
+`connect` asks for the room passphrase at the terminal, or reads it from `--passphrase-file`, where
+`-` reads stdin; a pipe is read only with `--passphrase-file -`, so input meant for something else
+is never taken as the passphrase. It joins once and exits, printing the command to list what is
 shared and that a service is reached through the daemon's proxy, running while a node is attached
 (`vox up` says where). Both sides then exchange trust as in [Identity and keyring](keyring.md); the host must
 trust the guest's fingerprint before the guest can reach its service.

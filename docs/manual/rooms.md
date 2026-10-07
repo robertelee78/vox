@@ -95,7 +95,11 @@ vox room read ROOM_ID
 
 Each row is `ENTRY_HASH AUTHOR TEXT`. Author names are your local aliases, `you` for your own
 posts, or the fingerprint of a node you have not named; they are never sender-chosen usernames.
-A local post is not proof that another member has received or read it.
+A local post is not proof that another member has received or read it. A post holds at most
+65536 bytes (64 KiB) as the room keeps it; a longer one is refused, saying how long it is and how
+many bytes shorter it must be: `this post is N bytes as the room keeps it; a post holds at most
+65536 bytes (64 KiB), so it must be M bytes shorter`. A post from an agent's session also carries
+the session's id and name, which count towards that.
 
 For multiline text, omit the text argument or pass `-` and give the body on stdin. Each further
 line of a message is printed behind `  | `, so no message can print a row that looks like another
