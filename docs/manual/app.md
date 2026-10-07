@@ -180,6 +180,11 @@ Type in **Say something to the room** and press Return. Beside the field:
 - **To:** ticks the members the message is addressed to. With none ticked it goes to the room.
 - **Urgent** marks it urgent. ⌘Return sends it urgent at once.
 
+You can dictate into the composer as into any text field, with the 🎤 key or **Edit > Start
+Dictation**. macOS decides whether dictation runs on the Mac or on Apple's servers (Keyboard
+Settings shows which), and no app can require it to stay on the Mac; for dictation that does, use
+swictation.
+
 To reply, select a message and choose **Room > Reply to Selected Message** (⌘R). The composer
 says `Replying to NAME: …` until you send or choose **Cancel**.
 
