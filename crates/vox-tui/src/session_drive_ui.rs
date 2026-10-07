@@ -29,6 +29,9 @@ pub struct Target {
     pub session: String,
     /// Its label (`vox_agentcomms::envelope::session_label`), as the TUI shows it.
     pub label: String,
+    /// The reader's name for its node, as the TUI holds it now (the keyring can change while the
+    /// TUI runs): what a refusal names.
+    pub node_alias: String,
     /// Whether this node may drive it (the Session row's `can_drive`).
     pub can_drive: bool,
 }
@@ -216,7 +219,7 @@ pub fn details(parts: &[(String, String)]) -> Vec<String> {
 /// Send `action` to the Session `t`, refusing first without drive or trust (CL-3), and say what
 /// came of it in the CLI's words.
 async fn act(paths: &Paths, t: &Target, action: Action) -> Result<String, String> {
-    let node = crate::ident::name_of(&t.node);
+    let node = &t.node_alias;
     if !t.can_drive {
         return Err(format!(
             "you cannot drive this Session: {node} has not given you drive"

@@ -32,6 +32,45 @@ pub struct Line {
     pub waiting: Option<Waiting>,
 }
 
+impl Line {
+    /// The request's `ref` when this line is an approval or a question still waiting for an
+    /// answer from a member with drive (not resolved, not expired, answerable from Vox); `None`
+    /// otherwise. What the TUI offers approve, reject and answer on, and what counts a Session
+    /// under "needs you" (ADR-029 CL-2).
+    #[must_use]
+    pub fn open(&self) -> Option<&str> {
+        self.waiting
+            .is_some()
+            .then_some(self.reference.as_str())
+            .filter(|r| !r.is_empty())
+    }
+}
+
+/// The refs of the requests in one Session's `rows` (its entries, in order) still waiting for an
+/// answer: the same rule [`lines`] words them by.
+#[must_use]
+pub fn waiting(rows: &[SessionRow]) -> Vec<String> {
+    lines(rows, "", &Nameless)
+        .iter()
+        .filter_map(|l| l.open().map(str::to_owned))
+        .collect()
+}
+
+/// Names for a reading that shows none.
+struct Nameless;
+
+impl Names for Nameless {
+    fn alias(&self, _: &Digest32) -> String {
+        String::new()
+    }
+    fn is_me(&self, _: &str) -> bool {
+        false
+    }
+    fn alias_b32(&self, _: &str) -> String {
+        String::new()
+    }
+}
+
 /// What an open request waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waiting {
