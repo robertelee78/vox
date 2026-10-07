@@ -66,6 +66,13 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
+/// A short root for the run's directories: a Unix socket's path must fit the platform's bound
+/// (104 bytes on macOS), which the system's temporary directory does not leave room for.
+#[cfg(target_os = "macos")]
+const SHORT_ROOT: &str = "/private/tmp/vc";
+#[cfg(not(target_os = "macos"))]
+const SHORT_ROOT: &str = "/tmp/vc";
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const PERSON: &str = "person";
 const WATCHER: &str = "watcher";
@@ -217,11 +224,11 @@ impl World {
 /// One daemon and the nodes named, all in one room `PERSON` made, each agent node trusting
 /// `PERSON` with drive and `WATCHER` to read, and trusted back by them.
 fn world(agents: &[&str]) -> (World, Daemon) {
-    std::fs::create_dir_all("/private/tmp/vc")
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+    std::fs::create_dir_all(SHORT_ROOT)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make {SHORT_ROOT}: {e}"));
     let tmp = tempfile::Builder::new()
         .prefix("cd-")
-        .tempdir_in("/private/tmp/vc")
+        .tempdir_in(SHORT_ROOT)
         .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
     let root = tmp.path().to_path_buf();
     for d in ["home", "work", "cx", "oc"] {

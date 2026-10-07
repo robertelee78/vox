@@ -32,22 +32,53 @@ def draw():
     sys.stdout.write("stand-in Claude Code\r\n\r\n" + RULE + "\r\n❯ " + buf + "\r\n" + RULE + "\r\n")
     sys.stdout.flush()
 
-def run_hook(path):
+def run_hook(path, via=None):
     with open(path, "rb") as f:
         event = f.read()
-    p = subprocess.run(hook_argv, input=event, capture_output=True)
+    # `via` puts another process between the stand-in and its hook, as a script or tool a session
+    # runs would be: then the hook's parent is not the harness.
+    argv = (via + hook_argv) if via else hook_argv
+    p = subprocess.run(argv, input=event, capture_output=True)
     record({"hook": os.path.basename(path), "exit": p.returncode,
             "stdout": p.stdout.decode(errors="replace"), "stderr": p.stderr.decode(errors="replace")[-400:]})
 
+tools = []
+
+def run_hook_via_tool(path):
+    # A tool the session runs, still running after it started the hook (as a test runner beneath
+    # a person's pane is): the hook's parent is the tool, alive, not the harness.
+    done = path + ".done"
+    with open(path, "rb") as f:
+        event = f.read()
+    tool = subprocess.Popen(
+        ["/usr/bin/perl", "-e",
+         "system(@ARGV); open(my $f, '>', $ENV{HOOK_DONE}); close($f); sleep 600"] + hook_argv,
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, HOOK_DONE=done))
+    tool.stdin.write(event)
+    tool.stdin.close()
+    tools.append(tool)
+    import time
+    for _ in range(200):
+        if os.path.exists(done):
+            break
+        time.sleep(0.1)
+    record({"hook": os.path.basename(path), "via": "tool", "tool": tool.pid})
+
 fd = sys.stdin.fileno()
-old = termios.tcgetattr(fd)
-tty.setraw(fd)
+# Outside a terminal (started by the proof itself, not in a pane) there is no tty to set raw.
+interactive = os.isatty(fd)
+old = termios.tcgetattr(fd) if interactive else None
+if interactive:
+    tty.setraw(fd)
 done = 0
 try:
-    record({"started": os.getpid()})
+    # Its tmux variables, which every hook it runs inherits: quoted by the proof, so a report can
+    # say which server and pane its hooks named.
+    record({"started": os.getpid(), "TMUX": os.environ.get("TMUX", ""), "TMUX_PANE": os.environ.get("TMUX_PANE", "")})
     draw()
     while True:
-        r, _, _ = select.select([fd], [], [], 0.1)
+        r, _, _ = select.select([fd] if interactive else [], [], [], 0.1)
         if r:
             data = os.read(fd, 4096).decode(errors="replace")
             for ch in data:
@@ -71,9 +102,16 @@ try:
         for line in lines[done:]:
             done += 1
             if line == "exit":
+                for t in tools:
+                    t.kill()
                 record({"exited": os.getpid()})
                 sys.exit(0)
             if line.startswith("hook "):
                 run_hook(line[5:])
+            if line.startswith("hookvia "):
+                run_hook_via_tool(line[8:])
 finally:
-    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    for t in tools:
+        t.kill()
+    if interactive:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)

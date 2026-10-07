@@ -41,7 +41,7 @@ use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use support::{until, Out, HARNESS_SESSION_VARS, VOX};
+use support::{until, Out, VOX};
 
 /// Rows of this many bytes of body, and how many: 5 MiB, twenty frames' worth.
 const ROW: usize = 32 * 1024;
@@ -172,9 +172,7 @@ fn a_room_past_one_frame_of_history_reads_whole() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for v in HARNESS_SESSION_VARS {
-        cmd.env_remove(v);
-    }
+    support::strip_harness_env(&mut cmd);
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("APPARATUS: could not spawn {VOX} room tail: {e}"));

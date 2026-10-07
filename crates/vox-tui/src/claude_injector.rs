@@ -133,7 +133,7 @@ fn tmux(p: &TmuxPane, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// One process, as the process table says.
+/// One process, as the kernel says: its parent, when it started, and what it is called.
 #[derive(Debug, Clone)]
 struct Proc {
     ppid: u32,
@@ -141,41 +141,46 @@ struct Proc {
     name: String,
 }
 
-/// The process table: pid → parent, start time (`lstart`) and name. One `ps` for the whole walk.
-fn processes() -> Result<std::collections::HashMap<u32, Proc>, String> {
-    let out = Command::new("/bin/ps")
-        .args(["-ax", "-o", "pid=,ppid=,lstart=,comm="])
-        .output()
-        .map_err(|e| format!("the process table could not be read: {e}"))?;
-    let mut table = std::collections::HashMap::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        // `lstart` is five words: "Tue Oct  6 18:04:12 2026".
-        let w: Vec<&str> = line.split_whitespace().collect();
-        if w.len() < 8 {
-            continue;
-        }
-        let (Ok(pid), Ok(ppid)) = (w[0].parse::<u32>(), w[1].parse::<u32>()) else {
-            continue;
-        };
-        let name = w[7..].join(" ");
-        let name = name.rsplit('/').next().unwrap_or(&name).to_owned();
-        table.insert(
-            pid,
-            Proc {
-                ppid,
-                start: w[2..7].join(" "),
-                name,
-            },
-        );
-    }
-    Ok(table)
+/// `pid`, read from the kernel itself (no program is run: a sandbox may refuse to start `ps`):
+/// `proc_pidinfo` on macOS, `/proc/<pid>/stat` on Linux. `None` when it is gone.
+#[cfg(target_os = "macos")]
+fn proc_of(pid: u32) -> Option<Proc> {
+    use libproc::bsd_info::BSDInfo;
+    let info = libproc::proc_pid::pidinfo::<BSDInfo>(i32::try_from(pid).ok()?, 0).ok()?;
+    let name: String = info
+        .pbi_comm
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| char::from(u8::from_ne_bytes(c.to_ne_bytes())))
+        .collect();
+    Some(Proc {
+        ppid: info.pbi_ppid,
+        start: format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+        name,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn proc_of(pid: u32) -> Option<Proc> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid …`: the name may hold spaces and parentheses, so it ends at the
+    // last ')'. After it, the fields from `state` on; `starttime` is the 22nd field of the line.
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let name = stat.get(open + 1..close)?.to_owned();
+    let rest: Vec<&str> = stat.get(close + 1..)?.split_whitespace().collect();
+    Some(Proc {
+        ppid: rest.get(1)?.parse().ok()?,
+        start: (*rest.get(19)?).to_owned(),
+        name,
+    })
 }
 
 /// The chain from `pid` up through its parents, `pid` first, ending at init or a loop.
-fn ancestry(table: &std::collections::HashMap<u32, Proc>, pid: u32) -> Vec<u32> {
+fn ancestry(pid: u32) -> Vec<u32> {
     let mut chain = vec![pid];
     let mut at = pid;
-    while let Some(p) = table.get(&at) {
+    while let Some(p) = proc_of(at) {
         if p.ppid <= 1 || chain.contains(&p.ppid) || chain.len() > 64 {
             break;
         }
@@ -234,7 +239,10 @@ pub fn claim_here() -> Result<Option<crate::wake::TmuxClaim>, String> {
 ///
 /// # Errors
 /// The pane malformed or unknown to tmux, or the hook not under the pane's process.
-pub fn prove(claim: &crate::wake::TmuxClaim) -> Result<TmuxPane, String> {
+pub fn prove(
+    claim: &crate::wake::TmuxClaim,
+    harnesses: &[std::path::PathBuf],
+) -> Result<TmuxPane, String> {
     let mut found = TmuxPane {
         socket: claim.socket.clone(),
         pane: claim.pane.clone(),
@@ -253,8 +261,30 @@ pub fn prove(claim: &crate::wake::TmuxClaim) -> Result<TmuxPane, String> {
     .trim()
     .parse()
     .map_err(|_| format!("tmux gave no process for pane {}", found.pane))?;
-    let table = processes()?;
-    let chain = ancestry(&table, claim.hook_pid);
+    let chain = ancestry(claim.hook_pid);
+    // **The hook must be the harness's own** (the lead's ruling after a proof's hook, started
+    // beneath the operator's real pane by a test, bound a made-up session to it and typed into it,
+    // 2026-10-07): its parent, after at most one `sh -c`, is a harness process, known by its
+    // executable's path as the kernel gives it, never by a name or a variable. Anything else
+    // beneath a pane (a test, a script, another node's hook) proves nothing.
+    let parent = chain.get(1).copied().unwrap_or(0);
+    let harness = if exe_of(parent).as_deref().is_some_and(is_shell) {
+        chain.get(2).copied().unwrap_or(0)
+    } else {
+        parent
+    };
+    let harness_exe = exe_of(harness);
+    if !harness_exe
+        .as_deref()
+        .is_some_and(|e| harnesses.iter().any(|h| h == e))
+    {
+        return Err(format!(
+            "the hook that named tmux pane {} was not started by Claude Code itself (it was started \
+             by {}), so the pane is not proven",
+            found.pane,
+            harness_exe.map_or_else(|| format!("process {harness}"), |e| e.display().to_string())
+        ));
+    }
     let Some(at) = chain.iter().position(|&p| p == pane_pid) else {
         // Case: nested tmux is fine (the innermost server's variables are the hook's, and its
         // chain reaches that pane). ssh, or variables inherited by a process outside the pane, is
@@ -264,15 +294,86 @@ pub fn prove(claim: &crate::wake::TmuxClaim) -> Result<TmuxPane, String> {
             found.pane
         ));
     };
-    let process = if at == 0 { pane_pid } else { chain[at - 1] };
-    let p = table
-        .get(&process)
-        .ok_or("the session's process left the process table")?;
+    // The harness itself must run beneath the pane, through any wrapper (a script, `npx`, a
+    // version shim): the pane's process is on its chain.
+    let Some(h_at) = chain.iter().position(|&p| p == harness) else {
+        return Err("the session's harness left the process table".into());
+    };
+    if at < h_at {
+        return Err(format!(
+            "Claude Code does not run under tmux pane {}'s process, though the hook does",
+            found.pane
+        ));
+    }
+    // The session's process is Claude Code itself: it lives exactly as long as the session.
+    let process = harness;
+    let p = proc_of(process).ok_or("the session's process left the process table")?;
     found.pane_pid = pane_pid;
     found.process = process;
     found.process_start.clone_from(&p.start);
     found.process_name.clone_from(&p.name);
     Ok(found)
+}
+
+/// A process's executable, as the kernel has it: `proc_pidpath` on macOS, `/proc/<pid>/exe` on
+/// Linux. `None` when it cannot be read.
+fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
+    if pid <= 1 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    let path = libproc::proc_pid::pidpath(i32::try_from(pid).ok()?)
+        .ok()
+        .map(std::path::PathBuf::from)?;
+    #[cfg(not(target_os = "macos"))]
+    let path = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// Whether `exe` is a POSIX shell a harness runs its hook command through (`sh -c`).
+fn is_shell(exe: &std::path::Path) -> bool {
+    exe.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| matches!(n, "sh" | "bash" | "zsh" | "dash" | "ksh"))
+        && (exe.starts_with("/bin") || exe.starts_with("/usr/bin"))
+}
+
+/// The executables that are Claude Code on this machine, each resolved:
+///
+/// - every `<HOME>/.local/share/claude/versions/*` (Claude Code's native install);
+/// - the `claude` the daemon's `PATH` finds;
+/// - each path the account's `harnesses` file names, one per line (`#` starts a comment), for an
+///   install elsewhere.
+///
+/// Read when a hook's pane is proven, so an update that adds a version is taken at once.
+#[must_use]
+pub fn harnesses(config_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let versions = std::path::Path::new(&home).join(".local/share/claude/versions");
+        if let Ok(dir) = std::fs::read_dir(versions) {
+            out.extend(
+                dir.flatten()
+                    .filter_map(|e| std::fs::canonicalize(e.path()).ok()),
+            );
+        }
+    }
+    if let Some(found) = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join("claude"))
+            .find(|c| c.is_file())
+    }) {
+        out.extend(std::fs::canonicalize(found).ok());
+    }
+    if let Ok(text) = std::fs::read_to_string(config_dir.join("harnesses")) {
+        out.extend(
+            text.lines()
+                .map(|l| l.split('#').next().unwrap_or_default().trim())
+                .filter(|l| !l.is_empty())
+                .filter_map(|l| std::fs::canonicalize(l).ok()),
+        );
+    }
+    out
 }
 
 /// The recorded socket and pane are well-formed.
@@ -311,10 +412,7 @@ fn check(p: &TmuxPane) -> Result<(), String> {
     // Case: Claude Code exited (the pane back at a shell), or a new session took the pane after
     // one that ended without a SessionEnd: the session's process is gone, or is another process
     // under the same pid.
-    let table = processes()?;
-    let alive = table
-        .get(&p.process)
-        .is_some_and(|q| q.start == p.process_start);
+    let alive = proc_of(p.process).is_some_and(|q| q.start == p.process_start);
     if !alive {
         return Err(format!(
             "the session is no longer running in tmux pane {}: its process ({} {}) has ended, \
@@ -324,7 +422,7 @@ fn check(p: &TmuxPane) -> Result<(), String> {
     }
     // Case: the process still lives but left the pane (moved by a wrapper, the pane respawned).
     // A pane moved, split, swapped or renumbered keeps its %N and its process: input follows it.
-    if p.process != p.pane_pid && !ancestry(&table, p.process).contains(&p.pane_pid) {
+    if p.process != p.pane_pid && !ancestry(p.process).contains(&p.pane_pid) {
         return Err(format!(
             "the session's process no longer runs under tmux pane {}",
             p.pane

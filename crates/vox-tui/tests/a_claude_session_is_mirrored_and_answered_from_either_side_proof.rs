@@ -41,6 +41,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A short root for the run's directories: a Unix socket's path must fit the platform's bound
+/// (104 bytes on macOS), which the system's temporary directory does not leave room for.
+#[cfg(target_os = "macos")]
+const SHORT_ROOT: &str = "/private/tmp/vc";
+#[cfg(not(target_os = "macos"))]
+const SHORT_ROOT: &str = "/tmp/vc";
+
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 const PERSON: &str = "person";
 const AGENT: &str = "claude-a";
@@ -248,11 +255,11 @@ impl World {
     /// `claude-a` in one room, `claude-a` trusting `person` with drive and `person` trusting it.
     /// The world, its daemon's guard, and the room's id.
     fn setup() -> (World, Daemon, String) {
-        std::fs::create_dir_all("/private/tmp/vc")
-            .unwrap_or_else(|e| panic!("APPARATUS: cannot make /private/tmp/vc: {e}"));
+        std::fs::create_dir_all(SHORT_ROOT)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make {SHORT_ROOT}: {e}"));
         let tmp = tempfile::Builder::new()
             .prefix("cs-")
-            .tempdir_in("/private/tmp/vc")
+            .tempdir_in(SHORT_ROOT)
             .unwrap_or_else(|e| panic!("APPARATUS: cannot make a temp directory: {e}"));
         let root = tmp.path().to_path_buf();
         for d in ["home", "work"] {
@@ -640,7 +647,26 @@ impl StandIn {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
+        s.log_tmux(name);
         s
+    }
+
+    /// Print the tmux variables the stand-in, and so every hook it runs, holds.
+    fn log_tmux(&self, name: &str) {
+        let started = self
+            .said()
+            .lines()
+            .find_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                v.get("started")?;
+                Some(v)
+            })
+            .unwrap_or_default();
+        println!(
+            "[proof] stand-in {name}: its hooks hold TMUX={:?} TMUX_PANE={:?}",
+            started["TMUX"].as_str().unwrap_or_default(),
+            started["TMUX_PANE"].as_str().unwrap_or_default()
+        );
     }
 
     fn said(&self) -> String {
@@ -649,6 +675,67 @@ impl StandIn {
 
     /// Run the session's hook for `event`, as the stand-in's child, and wait for it to finish.
     fn hook(&self, event: &serde_json::Value) {
+        self.hook_as("hook", event);
+    }
+
+    /// Run the session's hook for `event` through another process between the stand-in and the
+    /// hook (a tool or script the session runs), so the hook's parent is not the harness.
+    fn hook_via_another(&self, event: &serde_json::Value) {
+        self.hook_as("hookvia", event);
+    }
+
+    /// The stand-in's own process id, as it recorded it.
+    fn pid(&self) -> u32 {
+        self.said()
+            .lines()
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()?["started"].as_u64())
+            .and_then(|p| u32::try_from(p).ok())
+            .unwrap_or_else(|| panic!("APPARATUS: the stand-in recorded no process id"))
+    }
+
+    /// A stand-in started by this proof itself, outside every pane, with `env` (as a process
+    /// that inherited a pane's `$TMUX` and `$TMUX_PANE` would have them).
+    fn start_outside(w: &World, room: &str, name: &str, env: &[(String, String)]) -> (Self, Child) {
+        let dir = w.root.join(name);
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot make {dir:?}: {e}"));
+        let s = Self {
+            log: dir.join("log"),
+            control: dir.join("control"),
+            dir,
+            hooks: std::cell::Cell::new(0),
+        };
+        let hook = serde_json::json!([VOX, "agent", "hook", "--node", AGENT, "--room", room]);
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/claude_pane_standin.py"
+        );
+        let child = Command::new("python3")
+            .env_clear()
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .args([script, "--log"])
+            .arg(&s.log)
+            .arg("--control")
+            .arg(&s.control)
+            .args(["--hook", &hook.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("APPARATUS: cannot start the stand-in: {e}"));
+        let t0 = Instant::now();
+        while !s.said().contains("\"started\"") {
+            assert!(
+                t0.elapsed() < Duration::from_secs(15),
+                "APPARATUS: the stand-in did not start outside the panes"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        s.log_tmux(name);
+        (s, child)
+    }
+
+    fn hook_as(&self, how: &str, event: &serde_json::Value) {
         let n = self.hooks.get() + 1;
         self.hooks.set(n);
         let file = self.dir.join(format!("event-{n}.json"));
@@ -659,7 +746,7 @@ impl StandIn {
             .append(true)
             .open(&self.control)
             .unwrap_or_else(|e| panic!("APPARATUS: the stand-in's control: {e}"));
-        writeln!(f, "hook {}", file.display())
+        writeln!(f, "{how} {}", file.display())
             .unwrap_or_else(|e| panic!("APPARATUS: the stand-in's control: {e}"));
         let needle = format!("\"hook\": \"event-{n}.json\"");
         let t0 = Instant::now();
@@ -773,12 +860,14 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 /// 3. a session started through a wrapper (a shell script, not exec'd) is still bound;
 /// 4. the pane swapped with another and moved to a new window: input follows the pane;
 /// 5. a second server whose pane is also %0: each session reaches its own server;
-/// 6. `$TMUX`/`$TMUX_PANE` naming a pane the hook does not run in (as ssh forwarding or an
+/// 6. `$TMUX`/`$TMUX_PANE` naming a pane the harness does not run in (as ssh forwarding or an
 ///    inherited environment gives): refused;
 /// 7. the session exited, its pane back at the shell: refused, and the shell got nothing;
 /// 8. a new session in the same process and pane (`/clear`): the old one is refused;
 /// 9. the same session resumed in another pane: input goes to the new pane;
-/// 10. a session first seen by a tool hook (no prompt yet): bound; one never seen: refused.
+/// 10. a session first seen by a tool hook (no prompt yet): bound; one never seen: refused;
+/// 12. a hook started inside a pane by a process other than the harness (a tool the session ran,
+///     a test beneath a person's pane): the pane is not proven, and nothing is typed into it.
 ///
 /// **Which side a red is on.** What `vox room session` printed, or what a stand-in got or did not
 /// get, is `PRODUCT:`. A tmux server, stand-in or event this proof could not stage is
@@ -789,7 +878,8 @@ const S8: &str = "88888888-1111-4000-8000-000000000008";
 /// pane is recorded by its position, not its id (arm 4); one session per pane ignores the server
 /// (arm 5); the hook's ancestry not required to reach the pane (arm 6); the session's process not
 /// checked at the send (arm 7); one session per pane not kept (arm 8); a later hook not rebinding
-/// (arm 9); a tool hook not registering (arm 10).
+/// (arm 9); a tool hook not registering (arm 10); the hook's parent not required to be the
+/// harness (arm 12).
 #[test]
 #[ignore = "real binary; run in release"]
 fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
@@ -801,6 +891,26 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
     let p1 = t.pane();
     let p2 = t.pane();
     let a = StandIn::start(&w, &t, &p1, &room, "a", false);
+    // **The stand-in is the harness here** (the lead's binding rule, 2026-10-07: a hook's parent
+    // must be the harness, known by its executable's path from the kernel). The daemon's
+    // `harnesses` file names the stand-in's executable, as it names a Claude Code installed
+    // somewhere other than its native install; nothing else changes.
+    // Read from the kernel, as the daemon reads it: no `lsof`, which a sandbox may refuse to run.
+    #[cfg(target_os = "macos")]
+    let exe = i32::try_from(a.pid())
+        .ok()
+        .and_then(|pid| libproc::proc_pid::pidpath(pid).ok());
+    #[cfg(not(target_os = "macos"))]
+    let exe = std::fs::read_link(format!("/proc/{}/exe", a.pid()))
+        .ok()
+        .map(|p| p.display().to_string());
+    let exe = exe
+        .unwrap_or_else(|| panic!("APPARATUS: the kernel did not give the stand-in's executable"));
+    std::fs::create_dir_all(&w.cfg)
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make the config dir: {e}"));
+    std::fs::write(w.cfg.join("harnesses"), format!("{exe}\n"))
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot write the harnesses file: {e}"));
+    println!("[proof] the harness the daemon recognises: {exe}");
     let b = StandIn::start(&w, &t, &p2, &room, "b", false);
     a.hook(&prompt(&w, S1));
     b.hook(&prompt(&w, S2));
@@ -908,23 +1018,17 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         );
     }
 
-    // ---- 6. $TMUX_PANE naming a pane the hook does not run in ----
-    let mut hook = w.command(AGENT, &["agent", "hook", "--node", AGENT, "--room", &room]);
-    let server = format!("{},1,0", t.socket.display());
-    hook.env("TMUX", &server)
-        .env("TMUX_PANE", &p2)
-        .env("CLAUDE_CODE_ENTRYPOINT", "cli")
-        .env("PATH", t.env[0].1.clone())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = hook
-        .spawn()
-        .unwrap_or_else(|e| panic!("APPARATUS: cannot run the hook: {e}"));
-    if let Some(mut pipe) = child.stdin.take() {
-        let _ = pipe.write_all(prompt(&w, S5).to_string().as_bytes());
-    }
-    let _ = wait_within(child, Duration::from_secs(20));
+    // ---- 6. $TMUX_PANE naming a pane the harness does not run in ----
+    // A harness started outside every pane that inherited a pane's variables (as ssh forwarding,
+    // or a process started from a pane, would give them): its hook is the harness's own, but the
+    // harness is not beneath the pane.
+    let mut env = t.env.clone();
+    env.push(("TMUX".into(), format!("{},1,0", t.socket.display())));
+    env.push(("TMUX_PANE".into(), p2.clone()));
+    let (out, mut outside) = StandIn::start_outside(&w, &room, "out", &env);
+    out.hook(&prompt(&w, S5));
+    let _ = outside.kill();
+    let _ = outside.wait();
     session_listed(&w, &room, S5);
     let (ok, said) = drive(&w, &room, S5, &["--say", "not for this pane"]);
     println!("[proof] 6. --say to {S5}, whose $TMUX_PANE names {p2} it is not in: {said}");
@@ -934,8 +1038,8 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
                 &serde_json::json!({ "typed": "not for this pane" }),
                 Duration::from_millis(500)
             ),
-        "PRODUCT: arm 6: a session whose $TMUX_PANE names a pane it does not run in must be \
-         refused with why, and that pane must get nothing; vox said {said:?}"
+        "PRODUCT: arm 6: a session whose $TMUX_PANE names a pane its harness does not run in \
+         must be refused with why, and that pane must get nothing; vox said {said:?}"
     );
 
     // ---- 7. the session exited, the pane back at its shell ----
@@ -1024,6 +1128,28 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         ok && f.got(&serde_json::json!({ "typed": "after a tool hook" }), Duration::from_secs(10)),
         "PRODUCT: arm 10: a session first seen by a tool hook must be bound by it; vox said {said:?}"
     );
+
+    // ---- 12. a hook started inside a pane by something other than the harness ----
+    // The stand-in (the harness) runs a tool, and the tool starts the hook: as a test or a script
+    // run beneath a person's real pane would. Its pane is never proven, under any session id.
+    let p6 = t.pane();
+    let h = StandIn::start(&w, &t, &p6, &room, "h", false);
+    let s9 = "99999999-0000-4000-8000-000000000009";
+    h.hook_via_another(&prompt(&w, s9));
+    session_listed(&w, &room, s9);
+    let (ok, said) = drive(&w, &room, s9, &["--say", "from a stranger"]);
+    println!("[proof] 12. --say to {s9}, whose hook a tool in the pane started: {said}");
+    assert!(
+        !ok && said.contains("was not started by Claude Code itself")
+            && !h.got(
+                &serde_json::json!({ "typed": "from a stranger" }),
+                Duration::from_millis(500)
+            ),
+        "PRODUCT: arm 12: a pane named by a hook the harness did not start itself must not be \
+         proven, and nothing may be typed into it; vox said {said:?}"
+    );
+    // The tool ends with the stand-in.
+    h.exit();
 }
 
 /// The ref a waiting request's line says to answer it with: the word after `flag` on the

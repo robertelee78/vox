@@ -87,7 +87,7 @@ use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use support::{until, Out, Worker, HARNESS_SESSION_VARS, VOX};
+use support::{until, Out, Worker, VOX};
 
 /// One run of the consumer: a `tail` process, and a reader thread that forwards its
 /// lines — unless paused, when it stops reading the pipe altogether, so the pipe fills,
@@ -112,9 +112,7 @@ fn start(w: &Worker, r: &str, cursor: &str, stderr: &std::path::Path) -> Run {
                 .open(stderr)
                 .expect("APPARATUS: cannot open the tail's stderr file"),
         );
-    for v in HARNESS_SESSION_VARS {
-        cmd.env_remove(v);
-    }
+    support::strip_harness_env(&mut cmd);
     let mut child = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("APPARATUS: cannot spawn vox room tail: {e}"));
@@ -987,9 +985,7 @@ fn a_row_that_lands_between_the_subscription_and_the_read_is_not_lost() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for v in HARNESS_SESSION_VARS {
-        cmd.env_remove(v);
-    }
+    support::strip_harness_env(&mut cmd);
     let mut tail = cmd
         .spawn()
         .unwrap_or_else(|e| panic!("APPARATUS: could not spawn `vox room tail`: {e}"));

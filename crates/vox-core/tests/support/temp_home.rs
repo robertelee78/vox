@@ -137,6 +137,24 @@ extern "C" fn init() {
     for var in UNSET {
         std::env::remove_var(var);
     }
+    // **Nothing of a terminal or a harness session this proof did not make** (2026-10-07: a
+    // proof run from inside the operator's Claude Code session inherited its tmux pane, and a
+    // steer line was typed into that session). Every variable whose name starts with `TMUX`,
+    // `CLAUDE`, `CODEX` or `OPENCODE` is taken out of this process before `main`, walked from the
+    // environment rather than listed, so no child it starts inherits one. A proof that wants one
+    // sets its own, on the child.
+    let harness: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(k, _)| k)
+        .filter(|k| {
+            let k = k.to_string_lossy();
+            ["TMUX", "CLAUDE", "CODEX", "OPENCODE"]
+                .iter()
+                .any(|p| k.starts_with(p))
+        })
+        .collect();
+    for var in harness {
+        std::env::remove_var(var);
+    }
     // A daemon a proof starts binds its `.vox` proxy on a free port, never 127.0.0.1:1080 (ADR-028
     // S-5), so it takes that port from no real daemon and no other proof. `.cargo/config.toml` says
     // so for what `cargo test` runs; a proof binary run on its own (`run-slot.sh`, a checker) gets

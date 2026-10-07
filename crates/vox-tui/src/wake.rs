@@ -133,7 +133,7 @@ pub struct Session {
 
 /// What a hook's environment says of its tmux pane: claimed, not proven. The daemon proves it
 /// from the process table and tmux itself, since a hook may run where neither can be read (a
-/// sandbox refuses the setuid `ps`).
+/// sandbox).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TmuxClaim {
     /// `$TMUX`'s first field.
@@ -160,8 +160,8 @@ pub struct TmuxPane {
     pub bin: String,
     /// The pane's own process (`#{pane_pid}`), as tmux said when the hook bound it.
     pub pane_pid: u32,
-    /// The session's process: the hook's ancestor that is the pane's process or its child (a
-    /// wrapper such as `npx` or a version shim is that child, and lives as long as the session).
+    /// The session's process: Claude Code itself, the hook's parent (after at most one `sh -c`),
+    /// known by its executable, running beneath the pane through any wrapper.
     pub process: u32,
     /// When that process started, as the process table says: a reused pid is not the session.
     pub process_start: String,
