@@ -526,8 +526,9 @@ impl Router {
     }
 
     /// Open `reg`'s Session in its room (ADR-029 SE-1): at once when the node is a member, or once
-    /// a join from the room map (`join`) makes it one. A headless session gets none. What a join
-    /// under way says, for the session.
+    /// a join from the room map (`join`) makes it one. A headless session gets none, and neither
+    /// does a hook run by hand, with no harness behind it. What a join under way says, for the
+    /// session.
     async fn open_session(
         &self,
         node: &NodeName,
@@ -536,7 +537,7 @@ impl Router {
         join: Option<(String, Zeroizing<String>)>,
     ) -> Option<String> {
         let room_b32 = reg.room.as_ref()?;
-        if !reg.interactive {
+        if !reg.interactive || reg.harness == "unknown" {
             return None;
         }
         let room = vox_core::node::link::b32_decode(room_b32, "room").ok()?;

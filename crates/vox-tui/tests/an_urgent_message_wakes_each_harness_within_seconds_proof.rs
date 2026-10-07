@@ -685,3 +685,200 @@ fn an_urgent_message_wakes_each_harness_on_another_node_within_seconds() {
         failures.join("\n- ")
     );
 }
+
+/// ADR-029 TA-3 (#548) — **an urgent message to one session wakes that session alone**,
+/// announce-only, while one to the node wakes every session of it (TA-4), and one to a session
+/// that ended is refused where it is posted and wakes no one (TA-5).
+///
+/// Alice and bob share a room (`support/room.rs`). Bob's node runs three Claude Code sessions,
+/// registered by `vox agent hook` as Claude Code's hook registers one, each with a stand-in
+/// messaging socket: `s-one`, `s-two`, and `s-gone`, which then ends (`SessionEnd`).
+///
+/// 1. alice posts urgent to `<bob>/s-one`: s-one is woken by a notice naming one urgent message
+///    from alice and no byte of it; s-two gets nothing in the same window;
+/// 2. alice posts urgent to bob's node: both are woken;
+/// 3. alice posts urgent to `<bob>/s-gone`: her post is refused, saying it has ended, and neither
+///    s-one nor s-two gets anything.
+///
+/// **Which side a red is on.** A wake, a missing one or a post that went through, is `PRODUCT:`;
+/// a socket, a room or a registration this proof could not stage is `APPARATUS:`.
+///
+/// **Mutation that must turn it red:** every session of the node woken for a message to one of
+/// them (`wake::wakes` true for any session of the node) → s-two is woken in (1).
+#[test]
+#[ignore = "an anchor and two vox daemons with production Argon2id; CI runs it in release"]
+fn an_urgent_message_to_one_session_wakes_that_session_alone() {
+    let tmp = tempfile::tempdir().expect("APPARATUS: a temp dir");
+    watchdog::arm();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("APPARATUS: a tokio runtime");
+    let r = rt.block_on(support::room(tmp.path(), &["alice", "bob"]));
+    let (alice, bob) = (&r.workers[0], &r.workers[1]);
+    let room = r.id.clone();
+    let bob_fp = bob.b32();
+
+    // ---- bob's three Claude Code sessions ----
+    let mut inboxes = Vec::new();
+    let mut socks = Vec::new();
+    for name in ["one", "two", "gone"] {
+        let sock = tmp.path().join(format!("{name}.sock"));
+        inboxes.push(claude_socket(&sock));
+        socks.push(sock.to_string_lossy().into_owned());
+    }
+    let turn = |i: usize, session: &str, event: &str| {
+        let env = [
+            ("CLAUDE_CODE_MESSAGING_SOCKET", socks[i].as_str()),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "tok"),
+        ];
+        let input = serde_json::json!({
+            "session_id": session,
+            "hook_event_name": event,
+            "prompt": "hi",
+            "reason": "other",
+            "cwd": "/tmp",
+            "transcript_path": "/tmp/t.jsonl",
+            "permission_mode": "default",
+            "prompt_id": "p",
+        })
+        .to_string();
+        hook(
+            bob,
+            &env,
+            &["agent", "hook", "--node", "default", "--room", &room],
+            Some(&input),
+        )
+    };
+    let _ = turn(0, "s-one", "UserPromptSubmit");
+    let _ = turn(1, "s-two", "UserPromptSubmit");
+    let _ = turn(2, "s-gone", "UserPromptSubmit");
+    let _ = turn(2, "s-gone", "SessionEnd");
+    // Alice must know bob's Sessions, and that s-gone ended, before she addresses them.
+    until(
+        alice,
+        None,
+        "bob's Sessions, s-gone ended, to reach alice",
+        &["room", "sessions", &room, "--json"],
+        |o| {
+            let rows: Vec<serde_json::Value> = o
+                .stdout
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            let open = |id: &str| rows.iter().any(|v| v["id"] == id && v["open"] == true);
+            let ended = rows
+                .iter()
+                .any(|v| v["id"] == "s-gone" && v["open"] == false);
+            open("s-one") && open("s-two") && ended
+        },
+    );
+    let quiet = |i: usize, within: Duration| inboxes[i].recv_timeout(within).ok();
+    let mut failures = Vec::new();
+
+    // ---- (1) to one session ----
+    let posted = post(
+        alice,
+        &room,
+        &format!(
+            r#"{{"v":1,"type":"ask","to":["{bob_fp}/s-one"],"urgent":true,"body":"CANARY-ONE wake up"}}"#
+        ),
+    );
+    let one = inboxes[0].recv_timeout(PATIENCE).ok();
+    let two = quiet(1, PATIENCE);
+    let one_text = one
+        .as_ref()
+        .and_then(|(_, f)| claude_notice(f))
+        .unwrap_or_default();
+    println!(
+        "[proof] (1) to <bob>/s-one: s-one woken after {:?} with {one_text:?}; s-two woken: {}",
+        one.as_ref().map(|(t, _)| *t - posted),
+        two.is_some()
+    );
+    check(
+        &mut failures,
+        one_text.contains("1 urgent message addressed to you from alice")
+            && !one.as_ref().is_some_and(|(_, f)| f.contains("CANARY-ONE")),
+        format!(
+            "PRODUCT (1): s-one, addressed alone, must be woken by a notice naming one urgent \
+             message from alice and no byte of it; it got {one_text:?}"
+        ),
+    );
+    check(
+        &mut failures,
+        two.is_none(),
+        format!(
+            "PRODUCT (1): s-two, a sibling the message does not name, must not be woken; it got \
+             {:?}",
+            two.map(|(_, f)| f)
+        ),
+    );
+    // Each session reads what it is owed, so the next wake is not held back (V030-15): s-one's
+    // turn shows the message its wake announced.
+    let shown = context_of(&turn(0, "s-one", "UserPromptSubmit"));
+    let _ = turn(1, "s-two", "UserPromptSubmit");
+    println!(
+        "[proof] (1) s-one's next turn shows the message: {}",
+        shown.contains("CANARY-ONE")
+    );
+    check(
+        &mut failures,
+        shown.contains("CANARY-ONE"),
+        format!("PRODUCT (1): s-one's next turn must show the message its wake announced; it showed:\n{shown}"),
+    );
+
+    // ---- (2) to the node ----
+    let _ = post(
+        alice,
+        &room,
+        &format!(
+            r#"{{"v":1,"type":"ask","to":["{bob_fp}"],"urgent":true,"body":"CANARY-NODE wake up"}}"#
+        ),
+    );
+    let (one, two) = (quiet(0, PATIENCE), quiet(1, PATIENCE));
+    println!(
+        "[proof] (2) to bob's node: s-one woken {}, s-two woken {}",
+        one.is_some(),
+        two.is_some()
+    );
+    check(
+        &mut failures,
+        one.is_some() && two.is_some(),
+        "PRODUCT (2): a message to bob's node must wake every session of it".to_owned(),
+    );
+    let _ = turn(0, "s-one", "UserPromptSubmit");
+    let _ = turn(1, "s-two", "UserPromptSubmit");
+
+    // ---- (3) to a session that ended ----
+    let o = alice.vox_in(
+        None,
+        &["room", "post", &room, "-"],
+        Some(&format!(
+            r#"{{"v":1,"type":"ask","to":["{bob_fp}/s-gone"],"urgent":true,"body":"CANARY-GONE"}}"#
+        )),
+    );
+    let (one, two) = (
+        quiet(0, Duration::from_secs(15)),
+        quiet(1, Duration::from_secs(15)),
+    );
+    println!(
+        "[proof] (3) to <bob>/s-gone: post ok {}, said {:?}; s-one woken {}, s-two woken {}",
+        o.ok,
+        o.stderr.trim(),
+        one.is_some(),
+        two.is_some()
+    );
+    check(
+        &mut failures,
+        !o.ok && o.stderr.contains("ended") && one.is_none() && two.is_none(),
+        format!(
+            "PRODUCT (3): a message to the ended s-gone must be refused where it is posted, saying \
+             it ended, and wake no sibling; post ok {}, said {:?}, s-one woken {}, s-two woken {}",
+            o.ok,
+            o.stderr.trim(),
+            one.is_some(),
+            two.is_some()
+        ),
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

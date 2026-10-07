@@ -534,21 +534,48 @@ pub fn codex_input(transcript_path: &str, has_turn_id: bool) -> bool {
 /// nodes: a session there is woken, or not, by its own node.
 #[must_use]
 pub fn uninterruptible(paths: &Paths, me: &str, to: &[String]) -> Option<String> {
-    if !to.iter().any(|fp| fp == me) {
+    use vox_agentcomms::envelope::addressee;
+    // The sessions of this node the message names: every one for the node, or the one session a
+    // `<fingerprint>/<session id>` entry names (ADR-029 TA-3, TA-4).
+    let whole = to.iter().any(|n| n == me);
+    let named: Vec<&str> = to
+        .iter()
+        .filter_map(|n| match addressee(n) {
+            (node, Some(session)) if node == me => Some(session),
+            _ => None,
+        })
+        .collect();
+    if !whole && named.is_empty() {
         return None;
     }
-    let reachable = registered(paths)
-        .iter()
-        .any(|s| s.harness != "codex" && !s.endpoint.is_empty());
+    let reachable = registered(paths).iter().any(|s| {
+        (whole || named.contains(&s.session.as_str()))
+            && s.harness != "codex"
+            && !s.endpoint.is_empty()
+    });
     if reachable {
         return None;
     }
-    Some(
+    Some(if whole {
         "no session of this node can be interrupted: Vox never interrupts a Codex session, and \
          no other session here left Vox a way to reach it. Each reads the message at its next \
          turn."
-            .to_owned(),
-    )
+            .to_owned()
+    } else {
+        "the session it names cannot be interrupted: Vox never interrupts a Codex session, or that \
+         session left Vox no way to reach it. It reads the message at its next turn."
+            .to_owned()
+    })
+}
+
+/// Whether `e` may wake `session` of the node `me` (ADR-020 6.2, ADR-029 TA-3): urgent, not
+/// plumbing, and addressed to the node, which reaches every session of it, or to that one session.
+/// A wake is announce-only: it names counts and senders, never the message (V030-15).
+#[must_use]
+pub fn wakes(e: &Envelope, me: &str, session: &str) -> bool {
+    e.urgent
+        && !vox_agentcomms::envelope::is_plumbing(&e.kind)
+        && e.is_addressed_to_session(me, session)
 }
 
 /// Every session that has registered a wake channel.
@@ -970,7 +997,9 @@ pub fn unread<'a>(
         if me == Some(r.author) && !e.from.is_empty() && e.from == session.session {
             continue;
         }
-        let for_me = me_fp.as_deref().is_some_and(|fp| e.may_interrupt(fp));
+        let for_me = me_fp
+            .as_deref()
+            .is_some_and(|fp| wakes(&e, fp, &session.session));
         if for_me
             && hops_left(&e, timeline) > 0
             && !me.is_some_and(|m| in_chain(&e, timeline, &m, &session.session))
