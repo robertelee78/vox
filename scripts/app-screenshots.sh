@@ -124,6 +124,8 @@ for i in $(seq 1 30); do
     "$VOX" room read --node ann "$ROOM" 2>/dev/null | grep -q "Dinner" && break
 done
 "$VOX" room post --node ann "$ROOM" "Seven works. I'll make the soup." >/dev/null
+# ann keeps the room's messages a week: the timeline says so among them, and in its title.
+"$VOX" room retention --node ann "$ROOM" 1w >/dev/null
 printf 'Shopping: leeks, potatoes, cream, bread.\n' >"$DEMO/shopping-list.txt"
 "$VOX" share --node ben "$ROOM" "$DEMO/shopping-list.txt" --to "$ANN" -m "the list for Saturday" >/dev/null
 "$VOX" share --node ben "$ROOM" "$DEMO/hike.png" -m "the view from Sunday's hike" >/dev/null

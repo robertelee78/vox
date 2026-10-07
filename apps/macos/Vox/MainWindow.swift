@@ -157,6 +157,12 @@ private struct RoomView: View {
                     }
                     Divider()
                 }
+                Text(model.timelineTitle)
+                    .secondaryText()
+                    .lineLimit(1).truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12).padding(.top, 8)
+                    .accessibilityIdentifier("timeline-title")
                 Group {
                     GeometryReader { viewport in
                         ScrollViewReader { scroller in
@@ -165,18 +171,27 @@ private struct RoomView: View {
                             // told.
                             ScrollView {
                                 LazyVStack(alignment: .leading, spacing: 10) {
-                                    ForEach(model.messages, id: \.id) { message in
-                                        MessageRow(message: message, me: model.me,
-                                                   readBy: model.readBy[message.id] ?? [],
-                                                   pulledBy: model.pulledBy[message.id] ?? [],
-                                                   pulled: model.pulled[message.id]) { looking = $0 }
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .padding(4)
-                                            .selectable(model.selectedMessage == message.id) {
-                                                model.selectedMessage = message.id
-                                            }
-                                            .reportsFrame(of: message.id)
-                                            .id(message.id)
+                                    ForEach(model.timelineItems) { item in
+                                        if let message = item.message {
+                                            MessageRow(message: message, me: model.me,
+                                                       readBy: model.readBy[message.id] ?? [],
+                                                       pulledBy: model.pulledBy[message.id] ?? [],
+                                                       pulled: model.pulled[message.id]) { looking = $0 }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .padding(4)
+                                                .selectable(model.selectedMessage == message.id) {
+                                                    model.selectedMessage = message.id
+                                                }
+                                                .reportsFrame(of: message.id)
+                                                .id(message.id)
+                                        } else if let notice = item.notice {
+                                            // What was done to the room: a line among the
+                                            // messages, not one of them (ADR-028 R-1, R-7).
+                                            Text(notice).secondaryText().italic()
+                                                .padding(.horizontal, 4)
+                                                .accessibilityIdentifier(item.id)
+                                                .id(item.id)
+                                        }
                                     }
                                 }
                                 .padding(12)

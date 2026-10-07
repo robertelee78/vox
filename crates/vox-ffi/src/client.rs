@@ -570,6 +570,22 @@ pub struct DriveAnswer {
     pub delivery: DriveDelivery,
 }
 
+/// Something done to a room, said among its messages (ADR-028 R-1, R-7): its retention set, its
+/// name changed. The client names who: "you", the alias, or the fingerprint marked not in keyring.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RoomNoticeRow {
+    /// Its log entry's id.
+    pub id: String,
+    /// Who did it, base32.
+    pub author: String,
+    /// Their name in this node's keyring; empty when they are not in it.
+    pub author_name: String,
+    /// When, as its author's entry claims, milliseconds since the Unix epoch.
+    pub created_millis: u64,
+    /// What they did, without who, as the TUI says it: `set messages here to be kept for 1 week`.
+    pub what: String,
+}
+
 /// A share this node pulled by itself and verified (ADR-028 F-3, F-4).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct PulledFile {
@@ -962,14 +978,19 @@ impl VoxClient {
             .collect())
     }
 
-    /// One of the node's marks on its own entries in `room`, from one snapshot: each entry's id
-    /// and the sorted names of the members `pick` lists for it, entries with none left out.
-    async fn own_marks(
+    /// `room` as the node's snapshot holds it, and the names it knows: `None` when the room is
+    /// not open.
+    async fn open_snap(
         &self,
-        room: String,
-        pick: fn(vox_core::node::snapshot::OpenRoomSnap) -> Vec<(Digest32, Vec<Digest32>)>,
-    ) -> Result<Vec<(String, Vec<String>)>, VoxError> {
-        let channel_id = digest(&room, "room id")?;
+        room: &str,
+    ) -> Result<
+        (
+            Option<vox_core::node::snapshot::OpenRoomSnap>,
+            HashMap<Digest32, String>,
+        ),
+        VoxError,
+    > {
+        let channel_id = digest(room, "room id")?;
         let body = vox_core::node::snapshot::request_body();
         let (reply, names) = on_held!(self, |c| {
             let names = names(c).await?;
@@ -984,16 +1005,27 @@ impl VoxClient {
                 "the vox daemon did not answer with the node's state",
             ));
         };
+        Ok((
+            snap.open.into_iter().find(|o| o.channel_id == channel_id),
+            names,
+        ))
+    }
+
+    /// One of the node's marks on its own entries in `room`, from one snapshot: each entry's id
+    /// and the sorted names of the members `pick` lists for it, entries with none left out.
+    async fn own_marks(
+        &self,
+        room: String,
+        pick: fn(vox_core::node::snapshot::OpenRoomSnap) -> Vec<(Digest32, Vec<Digest32>)>,
+    ) -> Result<Vec<(String, Vec<String>)>, VoxError> {
+        let (open, names) = self.open_snap(&room).await?;
         let name = |fp: &Digest32| {
             names
                 .get(fp)
                 .cloned()
                 .unwrap_or_else(|| b32_encode(fp).chars().take(12).collect())
         };
-        Ok(snap
-            .open
-            .into_iter()
-            .find(|o| o.channel_id == channel_id)
+        Ok(open
             .map(pick)
             .unwrap_or_default()
             .into_iter()
@@ -2465,6 +2497,43 @@ impl VoxClient {
             .into_iter()
             .map(|(id, names)| ReadBy { id, names })
             .collect())
+    }
+
+    /// What was done to `room`, oldest first, as the TUI says it among the messages (ADR-028 R-1,
+    /// R-7): who set its retention, who renamed it.
+    ///
+    /// # Errors
+    /// A malformed id, the room not open, or the daemon's refusal.
+    pub async fn notices(&self, room: String) -> Result<Vec<RoomNoticeRow>, VoxError> {
+        let (open, names) = self.open_snap(&room).await?;
+        let Some(open) = open else {
+            return Err(failed("the room is not open on this node"));
+        };
+        let mut rows: Vec<RoomNoticeRow> = open
+            .notices
+            .into_iter()
+            .map(|n| RoomNoticeRow {
+                id: b32_encode(&n.entry_hash),
+                author: b32_encode(&n.author),
+                author_name: names.get(&n.author).cloned().unwrap_or_default(),
+                created_millis: n.created_millis,
+                what: n.what,
+            })
+            .collect();
+        rows.sort_by_key(|r| r.created_millis);
+        Ok(rows)
+    }
+
+    /// How long `room` keeps messages here, as a person reads it ("1 week", "forever"), as the
+    /// TUI's timeline title says it (ADR-028 R-7).
+    ///
+    /// # Errors
+    /// A malformed id, the room not open, or the daemon's refusal.
+    pub async fn retention(&self, room: String) -> Result<String, VoxError> {
+        match self.open_snap(&room).await?.0 {
+            Some(open) => Ok(vox_core::node::retention::describe(open.retention)),
+            None => Err(failed("the room is not open on this node")),
+        }
     }
 
     /// Who has pulled this node's own shares in `room` whole and verified them (ADR-028 F-7), from

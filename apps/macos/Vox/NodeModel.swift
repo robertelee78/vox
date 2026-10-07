@@ -74,6 +74,10 @@ final class NodeModel: ObservableObject {
     /// Who has pulled each of this node's own shares in the room on screen, verified, by the
     /// share's message id (ADR-028 F-6, #498).
     @Published private(set) var pulledBy: [String: [String]] = [:]
+    /// The room on screen's retention, as a person reads it (ADR-028 R-7).
+    @Published private(set) var retention = ""
+    /// What was done to the room on screen (its retention set, its name changed), oldest first.
+    @Published private(set) var notices: [RoomNoticeRow] = []
     /// Where this node's verified copy of each share it pulled in the room on screen is, by the
     /// share's message id (ADR-028 F-3, F-4): what its card opens with Quick Look.
     @Published private(set) var pulled: [String: String] = [:]
@@ -273,6 +277,8 @@ final class NodeModel: ObservableObject {
         readBy = [:]
         pulledBy = [:]
         pulled = [:]
+        retention = ""
+        notices = []
         members = []
         roomServices = []
         selectedMessage = nil
@@ -301,9 +307,13 @@ final class NodeModel: ObservableObject {
             messages = read
             let services = (try? await client.services(room: id).shared) ?? []
             let rows = try await memberRows(id)
+            let kept = (try? await client.retention(room: id)) ?? ""
+            let done = (try? await client.notices(room: id)) ?? []
             guard case .room(id) = self.selection else { return }
             roomServices = services
             members = rows
+            retention = kept
+            notices = done
             watchReads(id)
         } catch {
             said = sentence(error)
@@ -706,7 +716,11 @@ final class NodeModel: ObservableObject {
                 let copies = try? await self.client.pulled(room: room)
                 let services = try? await self.client.services(room: room).shared
                 let rows = try? await self.memberRows(room)
+                let kept = try? await self.client.retention(room: room)
+                let done = try? await self.client.notices(room: room)
                 guard case .room(room) = self.selection else { return }
+                if let kept, kept != self.retention { self.retention = kept }
+                if let done, done != self.notices { self.notices = done }
                 if let reads {
                     let now = Dictionary(uniqueKeysWithValues: reads.map { ($0.id, $0.names) })
                     if now != self.readBy { self.readBy = now }
