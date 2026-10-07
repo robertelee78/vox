@@ -580,7 +580,7 @@ impl Conn {
                 "clear" => {
                     let _ = reply.send(Err(
                         "/clear would start a new Codex thread, and driving never starts a \
-                         session (ADR-029 DR-7); type /clear at its terminal"
+                         session; type /clear at its terminal"
                             .into(),
                     ));
                     return;

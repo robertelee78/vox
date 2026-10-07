@@ -90,6 +90,16 @@ def status():
     return "\n".join(r.rstrip() for r in tui.display()[-3:])
 
 
+def focus(name):
+    """Tab until the pane titled `name` says it has the focus (`Name [focus]`): the cycle has grown
+    with the TUI (Timeline, Composer, Members, Shared, Sessions), so counting Tabs went stale."""
+    for _ in range(8):
+        if f"{name} [focus]" in tui.text():
+            return
+        key("\t", 0.5)
+    give(1, f"RED: PRODUCT (staging): Tab never gave the {name} pane the focus:\n{tui.text()}")
+
+
 try:
     # **Attach, not unlock** (ADR-026 N-2, S-4): the TUI is a client of the daemon, and a node has
     # no locked state. A node the daemon holds already is attached with no question; one it does
@@ -118,8 +128,7 @@ try:
         key(ROOMPASS + "\r", 6)
     if GRANT:
         stage(":consent grant")
-        key("\t", 0.5)  # timeline -> composer
-        key("\t", 0.5)  # composer -> members
+        focus("Members")
         members = lambda: pane(tui.display(), "Members")
         def label_of(prefix):
             rows = members()
@@ -140,7 +149,8 @@ try:
         # trusted (its key went out, so sessions are up), then 15 s more (V29-19 measured a first
         # grant failing for want of a session for up to 15 s after a room opened).
         rows_all = lambda: "\n".join(members())
-        if not tui.until(lambda: "in keyring ·" in rows_all(), 60, 1):
+        trusted = ("trusted both ways", "waiting for the other side")
+        if not tui.until(lambda: any(t in rows_all() for t in trusted), 60, 1):
             give(1, f"RED: PRODUCT (staging): the TUI's node never showed a trusted member, so it never connected:\n{tui.text()}")
         tui.pump(15)
         gone_check()
@@ -157,10 +167,9 @@ try:
         # Then a post from the composer, with the TUI's node up long enough to deliver it: what the
         # caller reads of it shows what the node did with the grant, not only what the TUI drew.
         stage("post after :consent grant")
-        key("\t", 0.5)  # members -> timeline
-        key("\t", 0.5)  # timeline -> composer
+        focus("Composer")
         key("BOB-AFTER-GRANT\r", 1)
-        key("\t", 0.5)  # composer -> members, where `:` opens the command line again
+        focus("Members")  # out of the composer, where `:` opens the command line again
         tui.pump(20)
         gone_check()
         print(f"{TAG} posted BOB-AFTER-GRANT")

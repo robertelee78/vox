@@ -1523,6 +1523,15 @@ pub enum NodeEvent {
     /// to open an existing profile comes before the node exists, and is said through
     /// [`NodeConfig::on_profile_wait`](crate::node::actor::NodeConfig::on_profile_wait).
     WaitingForProfile,
+    /// A Session entry was written here, or reached this node and opened (ADR-029 CL-2): the
+    /// session `session_id` in the room `channel_id` has news. Its entries are not room messages,
+    /// so no other event says so.
+    SessionEntry {
+        /// The room.
+        channel_id: Digest32,
+        /// The harness's session id.
+        session_id: String,
+    },
     /// A new rendered entry in a channel.
     NewEntry {
         /// The channel.
@@ -1903,6 +1912,12 @@ impl NodeEvent {
         match self {
             NodeEvent::WaitingForProfile => {
                 "waiting for another vox that is using this identity's files".into()
+            }
+            NodeEvent::SessionEntry { session_id, .. } => {
+                format!(
+                    "new activity in Session {}",
+                    session_id.chars().take(8).collect::<String>()
+                )
             }
             NodeEvent::CapabilityChanged { fingerprint, drive } => {
                 if *drive {

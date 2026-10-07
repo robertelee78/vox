@@ -3385,7 +3385,32 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        let retired = self.sender.chain_id();
         self.sender = next;
+        // **A generation retired before a reader took it is owed to that reader as history.**
+        // A member entitled to it that has not taken it — offline at the rotation, or refusing
+        // keys from an owner it does not trust yet (V210-118) — was owed it only as the live
+        // generation's re-key, which a rotation ends. Nothing owed it any more, so the next tick's
+        // prune (R14) deleted its origin before the member's refusal of the new key could owe it
+        // again, and the member never read what this identity wrote under it. Owed here, its
+        // history floor keeps it (`oldest_generation_needed`) until it is taken.
+        let readers = MembershipView::new(&self.evaluator).readers_of(&me);
+        let owed: Vec<(Digest32, u64)> = readers
+            .into_iter()
+            .filter(|t| *t != me && !self.has_left(t))
+            .filter_map(|t| {
+                let (from, _) = self.entitled.get(&t)?;
+                let floor = match self.delivered.get(&t) {
+                    None => *from,
+                    Some(d) if *d < retired => (*d + 1).max(*from),
+                    Some(_) => return None,
+                };
+                (floor <= retired).then_some((t, floor))
+            })
+            .collect();
+        for (target, floor) in owed {
+            self.owe_history(store, target, floor)?;
+        }
         Ok(chain_id)
     }
 
@@ -5441,8 +5466,18 @@ impl ChannelState {
                 cache_id: Some(id),
             },
         );
+        self.drive.news.push(row.session_id.clone());
         self.drive.sessions.push(row);
         Ok(entry_hash)
+    }
+
+    /// The sessions with an entry placed in this room since the last call, each once: what the
+    /// node says as [`crate::node::api::NodeEvent::SessionEntry`] (ADR-029 CL-2).
+    pub fn take_session_news(&mut self) -> Vec<String> {
+        let mut news = std::mem::take(&mut self.drive.news);
+        news.sort_unstable();
+        news.dedup();
+        news
     }
 
     /// Change this node's drive key if a member it was released to is no longer in `holders`
@@ -6059,6 +6094,7 @@ impl ChannelState {
         for (row, cache_id) in std::mem::take(&mut self.drive.pending) {
             self.retention
                 .rendered(&row.entry_hash, row.created_millis / 1_000, cache_id);
+            self.drive.news.push(row.session_id.clone());
             self.drive.sessions.push(row);
         }
         for (row, cache_id) in std::mem::take(&mut self.pending_reads) {

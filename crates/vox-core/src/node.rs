@@ -70,6 +70,7 @@ pub mod retention;
 pub mod room_join;
 pub mod seatstream;
 pub mod service_reach;
+pub mod session_view;
 pub mod sessions;
 pub mod shares;
 pub mod snapshot;

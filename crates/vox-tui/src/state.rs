@@ -1275,6 +1275,10 @@ impl UiState {
                     }
                     Some(Parsed::Show(showing)) => self.show(showing, vm),
                     Some(Parsed::Drive(channel_id, session, act)) => {
+                        // A file's note is the composer's words: spent with it.
+                        if matches!(act, DriveAct::File(..)) {
+                            self.composer.clear();
+                        }
                         Action::Dispatch(Command::Drive {
                             channel_id,
                             session,
@@ -1703,6 +1707,26 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
             }
         };
         return Some(Parsed::Drive(channel, (x.node, x.id.clone()), act));
+    }
+    // In a Session, `:share <path>` sends the session a file, for a driver (ADR-029 DR-1.7): the
+    // composer's words its note, as `:share` in a room takes them (ADR-028 F-1).
+    if let (Showing::Session(..), "share") = (&ui.showing, verb) {
+        if let Some(x) = showing_session(ui, vm) {
+            if !x.can_drive {
+                return Some(Parsed::Refused(format!(
+                    "you cannot drive this Session: {} has not given you drive",
+                    x.node_alias
+                )));
+            }
+            if !rest.is_empty() {
+                let note = Some(ui.composer.trim().to_owned()).filter(|n| !n.is_empty());
+                return Some(Parsed::Drive(
+                    channel,
+                    (x.node, x.id.clone()),
+                    DriveAct::File(rest.to_owned(), note),
+                ));
+            }
+        }
     }
     // In a Session, the composer's verbs would write to the room, not the session: refused.
     if let (Showing::Session(..), "send" | "share") = (&ui.showing, verb) {
