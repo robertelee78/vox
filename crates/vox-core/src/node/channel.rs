@@ -72,6 +72,7 @@ use crate::nat::bootstrap::BootstrapSet;
 use crate::nat::record::Admission;
 use crate::node::consent_order::Stamp;
 use crate::node::content::{Content, Decoded};
+use crate::node::drive::{drive_channel, DriveState, SessionRow};
 use crate::node::profile::Profile;
 use crate::node::retention::{RetentionIndex, Tracked};
 use crate::node::store::Store;
@@ -190,6 +191,11 @@ const SEG_KNOWN_MEMBERS: u64 = 15;
 
 /// Encoding version of [`SEG_KNOWN_MEMBERS`].
 const KNOWN_MEMBERS_VERSION: u64 = 1;
+
+/// This node's **drive key** material here (ADR-029 SC-2, #543) within
+/// [`SegmentKind::KeyMaterial`]: its own drive chain, the drive keys others released to it, and its
+/// release ledger ([`crate::node::drive::DriveState`]).
+const SEG_DRIVE: u64 = 16;
 
 fn known_members_bytes(known: &BTreeSet<Digest32>) -> Vec<u8> {
     let mut e = Encoder::new();
@@ -838,6 +844,9 @@ pub struct ChannelState {
     /// Members known before their records are admitted (V030-51), persisted in
     /// `SEG_KNOWN_MEMBERS`. See [`ChannelState::note_member`].
     known_members: BTreeSet<Digest32>,
+    /// The drive key and the Session entries it opens (ADR-029 SC-2), persisted in `SEG_DRIVE`;
+    /// the rows come from the plaintext cache.
+    drive: DriveState,
     /// The channel passphrase, retained **in memory only** for as long as the
     /// channel is open (M14.7c).
     ///
@@ -1331,16 +1340,32 @@ fn read_cache_bytes(r: &ReadRow) -> Vec<u8> {
     e.finish()
 }
 
-/// One plaintext-cache row: a message or a read record.
+/// A Session entry's cache row: `[CACHE_VERSION, entry hash, author, created_millis,
+/// KIND_SESSION, session id, body]`. Seven fields, so a row says which it is.
+fn session_cache_bytes(r: &SessionRow) -> Vec<u8> {
+    let mut e = Encoder::new();
+    e.array(7)
+        .uint(CACHE_VERSION)
+        .bytes(&r.entry_hash)
+        .bytes(&r.author)
+        .uint(r.created_millis)
+        .uint(crate::node::content::KIND_SESSION)
+        .text(&r.session_id)
+        .text(&r.body);
+    e.finish()
+}
+
+/// One plaintext-cache row: a message, a read record or a Session entry.
 enum CacheRow {
     Text(Rendered),
     Read(ReadRow),
+    Session(SessionRow),
 }
 
 fn parse_cache(bytes: &[u8]) -> Result<CacheRow> {
     let mut d = Decoder::new(bytes);
     let arity = d.array()?;
-    if arity != 5 && arity != 6 {
+    if !(5..=7).contains(&arity) {
         return Err(Error::MalformedAtRest("plaintext cache arity"));
     }
     if d.uint()? != CACHE_VERSION {
@@ -1355,6 +1380,21 @@ fn parse_cache(bytes: &[u8]) -> Result<CacheRow> {
         .try_into()
         .map_err(|_| Error::MalformedAtRest("plaintext cache author"))?;
     let created_millis = d.uint()?;
+    if arity == 7 {
+        if d.uint()? != crate::node::content::KIND_SESSION {
+            return Err(Error::MalformedAtRest("plaintext cache kind"));
+        }
+        let session_id = d.text()?.to_owned();
+        let body = d.text()?.to_owned();
+        d.finish()?;
+        return Ok(CacheRow::Session(SessionRow {
+            entry_hash,
+            author,
+            created_millis,
+            session_id,
+            body,
+        }));
+    }
     if arity == 6 {
         if d.uint()? != crate::node::content::KIND_READ {
             return Err(Error::MalformedAtRest("plaintext cache kind"));
@@ -1637,6 +1677,7 @@ impl ChannelState {
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
             known_members: BTreeSet::new(),
+            drive: DriveState::default(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled: true,
@@ -1904,6 +1945,7 @@ impl ChannelState {
         // was gone from the room at the next restart.
         let mut timeline = Vec::new();
         let (mut read_records, mut reads) = (BTreeMap::new(), BTreeMap::new());
+        let mut sessions = Vec::new();
         for (id, seg) in store.segments(channel_id, SegmentKind::PlaintextCache)? {
             next_log_id = next_log_id.max(id.saturating_add(1));
             let row = open_segment(&sek, SegmentKind::PlaintextCache, id, &seg)?;
@@ -1924,6 +1966,14 @@ impl ChannelState {
                     if retention.get(&r.entry_hash).is_some() {
                         retention.rendered(&r.entry_hash, r.created_millis / 1_000, id);
                         index_read(&mut read_records, &mut reads, r);
+                    }
+                }
+                // A Session entry ages like a message (SE-5) and is never a row of the timeline
+                // (SC-4).
+                CacheRow::Session(r) => {
+                    if retention.get(&r.entry_hash).is_some() {
+                        retention.rendered(&r.entry_hash, r.created_millis / 1_000, id);
+                        sessions.push(r);
                     }
                 }
             }
@@ -2033,6 +2083,14 @@ impl ChannelState {
                 }
                 None => BTreeSet::new(),
             };
+        let mut drive = match store.get_segment(channel_id, SegmentKind::KeyMaterial, SEG_DRIVE)? {
+            Some(seg) => {
+                let bytes = open_segment(&sek, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)?;
+                DriveState::from_state(&bytes)?
+            }
+            None => DriveState::default(),
+        };
+        drive.sessions = sessions;
 
         Self::refresh_gov_preds(&dag, &mut gov_entries);
         let evaluator = Arc::new(Self::build_evaluator(
@@ -2095,6 +2153,7 @@ impl ChannelState {
             entitled,
             trust_marks,
             known_members,
+            drive,
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled,
@@ -2335,6 +2394,7 @@ impl ChannelState {
             entitled: BTreeMap::new(),
             trust_marks: BTreeMap::new(),
             known_members: BTreeSet::new(),
+            drive: DriveState::default(),
             skipped: std::collections::VecDeque::new(),
             poisoned: false,
             settled: false,
@@ -3236,6 +3296,7 @@ impl ChannelState {
             let chain = match classify_payload(payload) {
                 Ok(EntryKind::Content) => GroupMessage::from_wire(payload)
                     .ok()
+                    .filter(|m| m.header.channel_id == self.channel_id)
                     .map(|m| m.header.chain_id),
                 Ok(EntryKind::Governance) => match GovBody::parse_framed(payload) {
                     Ok(GovBody::Presence(p)) => Some(p.body.chain_id),
@@ -5086,6 +5147,11 @@ impl ChannelState {
             .get(&author)
             .ok_or(Error::MalformedGovernance("SKDM from an unadmitted author"))?
             .clone();
+        // A drive key (ADR-029 SC-2) comes by the same paths as a sender key and is told apart
+        // by what it is bound to.
+        if skdm.body.channel_id == drive_channel(&self.channel_id) {
+            return self.accept_drive_skdm(store, skdm, &key, now_secs);
+        }
         let chain = ReceiverChain::from_skdm(skdm, &key, &self.channel_id, self.epoch)?;
         let slot = (author, chain.chain_id());
         // A second SKDM for a generation we already hold would rewind the chain
@@ -5127,7 +5193,340 @@ impl ChannelState {
         if dropped > 0 {
             self.persist_receivers(store)?;
         }
+        // A drive key too (ADR-029 SC-2): a node reads no Session of a node it does not trust.
+        let before = self.drive.receivers.len();
+        self.drive.receivers.retain(|(a, _), _| trusted.contains(a));
+        if self.drive.receivers.len() != before {
+            self.persist_drive(store)?;
+        }
         Ok(dropped)
+    }
+
+    // ---- Sessions: the drive key (ADR-029 SC-2, SC-2a, SC-2b; #543) ----------------------------
+
+    /// The Session entries this node has opened or written here, in the order it did: each
+    /// node's entries only if this node holds its drive key (SC-2), or wrote them.
+    #[must_use]
+    pub fn session_rows(&self) -> &[SessionRow] {
+        &self.drive.sessions
+    }
+
+    /// Whether this node holds any drive key of `author`'s here: whether it can read inside
+    /// `author`'s Sessions.
+    #[must_use]
+    pub fn holds_drive_key(&self, author: &Digest32) -> bool {
+        self.drive.holds_from(author)
+    }
+
+    /// The members a drive key may be owed to: every member admitted here that has not left,
+    /// this node excepted. Empty until this node holds its own feed (V210-164).
+    #[must_use]
+    pub fn drive_members(&self) -> BTreeSet<Digest32> {
+        if !self.settled {
+            return BTreeSet::new();
+        }
+        let me = self.me();
+        self.authors
+            .keys()
+            .copied()
+            .filter(|a| *a != me && !self.has_left(a))
+            .collect()
+    }
+
+    /// The highest drive generation this identity's own feed shows it used here, if any: a node
+    /// in the room again must not reuse one the others still hold (as the sender key, V210-164).
+    fn drive_used(&self) -> Option<u64> {
+        let me = self.me();
+        let ns = drive_channel(&self.channel_id);
+        self.dag
+            .feed(&me)?
+            .iter()
+            .filter_map(|e| e.payload.as_deref())
+            .filter_map(|p| GroupMessage::from_wire(p).ok())
+            .filter(|m| m.header.channel_id == ns)
+            .map(|m| m.header.chain_id)
+            .max()
+    }
+
+    /// A new drive generation for this node here: past every one it used, owed whole to
+    /// `holders`.
+    fn begin_drive(&mut self, holders: &BTreeSet<Digest32>, now_secs: u64) -> Result<()> {
+        let floor = self
+            .drive
+            .chain
+            .as_ref()
+            .map(SenderChain::chain_id)
+            .into_iter()
+            .chain(self.drive_used())
+            .max();
+        let next = floor.map_or(Ok(0), |f| {
+            f.checked_add(1)
+                .ok_or(Error::MalformedBundle("drive chain_id overflow"))
+        })?;
+        let me = self.me();
+        let chain = SenderChain::new(
+            &drive_channel(&self.channel_id),
+            self.epoch,
+            &me,
+            next,
+            now_secs,
+        )?;
+        let members = self.drive_members();
+        self.drive
+            .begin(chain, holders.iter().filter(|m| members.contains(*m)).copied());
+        Ok(())
+    }
+
+    /// Append one entry of Session `session_id` (ADR-029 SC-1), sealed under this node's drive
+    /// key (SC-2): only members it trusts with drive (`holders`) open it. The drive key is begun
+    /// here at its first use, owed whole to `holders`, and rotated on the sender key's schedule.
+    /// Returns the entry's hash.
+    pub fn append_session(
+        &mut self,
+        profile: &Profile,
+        session_id: &str,
+        body: &str,
+        holders: &BTreeSet<Digest32>,
+        now_millis: u64,
+    ) -> Result<Digest32> {
+        if self.poisoned {
+            return Err(Error::Profile(
+                "room is poisoned after a failed persist; reopen it",
+            ));
+        }
+        if !self.settled {
+            return Err(Error::RoomNotSynced);
+        }
+        let signer = profile.signer()?;
+        let me = signer.fingerprint();
+        if !self.authors.contains_key(&me) {
+            return Err(Error::Profile("this identity is not an author of the room"));
+        }
+        if self.ended(now_millis).is_some() {
+            return Err(Error::Profile("this room has ended"));
+        }
+        let content = crate::node::content::SessionEntry::new(now_millis, session_id, body)?;
+        let now_secs = now_millis / 1_000;
+        let stale = match &self.drive.chain {
+            None => true,
+            Some(c) => c.epoch() != self.epoch || c.should_rotate(now_secs),
+        };
+        if stale {
+            self.begin_drive(holders, now_secs)?;
+        }
+        let chain = self
+            .drive
+            .chain
+            .as_mut()
+            .ok_or(Error::Profile("drive key missing"))?;
+        let plaintext = Zeroizing::new(content.to_canonical_vec());
+        let payload = chain.encrypt(&plaintext)?.to_wire();
+        let skeleton = self.next_skeleton(&me, &payload, now_millis);
+        let entry = Entry::build_signed(signer, skeleton, payload)?;
+        let entry_hash = entry.entry_hash();
+        let wire = entry.to_wire();
+        let row = SessionRow {
+            entry_hash,
+            author: me,
+            created_millis: now_millis,
+            session_id: content.session_id,
+            body: content.body,
+        };
+        let id = self.next_log_id;
+        let log_seg = seal_segment(&self.sek, SegmentKind::LogDb, id, &wire)?;
+        let cache_seg = seal_segment(
+            &self.sek,
+            SegmentKind::PlaintextCache,
+            id,
+            &session_cache_bytes(&row),
+        )?;
+        let drive_seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_DRIVE,
+            &self.drive.to_state(),
+        )?;
+        let seen_seg = seal_segment(
+            &self.sek,
+            SegmentKind::Index,
+            id,
+            &first_seen_bytes(now_secs),
+        )?;
+        let key = signer.public_key();
+        self.dag
+            .accept(entry, EntryKind::Content, &key, &self.admission)
+            .map_err(|_| Error::Profile("authored entry failed the acceptance predicate"))?;
+        let persisted = (|| -> Result<()> {
+            let mut batch = profile.store().batch()?;
+            batch.put_segment(&self.channel_id, SegmentKind::LogDb, id, &log_seg)?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::PlaintextCache,
+                id,
+                &cache_seg,
+            )?;
+            batch.put_segment(
+                &self.channel_id,
+                SegmentKind::KeyMaterial,
+                SEG_DRIVE,
+                &drive_seg,
+            )?;
+            batch.put_segment(&self.channel_id, SegmentKind::Index, id, &seen_seg)?;
+            batch.commit()
+        })();
+        if let Err(e) = persisted {
+            self.poisoned = true;
+            return Err(e);
+        }
+        self.log_ids.insert(entry_hash, id);
+        self.next_log_id = id.saturating_add(1);
+        self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.retention.track(
+            entry_hash,
+            Tracked {
+                log_id: id,
+                first_seen: now_secs,
+                claimed: Some(now_secs),
+                cache_id: Some(id),
+            },
+        );
+        self.drive.sessions.push(row);
+        Ok(entry_hash)
+    }
+
+    /// Change this node's drive key if a member it was released to is no longer in `holders`
+    /// (SC-2b): a new generation, owed whole to the members that still are. Returns the members
+    /// that lost it; none, and nothing changes, when every holder still has drive.
+    pub fn rotate_drive_if_lost(
+        &mut self,
+        store: &Store,
+        holders: &BTreeSet<Digest32>,
+        now_secs: u64,
+    ) -> Result<Vec<Digest32>> {
+        let lost = self.drive.lost(holders);
+        if lost.is_empty() || self.drive.chain.is_none() {
+            return Ok(lost);
+        }
+        self.drive.forget(&lost);
+        self.begin_drive(holders, now_secs)?;
+        self.persist_drive(store)?;
+        Ok(lost)
+    }
+
+    /// The members owed this node's live drive key (SC-2a), each now marked owed from where the
+    /// key stands, if it was not before.
+    pub fn owed_drive(&mut self, holders: &BTreeSet<Digest32>) -> Vec<Digest32> {
+        let members = self.drive_members();
+        self.drive.take_owed(&members, holders)
+    }
+
+    /// The SKDM releasing this node's live drive key to `member` from its mark, and its
+    /// generation, for [`Self::note_drive_delivered`] once sent.
+    pub fn drive_skdm_for(&self, profile: &Profile, member: &Digest32) -> Result<(Skdm, u64)> {
+        self.drive.release_for(profile.signer()?, member)
+    }
+
+    /// Record that `member` holds generation `generation` of this node's drive key.
+    pub fn note_drive_delivered(
+        &mut self,
+        store: &Store,
+        member: Digest32,
+        generation: u64,
+    ) -> Result<()> {
+        self.drive.note_delivered(member, generation);
+        self.persist_drive(store)
+    }
+
+    /// Take a drive key `author` released to this node (SC-2), verified against its admitted key
+    /// and bound to this room's drive namespace, and open what it can of `author`'s Sessions.
+    fn accept_drive_skdm(
+        &mut self,
+        store: &Store,
+        skdm: &Skdm,
+        key: &CompositePublicKey,
+        now_secs: u64,
+    ) -> Result<usize> {
+        let chain =
+            ReceiverChain::from_skdm(skdm, key, &drive_channel(&self.channel_id), self.epoch)?;
+        let slot = (skdm.body.author_id, chain.chain_id());
+        if self.drive.receivers.contains_key(&slot) {
+            return Ok(0);
+        }
+        if self.drive.receivers.len() >= crate::node::drive::MAX_DRIVE_CHAINS {
+            return Err(Error::SizeLimitExceeded("room drive keys"));
+        }
+        self.drive.receivers.insert(slot, chain);
+        self.persist_drive(store)?;
+        let before = self.drive.sessions.len();
+        self.backfill(store, &skdm.body.author_id, now_secs)?;
+        Ok(self.drive.sessions.len() - before)
+    }
+
+    /// Open one Session entry with the drive key it names, if this node holds it, queueing its
+    /// cache row into `batch`; skipped quietly if it does not.
+    fn render_session_into(
+        &mut self,
+        batch: &mut crate::node::store::Batch<'_>,
+        author: Digest32,
+        entry_hash: Digest32,
+        msg: &GroupMessage,
+        now_secs: u64,
+        expired: &mut Vec<(Digest32, Tracked)>,
+    ) -> Result<()> {
+        let Some(chain) = self.drive.receivers.get_mut(&(author, msg.header.chain_id)) else {
+            return Ok(());
+        };
+        let Ok(plaintext) = chain.decrypt(msg).map(Zeroizing::new) else {
+            return Ok(());
+        };
+        self.chains_advanced = true;
+        // Only a Session entry opens under a drive key: a node's message to the room is sealed
+        // under its sender key, for every reader.
+        let Ok(Decoded::Session(entry)) = crate::node::content::decode(&plaintext) else {
+            return Ok(());
+        };
+        if self.already_expired(&entry_hash, entry.created_millis / 1_000, now_secs) {
+            expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
+            return Ok(());
+        }
+        let id = self.next_log_id;
+        let row = SessionRow {
+            entry_hash,
+            author,
+            created_millis: entry.created_millis,
+            session_id: entry.session_id,
+            body: entry.body,
+        };
+        let cache_seg = seal_segment(
+            &self.sek,
+            SegmentKind::PlaintextCache,
+            id,
+            &session_cache_bytes(&row),
+        )?;
+        batch.put_segment(
+            &self.channel_id,
+            SegmentKind::PlaintextCache,
+            id,
+            &cache_seg,
+        )?;
+        self.next_log_id = id.saturating_add(1);
+        self.drive.pending.push((row, id));
+        Ok(())
+    }
+
+    fn persist_drive(&mut self, store: &Store) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_DRIVE,
+            &self.drive.to_state(),
+        )?;
+        if let Err(e) = store.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
+        {
+            self.poisoned = true;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Offer `target` again **every** generation it is entitled to, if it is consented to here
@@ -5384,6 +5783,7 @@ impl ChannelState {
             .iter()
             .map(|r| r.entry_hash)
             .chain(self.read_records.keys().copied())
+            .chain(self.drive.sessions.iter().map(|r| r.entry_hash))
             .collect();
         let pending: Vec<(Digest32, Vec<u8>)> = match self.dag.feed(author) {
             None => Vec::new(),
@@ -5433,7 +5833,11 @@ impl ChannelState {
                 now_secs,
                 &mut expired,
             )?;
-            if row.is_none() && expired.is_empty() && self.pending_reads.is_empty() {
+            if row.is_none()
+                && expired.is_empty()
+                && self.pending_reads.is_empty()
+                && self.drive.pending.is_empty()
+            {
                 return Ok(None);
             }
             self.queue_receivers(&mut batch)?;
@@ -5488,6 +5892,12 @@ impl ChannelState {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
+        // **A Session entry opens only with its node's drive key** (ADR-029 SC-2): a member
+        // without it skips the entry, quietly; it is never owed, never a row.
+        if msg.header.channel_id == drive_channel(&self.channel_id) {
+            self.render_session_into(batch, author, entry_hash, &msg, now_secs, expired)?;
+            return Ok(None);
+        }
         let slot = (author, msg.header.chain_id);
         let Some(chain) = self.receivers.get_mut(&slot) else {
             return Ok(None);
@@ -5538,7 +5948,9 @@ impl ChannelState {
                 self.pending_reads.push((row, id));
                 return Ok(None);
             }
-            Err(_) => return Ok(None),
+            // A Session entry sealed under the sender key is not one: its node gave it to every
+            // reader, and the Session is only for those with drive (SC-2). Not shown.
+            Ok(Decoded::Session(_)) | Err(_) => return Ok(None),
         };
         if self.already_expired(&entry_hash, content.created_millis / 1_000, now_secs) {
             expired.extend(self.retention.forget(&entry_hash).map(|t| (entry_hash, t)));
@@ -5583,6 +5995,11 @@ impl ChannelState {
         rows: Vec<Rendered>,
         expired: &[(Digest32, Tracked)],
     ) -> Result<()> {
+        for (row, cache_id) in std::mem::take(&mut self.drive.pending) {
+            self.retention
+                .rendered(&row.entry_hash, row.created_millis / 1_000, cache_id);
+            self.drive.sessions.push(row);
+        }
         for (row, cache_id) in std::mem::take(&mut self.pending_reads) {
             self.retention
                 .rendered(&row.entry_hash, row.created_millis / 1_000, cache_id);
@@ -5615,7 +6032,19 @@ impl ChannelState {
             SegmentKind::KeyMaterial,
             SEG_RECEIVERS,
             &receivers_seg,
-        )
+        )?;
+        // The drive keys advance in the same passes.
+        self.queue_drive(batch)
+    }
+
+    fn queue_drive(&self, batch: &mut crate::node::store::Batch<'_>) -> Result<()> {
+        let seg = seal_segment(
+            &self.sek,
+            SegmentKind::KeyMaterial,
+            SEG_DRIVE,
+            &self.drive.to_state(),
+        )?;
+        batch.put_segment(&self.channel_id, SegmentKind::KeyMaterial, SEG_DRIVE, &seg)
     }
 
     /// Insert a just-rendered row at its place in the room's order — which is above
