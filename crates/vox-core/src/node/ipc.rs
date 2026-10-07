@@ -167,6 +167,8 @@ const T_CHANNEL_CLOSED: u64 = 14;
 const T_PEER_JOINED: u64 = 15;
 /// `[2525, fingerprint, drive]` — [`NodeEvent::CapabilityChanged`] (ADR-028 K-14).
 const T_CAPABILITY_CHANGED: u64 = 2525;
+/// `[2526, channel_id, session_id]` — [`NodeEvent::SessionEntry`] (ADR-029 CL-2).
+const T_SESSION_ENTRY: u64 = 2526;
 const T_SENDER_KEY: u64 = 16;
 const T_FORWARDING: u64 = 17;
 const T_INVITE_LINK: u64 = 18;
@@ -1983,6 +1985,15 @@ fn encode_event(e: &mut Encoder, ev: &NodeEvent) {
                 .bytes(fingerprint)
                 .uint(u64::from(*drive));
         }
+        NodeEvent::SessionEntry {
+            channel_id,
+            session_id,
+        } => {
+            e.array(3)
+                .uint(T_SESSION_ENTRY)
+                .bytes(channel_id)
+                .text(session_id);
+        }
         NodeEvent::Shutdown => {
             e.array(1).uint(T_SHUTDOWN);
         }
@@ -2578,6 +2589,10 @@ fn decode_body(d: &mut Decoder<'_>, tag: u64, n: usize) -> Result<Frame> {
         (T_CAPABILITY_CHANGED, 3) => NodeEvent::CapabilityChanged {
             fingerprint: digest(d)?,
             drive: flag(d, "ipc event drive")?,
+        },
+        (T_SESSION_ENTRY, 3) => NodeEvent::SessionEntry {
+            channel_id: digest(d)?,
+            session_id: text(d, "ipc event session id")?,
         },
         (T_CHANNEL_CLOSED, 2) => NodeEvent::ChannelClosed {
             channel_id: digest(d)?,

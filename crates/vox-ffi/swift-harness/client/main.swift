@@ -44,6 +44,15 @@
 //   CREATED <room> <link>   `createRoom` named "mine", and its link
 //   (waits for a line on stdin: the peer has joined it)
 //   RENAMED                 `renameRoom` gave it the name "renamed"
+//   (waits for a line on stdin: the id of a session of this node's, staged through its hook)
+//   SESSION <label> PENDING <n> DRIVE <bool>
+//                           `sessions`: that Session, once one request in it waits (up to 90 s)
+//   ENTRY <line>            `sessionRead`: one per entry, its line
+//   REQUEST <ref> OPEN <bool>
+//                           after an entry that is a request: its reference, and whether it is open
+//   NOTE <note>             what `sessionRead` says besides; empty for nothing
+//   HEARD <n> <m>           how many times the listener heard of an entry in that Session, and of
+//                           the room's Sessions changing
 //   (waits for a line on stdin)
 //   CLOSED                  the client has closed, letting go of the node
 //
@@ -65,8 +74,13 @@ func say(_ line: String) {
     fflush(stdout)
 }
 
-/// The app's side of the event stream: every message is announced as it arrives.
+/// The app's side of the event stream: every message is announced as it arrives; what it hears
+/// of Sessions is counted, for the proof to ask.
 final class Listener: ClientListener, @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String: Int] = [:]
+    private var rooms: [String: Int] = [:]
+
     func onMessage(room: String, message: RoomMessage) {
         say("GOT \(message.text)")
     }
@@ -76,6 +90,24 @@ final class Listener: ClientListener, @unchecked Sendable {
     func onEnded(text: String) {
         say("ENDED \(text)")
     }
+
+    func onSessions(room: String) {
+        lock.lock()
+        rooms[room, default: 0] += 1
+        lock.unlock()
+    }
+
+    func onSessionEntry(room: String, node: String, sessionId: String) {
+        lock.lock()
+        entries[sessionId, default: 0] += 1
+        lock.unlock()
+    }
+
+    func heard(session: String, room: String) -> (Int, Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (entries[session] ?? 0, rooms[room] ?? 0)
+    }
 }
 
 do {
@@ -84,7 +116,8 @@ do {
     let me = try await client.attach(node: node, passphrase: identity)
     identity.wipe()
     say("FP \(me)")
-    try await client.subscribe(listener: Listener())
+    let listener = Listener()
+    try await client.subscribe(listener: listener)
 
     let room = try await client.joinRoom(
         link: link, passphrase: try Passphrase(bytes: Data(args[5].utf8)))
@@ -181,6 +214,26 @@ do {
     _ = readLine()
     try await client.renameRoom(room: made, name: "renamed")
     say("RENAMED")
+
+    // A Session of this node's own (ADR-029, #554), staged by the proof through `vox agent hook`.
+    let sid = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
+    var row: FfiSession? = nil
+    let sessionUntil = Date().addingTimeInterval(90)
+    while row == nil && Date() < sessionUntil {
+        row = try await client.sessions(room: room).first { $0.sessionId == sid && $0.pending > 0 }
+        if row == nil { try await Task.sleep(nanoseconds: 250_000_000) }
+    }
+    say("SESSION \(row?.label ?? "") PENDING \(row?.pending ?? 0) DRIVE \(row?.canDrive ?? false)")
+    let session = try await client.sessionRead(room: room, node: me, sessionId: sid)
+    for e in session.entries {
+        say("ENTRY \(e.line)")
+        if let r = e.request {
+            say("REQUEST \(r.reference) OPEN \(r.state == nil)")
+        }
+    }
+    say("NOTE \(session.note ?? "")")
+    let (heardEntries, heardRooms) = listener.heard(session: sid, room: room)
+    say("HEARD \(heardEntries) \(heardRooms)")
     _ = readLine()
     await client.close()
     say("CLOSED")
