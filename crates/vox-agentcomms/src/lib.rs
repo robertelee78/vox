@@ -57,6 +57,7 @@
 pub mod activity;
 pub mod attention;
 pub mod claim;
+pub mod drive;
 pub mod envelope;
 pub mod ops;
 pub mod version;
