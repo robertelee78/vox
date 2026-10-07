@@ -5215,6 +5215,18 @@ impl ChannelState {
         &self.drive.sessions
     }
 
+    /// The files other members' Sessions sent out here that this node opened (ADR-029 DR-1.8).
+    #[must_use]
+    pub fn session_files(&self) -> Vec<SessionRow> {
+        let me = self.me();
+        self.drive
+            .sessions
+            .iter()
+            .filter(|r| r.author != me && crate::node::drive::is_file_out(r))
+            .cloned()
+            .collect()
+    }
+
     /// Whether this node holds any drive key of `author`'s here: whether it can read inside
     /// `author`'s Sessions.
     #[must_use]

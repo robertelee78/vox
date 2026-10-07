@@ -459,6 +459,37 @@ fn offer_in(text: &str, me: &str) -> Option<(String, u64, String, String, bool, 
     ))
 }
 
+/// The share a Session's `file` entry announces (ADR-029 DR-1.8, #546), as [`offer_in`] reads a
+/// room's: its fields sit in the entry itself, and it is for every member that can open it.
+#[allow(clippy::type_complexity)]
+fn offer_in_session(body: &str) -> Option<(String, u64, String, String, bool, Option<u64>)> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v["kind"] != "file" || v["dir"] != "out" {
+        return None;
+    }
+    let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str).map(str::to_owned);
+    let sha256 = s("sha256")?;
+    if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let files = match v.get("files") {
+        None => None,
+        Some(n) => Some(n.as_u64()?)
+            .filter(|n| (1..=crate::node::folder::MAX_FILES as u64).contains(n)),
+    };
+    if v.get("files").is_some() && files.is_none() {
+        return None;
+    }
+    Some((
+        s("name")?,
+        v.get("size").and_then(serde_json::Value::as_u64)?,
+        sha256.to_ascii_lowercase(),
+        s("tag")?,
+        v.get("http").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        files,
+    ))
+}
+
 impl Pulls {
     /// Pull what is this node's to pull, for as long as the node runs: the task ends when the
     /// node's view does.
@@ -540,6 +571,38 @@ impl Pulls {
                         continue;
                     }
                     // From a member this node has not trusted: not yet. A later trust pulls it.
+                    if !view.trusted.iter().any(|(fp, _)| *fp == r.author) {
+                        continue;
+                    }
+                    found.push(Offer {
+                        room: d.channel_id,
+                        entry: r.entry_hash,
+                        author: r.author,
+                        name,
+                        size,
+                        sha256,
+                        tag,
+                        http,
+                        created,
+                        files,
+                    });
+                }
+                // **A file a Session sent out** (ADR-029 DR-1.8): this node opened its entry, so
+                // its node trusts it with drive; it is pulled as a share addressed to it is.
+                for r in &d.session_files {
+                    if settled.contains(&r.entry_hash) {
+                        continue;
+                    }
+                    let Some((name, size, sha256, tag, http, files)) = offer_in_session(&r.body)
+                    else {
+                        never.push(r.entry_hash);
+                        continue;
+                    };
+                    let created = (r.created_millis / 1000).min(now);
+                    if d.retention > 0 && now >= created.saturating_add(d.retention) {
+                        never.push(r.entry_hash);
+                        continue;
+                    }
                     if !view.trusted.iter().any(|(fp, _)| *fp == r.author) {
                         continue;
                     }
