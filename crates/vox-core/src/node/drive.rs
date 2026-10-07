@@ -90,6 +90,16 @@ pub struct DriveState {
     pub(crate) pending: Vec<(SessionRow, u64)>,
 }
 
+/// Whether `row` announces a file out of its Session (ADR-029 DR-1.8, #546): what a member with
+/// drive pulls by itself.
+#[must_use]
+pub fn is_file_out(row: &SessionRow) -> bool {
+    // Most of a Session is not files: those are passed over without parsing them.
+    row.body.contains(r#""file""#)
+        && serde_json::from_str::<serde_json::Value>(&row.body)
+        .is_ok_and(|v| v["kind"] == "file" && v["dir"] == "out")
+}
+
 impl DriveState {
     /// Make `chain` this node's live drive generation, marking every member of `holders` owed it
     /// from its first entry.
