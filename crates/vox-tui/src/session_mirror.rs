@@ -132,7 +132,10 @@ impl Event {
                     "summary".into(),
                     json!(one_line(&input_summary(self.tool(), self.tool_input()))),
                 );
-                m.insert("input".into(), json!(input_text(self.tool(), self.tool_input())));
+                m.insert(
+                    "input".into(),
+                    json!(input_text(self.tool(), self.tool_input())),
+                );
                 out.extend(split(m, "input"));
             }
             "PostToolUse" => {
@@ -227,7 +230,10 @@ fn questions(input: &Value) -> Vec<Value> {
                 })
                 .collect();
             let mut m = Map::new();
-            m.insert("text".into(), q.get("question").cloned().unwrap_or_default());
+            m.insert(
+                "text".into(),
+                q.get("question").cloned().unwrap_or_default(),
+            );
             if let Some(h) = q.get("header").filter(|h| h.is_string()) {
                 m.insert("header".into(), h.clone());
             }
@@ -284,7 +290,11 @@ fn output_summary(tool: &str, response: &Value) -> String {
         return first.map_or_else(|| "(no output)".to_owned(), str::to_owned);
     }
     match response {
-        Value::String(s) => s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").to_owned(),
+        Value::String(s) => s
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .to_owned(),
         Value::Null => "(no output)".to_owned(),
         other => compact(other),
     }
@@ -349,7 +359,10 @@ pub fn split(m: Map<String, Value>, big: &str) -> Vec<String> {
         // Nothing to cut: the fields other than `big` are bounded (a summary is one line), so
         // this is an entry no harness event produces. Said, not dropped.
         let mut short = m;
-        short.insert("summary".into(), json!("(this entry was too large to keep)"));
+        short.insert(
+            "summary".into(),
+            json!("(this entry was too large to keep)"),
+        );
         return vec![Value::Object(short).to_string()];
     };
     let mut empty = m.clone();
@@ -381,4 +394,135 @@ pub fn split(m: Map<String, Value>, big: &str) -> Vec<String> {
             Value::Object(p).to_string()
         })
         .collect()
+}
+
+// ---- the hook's side ---------------------------------------------------------------------------
+
+/// The longest a hook waits for the daemon to take its activity. It only queues, so this is
+/// generous; a hook rides inside a model's turn and must never hold it up for long.
+const QUEUE_WITHIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The events this module answers for in `vox agent hook`, beside the drain.
+#[must_use]
+pub fn mirrors(event: &str) -> bool {
+    matches!(
+        event,
+        "UserPromptSubmit"
+            | "PreToolUse"
+            | "PostToolUse"
+            | "PostToolUseFailure"
+            | "PermissionRequest"
+            | "Stop"
+    )
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The SHA-256 of a tool's input, hex: how a permission request is matched to its call. Both
+/// events carry the input the harness serialised for the call, re-serialised here the same way.
+fn input_digest(input: &Value) -> String {
+    use sha2::Digest as _;
+    let d = sha2::Sha256::digest(input.to_string().as_bytes());
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The call an event is about, as the daemon matches it.
+fn call(ev: &Event, id: &str) -> vox_core::node::daemonipc::ToolCall {
+    vox_core::node::daemonipc::ToolCall {
+        id: id.to_owned(),
+        tool: ev.tool().to_owned(),
+        agent: ev.agent_id().unwrap_or_default().to_owned(),
+        input: input_digest(ev.tool_input()),
+    }
+}
+
+/// Mirror `ev` into `session`'s Session, and for a permission request wait for an answer from it.
+/// Returns what the hook prints for the harness: only a permission request answered in Vox prints
+/// anything. Every failure is said on stderr and the turn goes on.
+pub async fn hook(daemon: &crate::agent_hook::Daemon, ev: &Event, session: &str) -> Option<String> {
+    use vox_core::node::daemonipc::{DaemonClient, DaemonFrame, DaemonRequest};
+    let now = now_ms();
+    let request = if let Some(entry) = ev.request(session, now) {
+        DaemonRequest::SessionAsk {
+            node: daemon.node.clone(),
+            session: session.to_owned(),
+            body: Value::Object(entry).to_string(),
+            call: call(ev, ""),
+            transcript: ev.transcript().unwrap_or_default().to_owned(),
+        }
+    } else {
+        let bodies = ev.entries(session, now);
+        if bodies.is_empty() {
+            return None;
+        }
+        DaemonRequest::SessionActivity {
+            node: daemon.node.clone(),
+            session: session.to_owned(),
+            bodies,
+            call: (ev.name == "PreToolUse")
+                .then(|| ev.tool_use_id().map(|id| call(ev, id)))
+                .flatten(),
+        }
+    };
+    let asking = matches!(request, DaemonRequest::SessionAsk { .. });
+    let sent = async {
+        let mut d = DaemonClient::open(&daemon.account.socket()).await?;
+        d.request(request).await
+    };
+    // An ask waits as long as the harness lets its hook run: the terminal's own prompt is live the
+    // whole time (DR-3), so waiting holds nothing up.
+    let answer = if asking {
+        sent.await
+    } else {
+        match tokio::time::timeout(QUEUE_WITHIN, sent).await {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!(
+                    "vox agent hook: the daemon did not take this session's activity within {} s",
+                    QUEUE_WITHIN.as_secs()
+                );
+                return None;
+            }
+        }
+    };
+    match answer {
+        Ok(DaemonFrame::SessionAnswer(Some(a))) => claude_decision(ev, &a),
+        Ok(DaemonFrame::SessionAnswer(None) | DaemonFrame::Ok) => None,
+        Ok(DaemonFrame::Refused(r)) => {
+            eprintln!("vox agent hook: the Session did not take this: {r}");
+            None
+        }
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("vox agent hook: the Session did not take this: {e}");
+            None
+        }
+    }
+}
+
+/// The daemon's answer (`{"allow", "message"?}` or `{"answers"}`) as Claude Code's
+/// `PermissionRequest` output. A question is answered by allowing it with its own input plus the
+/// answers, which Claude Code takes while its terminal widget is still shown.
+fn claude_decision(ev: &Event, answer: &str) -> Option<String> {
+    let a: Value = serde_json::from_str(answer).ok()?;
+    let decision = if let Some(answers) = a.get("answers") {
+        let mut input = ev.tool_input().as_object().cloned().unwrap_or_default();
+        input.insert("answers".into(), answers.clone());
+        json!({ "behavior": "allow", "updatedInput": Value::Object(input) })
+    } else if a.get("allow").and_then(Value::as_bool) == Some(true) {
+        json!({ "behavior": "allow" })
+    } else {
+        json!({
+            "behavior": "deny",
+            "message": a.get("message").and_then(Value::as_str).unwrap_or_default(),
+        })
+    };
+    Some(
+        json!({ "hookSpecificOutput": { "hookEventName": "PermissionRequest", "decision": decision } })
+            .to_string(),
+    )
 }

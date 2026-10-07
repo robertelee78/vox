@@ -45,6 +45,8 @@ const T_METRICS: u64 = 4008;
 const T_DAEMON_STATUS: u64 = 4009;
 const T_SESSION_ENDED: u64 = 4010;
 const T_SESSION_REGISTERED: u64 = 4011;
+/// 4020–4029: the Session activity sink (ADR-029 §2, §3).
+const T_SESSION_ANSWER: u64 = 4020;
 
 // Client → daemon: the opening frame.
 const T_USE: u64 = 4100;
@@ -58,6 +60,9 @@ const T_REQ_SUBSCRIBE: u64 = 4107;
 const T_REQ_STOP: u64 = 4108;
 const T_REQ_SESSION_REGISTER: u64 = 4109;
 const T_REQ_SESSION_ROOM: u64 = 4110;
+/// 4120–4129: the Session activity sink (ADR-029 §2, §3).
+const T_REQ_SESSION_ACTIVITY: u64 = 4120;
+const T_REQ_SESSION_ASK: u64 = 4121;
 
 // Events.
 const T_EV_ATTACHED: u64 = 4200;
@@ -233,6 +238,52 @@ pub enum DaemonRequest {
     Subscribe,
     /// Detach every node and stop the daemon. Answered [`DaemonFrame::Ok`] once it has begun.
     Stop,
+    /// A harness session's activity for its Session (ADR-029 SC-1): `bodies` are entries in the
+    /// shared activity format, already split to fit, in the harness's order. Answered
+    /// [`DaemonFrame::Ok`] once they are queued, never after they are sent: a hook must not wait
+    /// on the network inside a model's turn.
+    SessionActivity {
+        /// The session's node.
+        node: NodeName,
+        /// The harness's session id.
+        session: String,
+        /// The entries.
+        bodies: Vec<String>,
+        /// The tool call these entries start, when they start one: the daemon ties a later
+        /// permission request to it (the harness's request names no call).
+        call: Option<ToolCall>,
+    },
+    /// A harness asks its operator for an approval or an answer (ADR-029 DR-3, DR-4): `body` is
+    /// the `approval` or `question` entry, without its `ref`. The daemon ties it to the one open
+    /// tool call it matches, posts it, and answers [`DaemonFrame::SessionAnswer`] with the first
+    /// answer a member with drive gives in the Session, or with none once the harness has settled
+    /// the request itself.
+    SessionAsk {
+        /// The session's node.
+        node: NodeName,
+        /// The harness's session id.
+        session: String,
+        /// The entry.
+        body: String,
+        /// What the request is about: matched against the session's open tool calls.
+        call: ToolCall,
+        /// The session's transcript, where the harness records how the request was settled.
+        transcript: String,
+    },
+}
+
+/// A tool call a harness has started, as a permission request is matched against it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    /// The harness's id for the call; empty in a [`DaemonRequest::SessionAsk`], which is what the
+    /// daemon finds.
+    pub id: String,
+    /// The tool.
+    pub tool: String,
+    /// The sub-agent making it, or empty for the session itself.
+    pub agent: String,
+    /// The SHA-256 of the tool's input as the harness gave it, hex.
+    pub input: String,
 }
 
 /// A client's first frame (ADR-026 C-2).
@@ -436,6 +487,9 @@ pub enum DaemonFrame {
         /// The node detached with it.
         detached: bool,
     },
+    /// The answer to a [`DaemonRequest::SessionAsk`]: what the hook gives its harness, or
+    /// nothing when the harness settled the request without Vox.
+    SessionAnswer(Option<String>),
     /// The daemon's status.
     Status(DaemonStatus),
     /// Prometheus text (answering [`DaemonRequest::Metrics`]).
@@ -502,6 +556,26 @@ fn secret(d: &mut Decoder<'_>, what: &'static str) -> Result<Option<Zeroizing<St
         1 => Ok(Some(Zeroizing::new(text(d, what)?))),
         _ => Err(Error::MalformedIpc(what)),
     }
+}
+
+fn put_call(e: &mut Encoder, c: &ToolCall) {
+    e.array(4)
+        .text(&c.id)
+        .text(&c.tool)
+        .text(&c.agent)
+        .text(&c.input);
+}
+
+fn call(d: &mut Decoder<'_>) -> Result<ToolCall> {
+    if d.array().map_err(malformed("ipc tool call"))? != 4 {
+        return Err(Error::MalformedIpc("ipc tool call"));
+    }
+    Ok(ToolCall {
+        id: text(d, "ipc tool call id")?,
+        tool: text(d, "ipc tool call tool")?,
+        agent: text(d, "ipc tool call agent")?,
+        input: text(d, "ipc tool call input")?,
+    })
 }
 
 fn put_texts(e: &mut Encoder, v: &[String]) {
@@ -766,6 +840,42 @@ impl Opening {
                 DaemonRequest::Stop => {
                     e.array(1).uint(T_REQ_STOP);
                 }
+                DaemonRequest::SessionActivity {
+                    node,
+                    session,
+                    bodies,
+                    call,
+                } => {
+                    e.array(5)
+                        .uint(T_REQ_SESSION_ACTIVITY)
+                        .text(node.as_str())
+                        .text(session);
+                    put_texts(&mut e, bodies);
+                    match call {
+                        None => {
+                            e.array(0);
+                        }
+                        Some(c) => {
+                            e.array(1);
+                            put_call(&mut e, c);
+                        }
+                    }
+                }
+                DaemonRequest::SessionAsk {
+                    node,
+                    session,
+                    body,
+                    call,
+                    transcript,
+                } => {
+                    e.array(6)
+                        .uint(T_REQ_SESSION_ASK)
+                        .text(node.as_str())
+                        .text(session)
+                        .text(body);
+                    put_call(&mut e, call);
+                    e.text(transcript);
+                }
             },
         }
         Zeroizing::new(e.finish())
@@ -860,6 +970,29 @@ impl Opening {
             (T_REQ_METRICS, 1) => Opening::Daemon(DaemonRequest::Metrics),
             (T_REQ_SUBSCRIBE, 1) => Opening::Daemon(DaemonRequest::Subscribe),
             (T_REQ_STOP, 1) => Opening::Daemon(DaemonRequest::Stop),
+            (T_REQ_SESSION_ACTIVITY, 5) => {
+                let node = name(&mut d, "ipc session activity node")?;
+                let session = text(&mut d, "ipc session activity session")?;
+                let bodies = texts(&mut d, "ipc session activity bodies")?;
+                let call = match d.array().map_err(malformed("ipc session activity call"))? {
+                    0 => None,
+                    1 => Some(call(&mut d)?),
+                    _ => return Err(Error::MalformedIpc("ipc session activity call")),
+                };
+                Opening::Daemon(DaemonRequest::SessionActivity {
+                    node,
+                    session,
+                    bodies,
+                    call,
+                })
+            }
+            (T_REQ_SESSION_ASK, 6) => Opening::Daemon(DaemonRequest::SessionAsk {
+                node: name(&mut d, "ipc session ask node")?,
+                session: text(&mut d, "ipc session ask session")?,
+                body: text(&mut d, "ipc session ask body")?,
+                call: call(&mut d)?,
+                transcript: text(&mut d, "ipc session ask transcript")?,
+            }),
             _ => return Err(Error::MalformedIpc("ipc opening tag")),
         };
         d.finish().map_err(malformed("ipc opening trailing"))?;
@@ -927,6 +1060,12 @@ impl DaemonFrame {
                     .uint(T_SESSION_ENDED)
                     .uint(u64::from(*was_registered))
                     .uint(u64::from(*detached));
+            }
+            DaemonFrame::SessionAnswer(a) => {
+                // An absent answer is the empty text: the arity stays fixed (ADR-008).
+                e.array(2)
+                    .uint(T_SESSION_ANSWER)
+                    .text(a.as_deref().unwrap_or(""));
             }
             DaemonFrame::Status(s) => {
                 e.array(6)
@@ -1007,6 +1146,10 @@ impl DaemonFrame {
                 was_registered: flag(&mut d, "ipc session ended registered")?,
                 detached: flag(&mut d, "ipc session ended detached")?,
             },
+            (T_SESSION_ANSWER, 2) => {
+                let a = text(&mut d, "ipc session answer")?;
+                DaemonFrame::SessionAnswer((!a.is_empty()).then_some(a))
+            }
             (T_DAEMON_STATUS, 6) => {
                 let version = text(&mut d, "ipc daemon status version")?;
                 let pid = u32::try_from(d.uint().map_err(malformed("ipc daemon status pid"))?)
