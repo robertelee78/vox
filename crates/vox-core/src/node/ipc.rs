@@ -3857,6 +3857,27 @@ async fn serve_request(handle: &NodeHandle, request: Request) -> Frame {
             // **The session's name, filled by its node** (ADR-029 MD-2): whatever verb or client
             // posted, a message from a registered session carries the name its harness gives.
             let text = crate::node::sessions::fill_name(handle.paths(), &text);
+            // **A post too long says how long, against what, and why** (#549): a post from a
+            // session carries the session's id and name around its words, so words that fit
+            // alone may not fit with them. "That is longer than this field allows" named no field.
+            let max = crate::node::content::MAX_TEXT_LEN;
+            if text.len() > max {
+                let from_session = vox_agentcomms::envelope::Envelope::parse(&text)
+                    .is_ok_and(|e| !e.from.trim().is_empty());
+                return Frame::Error {
+                    reason: format!(
+                        "this post is {} bytes as the room keeps it{}; a post holds at most {max} \
+                         bytes (64 KiB), so it must be {} bytes shorter",
+                        text.len(),
+                        if from_session {
+                            ", with the id and name of the session posting it"
+                        } else {
+                            ""
+                        },
+                        text.len() - max
+                    ),
+                };
+            }
             // A room just joined is written to once its first sync with another member has ended
             // (V210-164), usually within a second: `vox room join … && vox room post …` waits for
             // that rather than failing.
