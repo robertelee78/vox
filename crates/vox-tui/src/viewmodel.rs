@@ -285,6 +285,8 @@ pub enum DriveAct {
     /// Answer the question request with this ref: for each question, an option's number as shown
     /// or text typed as the answer (DR-1.5).
     Answer(String, Vec<(crate::session_drive_ui::Question, String)>),
+    /// Send the session the file or folder at this path, with a note (DR-1.7).
+    File(String, Option<String>),
 }
 
 /// One activity of a Session, as the reader sees it (ADR-029 SC-1).

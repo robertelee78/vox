@@ -674,6 +674,10 @@ pub struct RoomNotice {
     pub created_millis: u64,
     /// What they did, without who: `renamed the room to family`.
     pub what: String,
+    /// The newest timeline row before it in the room's order ([`Dag::order_key`]), where a
+    /// client draws it: `None` before every row. Its time claims seconds only, so a client that
+    /// placed it by time put it above a message sent earlier in the same second.
+    pub after: Option<Digest32>,
 }
 
 /// How many more of an author's entries must have expired since its last checkpoint before it
@@ -698,6 +702,23 @@ pub const MAX_OWED_ASKED: usize = 256;
 /// log page it is already stored in)`. The page is set only for a body that arrived for a skeleton
 /// held without one (V030-10).
 type Arrived = (Digest32, Digest32, Option<Vec<u8>>, Option<u64>);
+
+/// The milliseconds an entry authored at `now_secs` claims: the wall clock's, while it is within
+/// that second (or the next, just past it: that second's last millisecond), so governance and
+/// control entries order and show in milliseconds like messages, and a retention change made just
+/// after a post is never drawn before it (the decider, 2026-10-07: all time in milliseconds). A
+/// caller acting at another time (a test's clock) claims its second.
+fn claim_ms(now_secs: u64) -> u64 {
+    let wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let second = now_secs.saturating_mul(1_000);
+    match wall / 1_000 {
+        s if s == now_secs => wall,
+        s if s == now_secs.saturating_add(1) => second.saturating_add(999),
+        _ => second,
+    }
+}
 
 /// Whether an entry claimed at `claimed_ms` is past `ttl` seconds of retention at `now_secs`
 /// (`ttl == 0` keeps everything).
@@ -3381,7 +3402,32 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        let retired = self.sender.chain_id();
         self.sender = next;
+        // **A generation retired before a reader took it is owed to that reader as history.**
+        // A member entitled to it that has not taken it — offline at the rotation, or refusing
+        // keys from an owner it does not trust yet (V210-118) — was owed it only as the live
+        // generation's re-key, which a rotation ends. Nothing owed it any more, so the next tick's
+        // prune (R14) deleted its origin before the member's refusal of the new key could owe it
+        // again, and the member never read what this identity wrote under it. Owed here, its
+        // history floor keeps it (`oldest_generation_needed`) until it is taken.
+        let readers = MembershipView::new(&self.evaluator).readers_of(&me);
+        let owed: Vec<(Digest32, u64)> = readers
+            .into_iter()
+            .filter(|t| *t != me && !self.has_left(t))
+            .filter_map(|t| {
+                let (from, _) = self.entitled.get(&t)?;
+                let floor = match self.delivered.get(&t) {
+                    None => *from,
+                    Some(d) if *d < retired => (*d + 1).max(*from),
+                    Some(_) => return None,
+                };
+                (floor <= retired).then_some((t, floor))
+            })
+            .collect();
+        for (target, floor) in owed {
+            self.owe_history(store, target, floor)?;
+        }
         Ok(chain_id)
     }
 
@@ -4382,7 +4428,7 @@ impl ChannelState {
         }
         let signer = profile.signer()?;
         let me = signer.fingerprint();
-        let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
+        let skeleton = self.next_skeleton(&me, payload, claim_ms(now_secs));
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let id = self.next_log_id;
@@ -4595,9 +4641,7 @@ impl ChannelState {
         if !self.authors.contains_key(&me) {
             return Err(Error::Profile("this identity is not an author of the room"));
         }
-        // Governance is authored on the seconds clock; its place in the order is whole
-        // seconds, which only matters against entries it did not see.
-        let skeleton = self.next_skeleton(&me, payload, now_secs.saturating_mul(1_000));
+        let skeleton = self.next_skeleton(&me, payload, claim_ms(now_secs));
         let entry = Entry::build_signed(signer, skeleton, payload.to_vec())?;
         let hash = entry.entry_hash();
         let wire = entry.to_wire();
@@ -6807,6 +6851,7 @@ impl ChannelState {
             entry_hash: c.entry_hash,
             author: c.author,
             created_millis: at(&c.entry_hash),
+            after: None,
             what: if c.ttl == 0 {
                 "set the room's retention to forever: from now on no message is removed for its \
                  age"
@@ -6831,6 +6876,7 @@ impl ChannelState {
                     .dag
                     .get_by_hash(&n.entry_hash)
                     .map_or(0, |e| e.skeleton.claimed_ms),
+                after: None,
                 what: if i == 0 {
                     format!("named the room {}", n.name)
                 } else {
@@ -6839,8 +6885,18 @@ impl ChannelState {
             })
             .chain(retention)
             .collect();
-        // In the room's order: by the time each says it was made.
-        all.sort_by_key(|n| (n.created_millis, n.entry_hash));
+        // In the room's order, and each after the newest row that precedes it there.
+        let key = |h: &Digest32| self.dag.order_key(h).unwrap_or((u64::MAX, *h));
+        all.sort_by_key(|n| key(&n.entry_hash));
+        for n in &mut all {
+            let k = key(&n.entry_hash);
+            n.after = self
+                .timeline
+                .iter()
+                .rev()
+                .find(|r| key(&r.entry_hash) < k)
+                .map(|r| r.entry_hash);
+        }
         all
     }
 

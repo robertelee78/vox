@@ -113,6 +113,9 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             (cleared environment) opens a Session Bob may drive: from Bob's TUI, text typed in
             its composer reaches the pane as typed, "/compact" as a slash command, `:interrupt`
             as Esc and `:stop` as Ctrl-C (ADR-029 DR-1.2, DR-1.3, DR-1.6, #553);
+  share     in that Session, `:share <path>` as a driver: it says "accepted, pulling", Alice's node
+            lands the very bytes, and the Session's line "file sent in by you: …" reads "landed
+            at …"; without drive (in `sessions`) `:share` is refused (ADR-029 DR-1.7, #553);
   attach    with `:to alice`, the note typed in the composer and `:share <file>`, Alice reads one
             message: a `file` announcement carrying the note in it and `to` naming her, no second
             message for the note (ADR-028 F-1, #493);
@@ -1166,14 +1169,20 @@ try:
     tui.key(":send DRIVE-WITHOUT-DRIVE\r", 1)
     refused = " ".join(r.strip() for r in tui.display()[-3:])
     told = f"not sent: this is {open_label}; :general writes to the room" in refused
+    # A file sent into a Session is driving it (DR-1.7): without drive, refused, and nothing sent.
+    with open(f"{S}/nodrive-file.txt", "w") as f:
+        f.write("NODRIVE-FILE\n")
+    tui.key(f":share {S}/nodrive-file.txt\r", 2)
+    share_refused = " ".join(r.strip() for r in tui.display()[-3:])
+    share_told = "you cannot drive this Session: alice has not given you drive" in share_refused
     tui.key(":general\r", 2)
     leaked = "DRIVE-WITHOUT-DRIVE" in run("alice", "room", "read", room).stdout
     claim("sessions", listed and apart and merged and titled and nodrive and no_composer and told
-          and not leaked,
+          and not leaked and share_told,
           f"Sessions pane: {listed_rows!r} (open listed: {listed}, ended apart: {apart}); All merged the "
           f"openings and end among the messages: {merged}; `:session` titled {titled}, said no drive "
           f"{nodrive}, no composer {no_composer}; `:send` there said {refused!r}, reached the room: "
-          f"{leaked}" + ("" if merged else f"; All showed: {all_rows!r}")
+          f"{leaked}; `:share` there said {share_refused!r}" + ("" if merged else f"; All showed: {all_rows!r}")
           + ("" if titled and nodrive else "; screen:\n" + "\n".join(screen)))
 
     stage("drive")
@@ -1383,7 +1392,26 @@ try:
         focus("Timeline")
         reached["interrupt"] = act("interrupt", ":interrupt\r", {"key": "Escape"})
         reached["stop"] = act("stop", ":stop\r", {"key": "C-c"})
+        # A file sent into the Session (DR-1.7): `:share <path>` in it, as a driver. Alice's node
+        # pulls it, verified, lands it and tells the session; the Session's line for it, paired with
+        # its results, says so.
+        sent = b"STEER-FILE " + os.urandom(16).hex().encode() + b"\n"
+        with open(f"{S}/steer-file.txt", "wb") as f:
+            f.write(sent)
+        tui.key(f":share {S}/steer-file.txt\r", 3)
+        share_said = " ".join(r.strip() for r in tui.display()[-2:])
+        # The pane wraps: read it as one text without spaces.
+        LINE = "filesentinbyyou:steer-file.txt"
+        tail = lambda: flat().replace(" ", "").split(LINE, 1)[-1] if LINE in flat().replace(" ", "") else ""
+        paired = tui.until(lambda: "landedat" in tail(), 90, 1)
+        import glob
+        landed = [p for p in glob.glob(f"{S}/alice/**/steer-file.txt", recursive=True)
+                  if open(p, "rb").read() == sent]
+        shown = tail()[:300]
         tui.key(":general\r", 2)
+        claim("share", f"{steer_label}: accepted, pulling" in share_said and paired and bool(landed),
+              f"`:share` said {share_said!r}; the Session's line then read {shown!r} (paired with "
+              f"\"landed at\": {paired}); the bytes on alice's node: {landed!r}")
         claim("steer", all(reached.values()),
               f"{steer_label}: reached its pane {reached!r}; the TUI said {answers!r}; the stand-in "
               f"recorded {got()!r}")

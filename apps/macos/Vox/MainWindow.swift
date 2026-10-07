@@ -379,13 +379,13 @@ private struct MessageRow: View {
             }
             if !pulledBy.isEmpty {
                 Text("pulled by \(pulledBy.joined(separator: ", "))")
-                    .eyebrow().secondaryText()
+                    .caption().secondaryText()
                     .accessibilityIdentifier("pulled-by-\(message.id)")
                     .accessibilityLabel("pulled by \(pulledBy.joined(separator: ", "))")
             }
             if !readBy.isEmpty {
                 Text("read by \(readBy.joined(separator: ", "))")
-                    .eyebrow().secondaryText()
+                    .caption().secondaryText()
                     .accessibilityIdentifier("read-by-\(message.id)")
                     .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
             }
@@ -472,10 +472,10 @@ private struct LinkCardView: View {
                 // other scheme (file:, an app's own) is drawn as text, never opened.
                 if let url = URL(string: card.url),
                    ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-                    Link(card.url, destination: url).eyebrow().lineLimit(1)
+                    Link(card.url, destination: url).caption().lineLimit(1)
                         .truncationMode(.middle)
                 } else {
-                    Text(card.url).eyebrow().lineLimit(1).truncationMode(.middle)
+                    Text(card.url).caption().lineLimit(1).truncationMode(.middle)
                         .textSelection(.enabled)
                 }
             }
@@ -497,7 +497,7 @@ private struct ServiceCard: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(service.address).font(Theme.mono).textSelection(.enabled)
                 Text("by \(service.by)  ·  \(service.kind)\(service.udp && service.kind != "udp" ? "/udp" : "")")
-                    .eyebrow().secondaryText()
+                    .caption().secondaryText()
             }
         }
         .padding(8)

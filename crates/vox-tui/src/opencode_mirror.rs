@@ -302,7 +302,7 @@ impl Follow {
                 "clear" | "new" => {
                     let _ = reply.send(Err(format!(
                         "/{cmd} would start a new OpenCode session, and driving never starts a \
-                         session (ADR-029 DR-7); type it at its terminal"
+                         session; type it at its terminal"
                     )));
                     return None;
                 }

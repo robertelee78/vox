@@ -131,6 +131,29 @@ pub async fn reject(
     .await
 }
 
+/// Send the session a file (DR-1.7, #546): served to the session's node alone, which lands it and
+/// tells the session where. `note` is told with it.
+///
+/// # Errors
+/// As [`say`].
+pub async fn file(
+    paths: &Paths,
+    t: &Target,
+    path: &std::path::Path,
+    note: Option<&str>,
+) -> Result<String, String> {
+    if !t.can_drive {
+        return Err(format!(
+            "you cannot drive this Session: {} has not given you drive",
+            t.node_alias
+        ));
+    }
+    match crate::drive::send_file(paths, t.room, t.node, t.session.clone(), path, note).await {
+        Ok(said) => Ok(format!("{}: {said}", t.label)),
+        Err(e) => Err(e.sentence(&t.label)),
+    }
+}
+
 /// One question of a question request, as its entry carries it: its key (its id, else its text)
 /// and its options' labels, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]

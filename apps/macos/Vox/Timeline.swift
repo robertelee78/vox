@@ -1,4 +1,4 @@
-// The room's timeline as drawn (ADR-029 CL-2): for General, its messages and, among them by time,
+// The room's timeline as drawn (ADR-029 CL-2): for General, its messages and, among them in the room's order,
 // what was done to the room (its retention set, its name changed, ADR-028 R-1, R-7); for All,
 // those and each Session's opening and end; for one Session, its opening and end and, to a member
 // with drive, its entries. A Session's activity is never the room's (SC-4). Under a title that
@@ -56,16 +56,38 @@ extension NodeModel {
         return "Timeline\(shown) · ⏱ \(retention)"
     }
 
-    /// What the timeline draws, by time.
+    /// The room's messages and what was done to it, in the room's order: each notice right after
+    /// the message the node says it follows (the tie-break for the same millisecond); one that
+    /// follows a message not shown here, by time.
+    var roomItems: [TimelineItem] {
+        let shown = Set(messages.map(\.id))
+        let item = { (n: RoomNoticeRow) in
+            TimelineItem.notice("notice-\(n.id)", self.noticeWords(n), at: n.createdMillis)
+        }
+        let placed = notices.filter { $0.after.isEmpty || shown.contains($0.after) }
+        var items = placed.filter { $0.after.isEmpty }.map(item)
+        for m in messages {
+            items.append(.message(m))
+            items += placed.filter { $0.after == m.id }.map(item)
+        }
+        for n in notices where !n.after.isEmpty && !shown.contains(n.after) {
+            items.insert(item(n), at: items.firstIndex { $0.millis > n.createdMillis } ?? items.count)
+        }
+        return items
+    }
+
+    /// What the timeline draws.
     var timelineItems: [TimelineItem] {
-        let room = messages.map(TimelineItem.message)
-            + notices.map { .notice("notice-\($0.id)", noticeWords($0), at: $0.createdMillis) }
         switch showing {
         case .general:
-            return room.sorted { $0.millis < $1.millis }
+            return roomItems
         case .all:
-            return (room + sessions.flatMap(TimelineItem.openedAndEnded))
-                .sorted { $0.millis < $1.millis }
+            // Each Session's opening and end among the room's lines, by time.
+            var items = roomItems
+            for line in sessions.flatMap(TimelineItem.openedAndEnded) {
+                items.insert(line, at: items.firstIndex { $0.millis > line.millis } ?? items.count)
+            }
+            return items
         case .session:
             guard let s = shownSession else { return [] }
             var lines = TimelineItem.openedAndEnded(s)

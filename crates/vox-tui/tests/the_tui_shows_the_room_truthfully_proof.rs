@@ -4,7 +4,7 @@
 //! The work is in `tests/pty/tui_room_truth.py`: real daemons build a room of Alice, Bob, Carol and
 //! Dave (Alice and Bob trust each other, nobody trusts Carol, Bob trusts Dave and Dave nobody),
 //! Alice posts 70 lines, and Bob's real `vox tui` is read through the `pyte` terminal emulator at
-//! 160x50. It checks forty-two claims, each
+//! 160x50. It checks forty-three claims, each
 //! printed as a `CLAIM <name> ok|RED` line:
 //!
 //! - `newest`: the timeline shows m-070, the newest, and not m-001 (it drew from the top and never
@@ -106,6 +106,9 @@
 //!   a Session Bob may drive: from Bob's TUI, text typed in its composer reaches the pane as typed,
 //!   "/compact" as a slash command, `:interrupt` as Esc and `:stop` as Ctrl-C (ADR-029 DR-1.2,
 //!   DR-1.3, DR-1.6, #553);
+//! - `share`: in that Session, `:share <path>` as a driver says "accepted, pulling", Alice's node
+//!   lands the very bytes, and the Session's line "file sent in by you: …" reads "landed at …";
+//!   without drive (checked in `sessions`) `:share` is refused (ADR-029 DR-1.7, #553);
 //! - `attach`: with `:to alice`, a note typed in the composer and `:share <file>`, Alice reads
 //!   one message, a `file` announcement carrying the note and `to` naming her, and no second
 //!   message for the note (ADR-028 F-1, #493);
@@ -160,8 +163,9 @@
 //! drawn (`capability`), a read of a hung-up terminal that never returns (`gone`), a Session without drive
 //! offering a composer (`sessions`), a member with drive shown only that the Session exists
 //! (`drive`), `a` sending a rejection (`approve`),
-//! or `:interrupt` sent as a stop (`steer`). It passes only on the script's PASS with
-//! all 42 claims ok.
+//! `:interrupt` sent as a stop (`steer`),
+//! or a Session's `:share` sending the path as text (`share`). It passes only on the script's PASS with
+//! all 43 claims ok.
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -257,7 +261,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     let claims: Vec<&str> = said.lines().filter(|l| l.contains(" CLAIM ")).collect();
     let green = claims.iter().filter(|l| l.contains(" ok: ")).count();
     eprintln!(
-        "{said}\n[proof] claims ok: {green} of {} (42 expected); the driver took {:?}; its last \
+        "{said}\n[proof] claims ok: {green} of {} (43 expected); the driver took {:?}; its last \
          stage: {:?}; the runner's longest stall: {stall:?}",
         claims.len(),
         out.took,
@@ -271,8 +275,8 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
             );
             assert_eq!(
                 (claims.len(), green),
-                (42, 42),
-                "APPARATUS: the driver said PASS without all 42 claims ok: {said}"
+                (43, 43),
+                "APPARATUS: the driver said PASS without all 43 claims ok: {said}"
             );
         }
         Some(2) => panic!("APPARATUS, CANNOT MEASURE: the TUI proof's driver failed: {said}"),

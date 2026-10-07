@@ -1180,6 +1180,32 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         landed.len(),
         bytes.len()
     );
+    // The driver reads what came of it on the drive's own line: taken, then landed and told
+    // (the results paired with the drive by its tag).
+    let t0 = Instant::now();
+    let shown = loop {
+        let (_, plain, _) = w.vox(PERSON, &["room", "session", &room, S1], None);
+        let line = plain
+            .lines()
+            .find(|l| l.starts_with("file sent in by you: for-s1.txt ("))
+            .map(str::to_owned);
+        if let Some(l) = line.filter(|l| l.contains("and the session was told")) {
+            break l;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(60),
+            "PRODUCT: arm 11: within 60 s, the driver's Session must show the file sent in and \
+             what came of it on one line (\"file sent in by you: for-s1.txt (…) — accepted, \
+             pulling … — landed …, and the session was told\"); it showed:\n{plain}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    println!("[proof] 11. the driver's Session: {shown}");
+    assert!(
+        shown.contains(" — accepted, pulling 1472 bytes"),
+        "PRODUCT: arm 11: the file's line must carry the first result, \"accepted, pulling 1472 \
+         bytes\", before the landing; it read {shown:?}"
+    );
 
     // ---- 12. a hook started inside a pane by something other than the harness ----
     // The stand-in (the harness) runs a tool, and the tool starts the hook: as a test or a script
