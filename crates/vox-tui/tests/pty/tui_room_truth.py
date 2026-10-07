@@ -109,6 +109,10 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             Bob's TUI lists the room with "waiting 1" and the Session "· waiting on you"; `a` on
             the request's line approves it, the waiting hook gives Claude Code "allow", and the line
             then reads "approved here" (ADR-029 DR-1.4, CL-2, #553);
+  answer    Alice's session asks one question through the PermissionRequest hook: `:answer 1; 2`
+            is refused with "not sent to <label>: the question asks 1 thing(s); answer each,
+            separated by ;", word for word; the digit 2 on its line gives the hook "allow" with
+            the answer Blue, and the line then reads "answered here: Blue" (ADR-029 DR-1.5, #553);
   steer     a stand-in for Claude Code in a pane of a scratch tmux server under the run directory
             (cleared environment) opens a Session Bob may drive: from Bob's TUI, text typed in
             its composer reaches the pane as typed, "/compact" as a slash command, `:interrupt`
@@ -1299,6 +1303,62 @@ try:
           f"needs you: Sessions pane {flags[0]!r}, rooms {flags[1]!r} (flagged: {flagged}); `a` "
           f"said {said_a!r}; the hook gave Claude Code {decision!r} (stdout {out!r}, stderr "
           f"{err.strip()[:200]!r}); the line then read \"approved here\": {approved}")
+
+    stage("answer")
+    # A question waiting on a driver (ADR-029 DR-1.5, #553): Alice's session asks one question
+    # through Claude Code's PermissionRequest hook (AskUserQuestion). In Bob's TUI, `:answer` with
+    # two answers for its one question is refused, its sentence checked word for word; the digit
+    # 2 on the question's line answers it: the hook gives Claude Code the question's input with the
+    # answer "Blue", and once the harness records it the line reads "answered here: Blue".
+    qs = {"questions": [{"question": "Which colour?", "header": "Colour", "multiSelect": False,
+                         "options": [{"label": "Red", "description": "red"},
+                                     {"label": "Blue", "description": "blue"}]}]}
+    turn("PreToolUse", tool_name="AskUserQuestion", tool_input=qs, tool_use_id="toolu_q")
+    asking = subprocess.Popen([VOX, "agent", "hook", "--node", "default", "--room", room], env=e,
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True)
+    PROCS.append(asking)
+    asking.stdin.write(json.dumps({"session_id": OPEN_ID, "transcript_path": transcript, "cwd": work,
+                                   "permission_mode": "default", "hook_event_name": "PermissionRequest",
+                                   "tool_name": "AskUserQuestion", "tool_input": qs,
+                                   "permission_suggestions": []}))
+    asking.stdin.close()
+    tui.key(f":session {OPEN_ID[:8]}\r", 2)
+    focus("Timeline")
+    asked = tui.until(lambda: "question: Which colour?" in flat(), 60, 1)
+    tui.key(":answer 1; 2\r", 2)
+    wrong = " ".join(tui.display()[-1].split())
+    WRONG = f"not sent to {open_label}: the question asks 1 thing(s); answer each, separated by ;"
+    for _ in range(12):
+        if any(bare(r).startswith("▶ ") and "question: Which colour?" in r for r in pane(tui.display(), "Timeline")):
+            break
+        tui.key("\x1b[A", 0.3)  # Up: an older line
+    tui.key("2", 2)
+    try:
+        out, err = asking.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        asking.kill()
+        out, err = asking.communicate()
+    try:
+        decision = json.loads(out)["hookSpecificOutput"]["decision"]
+    except (ValueError, KeyError, TypeError):
+        decision = None
+    with open(transcript, "a") as f:
+        f.write(json.dumps({"type": "user", "sessionId": OPEN_ID, "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_q",
+             "content": "User has answered your questions: \"Which colour?\"=\"Blue\"."}]},
+            "toolUseResult": {"questions": qs["questions"], "answers": {"Which colour?": "Blue"}}}) + "\n")
+    # The line wraps in the pane: read it whole, without the spaces a wrap took.
+    answered = tui.until(lambda: "answeredhere:Blue" in flat().replace(" ", ""), 60, 1)
+    answer_line = flat().replace(" ", "").split("question:Whichcolour?", 1)[-1][:200]
+    tui.key(":general\r", 2)
+    d = decision or {}
+    claim("answer", asked and WRONG in wrong and d.get("behavior") == "allow"
+          and (d.get("updatedInput") or {}).get("answers", {}).get("Which colour?") == "Blue"
+          and answered,
+          f"question shown: {asked}; `:answer 1; 2` said {wrong!r} (want {WRONG!r}); the digit 2 "
+          f"gave the hook {decision!r} (stderr {err.strip()[:200]!r}); the line then read "
+          f"\"answered here: Blue\": {answered} ({answer_line!r})")
 
     stage("steer")
     # Driving a session from the TUI (ADR-029 DR-1.2, DR-1.3, DR-1.6, #553): a stand-in for Claude

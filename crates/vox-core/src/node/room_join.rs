@@ -37,6 +37,15 @@ impl Joins {
             .cloned()
     }
 
+    /// Whether a join of `room` is running now: its Session is not open there yet.
+    #[must_use]
+    pub fn under_way(&self, room: &str) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(room)
+    }
+
     /// Record what the join of `room` says now; `None` clears it.
     pub fn set_status(&self, room: &str, said: Option<String>) {
         let mut s = self

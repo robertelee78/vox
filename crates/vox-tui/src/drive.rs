@@ -68,8 +68,11 @@ pub async fn send(
     use vox_core::node::drive_input::Unsent;
     let at = crate::client::one_shot(paths).map_err(|e| NotDelivered::NotSent(e.to_string()))?;
     match vox_core::node::drive_input::send(&at, room, peer, request).await {
-        Ok(Answer { ok: true, said }) => Ok(said),
-        Ok(Answer { ok: false, said }) => Err(NotDelivered::Refused(said)),
+        Ok(a) if a.ok => Ok(a.said),
+        // The session's node is named as this node knows it.
+        Ok(a) => Err(NotDelivered::Refused(
+            a.said_to(&crate::ident::name_of(&peer)),
+        )),
         Err(Unsent::Unreachable(why)) => Err(NotDelivered::NotSent(why)),
         Err(Unsent::NoAnswer(why)) => Err(NotDelivered::NoAnswer(why)),
     }

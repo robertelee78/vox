@@ -15,15 +15,26 @@
 //! so the updater stays pinned to GitHub's origins and its mismatch refusals are recorded as
 //! an accepted gap in ADR-018 instead.
 //!
+//! On macOS the release is Vox.app carrying that `vox` at `Contents/Helpers/vox` (ADR-014 M-28):
+//! the installer puts the app in the folder `VOX_APPLICATIONS_DIR` names (a scratch stand-in for
+//! `/Applications`, so the proof never touches the real one) or in `~/Applications` when that
+//! folder is not writable, and links `~/.local/bin/vox` into the bundle. An Intel Mac or a Mac
+//! before macOS 13 is told so before anything is downloaded; the proof stands in for such a Mac
+//! with `uname`, `sysctl` and `sw_vers` shims on `PATH` and counts the release server's requests.
+//!
 //! This lives in `vox-tui`'s tests because it needs `vox` itself as the release payload.
 
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/release_server.rs"]
+mod release_server;
+use release_server::{serve, Server};
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 
 /// **Every red names which it is** (the decider's rule 1). A step of the proof's own staging that
 /// fails — a file, a process, the release server — is `APPARATUS (harness error)` at its line;
@@ -50,8 +61,10 @@ impl<T> Staged<T> for Option<T> {
 }
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
-/// The synthetic version served as "the release" — clearly not a real one.
-const SERVED: &str = "9.9.9";
+/// The version served as "the release": the built `vox`'s own, because on macOS the installer
+/// requires the app, its record and `vox --version` to agree (ADR-014 M-28). The loopback server
+/// is what keeps it from being mistaken for a real release.
+const SERVED: &str = env!("CARGO_PKG_VERSION");
 
 struct Claim {
     id: String,
@@ -85,8 +98,6 @@ fn install_sh() -> PathBuf {
 fn target_triple() -> &'static str {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "aarch64-apple-darwin"
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        "x86_64-apple-darwin"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         "x86_64-unknown-linux-gnu"
     } else {
@@ -105,115 +116,104 @@ fn sha256_hex(bytes: &[u8]) -> String {
         })
 }
 
-/// A python `http.server` over `root`, on a port it chose itself. Killed on drop.
-struct Server {
-    child: Child,
-    base: String,
+/// A record's JSON, every value a scalar, in the field order a `BTreeMap` gives.
+fn record_json(f: &BTreeMap<&str, String>) -> String {
+    let quoted = |k: &str| !matches!(k, "schema_version" | "size");
+    let body = f
+        .iter()
+        .map(|(k, v)| {
+            if quoted(k) {
+                format!("\"{k}\":\"{v}\"")
+            } else {
+                format!("\"{k}\":{v}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}\n")
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+/// On macOS, the release's Vox.app: `Vox-<version>-<triple>.zip` holding a bundle that carries
+/// the built `vox` at `Contents/Helpers/vox`, ad-hoc signed (a Developer ID signature exists only
+/// as output of the release workflow), and its record at `latest/download/app-<channel>-<triple>.json`.
+fn app_release(root: &Path, channel: &str) {
+    let triple = target_triple();
+    let work = tempfile::tempdir().staged();
+    let app = work.path().join("Vox.app");
+    let contents = app.join("Contents");
+    std::fs::create_dir_all(contents.join("MacOS")).staged();
+    std::fs::create_dir_all(contents.join("Helpers")).staged();
+    std::fs::copy(VOX, contents.join("MacOS/Vox")).staged();
+    std::fs::copy(VOX, contents.join("Helpers/vox")).staged();
+    std::fs::write(
+        contents.join("Info.plist"),
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\"><dict>\
+             <key>CFBundleIdentifier</key><string>us.vox.app</string>\
+             <key>CFBundleExecutable</key><string>Vox</string>\
+             <key>CFBundlePackageType</key><string>APPL</string>\
+             <key>CFBundleShortVersionString</key><string>{SERVED}</string>\
+             <key>LSMinimumSystemVersion</key><string>13.0</string>\
+             </dict></plist>\n"
+        ),
+    )
+    .staged();
+    let signed = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(&app)
+        .output()
+        .staged();
+    assert!(
+        signed.status.success(),
+        "APPARATUS (harness error): ad-hoc signing the fixture app: {}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    let zip_name = format!("Vox-{SERVED}-{triple}.zip");
+    let zip = work.path().join(&zip_name);
+    let zipped = Command::new("/usr/bin/ditto")
+        .args(["-c", "-k", "--keepParent"])
+        .arg(&app)
+        .arg(&zip)
+        .output()
+        .staged();
+    assert!(
+        zipped.status.success(),
+        "APPARATUS (harness error): zipping the fixture app: {}",
+        String::from_utf8_lossy(&zipped.stderr)
+    );
+    let bytes = std::fs::read(&zip).staged();
+    let asset_dir = root.join("releases/download").join(format!("v{SERVED}"));
+    std::fs::create_dir_all(&asset_dir).staged();
+    std::fs::write(asset_dir.join(&zip_name), &bytes).staged();
 
-/// How long python may take to start serving.
-///
-/// `python3` is whatever is on `PATH`, often a version-manager shim that runs several processes
-/// before python itself. This used to allow 5s, and on a loaded box (load 81) the proof failed in
-/// 9s with "the loopback release server never came up" while nothing was wrong with `install.sh`
-/// (#164). A python started 6s late reproduces that failure every time.
-const SERVER_START: std::time::Duration = std::time::Duration::from_secs(90);
-
-/// Serve `root` over loopback HTTP.
-///
-/// **python picks the port and says which.** This used to reserve a port by binding and
-/// releasing it, start python on it, and take "the port is bound now" as "python is serving". That
-/// was a race: anything that took the port in between made the check pass against the wrong
-/// server, and a python that failed to start left only a timeout, because its stderr went to
-/// `/dev/null`. Now python binds port 0 and prints the port it got, which is the one fact that
-/// means it is serving; and if it exits instead, the failure carries its exit status and stderr.
-fn serve(root: &Path) -> Result<Server, String> {
-    use std::io::{BufRead as _, BufReader, Read as _};
-    let mut child = Command::new("python3")
-        .args([
-            "-u",
-            "-m",
-            "http.server",
-            "0",
-            "--bind",
-            "127.0.0.1",
-            "--directory",
-        ])
-        .arg(root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("python3 could not be run ({e}); it is what serves the release"))?;
-    // Both pipes are drained for the server's whole life: its request log goes to stderr, and an
-    // undrained pipe would stop it mid-proof once full.
-    let said = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let mut stderr = child.stderr.take().staged();
-    let err_log = std::sync::Arc::clone(&said);
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = stderr.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            err_log
-                .lock()
-                .staged()
-                .push_str(&String::from_utf8_lossy(&buf[..n]));
-        }
-    });
-    let stdout = child.stdout.take().staged();
-    let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
-    let out_log = std::sync::Arc::clone(&said);
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            // "Serving HTTP on 127.0.0.1 port 61866 (http://127.0.0.1:61866/) ..."
-            if let Some(port) = line
-                .split_once(" port ")
-                .and_then(|(_, rest)| rest.split_whitespace().next())
-                .and_then(|p| p.parse().ok())
-            {
-                let _ = port_tx.send(port);
-            }
-            out_log.lock().staged().push_str(&format!("{line}\n"));
-        }
-    });
-    let started = std::time::Instant::now();
-    loop {
-        if let Ok(port) = port_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            let base = format!("http://127.0.0.1:{port}/releases");
-            return Ok(Server { child, base });
-        }
-        if let Ok(Some(status)) = child.try_wait() {
-            // Let the reader threads take what it said before it went.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            return Err(format!(
-                "python3 exited ({status}) after {:.1}s without serving; it said: {:?}",
-                started.elapsed().as_secs_f64(),
-                said.lock().staged()
-            ));
-        }
-        if started.elapsed() > SERVER_START {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "python3 did not start serving within {}s; it said: {:?}",
-                SERVER_START.as_secs(),
-                said.lock().staged()
-            ));
-        }
-    }
+    let mut f: BTreeMap<&str, String> = BTreeMap::new();
+    f.insert("kind", "vox.app-release".into());
+    f.insert("schema_version", "1".into());
+    f.insert("package", "Vox.app".into());
+    f.insert("channel", channel.into());
+    f.insert("target", triple.into());
+    f.insert("version", SERVED.into());
+    f.insert("size", bytes.len().to_string());
+    f.insert("sha256", sha256_hex(&bytes));
+    let rec_dir = root.join("releases/latest/download");
+    std::fs::create_dir_all(&rec_dir).staged();
+    std::fs::write(
+        rec_dir.join(format!("app-{channel}-{triple}.json")),
+        record_json(&f),
+    )
+    .staged();
 }
 
 /// A release tree: the record at `latest/download/<channel>-<triple>.json` and the binary at
-/// `download/v<version>/vox-<triple>`. `mangle` gets the last word on the record's fields.
+/// `download/v<version>/vox-<triple>`, and on macOS the app ([`app_release`]). `mangle` gets the
+/// last word on the `vox` record's fields.
 fn release_tree(root: &Path, channel: &str, mangle: &dyn Fn(&mut BTreeMap<&str, String>)) {
+    if cfg!(target_os = "macos") {
+        app_release(root, channel);
+    }
     let triple = target_triple();
     let bin = std::fs::read(VOX).staged();
     let asset_dir = root.join("releases/download").join(format!("v{SERVED}"));
@@ -230,26 +230,29 @@ fn release_tree(root: &Path, channel: &str, mangle: &dyn Fn(&mut BTreeMap<&str, 
     f.insert("size", bin.len().to_string());
     f.insert("sha256", sha256_hex(&bin));
     mangle(&mut f);
-
-    let quoted = |k: &str| !matches!(k, "schema_version" | "size");
-    let body = f
-        .iter()
-        .map(|(k, v)| {
-            if quoted(k) {
-                format!("\"{k}\":\"{v}\"")
-            } else {
-                format!("\"{k}\":{v}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",");
     let rec_dir = root.join("releases/latest/download");
     std::fs::create_dir_all(&rec_dir).staged();
     std::fs::write(
         rec_dir.join(format!("{channel}-{triple}.json")),
-        format!("{{{body}}}\n"),
+        record_json(&f),
     )
     .staged();
+}
+
+const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The proof's stand-in for `/Applications`, so no run touches the real one.
+fn system_apps(home: &Path) -> PathBuf {
+    home.join("SystemApplications")
+}
+
+/// Where the install's marker sits: beside the bundle on macOS, beside `vox` elsewhere.
+fn marker_path(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        system_apps(home).join(".vox-standalone.json")
+    } else {
+        home.join("bin/.vox-standalone.json")
+    }
 }
 
 /// Run the real `install.sh` against `server`, installing into `home/bin`.
@@ -265,19 +268,29 @@ fn run_installer_env(
     extra: &[(&str, &str)],
 ) -> (bool, String) {
     std::fs::create_dir_all(home).staged();
+    std::fs::create_dir_all(system_apps(home)).staged();
     let mut f = std::fs::File::create(home.join(".zshrc")).staged();
     f.write_all(b"export VOX_PROOF_USER_LINE=kept\n").staged();
+    // A `PATH` entry in `extra` goes in front of the system's: it is how a shim stands in for
+    // another Mac.
+    let path = extra
+        .iter()
+        .find(|(k, _)| *k == "PATH")
+        .map_or(SYSTEM_PATH.to_owned(), |(_, v)| {
+            format!("{v}:{SYSTEM_PATH}")
+        });
     let out = Command::new("sh")
         .arg(install_sh())
         .env_clear()
         .env("HOME", home)
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("VOX_APPLICATIONS_DIR", system_apps(home))
         .env("SHELL", "/bin/zsh")
         .env("TERM", "dumb")
         .env("VOX_RELEASE_BASE", &server.base)
         .env("VOX_INSTALL_DIR", home.join("bin"))
         .env("VOX_CHANNEL", channel)
-        .envs(extra.iter().copied())
+        .envs(extra.iter().copied().filter(|(k, _)| *k != "PATH"))
+        .env("PATH", path)
         .output()
         .staged();
     (
@@ -323,8 +336,7 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
             .unwrap_or_default();
-        let marker =
-            std::fs::read_to_string(home.join("bin/.vox-standalone.json")).unwrap_or_default();
+        let marker = std::fs::read_to_string(marker_path(home)).unwrap_or_default();
         let rc = std::fs::read_to_string(home.join(".zshrc")).unwrap_or_default();
         claims.push(claim(
             "install.places_a_runnable_binary",
@@ -389,9 +401,10 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
     }
 
     // ---- the Apple gate refuses bytes Apple did not vouch for (macOS) ----------------
-    // The fixture is a cargo build, so it carries at most an ad-hoc signature. Forcing the gate
-    // on is the only way to measure it locally: a genuinely notarized binary exists only as
-    // output of the release workflow.
+    // The fixture app is ad-hoc signed, around a cargo build. Forcing the gate on is the only way
+    // to measure it locally: a genuinely notarized app exists only as output of the release
+    // workflow. The refusal must name the app itself: its vox is checked too, but a gate that
+    // checked only the vox inside would let any bundle around it through.
     if cfg!(target_os = "macos") {
         release_tree(tree.path(), "stable", &|_| {});
         let tmp = tempfile::tempdir().staged();
@@ -399,8 +412,10 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         let (ok, text) =
             run_installer_env(&server, home, "stable", &[("VOX_PROOF_APPLE_VERIFY", "1")]);
         claims.push(claim(
-            "install.apple_gate_refuses_unsigned_bytes",
-            !ok && !home.join("bin/vox").exists() && text.contains("3T2D2YNTVW"),
+            "install.apple_gate_refuses_an_unsigned_app",
+            !ok && !system_apps(home).join("Vox.app").exists()
+                && !home.join("bin/vox").exists()
+                && text.contains("Vox.app is not signed by team 3T2D2YNTVW"),
             format!("with the Apple gate forced on, the installer said {text:?}"),
         ));
     }
@@ -431,12 +446,17 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         let home = tmp.path();
         let (ok1, _) = run_installer(&server, home, "stable");
         let (ok2, text) = run_installer(&server, home, "stable");
-        let previous = home.join("bin/.vox-previous");
+        let previous = if cfg!(target_os = "macos") {
+            system_apps(home).join(".Vox.app.previous/Contents/Helpers/vox")
+        } else {
+            home.join("bin/.vox-previous")
+        };
         claims.push(claim(
             "install.is_idempotent_and_keeps_the_previous",
             ok1 && ok2 && previous.is_file(),
             format!(
-                "second run exit_ok={ok2}, .vox-previous present={}, said {text:?}",
+                "second run exit_ok={ok2}, {} present={}, said {text:?}",
+                previous.display(),
                 previous.is_file()
             ),
         ));
@@ -452,7 +472,42 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
         let home = tmp.path();
         let bin = home.join("bin");
         let (first, said_first) = run_installer(&server, home, "stable");
-        if first {
+        if first && cfg!(target_os = "macos") {
+            // On macOS the leftovers are bundles: a read-only `.Vox.app.partial` and a read-only
+            // `.Vox.app.previous`, each with a file inside that only a writable folder can lose.
+            let apps = system_apps(home);
+            for leftover in [".Vox.app.partial", ".Vox.app.previous"] {
+                let dir = apps.join(leftover);
+                std::fs::create_dir_all(&dir).staged();
+                std::fs::write(dir.join("cut-short"), b"cut short").staged();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).staged();
+            }
+            let (ok, text) = run_installer(&server, home, "stable");
+            let version = Command::new(bin.join("vox"))
+                .arg("--version")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_default();
+            let replaced = apps
+                .join(".Vox.app.previous/Contents/Helpers/vox")
+                .is_file()
+                && !apps.join(".Vox.app.previous/cut-short").exists();
+            let partials: Vec<String> = std::fs::read_dir(&apps)
+                .staged()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".partial"))
+                .collect();
+            claims.push(claim(
+                "install.reruns_after_a_cut_short_run",
+                ok && version == format!("vox {SERVED}") && replaced && partials.is_empty(),
+                format!(
+                    "over a read-only .Vox.app.partial and .Vox.app.previous: exit_ok={ok}, the \
+                     installed vox reports {version:?}, .Vox.app.previous is the replaced \
+                     bundle={replaced}, partials left {partials:?}, said {text:?}"
+                ),
+            ));
+        } else if first {
             for leftover in [".vox-candidate.partial", ".vox-previous"] {
                 std::fs::write(bin.join(leftover), b"cut short").staged();
                 std::fs::set_permissions(
@@ -491,6 +546,310 @@ fn install_sh_installs_what_it_verified_and_refuses_what_it_could_not() {
                 "install.reruns_after_a_cut_short_run",
                 false,
                 format!("(staging) the first install failed, said {said_first:?}"),
+            ));
+        }
+    }
+
+    // ---- macOS: the app lands where the person can open it, and vox is a link into it ----
+    if cfg!(target_os = "macos") {
+        release_tree(tree.path(), "stable", &|_| {});
+        for (id, writable) in [
+            ("install.app_goes_to_applications_when_writable", true),
+            ("install.app_goes_to_home_applications_otherwise", false),
+        ] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            std::fs::create_dir_all(system_apps(home)).staged();
+            if !writable {
+                std::fs::set_permissions(system_apps(home), std::fs::Permissions::from_mode(0o555))
+                    .staged();
+            }
+            let (ok, text) = run_installer(&server, home, "stable");
+            let apps = if writable {
+                system_apps(home)
+            } else {
+                home.join("Applications")
+            };
+            let app = apps.join("Vox.app");
+            let link = std::fs::read_link(home.join("bin/vox")).unwrap_or_default();
+            let version = Command::new(home.join("bin/vox"))
+                .arg("--version")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_default();
+            let app_version = Command::new("/usr/libexec/PlistBuddy")
+                .args(["-c", "Print :CFBundleShortVersionString"])
+                .arg(app.join("Contents/Info.plist"))
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+                .unwrap_or_default();
+            let said_where = text.contains(&format!("installed: {}", app.display()));
+            claims.push(claim(
+                id,
+                ok && link == app.join("Contents/Helpers/vox")
+                    && !app_version.is_empty()
+                    && version == format!("vox {app_version}")
+                    && said_where,
+                format!(
+                    "exit_ok={ok}, ~/.local/bin/vox -> {}, it reports {version:?}, the app says \
+                     {app_version:?}, said where={said_where}, said {text:?}",
+                    link.display()
+                ),
+            ));
+            if !writable {
+                std::fs::set_permissions(system_apps(home), std::fs::Permissions::from_mode(0o755))
+                    .staged();
+            }
+        }
+
+        // An Intel Mac, and a Mac before macOS 13, stand in through shims on PATH. "Nothing was
+        // downloaded" is read from the server's request log, so the log must be seen counting
+        // the installs above first, or a refusal after downloading would read as none.
+        let counted = server.requests();
+        let shims = tempfile::tempdir().staged();
+        for (id, uname_m, os_version) in [
+            (
+                "install.refuses_an_intel_mac_before_downloading",
+                "x86_64",
+                "14.6",
+            ),
+            (
+                "install.refuses_macos_12_before_downloading",
+                "arm64",
+                "12.7.4",
+            ),
+        ] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = shims.path().join(id);
+            std::fs::create_dir_all(&dir).staged();
+            for (name, body) in [
+                (
+                    "uname",
+                    format!(
+                        "#!/bin/sh\ncase \"$1\" in -m) echo {uname_m} ;; *) exec /usr/bin/uname \"$@\" ;; esac\n"
+                    ),
+                ),
+                ("sysctl", "#!/bin/sh\necho 0\n".to_owned()),
+                ("sw_vers", format!("#!/bin/sh\necho {os_version}\n")),
+            ] {
+                std::fs::write(dir.join(name), body).staged();
+                std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o755))
+                    .staged();
+            }
+            if counted == 0 {
+                claims.push(blocked(
+                    id,
+                    "the release server's request log counted none of the installs above, so \
+                     whether anything was downloaded cannot be measured",
+                ));
+                continue;
+            }
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            let before = server.requests();
+            let dir_text = dir.to_string_lossy().into_owned();
+            let (ok, text) = run_installer_env(&server, home, "stable", &[("PATH", &dir_text)]);
+            // python logs a request after answering it; give a late line the time to land.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let fetched = server.requests() - before;
+            claims.push(claim(
+                id,
+                !ok && fetched == 0
+                    && text.contains("this Mac is not supported: Vox needs a Mac with Apple Silicon and macOS 13 or later")
+                    && !home.join("bin/vox").exists(),
+                format!("exit_ok={ok}, requests to the release server={fetched}, said {text:?}"),
+            ));
+        }
+
+        // ---- macOS: a failure after the swap puts the installed Vox.app back; one install or
+        // `vox update` at a time; a relative folder is refused up front (services2's review) ----
+        // The installed bundle carries a file the release does not, so whether it is the one that
+        // was installed, or the release's, is read off the bundle itself.
+        let installed_before = |home: &Path| {
+            let (ok, _) = run_installer(&server, home, "stable");
+            let mark = system_apps(home).join("Vox.app/Contents/installed-before");
+            ok && std::fs::write(&mark, b"the bundle that was installed").is_ok()
+        };
+        let still_the_old = |home: &Path| {
+            system_apps(home)
+                .join("Vox.app/Contents/installed-before")
+                .exists()
+        };
+        {
+            // The link step fails after the swap: VOX_INSTALL_DIR names a file, not a folder.
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            if installed_before(home) {
+                let not_a_dir = home.join("not-a-folder");
+                std::fs::write(&not_a_dir, b"a file").staged();
+                let not_a_dir = not_a_dir.to_string_lossy().into_owned();
+                let (ok, text) =
+                    run_installer_env(&server, home, "stable", &[("VOX_INSTALL_DIR", &not_a_dir)]);
+                let back = still_the_old(home);
+                claims.push(claim(
+                    "install.a_failure_after_the_swap_puts_the_app_back",
+                    !ok && back && text.contains("the Vox.app that was installed is back"),
+                    format!("exit_ok={ok}, the installed Vox.app back={back}, said {text:?}"),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.a_failure_after_the_swap_puts_the_app_back",
+                    "the first install, which the failing one would replace, did not happen",
+                ));
+            }
+        }
+        {
+            // A `vox update` (or another install) holds the lock: lockf, as `vox update`'s flock.
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            if installed_before(home) {
+                let lock = system_apps(home).join(".vox-standalone.lock");
+                let mut holder = Command::new("/usr/bin/lockf")
+                    .args(["-k"])
+                    .arg(&lock)
+                    .args(["sleep", "60"])
+                    .spawn()
+                    .staged();
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let (ok, text) = run_installer(&server, home, "stable");
+                let _ = holder.kill();
+                let _ = holder.wait();
+                let back = still_the_old(home);
+                claims.push(claim(
+                    "install.waits_for_a_running_update",
+                    !ok && back && text.contains("another install or a `vox update` is changing"),
+                    format!("exit_ok={ok}, the installed Vox.app untouched={back}, said {text:?}"),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.waits_for_a_running_update",
+                    "the first install, which the waiting one would replace, did not happen",
+                ));
+            }
+        }
+        {
+            // A daemon not restarted since an earlier install still runs from the bundle that
+            // install replaced: the next install must not remove it from under it.
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            let apps = system_apps(home);
+            let (ok1, _) = run_installer(&server, home, "stable");
+            let (ok2, _) = run_installer(&server, home, "stable");
+            let running_from = apps.join(".Vox.app.previous/Contents/Helpers/vox");
+            let scratch = home.join("a-node");
+            std::fs::create_dir_all(scratch.join("cfg")).staged();
+            let mut runner = Command::new(&running_from)
+                .args(["node", "--listen", "127.0.0.1:0"])
+                .env("VOX_DATA_DIR", &scratch)
+                .env("VOX_CONFIG_DIR", scratch.join("cfg"))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .staged();
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let alive = runner.try_wait().staged().is_none();
+            let (ok3, text3) = run_installer(&server, home, "stable");
+            let retired: Vec<PathBuf> = std::fs::read_dir(&apps)
+                .staged()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(".Vox.app.retired."))
+                })
+                .collect();
+            let kept = retired
+                .iter()
+                .any(|r| r.join("Contents/Helpers/vox").is_file());
+            let still_alive = runner.try_wait().staged().is_none();
+            let _ = runner.kill();
+            let _ = runner.wait();
+            let (ok4, _) = run_installer(&server, home, "stable");
+            let swept = !std::fs::read_dir(&apps)
+                .staged()
+                .filter_map(Result::ok)
+                .any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".Vox.app.retired.")
+                });
+            if ok1 && ok2 && alive {
+                claims.push(claim(
+                    "install.keeps_a_bundle_a_daemon_runs_from",
+                    ok3 && kept && still_alive && ok4 && swept,
+                    format!(
+                        "third install exit_ok={ok3}: the bundle the running vox came from kept \
+                         as {retired:?}={kept}, it still running={still_alive}; after it stopped, \
+                         a fourth install (exit_ok={ok4}) removed it={swept}; said {text3:?}"
+                    ),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.keeps_a_bundle_a_daemon_runs_from",
+                    format!(
+                        "staging: installs ok={ok1}/{ok2}, a vox running from the previous bundle \
+                         alive={alive}"
+                    ),
+                ));
+            }
+        }
+        {
+            // A `vox update` cut short between its swap and its rename (its journal says Vox
+            // 9.9.9 was put in place, and the bundle it replaced is under the partial name).
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            let apps = system_apps(home);
+            let (ok1, _) = run_installer(&server, home, "stable");
+            let staged = ok1
+                && std::fs::rename(apps.join("Vox.app"), apps.join(".Vox.app.partial")).is_ok()
+                && Command::new("/usr/bin/ditto")
+                    .arg(apps.join(".Vox.app.partial"))
+                    .arg(apps.join("Vox.app"))
+                    .status()
+                    .is_ok_and(|s| s.success())
+                && Command::new("/usr/libexec/PlistBuddy")
+                    .args(["-c", "Set :CFBundleShortVersionString 9.9.9"])
+                    .arg(apps.join("Vox.app/Contents/Info.plist"))
+                    .status()
+                    .is_ok_and(|s| s.success())
+                && std::fs::create_dir(apps.join(".Vox.app.publishing")).is_ok()
+                && std::fs::write(apps.join(".Vox.app.publishing/version"), "9.9.9").is_ok();
+            if staged {
+                let (ok, text) = run_installer(&server, home, "stable");
+                let journal_left = apps.join(".Vox.app.publishing").exists();
+                claims.push(claim(
+                    "install.finishes_a_cut_vox_update",
+                    ok && !journal_left
+                        && text
+                            .contains("an update was cut short after Vox 9.9.9 was put in place"),
+                    format!("exit_ok={ok}, the journal left behind={journal_left}, said {text:?}"),
+                ));
+            } else {
+                claims.push(blocked(
+                    "install.finishes_a_cut_vox_update",
+                    "staging a cut-short vox update's state did not succeed",
+                ));
+            }
+        }
+        {
+            let tmp = tempfile::tempdir().staged();
+            let home = tmp.path();
+            let before = server.requests();
+            let (ok, text) = run_installer_env(
+                &server,
+                home,
+                "stable",
+                &[("VOX_APPLICATIONS_DIR", "relative/Applications")],
+            );
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let fetched = server.requests() - before;
+            claims.push(claim(
+                "install.refuses_a_relative_applications_folder",
+                !ok && fetched == 0
+                    && text.contains("VOX_APPLICATIONS_DIR must be an absolute path"),
+                format!("exit_ok={ok}, requests to the release server={fetched}, said {text:?}"),
             ));
         }
     }

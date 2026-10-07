@@ -799,14 +799,17 @@ impl Router {
             (Err(_), _) => Answer {
                 ok: false,
                 said: "no drive request arrived in time".into(),
+                code: None,
             },
             (_, Err(_)) if buf.len() > MAX_REQUEST => Answer {
                 ok: false,
                 said: "the drive request is too long".into(),
+                code: None,
             },
             (_, Err(_)) => Answer {
                 ok: false,
                 said: "not a drive request this vox reads".into(),
+                code: None,
             },
             (Ok(()), Ok(req)) => self.drive(node, handle, &info, req).await,
         };
@@ -827,7 +830,11 @@ impl Router {
         req: crate::drive::Request,
     ) -> crate::drive::Answer {
         use crate::drive::{Action, Answer};
-        let refuse = |said: String| Answer { ok: false, said };
+        let refuse = |said: String| Answer {
+            ok: false,
+            said,
+            code: None,
+        };
         if req.v != 1 {
             return refuse(format!(
                 "drive protocol {} is not one this vox speaks",
@@ -836,11 +843,14 @@ impl Router {
         }
         let view = handle.view();
         // DR-2: only a member this node trusts with drive.
+        // Said without this node's name for itself, which the driver may not know it by: the
+        // driver names it (`code`).
         if !view.drive.contains(&info.peer) {
-            return refuse(format!(
-                "{} does not trust you with drive; it trusts you to read only, or not at all",
-                node
-            ));
+            return Answer {
+                ok: false,
+                said: vox_agentcomms::drive::no_drive("the session's node"),
+                code: Some(vox_agentcomms::drive::NO_DRIVE.to_owned()),
+            };
         }
         let Ok(paths) = self.inner.account.node_paths(node) else {
             return refuse("this node's files cannot be read".into());
@@ -1007,8 +1017,16 @@ impl Router {
             });
         }
         match outcome {
-            Ok(said) => Answer { ok: true, said },
-            Err(said) => Answer { ok: false, said },
+            Ok(said) => Answer {
+                ok: true,
+                said,
+                code: None,
+            },
+            Err(said) => Answer {
+                ok: false,
+                said,
+                code: None,
+            },
         }
     }
 
@@ -2167,20 +2185,53 @@ impl Dispatch for Router {
 /// other running. Production Argon2id: run in release.
 /// Post one session's entries into its Session, in the order they were queued. Each goes to the
 /// room its session works in now; a session in no room, or headless (ADR-029 SE-1), has no
-/// Session, and its entries go nowhere. A failure is said in the daemon's log, naming the entry's
-/// kind: the session goes on.
+/// Session, and its entries go nowhere.
+///
+/// **A Session keeps its start while its room is joined** (SC-1): while the node is joining the
+/// room the room map gave the session, or the room is not open on it yet, entries are held, in
+/// order, up to [`HELD_BYTES`] (the oldest dropped first), and appended once the room opens. A join
+/// that fails drops them. Either way the Session's first entry after them says how many were
+/// dropped. Any other failure is said in the daemon's log, naming the entry's kind, once until it
+/// changes or entries reach the Session again: the session goes on.
 async fn post_in_order(
     weak: std::sync::Weak<Inner>,
     node: NodeName,
     session: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
-    while let Some(body) = rx.recv().await {
+    let mut failing: Option<String> = None;
+    let mut held = std::collections::VecDeque::<String>::new();
+    let mut held_bytes = 0usize;
+    let mut dropped = 0u64;
+    loop {
+        // Waiting on the room: look again each second, and take what arrives meanwhile.
+        let next = if held.is_empty() {
+            rx.recv().await
+        } else {
+            match tokio::time::timeout(HELD_RETRY, rx.recv()).await {
+                Ok(None) => return,
+                Ok(next) => next,
+                Err(_) => None,
+            }
+        };
+        if let Some(body) = next {
+            held_bytes += body.len();
+            held.push_back(body);
+            while held_bytes > HELD_BYTES {
+                let Some(old) = held.pop_front() else { break };
+                held_bytes -= old.len();
+                dropped += 1;
+            }
+        } else if held.is_empty() {
+            return;
+        }
         let Some(inner) = weak.upgrade() else {
             return;
         };
         let router = Router { inner };
         let Some(handle) = router.handle_of(&node) else {
+            held.clear();
+            held_bytes = 0;
             continue;
         };
         let reg = router
@@ -2189,33 +2240,109 @@ async fn post_in_order(
             .node_paths(&node)
             .ok()
             .and_then(|p| crate::wake::registration(&p, &session));
-        let Some(room) = reg
-            .filter(|r| r.interactive)
-            .and_then(|r| r.room)
-            .and_then(|r| vox_core::node::link::b32_decode(&r, "room").ok())
+        let Some((room_b32, room)) =
+            reg.filter(|r| r.interactive)
+                .and_then(|r| r.room)
+                .and_then(|r| {
+                    vox_core::node::link::b32_decode(&r, "room")
+                        .ok()
+                        .map(|d| (r, d))
+                })
         else {
+            held.clear();
+            held_bytes = 0;
             continue;
         };
-        let outcome = handle
-            .apply(vox_core::node::api::NodeCommand::AppendSession {
-                channel_id: room,
-                session_id: session.clone(),
-                body: body.clone(),
-            })
-            .await;
-        if !matches!(
-            outcome,
-            vox_core::node::api::Outcome::Done | vox_core::node::api::Outcome::Appended(_)
-        ) {
-            let kind = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
-                .unwrap_or_default();
-            eprintln!(
-                "vox daemon: {node}: session {session}: a {kind} entry did not reach its Session: \
-                 {outcome}"
-            );
+        let joins = lock(&router.inner.joins).get(&node).cloned();
+        if joins.as_ref().is_some_and(|j| j.under_way(&room_b32)) {
+            continue;
         }
+        let member = handle.view().channels.iter().any(|c| c.channel_id == room);
+        if !member && joins.as_ref().and_then(|j| j.status(&room_b32)).is_some() {
+            // The join failed: what was held is dropped, and said once the Session opens.
+            dropped += held.len() as u64;
+            held.clear();
+            held_bytes = 0;
+            continue;
+        }
+        while let Some(body) = held.front().cloned() {
+            if dropped > 0 {
+                let notice = serde_json::json!({
+                    "v": vox_agentcomms::activity::VERSION,
+                    "session": session,
+                    "kind": "notice",
+                    "ts": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+                    "text": format!(
+                        "{dropped} {} of this session {} dropped before its room opened",
+                        if dropped == 1 { "entry" } else { "entries" },
+                        if dropped == 1 { "was" } else { "were" }
+                    ),
+                })
+                .to_string();
+                if append_entry(&handle, room, &session, &notice).await.is_ok() {
+                    dropped = 0;
+                }
+            }
+            match append_entry(&handle, room, &session, &body).await {
+                Ok(()) => {
+                    held.pop_front();
+                    held_bytes -= body.len();
+                    if failing.take().is_some() {
+                        eprintln!(
+                            "vox daemon: {node}: session {session}: entries reach its Session again"
+                        );
+                    }
+                }
+                // Not open yet: held, and tried again.
+                Err(vox_core::node::api::Outcome::Failed(
+                    vox_core::node::api::Fault::ChannelNotOpen,
+                )) => break,
+                Err(outcome) => {
+                    held.pop_front();
+                    held_bytes -= body.len();
+                    if failing.as_deref() != Some(outcome.to_string().as_str()) {
+                        failing = Some(outcome.to_string());
+                        let kind = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v.get("kind").and_then(|k| k.as_str()).map(str::to_owned))
+                            .unwrap_or_default();
+                        eprintln!(
+                            "vox daemon: {node}: session {session}: a {kind} entry did not reach \
+                             its Session: {outcome} (said once; later entries refused the same \
+                             way are not said)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How much of a session's activity is held while its room is not open yet.
+const HELD_BYTES: usize = 4 * 1024 * 1024;
+
+/// How often held entries look again for their room.
+const HELD_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Append one entry to `session`'s Session in `room`.
+async fn append_entry(
+    handle: &vox_core::node::actor::NodeHandle,
+    room: vox_core::hash::Digest32,
+    session: &str,
+    body: &str,
+) -> Result<(), vox_core::node::api::Outcome> {
+    match handle
+        .apply(vox_core::node::api::NodeCommand::AppendSession {
+            channel_id: room,
+            session_id: session.to_owned(),
+            body: body.to_owned(),
+        })
+        .await
+    {
+        vox_core::node::api::Outcome::Done | vox_core::node::api::Outcome::Appended(_) => Ok(()),
+        other => Err(other),
     }
 }
 
