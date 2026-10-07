@@ -2013,14 +2013,32 @@ pub fn claude_settings(node: &vox_core::node::paths::NodeName) -> String {
     text
 }
 
-/// Codex's `hooks.json` entry for `node`, as `vox agent plugin codex --node <name>` prints it.
-/// `async` MUST be false: an async hook's output is observed and discarded.
+/// Codex's `hooks.json` entries for `node`, as `vox agent plugin codex --node <name>` prints them.
+///
+/// - `UserPromptSubmit` drains the rooms into the turn, so it MUST be synchronous: an async
+///   hook's output is observed and discarded. It also posts the prompt to the Session.
+/// - `PreToolUse`, `PostToolUse` and `Stop` feed the Session (ADR-029 SC-1) when the session
+///   cannot be read from Codex's app-server (one was not running when `codex` started); the
+///   daemon drops them for a session it reads there. Async: a mirror never holds a turn up.
+/// - `SessionEnd` ends the Session (SE-4). Codex runs it synchronously, whatever it is told.
+/// - No `PermissionRequest`: a hook that decided would take the prompt from the terminal, and
+///   Codex's request carries no id to answer it by. An approval is answered from Vox only
+///   through the app-server.
 #[must_use]
 pub fn codex_hooks(node: &vox_core::node::paths::NodeName) -> String {
+    let entry = |sync: bool| {
+        serde_json::json!([ { "hooks": [
+            { "type": "command", "command": hook_command(node), "async": !sync }
+        ] } ])
+    };
     let v = serde_json::json!({
-        "hooks": { "UserPromptSubmit": [ { "hooks": [
-            { "type": "command", "command": hook_command(node), "async": false }
-        ] } ] }
+        "hooks": {
+            "UserPromptSubmit": entry(true),
+            "PreToolUse": entry(false),
+            "PostToolUse": entry(false),
+            "Stop": entry(false),
+            "SessionEnd": entry(true),
+        }
     });
     let mut text = serde_json::to_string_pretty(&v).unwrap_or_default();
     text.push('\n');

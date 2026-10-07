@@ -92,6 +92,9 @@ pub struct Session {
     /// When its drain last ran, in Unix milliseconds: the last time it read its rooms.
     #[serde(default)]
     pub last_drained_ms: u64,
+    /// A Codex session's `CODEX_HOME`, whose app-server the daemon reads it from (ADR-029 #541).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codex_home: String,
 }
 
 /// How a registered session can be reached now (V030-16), as `vox agent doctor` and a pong
@@ -257,6 +260,7 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                codex_home: crate::codex_mirror::codex_home_from_env(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("CLAUDE_CODE_MESSAGING_SOCKET"),
@@ -271,6 +275,7 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                codex_home: String::new(),
             }
         } else if let (Ok(endpoint), Ok(token)) = (
             std::env::var("VOX_OPENCODE_WAKE_SOCKET"),
@@ -285,6 +290,7 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                codex_home: String::new(),
             }
         } else {
             Session {
@@ -296,6 +302,7 @@ impl Session {
                 state_ms: now_millis(),
                 first_seen_ms: 0,
                 last_drained_ms: 0,
+                codex_home: String::new(),
             }
         }
     }

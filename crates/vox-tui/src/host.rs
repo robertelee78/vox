@@ -95,6 +95,8 @@ struct Inner {
     proxy: Option<Arc<crate::daemon_proxy::DaemonProxy>>,
     /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
     sink: Arc<crate::session_sink::Sink>,
+    /// Codex sessions' activity, read from Codex's app-server as a peer client (ADR-029 #541).
+    codex: Arc<crate::codex_mirror::CodexMirror>,
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -238,7 +240,9 @@ impl Router {
                         }
                     },
                 ));
+                let codex = crate::codex_mirror::CodexMirror::new(Arc::clone(&sink));
                 Inner {
+                    codex,
                     account,
                     rt,
                     defaults,
@@ -428,6 +432,15 @@ impl Router {
         Ok(g.info)
     }
 
+    /// A Codex session registered from a known `CODEX_HOME`: read it from that app-server.
+    fn watch_codex(&self, node: &NodeName, s: &crate::wake::Session) {
+        if s.harness == "codex" && !s.codex_home.is_empty() {
+            self.inner
+                .codex
+                .watch(std::path::Path::new(&s.codex_home), node, &s.session);
+        }
+    }
+
     /// Post `bodies`, numbered, to `session`'s Session: sealed to the members `node` trusts with
     /// drive (ADR-029 SC-2), in the room the session works in.
     // WIP(#540): reads2's `NodeCommand::AppendSession` and files2's session room are not on
@@ -444,6 +457,7 @@ impl Router {
     /// Returns whether the session was registered, and whether the node detached.
     pub async fn session_end(&self, node: &NodeName, session: &str) -> (bool, bool) {
         self.inner.sink.session_end(node, session);
+        self.inner.codex.end(session);
         let going = {
             let mut slots = lock(&self.inner.slots);
             match slots.get_mut(node) {
@@ -653,6 +667,11 @@ impl Router {
                             // This request attached it: what that said goes back to its client.
                             granted.notes = a.notes.clone();
                             let fingerprint = a.fingerprint;
+                            // Codex sessions registered before this daemon started are read
+                            // again from their app-server at once, not at their next turn.
+                            for s in crate::wake::registered(&a.paths) {
+                                self.watch_codex(node, &s);
+                            }
                             slots.insert(node.clone(), Slot::Attached(a));
                             drop(slots);
                             self.inner
@@ -706,6 +725,7 @@ impl Router {
             }
             Want::Session(s) => {
                 crate::wake::store(&a.paths, &s);
+                self.watch_codex(node, &s);
                 a.sessions.insert(s.session.clone());
                 None
             }
@@ -1251,6 +1271,20 @@ impl Dispatch for Router {
                 bodies,
                 call,
             } => {
+                // A Codex session read from its app-server: its hooks' copy of the same activity
+                // is not posted again. The prompt is the hook's alone (see codex_mirror).
+                let bodies = if self.inner.codex.subscribed(&session) {
+                    bodies
+                        .into_iter()
+                        .filter(|b| {
+                            serde_json::from_str::<serde_json::Value>(b).is_ok_and(|v| {
+                                v.get("kind").and_then(|k| k.as_str()) == Some("user")
+                            })
+                        })
+                        .collect()
+                } else {
+                    bodies
+                };
                 self.inner.sink.activity(&node, &session, bodies, call);
                 DaemonFrame::Ok
             }
