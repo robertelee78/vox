@@ -524,11 +524,13 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             for x in &channel.sessions {
                 notices.push(NoticeView {
                     timestamp: x.opened,
+                    after: None,
                     text: format!("{} opened", x.label),
                 });
                 if let Some(at) = x.ended {
                     notices.push(NoticeView {
                         timestamp: at,
+                        after: None,
                         text: format!("{} ended", x.label),
                     });
                 }
@@ -541,17 +543,20 @@ fn render_channel(frame: &mut Frame, area: Rect, vm: &ViewModel, ui: &mut UiStat
             if let Some(x) = session {
                 notices.push(NoticeView {
                     timestamp: x.opened,
+                    after: None,
                     text: format!("{} opened", x.label),
                 });
                 if let Some(at) = x.ended {
                     notices.push(NoticeView {
                         timestamp: at,
+                        after: None,
                         text: format!("{} ended", x.label),
                     });
                 }
                 if !x.can_drive {
                     notices.push(NoticeView {
                         timestamp: u64::MAX,
+                        after: None,
                         text: format!(
                             "Only members {} trusts with drive see inside this Session.",
                             x.node_alias
@@ -885,7 +890,18 @@ fn render_timeline(
             Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
         ))
     };
-    let mut said = room_notices.iter().rev().peekable();
+    // Each notice goes right after the message it follows in the room's order (`after`, #562): its
+    // time claims whole seconds, so by time a change made just after a post drew above it. One
+    // whose message is not in the timeline goes by time.
+    let anchored = |n: &NoticeView| {
+        n.after
+            .is_some_and(|h| timeline.iter().any(|m| m.entry_hash == h))
+    };
+    let mut said = room_notices
+        .iter()
+        .filter(|n| !anchored(n))
+        .rev()
+        .peekable();
     // The pane shows its newest lines, `scroll` lines up from the end (V210-82): drawn from the
     // top, a room that outgrew the pane hid every new message below its bottom edge. The lines
     // are wrapped here, not by the widget, so the count the window is taken from is the count
@@ -921,6 +937,13 @@ fn render_timeline(
             break;
         }
         while let Some(n) = said.next_if(|n| n.timestamp > m.timestamp) {
+            push(&mut rows, None, None, notice_line(n));
+        }
+        for n in room_notices
+            .iter()
+            .rev()
+            .filter(|n| n.after == Some(m.entry_hash))
+        {
             push(&mut rows, None, None, notice_line(n));
         }
         // Under a message it sent, who has read it, or where it is while nobody is known to

@@ -1468,8 +1468,9 @@ impl DaemonCore {
             } else {
                 crate::agent_hook::addressed(&r.text, me.as_ref(), trusted)
             },
-            // Displayed as a time of day, so seconds; the full precision is kept for ordering.
-            timestamp: r.created_millis / 1_000,
+            // Milliseconds: the timeline orders by it (a whole second put a room's change made
+            // just after a post above it); only a display rounds it.
+            timestamp: r.created_millis,
             // As `vox room read` and the drain show it, a structured post by its words (#406), and
             // an address in it readable, in this node's names (ADR-028 S-1a).
             body: Some(if r.owed {
@@ -1665,7 +1666,8 @@ impl DaemonCore {
                         .notices
                         .iter()
                         .map(|n| NoticeView {
-                            timestamp: n.created_millis / 1_000,
+                            timestamp: n.created_millis,
+                            after: n.after,
                             text: format!(
                                 "{} {}",
                                 if me == Some(n.author) {
@@ -1815,9 +1817,8 @@ impl DaemonCore {
                                     &x.id,
                                 ),
                                 node_alias,
-                                opened: x.opened_millis / 1_000,
-                                ended: (!x.open)
-                                    .then(|| x.ended_millis.unwrap_or(x.opened_millis) / 1_000),
+                                opened: x.opened_millis,
+                                ended: (!x.open).then(|| x.ended_millis.unwrap_or(x.opened_millis)),
                                 can_drive: x.can_drive,
                                 waiting: self.waiting_sessions.contains(&(
                                     d.channel_id,
