@@ -21,9 +21,9 @@ struct ComposerAddress: View {
             } label: {
                 Text(addressed).lineLimit(1).truncationMode(.tail)
             }
-            // At least wide enough for "To: the room": with no minimum the label collapsed and
-            // only the menu's chevron showed.
-            .frame(minWidth: 110, maxWidth: 160)
+            // As wide as what it says ("To: the room", one name, or how many): with no width
+            // the label collapsed to the chevron, and a fixed one cut it ("TO: THE…").
+            .fixedSize()
             .accessibilityLabel(addressedInFull)
             .accessibilityIdentifier("compose-to")
             Toggle("Urgent", isOn: $urgent)
@@ -31,7 +31,7 @@ struct ComposerAddress: View {
                 .accessibilityIdentifier("compose-urgent")
                 .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")
         }
-        .eyebrow()
+        .caption()
     }
 
     private var names: [String] { model.members.filter { to.contains($0.id) }.map(\.name) }

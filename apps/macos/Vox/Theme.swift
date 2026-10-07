@@ -119,11 +119,13 @@ private struct Typeset: ViewModifier {
     let face: VoxTokens.Face
     let font: Font
     let size: Double
+    /// Set the face's case: never for a caption, whose case is its content.
+    var keepCase = false
 
     func body(content: Content) -> some View {
         content.font(font)
             .tracking(face.tracking * size)
-            .textCase(face.uppercase ? .uppercase : nil)
+            .textCase(face.uppercase && !keepCase ? .uppercase : nil)
     }
 }
 
@@ -165,6 +167,15 @@ extension View {
         let face = VoxTokens.Fonts.appEyebrow
         return modifier(Typeset(face: face, font: Theme.eyebrow,
                                 size: face.size ?? NSFont.systemFontSize))
+    }
+
+    /// The eyebrow's face, size and tracking, never its case: for what carries a name, a link or
+    /// anything a person or a peer wrote, whose case is its content (an uppercased URL is another
+    /// URL, an uppercased alias another name).
+    func caption() -> some View {
+        let face = VoxTokens.Fonts.appEyebrow
+        return modifier(Typeset(face: face, font: Theme.eyebrow,
+                                size: face.size ?? NSFont.systemFontSize, keepCase: true))
     }
 
     /// A large heading, in the token file's face and tracking (L-7).

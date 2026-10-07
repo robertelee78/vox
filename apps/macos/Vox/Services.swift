@@ -114,7 +114,7 @@ private struct SharedServiceBox: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(service.address).font(Theme.mono).fontWeight(.bold).textSelection(.enabled)
-            Text("by \(service.by) in \(room)  ·  \(service.kind)").eyebrow().secondaryText()
+            Text("by \(service.by) in \(room)  ·  \(service.kind)").caption().secondaryText()
             ForEach(Array(service.commands.enumerated()), id: \.offset) { _, command in
                 HStack(alignment: .firstTextBaseline) {
                     Text(command.what).eyebrow().secondaryText().frame(width: 56, alignment: .leading)
