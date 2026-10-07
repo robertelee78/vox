@@ -198,7 +198,8 @@ private struct RoomView: View {
                                                 .accessibilityIdentifier(item.id)
                                                 .id(item.id)
                                         } else if let entry = item.entry, let session = model.shownSession {
-                                            SessionEntryRow(model: model, session: session, entry: entry)
+                                            SessionEntryRow(model: model, session: session,
+                                                            entry: entry) { looking = $0 }
                                                 .id(item.id)
                                         }
                                     }

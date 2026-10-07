@@ -3,6 +3,7 @@
 // Session's opening and end; a Session shows itself, its entries to a member with drive, and to
 // one without only that it is there.
 
+import AppKit
 import SwiftUI
 
 /// What the room's timeline shows (CL-2): its own conversation, that and every Session's opening
@@ -103,6 +104,8 @@ struct SessionEntryRow: View {
     @ObservedObject var model: NodeModel
     let session: FfiSession
     let entry: FfiSessionEntry
+    /// Open a pulled copy with Quick Look.
+    let look: (URL) -> Void
     @State private var details = false
 
     var body: some View {
@@ -111,6 +114,16 @@ struct SessionEntryRow: View {
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
                 RequestView(model: model, session: session, request: request)
+            }
+            // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
+            if let file = entry.file, let pulled = file.pulledPath {
+                HStack {
+                    Button("Quick Look") { look(URL(fileURLWithPath: pulled)) }
+                        .accessibilityIdentifier("quick-look-\(file.name)")
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: pulled)])
+                    }
+                }
             }
             if !entry.details.isEmpty {
                 Button(details ? "Hide details" : "Details") { details.toggle() }
