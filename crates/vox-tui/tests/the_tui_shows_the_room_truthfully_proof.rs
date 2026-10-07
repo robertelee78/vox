@@ -83,8 +83,8 @@
 //!   fingerprint shows grouped with its art; `x` dismisses it on Bob's node alone, and nothing
 //!   reaches the room; with Bob's node detached and attached again, Frank stays dismissed and
 //!   Carol, who trusts Bob, is still offered (ADR-028 K-15, K-17, K-18, #526);
-//! - `reoffer`: Frank leaves and joins again, and is offered again: a dismissal is kept against the
-//!   join (K-18);
+//! - `reoffer`: Frank leaves and joins again, and is offered again; dismissed again, he leaves and
+//!   joins once more, and is offered again: a dismissal is kept against the join (K-18);
 //! - `trust`: the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
 //!   in the members pane opens the trust prompt showing his fingerprint; Dave's fingerprint pasted
 //!   there adds nothing, says not to trust him and shows both; Frank's own, pasted through the
@@ -189,8 +189,9 @@
 //! `:interrupt` sent as a stop (`steer`),
 //! a Session's `:share` sending the path as text (`share`), notices placed by time again
 //! (`order`), or times rounded to the second (`session-order`). It passes only on the script's PASS with
-//! all 50 claims ok. Also: the dismissals not kept across a restart (`offer`), or no offer from a
-//! consent grant, so no offer back (`offerback`).
+//! all 50 claims ok. Also: the dismissals not kept across a restart (`offer`), a dismissal kept
+//! against the member rather than its join, so no offer when it joins again (`reoffer`), or no
+//! offer from a consent grant, so no offer back (`offerback`).
 //!
 //! A `vox` step on the way to the claims that fails (an identity, a daemon, create, invite, join,
 //! trust, a post, the roster, the TUI drawing the room or answering a command it supports) is
@@ -267,7 +268,7 @@ fn the_tui_shows_the_room_truthfully_and_consents_to_the_member_chosen() {
     // A hung proof is a failing proof (ADR-018 §6), and the driver is bounded on its own (#240).
     // Its bounds are the product's: a member waits 480 s for a joiner's proof of work (V210-87),
     // which a debug build can take minutes to grind, and the driver joins three members at once, then
-    // a fourth while the TUI is open and has it join again (`reoffer`), opens the TUI once more
+    // a fourth while the TUI is open and has it join again twice (`reoffer`), opens the TUI once more
     // (`offer`) and three times more (`depths`, about 90 s).
     // So the driver's budget is 1950 s, it is stopped from outside at 1980 s, and the watchdog is
     // past both. A release run takes about two minutes.

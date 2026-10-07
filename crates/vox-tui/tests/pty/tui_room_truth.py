@@ -91,8 +91,8 @@ timeline pane holds. Bob's daemon is stopped and his real `vox tui` is opened in
             fingerprint shows grouped with its art; `x` dismisses it, on Bob's node alone (nothing
             reaches the room); with Bob's node detached and attached again, Frank stays dismissed
             and Carol (who trusts Bob) is still offered (ADR-028 K-15, K-17, K-18, #526);
-  reoffer   Frank leaves and joins again, and is offered again (K-18: a dismissal is kept against
-            the join);
+  reoffer   Frank leaves and joins again, and is offered again; dismissed, he leaves and joins once
+            more, and is offered again (K-18: a dismissal is kept against the join);
   trust     the join's line offers ":trust <frank's first 8>" (ADR-028 K-5, #475); `t` on Frank
             in Bob's members pane opens the trust prompt, showing his fingerprint; Dave's pasted
             there adds nothing and shows both fingerprints; Frank's own, pasted through the hint's
@@ -1149,13 +1149,29 @@ try:
           f"still dismissed {frank_kept_out}; sidebar {side()!r}")
 
     stage("reoffer")
-    # A dismissal is kept against Frank's join: he leaves and joins again, and is offered again.
-    lv = run("frank", "room", "leave", room)
-    if lv.returncode != 0: product(f"frank's `vox room leave` failed: {lv.stderr.strip()}")
-    j = run("frank", "room", "join", "--passphrase-file", "-", link, stdin="room pass")
-    if j.returncode != 0: product(f"frank's second `vox room join` failed: {j.stderr.strip()}")
-    again = tui.until(lambda: offered("frank"), 120, 1)
-    claim("reoffer", again, f"after frank left and joined again, bob's sidebar: {side()!r}")
+    # A dismissal is kept against Frank's join: each time he leaves and joins again he is offered
+    # again, the second time as well as the first, dismissed in between.
+    def rejoin(n):
+        lv = run("frank", "room", "leave", room)
+        if lv.returncode != 0: product(f"frank's `vox room leave` ({n}) failed: {lv.stderr.strip()}")
+        j = run("frank", "room", "join", "--passphrase-file", "-", link, stdin="room pass")
+        if j.returncode != 0: product(f"frank's `vox room join` ({n}) failed: {j.stderr.strip()}")
+        return tui.until(lambda: offered("frank"), 120, 1)
+    again = rejoin("again")
+    again_side = side()
+    redismissed = select_offer("frank")
+    tui.key("x", 2)
+    redismissed = redismissed and tui.until(lambda: not offered("frank"), 10, 0.5)
+    twice = rejoin("a third time")
+    # The room selected again, as the later stages expect: Down past the offers.
+    for _ in range(10):
+        if any(r.startswith("▶ family") for r in side()):
+            break
+        tui.key("\x1b[B", 0.5)
+    claim("reoffer", again and redismissed and twice,
+          f"after frank left and joined again, offered: {again} (sidebar {again_side!r}); dismissed "
+          f"again: {redismissed}; after he left and joined once more, offered: {twice} (sidebar "
+          f"{side()!r})")
 
     stage("trust")
     # ADR-028 K-5 (#475): the join's line offers the one trust action, ":trust <frank's first 8>";
