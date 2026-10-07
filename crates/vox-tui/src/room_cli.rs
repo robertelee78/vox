@@ -1176,6 +1176,40 @@ async fn own_in(
         .unwrap_or_default()
 }
 
+/// What was done to `room` (its retention set, its name changed), in the room's order, each with
+/// the row it follows (ADR-028 R-1, R-7): from the node's view; none when it does not answer.
+async fn notices_in(
+    client: &mut IpcClient,
+    room: &Digest32,
+) -> Vec<vox_core::node::channel::RoomNotice> {
+    let body = vox_core::node::snapshot::request_body();
+    let Ok(reply) = client.exchange(&body).await else {
+        return Vec::new();
+    };
+    let Ok(Some(snap)) = vox_core::node::snapshot::NodeSnapshot::from_bytes(&reply) else {
+        return Vec::new();
+    };
+    snap.open
+        .into_iter()
+        .find(|o| o.channel_id == *room)
+        .map(|o| o.notices)
+        .unwrap_or_default()
+}
+
+/// A notice as `vox room read --json` gives it, among the rows: its own schema, so a program that
+/// reads messages skips it; who did it, by this node's names; and its time in milliseconds.
+fn notice_value(room_key: &str, n: &vox_core::node::channel::RoomNotice) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "vox.room.notice/1",
+        "room": room_key,
+        "entry_hash": claim::b32(&n.entry_hash),
+        "author": claim::b32(&n.author),
+        "by": crate::ident::name_of(&n.author),
+        "created_millis": n.created_millis,
+        "notice": n.what,
+    })
+}
+
 /// `pulled by <names>`, by this node's names, sorted.
 fn pulled_by_line(who: &[Digest32]) -> Option<String> {
     let mut names: Vec<String> = who.iter().map(crate::ident::name_of).collect();
@@ -1337,7 +1371,8 @@ pub(crate) async fn answers(
 /// `vox room read` — the room's messages, optionally only what follows a cursor.
 ///
 /// Each line is `<entry-hash> <author> <text>`; with `--json`, one
-/// `vox.room.row/1` object per line. The entry hash **is** the cursor.
+/// `vox.room.row/1` object per line. The entry hash **is** the cursor. With `--notices` too, what
+/// was done to the room, as `vox.room.notice/1` objects among them.
 ///
 /// # Errors
 /// If the node cannot be reached, the room is unknown, or the cursor is not in it.
@@ -1348,6 +1383,7 @@ pub async fn read(
     limit: u64,
     json: bool,
     only_late: bool,
+    with_notices: bool,
 ) -> Result<(), AppError> {
     let (mut client, channel_id, room_key) = open_room(paths, room).await?;
     let since = match since {
@@ -1426,7 +1462,20 @@ pub async fn read(
     let group = coord::structured(&mut client, channel_id, &[], &ids).await?;
     let ops = coord::index_of(&coord::posted_of(&group));
     let (read_by, pulled_by) = own_in(&mut client, &channel_id).await;
+    // Asked for (`--notices`), what was done to the room, each right after the row it follows in
+    // the room's order (a notice before every row only when reading from the start; one after a
+    // row not read here is not this page's).
+    let notices = if with_notices {
+        notices_in(&mut client, &channel_id).await
+    } else {
+        Vec::new()
+    };
     let mut out = std::io::stdout().lock();
+    if since.is_none() {
+        for n in notices.iter().filter(|n| n.after.is_none()) {
+            let _ = writeln!(out, "{}", notice_value(&room_key, n));
+        }
+    }
     for r in &shown {
         let mut row = row_value(&room_key, r, &ops, None);
         // Under a share this node sent, who has pulled it whole (ADR-028 F-7).
@@ -1442,6 +1491,9 @@ pub async fn read(
             row["read_by"] = names.into();
         }
         let _ = writeln!(out, "{row}");
+        for n in notices.iter().filter(|n| n.after == Some(r.entry_hash)) {
+            let _ = writeln!(out, "{}", notice_value(&room_key, n));
+        }
     }
     Ok(())
 }

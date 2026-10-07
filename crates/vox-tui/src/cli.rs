@@ -1315,6 +1315,12 @@ pub struct RoomReadArgs {
     /// One `vox.room.row/1` JSON object per line.
     #[arg(long)]
     pub json: bool,
+    /// With `--json`, also what was done to the room (its retention set, its name changed), each
+    /// as a `vox.room.notice/1` object right after the row it follows in the room's order, its
+    /// time in milliseconds. Off by default: a program that reads rows takes only
+    /// `vox.room.row/1` (ADR-021 7.6).
+    #[arg(long, requires = "json", conflicts_with = "late")]
+    pub notices: bool,
     /// Print every entry this node holds for the room in the room's order, one per
     /// line as `<entry-hash> <clock-ms>` — readable or not. The sequence every member's view is a part of,
     /// and the one that must be identical on every node.
@@ -2334,6 +2340,7 @@ pub fn run() -> ExitCode {
                                 a.limit,
                                 a.json,
                                 a.late,
+                                a.notices,
                             )
                             .await
                         }
