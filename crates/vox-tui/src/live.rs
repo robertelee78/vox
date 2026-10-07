@@ -242,6 +242,8 @@ struct Projected {
     me: Option<Digest32>,
     trusted: Vec<(Digest32, String)>,
     own: Own,
+    /// The names the rows' addresses were written readable with (ADR-028 S-1a).
+    names: vox_core::node::resolver::VoxResolver,
     len: usize,
     rows: std::sync::Arc<Vec<MessageView>>,
 }
@@ -1141,6 +1143,7 @@ impl DaemonCore {
         me: Option<Digest32>,
         trusted: &[(Digest32, String)],
         own: &Own,
+        names: &vox_core::node::resolver::VoxResolver,
     ) -> std::sync::Arc<Vec<MessageView>> {
         let images = &self.images;
         let Some(t) = self.timeline.as_mut() else {
@@ -1260,11 +1263,12 @@ impl DaemonCore {
             },
             // Displayed as a time of day, so seconds; the full precision is kept for ordering.
             timestamp: r.created_millis / 1_000,
-            // As `vox room read` and the drain show it, a structured post by its words (#406).
+            // As `vox room read` and the drain show it, a structured post by its words (#406), and
+            // an address in it readable, in this node's names (ADR-028 S-1a).
             body: Some(if r.owed {
                 vox_core::node::api::NOT_RECEIVED_YET.to_owned()
             } else {
-                crate::agent_hook::words(&r.text)
+                names.readable_in(&crate::agent_hook::words(&r.text))
             }),
             late: r.late,
             read_by: readers(r),
@@ -1287,6 +1291,7 @@ impl DaemonCore {
                     && p.verified == images.len()
                     && p.trusted.as_slice() == trusted
                     && p.own == *own
+                    && p.names == *names
                     && p.len <= held.len()
                     && !quoted_late(p) =>
             {
@@ -1303,6 +1308,7 @@ impl DaemonCore {
                     me,
                     trusted: trusted.to_vec(),
                     own: own.clone(),
+                    names: names.clone(),
                     len: held.len(),
                     rows: std::sync::Arc::clone(&rows),
                 });
@@ -1407,6 +1413,8 @@ impl DaemonCore {
             .collect();
         machine_nodes.sort();
         machine_nodes.dedup();
+        // This node's names, for every address the views write readable (ADR-028 S-1a).
+        let names = vox_core::node::resolver::VoxResolver::of_snapshot(&snap);
         let timeline = self.active.and_then(|cid| {
             let room = snap.open.iter().find(|d| d.channel_id == cid)?;
             let own = Own {
@@ -1415,7 +1423,7 @@ impl DaemonCore {
                 pulled_by: room.pulled_by.clone(),
                 others: room.members.iter().filter(|m| me != Some(**m)).count() as u64,
             };
-            Some(self.project_timeline(me, &snap.trusted, &own))
+            Some(self.project_timeline(me, &snap.trusted, &own, &names))
         });
         let active = self.active.and_then(|cid| {
             snap.open
@@ -1485,13 +1493,6 @@ impl DaemonCore {
                     // What is shared here, in this operator's own words (V030-25): the same
                     // addresses `vox service list` prints.
                     shared: {
-                        let mut names = vox_core::node::resolver::VoxResolver::new();
-                        for o in &snap.open {
-                            names.add_room(o.channel_id, o.name.as_deref(), &o.members);
-                        }
-                        for (fp, petname) in &snap.trusted {
-                            names.name(*fp, petname);
-                        }
                         d.shares
                             .iter()
                             .map(|s| {
