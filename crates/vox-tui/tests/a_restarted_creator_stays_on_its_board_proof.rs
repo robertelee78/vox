@@ -7,7 +7,7 @@
 //! member bundle and no address record, to any board, ever again. Once the records it had put up
 //! before the restart lapsed, nobody could find the creator through its anchor.
 //!
-//! Every process runs with `VOX_TEST_RECORD_TTL_SECS` = [`TTL`] (test-only, lower-only), so a
+//! Every process runs with `VOX_TEST_RECORD_TTL_MS` at [`TTL`] seconds (test-only, lower-only), so a
 //! record lapses in seconds:
 //!
 //! 1. Alice creates a room behind a real `vox node` anchor. She is its only member.
@@ -92,7 +92,7 @@ fn daemon(name: &str, data: &Path, spec: &str, pass_file: &Path, ttl: &str) -> V
                 .to_str()
                 .expect("APPARATUS: a path that is not UTF-8"),
         ]),
-        &[("VOX_TEST_RECORD_TTL_SECS", ttl)],
+        &[("VOX_TEST_RECORD_TTL_MS", ttl)],
     );
     let deadline = Instant::now() + TIMEOUT;
     while Instant::now() < deadline {
@@ -136,7 +136,7 @@ fn anchor_on(name: &str, data: &Path, port: u16, ttl: &str) -> (VoxProc, String)
         name,
         data,
         &args(&["node", "--listen", &format!("127.0.0.1:{port}")]),
-        &[("VOX_TEST_RECORD_TTL_SECS", ttl)],
+        &[("VOX_TEST_RECORD_TTL_MS", ttl)],
     );
     let spec = p
         .expect_line("an --anchor spec", |l| {
@@ -165,8 +165,8 @@ fn stop(mut p: VoxProc) {
 #[ignore = "real vox processes with production Argon2id, idle past a record lifetime; run in release"]
 fn a_restarted_creator_stays_findable_on_its_board() {
     watchdog::arm();
-    test_knobs::require(&["VOX_TEST_RECORD_TTL_SECS"]);
-    let ttl_s = TTL.to_string();
+    test_knobs::require(&["VOX_TEST_RECORD_TTL_MS"]);
+    let ttl_s = (TTL * 1_000).to_string();
     let tmp = tempfile::tempdir().expect("APPARATUS: no temp dir");
     let dir = |n: &str| {
         let d = tmp.path().join(n);

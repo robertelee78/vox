@@ -190,13 +190,13 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
     let s2 = stranger(0x52);
     let policy = ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        ttl: 0,
+        ttl_ms: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };
-    let genesis = Genesis::create(&s, hostile::now(), policy)
+    let genesis = Genesis::create(&s, hostile::now_ms(), policy)
         .expect("APPARATUS: build the stand-in peer's records");
     let fake = genesis.channel_id();
-    let t = hostile::now();
+    let t = hostile::now_ms();
     let ring2 = PrekeyRing::generate(&s2, &[0x3D; 32], t)
         .expect("APPARATUS: generate the stand-in peer's prekeys");
     let witness = JoinWitness::build(&s, &fake, 0, &s2.fingerprint(), t)
@@ -210,7 +210,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
             .expect("APPARATUS: build the stand-in peer's records"),
         1,
         t,
-        3600,
+        3_600_000,
         Admission::Witnessed(Box::new(witness)),
     )
     .expect("APPARATUS: build the stand-in peer's records")
@@ -222,7 +222,7 @@ fn a_trusted_anchor_serves_only_rooms_its_operator_trusts() {
         EndpointList::new(Vec::new()).expect("APPARATUS: build the stand-in peer's records"),
         1,
         t,
-        3600,
+        3_600_000,
     )
     .expect("APPARATUS: build the stand-in peer's records")
     .to_wire();

@@ -129,12 +129,12 @@ impl KeyPackage {
         &self,
         ring: &mut crate::node::prekeys::PrekeyRing,
         ctx: &JoinContext,
-        now_secs: u64,
+        now_ms: u64,
     ) -> Result<Skdm> {
         let init = self.initial_message()?;
         let mut reuse = crate::pairwise::OtpReuseTracker::new();
         if let Some(id) = init.one_time_prekey_id {
-            match ring.use_one_time(id, now_secs) {
+            match ring.use_one_time(id, now_ms) {
                 crate::node::prekeys::OneTimeUse::Fresh => {}
                 crate::node::prekeys::OneTimeUse::Reused => {
                     reuse.observe(id);
@@ -167,7 +167,7 @@ impl KeyPackage {
             &mut reuse,
             ctx.floor,
         )?;
-        self.open(&mut session, now_secs)
+        self.open(&mut session, now_ms / 1_000)
     }
 
     /// The framed entry payload.

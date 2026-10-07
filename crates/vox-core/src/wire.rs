@@ -16,8 +16,14 @@
 
 use crate::error::{Error, Result};
 
-/// Current format version emitted for every struct in this build.
+/// The format version every struct is emitted at unless [`StructTag::format_version`] says
+/// otherwise.
 pub const FORMAT_VERSION: u8 = 1;
+
+/// The format version of a struct whose times are in **milliseconds** (the decider, 2026-10-07:
+/// every time Vox stores, sends, compares or expires is in milliseconds). Its version 1 carried
+/// them in seconds.
+pub const MS_FORMAT_VERSION: u8 = 2;
 
 /// The ADR-008 struct-type tag registry. The 2-byte tag identifies the
 /// structure so identical canonical bytes are never cross-interpreted (the
@@ -161,11 +167,90 @@ impl StructTag {
             .ok_or(Error::UnknownStructTag(v))
     }
 
-    /// The ASCII domain-separation label `vox/<struct>/v1` used as the prefix of
-    /// this struct's signing input. This is the single source of truth for the
-    /// labels referenced by the individual ADRs.
+    /// The format version this build writes the struct at: [`MS_FORMAT_VERSION`] for a struct
+    /// that carries a time, [`FORMAT_VERSION`] otherwise.
+    #[must_use]
+    pub const fn format_version(self) -> u8 {
+        match self {
+            StructTag::RendezvousRecord
+            | StructTag::PreJoinRecord
+            | StructTag::MemberBundleRecord
+            | StructTag::JoinWitness
+            | StructTag::BoardWithdraw
+            | StructTag::GenesisRecord
+            | StructTag::AdminCert
+            | StructTag::PolicyRotation
+            | StructTag::RoomLifecycle => MS_FORMAT_VERSION,
+            _ => FORMAT_VERSION,
+        }
+    }
+
+    /// Whether a version-1 frame of this struct, whose times are in seconds, is still read. A
+    /// struct a room's log keeps (its genesis, an admin cert, a policy update, a lifecycle fact) is
+    /// read at version 1 and its seconds converted, so every room made before stays as it was
+    /// and its id is unchanged. A board record expires within days and every node upgrades
+    /// together, so its version 1 is refused ([`Error::OlderFormat`]).
+    #[must_use]
+    pub const fn reads_seconds_format(self) -> bool {
+        matches!(
+            self,
+            StructTag::GenesisRecord
+                | StructTag::AdminCert
+                | StructTag::PolicyRotation
+                | StructTag::RoomLifecycle
+        )
+    }
+
+    /// A person's name for the struct, for a refusal.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            StructTag::RendezvousRecord => "board record",
+            StructTag::PreJoinRecord => "pre-join board record",
+            StructTag::MemberBundleRecord => "member bundle board record",
+            StructTag::JoinWitness => "join witness",
+            StructTag::BoardWithdraw => "board withdraw",
+            StructTag::GenesisRecord => "room genesis",
+            StructTag::AdminCert => "admin certificate",
+            StructTag::PolicyRotation => "retention change",
+            StructTag::RoomLifecycle => "room lifecycle fact",
+            _ => "record",
+        }
+    }
+
+    /// The domain-separation label at `version`: [`StructTag::domain_sep`] for the version this
+    /// build writes, and the version-1 label of a struct that changed, so a version-1 struct read
+    /// from a log is verified over exactly what its signer signed.
+    #[must_use]
+    pub const fn domain_sep_at(self, version: u8) -> &'static str {
+        if version == self.format_version() {
+            return self.domain_sep();
+        }
+        self.domain_sep_v1()
+    }
+
+    /// The ASCII domain-separation label used as the prefix of this struct's signing input, at
+    /// the version this build writes: `vox/<struct>/v2` for a struct at [`MS_FORMAT_VERSION`],
+    /// `vox/<struct>/v1` otherwise. This is the single source of truth for the labels referenced
+    /// by the individual ADRs.
     #[must_use]
     pub const fn domain_sep(self) -> &'static str {
+        match self {
+            StructTag::RendezvousRecord => "vox/rendezvous-record/v2",
+            StructTag::PreJoinRecord => "vox/pre-join-record/v2",
+            StructTag::MemberBundleRecord => "vox/member-bundle-record/v2",
+            StructTag::JoinWitness => "vox/join-witness/v2",
+            StructTag::BoardWithdraw => "vox/board-withdraw/v2",
+            StructTag::GenesisRecord => "vox/genesis/v2",
+            StructTag::AdminCert => "vox/admin-cert/v2",
+            StructTag::PolicyRotation => "vox/policy-rotation/v2",
+            StructTag::RoomLifecycle => "vox/room-lifecycle/v2",
+            _ => self.domain_sep_v1(),
+        }
+    }
+
+    /// The version-1 label of every struct.
+    const fn domain_sep_v1(self) -> &'static str {
         match self {
             StructTag::LogEntry => "vox/log-entry/v1",
             StructTag::Skdm => "vox/skdm/v1",
@@ -201,12 +286,19 @@ impl StructTag {
     }
 }
 
-/// Frame a canonical CBOR body for the wire: `tag(2 BE) ‖ version(1) ‖ body`.
+/// Frame a canonical CBOR body for the wire: `tag(2 BE) ‖ version(1) ‖ body`, at the version
+/// this build writes the struct ([`StructTag::format_version`]).
 #[must_use]
 pub fn frame(tag: StructTag, body: &[u8]) -> Vec<u8> {
+    frame_at(tag, tag.format_version(), body)
+}
+
+/// [`frame`] at `version`: a version-1 struct read from a log is written back exactly as it was.
+#[must_use]
+pub fn frame_at(tag: StructTag, version: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len().saturating_add(3));
     out.extend_from_slice(&tag.as_u16().to_be_bytes());
-    out.push(FORMAT_VERSION);
+    out.push(version);
     out.extend_from_slice(body);
     out
 }
@@ -233,11 +325,21 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>> {
         tag: tag_val,
         version: 0,
     })?;
-    if version != FORMAT_VERSION {
-        return Err(Error::UnsupportedVersion {
-            tag: tag_val,
-            version,
-        });
+    if version != tag.format_version() {
+        if version == FORMAT_VERSION && tag.format_version() == MS_FORMAT_VERSION {
+            if !tag.reads_seconds_format() {
+                return Err(Error::OlderFormat {
+                    what: tag.name(),
+                    version,
+                    current: MS_FORMAT_VERSION,
+                });
+            }
+        } else {
+            return Err(Error::UnsupportedVersion {
+                tag: tag_val,
+                version,
+            });
+        }
     }
     Ok(Frame {
         tag,
@@ -246,11 +348,40 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>> {
     })
 }
 
+/// A time held in milliseconds, as a struct at `version` encodes it: whole seconds at
+/// [`FORMAT_VERSION`] (1), for a struct written before its times were milliseconds. Such a struct
+/// was read from whole seconds ([`time_decoded`]), so this is exact.
+#[must_use]
+pub const fn time_encoded(ms: u64, version: u8) -> u64 {
+    if version == FORMAT_VERSION {
+        ms / 1_000
+    } else {
+        ms
+    }
+}
+
+/// A time as a struct at `version` encodes it, in milliseconds: never a value read in the wrong
+/// unit.
+#[must_use]
+pub const fn time_decoded(v: u64, version: u8) -> u64 {
+    if version == FORMAT_VERSION {
+        v.saturating_mul(1_000)
+    } else {
+        v
+    }
+}
+
 /// Build the signing/authentication input for a struct: `domain_sep ‖ body`
 /// (ADR-008). `body` is the canonical CBOR encoding of the struct's fields.
 #[must_use]
 pub fn signing_input(tag: StructTag, body: &[u8]) -> Vec<u8> {
-    let dom = tag.domain_sep().as_bytes();
+    signing_input_at(tag, tag.format_version(), body)
+}
+
+/// [`signing_input`] at `version`: what the signer of a version-1 struct signed.
+#[must_use]
+pub fn signing_input_at(tag: StructTag, version: u8, body: &[u8]) -> Vec<u8> {
+    let dom = tag.domain_sep_at(version).as_bytes();
     let mut out = Vec::with_capacity(dom.len().saturating_add(body.len()));
     out.extend_from_slice(dom);
     out.extend_from_slice(body);

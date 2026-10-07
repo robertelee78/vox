@@ -440,14 +440,14 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let s2 = stranger(0x52);
     let policy = ChannelPolicy {
         history_mode: HistoryMode::ForwardOnly,
-        ttl: 0,
+        ttl_ms: 0,
         min_suite: vox_core::suite::SuiteFloor::DAY_ONE.id(),
     };
-    let genesis = Genesis::create(&s, hostile::now(), policy)
+    let genesis = Genesis::create(&s, hostile::now_ms(), policy)
         .expect("APPARATUS (harness error): the stranger's genesis");
     let fake = genesis.channel_id();
     let minted = genesis.to_wire();
-    let t = hostile::now();
+    let t = hostile::now_ms();
     let ring2 = PrekeyRing::generate(&s2, &[0x3D; 32], t)
         .expect("APPARATUS (harness error): a prekey ring");
     let witness = JoinWitness::build(&s, &fake, 0, &s2.fingerprint(), t)
@@ -461,7 +461,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
-        3600,
+        3_600_000,
         Admission::Witnessed(Box::new(witness)),
     )
     .expect("APPARATUS (harness error): the second identity's bundle")
@@ -473,7 +473,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         EndpointList::new(Vec::new()).expect("APPARATUS (harness error): an empty endpoint list"),
         1,
         t,
-        3600,
+        3_600_000,
     )
     .expect("APPARATUS (harness error): the second identity's address record")
     .to_wire();
@@ -507,14 +507,15 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
 
     // ---- 3. a key nobody witnessed, vouched for by a real member ---------------------------
     let x = stranger(0x77);
-    let t = hostile::now();
+    let t = hostile::now_ms();
     let ring =
         PrekeyRing::generate(&x, &[0x3C; 32], t).expect("APPARATUS (harness error): a prekey ring");
     let bundle = ring
         .bundle(&x.public_key())
         .expect("APPARATUS (harness error): a prekey bundle");
-    let x_bundle = MemberBundleRecord::build(&x, &room, 0, bundle, 1, t, 3600, Admission::Creator)
-        .expect("APPARATUS (harness error): X's bundle");
+    let x_bundle =
+        MemberBundleRecord::build(&x, &room, 0, bundle, 1, t, 3_600_000, Admission::Creator)
+            .expect("APPARATUS (harness error): X's bundle");
     let x_address = RendezvousRecord::build(
         &x,
         &room,
@@ -522,7 +523,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         EndpointList::new(Vec::new()).expect("APPARATUS (harness error): an empty endpoint list"),
         1,
         t,
-        3600,
+        3_600_000,
     )
     .expect("APPARATUS (harness error): X's address record");
     let vouched = rt.block_on(put(&bravo_v, &x_bundle.to_wire()));
@@ -544,7 +545,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     // a stranger. Only the witness's signature separates it from a real one.
     let x2 = stranger(0x78);
     let forger = stranger(0x79);
-    let t = hostile::now();
+    let t = hostile::now_ms();
     let ring = PrekeyRing::generate(&x2, &[0x3E; 32], t)
         .expect("APPARATUS (harness error): a prekey ring");
     let mut forged = JoinWitness::build(&forger, &room, 0, &x2.fingerprint(), t)
@@ -558,7 +559,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
-        3600,
+        3_600_000,
         Admission::Witnessed(Box::new(forged)),
     )
     .expect("APPARATUS (harness error): X2's bundle")
@@ -570,7 +571,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         EndpointList::new(Vec::new()).expect("APPARATUS (harness error): an empty endpoint list"),
         1,
         t,
-        3600,
+        3_600_000,
     )
     .expect("APPARATUS (harness error): X2's address record")
     .to_wire();
@@ -592,7 +593,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     // ---- 3c. a pre-join put by one identity for another --------------------------------------
     let p = stranger(0x81);
     let q = stranger(0x82);
-    let t = hostile::now();
+    let t = hostile::now_ms();
     let qring =
         PrekeyRing::generate(&q, &[0x3F; 32], t).expect("APPARATUS (harness error): a prekey ring");
     let q_prejoin = PreJoinRecord::build(
@@ -616,6 +617,86 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
         on_victim.is_err() && on_anchor.is_err(),
         "PRODUCT: a pre-join was taken from an identity other than the one it names — one \
          connection can fill a room's pre-join slots (victim {on_victim:?}, anchor {on_anchor:?})"
+    );
+
+    // ---- 3d. a board record's lifetime is judged to the millisecond (#562) -----------------
+    // Two strangers each put their own pre-join, which lives `DEFAULT_TTL_MS` from its stamp: R1's
+    // stamped to end 900 ms from now, R2's to have ended 300 ms ago. Sent in the first 100 ms of a
+    // second, R1's end falls in the same whole second as now: a board that judged lifetimes in
+    // whole seconds would call it over on arrival.
+    let lifetime = vox_core::nat::store::DEFAULT_TTL_MS;
+    let (r1, r2) = (stranger(0x83), stranger(0x84));
+    let (_r1c, r1_v) = rt.block_on(connect(&r1, victim_addr, victim_id));
+    let (_r2c, r2_v) = rt.block_on(connect(&r2, victim_addr, victim_id));
+    let prejoin =
+        |who: &Arc<vox_core::identity::composite::SoftwareRootSigner>, seed: u8, stamp| {
+            let ring = PrekeyRing::generate(&**who, &[seed; 32], stamp)
+                .expect("APPARATUS (harness error): a prekey ring");
+            PreJoinRecord::build(
+                &**who,
+                &room,
+                ring.bundle(&who.public_key())
+                    .expect("APPARATUS (harness error): a prekey bundle"),
+                EndpointList::new(Vec::new())
+                    .expect("APPARATUS (harness error): an empty endpoint list"),
+                1,
+                stamp,
+            )
+            .expect("APPARATUS (harness error): a pre-join")
+        };
+    let (r1_rec, r2_rec, sent_at) = loop {
+        let now = hostile::now_ms();
+        if now % 1_000 < 50 {
+            let built = (
+                prejoin(&r1, 0x43, now + 900 - lifetime),
+                prejoin(&r2, 0x44, now - 300 - lifetime),
+            );
+            // Still inside the first 100 ms once both are signed, or wait for the next second.
+            if hostile::now_ms() % 1_000 < 100 {
+                break (built.0, built.1, now);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let (inside, inside_read) = rt.block_on(async {
+        let put = put(&r1_v, &r1_rec.to_wire()).await;
+        let mut client = RendezvousClient::open(&r1_v)
+            .await
+            .expect("PRODUCT (staging): the victim would not open a rendezvous stream");
+        let read = client.get(&room, 0, RecordKinds::PREJOINS).await;
+        client.finish();
+        (put, read)
+    });
+    let read_at = hostile::now_ms();
+    let past = rt.block_on(put(&r2_v, &r2_rec.to_wire()));
+    let r1_served = inside_read.as_ref().is_ok_and(|set| {
+        set.prejoins
+            .iter()
+            .any(|p| p.asserted_id() == r1.fingerprint())
+    });
+    println!(
+        "[proof] step: a pre-join with 900 ms of its lifetime left, sent {} ms into a second \
+         → {inside:?}, read back {} ms later: {}; one 300 ms past its lifetime → {past:?}",
+        sent_at % 1_000,
+        read_at - sent_at,
+        if r1_served { "served" } else { "not served" }
+    );
+    assert!(
+        read_at - sent_at < 900,
+        "APPARATUS (staging not achieved): the put and the read took {} ms, past the record's \
+         900 ms; nothing below would measure the lifetime",
+        read_at - sent_at
+    );
+    assert!(
+        inside.is_ok() && r1_served,
+        "PRODUCT: a board record with 900 ms of its lifetime left must be taken and served; the \
+         victim said {inside:?} and served {}",
+        if r1_served { "it" } else { "no such record" }
+    );
+    assert!(
+        past.as_ref().is_err_and(|e| e.contains("policy")),
+        "PRODUCT: a board record 300 ms past its lifetime must be refused as expired; the victim \
+         said {past:?}"
     );
 
     // ---- 4. the stranger's own room, on the anchor ----------------------------------------
@@ -644,7 +725,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
     let f1 = stranger(0x91);
     let f2 = stranger(0x92);
     let f2_forger = stranger(0x93);
-    let t = hostile::now();
+    let t = hostile::now_ms();
     let f1_ring = PrekeyRing::generate(&f1, &[0x40; 32], t)
         .expect("APPARATUS (harness error): a prekey ring");
     let f1_bundle = MemberBundleRecord::build(
@@ -656,7 +737,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
-        3600,
+        3_600_000,
         Admission::Creator,
     )
     .expect("APPARATUS (harness error): F1's bundle")
@@ -675,7 +756,7 @@ fn a_board_admits_only_verified_members_and_relays_only_within_a_room() {
             .expect("APPARATUS (harness error): a prekey bundle"),
         1,
         t,
-        3600,
+        3_600_000,
         Admission::Witnessed(Box::new(f2_witness)),
     )
     .expect("APPARATUS (harness error): F2's bundle")

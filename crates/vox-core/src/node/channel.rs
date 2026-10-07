@@ -1529,17 +1529,16 @@ impl ChannelState {
         name: &str,
         now: crate::time::Ms,
     ) -> Result<(Genesis, Sek)> {
-        let now_ms = now.get();
         if crate::governance::name::room_name(name).as_deref() != Ok(name) {
             return Err(Error::MalformedGovernance("room name is not a DNS label"));
         }
         let signer = profile.signer()?;
         let policy = ChannelPolicy {
             history_mode: HistoryMode::ForwardOnly,
-            ttl: 0,
+            ttl_ms: 0,
             min_suite: SuiteFloor::DAY_ONE.id(),
         };
-        let genesis = Genesis::create(signer, now_ms / 1_000, policy)?;
+        let genesis = Genesis::create(signer, now.get(), policy)?;
         Ok((genesis, Sek::generate()?))
     }
 
@@ -1631,7 +1630,7 @@ impl ChannelState {
 
         let mut admission = AdmissionPolicy::new();
         admission.admit(channel_id, epoch, me);
-        let origin_ms = genesis.body.created.saturating_mul(1_000);
+        let origin_ms = genesis.body.created_ms;
         let evaluator = Arc::new(Self::build_evaluator(&genesis, &authors, &[], now_ms)?);
         let mut room = Self {
             channel_id,
@@ -1775,7 +1774,7 @@ impl ChannelState {
         // ones again. Anything else that fails acceptance is a tampered store, and the room does
         // not open. (A body-less entry is not set aside here, as it is in v0.2.10: in v0.3.0 it is
         // a pruned skeleton, kept on purpose — ADR-023 decision 2.)
-        let mut dag = Dag::for_room(genesis.body.created.saturating_mul(1_000));
+        let mut dag = Dag::for_room(genesis.body.created_ms);
         let mut log_ids = std::collections::HashMap::new();
         let mut next_log_id = 1u64;
         let mut gov_entries = Vec::new();
@@ -2102,7 +2101,7 @@ impl ChannelState {
         )?);
         // By the room's retention; the node's own, set once the room is open, settles the rest
         // (`set_node_retention`).
-        let room_ttl = evaluator.policy().ttl;
+        let room_ttl = evaluator.policy().ttl_ms / 1_000;
         let owed = held_bare
             .into_iter()
             .filter(|(_, _, claimed)| !expired_at(*claimed, now_ms, room_ttl))
@@ -2175,7 +2174,7 @@ impl ChannelState {
         Evaluator::build_with_members(
             genesis,
             gov_entries,
-            now_ms / 1_000,
+            now_ms,
             |id| authors.get(id).cloned(),
             authors.keys().copied().collect(),
         )
@@ -2193,7 +2192,7 @@ impl ChannelState {
         Evaluator::build_reusing(
             genesis,
             gov_entries,
-            now_ms / 1_000,
+            now_ms,
             |id| authors.get(id).cloned(),
             authors.keys().copied().collect(),
             Some(prior),
@@ -2359,7 +2358,7 @@ impl ChannelState {
             sek,
             authors,
             admission,
-            dag: Dag::for_room(genesis.body.created.saturating_mul(1_000)),
+            dag: Dag::for_room(genesis.body.created_ms),
             forks_kept: 0,
             evaluator,
             sender,
@@ -4102,7 +4101,7 @@ impl ChannelState {
     /// force, as the evaluator folds it from the log.
     #[must_use]
     pub fn room_retention(&self) -> u64 {
-        self.evaluator.policy().ttl
+        self.evaluator.policy().ttl_ms / 1_000
     }
 
     /// Whether `member` sets this room's retention: its creator, or an admin it named — a holder
@@ -4296,7 +4295,7 @@ impl ChannelState {
             signer,
             &self.channel_id,
             self.epoch,
-            ttl,
+            ttl.saturating_mul(1_000),
         )?;
         self.append_governance(profile, &update.to_wire(), now_ms)?;
         Ok(())
@@ -6866,12 +6865,12 @@ impl ChannelState {
             entry_hash: c.entry_hash,
             author: c.author,
             created_millis: at(&c.entry_hash),
-            what: if c.ttl == 0 {
+            what: if c.ttl_ms == 0 {
                 "set the room's retention to forever: from now on no message is removed for its \
                  age"
                     .to_owned()
             } else {
-                let d = crate::node::retention::describe(c.ttl);
+                let d = crate::node::retention::describe(c.ttl_ms / 1_000);
                 format!(
                     "set the room's retention to {d}: messages older than {d} are removed from \
                      now on"
@@ -7082,19 +7081,21 @@ impl ChannelState {
         if lifecycle.ended_by.is_some() {
             return Some(RoomEnd::ByCreator);
         }
-        let idle = lifecycle.idle_end_secs?;
+        let idle_ms = lifecycle.idle_end_ms?;
         let last = self
             .dag
             .newest_clock()
             .unwrap_or_else(|| self.created().saturating_mul(1_000));
-        let at = last.saturating_add(idle.saturating_mul(1_000));
-        (now_ms >= at).then_some(RoomEnd::Idle { idle_secs: idle })
+        let at = last.saturating_add(idle_ms);
+        (now_ms >= at).then_some(RoomEnd::Idle {
+            idle_secs: idle_ms / 1_000,
+        })
     }
 
     /// The idle end this room's creator chose, in seconds, if any (V030-08).
     #[must_use]
     pub fn idle_end(&self) -> Option<u64> {
-        self.evaluator.lifecycle().idle_end_secs
+        self.evaluator.lifecycle().idle_end_ms.map(|ms| ms / 1_000)
     }
 
     /// End the room for everyone (V030-08). Only its creator, or an admin the creator delegated,
@@ -7266,7 +7267,7 @@ impl ChannelState {
             signer,
             &self.channel_id,
             self.epoch,
-            crate::governance::lifecycle::LifecycleKind::IdleEnd(idle_secs),
+            crate::governance::lifecycle::LifecycleKind::IdleEnd(idle_secs.saturating_mul(1_000)),
         )?;
         self.append_governance(profile, &fact.to_wire(), now_ms)
     }

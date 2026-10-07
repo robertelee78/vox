@@ -1,5 +1,6 @@
 //! Policy-update entries (ADR-007 §"Per-type body schemas", tag `0x0006`, domain
-//! `vox/policy-rotation/v1`).
+//! `vox/policy-rotation/v2`; `v1` for a format-1 update, whose retention was in seconds and is
+//! read as milliseconds, encoded and verified as it was written).
 //!
 //! A policy-update, issued by a holder of the `policy` capability — the room's creator or an
 //! admin (#319) — changes the room's **retention** (TTL) from its causal position forward.
@@ -16,7 +17,7 @@ use crate::cbor::{Decoder, Encoder};
 use crate::error::{Error, Result};
 use crate::hash::{Digest32, COMPOSITE_SIG_LEN};
 use crate::identity::composite::{CompositePublicKey, CompositeSignature, RootSigner};
-use crate::wire::{frame, parse_frame, signing_input, StructTag};
+use crate::wire::{frame_at, parse_frame, signing_input_at, time_decoded, time_encoded, StructTag};
 
 /// Body kind discriminant of a policy-update under the `PolicyRotation` tag (`0x0006`). Kind 2,
 /// the passphrase rotation, is reserved: never written, refused on decode (V030-32).
@@ -33,8 +34,10 @@ pub struct PolicyUpdateBody {
     pub epoch: u64,
     /// The issuing `policy`-holder's identity fingerprint.
     pub issuer_id: Digest32,
-    /// New retention in seconds (`0` = forever), or `None` to leave it unchanged.
-    pub ttl: Option<u64>,
+    /// New retention in milliseconds (`0` = forever), or `None` to leave it unchanged.
+    pub ttl_ms: Option<u64>,
+    /// The format it was written in (see [`crate::governance::genesis`]).
+    pub format: u8,
 }
 
 /// The elements a body or wire array holds: kind, channel, epoch, issuer, the history flag
@@ -50,7 +53,7 @@ impl PolicyUpdateBody {
     #[must_use]
     pub fn canonical_body(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(arity_for(self.ttl.is_some()));
+        e.array(arity_for(self.ttl_ms.is_some()));
         self.encode_fields(&mut e);
         e.finish()
     }
@@ -61,23 +64,28 @@ impl PolicyUpdateBody {
             .uint(self.epoch)
             .bytes(&self.issuer_id)
             .uint(0)
-            .uint(u64::from(self.ttl.is_some()));
-        if let Some(ttl) = self.ttl {
-            e.uint(ttl);
+            .uint(u64::from(self.ttl_ms.is_some()));
+        if let Some(ttl) = self.ttl_ms {
+            e.uint(time_encoded(ttl, self.format));
         }
         e.uint(0);
     }
 
-    /// The signing input: `vox/policy-rotation/v1 ‖ canonical_body` (ADR-008).
+    /// The signing input: `vox/policy-rotation/v2 ‖ canonical_body` (ADR-008), or the `v1` label
+    /// for a format-1 update.
     #[must_use]
     pub fn signing_input(&self) -> Vec<u8> {
-        signing_input(StructTag::PolicyRotation, &self.canonical_body())
+        signing_input_at(
+            StructTag::PolicyRotation,
+            self.format,
+            &self.canonical_body(),
+        )
     }
 
     /// Decode the fields after the array header from `d`, which is positioned at the kind. A
     /// wrong kind (the reserved rotation), a history-mode or suite-floor update, and any
     /// presence or arity inconsistency are refused.
-    fn decode_fields(d: &mut Decoder<'_>, arity: usize) -> Result<Self> {
+    fn decode_fields(d: &mut Decoder<'_>, arity: usize, format: u8) -> Result<Self> {
         if d.uint()? != KIND_POLICY_UPDATE {
             return Err(Error::MalformedGovernance("policy-update wrong body kind"));
         }
@@ -91,7 +99,7 @@ impl PolicyUpdateBody {
         }
         let ttl = match d.uint()? {
             0 => None,
-            1 => Some(d.uint()?),
+            1 => Some(time_decoded(d.uint()?, format)),
             _ => return Err(Error::MalformedGovernance("policy-update ttl_present")),
         };
         if d.uint()? != 0 {
@@ -108,7 +116,8 @@ impl PolicyUpdateBody {
             channel_id,
             epoch,
             issuer_id,
-            ttl,
+            ttl_ms: ttl,
+            format,
         })
     }
 }
@@ -123,19 +132,20 @@ pub struct PolicyUpdate {
 }
 
 impl PolicyUpdate {
-    /// Build and root-sign a policy-update setting the room's retention to `ttl` seconds
+    /// Build and root-sign a policy-update setting the room's retention to `ttl_ms` milliseconds
     /// (`0` = forever).
     pub fn build(
         issuer_root: &dyn RootSigner,
         channel_id: &Digest32,
         epoch: u64,
-        ttl: u64,
+        ttl_ms: u64,
     ) -> Result<Self> {
         let body = PolicyUpdateBody {
             channel_id: *channel_id,
             epoch,
             issuer_id: issuer_root.fingerprint(),
-            ttl: Some(ttl),
+            ttl_ms: Some(ttl_ms),
+            format: StructTag::PolicyRotation.format_version(),
         };
         let signature = issuer_root.sign(&body.signing_input())?;
         Ok(Self { body, signature })
@@ -146,10 +156,10 @@ impl PolicyUpdate {
     #[must_use]
     pub fn to_wire(&self) -> Vec<u8> {
         let mut e = Encoder::new();
-        e.array(arity_for(self.body.ttl.is_some()) + 1);
+        e.array(arity_for(self.body.ttl_ms.is_some()) + 1);
         self.body.encode_fields(&mut e);
         e.bytes(&self.signature.to_bytes());
-        frame(StructTag::PolicyRotation, &e.finish())
+        frame_at(StructTag::PolicyRotation, self.body.format, &e.finish())
     }
 
     /// Parse a framed policy-update (does NOT verify — call [`PolicyUpdate::verify`]).
@@ -163,7 +173,7 @@ impl PolicyUpdate {
         if !(8..=9).contains(&wire_arity) {
             return Err(Error::MalformedGovernance("policy-update wire arity"));
         }
-        let body = PolicyUpdateBody::decode_fields(&mut d, wire_arity - 1)?;
+        let body = PolicyUpdateBody::decode_fields(&mut d, wire_arity - 1, parsed.version)?;
         let signature = parse_sig(d.bytes()?)?;
         d.finish()?;
         Ok(Self { body, signature })

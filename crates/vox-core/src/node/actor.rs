@@ -4139,7 +4139,7 @@ pub struct Node {
     /// Per-channel record sequence for board publishes (strictly increasing per
     /// `(author, channel, epoch)`, ADR-012), across restarts too: see `next_record_seq`.
     record_seq: BTreeMap<Digest32, u64>,
-    /// Per channel: the earliest `timestamp` this process's next records may carry (V210-64). Moved
+    /// Per channel: the earliest `timestamp_ms` this process's next records may carry (V210-64). Moved
     /// forward, like `record_seq`, by a stale refusal; `record_timestamp` is the later of it and
     /// the clock.
     record_ts_floor: BTreeMap<Digest32, u64>,
@@ -5263,7 +5263,7 @@ impl Node {
                 self.profile = Some(p);
                 // A fresh identity gets its prekey ring immediately: without it the
                 // node has nothing to publish and cannot answer PQXDH.
-                if let Err(e) = self.load_prekeys(now) {
+                if let Err(e) = self.load_prekeys(self.now_ms().get()) {
                     return Outcome::Failed(fault_of(&e));
                 }
                 if let Err(e) = self.start_network() {
@@ -5281,8 +5281,7 @@ impl Node {
         };
         match profile.unlock(passphrase) {
             Ok(()) => {
-                let now = self.now();
-                if let Err(e) = self.load_prekeys(now) {
+                if let Err(e) = self.load_prekeys(self.now_ms().get()) {
                     // The identity is usable but the ring is not: lock again rather
                     // than run without key-agreement keys.
                     drop(self.lock_all().await);
@@ -5980,7 +5979,8 @@ impl Node {
     /// The `timestamp` for this process's next records in `channel_id`: the clock, or later if a
     /// stale refusal moved the floor past it (V210-64).
     fn record_timestamp(&self, channel_id: &Digest32) -> u64 {
-        self.now()
+        self.now_ms()
+            .get()
             .max(self.record_ts_floor.get(channel_id).copied().unwrap_or(0))
     }
 
@@ -7382,7 +7382,7 @@ impl Node {
                     let tries = self.stale_retries.get(&key).copied().unwrap_or(0);
                     if tries < STALE_REPUBLISH_TRIES && self.republish_pending.insert(key) {
                         // **And the `seq` floor moves on, not only the clock** (V210-61). A board
-                        // wants a later `seq` as well as a later second, and `seq` is floored by
+                        // wants a later `seq` as well as a later timestamp, and `seq` is floored by
                         // this process's millisecond clock: waiting a second per try let a process
                         // whose clock is behind its predecessor's catch up by one second a try, so
                         // three tries cured a lag of about three seconds and no more. #230's own
@@ -7393,8 +7393,8 @@ impl Node {
                         // three tries cover a lag of more than 15 s. `seq` is only compared, never
                         // bounded by a board, and it stays this process's own and increasing.
                         //
-                        // **And the `timestamp` floor with it** (V210-64): a board wants a later
-                        // second too, and a real clock step moves both clocks. **Both capped** at
+                        // **And the `timestamp_ms` floor with it** (V210-64): a board wants a later
+                        // timestamp too, and a real clock step moves both clocks. **Both capped** at
                         // `STALE_AHEAD_MAX_MS` past the clock, and never moved back.
                         let clock_ms = (self.millis_clock)();
                         let ahead = STALE_SEQ_STEP_MS << tries.min(8);
@@ -7404,12 +7404,12 @@ impl Node {
                             .max(clock_ms)
                             .saturating_add(ahead)
                             .min((*entry).max(cap));
-                        let now = self.now();
-                        let ts_cap = now.saturating_add(STALE_AHEAD_MAX_MS / 1_000);
+                        let now = self.now_ms().get();
+                        let ts_cap = now.saturating_add(STALE_AHEAD_MAX_MS);
                         let stamp = self.record_ts_floor.entry(channel_id).or_insert(0);
                         *stamp = (*stamp)
                             .max(now)
-                            .saturating_add(ahead / 1_000)
+                            .saturating_add(ahead)
                             .min((*stamp).max(ts_cap));
                         let past_the_second = 1_000 - (self.millis_clock)() % 1_000 + 50;
                         let tx = self.net_tx.clone();
@@ -8812,7 +8812,8 @@ impl Node {
             return;
         };
         let now_ms = self.now_ms();
-        let now = now_ms.secs();
+        // The pre-join record is stamped in milliseconds.
+        let now = now_ms.get();
         let me = net.local_id();
         // The boards to try, in the order `reach_a_board` tried them: the link's anchors, this
         // node's own, then any anchor it already holds a live connection to.
@@ -10249,11 +10250,9 @@ impl Node {
 
     /// Arm `room`'s next renewal at half its records' lifetime from now.
     fn arm_record_renewal(&mut self, room: &Digest32) {
-        let half_ms = crate::nat::store::own_record_ttl_secs().saturating_mul(1_000) / 2;
-        self.records_renew_at.insert(
-            *room,
-            self.now_ms().get().saturating_add(half_ms.max(1_000)),
-        );
+        let half = crate::nat::store::own_record_ttl_ms() / 2;
+        self.records_renew_at
+            .insert(*room, self.now_ms().get().saturating_add(half.max(1_000)));
     }
 
     /// ADR-025: a local append bumped the room's generation (inside the room's own write), so the
@@ -11779,7 +11778,7 @@ impl Node {
         init: &InitialMessage,
         ctx: &crate::join::session::JoinContext,
     ) -> Option<crate::pairwise::session::Session> {
-        let now = self.now();
+        let now = self.now_ms().get();
         let mut reuse = crate::pairwise::OtpReuseTracker::new();
         let profile = self.profile.as_ref()?;
         let store = profile.store();
@@ -12261,7 +12260,7 @@ impl Node {
                 room,
                 &me,
                 at.port(),
-                now / 1_000,
+                now,
             ));
             if !missing {
                 missing = channel
@@ -12296,7 +12295,7 @@ impl Node {
                 if m == me || found.contains_key(&m) || net.manager().existing(&m).is_some() {
                     continue;
                 }
-                if let Some(port) = crate::node::nearby::port_of(entries, room, &m, now / 1_000) {
+                if let Some(port) = crate::node::nearby::port_of(entries, room, &m, now) {
                     found.insert(m, port);
                 }
             }
@@ -12681,7 +12680,7 @@ impl Node {
     /// Load (or, on first use, generate) the prekey ring for the unlocked
     /// identity, rotating the signed prekey and refilling the one-time pool if due
     /// (ADR-002 §2 cadence, applied on every unlock).
-    fn load_prekeys(&mut self, now: u64) -> crate::error::Result<()> {
+    fn load_prekeys(&mut self, now_ms: u64) -> crate::error::Result<()> {
         let profile = self
             .profile
             .as_ref()
@@ -12690,7 +12689,8 @@ impl Node {
         // The ring's identity DH key is the identity's own (ADR-002), taken from the
         // unlocked vault — never a fresh one, or a restore would change it.
         let dh_secret = *signer.x25519_identity_secret();
-        let (ring, _created) = prekeys::load_or_create(profile.store(), signer, &dh_secret, now)?;
+        let (ring, _created) =
+            prekeys::load_or_create(profile.store(), signer, &dh_secret, now_ms)?;
         self.prekeys = Some(Arc::new(tokio::sync::Mutex::new(ring)));
         // The keyring is sealed under this identity, so it can only be opened now
         // (ADR-020 §3). Without this the node would hold an empty keyring and
@@ -12712,7 +12712,7 @@ impl Node {
     /// ran out of one-time prekeys after 64 sessions and never rotated. Cheap when nothing is
     /// due; a join holding the ring is left alone, and the next tick does it.
     fn maintain_prekeys(&mut self) {
-        let now = self.now();
+        let now = self.now_ms().get();
         let (Some(profile), Some(ring)) = (self.profile.as_ref(), self.prekeys.as_ref()) else {
             return;
         };
@@ -13508,7 +13508,7 @@ impl Node {
         channel_id: &Digest32,
         scope: crate::nat::withdraw::WithdrawScope,
     ) -> usize {
-        let now = self.now();
+        let now_ms = self.now_ms().get();
         let (Some(net), Some(profile)) = (self.net.as_ref().map(Arc::clone), self.profile.as_ref())
         else {
             return 0;
@@ -13521,7 +13521,7 @@ impl Node {
         };
         let epoch = shared.lock().await.epoch();
         let Ok(w) =
-            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now)
+            crate::nat::withdraw::BoardWithdraw::build(signer, channel_id, epoch, scope, now_ms)
         else {
             return 0;
         };
@@ -13868,9 +13868,9 @@ impl Node {
             // a member that left, or the whole room once it ended. A joiner reading it, or an
             // anchor this node mirrors to, would otherwise be handed them.
             if let Some(net) = self.net.as_ref() {
-                let now = self.now();
+                let now_ms = self.now_ms().get();
                 for d in &newly {
-                    net.forget_member_on_board(&cid, d, now);
+                    net.forget_member_on_board(&cid, d, now_ms);
                 }
                 if ended_here {
                     net.forget_room_on_board(&cid);
