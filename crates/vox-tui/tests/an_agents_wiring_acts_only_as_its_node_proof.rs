@@ -11,12 +11,26 @@
 //!    saying which and how to fix it, and passes the entry the plugin prints.
 //! 5. `vox agent hook` without `--node` refuses.
 //!
-//! No harness and no model runs: the harnesses' settings are files in this test's directories.
+//! And **`vox setup` wires each installed harness to a node of its own** (ADR-029 §7, #552), typed
+//! at a real terminal (a pty) as an operator types it: with Claude Code and OpenCode on `PATH` and
+//! Codex not, it says Codex is not found and makes no node for it; it makes `claude-<host>` and
+//! `opencode-<host>` with the passphrases typed; it installs each one's hook where the harness
+//! reads it, which `vox agent doctor` passes, keeping what Claude's settings already held and
+//! replacing the Vox hook for another node there; on macOS it offers a node for the person, and
+//! skipping it makes none (`vox node list` lists exactly the two); and it prints each node's
+//! fingerprint, grouped with its art, as `vox id` has it, with its alias, harness, host, OS and
+//! Vox version. Mutant: a harness not on `PATH` taken as found (a node made for Codex).
+//!
+//! No harness and no model runs: the harnesses' settings are files in this test's directories,
+//! and the harnesses' programs on `PATH` are stand-ins that only exist.
 
 #![cfg(unix)]
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const VOX: &str = env!("CARGO_BIN_EXE_vox");
 
@@ -175,5 +189,259 @@ fn an_agents_hooks_act_only_as_its_own_node() {
     assert!(
         !ok && err.contains("--node"),
         "PRODUCT: a hook without --node must refuse, naming it: {err}"
+    );
+}
+
+/// `vox setup` on a pseudo-terminal, as an operator runs it: what it printed, as text, and a way
+/// to answer it. Killed by its own handle when dropped.
+struct Setup {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    input: Box<dyn Write + Send>,
+    said: Arc<Mutex<String>>,
+}
+
+impl Drop for Setup {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Setup {
+    fn spawn(d: &Dirs, path: &str) -> Self {
+        use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem as _};
+        let pair = NativePtySystem::default()
+            .openpty(PtySize {
+                rows: 50,
+                cols: 200,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("APPARATUS: open a pty");
+        let r = &d.root;
+        let mut cmd = CommandBuilder::new(VOX);
+        cmd.arg("setup");
+        cmd.env_clear();
+        cmd.cwd(r);
+        for (k, v) in [
+            ("PATH", path.to_owned()),
+            ("HOME", r.join("home").display().to_string()),
+            ("USER", "proof".to_owned()),
+            ("TERM", "xterm-256color".to_owned()),
+            ("VOX_DATA_DIR", r.join("d").display().to_string()),
+            ("VOX_CONFIG_DIR", r.join("c").display().to_string()),
+            ("VOX_PROXY", "127.0.0.1:0".to_owned()),
+            ("CLAUDE_CONFIG_DIR", r.join("claude").display().to_string()),
+            ("CODEX_HOME", r.join("codex").display().to_string()),
+            ("OPENCODE_CONFIG_DIR", r.join("oc").display().to_string()),
+        ] {
+            cmd.env(k, v);
+        }
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("APPARATUS: spawn vox setup");
+        drop(pair.slave);
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("APPARATUS: pty reader");
+        let input = pair.master.take_writer().expect("APPARATUS: pty writer");
+        let said = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&said);
+        let master = pair.master;
+        std::thread::spawn(move || {
+            let _master = master;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buf[..n])),
+                }
+            }
+        });
+        Self { child, input, said }
+    }
+
+    fn said(&self) -> String {
+        self.said.lock().unwrap().replace('\r', "")
+    }
+
+    /// Wait up to 120 s (a node's passphrase is sealed with production Argon2id) for the
+    /// `n`-th `want` in what setup said, then type `keys`.
+    fn answer(&mut self, want: &str, n: usize, keys: &str) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while self.said().matches(want).count() < n {
+            assert!(
+                Instant::now() < deadline && self.child.try_wait().ok().flatten().is_none(),
+                "PRODUCT: `vox setup` never asked {want:?} (the {n}th time); it said:\n{}",
+                self.said()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Raw mode is set only once the question is printed: let it settle before typing.
+        std::thread::sleep(Duration::from_millis(200));
+        self.input
+            .write_all(keys.as_bytes())
+            .and_then(|()| self.input.flush())
+            .expect("APPARATUS: type into vox setup");
+    }
+
+    /// Wait up to 120 s for setup to exit: its exit status.
+    fn finish(&mut self) -> portable_pty::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                std::thread::sleep(Duration::from_millis(200));
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PRODUCT: `vox setup` did not finish within 120 s of its last answer; it said:\n{}",
+                self.said()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[test]
+#[ignore = "real binary, production Argon2id, a pty; run in release"]
+fn setup_makes_a_node_for_each_installed_harness() {
+    let d = Dirs::new();
+    // Claude Code and OpenCode are installed; Codex is not. Stand-ins that only exist.
+    let bin = d.root.join("bin");
+    std::fs::create_dir_all(&bin).expect("APPARATUS: a bin directory");
+    for program in ["claude", "opencode"] {
+        let p = bin.join(program);
+        write(&p, "#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(
+            &p,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("APPARATUS: make a stand-in executable");
+    }
+    // `hostname` and `sw_vers` are in /bin and /usr/bin; no harness is.
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    for program in ["claude", "codex", "opencode"] {
+        for dir in ["/usr/bin", "/bin"] {
+            assert!(
+                !Path::new(dir).join(program).exists(),
+                "APPARATUS: {dir}/{program} exists, so this machine cannot stage a harness that \
+                 is not installed"
+            );
+        }
+    }
+    // Claude's settings already hold the person's own hook, a setting, and a Vox hook for
+    // another node, which setup is to replace.
+    write(
+        &d.claude_settings(),
+        r#"{"theme":"dark","hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"vox agent hook --node someone-else"},{"type":"command","command":"echo mine"}]}]}}"#,
+    );
+
+    let mut setup = Setup::spawn(&d, &path);
+    // ---- Codex is said not found, and offered nothing ----
+    // Read before anything is answered: what it found is said first, and a question for Codex
+    // would come before OpenCode's.
+    setup.answer("wire Claude Code to it?", 1, "");
+    let found = setup.said();
+    assert!(
+        found
+            .lines()
+            .any(|l| l.trim_start().starts_with("Codex") && l.contains("not found")),
+        "PRODUCT: `vox setup` must say Codex, which is not on PATH, is not found:\n{found}"
+    );
+    setup.answer("wire Claude Code to it?", 1, "\r");
+    setup.answer("passphrase for claude-", 1, "claude passphrase\r");
+    setup.answer("again:", 1, "claude passphrase\r");
+    setup.answer("wire OpenCode to it?", 1, "\r");
+    setup.answer("passphrase for opencode-", 1, "opencode passphrase\r");
+    setup.answer("again:", 2, "opencode passphrase\r");
+    if cfg!(target_os = "macos") {
+        // The person's node is offered, and skipped.
+        setup.answer("Create a node for you?", 1, "\r");
+    }
+    let status = setup.finish();
+    let said = setup.said();
+    println!("[proof] vox setup said:\n{said}");
+    assert!(
+        status.success(),
+        "PRODUCT: `vox setup` failed ({status:?}):\n{said}"
+    );
+
+    assert!(
+        !said.contains("wire Codex"),
+        "PRODUCT: `vox setup` must offer Codex, which is not installed, nothing:\n{said}"
+    );
+
+    // ---- exactly the two nodes ----
+    let (ok, listed, err) = d.vox(&["node", "list"]);
+    assert!(ok, "PRODUCT (staging): vox node list: {err}");
+    let nodes: Vec<&str> = listed
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| w.contains('-'))
+        .collect();
+    let host = nodes
+        .iter()
+        .find_map(|n| n.strip_prefix("claude-"))
+        .unwrap_or_default()
+        .to_owned();
+    println!("[proof] vox node list:\n{listed}");
+    assert!(
+        !host.is_empty()
+            && nodes.contains(&format!("opencode-{host}").as_str())
+            && nodes.len() == 2,
+        "PRODUCT: `vox setup` must make claude-<host> and opencode-<host> and nothing else (no \
+         node for Codex, none for the person who skipped it): `vox node list` says:\n{listed}"
+    );
+
+    // ---- each node's card: its fingerprint, grouped, with art, and its facts ----
+    for (harness, name) in [("Claude Code", "claude"), ("OpenCode", "opencode")] {
+        let node = format!("{name}-{host}");
+        let (ok, id, err) = d.vox(&["id", "--node", &node]);
+        assert!(ok, "PRODUCT (staging): vox id --node {node}: {err}");
+        let fp = id.trim();
+        let first: Vec<&str> = (0..5).map(|i| &fp[i * 4..i * 4 + 4]).collect();
+        let facts = format!("alias {node} · harness {harness} · host {host} · ");
+        let card_row = said
+            .lines()
+            .find(|l| l.contains(&first.join(" ")))
+            .unwrap_or_default();
+        let fact_row = said
+            .lines()
+            .find(|l| l.contains(&facts))
+            .unwrap_or_default();
+        println!("[proof] {node}: {card_row:?} / {fact_row:?}");
+        assert!(
+            card_row.contains(['◢', '◣', '◤', '◥'])
+                && fact_row.contains(&format!("vox {}", env!("CARGO_PKG_VERSION"))),
+            "PRODUCT: `vox setup` must print {node}'s fingerprint ({fp}) grouped with its art, \
+             and its alias, harness, host, OS and Vox version:\n{said}"
+        );
+    }
+
+    // ---- each hook installed where its harness reads it, acting as its node ----
+    for (check, node) in [
+        ("claude-hook UserPromptSubmit", format!("claude-{host}")),
+        ("opencode-plugin", format!("opencode-{host}")),
+    ] {
+        let (_, out, err) = d.vox(&["agent", "doctor", "--node", &node]);
+        let line = doctor_line(&format!("{out}{err}"), check);
+        println!("[proof] doctor --node {node}: {line}");
+        assert!(
+            line.starts_with("ok"),
+            "PRODUCT: after `vox setup`, `vox agent doctor --node {node}` must pass {check}; it \
+             said:\n{line}\nall:\n{out}{err}"
+        );
+    }
+    let kept = std::fs::read_to_string(d.claude_settings()).unwrap_or_default();
+    assert!(
+        kept.contains("echo mine") && kept.contains("\"theme\"") && !kept.contains("someone-else"),
+        "PRODUCT: `vox setup` must keep what Claude's settings held and replace the Vox hook for \
+         another node: {kept}"
     );
 }
