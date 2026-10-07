@@ -18,11 +18,14 @@ The **readable address** is the one you type:
 SERVICE.NODE.ROOM.vox
 ```
 
-`SERVICE` is the sharer's name for the service, `NODE` is **your** name for the sharing node (the
-name you gave it with `vox trust add`) and `ROOM` is **your** name for the room. Two members can
-therefore see different readable addresses for the same service: `web.robertgpt.family.vox` on
-your machine may be `web.rob.home.vox` on someone else's. Names are matched without regard to
-case, so your alias `robertGPT` appears as `robertgpt` in an address. A part that names nothing
+`SERVICE` is the sharer's name for the service and `ROOM` is the room's name. `NODE` is **your**
+name for the sharing node, the name you gave it with `vox trust add`. For a node you have no name
+for, including your own, it is the first twelve characters of its fingerprint
+(`web.g5xawb52urpd.family.vox`), and where either would be ambiguous (a name two of your nodes
+share, or a short form another member's fingerprint also begins with) it is the whole fingerprint.
+Two members can therefore see different readable addresses for the same service:
+`web.robertgpt.family.vox` on your machine may be `web.rob.family.vox` on someone else's. Names are
+matched without regard to case, so your alias `robertGPT` appears as `robertgpt` in an address. A part that names nothing
 you know is refused with the reason, for example ``no node you trust is called `nobody` — only
 trusted nodes have names here``.
 
@@ -36,7 +39,10 @@ vox: shared in family (pym47virdp2b)
     lnprznanqhhlxnmpzbtyfwrlomjfpzxzzovs5la2ru27smorscjq.xcxrnsegnn74dd5mxxmdrch7zfvooa4ekqxaswamlgzjwejmrwsq.pym47virdp2bauqugugmjbqa3tm6qeu762dxggg663vglzd44zua.vox
 ```
 
-`NODE.ROOM.vox` and `ROOM.vox` reach nothing.
+`NODE.ROOM.vox` and `ROOM.vox` reach nothing. A canonical address inside a message is shown to
+you in its readable form, in `vox room read` and the TUI: a message saying `open
+SERVICE_ID.NODE_FINGERPRINT.ROOM_ID.vox please` reads `open web.robertgpt.family.vox please` on
+your machine. `--json` and anything you copy keep the canonical form.
 
 On a member's machine, `vox service list` also gives the commands for each service's kind, ready
 to copy, with its canonical address in them, and what each needs, with whether it holds now:
