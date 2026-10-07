@@ -947,7 +947,7 @@ pub enum Fault {
     /// An input exceeded its bound (name or text length).
     TooLong,
     /// A trust add or remove needs the identity passphrase: it was not entered for a keyring
-    /// change within [`KEYRING_WINDOW_SECS`](crate::node::actor::KEYRING_WINDOW_SECS) (V210-159,
+    /// change within [`KEYRING_WINDOW_MS`](crate::node::actor::KEYRING_WINDOW_MS) (V210-159,
     /// ADR-028 K-12). Not
     /// [`Fault::WrongPassphrase`]: none was given, and the client asks for it and tries again.
     PassphraseNeeded,
@@ -1126,7 +1126,8 @@ impl Fault {
     // `Fault::TunnelLimit`'s explanation names the cap in words, as `Error::TunnelLimit` does.
     const _TUNNEL_CAP_NAMED: () = assert!(crate::transport::quic::TUNNELS_PER_PEER == 16);
     // `Fault::PassphraseNeeded`'s explanation names the window in words.
-    const _KEYRING_WINDOW_NAMED: () = assert!(crate::node::actor::KEYRING_WINDOW_SECS == 30 * 60);
+    const _KEYRING_WINDOW_NAMED: () =
+        assert!(crate::node::actor::KEYRING_WINDOW_MS == 30 * 60 * 1_000);
 
     /// **Why this exists (PRD-001 R36).** A `Fault` is a closed token, and every surface that
     /// had one printed it with `{:?}` — so a person saw `Failed(Refused)`, `Failed(Internal)`,

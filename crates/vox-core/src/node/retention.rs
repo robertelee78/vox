@@ -208,19 +208,20 @@ impl RetentionConfig {
 pub(crate) struct Tracked {
     /// The entry's `LogDb` segment id.
     pub log_id: u64,
-    /// When this node first saw it, seconds.
-    pub first_seen: u64,
-    /// The author's claimed time in seconds, once this node has read it.
-    pub claimed: Option<u64>,
+    /// When this node first saw it, milliseconds since the Unix epoch.
+    pub first_seen_ms: u64,
+    /// The author's claimed time in milliseconds, once this node has read it.
+    pub claimed_ms: Option<u64>,
     /// Its plaintext cache row, once rendered.
     pub cache_id: Option<u64>,
 }
 
 impl Tracked {
-    /// The instant its age runs from: the claim, clamped to no later than first sight.
+    /// The instant its age runs from, milliseconds: the claim, clamped to no later than first
+    /// sight.
     pub fn base(&self) -> u64 {
-        self.claimed
-            .map_or(self.first_seen, |c| c.min(self.first_seen))
+        self.claimed_ms
+            .map_or(self.first_seen_ms, |c| c.min(self.first_seen_ms))
     }
 }
 
@@ -240,10 +241,10 @@ impl RetentionIndex {
         self.live.insert(hash, tracked);
     }
 
-    /// Record that the body was read: its claimed time and its cache row.
-    pub fn rendered(&mut self, hash: &Digest32, claimed: u64, cache_id: u64) {
+    /// Record that the body was read: its claimed time, milliseconds, and its cache row.
+    pub fn rendered(&mut self, hash: &Digest32, claimed_ms: u64, cache_id: u64) {
         if let Some(mut t) = self.live.get(hash).copied() {
-            t.claimed = Some(claimed);
+            t.claimed_ms = Some(claimed_ms);
             t.cache_id = Some(cache_id);
             self.track(*hash, t);
         }
@@ -261,12 +262,12 @@ impl RetentionIndex {
         Some(t)
     }
 
-    /// Remove and return every entry whose age base is at or before `cutoff`.
-    pub fn take_due(&mut self, cutoff: u64) -> Vec<(Digest32, Tracked)> {
+    /// Remove and return every entry whose age base is at or before `cutoff_ms`.
+    pub fn take_due(&mut self, cutoff_ms: u64) -> Vec<(Digest32, Tracked)> {
         let due: Vec<Digest32> = self
             .by_age
             .iter()
-            .take_while(|(base, _)| *base <= cutoff)
+            .take_while(|(base, _)| *base <= cutoff_ms)
             .map(|(_, h)| *h)
             .collect();
         due.into_iter()

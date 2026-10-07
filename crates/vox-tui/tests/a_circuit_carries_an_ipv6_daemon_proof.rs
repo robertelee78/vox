@@ -406,7 +406,7 @@ fn synced_with(dir: &std::path::Path, room: &str, member: &str) -> bool {
     ok && serde_json::from_str::<serde_json::Value>(out.trim()).is_ok_and(|v| {
         v["rooms"].as_array().into_iter().flatten().any(|r| {
             r["id"].as_str().is_some_and(|id| id.starts_with(room))
-                && !r["last_sync"].is_null()
+                && !r["last_sync_ms"].is_null()
                 && r["members"]
                     .as_array()
                     .into_iter()

@@ -609,7 +609,7 @@ impl NodeNet {
     }
 
     fn now(&self) -> u64 {
-        (self.clock)()
+        (self.clock)() / 1_000
     }
 
     /// Accept the next stream on `conn`, authorize it against the shared policy, and
@@ -673,7 +673,7 @@ impl NodeNet {
             if let Some(log) = lock(&self.decisions).as_ref() {
                 let why = format!("it may not open a {kind:?} stream here, as {class:?}");
                 log.record_folded(
-                    (self.clock)().saturating_mul(1_000),
+                    (self.clock)(),
                     &format!("stream {} {why}", crate::node::link::b32_encode(&peer)),
                     &crate::node::decisions::Decision {
                         asked: "to open a stream",
@@ -941,7 +941,7 @@ impl NodeNet {
                 };
                 if let (Some(why), Some(log)) = (refused, lock(&self.decisions).as_ref()) {
                     log.record(
-                        (self.clock)().saturating_mul(1_000),
+                        (self.clock)(),
                         &crate::node::decisions::Decision {
                             asked: "a relay circuit",
                             by: peer,

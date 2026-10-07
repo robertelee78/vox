@@ -564,7 +564,7 @@ pub fn attach_passphrase(
 pub fn create_identity(paths: &Paths, passphrase: &str) -> Result<Digest32, AppError> {
     // The node's own clock, a test step included (V210-64): an identity made here is stamped as
     // the node making it would have stamped it.
-    let now = (vox_core::time::clock_with_test_skew())();
+    let now = (vox_core::time::clock_with_test_skew())() / 1_000;
     // **A wait is said, once, after a second** (V210-100): another vox making this node's identity
     // holds its directory, and one stopped (Ctrl-Z) holds it until resumed; this one waiting with
     // nothing on the screen looked hung.

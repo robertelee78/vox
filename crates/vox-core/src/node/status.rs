@@ -13,9 +13,9 @@
 //!
 //! A line in [`StatusReport::unhealthy`] is something an operator should look at:
 //!
-//! - a room with other members that has not completed a sync in [`STALE_SYNC_SECS`];
+//! - a room with other members that has not completed a sync in [`STALE_SYNC_MS`];
 //! - a **trusted** member of an open room this node was connected to and no longer is;
-//! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_SECS`], while
+//! - an **anchor** this node keeps that it has not reached for [`ANCHOR_UNREACHABLE_MS`], while
 //!   this node needs one. An anchor only bridges hosts that cannot otherwise find each other
 //!   (ADR-012), so an anchor this node does not need alarms no one: the line is raised only while
 //!   an open room has a trusted member this node does not hold a direct connection to (one it
@@ -62,14 +62,15 @@ use crate::node::link::b32_encode;
 use crate::transport::router::DatagramStats;
 
 /// A room with other members and no completed sync for this long is flagged.
-pub const STALE_SYNC_SECS: u64 = 10 * 60;
+pub const STALE_SYNC_MS: u64 = 10 * 60 * 1_000;
 
 /// An anchor this node keeps and has not reached for this long is flagged (PRD-001 R37). Long
 /// enough that an anchor restarting, which members are back from within seconds (V210-86), never
 /// interrupts anyone.
-pub const ANCHOR_UNREACHABLE_SECS: u64 = 60;
+pub const ANCHOR_UNREACHABLE_MS: u64 = 60_000;
 
-/// The ledgers this module keeps beside the node's own state.
+/// The ledgers this module keeps beside the node's own state. Every time here is unix
+/// milliseconds.
 #[derive(Debug, Default)]
 pub struct StatusBook {
     /// Room → when a sync this node ran there last completed.
@@ -78,8 +79,8 @@ pub struct StatusBook {
     pub member_synced: BTreeMap<Digest32, u64>,
     /// Peer → when this node last saw a live connection to it.
     pub last_seen: BTreeMap<Digest32, u64>,
-    /// When the node started, seconds since the epoch: a room that has not synced *yet*
-    /// is not stale until it has had [`STALE_SYNC_SECS`] to do so.
+    /// When the node started: a room that has not synced *yet*
+    /// is not stale until it has had [`STALE_SYNC_MS`] to do so.
     pub started: u64,
 }
 
@@ -94,9 +95,9 @@ pub struct MemberStatus {
     pub trusted: bool,
     /// Whether this node has a live connection to it now.
     pub connected: bool,
-    /// When this node last saw it connected (now, if it is).
+    /// When this node last saw it connected (now, if it is), unix milliseconds.
     pub last_seen: Option<u64>,
-    /// When a sync session with it last ran.
+    /// When a sync session with it last ran, unix milliseconds.
     pub last_sync: Option<u64>,
 }
 
@@ -109,7 +110,7 @@ pub struct RoomStatus {
     pub name: String,
     /// Its epoch.
     pub epoch: u64,
-    /// When a sync this node ran there last completed.
+    /// When a sync this node ran there last completed, unix milliseconds.
     pub last_sync: Option<u64>,
     /// The retention this node applies here, seconds (`0` forever): the shorter of the room's
     /// and the node's own (ADR-023 decision 2).
@@ -233,20 +234,20 @@ impl GatewayFamily {
 /// Everything `vox status` shows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatusReport {
-    /// When this was taken, seconds since the epoch.
+    /// When this was taken, unix milliseconds.
     pub now: u64,
     /// The node's most recent refusals, newest first, from its decision record (ADR-028 D-3).
     pub refusals: Vec<crate::node::decisions::Event>,
     /// How many seconds a keyring change still goes without the identity passphrase, or `None`
     /// when the next one will ask for it (ADR-028 K-9).
     pub keyring_open_secs: Option<u64>,
-    /// When the node started, seconds since the epoch.
+    /// When the node started, unix milliseconds.
     pub started: u64,
     /// This node.
     pub identity: Option<Digest32>,
     /// Whether it is on the network.
     pub networked: bool,
-    /// When the machine's network last changed, unix seconds, and the change in one line
+    /// When the machine's network last changed, unix milliseconds, and the change in one line
     /// (ADR-012 N-52); `None` if it has not since the daemon started.
     pub network_changed: Option<(u64, String)>,
     /// Where it listens.
@@ -282,7 +283,7 @@ pub struct StatusReport {
 pub struct AnchorStatus {
     /// Its identity.
     pub id: Digest32,
-    /// Since when this node has not reached it (unix seconds); `None` while it is reached.
+    /// Since when this node has not reached it (unix milliseconds); `None` while it is reached.
     pub unreached_since: Option<u64>,
 }
 
@@ -314,7 +315,7 @@ impl StatusReport {
             // has been none: a daemon that has just started is not unhealthy for not
             // having synced in its first seconds, and would otherwise alarm on every start.
             let since = room.last_sync.unwrap_or(self.started);
-            let stale = self.now.saturating_sub(since) > STALE_SYNC_SECS;
+            let stale = self.now.saturating_sub(since) > STALE_SYNC_MS;
             if stale {
                 out.push(Unhealthy {
                     key: format!("room-stale:{}", b32_encode(&room.id)),
@@ -322,7 +323,7 @@ impl StatusReport {
                         "room {} ({}): no completed sync in {} minutes",
                         short(&room.id),
                         room.name,
-                        STALE_SYNC_SECS / 60
+                        STALE_SYNC_MS / 60_000
                     ),
                 });
             }
@@ -342,7 +343,7 @@ impl StatusReport {
                             short(&room.id),
                             room.name,
                             short(&m.id),
-                            self.now.saturating_sub(seen)
+                            self.now.saturating_sub(seen) / 1_000
                         ),
                     });
                 }
@@ -361,8 +362,9 @@ impl StatusReport {
                 let Some(since) = a.unreached_since else {
                     continue;
                 };
-                let for_secs = self.now.saturating_sub(since);
-                if for_secs > ANCHOR_UNREACHABLE_SECS {
+                let for_ms = self.now.saturating_sub(since);
+                if for_ms > ANCHOR_UNREACHABLE_MS {
+                    let for_secs = for_ms / 1_000;
                     out.push(Unhealthy {
                         key: format!("anchor-unreachable:{}", b32_encode(&a.id)),
                         message: format!(
@@ -383,7 +385,7 @@ impl StatusReport {
     #[must_use]
     pub fn to_json(&self) -> String {
         let mut j = String::from("{");
-        let _ = write!(j, "\"now\":{},", self.now);
+        let _ = write!(j, "\"now_ms\":{},", self.now);
         let _ = write!(
             j,
             "\"identity\":{},",
@@ -401,7 +403,7 @@ impl StatusReport {
             "\"network_changed\":{},",
             self.network_changed.as_ref().map_or_else(
                 || "null".to_owned(),
-                |(at, said)| format!("{{\"at\":{at},\"change\":{}}}", q(said))
+                |(at, said)| format!("{{\"at_ms\":{at},\"change\":{}}}", q(said))
             )
         );
         let _ = write!(
@@ -418,12 +420,12 @@ impl StatusReport {
         let _ = write!(
             j,
             "\"always_on_member\":{},",
-            q("not recorded: Vox does not track which member stays online; each member's last_seen says when it was last heard from")
+            q("not recorded: Vox does not track which member stays online; each member's last seen time says when it was last heard from")
         );
         let rooms = self.rooms.iter().map(|r| {
             let members = r.members.iter().map(|m| {
                 format!(
-                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen\":{},\"last_sync\":{}}}",
+                    "{{\"id\":{},\"me\":{},\"trusted\":{},\"connected\":{},\"last_seen_ms\":{},\"last_sync_ms\":{}}}",
                     q(&b32_encode(&m.id)),
                     m.me,
                     m.trusted,
@@ -434,7 +436,7 @@ impl StatusReport {
             });
             let frozen = list(r.frozen.iter().map(|d| q(&b32_encode(d))));
             format!(
-                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"members\":[{}]}}",
+                "{{\"id\":{},\"name\":{},\"epoch\":{},\"last_sync_ms\":{},\"retention\":{},\"key_generations\":{},\"received_key_generations\":{},\"frozen\":[{}],\"refused_below_checkpoint\":{},\"entries\":{},\"members\":[{}]}}",
                 q(&b32_encode(&r.id)),
                 q(&r.name),
                 r.epoch,
@@ -522,7 +524,7 @@ impl StatusReport {
             j,
             "\"anchors\":[{}],",
             list(self.anchors.iter().map(|a| format!(
-                "{{\"id\":{},\"reached\":{},\"unreached_since\":{}}}",
+                "{{\"id\":{},\"reached\":{},\"unreached_since_ms\":{}}}",
                 q(&b32_encode(&a.id)),
                 a.unreached_since.is_none(),
                 opt(a.unreached_since)
@@ -622,7 +624,7 @@ impl StatusReport {
                 .map(|r| {
                     (
                         format!("{{room=\"{}\"}}", b32_encode(&r.id)),
-                        r.last_sync.unwrap_or(0),
+                        r.last_sync.map_or(0, |ms| ms / 1_000),
                     )
                 })
                 .collect(),
@@ -1522,7 +1524,7 @@ impl SyncBook {
             );
         }
         // **Every live tunnel** (V210-81): the member, the service, which way it was opened, and
-        // when it was opened and last moved a byte (Unix seconds), so a stale one is visible.
+        // when it was opened and last moved a byte (unix milliseconds), so a stale one is visible.
         s.push_str("],\"tunnels\":[");
         // Only this node's tunnels: a process may host several (ADR-026 P-1).
         for (i, t) in crate::transport::quic::live_tunnels(me).iter().enumerate() {
@@ -1532,7 +1534,7 @@ impl SyncBook {
             let _ = write!(
                 s,
                 "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
-                 \"opened\":{},\"last_moved\":{}}}",
+                 \"opened_ms\":{},\"last_moved_ms\":{}}}",
                 t.id,
                 b32_encode(&t.peer),
                 q(&t.service),
@@ -1554,7 +1556,7 @@ impl SyncBook {
             let _ = write!(
                 s,
                 "{{\"id\":{},\"peer\":\"{}\",\"service\":{},\"direction\":\"{}\",\
-                 \"opened\":{},\"closed\":{},\"why\":{}}}",
+                 \"opened_ms\":{},\"closed_ms\":{},\"why\":{}}}",
                 t.id,
                 b32_encode(&t.peer),
                 q(&t.service),
