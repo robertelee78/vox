@@ -3144,6 +3144,60 @@ pub async fn get_file(
             break;
         }
     }
+    // **A file a Session sent out** (ADR-029 DR-1.8, #546): announced inside the Session, so only
+    // a member that can open it finds it, by its name, SHA-256, tag or entry.
+    if offers.is_empty() {
+        if let Ok(Frame::SessionEntries { rows }) = client
+            .request(&Request::SessionEntries { channel_id })
+            .await
+        {
+            let me = client.me();
+            for r in rows.iter().rev().filter(|r| Some(r.author) != me) {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&r.body) else {
+                    continue;
+                };
+                if v["kind"] != "file" || v["dir"] != "out" {
+                    continue;
+                }
+                let field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_owned);
+                let (Some(name), Some(sha256), Some(tag), Some(size)) = (
+                    field("name"),
+                    field("sha256"),
+                    field("tag"),
+                    v.get("size").and_then(serde_json::Value::as_u64),
+                ) else {
+                    continue;
+                };
+                let entry = vox_core::node::link::b32_encode(&r.entry_hash);
+                let matches = name == selector
+                    || sha256.starts_with(selector)
+                    || tag == selector
+                    || (selector.len() >= 8 && entry.starts_with(selector));
+                if !matches {
+                    continue;
+                }
+                offers.push(Offer {
+                    entry: r.entry_hash,
+                    created: (r.created_millis / 1000).min(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs()),
+                    ),
+                    author: r.author,
+                    name,
+                    size,
+                    sha256,
+                    tag,
+                    http: v
+                        .get("http")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                    files: v.get("files").and_then(serde_json::Value::as_u64),
+                });
+                break;
+            }
+        }
+    }
     if offers.is_empty() {
         return Err(AppError::Usage(format!(
             "no offer in this room matches {selector:?} — `vox room read` shows what was \
