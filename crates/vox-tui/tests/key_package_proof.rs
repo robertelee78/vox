@@ -55,6 +55,8 @@ mod watchdog;
 
 #[path = "support/layout.rs"]
 mod layout;
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -182,12 +184,17 @@ impl Daemon {
 }
 
 fn vox(dir: &std::path::Path, args: &[&str], stdin: &str) -> (bool, String) {
-    let mut child = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .env("VOX_DATA_DIR", dir)
         .env("VOX_CONFIG_DIR", dir.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDPASS)
-        .env_remove("VOX_ROOM")
+        .env_remove("VOX_ROOM");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        return typed::keyring(&cmd);
+    }
+    let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -61,6 +61,8 @@
 
 #[path = "support/test_knobs.rs"]
 mod test_knobs;
+#[path = "support/typed.rs"]
+mod typed;
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
@@ -108,6 +110,17 @@ impl Daemon {
     }
 
     fn run(&self, args: &[&str], stdin: &str) -> String {
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&self.command(args));
+            assert!(
+                ok,
+                "PRODUCT (staging): `vox {}` failed: {shown}",
+                args.join(" ")
+            );
+            return shown;
+        }
         let mut child = self
             .command(args)
             .stdin(Stdio::piped())

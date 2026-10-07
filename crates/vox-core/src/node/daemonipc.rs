@@ -194,9 +194,9 @@ pub enum DaemonRequest {
         reason: String,
     },
     /// Register (or refresh) an agent session of `node` (ADR-020 6.10, ADR-026 D-3): the session
-    /// becomes a holder of its node, which is attached implicitly first if it is not attached
-    /// (L-2), with `passphrase` and `anchors` as a `Use` would. Answered [`DaemonFrame::Attached`]
-    /// or [`DaemonFrame::Refused`].
+    /// becomes a holder of its node. **A session never attaches its node** (ADR-028 K-13): a node
+    /// not attached is refused [`Refusal::NotAttached`], and the operator attaches it outside the
+    /// session. Answered [`DaemonFrame::Attached`] or [`DaemonFrame::Refused`].
     SessionRegister {
         /// The node.
         node: NodeName,
@@ -205,10 +205,6 @@ pub enum DaemonRequest {
         /// The session's record as the client built it from its harness's environment (the
         /// daemon stores it; the client's environment is never the daemon's).
         record: String,
-        /// The identity passphrase, for an attach this may cause.
-        passphrase: Option<Zeroizing<String>>,
-        /// Anchor specs the node is attached with, if this attaches it.
-        anchors: Vec<String>,
         /// When the session's room is one the node is not a member of (ADR-029 RB-3): the room's
         /// link and passphrase, for the daemon to join in the background. Never stored, never
         /// logged.
@@ -739,17 +735,13 @@ impl Opening {
                     node,
                     session,
                     record,
-                    passphrase,
-                    anchors,
                     join,
                 } => {
-                    e.array(8)
+                    e.array(6)
                         .uint(T_REQ_SESSION_REGISTER)
                         .text(node.as_str())
                         .text(session)
                         .text(record);
-                    put_secret(&mut e, passphrase.as_ref());
-                    put_texts(&mut e, anchors);
                     // The join's link, empty for none, then its passphrase.
                     e.text(join.as_ref().map_or("", |(link, _)| link.as_str()));
                     put_secret(&mut e, join.as_ref().map(|(_, p)| p));
@@ -839,20 +831,16 @@ impl Opening {
                 session: text(&mut d, "ipc session room session")?,
                 room: text(&mut d, "ipc session room room")?,
             }),
-            (T_REQ_SESSION_REGISTER, 8) => {
+            (T_REQ_SESSION_REGISTER, 6) => {
                 let node = name(&mut d, "ipc session register node")?;
                 let session = text(&mut d, "ipc session register session")?;
                 let record = text(&mut d, "ipc session register record")?;
-                let passphrase = secret(&mut d, "ipc session register passphrase")?;
-                let anchors = texts(&mut d, "ipc session register anchors")?;
                 let link = text(&mut d, "ipc session register join link")?;
                 let pass = secret(&mut d, "ipc session register join passphrase")?;
                 Opening::Daemon(DaemonRequest::SessionRegister {
                     node,
                     session,
                     record,
-                    passphrase,
-                    anchors,
                     join: (!link.is_empty()).then(|| (link, pass.unwrap_or_default())),
                 })
             }
@@ -1287,8 +1275,6 @@ mod tests {
                 node: n("alice"),
                 session: "s-1".into(),
                 record: "{}".into(),
-                passphrase: Some(Zeroizing::new("pw".into())),
-                anchors: vec!["a".into()],
                 join: None,
             }),
             Opening::Daemon(DaemonRequest::Status),

@@ -138,7 +138,8 @@ enum Want {
     Explicit(Option<KeepSource>),
     /// A held connection: attached implicitly if need be, and held while the connection is open.
     Hold,
-    /// An agent session: attached implicitly if need be, and held while it is registered.
+    /// An agent session: only if attached already (ADR-028 K-13), and held while it is
+    /// registered.
     Session(Box<crate::wake::Session>),
     /// A one-shot verb: only if it is attached already (L-2).
     IfAttached,
@@ -395,7 +396,8 @@ impl Router {
     }
 
     /// Register an agent session of `node` (ADR-020 6.10): store its record and count it as a
-    /// holder, attaching the node implicitly if it is not attached.
+    /// holder. **A session never attaches its node** (ADR-028 K-13): one not attached is refused
+    /// [`Refusal::NotAttached`], and its operator attaches it outside the session.
     ///
     /// # Errors
     /// The [`Refusal`] the hook is told.
@@ -403,10 +405,12 @@ impl Router {
         &self,
         node: &NodeName,
         session: crate::wake::Session,
-        passphrase: Option<Zeroizing<String>>,
-        anchors: Vec<String>,
         join: Option<(String, Zeroizing<String>)>,
     ) -> Result<DaemonFrame, Refusal> {
+        // A node that does not exist is said as that, not as one to attach.
+        if !self.inner.account.nodes_on_disk().contains(node) {
+            return Err(Refusal::NoSuchNode { node: node.clone() });
+        }
         // Whether this node knew the session before this turn: its registration on disk.
         let known = self
             .inner
@@ -419,9 +423,9 @@ impl Router {
             .want(
                 node,
                 Want::Session(Box::new(session)),
-                passphrase,
+                None,
                 Vec::new(),
-                anchors,
+                Vec::new(),
             )
             .await?;
         let handle = self.handle_of(node);
@@ -764,7 +768,11 @@ impl Router {
                     }
                     Some(Slot::Attaching(rx)) => Step::WaitAttach(rx.clone()),
                     Some(Slot::Detaching(rx)) => Step::WaitDetach(rx.clone()),
-                    None if matches!(want, Some(Want::IfAttached)) => Step::NotAttached,
+                    // Neither a one-shot verb nor an agent's session attaches a node (L-2;
+                    // ADR-028 K-13).
+                    None if matches!(want, Some(Want::IfAttached | Want::Session(_))) => {
+                        Step::NotAttached
+                    }
                     None => {
                         let (tx, rx) = watch::channel(None);
                         slots.insert(node.clone(), Slot::Attaching(rx));
@@ -1344,8 +1352,6 @@ impl Dispatch for Router {
                 node,
                 session,
                 record,
-                passphrase,
-                anchors,
                 join,
             } => {
                 let record = match serde_json::from_str::<crate::wake::Session>(&record) {
@@ -1358,10 +1364,7 @@ impl Dispatch for Router {
                         })
                     }
                 };
-                match self
-                    .session_register(&node, record, passphrase, anchors, join)
-                    .await
-                {
+                match self.session_register(&node, record, join).await {
                     Ok(frame) => frame,
                     Err(r) => refused(r),
                 }
@@ -1626,36 +1629,26 @@ mod tests {
         });
     }
 
-    /// An agent session holds its node; the session's end is its last holder going, and the node
-    /// detaches in the same decision (L-3, ADR-020 6.10). A node attached by hand stays.
+    /// An agent session never attaches its node (ADR-028 K-13); one attached by hand stays
+    /// attached when the session ends (L-3, ADR-020 6.10).
     #[test]
-    fn a_sessions_end_detaches_its_implicit_node_and_not_a_kept_one() {
+    fn a_session_attaches_nothing_and_its_end_leaves_a_node_attached_by_hand() {
         rt().block_on(async {
             let dir = tempfile::tempdir().unwrap();
             let r = router(account(dir.path(), &["agent", "person"]).await);
             let s = crate::wake::Session::from_env("s-1", true);
-            r.session_register(&n("agent"), s, pass(), Vec::new(), None)
-                .await
-                .expect("PRODUCT: register");
-            let lease = r.use_node(hold("agent")).await.unwrap();
-            drop(lease);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            assert_eq!(
-                state(&r, "agent"),
-                NodeState::Attached,
-                "PRODUCT: a registered session did not hold its node"
+            let refused = r.session_register(&n("agent"), s, None).await;
+            assert!(
+                matches!(refused, Err(Refusal::NotAttached { .. })),
+                "PRODUCT: a session attached its node: {refused:?}"
             );
-            let (was, detached) = r.session_end(&n("agent"), "s-1", "").await;
-            assert!(was && detached, "PRODUCT: end said {was} {detached}");
             assert_eq!(state(&r, "agent"), NodeState::Detached);
 
             r.attach(&n("person"), pass(), None, Vec::new(), Vec::new())
                 .await
                 .unwrap();
             let s = crate::wake::Session::from_env("s-2", true);
-            r.session_register(&n("person"), s, None, Vec::new(), None)
-                .await
-                .unwrap();
+            r.session_register(&n("person"), s, None).await.unwrap();
             let (_, detached) = r.session_end(&n("person"), "s-2", "").await;
             assert!(
                 !detached,

@@ -59,6 +59,9 @@ mod watchdog;
 #[path = "support/attach.rs"]
 mod attach;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -146,6 +149,12 @@ impl Member {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            return (ok, shown.clone(), shown);
+        }
         let mut child = harness(cmd.spawn(), "spawn vox");
         if let Some(s) = stdin {
             let mut pipe = child

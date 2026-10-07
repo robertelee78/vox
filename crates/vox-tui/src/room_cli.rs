@@ -4270,25 +4270,34 @@ pub async fn link(paths: &Paths, room: &str) -> Result<(), AppError> {
 // ---------------------------------------------------------------- the trust keyring
 
 /// Send a keyring change, giving the identity passphrase only when the node says it needs it
-/// (V210-159): within 30 minutes of its last entry none is needed. `given` is what the command line
-/// gave (`--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`); it is sent at once, and a right
-/// one starts the window again. With none given and the window passed, it is asked for at the
-/// terminal and the change sent again; with no terminal, the node's reason is the answer.
+/// (V210-159): within 30 minutes of one typed for a keyring change none is needed (ADR-028 K-12).
+/// **It is typed, at a terminal, and taken from nothing else** (ADR-028 K-13): not
+/// `VOX_IDENTITY_PASSPHRASE`, not a file, not the Keychain. With no terminal the change is refused,
+/// with the command to run in one.
 async fn keyring_change(
     client: &mut IpcClient,
-    given: Option<String>,
     request: impl Fn(zeroize::Zeroizing<String>) -> Request,
 ) -> Result<Frame, AppError> {
-    let asked = given.is_none();
     let reply = client
-        .request(&request(zeroize::Zeroizing::new(given.unwrap_or_default())))
+        .request(&request(zeroize::Zeroizing::new(String::new())))
         .await
         .map_err(|e| AppError::Usage(e.to_string()))?;
     let needed = vox_core::node::api::Fault::PassphraseNeeded.explain();
     match reply {
-        Frame::Error { reason }
-            if asked && reason == needed && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
-        {
+        Frame::Error { reason } if reason == needed => {
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                return Err(AppError::Usage(format!(
+                    "{}\n       {}",
+                    reason.lines().next().unwrap_or_default(),
+                    typed_only()
+                )));
+            }
+            if std::env::var_os("VOX_IDENTITY_PASSPHRASE").is_some() {
+                eprintln!(
+                    "vox: VOX_IDENTITY_PASSPHRASE is not read for a keyring change; type the \
+                     passphrase"
+                );
+            }
             eprintln!("vox: {}", reason.lines().next().unwrap_or_default());
             let passphrase = crate::tunnel_cli::ask_identity_passphrase()?;
             client
@@ -4298,6 +4307,19 @@ async fn keyring_change(
         }
         other => Ok(other),
     }
+}
+
+/// What a keyring change that needs the passphrase says with no terminal to type it at: the
+/// command, to run in a terminal (ADR-028 K-13).
+pub(crate) fn typed_only() -> String {
+    let command: Vec<String> = std::iter::once("vox".to_owned())
+        .chain(std::env::args().skip(1))
+        .collect();
+    format!(
+        "it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not \
+         a file). Run it in a terminal: {}",
+        command.join(" ")
+    )
 }
 
 // ------------------------------------------------- what a change of access touches (ADR-028 E-5)
@@ -4463,7 +4485,6 @@ pub async fn trust_add(
     paths: &Paths,
     target: Digest32,
     petname: &str,
-    given: Option<String>,
     full_history: bool,
     drive: bool,
 ) -> Result<(), AppError> {
@@ -4492,7 +4513,7 @@ pub async fn trust_add(
             "your services in a room you share, once you offer one"
         )
     );
-    match keyring_change(&mut client, given, |identity_passphrase| Request::Trust {
+    match keyring_change(&mut client, |identity_passphrase| Request::Trust {
         target,
         petname: petname.to_owned(),
         identity_passphrase,
@@ -4539,12 +4560,7 @@ pub async fn trust_add(
 /// `vox trust rename`, asked of the running node: only an identity already trusted. A keyring
 /// change, so the identity passphrase is asked for only when the node says it is needed
 /// (V210-159), as `vox trust add` and `remove` do.
-pub async fn trust_rename(
-    paths: &Paths,
-    fingerprint: &str,
-    name: &str,
-    given: Option<String>,
-) -> Result<(), AppError> {
+pub async fn trust_rename(paths: &Paths, fingerprint: &str, name: &str) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     // A read, so no passphrase (V210-165).
     let entries = match client.trusted("").await {
@@ -4561,7 +4577,7 @@ pub async fn trust_rename(
         ))
     })?;
     crate::ident::check_new_name(&entries, &target, name)?;
-    match keyring_change(&mut client, given, |identity_passphrase| Request::Rename {
+    match keyring_change(&mut client, |identity_passphrase| Request::Rename {
         target,
         petname: name.to_owned(),
         identity_passphrase,
@@ -4590,7 +4606,6 @@ pub async fn trust_capability(
     paths: &Paths,
     fingerprint: &str,
     drive: bool,
-    given: Option<String>,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     // A read, so no passphrase (V210-165).
@@ -4612,12 +4627,10 @@ pub async fn trust_capability(
     } else {
         vox_core::node::trust::Capability::Read
     };
-    match keyring_change(&mut client, given, |identity_passphrase| {
-        Request::SetCapability {
-            target,
-            drive,
-            identity_passphrase,
-        }
+    match keyring_change(&mut client, |identity_passphrase| Request::SetCapability {
+        target,
+        drive,
+        identity_passphrase,
     })
     .await
     {
@@ -4636,11 +4649,7 @@ pub async fn trust_capability(
 }
 
 /// `vox trust remove`, asked of the running node.
-pub async fn trust_remove(
-    paths: &Paths,
-    target: Digest32,
-    given: Option<String>,
-) -> Result<(), AppError> {
+pub async fn trust_remove(paths: &Paths, target: Digest32) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     // What it is to stop, said before it is done (ADR-028 E-5).
     let rooms = rooms_with(&mut client, &target).await;
@@ -4676,7 +4685,7 @@ pub async fn trust_remove(
         "     its live sessions into your services are to be cut: {}",
         listed(&said, "none is open")
     );
-    match keyring_change(&mut client, given, |identity_passphrase| Request::Untrust {
+    match keyring_change(&mut client, |identity_passphrase| Request::Untrust {
         target,
         identity_passphrase,
     })

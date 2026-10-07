@@ -58,10 +58,11 @@ confirm a message can be read in each direction.
 default, releases what you write from this approval onward; `full` also releases everything you
 still hold a key for. It never releases anyone else's messages.
 
-A keyring change (add, rename, remove) asks for the identity passphrase again once 30 minutes
-have passed since you last gave it. At a terminal it asks; otherwise give
-`--identity-passphrase-file`. Do not put that passphrase in `--identity-passphrase`, which is
-intentionally refused.
+A keyring change (add, rename, remove) asks for the identity passphrase unless you typed it for a
+keyring change in the last 30 minutes; attaching the node does not count. It is typed at a
+terminal and taken from nothing else: `--identity-passphrase`, `--identity-passphrase-file` and
+`VOX_IDENTITY_PASSPHRASE` are not read for it. Without a terminal the change is refused, with the
+command to run in one.
 
 ## Rename a node in your keyring
 

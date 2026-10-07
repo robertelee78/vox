@@ -30,7 +30,7 @@ import os, re, subprocess, sys, time
 
 sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vox_pty import Hung, Tui, arm, disarm, pane as pane_of, pyte, stage  # noqa: E402
+from vox_pty import Hung, Tui, arm, disarm, pane as pane_of, pyte, stage, is_keyring_change, typed_run  # noqa: E402
 
 VOX, TAG = sys.argv[1], sys.argv[2]
 # Sized for the debug build, whose joins grind their proof of work for a minute or more each (40-58 s
@@ -60,6 +60,9 @@ def env(w):
 
 def run(w, *args, stdin=None):
     secs = JOIN_SECS if args[:2] == ("room", "join") else 120
+    if is_keyring_change(args):
+        # A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+        return typed_run([VOX, *args], env(w), secs)
     return subprocess.run([VOX, *args], env=env(w), input=stdin, capture_output=True, text=True, timeout=secs)
 
 def spawn(w, *args, out):
@@ -170,7 +173,7 @@ try:
     alice_fp_shown = fp["alice"][:8] in txt
     carol_at = next((i for i, r in enumerate(pane) if want_carol in r), None)
     carol_ok = (carol_at is not None and carol_at + 1 < len(pane)
-                and pane[carol_at + 1].strip().strip("│").strip().startswith("not in keyring ·"))
+                and pane[carol_at + 1].strip().strip("│").strip().startswith("not in keyring"))
     print(f"{TAG} alice named 'alice': {alice_ok}; alice's fingerprint shown: {alice_fp_shown}; "
           f"carol by 26 chars, 'not in keyring' under: {carol_ok}")
 

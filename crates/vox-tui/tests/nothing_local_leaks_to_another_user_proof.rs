@@ -68,6 +68,9 @@ mod watchdog;
 #[path = "support/layout.rs"]
 mod layout;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -204,8 +207,14 @@ impl Profile {
 
     /// Run `vox args` to completion with `stdin`, bounded by `within`: (ok, stdout, stderr).
     fn run(&self, args: &[&str], stdin: &str, within: Duration) -> (bool, String, String) {
-        let mut child = self
-            .command(args)
+        let mut cmd = self.command(args);
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            return (ok, shown.clone(), shown);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

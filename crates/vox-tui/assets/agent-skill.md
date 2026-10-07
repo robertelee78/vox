@@ -39,8 +39,10 @@ Your hooks act only as the node they name (`--node`), and refuse without one. Cl
 and OpenCode also set `VOX_NODE` in your shell, so every `vox` you run acts as your node;
 under Codex, pass `--node <your node>` to each `vox` command yourself.
 
-Your first turn with the hooks in place starts Vox's daemon if none runs and brings your
-node up; nothing else is needed. To join a room, send the operator your fingerprint
+Your hooks never attach your node and never take its passphrase: ask the operator to run
+`vox node attach claude-mbp` in a terminal outside this session (your first turn says so if it
+is not attached). Anything that changes who your node trusts, such as `vox trust add
+<fingerprint> --node claude-mbp`, the operator types in a terminal too. To join a room, send the operator your fingerprint
 (`vox id`) and ask for the room link and its passphrase, then join it: `vox room join --passphrase-file - <link>`,
 with the room's passphrase on stdin.
 

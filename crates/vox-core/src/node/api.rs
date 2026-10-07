@@ -1128,7 +1128,7 @@ impl Fault {
             }
             Fault::WrongPassphrase => "the passphrase is wrong",
             Fault::PassphraseNeeded => {
-                "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       give it, and the change is made: `vox trust` asks at a terminal, or takes --identity-passphrase-file or VOX_IDENTITY_PASSPHRASE"
+                "changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes\n       type it, and the change is made: `vox trust` asks for it at a terminal"
             }
             Fault::PassphraseEmpty => {
                 "every node has an identity passphrase, and an empty one is refused; nothing was created"

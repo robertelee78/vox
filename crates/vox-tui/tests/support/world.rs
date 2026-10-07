@@ -25,6 +25,9 @@ mod layout;
 
 #[path = "attach.rs"]
 pub mod attach;
+
+#[path = "typed.rs"]
+pub mod typed;
 #[allow(unused_imports)] // not every includer uses every item
 pub use layout::{
     daemon_lock, daemon_pid, find_named, kill_daemon, node_dir, reap_daemon, Reaper, DEFAULT_NODE,
@@ -396,13 +399,19 @@ pub fn vox_once(data: &Path, args: &[String]) -> (bool, String, String) {
 
 /// [`vox_once`] exactly as given, attaching nothing.
 pub fn vox_once_plain(data: &Path, args: &[String]) -> (bool, String, String) {
-    let out = Command::new(VOX)
-        .args(args)
+    let mut cmd = Command::new(VOX);
+    cmd.args(args)
         .env("VOX_PROXY", proxy())
         .env("VOX_DATA_DIR", data)
         .env("VOX_CONFIG_DIR", data.join("cfg"))
         .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-        .env_remove("VOX_ROOM_PASSPHRASE")
+        .env_remove("VOX_ROOM_PASSPHRASE");
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
+    let out = cmd
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("APPARATUS: could not run {VOX} {args:?}: {e}"));

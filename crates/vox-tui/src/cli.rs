@@ -198,15 +198,26 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Only what the command line gave. A read needs none, and a change asks for it only when
-    // the node says it is needed (V210-159, V210-165).
-    let given = match crate::tunnel_cli::identity_passphrase_given(pass, pass_file) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("vox: {e}");
+    // **A keyring change's passphrase is typed** (ADR-028 K-13): a read needs none, and a change
+    // asks for it at the terminal only when the node says it is needed (V210-159, V210-165). A
+    // passphrase given on the command line or in a file is refused, saying so.
+    if !matches!(sub, TrustCmd::List(_)) {
+        if pass.is_some() {
+            eprintln!(
+                "vox: --identity-passphrase is refused: a keyring change's passphrase is typed at \
+                 a terminal (ADR-028 K-13)"
+            );
             return ExitCode::FAILURE;
         }
-    };
+        if pass_file.is_some() {
+            eprintln!(
+                "vox: --identity-passphrase-file is refused: a keyring change's passphrase is \
+                 typed at a terminal, never read from a file (ADR-028 K-13)"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    drop((pass, pass_file));
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -223,28 +234,21 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::List(_) => crate::room_cli::trust_list(&paths).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(
-                    &paths,
-                    target,
-                    &name,
-                    given,
-                    a.history == "full",
-                    a.drive,
-                )
-                .await
+                crate::room_cli::trust_add(&paths, target, &name, a.history == "full", a.drive)
+                    .await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_remove(&paths, target, given).await
+                crate::room_cli::trust_remove(&paths, target).await
             }
             TrustCmd::Rename(a) => {
-                crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name, given).await
+                crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name).await
             }
             TrustCmd::Drive(a) => {
-                crate::room_cli::trust_capability(&paths, &a.fingerprint, true, given).await
+                crate::room_cli::trust_capability(&paths, &a.fingerprint, true).await
             }
             TrustCmd::Read(a) => {
-                crate::room_cli::trust_capability(&paths, &a.fingerprint, false, given).await
+                crate::room_cli::trust_capability(&paths, &a.fingerprint, false).await
             }
         }
     });

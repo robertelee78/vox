@@ -41,6 +41,8 @@ mod watchdog;
 
 #[path = "support/attach.rs"]
 mod attach;
+#[path = "support/typed.rs"]
+mod typed;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -117,6 +119,11 @@ fn vox_plain(dir: &Path, args: &[&str], stdin: Option<&str>) -> (bool, String, S
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028 K-13).
+    if typed::is_keyring_change(args) {
+        let (ok, shown) = typed::keyring(&cmd);
+        return (ok, shown.clone(), shown);
+    }
     let mut child = cmd.spawn().expect("spawn vox");
     if let Some(text) = stdin {
         child

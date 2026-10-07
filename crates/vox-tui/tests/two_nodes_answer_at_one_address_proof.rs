@@ -2,7 +2,7 @@
 //! (ADR-026 §9.1's network half, D-3, D-5; #403), every participant the shipped `vox` binary.
 //!
 //! **Staging.** One account runs `vox daemon --node a` on `127.0.0.1:0`; node `b` is attached to the
-//! same daemon by its agent's hook. Where the daemon listens is `.daemon/port`, the data root's one
+//! same daemon by its operator, `vox node attach b` (a hook never attaches one, ADR-028 K-13). Where the daemon listens is `.daemon/port`, the data root's one
 //! port. A remote, on an account of its own, runs `vox serve` told that both `a` and `b` are anchors
 //! at that one address.
 //!
@@ -10,7 +10,7 @@
 //! 1. The remote connects to `a` and to `b`, both at the daemon's one ip:port: the daemon answers
 //!    as whichever node the dial names (the identity exchange), and neither binds a socket of its
 //!    own.
-//! 2. Once `b` detaches (its only session ends), a second remote told the same is answered by `a`
+//! 2. Once `b` is detached (`vox node detach b`), a second remote told the same is answered by `a`
 //!    at that address and told that nothing there answers as `b`.
 //!
 //! A red is PRODUCT, quoting what the processes said; a daemon or remote that never got going is
@@ -29,7 +29,6 @@ mod watchdog;
 #[path = "support/world.rs"]
 mod world;
 
-use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -55,36 +54,6 @@ fn pass_file(dir: &Path) -> String {
     let p = dir.join("identity.pass");
     std::fs::write(&p, format!("{IDENTITY}\n")).expect("APPARATUS: passphrase file");
     p.to_str().expect("APPARATUS: utf-8 path").to_owned()
-}
-
-/// An agent hook turn of `session` as node `node`, in the account at `dir`.
-fn hook(dir: &Path, node: &str, session: &str, event: &str) -> (bool, String) {
-    let mut child = Command::new(VOX)
-        .args(["agent", "hook", "--node", node])
-        .env("VOX_DATA_DIR", dir)
-        .env("VOX_CONFIG_DIR", dir.join("cfg"))
-        .env("VOX_IDENTITY_PASSPHRASE", IDENTITY)
-        .env("VOX_LISTEN", "127.0.0.1:0")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("APPARATUS: spawn vox agent hook: {e}"));
-    let input = format!(r#"{{"hook_event_name":"{event}","session_id":"{session}"}}"#);
-    let _ = child
-        .stdin
-        .take()
-        .expect("APPARATUS: stdin")
-        .write_all(input.as_bytes());
-    let out = child.wait_with_output().expect("APPARATUS: hook output");
-    (
-        out.status.success(),
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
-    )
 }
 
 fn short(fp: &str) -> String {
@@ -143,8 +112,11 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
         ]),
     );
     daemon.expect_staging("its identity", |l| l.contains("vox daemon: identity"));
-    let (ok, said) = hook(&home, "b", "s-b", "UserPromptSubmit");
-    assert!(ok, "PRODUCT (staging): b's hook failed: {said}");
+    let (ok, out, err) = vox_once(&home, &args(&["node", "attach", "b"]));
+    assert!(
+        ok,
+        "PRODUCT (staging): vox node attach b failed: {out}{err}"
+    );
     daemon.expect_staging("node b attached", |l| {
         l.contains("vox daemon: node b attached")
     });
@@ -176,8 +148,11 @@ fn two_nodes_answer_at_one_address_and_a_detach_leaves_the_other() {
     drop(r1);
 
     // 2. b detaches; a is still there, and nothing answers as b.
-    let (ok, said) = hook(&home, "b", "s-b", "SessionEnd");
-    assert!(ok, "PRODUCT (staging): b's SessionEnd failed: {said}");
+    let (ok, out, err) = vox_once(&home, &args(&["node", "detach", "b"]));
+    assert!(
+        ok,
+        "PRODUCT (staging): vox node detach b failed: {out}{err}"
+    );
     daemon.expect_staging("node b detached", |l| {
         l.contains("vox daemon: node b detached")
     });

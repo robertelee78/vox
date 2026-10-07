@@ -27,6 +27,9 @@
 #[path = "../../vox-core/tests/support/watchdog.rs"]
 mod watchdog;
 
+#[path = "support/typed.rs"]
+mod typed;
+
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -130,8 +133,14 @@ impl Root {
     }
 
     fn run(&self, args: &[&str]) -> (bool, String, String) {
-        let out = self
-            .cmd(args)
+        let mut cmd = self.cmd(args);
+        // A keyring change's passphrase is typed at a terminal, as a person types it (ADR-028
+        // K-13).
+        if typed::is_keyring_change(args) {
+            let (ok, shown) = typed::keyring(&cmd);
+            return (ok, shown.clone(), shown);
+        }
+        let out = cmd
             .stdin(Stdio::null())
             .output()
             .expect("APPARATUS: run vox");
