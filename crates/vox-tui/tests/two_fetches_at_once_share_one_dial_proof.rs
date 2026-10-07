@@ -521,15 +521,26 @@ fn two_fetches_at_once_share_one_dial() {
         // answered with whichever forward bound first, so both used one and the other was never
         // stopped: bob's daemon went on listening on a port nothing would ever connect to (and,
         // when the first get stopped the shared one while the second was still connecting, the
-        // second was refused). With both gets done, bob's daemon listens on no TCP port.
-        let listening = tcp_listeners(
-            bob.daemon
-                .as_ref()
-                .expect("APPARATUS: bob's daemon handle is gone")
-                .0
-                .id(),
+        // second was refused). With both gets done, bob's daemon listens on no TCP port but the
+        // `.vox` proxy it runs while a node is attached (ADR-028 S-5), at the address it said.
+        let daemon = bob
+            .daemon
+            .as_ref()
+            .expect("APPARATUS: bob's daemon handle is gone");
+        let proxy: Vec<String> = daemon
+            .said()
+            .lines()
+            .filter_map(|l| l.split("the .vox proxy is on ").nth(1))
+            .map(|a| a.trim().to_owned())
+            .collect();
+        let listening: Vec<String> = tcp_listeners(daemon.0.id())
+            .into_iter()
+            .filter(|a| !proxy.contains(a))
+            .collect();
+        eprintln!(
+            "[proof] cycle {cycle}: bob's daemon listens on {listening:?} after both gets, besides \
+             its .vox proxy {proxy:?}"
         );
-        eprintln!("[proof] cycle {cycle}: bob's daemon listens on {listening:?} after both gets");
         if !listening.is_empty() {
             left_listening.push(format!("cycle {cycle}: {listening:?}"));
         }
