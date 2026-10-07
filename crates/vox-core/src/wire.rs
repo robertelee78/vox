@@ -180,7 +180,8 @@ impl StructTag {
             | StructTag::GenesisRecord
             | StructTag::AdminCert
             | StructTag::PolicyRotation
-            | StructTag::RoomLifecycle => MS_FORMAT_VERSION,
+            | StructTag::RoomLifecycle
+            | StructTag::SessionEstablishment => MS_FORMAT_VERSION,
             _ => FORMAT_VERSION,
         }
     }
@@ -214,6 +215,7 @@ impl StructTag {
             StructTag::AdminCert => "admin certificate",
             StructTag::PolicyRotation => "retention change",
             StructTag::RoomLifecycle => "room lifecycle fact",
+            StructTag::SessionEstablishment => "session record",
             _ => "record",
         }
     }
@@ -245,6 +247,7 @@ impl StructTag {
             StructTag::AdminCert => "vox/admin-cert/v2",
             StructTag::PolicyRotation => "vox/policy-rotation/v2",
             StructTag::RoomLifecycle => "vox/room-lifecycle/v2",
+            StructTag::SessionEstablishment => "vox/session-establishment/v2",
             _ => self.domain_sep_v1(),
         }
     }

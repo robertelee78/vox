@@ -640,12 +640,6 @@ impl NodeNet {
         &self.presence
     }
 
-    /// The clock in whole seconds, for the transport's session records, which are specified in
-    /// seconds.
-    fn now_secs(&self) -> u64 {
-        (self.clock)() / 1_000
-    }
-
     /// The clock in milliseconds: what the board's records are stamped with and judged by.
     fn now_ms(&self) -> u64 {
         (self.clock)()
@@ -1217,7 +1211,7 @@ impl NodeNet {
         let (direct_failed, failed) = tokio::sync::watch::channel(candidates_none);
         if has_direct {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             // The addresses go into the label: "all direct candidates failed" is not a
             // diagnosis on its own, and which addresses this node believed in is exactly
             // what distinguishes a stale board record from a blocked path.
@@ -1268,7 +1262,7 @@ impl NodeNet {
             let me = self.local_id();
             let coordinator = Arc::clone(coordinator);
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             let label = format!("dial-back via {}", short_id(coordinator.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
@@ -1399,7 +1393,7 @@ impl NodeNet {
         let mut waiting: Vec<(Digest32, Arc<std::sync::atomic::AtomicBool>)> = Vec::new();
         for relay in helpers {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             let label = format!("circuit via {}", short_id(relay.peer_id()));
             let mut failed = failed.clone();
             let manager = Arc::clone(&self.manager);
@@ -1641,7 +1635,7 @@ impl NodeNet {
         let candidates = direct_candidates(endpoints);
         if !candidates.is_empty() {
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             set.spawn(async move {
                 crate::nat::reachability::connect_direct_within(
                     endpoint,
@@ -1662,7 +1656,7 @@ impl NodeNet {
             };
             let local = coordstream::punch_endpoints(observed, &local_eps);
             let endpoint = Arc::clone(self.manager.endpoint());
-            let now = self.now_secs();
+            let now = self.now_ms();
             set.spawn(async move {
                 let (mut send, mut recv) =
                     coordstream::open_punch_session(&coordinator, peer).await?;
@@ -1746,7 +1740,7 @@ impl NodeNet {
             Arc::clone(self.manager.endpoint()),
             plan,
             peer,
-            self.now_secs(),
+            self.now_ms(),
         )
         .await?;
         Ok(self.manager.adopt(conn).await)
@@ -1761,7 +1755,7 @@ impl NodeNet {
         peer: Digest32,
     ) -> Result<Arc<VoxConnection>> {
         let conn =
-            circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now_secs())
+            circuitstream::connect_through(relay, peer, self.manager.endpoint(), self.now_ms())
                 .await?;
         Ok(self.manager.adopt(conn).await)
     }
@@ -1786,7 +1780,7 @@ impl NodeNet {
             Arc::clone(self.manager.endpoint()),
             plan,
             peer,
-            self.now_secs(),
+            self.now_ms(),
         )
         .await;
         // **Said, either way** (V030-22): this is the dial a peer that cannot reach this node asked

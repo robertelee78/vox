@@ -62,12 +62,15 @@ pub enum Ask {
     Ranges(Vec<WantRange>),
 }
 
-/// The unix time now, in seconds.
+/// The unix time now, in milliseconds (what a dial stamps its session record with).
 pub fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
 }
 
 /// A node's dialable loopback address, from the ADR-012 multiaddrs it advertises.
