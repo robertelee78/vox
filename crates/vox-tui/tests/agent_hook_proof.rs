@@ -1904,6 +1904,70 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     let (data, cfg) = (daemon.data.clone(), daemon.cfg.clone());
     let room: String = daemon.room_key.chars().take(12).collect();
     let person = [("CLAUDE_CODE_ENTRYPOINT", "cli")];
+    // bob, another member, who calls the session's node by his own alias for it (ADR-029 SE-3).
+    let mut bob = Daemon::start_bare(&tmp.path().join("bob"));
+    for (who, other, name) in [(&daemon, &bob, "bob"), (&bob, &daemon, "codex@device-2")] {
+        let pass = who
+            .data
+            .parent()
+            .expect("APPARATUS: a root")
+            .join("identity.pass");
+        let (ok, _, err) = hook(
+            &who.data,
+            &who.cfg,
+            &[
+                "trust",
+                "add",
+                &other.fingerprint,
+                "--name",
+                name,
+                "--identity-passphrase-file",
+                pass.to_str().expect("APPARATUS: a UTF-8 path"),
+            ],
+            "",
+        );
+        assert!(ok, "PRODUCT (staging): vox trust add {name} failed: {err}");
+    }
+    let (ok, _, err) = hook(
+        &bob.data,
+        &bob.cfg,
+        &[
+            "room",
+            "join",
+            "--passphrase-file",
+            "-",
+            &daemon.link(&room),
+        ],
+        "channel passphrase",
+    );
+    assert!(ok, "PRODUCT (staging): bob could not join the room: {err}");
+    bob.room_key.clone_from(&daemon.room_key);
+    // The label bob's `vox room sessions` gives the session, once bob holds `marker`.
+    let bob_label = |marker: &str| -> String {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        while !shown_rows(&bob).iter().any(|(_, t)| t.contains(marker)) {
+            assert!(
+                Instant::now() < deadline,
+                "APPARATUS: staging not achieved: {marker} did not reach bob in 90 s"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let (ok, out, err) = hook(
+            &bob.data,
+            &bob.cfg,
+            &["room", "sessions", &room, "--json"],
+            "",
+        );
+        assert!(
+            ok,
+            "PRODUCT: bob's `vox room sessions --json` failed: {err}"
+        );
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|r| r["id"] == "3f0c25bf-aaaa-4bbb-8ccc-dddddddddddd")
+            .map(|r| r["label"].as_str().unwrap_or_default().to_owned())
+            .unwrap_or_default()
+    };
     // The session's transcript, as Claude Code writes it: a title it made, then the person's
     // `/rename` (ADR-029 MD-1).
     let transcript = tmp.path().join("transcript.jsonl");
@@ -1959,6 +2023,28 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         ),
         &person,
     );
+    // (2b) A hook run by hand, as a script runs it: a session named, no harness behind it.
+    let (ok, out, err) = hook(
+        &data,
+        &cfg,
+        &[
+            "agent",
+            "hook",
+            "--node",
+            "default",
+            "--room",
+            room.as_str(),
+            "--format",
+            "text",
+            "--session",
+            "bare-run-0001",
+        ],
+        "",
+    );
+    assert!(
+        ok,
+        "PRODUCT: a hook run by hand must exit 0; it said {out}{err}"
+    );
     let after_open = sessions();
     // (7) Every message from a session carries its id and name, whatever verb posts it
     // (ADR-029 MD-1, MD-2): a plain `vox room post` from it, and one from a session with no name.
@@ -1991,6 +2077,20 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
     let named = envelope_of("PLAIN-FROM-NAMED");
     let nameless = envelope_of("PLAIN-FROM-NAMELESS");
     let (_, nameless_listed, _) = hook(&data, &cfg, &["room", "sessions", &room], "");
+    let bob_first = bob_label("PLAIN-FROM-NAMED");
+    // (9) The person renames the session (`/rename`); its next message carries the new name, and
+    // every member's label for it follows (ADR-029 SE-3).
+    let mut renamed = std::fs::read_to_string(&transcript).unwrap_or_default();
+    renamed.push_str(
+        "{\"type\":\"custom-title\",\"customTitle\":\"gso-cap-2\",\"sessionId\":\"x\"}\n",
+    );
+    std::fs::write(&transcript, renamed).expect("APPARATUS: cannot rename in the transcript");
+    run(
+        claude_event_at(at, "UserPromptSubmit", r#","prompt":"go on""#, &transcript),
+        &person,
+    );
+    post_as(at, "AFTER-RENAME the cap holds");
+    let bob_renamed = bob_label("AFTER-RENAME");
     // (8) The daemon restarts mid-session; the session's next turn opens no second Session.
     restart(&mut daemon, tmp.path());
     run(
@@ -2039,6 +2139,11 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
          own id, even after a sub-agent's event under that id; the room lists {after_open:?}"
     );
     assert!(
+        of(&after_open, "bare-run-0001").is_empty(),
+        "PRODUCT: a hook run with no harness behind it must open no Session (ADR-029 SE-1); the \
+         room lists {after_open:?}"
+    );
+    assert!(
         after_open.len() == 1,
         "PRODUCT: a headless run must open no Session; the room lists {after_open:?}"
     );
@@ -2061,6 +2166,17 @@ fn a_session_opens_with_its_hook_and_ends_only_on_a_real_end() {
         nameless_listed.contains("0a1b2c3d") && !nameless_listed.contains("nameless ·"),
         "PRODUCT: a Session with no name must be shown by its short id; `vox room sessions` \
          printed:\n{nameless_listed}"
+    );
+    eprintln!("[proof] bob's label: {bob_first:?}, then after the rename: {bob_renamed:?}");
+    assert!(
+        bob_first == "codex@device-2 \u{b7} gso-cap \u{b7} 3f0c25bf",
+        "PRODUCT: another member must label a Session with his own alias for its node, its name \
+         and its short id; bob's `vox room sessions` labelled it {bob_first:?}"
+    );
+    assert!(
+        bob_renamed == "codex@device-2 \u{b7} gso-cap-2 \u{b7} 3f0c25bf",
+        "PRODUCT: a renamed session's label must change with its next message; bob's `vox room \
+         sessions` labelled it {bob_renamed:?} after the post"
     );
     assert!(
         of(&after_restart, at).len() == 1 && openings == 1,
