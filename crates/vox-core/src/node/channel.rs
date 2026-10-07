@@ -983,8 +983,11 @@ pub struct ChannelState {
     gen: Arc<std::sync::atomic::AtomicU64>,
     /// Members that left and that this node let in again by answering their join (V030-08):
     /// members here until their signed return reaches it, which it then carries to the others.
+    /// Each with the position in its feed of the departure the join undid: only that one. A
+    /// departure it writes later, after it joined again, is a leave like any other; a member
+    /// let in again kept its readmission for good, so a second leave was never applied (#564).
     /// In memory: a join is answered again after a restart.
-    readmitted: BTreeSet<Digest32>,
+    readmitted: BTreeMap<Digest32, u64>,
 }
 
 impl std::fmt::Debug for ChannelState {
@@ -1773,7 +1776,7 @@ impl ChannelState {
             poisoned: false,
             settled: true,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            readmitted: BTreeSet::new(),
+            readmitted: BTreeMap::new(),
         };
         // The room's name is stated on its log as its first entry after the genesis, so every
         // member that joins reads it there (ADR-028 R-1).
@@ -2255,7 +2258,7 @@ impl ChannelState {
             poisoned: false,
             settled,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            readmitted: BTreeSet::new(),
+            readmitted: BTreeMap::new(),
         })
     }
 
@@ -2498,7 +2501,7 @@ impl ChannelState {
             poisoned: false,
             settled: false,
             gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            readmitted: BTreeSet::new(),
+            readmitted: BTreeMap::new(),
         })
     }
 
@@ -7285,19 +7288,27 @@ impl ChannelState {
     /// ([`Self::readmit`]). Anything it authored after one — it joined again — puts it back.
     #[must_use]
     pub fn has_left(&self, author: &Digest32) -> bool {
-        self.said_left(author) && !self.readmitted.contains(author)
+        self.left_at(author)
+            .is_some_and(|seq| self.readmitted.get(author) != Some(&seq))
     }
 
     /// Whether `author`'s feed, as this node holds it, ends in its statement that it left.
     fn said_left(&self, author: &Digest32) -> bool {
-        let Some(head) = self.dag.feed(author).map(|f| f.max_seq()) else {
-            return false;
-        };
-        self.gov_entries.iter().any(|g| {
-            g.author_id == *author
-                && g.seq == head
-                && matches!(&g.body, GovBody::Presence(p) if p.body.author_id == *author && !p.body.here)
-        })
+        self.left_at(author).is_some()
+    }
+
+    /// Where in `author`'s feed, as this node holds it, its statement that it left stands, when
+    /// that statement is the feed's last entry.
+    fn left_at(&self, author: &Digest32) -> Option<u64> {
+        let head = self.dag.feed(author).map(|f| f.max_seq())?;
+        self.gov_entries
+            .iter()
+            .any(|g| {
+                g.author_id == *author
+                    && g.seq == head
+                    && matches!(&g.body, GovBody::Presence(p) if p.body.author_id == *author && !p.body.here)
+            })
+            .then_some(head)
     }
 
     /// Every author that has left the room ([`Self::has_left`]), in one pass over the log's
@@ -7308,7 +7319,7 @@ impl ChannelState {
             .filter(|g| {
                 matches!(&g.body, GovBody::Presence(p) if p.body.author_id == g.author_id && !p.body.here)
                     && self.dag.feed(&g.author_id).map(|f| f.max_seq()) == Some(g.seq)
-                    && !self.readmitted.contains(&g.author_id)
+                    && self.readmitted.get(&g.author_id) != Some(&g.seq)
             })
             .map(|g| g.author_id)
             .collect()
@@ -7318,8 +7329,8 @@ impl ChannelState {
     /// join this node answered. It is a member here until its own statement that it is back
     /// reaches the others through this node.
     pub fn readmit(&mut self, who: Digest32) {
-        if self.said_left(&who) {
-            self.readmitted.insert(who);
+        if let Some(seq) = self.left_at(&who) {
+            self.readmitted.insert(who, seq);
         }
     }
 
