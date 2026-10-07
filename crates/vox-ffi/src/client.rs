@@ -534,11 +534,11 @@ async fn start_file_for(
     note: Option<String>,
 ) -> Result<vox_agentcomms::drive::Action, String> {
     let path = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
-    let note = note
-        .map(|n| n.trim().to_owned())
-        .filter(|n| !n.is_empty());
-    let mut env =
-        vox_agentcomms::envelope::Envelope::new(vox_core::node::shares::FILE, note.as_deref().unwrap_or(""));
+    let note = note.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+    let mut env = vox_agentcomms::envelope::Envelope::new(
+        vox_core::node::shares::FILE,
+        note.as_deref().unwrap_or(""),
+    );
     if let Some(n) = &note {
         env.data = serde_json::json!({ "note": n });
     }

@@ -14,6 +14,11 @@
 //!    directory; carol's pulls nothing. Carol, given the share's tag by a member that has it (an
 //!    apparatus attacker reading bob's Session), forwards to alice's service and asks for it
 //!    herself: refused (403), though alice's node trusts her.
+//! 4. **A file into a Session comes only from drive** (DR-1.7, #546). Bob runs `vox room session
+//!    ROOM SESSION --file PATH --note …`: alice's node answers that it is pulling it, the file lands
+//!    in alice's files directory byte for byte, and the Session shows it come in, as bob reads it.
+//!    Carol, read only, sending a file the same way is refused by alice's node, and nothing of
+//!    hers lands there.
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
 //!    Bob's node opens none of the entries alice's Session writes afterwards, while it still holds
 //!    the ones it read before and still reads alice's messages to the room; and its
@@ -42,6 +47,8 @@
 //!   red PRODUCT.
 //! - **A Session's file served to any trusted member** (claim 3): `Witness::allowed` in
 //!   `crates/vox-core/src/node/shares.rs` lets anyone in. Carol is served the file: red PRODUCT.
+//! - **A driven file taken without checking drive** (claim 4): the DR-2 check in `drive` in
+//!   `crates/vox-tui/src/host.rs` is removed. Carol's file lands on alice's node: red PRODUCT.
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
@@ -630,6 +637,76 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         status.contains("403"),
         "PRODUCT: alice's node must refuse carol the Session's file though she asks by its tag: it \
          answered {status:?}"
+    );
+
+    // ---- claim 4: bob drives a file into alice's Session; carol, read only, cannot ----
+    let into = tmp.path().join("for-session.bin");
+    let into_bytes: Vec<u8> = (0..90_000u32).map(|i| (i * 17 % 241) as u8).collect();
+    std::fs::write(&into, &into_bytes).expect("APPARATUS: write the file to drive in");
+    let (bob_ok, bob_said, bob_err) = bob.vox(
+        &[
+            "room",
+            "session",
+            &room,
+            SESSION,
+            "--file",
+            into.to_str().expect("APPARATUS: a UTF-8 temp path"),
+            "--note",
+            "for your review",
+        ],
+        None,
+    );
+    let alice_got = until(Duration::from_secs(120), || {
+        landed(&alice, &id, "for-session.bin").as_deref() == Some(&into_bytes[..])
+    });
+    let came_in = until(Duration::from_secs(60), || {
+        let (_, out, _) = bob.vox(&["room", "session", &room, SESSION, "--json"], None);
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| {
+                v["kind"] == "file"
+                    && v["line"]
+                        .as_str()
+                        .is_some_and(|l| l.starts_with("file to ") && l.contains("for-session.bin"))
+            })
+    });
+    let carol_file = tmp.path().join("from-carol.bin");
+    std::fs::write(&carol_file, b"carol has read only").expect("APPARATUS: write carol's file");
+    let (carol_ok, carol_said, carol_err) = carol.vox(
+        &[
+            "room",
+            "session",
+            &room,
+            SESSION,
+            "--file",
+            carol_file.to_str().expect("APPARATUS: a UTF-8 temp path"),
+        ],
+        None,
+    );
+    // As long as alice's node took to land bob's, and five seconds more.
+    std::thread::sleep(Duration::from_secs(5));
+    let carol_landed_at_alice = landed(&alice, &id, "from-carol.bin").is_some();
+    eprintln!(
+        "[proof] claim 4: bob's --file: {bob_ok} {bob_said}{bob_err}; it landed at alice: \
+         {alice_got}; bob's Session shows it come in: {came_in}; carol's --file: {carol_ok} \
+         {carol_said}{carol_err}; hers landed at alice: {carol_landed_at_alice}"
+    );
+    assert!(
+        bob_ok && bob_said.contains("pulling"),
+        "PRODUCT: bob, whom alice trusts with drive, must have his file accepted: {bob_said}{bob_err}"
+    );
+    assert!(
+        alice_got,
+        "PRODUCT: the file bob drove into alice's Session must land on her node, byte for byte"
+    );
+    assert!(
+        came_in,
+        "PRODUCT: alice's Session must show the file come in, as bob reads it"
+    );
+    assert!(
+        !carol_ok && !carol_landed_at_alice,
+        "PRODUCT: carol, read only, must be refused a file into alice's Session, and none of hers \
+         may land: she was told {carol_said}{carol_err}"
     );
 
     // ---- claim 2: alice downgrades bob to read; her Session's later entries are not his ----
