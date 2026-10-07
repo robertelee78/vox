@@ -1636,7 +1636,10 @@ fn event_loop(io: &mut impl TerminalIo, core: &mut impl CoreHandle) -> Result<()
             Action::Dispatch(cmd) => {
                 // Moving between screens is no action to report: a "done" there took the place of
                 // the screen's own key hints.
-                let moving = matches!(cmd, Command::SelectChannel { .. });
+                let moving = matches!(
+                    cmd,
+                    Command::SelectChannel { .. } | Command::ShowSession { .. }
+                );
                 // **Waiting is said in the status line** (V210-100), never on stderr: stderr is
                 // this terminal, and a line written there lands inside the screen.
                 let status = core.apply_noting(cmd, &mut || {

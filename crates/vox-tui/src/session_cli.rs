@@ -32,6 +32,45 @@ pub struct Line {
     pub waiting: Option<Waiting>,
 }
 
+impl Line {
+    /// The request's `ref` when this line is an approval or a question still waiting for an
+    /// answer from a member with drive (not resolved, not expired, answerable from Vox); `None`
+    /// otherwise. What the TUI offers approve, reject and answer on, and what counts a Session
+    /// under "needs you" (ADR-029 CL-2).
+    #[must_use]
+    pub fn open(&self) -> Option<&str> {
+        self.waiting
+            .is_some()
+            .then_some(self.reference.as_str())
+            .filter(|r| !r.is_empty())
+    }
+}
+
+/// The refs of the requests in one Session's `rows` (its entries, in order) still waiting for an
+/// answer: the same rule [`lines`] words them by.
+#[must_use]
+pub fn waiting(rows: &[SessionRow]) -> Vec<String> {
+    lines(rows, "", &Nameless)
+        .iter()
+        .filter_map(|l| l.open().map(str::to_owned))
+        .collect()
+}
+
+/// Names for a reading that shows none.
+struct Nameless;
+
+impl Names for Nameless {
+    fn alias(&self, _: &Digest32) -> String {
+        String::new()
+    }
+    fn is_me(&self, _: &str) -> bool {
+        false
+    }
+    fn alias_b32(&self, _: &str) -> String {
+        String::new()
+    }
+}
+
 /// What an open request waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waiting {
@@ -148,6 +187,9 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
     // What settles an earlier line: a tool call's result, a request's resolution.
     let mut done: BTreeMap<String, usize> = BTreeMap::new();
     let mut resolved: BTreeMap<String, usize> = BTreeMap::new();
+    // A drive's results, by the drive's tag (`of` on the result, `id` on the drive), in order.
+    let mut results: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut driven: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     // Calls that asked first: their request's line names them, so an unanswered or refused call
     // is not shown twice.
     let mut asked: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -161,6 +203,12 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             }
             "resolved" => {
                 resolved.insert(b.reference().to_owned(), i);
+            }
+            "drive" if !b.str("id").is_empty() => {
+                driven.insert(b.str("id").to_owned());
+            }
+            "drive-result" if !b.str("of").is_empty() => {
+                results.entry(b.str("of").to_owned()).or_default().push(i);
             }
             _ => {}
         }
@@ -285,9 +333,20 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     size(b.fields.get("size").and_then(Value::as_u64).unwrap_or(0))
                 );
                 if b.str("dir") == "in" {
-                    format!("file to {label}: {what}")
+                    // Written by the session's node once the file has landed (#546).
+                    let from = match b.str("by") {
+                        "" => String::new(),
+                        by => format!(" from {}", names.alias_b32(by)),
+                    };
+                    match b.str("path") {
+                        "" => format!("file to {label}: {what}{from}"),
+                        path => format!("file to {label}: {what}{from}, at {path}"),
+                    }
                 } else {
-                    format!("file from {label}: {what}")
+                    match b.str("note").trim() {
+                        "" => format!("file from {label}: {what}"),
+                        note => format!("file from {label}: {what} — {}", one_line(note)),
+                    }
                 }
             }
             "drive" => {
@@ -305,6 +364,26 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
                     "interrupt" => format!("interrupt sent by {by}"),
                     "stop" => format!("stop sent by {by}"),
                     "slash" => format!("/{} sent by {by}", b.str("cmd").trim_start_matches('/')),
+                    "file" => {
+                        if !b.str("note").trim().is_empty() {
+                            details.push(("note".into(), b.str("note").to_owned()));
+                        }
+                        let mut line = format!(
+                            "file sent in by {by}: {} ({})",
+                            b.str("name"),
+                            size(b.fields.get("size").and_then(Value::as_u64).unwrap_or(0))
+                        );
+                        // What came of it, in order: each result names this drive's tag as `of`.
+                        for r in results.get(b.str("id")).into_iter().flatten() {
+                            let r = &bodies[*r];
+                            if r.fields.get("ok").and_then(Value::as_bool) == Some(true) {
+                                line.push_str(&format!(" — {}", r.str("said")));
+                            } else {
+                                line.push_str(&format!(" ✗ {}", r.str("why")));
+                            }
+                        }
+                        line
+                    }
                     // An answer shows on its request's line.
                     _ => continue,
                 }
@@ -312,6 +391,10 @@ pub fn lines(rows: &[SessionRow], label: &str, names: &dyn Names) -> Vec<Line> {
             // A line Vox itself says in the Session.
             "notice" => format!("Vox: {}", one_line(b.str("text"))),
             "drive-result" => {
+                // A result paired with its drive's tag is drawn on that drive's line.
+                if !b.str("of").is_empty() && driven.contains(b.str("of")) {
+                    continue;
+                }
                 if b.fields.get("ok").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
@@ -365,6 +448,51 @@ pub fn render(lines: &[Line], details: bool, answer_with: &str) -> String {
         }
     }
     s
+}
+
+/// The entries of the Session `id` of `node` among a room's Session entries, in the order they were
+/// written: the session node's own, and the drive entries that name the session; each author's
+/// send time, and within one moment the session node's own numbering (a split entry's parts share
+/// a millisecond).
+#[must_use]
+pub fn of_session(rows: Vec<SessionRow>, id: &str, node: &Digest32) -> Vec<SessionRow> {
+    let field = |r: &SessionRow, k: &str| {
+        serde_json::from_str::<Value>(&r.body)
+            .ok()
+            .and_then(|v| v.get(k).cloned())
+    };
+    let mut mine: Vec<SessionRow> = rows
+        .into_iter()
+        .filter(|r| {
+            r.session_id == id
+                && (r.author == *node
+                    || field(r, "kind").as_ref().and_then(Value::as_str) == Some("drive"))
+        })
+        .collect();
+    mine.sort_by_key(|r| {
+        (
+            r.created_millis,
+            field(r, "seq")
+                .as_ref()
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+    });
+    mine
+}
+
+/// One Session's lines, each with its Details as plain lines, named as this node names its members:
+/// what `vox room session --details` prints, for the TUI to draw the same words (CL-1). `rows` are
+/// the Session's entries, in order; `label` its label.
+#[must_use]
+pub fn drawn(rows: &[SessionRow], label: &str) -> Vec<(String, Vec<String>)> {
+    lines(rows, label, &ByIdent)
+        .into_iter()
+        .map(|l| {
+            let details = crate::session_drive_ui::details(&l.details);
+            (l.text, details)
+        })
+        .collect()
 }
 
 /// How this command names nodes: the names this node gave them ([`crate::ident`]).
@@ -471,20 +599,7 @@ pub async fn show(
                 )
             }
         };
-    // The Session's own entries are its node's; a driver's entries name the session too.
-    let mut mine: Vec<SessionRow> = rows
-        .into_iter()
-        .filter(|r| r.session_id == id && (r.author == node || kind(r) == "drive"))
-        .collect();
-    // In the order the entries were written: each author's send time, and within one moment the
-    // session node's own numbering (a split entry's parts share a millisecond).
-    let seq = |r: &SessionRow| {
-        serde_json::from_str::<Value>(&r.body)
-            .ok()
-            .and_then(|v| v.get("seq").and_then(Value::as_u64))
-            .unwrap_or(0)
-    };
-    mine.sort_by_key(|r| (r.created_millis, seq(r)));
+    let mine = of_session(rows, &id, &node);
     use std::io::Write as _;
     // A member without drive holds the entries but cannot open them (SC-2, SC-3): it is told whose
     // trust it lacks, never shown an empty Session.
