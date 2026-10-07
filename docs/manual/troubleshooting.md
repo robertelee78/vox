@@ -58,8 +58,10 @@ damaged node.
 
 **Check:** run `vox node list`: each node is `attached` or `detached`. Compare `--node`,
 `VOX_NODE`, the data/config roots and the OS user with the terminal or agent that should hold the
-node. A node attached because a session needed it, such as `vox forward` or an agent session,
-detaches again when the last of them ends.
+node. A node attached because a session needed it, such as `vox forward`, detaches again when
+the last of them ends. An agent's hook never attaches its node: the agent says `node NAME is not
+attached, and a hook never attaches it`, and you attach it, in a terminal outside the agent's
+session.
 
 **Fix:** `vox node attach robertgpt`. Do not create a second node to get past this message: a
 new node is a new identity, with no rooms and no trust. To keep a node attached across daemon
