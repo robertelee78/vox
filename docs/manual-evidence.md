@@ -133,6 +133,8 @@ macOS, `ss` on Linux, `kind_of_command` in `crates/vox-core/src/node/probe.rs`);
 connections to a TCP service (`probe_tcp`). The split case was red once in this check: bob refused
 y as full because x, whose daemon was still running, had reached bob directly. That run's red was
 reported to the lead as staging rather than product, and a second run was green.
+| A Session keeps what its session did while its room was joining | `agent_hook_proof::a_session_works_in_the_room_its_start_directory_is_mapped_to`, release, `--ignored`, at `48b1c743` (2026-10-07) | passed in 70.9 s: the first prompt, typed before the node was a member, is read in the Session once the room opens; the dropped-entries sentence is quoted from `host.rs` (b2f4bd42), not run (it needs over 4 MiB held) |
+| `--to member/session` on `vox share` | `vox share --help` at `48b1c743` (f60207c0) | `Or address one session of a member as <member>/<session>, the session named as vox room sessions names it` … `For example: --to bob/gso-cap` |
 
 ## v0.3.1 command check
 
