@@ -93,6 +93,8 @@ struct Inner {
     connections: Arc<std::sync::atomic::AtomicUsize>,
     /// The daemon's `.vox` proxy, run while any node is attached (ADR-028 S-5).
     proxy: Option<Arc<crate::daemon_proxy::DaemonProxy>>,
+    /// Where harness sessions' activity is numbered and posted, and approvals wait (ADR-029).
+    sink: Arc<crate::session_sink::Sink>,
 }
 
 /// One node's place in its life (L-1). A node with no slot is detached.
@@ -227,20 +229,31 @@ impl Router {
             .proxy
             .map(|bind| Arc::new(crate::daemon_proxy::DaemonProxy::new(bind)));
         let router = Self {
-            inner: Arc::new(Inner {
-                account,
-                rt,
-                defaults,
-                slots: Mutex::new(BTreeMap::new()),
-                events: broadcast::channel(256).0,
-                metrics: Arc::new(DaemonMetrics::default()),
-                stopping: AtomicBool::new(false),
-                next_generation: AtomicU64::new(1),
-                stop_asked: tokio::sync::Notify::new(),
-                serve_only: Mutex::default(),
-                unfinished_stop: AtomicBool::new(false),
-                connections: Arc::default(),
-                proxy,
+            inner: Arc::new_cyclic(|weak: &std::sync::Weak<Inner>| {
+                let weak = weak.clone();
+                let sink = crate::session_sink::Sink::new(Arc::new(
+                    move |node: &NodeName, session: &str, bodies: Vec<String>| {
+                        if let Some(inner) = weak.upgrade() {
+                            Router { inner }.post_session(node, session, bodies);
+                        }
+                    },
+                ));
+                Inner {
+                    account,
+                    rt,
+                    defaults,
+                    slots: Mutex::new(BTreeMap::new()),
+                    events: broadcast::channel(256).0,
+                    metrics: Arc::new(DaemonMetrics::default()),
+                    stopping: AtomicBool::new(false),
+                    next_generation: AtomicU64::new(1),
+                    stop_asked: tokio::sync::Notify::new(),
+                    serve_only: Mutex::default(),
+                    unfinished_stop: AtomicBool::new(false),
+                    connections: Arc::default(),
+                    proxy,
+                    sink,
+                }
             }),
         };
         router.follow_attached_with_the_proxy();
@@ -415,6 +428,14 @@ impl Router {
         Ok(g.info)
     }
 
+    /// Post `bodies`, numbered, to `session`'s Session: sealed to the members `node` trusts with
+    /// drive (ADR-029 SC-2), in the room the session works in.
+    // WIP(#540): reads2's `NodeCommand::AppendSession` and files2's session room are not on
+    // integrate yet; until they are, nothing is posted. Never posted unsealed.
+    fn post_session(&self, node: &NodeName, session: &str, bodies: Vec<String>) {
+        let _ = (node, session, bodies);
+    }
+
     /// Unregister an agent session of `node`, and detach the node if it was attached implicitly
     /// and that session was its last holder, **in one decision** (L-3): the unregister and the
     /// move to `Detaching` happen in one critical section, so a session registering at the same
@@ -422,6 +443,7 @@ impl Router {
     ///
     /// Returns whether the session was registered, and whether the node detached.
     pub async fn session_end(&self, node: &NodeName, session: &str) -> (bool, bool) {
+        self.inner.sink.session_end(node, session);
         let going = {
             let mut slots = lock(&self.inner.slots);
             match slots.get_mut(node) {
@@ -1223,6 +1245,27 @@ impl Dispatch for Router {
                 self.inner.stop_asked.notify_one();
                 DaemonFrame::Ok
             }
+            DaemonRequest::SessionActivity {
+                node,
+                session,
+                bodies,
+                call,
+            } => {
+                self.inner.sink.activity(&node, &session, bodies, call);
+                DaemonFrame::Ok
+            }
+            DaemonRequest::SessionAsk {
+                node,
+                session,
+                body,
+                call,
+                transcript,
+            } => DaemonFrame::SessionAnswer(
+                self.inner
+                    .sink
+                    .ask(&node, &session, body, call, transcript)
+                    .await,
+            ),
         }
     }
 

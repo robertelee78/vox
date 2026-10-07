@@ -1154,6 +1154,22 @@ pub async fn run(
         input.session_id = s.trim().to_owned();
     }
 
+    // ADR-029 SC-1: what the session does goes to its Session (#540), and an approval or a
+    // question waits there for an answer from either side (#545).
+    let mirrored = crate::session_mirror::Event::parse(&raw)
+        .filter(|ev| crate::session_mirror::mirrors(&ev.name));
+    if let Some(ev) = &mirrored {
+        if ev.name != "UserPromptSubmit" {
+            if ev.name == "Stop" {
+                crate::wake::record_idle(paths, &input.session_id);
+            }
+            if let Some(out) = crate::session_mirror::hook(daemon, ev, &input.session_id).await {
+                println!("{out}");
+            }
+            return Ok(());
+        }
+    }
+
     match input.event.as_str() {
         "Stop" => {
             crate::wake::record_idle(paths, &input.session_id);
@@ -1167,7 +1183,13 @@ pub async fn run(
     }
 
     let drained = match daemon.register(&input).await {
-        Ok(()) => drain(paths, room_arg, &input, &raw, format).await,
+        Ok(()) => {
+            // The prompt goes to the Session first: it is what the turn the drain starts answers.
+            if let Some(ev) = &mirrored {
+                crate::session_mirror::hook(daemon, ev, &input.session_id).await;
+            }
+            drain(paths, room_arg, &input, &raw, format).await
+        }
         Err(e) => Err(e),
     };
     if let Err(e) = drained {
@@ -1905,13 +1927,43 @@ async fn read_room(
 }
 
 /// The hook entries `vox agent plugin claude` prints, for `~/.claude/settings.json`: one per event
-/// `vox agent hook` acts on (see [`run`]).
+/// `vox agent hook` acts on (see [`run`]). The tool events and `PermissionRequest` feed the
+/// session's Session (ADR-029 SC-1, DR-3); `PermissionRequest` waits for an answer from it for up
+/// to an hour, while the terminal's own prompt stays live, so its timeout is that long.
 pub const CLAUDE_HOOKS: &str = r#"{
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
           { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook" }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "vox agent hook", "timeout": 3600 }
         ]
       }
     ],
