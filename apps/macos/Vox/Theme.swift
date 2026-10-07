@@ -37,6 +37,18 @@ enum Theme {
         return scales.contains(kept) ? kept : 1
     }
     static let scaleKey = "textScale"
+    /// Buttons, menus and toggles at the app's text size: macOS draws a control's label in the
+    /// control's own size, not the view's font.
+    static var controls: ControlSize {
+        switch scale {
+        case ..<1.15: return .regular
+        case ..<1.75: return .large
+        default:
+            if #available(macOS 14, *) { return .extraLarge }
+            return .large
+        }
+    }
+
     /// A width that holds text, at the app's text size.
     static func scaled(_ points: CGFloat) -> CGFloat { points * CGFloat(scale) }
     /// The sizes Bigger and Smaller step through.
@@ -156,14 +168,12 @@ private struct Typeset: ViewModifier {
     }
 }
 
-/// A card's outline: line.hair, or text.secondary under Increase Contrast (L-5).
+/// A card's outline: text.muted, 4.5:1 or more on every background, since an outline is all that
+/// marks a card's edge (WCAG 2.1 1.4.11); under Increase Contrast its token's hex_hc, which the
+/// colour set carries (L-5, #450).
 private struct CardOutline: ViewModifier {
-    @Environment(\.colorSchemeContrast) private var contrast
-
     func body(content: Content) -> some View {
-        content.overlay(RoundedRectangle(cornerRadius: 6)
-            .stroke(contrast == .increased ? VoxTokens.Colors.textSecondary
-                                           : VoxTokens.Colors.lineHair))
+        content.overlay(RoundedRectangle(cornerRadius: 6).stroke(VoxTokens.Colors.textMuted))
     }
 }
 

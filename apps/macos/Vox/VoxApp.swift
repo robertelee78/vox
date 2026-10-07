@@ -20,6 +20,7 @@ struct VoxApp: App {
                 // Every view's text in the app's face and size; drawn again when the size
                 // changes (View > Bigger, Smaller, Actual Size).
                 .font(Theme.text)
+                .controlSize(Theme.controls)
                 .id(model.textScale)
                 // The sidebar (260) and the inspector (240) leave the room 400 or more: room
                 // for the composer's field beside its To: and Urgent controls.
@@ -34,6 +35,7 @@ struct VoxApp: App {
                                          set: { model.showMenuBar($0) })) {
             MenuBarContent(app: model)
                 .font(Theme.text)
+                .controlSize(Theme.controls)
                 .id(model.textScale)
                 .preferredColorScheme(.dark)
         }

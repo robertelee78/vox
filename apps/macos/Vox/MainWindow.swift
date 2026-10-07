@@ -87,7 +87,7 @@ private struct Sidebar: View {
                         .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
-                Text("nodes on this Mac").eyebrow()
+                Text("nodes on this Mac").eyebrow().accessibilityAddTraits(.isHeader)
             }
         }
         .listStyle(.sidebar)
@@ -391,6 +391,29 @@ private struct MessageRow: View {
                     .accessibilityLabel("read by \(readBy.joined(separator: ", "))")
             }
         }
+        // VoiceOver reads the row first as one sentence, in the order it is drawn; its parts
+        // (the file's buttons, the link) stay reachable inside it (WCAG 1.3.1, 4.1.2).
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(spoken)
+    }
+
+    /// The row as one sentence: who, to whom, how, what, and what became of it.
+    private var spoken: String {
+        var parts = [author]
+        if message.to.contains(me) { parts.append("to you") }
+        if message.urgent { parts.append("urgent") }
+        if message.late { parts.append("arrived late") }
+        var said = parts.joined(separator: ", ") + ": "
+        if let file = message.file {
+            said += "\(file.folder ? "folder" : "file") \(file.name)"
+            if !file.note.isEmpty { said += ", \(file.note)" }
+        } else {
+            said += message.owed ? "not received yet" : message.text
+        }
+        if let card = message.card, !card.title.isEmpty { said += ", link: \(card.title)" }
+        if !pulledBy.isEmpty { said += ", pulled by \(pulledBy.joined(separator: ", "))" }
+        if !readBy.isEmpty { said += ", read by \(readBy.joined(separator: ", "))" }
+        return said
     }
 
     /// A share's text is its note.
@@ -516,6 +539,7 @@ private struct Inspector: View {
             SessionsList(model: model)
             Divider().padding(.vertical, 8)
             Text("MEMBERS").eyebrow().secondaryText()
+                .accessibilityAddTraits(.isHeader)
             ForEach(model.members) { member in
                 TrustMark(name: member.name, trust: member.trust)
                     .accessibilityIdentifier("member-\(member.name)")
@@ -540,6 +564,7 @@ private struct FamilyLan: View {
 
     var body: some View {
         Text("FAMILY LAN").eyebrow().secondaryText()
+            .accessibilityAddTraits(.isHeader)
         if model.lanHelperReady {
             Toggle("On this room's LAN", isOn: Binding(
                 get: { model.lanOn.contains(room) },

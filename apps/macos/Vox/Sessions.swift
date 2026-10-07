@@ -54,6 +54,7 @@ struct SessionsList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("SESSIONS").eyebrow().secondaryText()
+                .accessibilityAddTraits(.isHeader)
             row("General", .general, id: "session-general")
             row("All", .all, id: "session-all")
             ForEach(model.openSessions, id: \.self) { s in
@@ -67,6 +68,7 @@ struct SessionsList: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("sessions-ended")
+                .accessibilityValue(endedOpen ? "expanded" : "collapsed")
                 if endedOpen {
                     ForEach(ended, id: \.self) { s in
                         row("\(s.label) · ended", .session(node: s.nodeFingerprint, id: s.sessionId),
@@ -113,7 +115,7 @@ struct SessionEntryRow: View {
             Text(entry.line).font(Theme.mono).textSelection(.enabled)
                 .accessibilityIdentifier("entry-line-\(entry.id)")
             if let request = entry.request {
-                RequestView(model: model, session: session, request: request)
+                RequestView(model: model, session: session, request: request, about: entry.line)
             }
             // A file the session sent, once this node has a verified copy (ADR-029 DR-1, F-11).
             if let file = entry.file, let pulled = file.pulledPath {

@@ -74,7 +74,7 @@ struct KeyringView: View {
     /// done (E-5).
     private var addForm: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("ADD A NODE").eyebrow().secondaryText()
+            Text("ADD A NODE").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
             TextField("Fingerprint (paste or type)", text: $fingerprint)
                 .font(Theme.mono)
                 .focused($adding)

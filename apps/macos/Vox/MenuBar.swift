@@ -145,7 +145,7 @@ private struct NodeFacts: View {
 
     @ViewBuilder
     private func section(_ title: String, @ViewBuilder _ rows: () -> some View) -> some View {
-        Text(title).eyebrow().secondaryText()
+        Text(title).eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
         rows()
     }
 }

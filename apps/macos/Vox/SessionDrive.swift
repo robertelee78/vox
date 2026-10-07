@@ -109,16 +109,19 @@ struct RequestView: View {
     @ObservedObject var model: NodeModel
     let session: FfiSession
     let request: FfiRequest
+    /// What the request asks, as its entry's line says it: its buttons name it to VoiceOver.
+    let about: String
     @State private var why = ""
     /// Each part's chosen option, by its index, for a question of several parts.
     @State private var chosen: [Int: String] = [:]
     @State private var said = ""
     @State private var busy = false
 
-    init(model: NodeModel, session: FfiSession, request: FfiRequest) {
+    init(model: NodeModel, session: FfiSession, request: FfiRequest, about: String = "") {
         self.model = model
         self.session = session
         self.request = request
+        self.about = about
     }
 
     var body: some View {
@@ -141,11 +144,13 @@ struct RequestView: View {
         HStack(spacing: 8) {
             Button("Approve") { act(.approve(reference: request.reference)) }
                 .accessibilityIdentifier("request-approve-\(request.reference)")
+                .accessibilityLabel(about.isEmpty ? "Approve" : "Approve: \(about)")
             Button("Reject") {
                 let reason = why.trimmingCharacters(in: .whitespacesAndNewlines)
                 act(.reject(reference: request.reference, why: reason.isEmpty ? nil : reason))
             }
             .accessibilityIdentifier("request-reject-\(request.reference)")
+            .accessibilityLabel(about.isEmpty ? "Reject" : "Reject: \(about)")
             TextField("Why (optional, told to the model)", text: $why)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: Theme.scaled(260))
@@ -169,6 +174,7 @@ struct RequestView: View {
                             Button(option) { pick(part: i, option) }
                                 .selectionMark(chosen[i] == option)
                                 .accessibilityIdentifier("request-option-\(request.reference)-\(offsets[i] + n + 1)")
+                                .accessibilityLabel("\(option), answer to \(parts[i].text)")
                                 .accessibilityAddTraits(chosen[i] == option ? .isSelected : [])
                         }
                     }
