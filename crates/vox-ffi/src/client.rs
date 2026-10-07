@@ -584,6 +584,9 @@ pub struct RoomNoticeRow {
     pub created_millis: u64,
     /// What they did, without who, as the TUI says it: `set messages here to be kept for 1 week`.
     pub what: String,
+    /// The id of the message it follows in the room's order, where it is drawn; empty before
+    /// every message.
+    pub after: String,
 }
 
 /// A share this node pulled by itself and verified (ADR-028 F-3, F-4).
@@ -2499,8 +2502,8 @@ impl VoxClient {
             .collect())
     }
 
-    /// What was done to `room`, oldest first, as the TUI says it among the messages (ADR-028 R-1,
-    /// R-7): who set its retention, who renamed it.
+    /// What was done to `room`, in the room's order, as the TUI says it among the messages
+    /// (ADR-028 R-1, R-7): who set its retention, who renamed it, and the message each follows.
     ///
     /// # Errors
     /// A malformed id, the room not open, or the daemon's refusal.
@@ -2509,7 +2512,7 @@ impl VoxClient {
         let Some(open) = open else {
             return Err(failed("the room is not open on this node"));
         };
-        let mut rows: Vec<RoomNoticeRow> = open
+        Ok(open
             .notices
             .into_iter()
             .map(|n| RoomNoticeRow {
@@ -2518,10 +2521,9 @@ impl VoxClient {
                 author_name: names.get(&n.author).cloned().unwrap_or_default(),
                 created_millis: n.created_millis,
                 what: n.what,
+                after: n.after.map(|a| b32_encode(&a)).unwrap_or_default(),
             })
-            .collect();
-        rows.sort_by_key(|r| r.created_millis);
-        Ok(rows)
+            .collect())
     }
 
     /// How long `room` keeps messages here, as a person reads it ("1 week", "forever"), as the

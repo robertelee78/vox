@@ -26,11 +26,26 @@ extension NodeModel {
         "Timeline · ⏱ \(retention)"
     }
 
-    /// The room's messages and what was done to it, by time.
+    /// The room's messages and what was done to it, in the room's order: each notice right after
+    /// the message the node says it follows (its time claims seconds only, so by time it could
+    /// draw above a message sent earlier in the same second); one that follows a message not
+    /// shown here, by time.
     var timelineItems: [TimelineItem] {
-        (messages.map(TimelineItem.message)
-            + notices.map { .notice("notice-\($0.id)", noticeWords($0), at: $0.createdMillis) })
-            .sorted { $0.millis < $1.millis }
+        let shown = Set(messages.map(\.id))
+        let item = { (n: RoomNoticeRow) in
+            TimelineItem.notice("notice-\(n.id)", self.noticeWords(n), at: n.createdMillis)
+        }
+        let placed = notices.filter { $0.after.isEmpty || shown.contains($0.after) }
+        var items = placed.filter { $0.after.isEmpty }.map(item)
+        for m in messages {
+            items.append(.message(m))
+            items += placed.filter { $0.after == m.id }.map(item)
+        }
+        for n in notices where !n.after.isEmpty && !shown.contains(n.after) {
+            let at = items.firstIndex { $0.millis > n.createdMillis } ?? items.count
+            items.insert(item(n), at: at)
+        }
+        return items
     }
 
     /// "<who> <what>", who named as the TUI names them: you, the alias, or the fingerprint's first

@@ -674,6 +674,10 @@ pub struct RoomNotice {
     pub created_millis: u64,
     /// What they did, without who: `renamed the room to family`.
     pub what: String,
+    /// The newest timeline row before it in the room's order ([`Dag::order_key`]), where a
+    /// client draws it: `None` before every row. Its time claims seconds only, so a client that
+    /// placed it by time put it above a message sent earlier in the same second.
+    pub after: Option<Digest32>,
 }
 
 /// How many more of an author's entries must have expired since its last checkpoint before it
@@ -6796,6 +6800,7 @@ impl ChannelState {
             entry_hash: c.entry_hash,
             author: c.author,
             created_millis: at(&c.entry_hash),
+            after: None,
             what: if c.ttl == 0 {
                 "set the room's retention to forever: from now on no message is removed for its \
                  age"
@@ -6820,6 +6825,7 @@ impl ChannelState {
                     .dag
                     .get_by_hash(&n.entry_hash)
                     .map_or(0, |e| e.skeleton.claimed_ms),
+                after: None,
                 what: if i == 0 {
                     format!("named the room {}", n.name)
                 } else {
@@ -6828,8 +6834,18 @@ impl ChannelState {
             })
             .chain(retention)
             .collect();
-        // In the room's order: by the time each says it was made.
-        all.sort_by_key(|n| (n.created_millis, n.entry_hash));
+        // In the room's order, and each after the newest row that precedes it there.
+        let key = |h: &Digest32| self.dag.order_key(h).unwrap_or((u64::MAX, *h));
+        all.sort_by_key(|n| key(&n.entry_hash));
+        for n in &mut all {
+            let k = key(&n.entry_hash);
+            n.after = self
+                .timeline
+                .iter()
+                .rev()
+                .find(|r| key(&r.entry_hash) < k)
+                .map(|r| r.entry_hash);
+        }
         all
     }
 
