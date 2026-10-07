@@ -446,9 +446,12 @@ fn a_member_removed_while_its_room_was_closed_is_acted_on_when_it_opens() {
             .any(|l| l
                 .rsplit("row then:")
                 .next()
-                // The row says "not in keyring · …" for a member bob does not trust (the members
-                // pane's mark mirrors trust): only an "in keyring" outside that phrase is a red.
-                .is_some_and(|row| row.replace("not in keyring", "").contains("in keyring"))),
+                // The row says "not in keyring…" for a member bob does not trust (the members
+                // pane's mark mirrors trust); one he trusts says "trusted both ways" or "waiting
+                // for the other side" (`ui::trust_label`): either is a red.
+                .is_some_and(|row| {
+                    row.contains("trusted both ways") || row.contains("waiting for the other side")
+                })),
         "PRODUCT: (d) after `:consent grant`, bob's TUI shows carol trusted: {said}"
     );
 }
