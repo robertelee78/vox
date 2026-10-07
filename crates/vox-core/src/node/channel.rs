@@ -5223,10 +5223,30 @@ impl ChannelState {
     }
 
     /// The nodes whose Sessions this node can read inside here, sorted: itself, and each node
-    /// whose drive key it holds (SC-2).
+    /// whose **live** drive key it holds (SC-2) — the generation of that node's newest
+    /// drive-sealed entry here, or any it released while it has written none. A member whose key
+    /// was rotated away (SC-2b) drops out at the first entry sealed under the new one: before
+    /// that, nothing here can tell the key changed, and the session's node is the authority on
+    /// whom it lets drive (DR-2).
     #[must_use]
     pub fn drive_from(&self) -> Vec<Digest32> {
-        let mut from: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
+        let ns = drive_channel(&self.channel_id);
+        let held: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
+        let mut from: BTreeSet<Digest32> = held
+            .into_iter()
+            .filter(|author| {
+                let newest = self.dag.feed(author).and_then(|f| {
+                    (1..=f.max_seq())
+                        .rev()
+                        .filter_map(|seq| f.get(seq))
+                        .filter_map(|e| e.payload.as_deref())
+                        .filter_map(|p| GroupMessage::from_wire(p).ok())
+                        .find(|m| m.header.channel_id == ns)
+                        .map(|m| m.header.chain_id)
+                });
+                newest.is_none_or(|g| self.drive.receivers.contains_key(&(*author, g)))
+            })
+            .collect();
         from.insert(self.me());
         from.into_iter().collect()
     }
