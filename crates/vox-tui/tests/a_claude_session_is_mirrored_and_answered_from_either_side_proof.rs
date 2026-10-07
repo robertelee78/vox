@@ -999,8 +999,15 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         "PreToolUse",
         serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_use_id": "toolu_first" }),
     ));
-    session_listed(&w, &room, s7);
-    let (ok, said) = drive(&w, &room, s7, &["--say", "after a tool hook"]);
+    // The Session opens as the daemon takes the hook; until it is listed, a drive is refused.
+    let t0 = Instant::now();
+    let (ok, said) = loop {
+        let (ok, said) = drive(&w, &room, s7, &["--say", "after a tool hook"]);
+        if ok || t0.elapsed() > Duration::from_secs(60) {
+            break (ok, said);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
     println!("[proof] 10. --say to {s7}, first seen by a tool hook: {said}");
     assert!(
         ok && f.got(&serde_json::json!({ "typed": "after a tool hook" }), Duration::from_secs(10)),
