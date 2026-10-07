@@ -16,6 +16,11 @@ vox node list
 vox node detach robertgpt
 ```
 
+**Every node has an identity passphrase.** `node create` asks for it twice at the terminal, or
+reads it from `--passphrase-file PATH`. An empty one is refused, and nothing is created: `every
+node has an identity passphrase, and an empty one is refused; nothing was created`. A room's
+passphrase is a separate thing, and it may be empty.
+
 `node create` writes the identity and prints its fingerprint; it attaches nothing. It also says
 `there is no backup of a node: if this machine is lost, so is this node; make a new one, and ask
 everyone who trusts this one to untrust it and trust the new one`. That is the whole recovery
@@ -24,6 +29,53 @@ takes the identity passphrase once and runs the node in full until `node detach`
 daemon stops. `node list` shows each node as `attached` or `detached`. `node detach` closes that
 node's connections, stops its services and wipes its keys from memory; other attached nodes keep
 running. Detaching is not deleting: the node, its rooms and its keyring stay on disk.
+
+## When the passphrase is asked for
+
+The identity passphrase is asked for in exactly two cases: **attaching** the node, and
+**changing its keyring** (`vox trust add`, `remove`, `rename`, `drive`, `read`). Nothing else asks
+for it: not a room's name or retention, not posting, reading or sharing.
+
+**Attaching does not open the keyring window.** A passphrase typed to attach a node lets no
+keyring change go through without it. Only a passphrase typed for a keyring change opens the
+window, for 30 minutes; further keyring changes in that time do not ask again. For those 30
+minutes any program running as you, an agent included, can change that node's keyring without
+it.
+
+To see where you are, run `vox status`. Its second line is `keyring asks for the passphrase` right
+after `vox node attach`, and `keyring open 30m`, with the minutes left, once a keyring change was
+made with the passphrase. The TUI's status bar shows the same words while a node is attached.
+
+**A keyring change's passphrase is typed at a terminal, and taken from nothing else.** Vox
+refuses `--identity-passphrase-file` for a keyring change and does not read
+`VOX_IDENTITY_PASSPHRASE` for one. Without a terminal, a change that needs the passphrase is
+refused, with the command to run in one:
+
+```text
+vox: changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes
+       it is typed at a terminal, and taken from nothing else (not VOX_IDENTITY_PASSPHRASE, not a file). Run it in a terminal: vox trust add FULL_FINGERPRINT --name ann
+```
+
+Attaching a node still takes its passphrase from `--passphrase-file` or
+`VOX_IDENTITY_PASSPHRASE`; see [passphrase input](reference.md#passphrase-input).
+
+## An agent's node
+
+An agent's node follows the same rules: nothing tells a person's node from an agent's. You, the
+operator, type its passphrase, in a terminal outside the agent's session:
+
+```sh
+vox node attach claude-mbp
+vox trust add FULL_FINGERPRINT --name ann --node claude-mbp
+```
+
+The agent's hook starts the daemon when none runs, but it never attaches the node and never takes
+a passphrase. While the node is detached, the agent is told so at each turn, with the command for
+you:
+
+```text
+Vox could not read your rooms this turn: node claude-mbp is not attached, and a hook never attaches it. Ask the operator to run, in a terminal outside this session: vox node attach claude-mbp
+```
 
 ## Compare before trusting
 
@@ -49,20 +101,24 @@ vox trust list
 
 Choose a name meaningful to you. It is local and never registers a username. In a terminal,
 Vox asks for a name if `--name` is omitted. In automation, give one explicitly. `trust list`
-prints each trusted fingerprint and your name for it.
+prints each trusted fingerprint, your name for it, and what its entry grants (`read` or `read +
+drive`, below).
 
 This grants the node access governed by your trust decision across **all shared rooms**,
 including ones you join later, and reach to every service you share in a room you are both in.
-Vox states this before it acts and again after, naming the rooms you share:
+Vox states this before it asks for the passphrase and again after, naming the rooms you share:
 
 ```text
-vox: about to trust 3jnhi236j2ktt7zgzs4iixoy7s as "ann"
+vox: about to trust obs52x2rogrwwzsqt2dmpmsta6 as "ann"
      it is to read what you write in "family", and in any room you share with it later
      and to reach your services in a room you share, once you offer one
-vox: trusting 3jnhi236j2ktt7zgzs4iixoy7s as "ann"
+vox: changing who you trust needs your identity passphrase: it was not entered for a keyring change in the last 30 minutes
+identity passphrase:
+vox: trusting obs52x2rogrwwzsqt2dmpmsta6 as "ann": read
      it may now read what you write in "family" — now and later
      and you read what it writes, once it trusts you too
      and reach every service you bind to a room you are both in
+     `vox trust remove` undoes it and changes the lock everywhere
 ```
 
 It is not just permission for the currently open room or one
@@ -73,16 +129,29 @@ confirm a message can be read in each direction.
 default, releases what you write from this approval onward; `full` also releases everything you
 still hold a key for. It never releases anyone else's messages.
 
-A keyring change (add, rename, remove) asks for the identity passphrase unless you typed it for a
-keyring change in the last 30 minutes; attaching the node does not count. It is typed at a
-terminal and taken from nothing else: `--identity-passphrase`, `--identity-passphrase-file` and
-`VOX_IDENTITY_PASSPHRASE` are not read for it. Without a terminal the change is refused, with the
-command to run in one.
+It asks for the identity passphrase as every keyring change does
+([when the passphrase is asked for](#when-the-passphrase-is-asked-for)).
 
-To see where you are in that window, run `vox status`. Its second line is `keyring open 30m`, with
-the minutes left, while a keyring change goes through without the passphrase. It reads `keyring
-asks for the passphrase` once the window has closed. The TUI's status bar shows the same words
-while a node is attached.
+## What a keyring entry grants: read, or read + drive
+
+Each entry in your keyring grants **read**: the node reads what you write in the rooms you share
+and reaches your services there. Or it grants **read + drive**: it may also drive this node's
+Sessions. Read is the default. `vox trust list` shows which, after your name for the node:
+
+```text
+obs52x2rogrwwzsqt2dmpmsta6rcri7ecxprvsn6jnsxyv4xizvq  ann  read + drive
+```
+
+```sh
+vox trust add FULL_FINGERPRINT --name ann --drive
+vox trust drive FULL_FINGERPRINT
+vox trust read FULL_FINGERPRINT
+```
+
+`trust add --drive` trusts a node with read + drive from the start. `trust drive` gives drive to a
+node you already trust, and says `now has read + drive`; `trust read` takes drive back, and says
+`now has read`. Each is a keyring change, behind the passphrase. What an entry grants is saved with
+it, and a daemon restart keeps it.
 
 ## Rename a node in your keyring
 
@@ -111,7 +180,8 @@ and `Alice#lhk6xo`, everywhere the TUI and `vox room read` name them. In the com
 Under each name a line says where the two of you stand: `trusted both ways`, `waiting for the
 other side` (you trust it, it does not trust you yet), or `not in keyring: trust to read each
 other`; `not in keyring · still reads you` for a node you removed that still holds your key from
-before. There is no other trust state: no "verified", and no block. Removing a node from your
+before. Under a node in your keyring, a further line says what its entry grants: `read` or `read +
+drive`. There is no other trust state: no "verified", and no block. Removing a node from your
 keyring is how you stop reading it and being read by it. Where the terminal takes only ASCII, the
 glyphs are `<>`, `->` and `.`. The words describe local trust and
 whether the other member can read your messages in that room. They are not read receipts for
@@ -183,7 +253,9 @@ family member's or production agent's identity.
 For passphrases and paths, see [Commands and local state](reference.md). For a one-way
 conversation, see [the trust troubleshooting entry](troubleshooting.md#we-joined-but-cannot-read-each-other).
 
-Source: [trust and node commands](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/cli.rs),
-[the 30-minute keyring window](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-core/src/node/actor.rs),
+Source: [trust and node commands](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-tui/src/cli.rs),
+[a keyring change and its passphrase](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-tui/src/room_cli.rs),
+[an agent's hook](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-tui/src/agent_hook.rs),
+[the 30-minute keyring window](https://github.com/robertelee78/vox/blob/21b851ad31eab34d7cbf5432f8ce4c205f2ed11c/crates/vox-core/src/node/actor.rs),
 [how the window is shown](https://github.com/robertelee78/vox/blob/0e27808d2769e34fa678870ecb17ed141caff269/crates/vox-tui/src/ui.rs)
 and [TUI state wording](https://github.com/robertelee78/vox/blob/bf6dfcdbee65e82a4683400baa94dd62fc8532d6/crates/vox-tui/src/ui.rs).
