@@ -631,7 +631,16 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
             .collect();
         let (ok, _, err) = vox(
             &host,
-            &["room", "create", "--passphrase-file", "-", "--name", "h"],
+            // A room of its own name: a node holds one room of a name, and alice joins every
+            // host's.
+            &[
+                "room",
+                "create",
+                "--passphrase-file",
+                "-",
+                "--name",
+                &format!("h{k}"),
+            ],
             Some(&format!("{ROOMPASS}\n")),
         );
         assert!(ok, "PRODUCT (staging): host{k}'s room create: {err}");
@@ -669,13 +678,19 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
             }
         }
         std::fs::write(&arm, k.to_string()).expect("APPARATUS: write a staging file");
-        let _ = join(&alice);
+        // What the join said, for the red: a join no kill cut short must have landed.
+        let armed_join = join(&alice);
         let t = Instant::now();
         while alive(&mut alice_daemon) && t.elapsed() < PAST_THE_END {
             std::thread::sleep(Duration::from_millis(50));
         }
         std::fs::remove_file(&arm).expect("APPARATUS: remove a staging file");
         let killed = !alive(&mut alice_daemon);
+        assert!(
+            killed || armed_join.0,
+            "PRODUCT (staging): alice's join of host{k}'s room was refused, and no kill point cut \
+             it short: {armed_join:?}"
+        );
         if killed {
             kills += 1;
             // As in the trust arm: the host's daemon is down while alice's comes back (F-B2).
@@ -705,7 +720,10 @@ fn a_crash_in_a_consent_whose_member_key_is_held_still_delivers_it() {
             }
             assert!(
                 t.elapsed() < Duration::from_secs(60),
-                "PRODUCT (staging): alice could not post in host{k}'s room: {err}"
+                "PRODUCT (staging): alice could not post in host{k}'s room: {err}\n\
+                 killed at kill point {k}: {killed}; the join under the kill point said: \
+                 {armed_join:?}\nalice's `vox room list`: {}",
+                vox(&alice, &["room", "list"], None).1
             );
             std::thread::sleep(Duration::from_millis(500));
         }
