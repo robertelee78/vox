@@ -1003,3 +1003,188 @@ fn a_driver_reaches_exactly_the_session_it_names_or_is_told_why() {
         "PRODUCT: arm 10: a session first seen by a tool hook must be bound by it; vox said {said:?}"
     );
 }
+
+/// ADR-029 DR-3, DR-4 (#545) — **an approval or a question is answered from either side, and the
+/// harness's own record says which answer took effect.**
+///
+/// The stand-in harness keeps Claude Code's rule, read from 2.1.292 and seen live: its prompt and
+/// the `PermissionRequest` hook are open together, the first to answer claims the request, and the
+/// transcript records the outcome (a `tool_result`, an error for a rejection, carrying the
+/// rejection's text). `person`, with drive, answers with `vox room session … --approve/--reject/
+/// --answer` and reads the Session.
+///
+/// 1. approved in the Session first: the hook gives Claude Code the approval; the Session reads
+///    "approved here";
+/// 2. rejected in the Session, with a reason: the hook gives the rejection with that reason; the
+///    Session reads "rejected here";
+/// 3. a question answered in the Session: the hook gives the answers with the question's input;
+///    the Session reads "answered here: Blue";
+/// 4. the race: the terminal claims a rejection, then the Session's approval reaches the hook
+///    before the harness has recorded the rejection. Exactly one takes effect, the terminal's: the
+///    Session reads "answered in the terminal: rejected", and an answer after the record is
+///    refused, saying it was answered at the terminal.
+///
+/// **Mutation that must turn it red** (#545's own): the request closed when the Session's answer
+/// is sent → arm 4 reads "approved here".
+#[test]
+#[ignore = "real binary; run in release"]
+fn an_approval_is_answered_from_either_side_and_the_first_answer_wins() {
+    watchdog::arm_for(Duration::from_secs(600));
+    let (w, _daemon, room) = World::setup();
+    let work = w.root.join("work");
+    let transcript = Transcript(work.join(format!("{SESSION}.jsonl")));
+    std::fs::write(&transcript.0, "")
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot make the transcript: {e}"));
+    let ev = |name: &str, extra: serde_json::Value| with(base(name, &work, &transcript.0), extra);
+    w.hook_done(
+        &room,
+        &ev(
+            "UserPromptSubmit",
+            serde_json::json!({ "prompt": "make e2, e3, e4", "prompt_id": "p-1" }),
+        ),
+    );
+    session_listed(&w, &room, SESSION);
+    let session_says = |want: &str| -> String {
+        let t0 = Instant::now();
+        loop {
+            let (_, plain, err) = w.vox(PERSON, &["room", "session", &room, SESSION], None);
+            if plain.contains(want) {
+                return plain;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "PRODUCT: within 60 s the Session never read {want:?}; it read:\n{plain}{err}"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    };
+    // One permission request: the call starts, the hook asks and waits.
+    let ask = |id: &str, tool: &str, input: &serde_json::Value| -> Child {
+        w.hook_done(
+            &room,
+            &ev(
+                "PreToolUse",
+                serde_json::json!({ "tool_name": tool, "tool_input": input, "tool_use_id": id }),
+            ),
+        );
+        let child = w.hook(
+            &room,
+            &ev(
+                "PermissionRequest",
+                serde_json::json!({ "tool_name": tool, "tool_input": input,
+                    "permission_suggestions": [] }),
+            ),
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        child
+    };
+    let decision = |child: Child| -> serde_json::Value {
+        let out = wait_within(child, Duration::from_secs(20))
+            .unwrap_or_else(|| panic!("PRODUCT: the permission hook never gave an answer"));
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap_or(serde_json::Value::Null)
+            ["hookSpecificOutput"]["decision"]
+            .clone()
+    };
+
+    // ---- 1. approved in the Session ----
+    let e2 = serde_json::json!({ "command": "touch e2" });
+    let hook = ask("toolu_2", "Bash", &e2);
+    let (ok, said) = drive(&w, &room, SESSION, &["--approve", "toolu_2"]);
+    println!("[proof] 1. --approve toolu_2: {said}");
+    let d = decision(hook);
+    assert!(
+        ok && d["behavior"] == "allow",
+        "PRODUCT: arm 1: the Session's approval must reach Claude Code through its hook; vox said \
+         {said:?}, the hook gave {d}"
+    );
+    // The harness takes it: the call runs.
+    transcript.tool_result("toolu_2", "", false);
+    w.hook_done(
+        &room,
+        &ev(
+            "PostToolUse",
+            serde_json::json!({ "tool_name": "Bash", "tool_input": e2, "tool_use_id": "toolu_2",
+                "tool_response": { "stdout": "", "stderr": "", "interrupted": false } }),
+        ),
+    );
+    session_says("Bash: touch e2 — approved here");
+
+    // ---- 2. rejected in the Session, with a reason ----
+    let e3 = serde_json::json!({ "command": "touch e3" });
+    let hook = ask("toolu_3", "Bash", &e3);
+    let (ok, said) = drive(&w, &room, SESSION, &["--reject", "toolu_3", "not now"]);
+    println!("[proof] 2. --reject toolu_3: {said}");
+    let d = decision(hook);
+    let message = d["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        ok && d["behavior"] == "deny"
+            && message.contains("rejected in Vox by")
+            && message.contains("not now"),
+        "PRODUCT: arm 2: the Session's rejection must reach Claude Code with its reason; the hook \
+         gave {d}"
+    );
+    transcript.tool_result("toolu_3", &message, true);
+    session_says("Bash: touch e3 — rejected here");
+
+    // ---- 3. a question answered in the Session ----
+    let q = serde_json::json!({ "questions": [ { "question": "Which colour?", "header": "Colour",
+        "multiSelect": false, "options": [ { "label": "Red", "description": "red" },
+        { "label": "Blue", "description": "blue" } ] } ] });
+    let hook = ask("toolu_q", "AskUserQuestion", &q);
+    let (ok, said) = drive(
+        &w,
+        &room,
+        SESSION,
+        &["--answer", "toolu_q", "Which colour?=Blue"],
+    );
+    println!("[proof] 3. --answer toolu_q: {said}");
+    let d = decision(hook);
+    assert!(
+        ok && d["behavior"] == "allow"
+            && d["updatedInput"]["answers"]["Which colour?"] == "Blue"
+            && d["updatedInput"]["questions"] == q["questions"],
+        "PRODUCT: arm 3: the Session's answer must reach Claude Code as the question's input with \
+         its answers; the hook gave {d}"
+    );
+    let line = serde_json::json!({
+        "type": "user", "sessionId": SESSION,
+        "message": { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "toolu_q",
+            "content": "User has answered your questions: \"Which colour?\"=\"Blue\"." } ] },
+        "toolUseResult": { "questions": q["questions"], "answers": { "Which colour?": "Blue" } },
+    });
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript.0)
+        .and_then(|mut f| writeln!(f, "{line}"))
+        .unwrap_or_else(|e| panic!("APPARATUS: the transcript: {e}"));
+    session_says("— answered here: Blue");
+
+    // ---- 4. the race: the terminal claims first ----
+    let e4 = serde_json::json!({ "command": "touch e4" });
+    let hook = ask("toolu_4", "Bash", &e4);
+    // The terminal's rejection has claimed the request (Claude Code's first-claim rule); the
+    // Session's approval then reaches the hook, which the harness no longer listens to.
+    let (_, said) = drive(&w, &room, SESSION, &["--approve", "toolu_4"]);
+    println!("[proof] 4. --approve toolu_4 after the terminal claimed it: {said}");
+    let _late = decision(hook);
+    transcript.tool_result(
+        "toolu_4",
+        "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it \
+         was a file edit, the new_string was NOT written to the file). STOP what you are doing and \
+         wait for the user to tell you how to proceed.",
+        true,
+    );
+    let plain = session_says("Bash: touch e4 — answered in the terminal: rejected");
+    assert!(
+        !plain.contains("Bash: touch e4 — approved here"),
+        "PRODUCT: arm 4: only the terminal's rejection took effect; the Session must not also say \
+         it was approved here:\n{plain}"
+    );
+    let (ok, said) = drive(&w, &room, SESSION, &["--approve", "toolu_4"]);
+    println!("[proof] 4. a second --approve toolu_4 after the record: {said}");
+    assert!(
+        !ok && said.contains("already answered at the terminal"),
+        "PRODUCT: arm 4: an answer after the harness settled the request must be refused, saying \
+         it was answered at the terminal; vox said {said:?}"
+    );
+}
