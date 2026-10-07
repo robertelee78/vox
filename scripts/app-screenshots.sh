@@ -114,11 +114,12 @@ for n in ben builder; do
 done
 # A keyring change's passphrase is typed at a terminal (ADR-028 K-13): typed here, as a person does.
 trust() {
-    python3 scripts/type-passphrase.py 120 "$VOX" trust add --node "$1" "$2" --name "$3" \
+    python3 scripts/type-passphrase.py 120 "$VOX" trust add --node "$1" "$2" --name "$3" "${@:4}" \
         <"$DEMO/identity" >"$DEMO/trust.log" 2>&1 ||
         { echo "app-screenshots: trusting $3 as $1 failed:" >&2; cat "$DEMO/trust.log" >&2; exit 2; }
 }
-trust ann "$BEN" ben; trust ann "$BUILDER" builder
+# ann's agent, builder, may drive her Sessions too (ADR-028 K-14): the keyring shows both grants.
+trust ann "$BEN" ben; trust ann "$BUILDER" builder --drive
 trust ben "$ANN" ann; trust builder "$ANN" ann; trust ben "$BUILDER" builder; trust builder "$BEN" ben
 for i in $(seq 1 30); do
     "$VOX" room post --node ben "$ROOM" "Dinner at seven? I can bring the bread." >/dev/null

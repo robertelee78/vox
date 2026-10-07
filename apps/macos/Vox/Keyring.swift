@@ -19,6 +19,8 @@ struct KeyringView: View {
     @ObservedObject var model: NodeModel
     @State private var fingerprint = ""
     @State private var alias = ""
+    /// What trusting grants: read, the default (K-16), or read + drive.
+    @State private var drive = false
     @State private var removing: TrustedNode?
     @FocusState private var adding: Bool
 
@@ -81,17 +83,25 @@ struct KeyringView: View {
                 .accessibilityIdentifier("keyring-add-fingerprint")
             TextField("Alias", text: $alias)
                 .accessibilityIdentifier("keyring-add-alias")
+            Picker("Grants", selection: $drive) {
+                Text(Capability.words(false)).tag(false)
+                Text(Capability.words(true)).tag(true)
+            }
+            .pickerStyle(.segmented)
+            .fixedSize()
+            .accessibilityIdentifier("keyring-add-capability")
             if !fingerprint.isEmpty && !alias.isEmpty {
-                Text(Effects.trusting(alias))
+                Text(Effects.trusting(alias) + " " + Effects.granting(alias, drive: drive))
                     .secondaryText()
                     .accessibilityIdentifier("keyring-add-effect")
             }
             Button("Trust") {
-                let (fp, name) = (fingerprint, alias)
+                let (fp, name, grant) = (fingerprint, alias, drive)
                 Task {
-                    if await model.trust(fp, as: name) {
+                    if await model.trust(fp, as: name, drive: grant) {
                         fingerprint = ""
                         alias = ""
+                        drive = false
                     }
                 }
             }
@@ -101,8 +111,23 @@ struct KeyringView: View {
     }
 }
 
+/// What a keyring entry grants, in the words `vox trust list` and the TUI use (ADR-028 K-14).
+enum Capability {
+    static func words(_ drive: Bool) -> String { drive ? "read + drive" : "read" }
+}
+
 /// What each keyring change does, in words, said before it acts (ADR-028 E-5).
 enum Effects {
+    /// What drive adds to read (ADR-029 DR-1), or what read alone leaves out (SC-3).
+    static func granting(_ alias: String, drive: Bool) -> String {
+        drive
+            ? "With drive, \(alias) also sees inside your Sessions and may type into them, "
+                + "interrupt or stop them, answer their approvals and questions, and send and "
+                + "receive their files."
+            : "With read only, \(alias) sees each of your Sessions' name and whether it is open, "
+                + "and nothing inside it."
+    }
+
     static func trusting(_ alias: String) -> String {
         "Trusting \(alias): it may read what you write in every room you share, now and later; you "
             + "read what it writes once it trusts you too; and it reaches every service you bind "
@@ -130,6 +155,7 @@ private struct KeyringRow: View {
     @State private var newAlias = ""
     @State private var comparing = false
     @State private var other = ""
+    @State private var changing = false
 
     var body: some View {
         let card = fingerprintCard(fingerprint: node.fingerprint)
@@ -144,15 +170,29 @@ private struct KeyringRow: View {
                     // ⇄ once it trusts this node back, → until then (L-4).
                     TrustMark(name: node.name,
                               trust: model.trustsBack.contains(node.fingerprint) ? .mutual : .oneWay)
+                    Text(Capability.words(node.drive)).secondaryText()
+                        .accessibilityIdentifier("keyring-capability-\(node.name)")
                     Text(card.grouped).font(Theme.mono).textSelection(.enabled)
                         .accessibilityIdentifier("keyring-fingerprint-\(node.name)")
                 }
             }
             HStack {
+                Button("Change…") { changing.toggle() }
+                    .accessibilityIdentifier("keyring-change-\(node.name)")
                 Button("Rename…") { renaming.toggle(); newAlias = node.name }
                 Button("Compare…") { comparing.toggle(); other = "" }
                 Button("Remove…", role: .destructive, action: remove)
                     .accessibilityIdentifier("keyring-remove-\(node.name)")
+            }
+            if changing {
+                // The other grant, said before it is made (E-5).
+                Text(Effects.granting(node.name, drive: !node.drive)).secondaryText()
+                    .accessibilityIdentifier("keyring-change-effect-\(node.name)")
+                Button(node.drive ? "Read only" : "Give drive") {
+                    let grant = !node.drive
+                    Task { if await model.setCapability(node, drive: grant) { changing = false } }
+                }
+                .accessibilityIdentifier("keyring-change-confirm-\(node.name)")
             }
             if renaming {
                 HStack {
