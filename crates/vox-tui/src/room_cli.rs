@@ -3974,7 +3974,7 @@ async fn who_reads_whom(client: &mut IpcClient, channel_id: Digest32) {
         return;
     };
     let keyring = match client.trusted("").await {
-        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
         _ => Vec::new(),
     };
     let me = client.me();
@@ -4465,6 +4465,7 @@ pub async fn trust_add(
     petname: &str,
     given: Option<String>,
     full_history: bool,
+    drive: bool,
 ) -> Result<(), AppError> {
     let mut client = attach(paths).await?;
     crate::ident::check_new_name(crate::ident::names(), &target, petname)?;
@@ -4496,13 +4497,20 @@ pub async fn trust_add(
         petname: petname.to_owned(),
         identity_passphrase,
         full_history,
+        drive,
     })
     .await
     {
         Ok(Frame::Ok) => {
             println!(
-                "vox: trusting {} as {petname:?}",
-                crate::ident::author_id(&target)
+                "vox: trusting {} as {petname:?}: {}",
+                crate::ident::author_id(&target),
+                if drive {
+                    vox_core::node::trust::Capability::ReadDrive
+                } else {
+                    vox_core::node::trust::Capability::Read
+                }
+                .words()
             );
             if full_history {
                 println!("     with full history: it may also read what you wrote before now");
@@ -4540,7 +4548,7 @@ pub async fn trust_rename(
     let mut client = attach(paths).await?;
     // A read, so no passphrase (V210-165).
     let entries = match client.trusted("").await {
-        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Trusted { entries }) => crate::ident::names_of(entries),
         Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
         Ok(other) => return Err(crate::client::unexpected(&other)),
         Err(e) => return Err(AppError::Usage(e.to_string())),
@@ -4566,6 +4574,58 @@ pub async fn trust_rename(
                  <service>.{}.<room>.vox",
                 short(&target),
                 vox_core::node::resolver::label_of(name)
+            );
+            Ok(())
+        }
+        Ok(Frame::Error { reason }) => Err(AppError::Usage(reason)),
+        Ok(other) => Err(crate::client::unexpected(&other)),
+        Err(e) => Err(e),
+    }
+}
+
+/// `vox trust drive` and `vox trust read`, asked of the running node (ADR-028 K-14): only an
+/// identity already trusted. A keyring change, so the identity passphrase is asked for only when
+/// the node says it is needed.
+pub async fn trust_capability(
+    paths: &Paths,
+    fingerprint: &str,
+    drive: bool,
+    given: Option<String>,
+) -> Result<(), AppError> {
+    let mut client = attach(paths).await?;
+    // A read, so no passphrase (V210-165).
+    let entries = match client.trusted("").await {
+        Ok(Frame::Trusted { entries }) => entries,
+        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+        Ok(other) => return Err(crate::client::unexpected(&other)),
+        Err(e) => return Err(AppError::Usage(e.to_string())),
+    };
+    let ids: Vec<Digest32> = entries.iter().map(|(id, _, _)| *id).collect();
+    let target = resolve_prefix(fingerprint, &ids).map_err(|_| {
+        AppError::Usage(format!(
+            "no trusted identity matches {fingerprint:?}, so it has nothing to change — \
+             `vox trust add` it first"
+        ))
+    })?;
+    let capability = if drive {
+        vox_core::node::trust::Capability::ReadDrive
+    } else {
+        vox_core::node::trust::Capability::Read
+    };
+    match keyring_change(&mut client, given, |identity_passphrase| {
+        Request::SetCapability {
+            target,
+            drive,
+            identity_passphrase,
+        }
+    })
+    .await
+    {
+        Ok(Frame::Ok) => {
+            println!(
+                "vox: {} now has {}",
+                crate::ident::author_id(&target),
+                capability.words()
             );
             Ok(())
         }
@@ -4662,8 +4722,13 @@ pub async fn trust_list(paths: &Paths) -> Result<(), AppError> {
                 println!("     nobody can read what you write until you `vox trust add` them");
                 return Ok(());
             }
-            for (id, petname) in entries {
-                println!("{}  {petname}", vox_core::node::link::b32_encode(&id));
+            // What each entry grants, read or read + drive (ADR-028 K-14).
+            for (id, petname, capability) in entries {
+                println!(
+                    "{}  {petname}  {}",
+                    vox_core::node::link::b32_encode(&id),
+                    capability.words()
+                );
             }
             Ok(())
         }

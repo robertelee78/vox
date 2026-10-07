@@ -513,7 +513,7 @@ async fn names(client: &mut IpcClient) -> Result<HashMap<Digest32, String>, VoxE
     )? {
         Frame::Trusted { entries } => Ok(entries
             .into_iter()
-            .map(|(fp, name)| (fp, shown_name(&name)))
+            .map(|(fp, name, _)| (fp, shown_name(&name)))
             .collect()),
         other => Err(unexpected(&other)),
     }
@@ -1067,6 +1067,7 @@ impl VoxClient {
             petname: name,
             identity_passphrase: copy_of(identity_passphrase.as_ref()),
             full_history: false,
+            drive: false,
         };
         on_held!(self, |c| done(c, &req).await)
     }

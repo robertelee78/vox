@@ -4974,6 +4974,7 @@ impl Node {
                     *change,
                     NodeCommand::Trust { .. }
                         | NodeCommand::TrustWith { .. }
+                        | NodeCommand::SetCapability { .. }
                         | NodeCommand::Rename { .. }
                         | NodeCommand::Untrust { .. }
                 ) {
@@ -4991,6 +4992,7 @@ impl Node {
             // locked one falls through, and says that: a passphrase would not make the change.
             NodeCommand::Trust { .. }
             | NodeCommand::TrustWith { .. }
+            | NodeCommand::SetCapability { .. }
             | NodeCommand::Rename { .. }
             | NodeCommand::Untrust { .. }
                 if self.profile.as_ref().is_some_and(Profile::is_unlocked)
@@ -5005,7 +5007,12 @@ impl Node {
             } => {
                 let was = self.trust.is_trusted(&fingerprint);
                 let out = self
-                    .trust_identity(fingerprint, &petname, crate::node::trust::HistoryGrant::Now)
+                    .trust_identity(
+                        fingerprint,
+                        &petname,
+                        crate::node::trust::HistoryGrant::Now,
+                        None,
+                    )
                     .await;
                 self.decided_trust(was, fingerprint, &out);
                 out
@@ -5014,19 +5021,27 @@ impl Node {
                 fingerprint,
                 petname,
                 history,
+                capability,
             } => {
                 let was = self.trust.is_trusted(&fingerprint);
-                let out = self.trust_identity(fingerprint, &petname, history).await;
+                let out = self
+                    .trust_identity(fingerprint, &petname, history, capability)
+                    .await;
                 self.decided_trust(was, fingerprint, &out);
                 out
             }
+            NodeCommand::SetCapability {
+                fingerprint,
+                capability,
+            } => self.set_capability(fingerprint, capability).await,
             NodeCommand::Rename {
                 fingerprint,
                 petname,
             } => {
                 if self.trust.is_trusted(&fingerprint) {
                     let history = self.trust.history(&fingerprint);
-                    self.trust_identity(fingerprint, &petname, history).await
+                    self.trust_identity(fingerprint, &petname, history, None)
+                        .await
                 } else {
                     Outcome::Failed(Fault::NotConsented)
                 }
@@ -9490,8 +9505,9 @@ impl Node {
         fingerprint: Digest32,
         petname: &'a str,
         history: crate::node::trust::HistoryGrant,
+        capability: Option<crate::node::trust::Capability>,
     ) -> Boxed<'a, Outcome> {
-        Box::pin(self.trust_identity_unboxed(fingerprint, petname, history))
+        Box::pin(self.trust_identity_unboxed(fingerprint, petname, history, capability))
     }
 
     /// [`Self::trust_identity`], unboxed: see [`Boxed`].
@@ -9500,6 +9516,7 @@ impl Node {
         fingerprint: Digest32,
         petname: &str,
         history: crate::node::trust::HistoryGrant,
+        capability: Option<crate::node::trust::Capability>,
     ) -> Outcome {
         match self.profile.as_ref().map(Profile::signer) {
             None => return Outcome::Failed(Fault::NoIdentity),
@@ -9507,8 +9524,12 @@ impl Node {
             Some(Ok(_)) => {}
         }
         let newly = !self.trust.is_trusted(&fingerprint);
+        let had_drive = self.trust.has_drive(&fingerprint);
+        let capability = capability
+            .or_else(|| self.trust.capability(&fingerprint))
+            .unwrap_or_default();
         let mut next = self.trust.clone();
-        if let Err(e) = next.trust_with(fingerprint, petname, history) {
+        if let Err(e) = next.trust_as(fingerprint, petname, history, capability) {
             return Outcome::Failed(fault_of(&e));
         }
         // **The decision's place in the consent order is drawn before the trust is saved**
@@ -9537,6 +9558,7 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        self.note_capability(fingerprint, had_drive);
         // A removal still waiting on a closed room is withdrawn with this decision (V210-118
         // amendment). Not load-bearing: left behind, it would change the lock on the reopen, and
         // the consent owed to a trusted member would then be released again.
@@ -9590,6 +9612,7 @@ impl Node {
             Ok(s) => s,
             Err(e) => return Outcome::Failed(fault_of(&e)),
         };
+        let had_drive = self.trust.has_drive(fingerprint);
         let mut next = self.trust.clone();
         if !next.untrust(fingerprint) {
             return Outcome::Failed(Fault::NotConsented);
@@ -9642,6 +9665,7 @@ impl Node {
             return Outcome::Failed(fault_of(&e));
         }
         self.trust = next;
+        self.note_capability(*fingerprint, had_drive);
         // **It stops being read here too** (V210-118): its keys are dropped in every open room, so
         // nothing it posts from now opens on this node. A closed room drops them, and changes its
         // lock, when it opens (recorded above). What was already read stays read. A re-trust is
@@ -14797,6 +14821,12 @@ impl Node {
             open_channels: Vec::new(),
             forwards: Vec::new(),
             trusted: self.trust_rows(),
+            drive: self
+                .trust
+                .iter()
+                .map(|(fp, _)| *fp)
+                .filter(|fp| self.trust.has_drive(fp))
+                .collect(),
             relayed_peers: Vec::new(),
             connected: 0,
             connected_peers: Vec::new(),
@@ -14929,6 +14959,11 @@ impl Node {
         let (relayed_peers, relaying) = self.path_view();
         let connected_peers = self.connected_peers();
         let trusted = self.trust_rows();
+        let drive = trusted
+            .iter()
+            .map(|(fp, _)| *fp)
+            .filter(|fp| self.trust.has_drive(fp))
+            .collect();
         // What the decision record names members as where the keyring is not at hand.
         self.decisions.set_aliases(&trusted);
         let view = NodeView {
@@ -14951,6 +14986,7 @@ impl Node {
                 })
                 .collect(),
             trusted,
+            drive,
             relayed_peers,
             relaying,
             connected: connected_peers.len(),
@@ -15060,6 +15096,45 @@ impl Node {
                 room,
             },
         );
+    }
+
+    /// Change what `fingerprint`'s keyring entry grants (ADR-028 K-14): saved before it is adopted,
+    /// as every keyring change is, and said to the node's Sessions when drive moved.
+    async fn set_capability(
+        &mut self,
+        fingerprint: Digest32,
+        capability: crate::node::trust::Capability,
+    ) -> Outcome {
+        let Some(profile) = self.profile.as_ref() else {
+            return Outcome::Failed(Fault::NoIdentity);
+        };
+        let signer = match profile.signer() {
+            Ok(s) => s,
+            Err(e) => return Outcome::Failed(fault_of(&e)),
+        };
+        let had_drive = self.trust.has_drive(&fingerprint);
+        let mut next = self.trust.clone();
+        if !next.set_capability(&fingerprint, capability) {
+            return Outcome::Failed(Fault::NotConsented);
+        }
+        if let Err(e) = next.save(profile.store(), signer) {
+            return Outcome::Failed(fault_of(&e));
+        }
+        self.trust = next;
+        self.note_capability(fingerprint, had_drive);
+        self.publish().await;
+        Outcome::Done
+    }
+
+    /// Raise [`NodeEvent::CapabilityChanged`] when `fingerprint`'s drive is no longer what it was
+    /// (`had_drive`) before a keyring change.
+    fn note_capability(&self, fingerprint: Digest32, had_drive: bool) {
+        let drive = self.trust.has_drive(&fingerprint);
+        if drive != had_drive {
+            let _ = self
+                .event_tx
+                .send(NodeEvent::CapabilityChanged { fingerprint, drive });
+        }
     }
 
     /// A trust just asked for: recorded when it added someone who was not trusted before.

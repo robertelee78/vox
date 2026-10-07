@@ -185,6 +185,11 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             a.identity_passphrase.clone(),
             a.identity_passphrase_file.clone(),
         ),
+        TrustCmd::Drive(a) | TrustCmd::Read(a) => (
+            a.profile.clone(),
+            a.identity_passphrase.clone(),
+            a.identity_passphrase_file.clone(),
+        ),
     };
     let paths = match profile.paths() {
         Ok(p) => p,
@@ -218,7 +223,15 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             TrustCmd::List(_) => crate::room_cli::trust_list(&paths).await,
             TrustCmd::Add(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
-                crate::room_cli::trust_add(&paths, target, &name, given, a.history == "full").await
+                crate::room_cli::trust_add(
+                    &paths,
+                    target,
+                    &name,
+                    given,
+                    a.history == "full",
+                    a.drive,
+                )
+                .await
             }
             TrustCmd::Remove(a) => {
                 let target = crate::tunnel_cli::parse_fingerprint(&a.fingerprint)?;
@@ -226,6 +239,12 @@ fn run_trust_over_socket(sub: TrustCmd) -> ExitCode {
             }
             TrustCmd::Rename(a) => {
                 crate::room_cli::trust_rename(&paths, &a.fingerprint, &a.name, given).await
+            }
+            TrustCmd::Drive(a) => {
+                crate::room_cli::trust_capability(&paths, &a.fingerprint, true, given).await
+            }
+            TrustCmd::Read(a) => {
+                crate::room_cli::trust_capability(&paths, &a.fingerprint, false, given).await
             }
         }
     });
@@ -1498,6 +1517,26 @@ enum TrustCmd {
     /// `<service>.<name>.<room>.vox`; it is local to this machine and never
     /// leaves it. Grants nothing: only an identity already trusted can be renamed.
     Rename(TrustRenameArgs),
+    /// Let a trusted identity drive this node's Sessions as well as read (ADR-028 K-14): its
+    /// keyring entry becomes read + drive. A keyring change, behind the passphrase.
+    Drive(TrustCapabilityArgs),
+    /// Take drive back from a trusted identity: its keyring entry grants read only.
+    Read(TrustCapabilityArgs),
+}
+
+/// `vox trust drive` and `vox trust read`
+#[derive(Args, Debug, Clone)]
+pub struct TrustCapabilityArgs {
+    #[command(flatten)]
+    pub profile: NodeArgs,
+    /// The trusted identity (base32, or a unique prefix).
+    pub fingerprint: String,
+    /// **Refused.** Use `--identity-passphrase-file`, `VOX_IDENTITY_PASSPHRASE`, or the prompt.
+    #[arg(long)]
+    pub identity_passphrase: Option<String>,
+    /// Read the identity passphrase from this file (first line).
+    #[arg(long)]
+    pub identity_passphrase_file: Option<std::path::PathBuf>,
 }
 
 /// `vox trust rename`
@@ -1535,6 +1574,10 @@ pub struct TrustAddArgs {
     /// for, so it also reads what you wrote before. Your messages only — nobody else's.
     #[arg(long, value_parser = ["now", "full"], default_value = "now")]
     pub history: String,
+    /// Grant read + drive: it may also drive this node's Sessions (ADR-028 K-14). Without it
+    /// the entry grants read, the default.
+    #[arg(long)]
+    pub drive: bool,
     /// **Refused.** A command line is world-readable while the process runs — `ps`, or
     /// `/proc/<pid>/cmdline` — so a passphrase here is disclosed to every process on the
     /// machine, and lands in the shell's history besides. It is still accepted by the
