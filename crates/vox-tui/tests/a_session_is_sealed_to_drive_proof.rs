@@ -18,7 +18,10 @@
 //!    ROOM SESSION --file PATH --note …`: alice's node answers that it is pulling it, the file lands
 //!    in alice's files directory byte for byte, and the Session shows it come in, as bob reads it.
 //!    Carol, read only, sending a file the same way is refused by alice's node, and nothing of
-//!    hers lands there. That the session is then told the path is not asserted here: alice's
+//!    hers lands there. A file larger than alice's disk can take past its reserve is refused when
+//!    it is offered, before anything is pulled (ADR-028 F-3: a pull never fills the disk): bob's
+//!    node, as an apparatus attacker, sends a drive request naming a petabyte. That the session is
+//!    then told the path is not asserted here: alice's
 //!    session has no terminal in this proof (its hook runs with no tmux of anyone's), so the told
 //!    line is proved in the tmux proof's own scratch server (a_claude_session_is_mirrored…, arm 11).
 //! 2. **Losing drive changes the key** (SC-2b). Alice downgrades bob to read (`vox trust read`).
@@ -51,6 +54,8 @@
 //!   `crates/vox-core/src/node/shares.rs` lets anyone in. Carol is served the file: red PRODUCT.
 //! - **A driven file taken without checking drive** (claim 4): the DR-2 check in `drive` in
 //!   `crates/vox-tui/src/host.rs` is removed. Carol's file lands on alice's node: red PRODUCT.
+//! - **A driven file's size not checked** (claim 4): `short_of_space` is not asked in `drive`'s
+//!   file arm in `crates/vox-tui/src/host.rs`. The petabyte is accepted: red PRODUCT.
 //! - **No rotation on losing drive** (claim 2): `rotate_drive_if_lost` in
 //!   `crates/vox-core/src/node/channel.rs` returns the lost members without changing the key. Bob's
 //!   node opens the entries written after his downgrade: red PRODUCT.
@@ -750,6 +755,46 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     assert!(
         came_in,
         "PRODUCT: alice's Session must show the file come in, as bob reads it"
+    );
+    // A petabyte, named by bob's node as an attacker would: never accepted.
+    let alice_fp_for_drive: [u8; 32] = vox_core::node::link::b32_decode(&alice.fp, "alice")
+        .expect("APPARATUS: alice's fingerprint");
+    let bob_at = {
+        let paths = vox_core::node::paths::Paths::resolve(
+            "default",
+            Some(&bob.data),
+            Some(&bob.data.join("cfg")),
+        )
+        .expect("APPARATUS: bob's paths");
+        NodeSocket::one_shot(
+            paths.account().socket(),
+            vox_core::node::paths::NodeName::parse("default").expect("APPARATUS: a node name"),
+        )
+    };
+    let huge = rt.block_on(vox_core::node::drive_input::send(
+        &bob_at,
+        id,
+        alice_fp_for_drive,
+        &vox_agentcomms::drive::Request {
+            v: 1,
+            session: SESSION.to_owned(),
+            action: vox_agentcomms::drive::Action::File {
+                name: "huge.bin".into(),
+                size: 1_000_000_000_000_000,
+                sha256: "0".repeat(64),
+                tag: "file-0000000000000000-0000000000000000".into(),
+                note: None,
+            },
+        },
+    ));
+    eprintln!("[proof] claim 4: a petabyte offered: {huge:?}");
+    let huge = huge.unwrap_or_else(|e| {
+        panic!("CANNOT MEASURE (apparatus): bob's crafted drive request got no answer: {e:?}")
+    });
+    assert!(
+        !huge.ok && huge.said.contains("not accepted"),
+        "PRODUCT: a file past alice's disk reserve must be refused when it is offered: she \
+         answered {huge:?}"
     );
     assert!(
         !carol_ok && !carol_landed_at_alice,
