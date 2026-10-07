@@ -20,7 +20,8 @@
     "app.text":    { "family": "SF Pro",        "system": "body",       "weight": 400 },
     "app.mono":    { "family": "SF Mono",       "system": "monospaced", "weight": 400 },
     "app.eyebrow": { "family": "SF Mono",       "system": "monospaced", "weight": 600, "tracking": 0.12, "uppercase": true, "size": 11 },
-    "app.heading": { "family": "Inter Display", "bundled": "InterDisplay-ExtraBold.otf", "weight": 800, "tracking": -0.02 }
+    "app.heading": { "family": "Inter Display", "bundled": "InterDisplay-ExtraBold.otf", "weight": 800, "tracking": -0.02 },
+    "app.glyph":   { "family": "SF Pro",        "system": "title",      "weight": 400 }
   },
   "motion": {
     "tui.max_frames": 3,
