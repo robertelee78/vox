@@ -15,11 +15,10 @@
 //! - Every `vox` is the shipped binary in a scratch `VOX_DATA_DIR`/`VOX_CONFIG_DIR`; every step a
 //!   person takes is typed as one types it (`vox id`, `vox room create|link|join|post|read`,
 //!   `vox trust add [--drive]`, `vox trust read`).
-//! - A Session's entries are written as its harness's hook writes them, and read as the TUI and the
-//!   app read them: through the daemon's control socket ([`Request::AppendSession`],
-//!   [`Request::SessionEntries`]). The proof speaks that protocol itself, as apparatus, because
-//!   the hook that will send them (#540) and the views that will show them (#553, #554) build on
-//!   this; it never reaches into a node's store.
+//! - A Session's entries are written as its harness's hook writes them: through the daemon's
+//!   control socket ([`Request::AppendSession`]), in the harnesses' activity format, the proof
+//!   speaking that protocol itself as apparatus (staging). Each member's verdict is read as a
+//!   person reads a Session: `vox room session ROOM SESSION --json`.
 //! - Positive controls make each "none" mean something: carol reads a room message alice posts
 //!   after the Session entries, so her node has synced past them; bob, after the downgrade, reads a
 //!   room message alice posts after the later entries.
@@ -302,23 +301,26 @@ fn channel_id(rt: &tokio::runtime::Runtime, m: &Member, short: &str) -> [u8; 32]
     }
 }
 
-/// The bodies of alice's Session entries `m`'s node opens in the room.
-fn opened(rt: &tokio::runtime::Runtime, m: &Member, room: [u8; 32], alice: &str) -> Vec<String> {
-    match rt.block_on(
-        m.socket(rt)
-            .request(&Request::SessionEntries { channel_id: room }),
-    ) {
-        Ok(Frame::SessionEntries { rows }) => rows
-            .into_iter()
-            .filter(|r| vox_core::node::link::b32_encode(&r.author) == alice)
-            .filter(|r| r.session_id == SESSION)
-            .map(|r| r.body)
-            .collect(),
-        other => panic!(
-            "PRODUCT: {}'s node answered the Session read with {other:?}",
-            m.name
-        ),
-    }
+/// One reply of alice's Session, in the harnesses' activity format.
+fn reply(seq: usize, text: &str) -> String {
+    serde_json::json!({ "v": 1, "session": SESSION, "kind": "reply", "seq": seq, "text": text })
+        .to_string()
+}
+
+/// The replies of alice's Session that `m` reads, as `vox room session --json` gives them: what
+/// each line says after "reply: ". A member that can open none is told no Session answers.
+fn opened(m: &Member, room: &str) -> Vec<String> {
+    let (_, out, _) = m.vox(&["room", "session", room, SESSION, "--json"], None);
+    out.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["kind"] == "reply")
+        .filter_map(|v| {
+            v["line"]
+                .as_str()
+                .and_then(|l| l.strip_prefix("reply: "))
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// How many entries `m`'s node holds in the room, as `vox status --json` counts them.
@@ -380,30 +382,28 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         .map(|n| format!("BEFORE-DOWNGRADE {n}"))
         .collect();
     let carol_held = entries(&carol, &room);
-    for body in &before {
+    for (n, text) in before.iter().enumerate() {
         match rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
             channel_id: id,
             session_id: SESSION.to_owned(),
-            body: body.clone(),
+            body: reply(n + 1, text),
         })) {
             Ok(Frame::Appended { .. }) => {}
             other => panic!("PRODUCT: alice's node refused a Session entry: {other:?}"),
         }
     }
-    let bob_read = until(Duration::from_secs(120), || {
-        opened(&rt, &bob, id, &alice.fp) == before
-    });
+    let bob_read = until(Duration::from_secs(120), || opened(&bob, &room) == before);
     // Carol's control: a room message alice posts after the entries, read by carol, so her node
     // holds the log past them.
     let carol_synced = posts_until_read(&alice, &carol, &room, "AFTER-ENTRIES");
     let carol_holds = entries(&carol, &room).saturating_sub(carol_held);
-    let carol_opened = opened(&rt, &carol, id, &alice.fp);
+    let carol_opened = opened(&carol, &room);
     let timeline_bob = bob.vox(&["room", "read", &room], None).1;
     let timeline_carol = carol.vox(&["room", "read", &room], None).1;
     eprintln!(
         "[proof] claim 1: bob opened {:?}; carol synced past them: {carol_synced}, holds {carol_holds} \
          new entries, opened {carol_opened:?}",
-        opened(&rt, &bob, id, &alice.fp)
+        opened(&bob, &room)
     );
     assert!(
         carol_synced && carol_holds as usize >= ENTRIES,
@@ -414,7 +414,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
         bob_read,
         "PRODUCT: bob, whom alice trusts with drive, must open every entry of her Session: he \
          opened {:?}",
-        opened(&rt, &bob, id, &alice.fp)
+        opened(&bob, &room)
     );
     assert!(
         carol_opened.is_empty(),
@@ -442,11 +442,11 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let after: Vec<String> = (1..=ENTRIES)
         .map(|n| format!("AFTER-DOWNGRADE {n}"))
         .collect();
-    for body in &after {
+    for (n, text) in after.iter().enumerate() {
         match rt.block_on(alice.socket(&rt).request(&Request::AppendSession {
             channel_id: id,
             session_id: SESSION.to_owned(),
-            body: body.clone(),
+            body: reply(ENTRIES + n + 1, text),
         })) {
             Ok(Frame::Appended { .. }) => {}
             other => panic!("PRODUCT: alice's node refused a Session entry: {other:?}"),
@@ -456,7 +456,7 @@ fn a_session_is_read_only_by_members_with_drive_and_a_downgrade_changes_its_key(
     let bob_synced = posts_until_read(&alice, &bob, &room, "AFTER-DOWNGRADE-CONTROL");
     // Ten seconds more for anything still on its way.
     std::thread::sleep(Duration::from_secs(10));
-    let bob_now = opened(&rt, &bob, id, &alice.fp);
+    let bob_now = opened(&bob, &room);
     eprintln!(
         "[proof] claim 2: bob synced past the later entries: {bob_synced}; opened {bob_now:?}"
     );
