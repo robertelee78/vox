@@ -1106,6 +1106,7 @@ impl DaemonCore {
             node,
             session: id.to_owned(),
             label: vox_agentcomms::envelope::session_label(&alias, row.name.as_deref(), id),
+            node_alias: alias.clone(),
             can_drive: row.can_drive,
         };
         let paths = match self.account.node_paths(&self.node) {
