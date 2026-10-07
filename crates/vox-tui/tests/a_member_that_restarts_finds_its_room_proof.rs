@@ -18,6 +18,16 @@
 //! back must reach the other, both within 10 s of the restarted node answering (printed).
 //! Mutation: nothing persisted — it never reconverges.
 //!
+//! - (c) **a pair whose peer books were written when Vox kept times in seconds** (#562). The
+//!   fixture `fixtures/seconds-format-pair.tar.gz` is two members' data directories, alice and
+//!   bob, made by `vox` at integrate 48b1c743 (peer book version 1, times in seconds): one room,
+//!   both trusting each other, last reached directly with bob on 127.0.0.1:47613. This build
+//!   brings bob back there and alice on a new port, with no anchor and nothing said nearby
+//!   (`VOX_TEST_NO_NEARBY`, a `test-knobs` knob: on one computer, what a node says nearby finds
+//!   the other within seconds too), so the books are the only way the two find each other. Each
+//!   must read the other's new message within 10 s, and the posts from before still read.
+//!   Mutation: a version-1 book refused — they never reconverge.
+//!
 //! The 10 s bar also needs the survivor to stop using its connection to the dead process as soon
 //! as the restarted one connects (`prd1/restart-probe` 582f18a). Without that, both directions
 //! measured 29.4–30.1 s: the old connection held the room's sync until `SILENCE_IS_DEATH`.
@@ -31,6 +41,9 @@ mod watchdog;
 
 #[path = "support/typed.rs"]
 mod typed;
+
+#[path = "support/test_knobs.rs"]
+mod test_knobs;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -321,5 +334,67 @@ fn a_member_that_restarts_finds_its_room_again_without_an_anchor() {
         results.len(),
         "a restarted member must find its room again, both ways, within {WITHIN:?} of being \
          back (None = never, in 60 s): {results:?}"
+    );
+}
+
+/// The room the pair fixture holds, as `vox` at integrate 48b1c743 made it.
+const PAIR_ROOM: &str = "alr5dektwa2b6ti7ycp4wps6gwtknwvd5qhk2gnpk7je7avttdha";
+/// Where bob listened when the fixture was made: the address alice's book holds for him.
+const PAIR_BOB_AT: &str = "127.0.0.1:47613";
+
+#[test]
+#[ignore = "real vox daemons and production Argon2id; CI runs it in release"]
+fn a_pair_whose_peer_books_were_kept_in_seconds_finds_each_other_again() {
+    watchdog::arm();
+    let t = tempfile::tempdir().expect("APPARATUS: no temp dir");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/seconds-format-pair.tar.gz"
+    );
+    let unpacked = Command::new("tar")
+        .args(["-xzf", fixture, "-C"])
+        .arg(t.path())
+        .status()
+        .unwrap_or_else(|e| panic!("APPARATUS: cannot run tar: {e}"));
+    assert!(
+        unpacked.success(),
+        "APPARATUS: tar could not unpack {fixture}"
+    );
+    let (alice, bob) = (t.path().join("alice"), t.path().join("bob"));
+    test_knobs::require(&["VOX_TEST_NO_NEARBY"]);
+    let unlock = format!("{IDENTITY}\n{ROOMPASS}\n");
+    let unheard = [("VOX_TEST_NO_NEARBY", "1".to_owned())];
+    let _b = daemon(&bob, "bob", &unlock, PAIR_BOB_AT, &unheard);
+    let _a = daemon(&alice, "alice", &unlock, "127.0.0.1:0", &unheard);
+    let back_at = Instant::now();
+    for (dir, who) in [(&alice, "alice"), (&bob, "bob")] {
+        let before = format!("{who} said while times were seconds");
+        assert!(
+            read(dir, PAIR_ROOM).contains(&before),
+            "PRODUCT: {who}'s post from when times were seconds must still read on {who}'s node"
+        );
+    }
+    let (to_alice, to_bob) = (
+        "bob is back in milliseconds",
+        "alice is back in milliseconds",
+    );
+    post(&bob, PAIR_ROOM, to_alice);
+    post(&alice, PAIR_ROOM, to_bob);
+    let (a, b) = arrivals(
+        back_at,
+        (&alice, to_alice),
+        (&bob, to_bob),
+        PAIR_ROOM,
+        Duration::from_secs(60),
+    );
+    println!(
+        "[proof] a pair from when times were seconds, back with no anchor: bob's message reached \
+         alice after {a:?}, alice's reached bob after {b:?}"
+    );
+    assert!(
+        a.is_some_and(|a| a <= WITHIN) && b.is_some_and(|b| b <= WITHIN),
+        "PRODUCT: two members whose peer books were written when times were seconds must find each \
+         other again with no anchor, both ways, within {WITHIN:?} (None = never, in 60 s): bob to \
+         alice {a:?}, alice to bob {b:?}"
     );
 }

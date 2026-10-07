@@ -2099,6 +2099,12 @@ pub const TEST_KEYRING_WINDOW_ENV: &str = "VOX_TEST_KEYRING_WINDOW_SECS";
 #[cfg(feature = "test-knobs")]
 pub const TEST_STOPPED_DELAY_ENV: &str = "VOX_TEST_STOPPED_DELAY_MS";
 
+/// **For proofs only.** When set, the node does not say or hear where members listen nearby
+/// (`node::nearby`), so a proof on one computer can show what a node finds its members by without
+/// it. Nothing a person runs sets it. Not compiled in without the `test-knobs` feature (V210-105).
+#[cfg(feature = "test-knobs")]
+pub const TEST_NO_NEARBY_ENV: &str = "VOX_TEST_NO_NEARBY";
+
 #[cfg(feature = "test-knobs")]
 fn test_stopped_delay_ms() -> Option<u64> {
     std::env::var(TEST_STOPPED_DELAY_ENV).ok()?.parse().ok()
@@ -5470,7 +5476,11 @@ impl Node {
         // anchor holds no room and has nobody to find. Without the group, a node is found only
         // where its records say, as before.
         // On the daemon's presence the group is the daemon's (ADR-026 D-3, ADR-012 N-44).
-        let nearby = if self.headless.is_none() {
+        #[cfg(feature = "test-knobs")]
+        let unheard = std::env::var_os(TEST_NO_NEARBY_ENV).is_some();
+        #[cfg(not(feature = "test-knobs"))]
+        let unheard = false;
+        let nearby = if self.headless.is_none() && !unheard {
             self.presence.as_ref().and_then(|(p, _)| p.nearby())
         } else {
             None

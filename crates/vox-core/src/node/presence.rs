@@ -205,8 +205,10 @@ const MAPPING_RETRY_MS: u64 = 15_000;
 /// The longest wait between retries of a failed port-mapping renewal.
 const MAPPING_RETRY_MAX_MS: u64 = 600_000;
 
-/// The least time between two renewal attempts of one lease: RFC 6887 §11.2.1's 4 s (N-55).
-const RENEW_SPACING_MS: u64 = 4_000;
+/// The least time between two renewal attempts of one lease: RFC 6887 §11.2.1's 4 s (N-55), plus
+/// one, because the schedule was kept in whole seconds and an attempt started late in one second
+/// and the next early in another would otherwise have been under 4 s apart.
+const RENEW_SPACING_MS: u64 = 5_000;
 
 /// A uniformly random whole number of milliseconds in `lo..=hi`.
 fn uniform(lo: u64, hi: u64) -> u64 {
