@@ -2749,16 +2749,6 @@ pub async fn board(
         author: snap.me,
         session: session.clone(),
     };
-    // Each other member's lane state (ADR-028 W-3), as the node derives it from the room.
-    let lanes = match client
-        .request(&vox_core::node::ipc::Request::Lanes { channel_id: cid })
-        .await
-        .map_err(|e| AppError::Usage(e.to_string()))?
-    {
-        vox_core::node::ipc::Frame::Lanes { lanes } => lanes,
-        vox_core::node::ipc::Frame::Error { reason } => return Err(AppError::Usage(reason)),
-        other => return Err(crate::client::unexpected(&other)),
-    };
 
     if json {
         let resources: Vec<serde_json::Value> = snap
@@ -2811,13 +2801,6 @@ pub async fn board(
                 "participants": participants,
                 "resources": resources,
                 "violations": violations,
-                "lanes": lanes
-                    .iter()
-                    .map(|(m, state)| serde_json::json!({
-                        "member": claim::b32(m),
-                        "state": state,
-                    }))
-                    .collect::<Vec<_>>(),
                 "position": {
                     // A cursor, so never a message not received yet (V030-10): the node's
                     // `last` is the row that arrived last.
@@ -2881,13 +2864,6 @@ pub async fn board(
             ),
         };
         writeln!(out, "{line}").map_err(AppError::Io)?;
-    }
-    // The lanes (ADR-028 W-3): one line per other member, by your name for it, and its state.
-    if !lanes.is_empty() {
-        writeln!(out, "lanes:").map_err(AppError::Io)?;
-        for (member, state) in &lanes {
-            writeln!(out, "  {}\t{state}", crate::ident::name_of(member)).map_err(AppError::Io)?;
-        }
     }
     Ok(())
 }

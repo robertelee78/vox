@@ -306,13 +306,11 @@ pub struct UiState {
     pub selected_listening: usize,
     /// The room the share flow offers into.
     pub serve_room: Option<Digest32>,
-    /// The room's lanes are on screen in place of its timeline (ADR-028 W-3): `:lanes`.
-    pub lanes: bool,
     /// Whom the composer's next message is to (ADR-028 W-4, `to`): `:to <name>…`.
     pub to: Vec<Digest32>,
     /// The composer's next message is urgent (W-4, ADR-020 4.5): `:urgent`.
     pub urgent: bool,
-    /// The room the lanes, To: and urgent belong to: another room starts without them.
+    /// The room the To: and urgent belong to: another room starts without them.
     pub compose_room: Option<Digest32>,
 }
 
@@ -337,7 +335,6 @@ impl Default for UiState {
             on_screen: Vec::new(),
             selected_listening: 0,
             serve_room: None,
-            lanes: false,
             to: Vec::new(),
             urgent: false,
             compose_room: None,
@@ -356,11 +353,10 @@ impl UiState {
     /// nothing is, or when the member selected is no longer in the pane, so the marker the pane
     /// draws and the member a command acts on are one member, held by identity from then on.
     pub fn settle(&mut self, vm: &ViewModel) {
-        // The lanes, To: and urgent are the room's: another room starts without them.
+        // The To: and urgent are the room's: another room starts without them.
         let room = vm.active.as_ref().map(|c| c.channel_id);
         if room != self.compose_room {
             self.compose_room = room;
-            self.lanes = false;
             self.to.clear();
             self.urgent = false;
         }
@@ -604,10 +600,6 @@ impl UiState {
                     }
                     self.screen = Screen::Channel;
                     return Action::Redraw;
-                }
-                // Out of the lanes, back to the room's timeline.
-                if self.screen == Screen::Channel && self.lanes {
-                    return self.leave_lanes(vm);
                 }
                 if self.screen == Screen::Channel {
                     self.screen = Screen::ChannelList;
@@ -1089,14 +1081,6 @@ impl UiState {
                             urgent,
                         })
                     }
-                    Some(Parsed::Lanes) => {
-                        if self.lanes {
-                            self.leave_lanes(vm)
-                        } else {
-                            self.lanes = true;
-                            Action::Redraw
-                        }
-                    }
                     Some(Parsed::To(names)) => {
                         self.set_to(&names, vm);
                         Action::Redraw
@@ -1135,30 +1119,6 @@ impl UiState {
             }
             _ => Action::Redraw,
         }
-    }
-
-    /// Leave the lanes: what each lane showed is what the person has now seen (W-3), kept by
-    /// the node's TUI state so the next look marks only what is newer, across restarts.
-    fn leave_lanes(&mut self, vm: &ViewModel) -> Action {
-        self.lanes = false;
-        let Some(c) = vm.active.as_ref() else {
-            return Action::Redraw;
-        };
-        let seen: Vec<(Digest32, Digest32)> = c
-            .lanes
-            .iter()
-            .filter_map(|(member, _)| {
-                c.timeline
-                    .iter()
-                    .rev()
-                    .find(|m| m.author == *member && !m.coordination)
-                    .map(|m| (*member, m.entry_hash))
-            })
-            .collect();
-        Action::Dispatch(Command::LanesSeen {
-            channel_id: c.channel_id,
-            seen,
-        })
     }
 
     /// Set the composer's To: from `names`, this node's names for members of the room or the
@@ -1301,8 +1261,6 @@ pub enum Parsed {
     Send(Digest32, String),
     /// Share the file or folder at this path in the room, from the composer (ADR-028 F-1).
     Attach(Digest32, String),
-    /// Show or leave the room's lanes (ADR-028 W-3).
-    Lanes,
     /// Set the composer's To: from these names (W-4); none clears it.
     To(String),
     /// Switch the composer's urgent on or off (W-4).
@@ -1398,7 +1356,6 @@ pub fn parse_command(line: &str, ui: &UiState, vm: &ViewModel) -> Option<Parsed>
     let channel = ui.active_channel_id(vm)?;
     match verb {
         "send" if !rest.is_empty() => return Some(Parsed::Send(channel, rest.to_owned())),
-        "lanes" => return Some(Parsed::Lanes),
         // Share a file or folder here, from the composer (F-1): its words the note. `share`, as
         // `vox share` is; `:attach` is the node's.
         "share" if !rest.is_empty() => return Some(Parsed::Attach(channel, rest.to_owned())),
