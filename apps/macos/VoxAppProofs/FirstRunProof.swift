@@ -816,7 +816,8 @@ final class FirstRunProof: XCTestCase {
         let to = Key.id("compose-to")
         present(ui, to, timeout: 10, "the composer must offer To:")
         tap(ui, to, "To:")
-        tap(ui, Key.menuItem("bob"), "bob in To:")
+        tap(ui, Key.id("to-bob"), "bob in To:")
+        ui.typeKey(.escape, modifierFlags: [])
         words(ui, to, timeout: 10, "ticking bob in To: must say so", until: { $0 == "To: bob" })
         // Seen in mission, then at once another room: the read record names mission, the room the
         // message is in.

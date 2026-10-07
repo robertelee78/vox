@@ -9,24 +9,36 @@ struct ComposerAddress: View {
     @ObservedObject var model: NodeModel
     @Binding var to: Set<String>
     @Binding var urgent: Bool
+    @State private var choosing = false
 
     var body: some View {
         HStack(spacing: 8) {
-            Menu {
-                ForEach(model.members) { member in
-                    Toggle(member.name, isOn: Binding(
-                        get: { to.contains(member.id) },
-                        set: { on in if on { to.insert(member.id) } else { to.remove(member.id) } }))
-                }
-            } label: {
+            // A button that opens the members to tick, not a menu: macOS draws a menu's label in
+            // its own fixed size, and To: must follow the app's text size (WCAG 1.4.4).
+            Button { choosing.toggle() } label: {
                 Text(addressed).lineLimit(1).truncationMode(.tail)
             }
-            // As wide as what it says ("To: the room", one name, or how many): with no width
-            // the label collapsed to the chevron, and a fixed one cut it ("TO: THE…").
+            // As wide as what it says ("To: the room", one name, or how many): a fixed width
+            // cut it ("TO: THE…").
             .fixedSize()
             .accessibilityLabel(addressedInFull)
             .accessibilityIdentifier("compose-to")
-            Toggle("Urgent", isOn: $urgent)
+            .popover(isPresented: $choosing, arrowEdge: .top) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("To").eyebrow().secondaryText().accessibilityAddTraits(.isHeader)
+                    if model.members.isEmpty { Text("No other members yet").secondaryText() }
+                    ForEach(model.members) { member in
+                        Toggle(isOn: Binding(
+                            get: { to.contains(member.id) },
+                            set: { on in if on { to.insert(member.id) } else { to.remove(member.id) } }
+                        )) { Text(member.name) }
+                            .accessibilityIdentifier("to-\(member.name)")
+                    }
+                }
+                .font(Theme.text)
+                .padding(12)
+            }
+            Toggle(isOn: $urgent) { Text("Urgent") }
                 .fixedSize()
                 .accessibilityIdentifier("compose-urgent")
                 .accessibilityLabel(urgent ? "Urgent, on" : "Urgent, off")

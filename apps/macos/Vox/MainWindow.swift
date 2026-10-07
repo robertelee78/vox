@@ -57,6 +57,7 @@ private struct Sidebar: View {
                                 })) {
             Section {
                 StateMark(kind: .live, words: "node \(model.node), attached")
+                    .font(Theme.text)
                     .accessibilityIdentifier("attached")
             }
             ForEach([RoomGroup.needsYou, .active, .quiet], id: \.self) { need in
@@ -73,17 +74,18 @@ private struct Sidebar: View {
                 }
             }
             Section {
-                Text("Keyring").tag(NodeModel.Selection.keyring)
+                Text("Keyring").font(Theme.text).tag(NodeModel.Selection.keyring)
                     .accessibilityIdentifier("keyring")
-                Text("Decision record").tag(NodeModel.Selection.decisions)
+                Text("Decision record").font(Theme.text).tag(NodeModel.Selection.decisions)
                     .accessibilityIdentifier("decisions")
-                Text("Services").tag(NodeModel.Selection.services)
+                Text("Services").font(Theme.text).tag(NodeModel.Selection.services)
                     .accessibilityIdentifier("services")
             }
             Section {
                 ForEach(model.nodes, id: \.name) { node in
                     StateMark(kind: node.state == "attached" ? .live : .plain,
                               words: "\(node.name) \(node.state)")
+                        .font(Theme.text)
                         .accessibilityIdentifier("node-\(node.name)")
                 }
             } header: {
@@ -91,6 +93,9 @@ private struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+        // The sidebar's rows in the app's face and size: a sidebar list sets its own otherwise.
+        .font(Theme.text)
+        .environment(\.defaultMinListRowHeight, Theme.scaled(24))
     }
 }
 
@@ -100,7 +105,7 @@ private struct RoomRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(room.name).fontWeight(room.need == .quiet ? .regular : .bold)
+            Text(room.name).font(Theme.text).fontWeight(room.need == .quiet ? .regular : .bold)
             if room.need != .quiet {
                 Text(room.words).eyebrow().secondaryText()
             }
@@ -496,8 +501,11 @@ private struct LinkCardView: View {
                 // other scheme (file:, an app's own) is drawn as text, never opened.
                 if let url = URL(string: card.url),
                    ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                    // A link, drawn as one: not in the app's button style.
                     Link(card.url, destination: url).caption().lineLimit(1)
                         .truncationMode(.middle)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(VoxTokens.Colors.accent)
                 } else {
                     Text(card.url).caption().lineLimit(1).truncationMode(.middle)
                         .textSelection(.enabled)

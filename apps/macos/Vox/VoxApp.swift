@@ -21,6 +21,7 @@ struct VoxApp: App {
                 // changes (View > Bigger, Smaller, Actual Size).
                 .font(Theme.text)
                 .controlSize(Theme.controls)
+                .buttonStyle(VoxButtonStyle())
                 .id(model.textScale)
                 // The sidebar (260) and the inspector (240) leave the room 400 or more: room
                 // for the composer's field beside its To: and Urgent controls.
@@ -36,6 +37,7 @@ struct VoxApp: App {
             MenuBarContent(app: model)
                 .font(Theme.text)
                 .controlSize(Theme.controls)
+                .buttonStyle(VoxButtonStyle())
                 .id(model.textScale)
                 .preferredColorScheme(.dark)
         }

@@ -168,6 +168,28 @@ private struct Typeset: ViewModifier {
     }
 }
 
+/// Every bordered button, drawn in SwiftUI so its label takes the app's face and text size (WCAG
+/// 1.4.4: macOS draws its own buttons in a fixed control font): bg.overlay with a text.muted edge
+/// (1.4.11), the label in text.primary, or danger for a destructive one; dimmer while pressed or
+/// off. A button styled plain or borderless keeps its own.
+struct VoxButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var enabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(Theme.text)
+            .foregroundStyle(configuration.role == .destructive ? VoxTokens.Colors.danger
+                                                                : VoxTokens.Colors.textPrimary)
+            .padding(.horizontal, Theme.scaled(10))
+            .padding(.vertical, Theme.scaled(4))
+            .background(RoundedRectangle(cornerRadius: 5)
+                .fill(configuration.isPressed ? VoxTokens.Colors.bgPanel : VoxTokens.Colors.bgOverlay))
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(VoxTokens.Colors.textMuted))
+            .opacity(enabled ? 1 : 0.45)
+            .contentShape(Rectangle())
+    }
+}
+
 /// A card's outline: text.muted, 4.5:1 or more on every background, since an outline is all that
 /// marks a card's edge (WCAG 2.1 1.4.11); under Increase Contrast its token's hex_hc, which the
 /// colour set carries (L-5, #450).
