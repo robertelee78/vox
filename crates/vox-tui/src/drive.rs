@@ -229,13 +229,16 @@ async fn target(
     // The app gate opens a stream only between nodes that trust each other. That costs a member
     // with drive nothing: it reads a Session only through the session node's drive key, which it
     // takes only from a node it trusts (#543), so a driver already trusts the session's node.
-    // Said here, before anything is sent, rather than as an unreachable peer.
-    let trusted = match client.trusted("").await {
-        Ok(Frame::Trusted { entries }) => entries.iter().any(|(fp, _, _)| *fp == row.node),
-        Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
-        Ok(other) => return Err(crate::client::unexpected(&other)),
-        Err(e) => return Err(AppError::Usage(e.to_string())),
-    };
+    // Said here, before anything is sent, rather than as an unreachable peer. This node's own
+    // Sessions it drives as their operator (SC-2), over its own socket: no trust is asked.
+    let own = client.me() == Some(row.node);
+    let trusted = own
+        || match client.trusted("").await {
+            Ok(Frame::Trusted { entries }) => entries.iter().any(|(fp, _, _)| *fp == row.node),
+            Ok(Frame::Error { reason }) => return Err(AppError::Usage(reason)),
+            Ok(other) => return Err(crate::client::unexpected(&other)),
+            Err(e) => return Err(AppError::Usage(e.to_string())),
+        };
     if !trusted {
         let node = crate::ident::name_of(&row.node);
         return Err(AppError::Usage(format!(
