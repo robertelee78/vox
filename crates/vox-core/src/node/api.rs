@@ -870,6 +870,16 @@ pub enum NodeCommand {
         /// The new name, one DNS label (ADR-028 R-2).
         name: String,
     },
+    /// Append one entry of a Session (ADR-029 SC-1), sealed under this node's drive key so only
+    /// members it trusts with drive read it (SC-2).
+    AppendSession {
+        /// The channel.
+        channel_id: Digest32,
+        /// The harness's own session id.
+        session_id: String,
+        /// The activity item.
+        body: String,
+    },
     /// Reconcile a channel's log with the members this node can reach (ADR-008
     /// frontier sync).
     Sync {

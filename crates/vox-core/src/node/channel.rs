@@ -4494,6 +4494,8 @@ impl ChannelState {
         }
         let gone: BTreeSet<Digest32> = due.iter().map(|(h, _)| *h).collect();
         self.timeline.retain(|r| !gone.contains(&r.entry_hash));
+        // A Session entry follows the room's retention (SE-5).
+        self.drive.sessions.retain(|r| !gone.contains(&r.entry_hash));
         for h in &gone {
             self.forget_read_record(h);
         }
@@ -5414,10 +5416,15 @@ impl ChannelState {
     }
 
     /// The members owed this node's live drive key (SC-2a), each now marked owed from where the
-    /// key stands, if it was not before.
-    pub fn owed_drive(&mut self, holders: &BTreeSet<Digest32>) -> Vec<Digest32> {
+    /// key stands, if it was not before; the marks are kept, so a release made later is made
+    /// from them.
+    pub fn owed_drive(&mut self, store: &Store, holders: &BTreeSet<Digest32>) -> Result<Vec<Digest32>> {
         let members = self.drive_members();
-        self.drive.take_owed(&members, holders)
+        let owed = self.drive.take_owed(&members, holders);
+        if !owed.is_empty() {
+            self.persist_drive(store)?;
+        }
+        Ok(owed)
     }
 
     /// The SKDM releasing this node's live drive key to `member` from its mark, and its
