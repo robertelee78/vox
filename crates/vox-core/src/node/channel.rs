@@ -3381,7 +3381,32 @@ impl ChannelState {
             self.poisoned = true;
             return Err(e);
         }
+        let retired = self.sender.chain_id();
         self.sender = next;
+        // **A generation retired before a reader took it is owed to that reader as history.**
+        // A member entitled to it that has not taken it — offline at the rotation, or refusing
+        // keys from an owner it does not trust yet (V210-118) — was owed it only as the live
+        // generation's re-key, which a rotation ends. Nothing owed it any more, so the next tick's
+        // prune (R14) deleted its origin before the member's refusal of the new key could owe it
+        // again, and the member never read what this identity wrote under it. Owed here, its
+        // history floor keeps it (`oldest_generation_needed`) until it is taken.
+        let readers = MembershipView::new(&self.evaluator).readers_of(&me);
+        let owed: Vec<(Digest32, u64)> = readers
+            .into_iter()
+            .filter(|t| *t != me && !self.has_left(t))
+            .filter_map(|t| {
+                let (from, _) = self.entitled.get(&t)?;
+                let floor = match self.delivered.get(&t) {
+                    None => *from,
+                    Some(d) if *d < retired => (*d + 1).max(*from),
+                    Some(_) => return None,
+                };
+                (floor <= retired).then_some((t, floor))
+            })
+            .collect();
+        for (target, floor) in owed {
+            self.owe_history(store, target, floor)?;
+        }
         Ok(chain_id)
     }
 
