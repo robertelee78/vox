@@ -315,6 +315,7 @@ fn detail_of(ch: &ChannelState, prev: Option<&ChannelDetail>) -> ChannelDetail {
         read_by: ch.read_by_own(),
         held: ch.held_own(),
         unread: ch.unread(),
+        drive_from: ch.drive_from(),
     }
 }
 

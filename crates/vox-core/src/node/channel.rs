@@ -5222,6 +5222,15 @@ impl ChannelState {
         self.drive.holds_from(author)
     }
 
+    /// The nodes whose Sessions this node can read inside here, sorted: itself, and each node
+    /// whose drive key it holds (SC-2).
+    #[must_use]
+    pub fn drive_from(&self) -> Vec<Digest32> {
+        let mut from: BTreeSet<Digest32> = self.drive.receivers.keys().map(|(a, _)| *a).collect();
+        from.insert(self.me());
+        from.into_iter().collect()
+    }
+
     /// The members a drive key may be owed to: every member admitted here that has not left,
     /// this node excepted. Empty until this node holds its own feed (V210-164).
     #[must_use]
