@@ -297,7 +297,7 @@ keep code in sync through GitHub.
   | line.hair | `#26272b` | 235 | bright black |
   | text.primary | `#f0ece4` | 255 | default fg |
   | text.secondary | `#a8a299` | 247 | default fg |
-  | text.muted | `#85807a` | 244 | bright black |
+  | text.muted | `#8a857f` | 244 | bright black |
   | accent (ice) | `#5ec8ff`, hover `#8fdbff`, deep `#2fa8f0` | 81 | bright cyan |
   | attention | `#f2b33d` with ▲ | 215 | yellow |
   | danger | `#ff5f3a` with ✕ | 203 | bright red |
