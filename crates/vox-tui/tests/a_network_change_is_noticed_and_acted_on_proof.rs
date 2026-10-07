@@ -248,8 +248,12 @@ impl Loopback {
 /// (`VOX_TEST_SOLVE_AT_LEAST_MS`), and is stopped (SIGSTOP) across the move: a peer busy for a
 /// moment, as one solving on a loaded machine is. The join must still get in.
 ///
-/// **Mutant**: `close_stranded` probing loopback connections too. alice closes the agent's
-/// connection as stranded and the join in flight fails.
+/// Then alice stops while a second join's puzzle runs: the joiner must say the member closed the
+/// connection during the exchange, not that it did not answer in time.
+///
+/// **Mutants**: `close_stranded` probing loopback connections too (alice closes the agent's
+/// connection as stranded and the join in flight fails); the joiner's `closed_by_peer` never
+/// finding a close (the old words).
 #[test]
 #[ignore = "real daemons and a staged default-route move; run in release with test-knobs"]
 fn a_peer_on_loopback_is_not_cut_off_when_the_default_route_moves() {
@@ -361,5 +365,77 @@ fn a_peer_on_loopback_is_not_cut_off_when_the_default_route_moves() {
          the agent's daemon said:\n{}",
         alice.said(),
         agent.said()
+    );
+
+    // ---- a member that closes the connection during the exchange is said to have closed it ----
+    // alice stops (SIGTERM, a clean stop) while a second joiner's puzzle runs: the joiner must say
+    // the member closed the connection, not that it "did not answer the join exchange in time".
+    let late = Loopback::start(
+        &tmp.path().join("late"),
+        &route,
+        &[("VOX_TEST_SOLVE_AT_LEAST_MS", "4000")],
+    );
+    // A room alice alone is in, so no other member can answer the join in her place.
+    let (ok, said) = alice.vox(
+        &["room", "create", "--passphrase-file", "-", "--name", "solo"],
+        "channel passphrase",
+    );
+    assert!(ok, "PRODUCT (staging): vox room create: {said}");
+    let (_, list) = alice.vox(&["room", "list"], "");
+    let solo = list
+        .lines()
+        .find(|l| l.contains("solo"))
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room list` named no solo room: {list}"))
+        .to_owned();
+    let (ok, link) = alice.vox(&["room", "link", &solo], "");
+    let link = link
+        .lines()
+        .find(|l| l.starts_with("vox://"))
+        .unwrap_or_else(|| panic!("PRODUCT (staging): `vox room link` printed no link: {link}"))
+        .to_owned();
+    assert!(ok, "PRODUCT (staging): vox room link: {link}");
+    let joining = std::thread::spawn({
+        let data = late.data.clone();
+        move || {
+            let mut child = vox_at(&data)
+                .args(["room", "join", &link, "--passphrase-file", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("APPARATUS: run vox room join");
+            child
+                .stdin
+                .take()
+                .expect("APPARATUS: join's stdin")
+                .write_all(b"channel passphrase")
+                .expect("APPARATUS: write join's stdin");
+            let out = child
+                .wait_with_output()
+                .expect("APPARATUS: wait for vox room join");
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        }
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    alice.signal("-TERM");
+    let said = joining.join().expect("APPARATUS: the join's thread");
+    println!("[proof] the join whose member stopped during its exchange said: {said:?}");
+    assert!(
+        late.said().contains("exchange (incl. solve)") && !said.contains("joined solo"),
+        "APPARATUS: staging not achieved: the second join did not reach the exchange before alice \
+         stopped: {said}\nits daemon said:\n{}",
+        late.said()
+    );
+    assert!(
+        said.contains("closed the connection during the join exchange")
+            && !said.contains("did not answer the join exchange in time"),
+        "PRODUCT: a member that closed the connection during the join exchange must be said to \
+         have closed it, not to have not answered in time:\n{said}\nthe joiner's daemon said:\n{}",
+        late.said()
     );
 }

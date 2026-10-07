@@ -3368,6 +3368,11 @@ impl Joiner {
                     // or anything else the exchange met, which was left unsaid (V210-83).
                     if last_fault == Fault::SolveTooSlow {
                         why.push(format!("{short}: {e}"));
+                    } else if let Some(said) = closed_by_peer(&conn) {
+                        // **A member that closed the connection is not one that did not answer.**
+                        // The stream's error says only that it closed; the connection says who
+                        // closed it, and why.
+                        why.push(format!("{short}: exchange: {MEMBER_CLOSED} ({said})"));
                     } else {
                         why.push(format!("{short}: exchange: {e}"));
                     }
@@ -3436,6 +3441,34 @@ fn went_offline(conn: &VoxConnection) -> Option<String> {
                 WireError::NotAvailable => Some("its node is not there (not available)".to_owned()),
                 _ => None,
             }
+        }
+        _ => None,
+    }
+}
+
+/// How a join's steps say a member closed the connection during the join exchange; the client's
+/// advice keys on it.
+pub const MEMBER_CLOSED: &str = "the member closed the connection during the join exchange";
+
+/// What the peer said when it closed `conn`, or said it was closing it: its coded reason. `None`
+/// when the connection is open, or this end or the network ended it unasked. A peer that says it
+/// is stopping (V210-93) is closed from this end on hearing it, so that is asked first.
+fn closed_by_peer(conn: &VoxConnection) -> Option<String> {
+    if conn.peer_stopped() {
+        return Some("it said it was stopping".to_owned());
+    }
+    match conn.quinn().close_reason()? {
+        quinn::ConnectionError::ApplicationClosed(close) => Some(
+            u8::try_from(close.error_code.into_inner())
+                .ok()
+                .and_then(crate::wire::WireError::from_code)
+                .map_or_else(
+                    || format!("code {}", close.error_code),
+                    |e| format!("it said: {e}"),
+                ),
+        ),
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            Some(format!("it closed it at the transport: {close}"))
         }
         _ => None,
     }
