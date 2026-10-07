@@ -394,11 +394,23 @@ fn attempt(
         .local_addr()
         .expect("APPARATUS: the server's address");
     let written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // **The tunnel's connection, not the share's probe.** `vox service add` connects once to
+    // learn the service's kind (#489), and the server accepted that connection and no other: its
+    // payload went to the probe, and Alice's daemon, opening the tunnel's own connection later,
+    // was refused ("the local service did not accept the connection"), so no attempt ever staged.
+    // Connections before `armed` is set (the probe's) are closed at once.
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let written = Arc::clone(&written);
+        let armed = Arc::clone(&armed);
         std::thread::spawn(move || {
-            let Ok((mut sock, _)) = server.accept() else {
-                return;
+            let mut sock = loop {
+                let Ok((sock, _)) = server.accept() else {
+                    return;
+                };
+                if armed.load(std::sync::atomic::Ordering::SeqCst) {
+                    break sock;
+                }
             };
             let chunk: Vec<u8> = (0..1 << 16)
                 .map(|i: u32| (i.wrapping_mul(7).wrapping_add(n as u32) % 251) as u8)
@@ -433,6 +445,8 @@ fn attempt(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    // Every connection from here on is the tunnel's: the share's probe was made in `service add`.
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
     let fwd_out = root.join(format!("fwd{n}.out"));
     let _fwd = spawn_member(
         &bob,
@@ -557,8 +571,9 @@ fn a_stop_waits_out_last_bytes_within_its_patience() {
         .find_map(|n| attempt(root, n, &[], WAITED))
         .unwrap_or_else(|| {
             panic!(
-                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
-                 unacknowledged at the stop (each attempt's own line says which step it missed)"
+                "CANNOT MEASURE (staging not achieved): in none of {ATTEMPTS} attempts did vox leave a \
+                 finished tunnel's tail unacknowledged at the stop (each attempt's own line says \
+                 which step it missed)"
             )
         });
     let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
@@ -591,8 +606,9 @@ fn a_stop_past_its_patience_says_it_did_not_finish() {
         .find_map(|n| attempt(root, n, &[(PATIENCE_KNOB, ms.as_str())], SHORT_PATIENCE))
         .unwrap_or_else(|| {
             panic!(
-                "PRODUCT (staging): in none of {ATTEMPTS} attempts did vox leave a finished tunnel's tail \
-                 unacknowledged long enough to outlast a {SHORT_PATIENCE:?} patience"
+                "CANNOT MEASURE (staging not achieved): in none of {ATTEMPTS} attempts did vox leave a \
+                 finished tunnel's tail unacknowledged long enough to outlast a {SHORT_PATIENCE:?} \
+                 patience"
             )
         });
     let gave_up = said.lines().find(|l| l.contains(GAVE_UP));
