@@ -284,20 +284,8 @@ fn a_retention_set_by_an_admin_revoked_meanwhile_does_not_stand() {
         tmp.path(),
         "set the room's retention to a week",
         |carol, id| {
-            carol.vox(
-                None,
-                &[
-                    "room",
-                    "retention",
-                    id,
-                    "1w",
-                    "--identity-passphrase-file",
-                    carol
-                        .pass
-                        .to_str()
-                        .expect("APPARATUS: a temp path is not UTF-8"),
-                ],
-            )
+            // A retention change asks for no passphrase (ADR-028 K-11).
+            carol.vox(None, &["room", "retention", id, "1w"])
         },
     );
     let id = room.id.as_str();

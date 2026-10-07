@@ -244,7 +244,7 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     );
 
     // ---- the room's name (ADR-028 R-1, R-2): one DNS label, changed with `vox room rename`,
-    // which asks for the identity passphrase; a name that is no label is refused with the reason ----
+    // which asks for no passphrase; a name that is no label is refused with the reason ----
     let (ok, out, err) = vox(
         &data,
         &cfg,
@@ -264,18 +264,8 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
         "PRODUCT: `vox room create --name \"Our Room\"` must be refused, saying a room name is \
          one DNS label and what is wrong with this one; it said: {out}{err}"
     );
-    let identity = [
-        "--identity-passphrase-file",
-        pass.to_str().expect("APPARATUS: a UTF-8 path"),
-    ];
-    let rename = |room: &str, name: &str| {
-        vox(
-            &data,
-            &cfg,
-            &[&["room", "rename", room, name][..], &identity[..]].concat(),
-            None,
-        )
-    };
+    // A rename asks for no passphrase (ADR-028 K-11).
+    let rename = |room: &str, name: &str| vox(&data, &cfg, &["room", "rename", room, name], None);
     let (ok, out, err) = rename("agents", "team-");
     assert!(
         !ok && err.contains("a room name cannot start or end with `-`"),
@@ -554,14 +544,8 @@ fn vox_room_speaks_to_a_node_it_did_not_start() {
     let (ok, out, err) = vox(
         &data,
         &cfg,
-        &[
-            "room",
-            "retention",
-            &room_prefix,
-            "1w",
-            "--identity-passphrase-file",
-            pass_file,
-        ],
+        // A retention change asks for no passphrase (ADR-028 K-11).
+        &["room", "retention", &room_prefix, "1w"],
         None,
     );
     assert!(ok, "PRODUCT: room retention failed: {err}");

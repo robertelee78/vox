@@ -168,9 +168,9 @@ do {
         .compactMap { $0.image }.first
     let jpeg = image.map { $0.thumb.starts(with: [0xFF, 0xD8]) } ?? false
     say("IMAGE \(image?.width ?? 0)x\(image?.height ?? 0) JPEG \(jpeg) BLURHASH \(image?.blurhash ?? "")")
-    let operator_ = try Passphrase(bytes: Data(args[3].utf8))
+    // A rename asks for no passphrase (ADR-028 K-11).
     do {
-        try await client.renameRoom(room: room, name: "taken", identityPassphrase: operator_)
+        try await client.renameRoom(room: room, name: "taken")
         say("REFUSED nothing: the rename was answered")
     } catch {
         say("REFUSED \(error)")
@@ -179,8 +179,7 @@ do {
         name: "mine", passphrase: try Passphrase(bytes: Data("mine passphrase".utf8)))
     say("CREATED \(made) \(try await client.link(room: made).url)")
     _ = readLine()
-    try await client.renameRoom(room: made, name: "renamed", identityPassphrase: operator_)
-    operator_.wipe()
+    try await client.renameRoom(room: made, name: "renamed")
     say("RENAMED")
     _ = readLine()
     await client.close()

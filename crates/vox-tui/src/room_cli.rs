@@ -4033,14 +4033,9 @@ pub async fn create(
 /// `vox room rename` — give a room a new name, for every member (ADR-028 R-1).
 ///
 /// # Errors
-/// A name that is not one DNS label, an unreachable node, an unknown room, a wrong identity
-/// passphrase, or a caller who is not the room's creator or an admin.
-pub async fn rename(
-    paths: &Paths,
-    room: &str,
-    name: &str,
-    identity_passphrase: &str,
-) -> Result<(), AppError> {
+/// A name that is not one DNS label, an unreachable node, an unknown room, or a caller who is
+/// not the room's creator or an admin. No passphrase is asked for (ADR-028 K-11).
+pub async fn rename(paths: &Paths, room: &str, name: &str) -> Result<(), AppError> {
     let name = vox_core::governance::name::room_name(name)
         .map_err(|why| AppError::Usage(format!("cannot rename the room: {why}")))?;
     let mut client = attach(paths).await?;
@@ -4049,7 +4044,6 @@ pub async fn rename(
         .request(&Request::RenameRoom {
             channel_id,
             name: name.clone(),
-            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
         })
         .await
     {
@@ -4070,14 +4064,9 @@ pub async fn rename(
 /// `vox room retention` — set how long the room keeps messages (ADR-023 decision 2).
 ///
 /// # Errors
-/// An unparseable duration, an unreachable node, an unknown room, a wrong identity
-/// passphrase, or a caller who is not the room's admin.
-pub async fn retention(
-    paths: &Paths,
-    room: &str,
-    duration: &str,
-    identity_passphrase: &str,
-) -> Result<(), AppError> {
+/// An unparseable duration, an unreachable node, an unknown room, or a caller who is not the
+/// room's admin. No passphrase is asked for (ADR-028 K-11).
+pub async fn retention(paths: &Paths, room: &str, duration: &str) -> Result<(), AppError> {
     let ttl = vox_core::node::retention::parse_duration(duration).ok_or_else(|| {
         AppError::Usage(format!(
             "{duration:?} is not a retention: use 1h, 1w, 1m (a month), a number of seconds, \
@@ -4102,11 +4091,7 @@ pub async fn retention(
         );
     }
     match client
-        .request(&Request::SetRetention {
-            channel_id,
-            ttl,
-            identity_passphrase: zeroize::Zeroizing::new(identity_passphrase.to_owned()),
-        })
+        .request(&Request::SetRetention { channel_id, ttl })
         .await
     {
         Ok(Frame::Ok) => {
